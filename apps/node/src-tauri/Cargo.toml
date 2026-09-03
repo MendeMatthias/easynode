@@ -1,0 +1,35 @@
+[package]
+name = "easybtx-node"
+version = "0.6.17"
+description = "easyBTX Node — run a BTX full node in one click and support the network"
+authors = ["Matthias Mende"]
+license = "MIT"
+edition = "2021"
+
+[lib]
+name = "easybtx_node_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The shared BTX node engine (extracted from the miner): node lifecycle, RPC,
+# assumeutxo faststart, sync health, disk maintenance, keep-awake.
+btx-core = { path = "../../../crates/btx-core" }
+# tray-icon: this is a background support app — closing the window hides to the
+# tray and the node keeps running; the tray is the always-there control surface.
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+base64 = "0.21"
+tauri-plugin-opener = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+# Launch at login (spec: menu-bar tray + launch-at-login + keep-awake).
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "fs", "io-util"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+tempfile = "3"

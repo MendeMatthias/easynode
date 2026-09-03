@@ -1,0 +1,1071 @@
+/* easyBTX Node — cosmic dark design, sharing the miner's visual language
+   (JetBrains Mono, Bitcoin-orange accent, near-black surfaces). The node app
+   is dark-only: it lives in the menu bar and glances should feel calm. */
+
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal; font-weight: 400; font-display: swap;
+  src: url("./assets/fonts/JetBrainsMono-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal; font-weight: 700; font-display: swap;
+  src: url("./assets/fonts/JetBrainsMono-Bold.woff2") format("woff2");
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* The [hidden] attribute must always win — several components set their own
+   display (flex/grid), whose class specificity would otherwise override the
+   UA's `[hidden] { display: none }` and "hidden" elements would render. */
+[hidden] { display: none !important; }
+
+:root {
+  --color-bg:      #0b0e0c;
+  --color-surface: #161a17;
+  --color-border:  #283029;
+  --color-text:    #f0ede8;
+  --color-muted:   #9b9790;
+  --color-accent:  #f7931a;
+  --color-accent-dk: #ffb24d;
+  --color-danger:  #f87171;
+  --color-green:   #4ade80;
+  --color-amber:   #fbbf24;
+  --color-raise:   #1e2420;
+
+  --radius:  10px;
+  --radius-l: 14px;
+  --space-xs: 6px;
+  --space-s:  12px;
+  --space-m:  20px;
+  --space-l:  32px;
+
+  --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+
+  font-family: var(--font-mono);
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--color-text);
+  background: var(--color-bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Accent themes ("the light your node glows with") ─────────────────────
+   Same idea as the miner's color themes, kept minimal: one accent var pair
+   swaps; the ambient line + orb read the vars at draw time. Set before first
+   paint by an inline bootstrap in main.ts reading localStorage. */
+:root[data-accent="btx"]   { --color-accent: #4ade80; --color-accent-dk: #86efac; }
+:root[data-accent="ocean"] { --color-accent: #38bdf8; --color-accent-dk: #7dd3fc; }
+:root[data-accent="nova"]  { --color-accent: #c084fc; --color-accent-dk: #d8b4fe; }
+
+body {
+  overflow: hidden;
+  user-select: none;
+  cursor: default;
+}
+
+/* ── Cosmic backdrop: a soft orange nebula + pinprick stars, pure CSS ─────── */
+.stars {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(1px 1px at 12% 18%, rgba(240, 237, 232, 0.55) 50%, transparent 51%),
+    radial-gradient(1px 1px at 78% 9%,  rgba(240, 237, 232, 0.35) 50%, transparent 51%),
+    radial-gradient(1.5px 1.5px at 64% 32%, rgba(240, 237, 232, 0.42) 50%, transparent 51%),
+    radial-gradient(1px 1px at 31% 58%, rgba(240, 237, 232, 0.30) 50%, transparent 51%),
+    radial-gradient(1px 1px at 89% 51%, rgba(240, 237, 232, 0.38) 50%, transparent 51%),
+    radial-gradient(1.5px 1.5px at 45% 84%, rgba(240, 237, 232, 0.28) 50%, transparent 51%),
+    radial-gradient(1px 1px at 8% 79%,  rgba(240, 237, 232, 0.33) 50%, transparent 51%),
+    radial-gradient(1px 1px at 71% 71%, rgba(240, 237, 232, 0.25) 50%, transparent 51%),
+    radial-gradient(ellipse 90% 55% at 50% -15%, rgba(247, 147, 26, 0.10), transparent 60%),
+    var(--color-bg);
+}
+
+.app {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  padding: var(--space-m);
+  gap: var(--space-m);
+}
+
+/* ── Header ───────────────────────────────────────────────────────────────── */
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.app-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.brand-mark {
+  color: var(--color-green);
+  filter: drop-shadow(0 0 6px rgba(74, 222, 128, 0.45));
+  flex: none;
+}
+
+.brand-logo {
+  width: 26px;
+  height: 26px;
+  align-self: center;
+}
+.brand-name {
+  font-weight: 700;
+  font-size: 17px;
+  letter-spacing: 0.02em;
+  letter-spacing: 0.06em;
+  font-weight: 700;
+}
+.brand-name em {
+  font-style: normal;
+  color: var(--color-green);
+}
+.brand-version {
+  font-size: 11px;
+  color: var(--color-muted);
+}
+.header-actions { display: flex; gap: 8px; }
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  color: var(--color-muted);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.icon-btn:hover { color: var(--color-text); border-color: var(--color-muted); }
+
+/* Close (✕) buttons on every overlay read RED so "this closes it" is obvious;
+   the header action icons (ask/wallet/info/settings) keep the neutral look. */
+.icon-btn[aria-label="Close"] {
+  color: #ff6b6b;
+  border-color: color-mix(in srgb, #ff6b6b 45%, var(--color-border));
+}
+.icon-btn[aria-label="Close"]:hover {
+  color: #fff;
+  background: #e0524a;
+  border-color: #e0524a;
+}
+
+/* ── Screens ──────────────────────────────────────────────────────────────── */
+.screen {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-m);
+  flex: 1;
+  min-height: 0;
+  /* The window is fixed-size and body clips. Without this, anything past the
+     fold (the setup progress card, the ERROR card) was simply unreachable —
+     on Windows, whose taller font metrics push the wizard past 780px, that
+     made a clicked "Set up my node" look frozen. The screen itself scrolls. */
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border) transparent;
+}
+.screen[hidden] { display: none; }
+
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-l);
+  padding: var(--space-m);
+}
+
+/* ── Wizard ───────────────────────────────────────────────────────────────── */
+.hero { margin-top: var(--space-m); text-align: center; }
+.hero h1 {
+  font-size: 26px;
+  line-height: 1.3;
+  letter-spacing: 0.01em;
+}
+.hero-sub {
+  margin-top: var(--space-s);
+  color: var(--color-muted);
+  font-size: 13.5px;
+  max-width: 42ch;
+  margin-left: auto;
+  margin-right: auto;
+}
+.wizard-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-m);
+}
+.wizard-facts { display: flex; flex-direction: column; gap: var(--space-xs); }
+.fact { display: flex; justify-content: space-between; gap: var(--space-s); font-size: 13px; }
+.fact-label { color: var(--color-muted); white-space: nowrap; }
+.fact-value { text-align: right; }
+.wizard-note {
+  font-size: 12px;
+  color: var(--color-muted);
+  text-align: center;
+}
+
+.btn-primary {
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 700;
+  padding: 13px 20px;
+  border: none;
+  border-radius: var(--radius);
+  background: var(--color-accent);
+  color: #14100a;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.05s;
+}
+.btn-primary:hover { background: var(--color-accent-dk); }
+.btn-primary:active { transform: scale(0.99); }
+.btn-primary:disabled { opacity: 0.5; cursor: default; }
+
+/* Loading state: a spinner + live label, kept FULLY visible (not the dim
+   disabled look) so a click reads as "working", never "dead/frozen". */
+.btn-primary .btn-spinner { display: none; }
+.btn-primary.is-loading {
+  cursor: default;
+  background: var(--color-accent);
+}
+.btn-primary.is-loading:disabled { opacity: 1; } /* override the dim disabled look */
+.btn-primary.is-loading .btn-spinner {
+  display: inline-block;
+  width: 15px;
+  height: 15px;
+  margin-right: 9px;
+  vertical-align: -2px;
+  border: 2px solid rgba(20, 16, 10, 0.3);
+  border-top-color: #14100a;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.wizard-setup-note {
+  font-size: 12.5px;
+  color: var(--color-text);
+  text-align: center;
+  line-height: 1.5;
+}
+.btn-primary.is-stop { background: var(--color-raise); color: var(--color-text); border: 1px solid var(--color-border); }
+.btn-primary.is-stop:hover { border-color: var(--color-muted); }
+
+.btn-secondary {
+  font-family: inherit;
+  font-size: 13px;
+  padding: 8px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--color-text);
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.btn-secondary:hover { border-color: var(--color-muted); }
+.btn-secondary:disabled { opacity: 0.5; cursor: default; }
+
+/* ── Update banner: a loud, visible cue that a new version is arriving.
+   The updater itself is automatic; this exists purely so the user SEES it
+   happen instead of a silent relaunch (ported from the miner's banner). ── */
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+  font-size: 13px;
+  animation: banner-in 0.3s ease;
+}
+.update-banner .update-banner-icon { flex-shrink: 0; }
+.update-banner strong { color: var(--color-accent); }
+@keyframes banner-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) { .update-banner { animation: none; } }
+
+/* Setup progress steps */
+.steps { list-style: none; display: flex; flex-direction: column; gap: var(--space-s); }
+.step { display: flex; align-items: center; gap: var(--space-s); font-size: 13.5px; color: var(--color-muted); }
+.step-dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--color-border);
+  flex-shrink: 0;
+}
+.step.is-active { color: var(--color-text); }
+.step.is-active .step-dot {
+  border-color: var(--color-accent);
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+.step.is-done { color: var(--color-muted); }
+.step.is-done .step-dot { border-color: var(--color-green); background: var(--color-green); }
+@keyframes pulse-dot {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(247, 147, 26, 0.5); }
+  50% { box-shadow: 0 0 0 5px rgba(247, 147, 26, 0); }
+}
+.progress-track {
+  margin-top: var(--space-s);
+  height: 6px;
+  border-radius: 3px;
+  background: var(--color-raise);
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--color-accent), var(--color-accent-dk));
+  transition: width 0.4s ease;
+}
+/* Before a real download % arrives (the moment right after the click, and the
+   quick non-download steps), sweep a band across so the bar is never a dead 0%. */
+.progress-track.is-indeterminate .progress-fill {
+  width: 40%;
+  transition: none;
+  animation: indeterminate 1.4s ease-in-out infinite;
+}
+@keyframes indeterminate {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(275%); }
+}
+
+/* ── Status screen ────────────────────────────────────────────────────────── */
+.status-orb-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-s);
+  margin-top: var(--space-s);
+}
+.status-orb {
+  width: 84px;
+  height: 84px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #3a3733, #191715 70%);
+  border: 1px solid var(--color-border);
+  position: relative;
+  transition: box-shadow 0.6s ease;
+}
+.status-orb::after {
+  content: "";
+  position: absolute;
+  inset: 26px;
+  border-radius: 50%;
+  background: var(--color-muted);
+  transition: background 0.4s ease;
+}
+.status-orb.is-ready { box-shadow: 0 0 34px rgba(74, 222, 128, 0.28); }
+.status-orb.is-ready::after { background: var(--color-green); animation: breathe 3.2s ease-in-out infinite; }
+.status-orb.is-syncing { box-shadow: 0 0 34px color-mix(in srgb, var(--color-accent) 30%, transparent); }
+.status-orb.is-syncing::after { background: var(--color-accent); animation: breathe 1.6s ease-in-out infinite; }
+.status-orb.is-stopped::after { background: var(--color-muted); }
+.status-orb.is-error { box-shadow: 0 0 34px rgba(248, 113, 113, 0.25); }
+.status-orb.is-error::after { background: var(--color-danger); }
+/* Running, but not following the chain. Amber rather than red: nothing is
+   broken or lost, the machine simply cannot check the new proof of work. It
+   still breathes, because the process really is alive. */
+.status-orb.is-stalled { box-shadow: 0 0 34px rgba(251, 191, 36, 0.26); }
+.status-orb.is-stalled::after {
+  background: var(--color-amber);
+  animation: breathe 3.2s ease-in-out infinite;
+}
+@keyframes breathe {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(0.88); opacity: 0.75; }
+}
+.status-badge {
+  font-weight: 700;
+  font-size: 16px;
+  letter-spacing: 0.06em;
+}
+.status-sub {
+  font-size: 12.5px;
+  color: var(--color-muted);
+  min-height: 20px;
+  text-align: center;
+}
+
+/* The frequency line — the node's calm heartbeat under the orb. */
+.ambient-canvas {
+  width: 100%;
+  height: 72px;
+  margin-top: -10px;
+  pointer-events: none;
+}
+
+/* The energy pulse (power core) — occupies the orb+line region on the status
+   screen, and the whole square in compact mode. */
+.power-canvas {
+  width: 230px;
+  height: 210px;
+  pointer-events: none;
+  /* Feather the square canvas into a round glow so the energy core floats as a
+     pulse, not a lit rectangle (the shader's own vignette leaves rect edges). */
+  -webkit-mask-image: radial-gradient(closest-side, #000 58%, transparent 100%);
+  mask-image: radial-gradient(closest-side, #000 58%, transparent 100%);
+}
+.compact-power-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  -webkit-mask-image: radial-gradient(closest-side, #000 62%, transparent 100%);
+  mask-image: radial-gradient(closest-side, #000 62%, transparent 100%);
+}
+
+/* data-visual switches which visual is shown. Default (calm): orb + line;
+   energy: the power core. The hidden ones are display:none so their canvases
+   report 0 size and their loops idle cheaply. */
+:root:not([data-visual="energy"]) .power-canvas { display: none; }
+:root[data-visual="energy"] .status-orb,
+:root[data-visual="energy"] .ambient-canvas,
+:root[data-visual="energy"] .compact-orb,
+:root[data-visual="energy"] .compact-canvas { display: none; }
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-s);
+}
+.stat {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: var(--space-s) var(--space-m);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.stat-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-muted);
+}
+.stat-value { font-size: 16px; font-weight: 700; }
+
+.disk-card { display: flex; flex-direction: column; gap: var(--space-xs); }
+.disk-row { display: flex; justify-content: space-between; font-size: 13px; }
+.disk-label { color: var(--color-muted); }
+.disk-warning {
+  margin-top: var(--space-xs);
+  font-size: 12.5px;
+  color: var(--color-amber);
+}
+.disk-warning.is-critical { color: var(--color-danger); }
+
+/* Block checking (MatMul v4.7 / RC). Mirrors the disk card so it reads as one
+   more plain fact about this machine, not an alarm. Colour carries the state:
+   default = checking everything itself, amber = keeping up is not guaranteed,
+   danger = stopped. */
+.validation-card { display: flex; flex-direction: column; gap: var(--space-xs); }
+.validation-row { display: flex; justify-content: space-between; font-size: 13px; }
+.validation-label { color: var(--color-muted); }
+.validation-value { font-weight: 700; }
+.validation-card.is-degraded .validation-value { color: var(--color-amber); }
+.validation-card.is-stalled .validation-value { color: var(--color-danger); }
+.validation-note {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--color-muted);
+  line-height: 1.45;
+}
+.validation-card.is-stalled .validation-note { color: var(--color-danger); }
+
+/* What this node gives back. Sits above the Node mode card because "you are
+   helping" is the answer people need before they read how their machine
+   checks blocks. The dot is the only moving thing on the screen: a node that
+   is serving peers should look alive, not like a static readout. */
+.contribution-card { display: flex; flex-direction: column; gap: var(--space-xs); }
+.contribution-row { display: flex; align-items: center; gap: 8px; }
+.contribution-headline { font-size: 13px; font-weight: 700; }
+.contribution-detail {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--color-muted);
+  line-height: 1.45;
+}
+.contribution-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-muted);
+  flex: none;
+}
+/* Green, not the orange --color-accent: this is the same "healthy and running"
+   signal the ready state uses, and orange here would read as a warning. The
+   glow rgba is --color-green (#4ade80) spelled out, since CSS cannot put a
+   custom property inside a box-shadow colour with alpha. */
+.contribution-card.is-live .contribution-headline { color: var(--color-green); }
+.contribution-card.is-live .contribution-dot {
+  background: var(--color-green);
+  animation: contribution-pulse 2.4s ease-in-out infinite;
+}
+.contribution-card.is-waiting .contribution-dot { background: var(--color-muted); }
+@keyframes contribution-pulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.45); }
+  50%      { opacity: 0.75; box-shadow: 0 0 0 5px rgba(74, 222, 128, 0); }
+}
+/* A pulsing dot is decoration, not information: the text already says it. */
+@media (prefers-reduced-motion: reduce) {
+  .contribution-card.is-live .contribution-dot { animation: none; }
+}
+
+.actions { margin-top: auto; display: flex; flex-direction: column; gap: var(--space-s); }
+.actions .btn-primary { width: 100%; }
+
+.error-card {
+  border-color: rgba(248, 113, 113, 0.4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-s);
+  font-size: 13px;
+}
+.error-card p { color: var(--color-danger); }
+
+/* ── Settings overlay ─────────────────────────────────────────────────────── */
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  background: rgba(10, 9, 8, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-m);
+}
+.overlay[hidden] { display: none; }
+.overlay-panel {
+  width: 100%;
+  max-width: 460px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-l);
+  padding: var(--space-m);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-m);
+  max-height: 86vh;
+  overflow-y: auto;
+}
+.overlay-head { display: flex; align-items: center; justify-content: space-between; }
+.overlay-head h2 { font-size: 17px; }
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-m);
+}
+.setting-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.setting-name { font-size: 14px; font-weight: 700; }
+.setting-desc {
+  font-size: 12px;
+  color: var(--color-muted);
+  overflow-wrap: anywhere;
+}
+.setting-result { font-size: 12.5px; color: var(--color-green); }
+.settings-footer {
+  font-size: 11.5px;
+  color: var(--color-muted);
+  text-align: center;
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--space-s);
+}
+
+/* Toggle switch */
+.switch { position: relative; display: inline-block; width: 42px; height: 24px; flex-shrink: 0; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider {
+  position: absolute;
+  inset: 0;
+  border-radius: 12px;
+  background: var(--color-raise);
+  border: 1px solid var(--color-border);
+  transition: background 0.2s;
+  cursor: pointer;
+}
+.slider::before {
+  content: "";
+  position: absolute;
+  width: 18px; height: 18px;
+  left: 2px; top: 2px;
+  border-radius: 50%;
+  background: var(--color-muted);
+  transition: transform 0.2s, background 0.2s;
+}
+.switch input:checked + .slider { background: rgba(247, 147, 26, 0.25); border-color: var(--color-accent); }
+.switch input:checked + .slider::before { transform: translateX(18px); background: var(--color-accent); }
+
+/* Toast */
+.toast {
+  position: fixed;
+  bottom: var(--space-m);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  background: var(--color-raise);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 10px 16px;
+  font-size: 13px;
+  max-width: 90%;
+}
+.toast[hidden] { display: none; }
+
+/* ── Accent picker: four dots, modern + simple ────────────────────────────── */
+.accent-dots { display: flex; gap: 10px; flex-shrink: 0; }
+.accent-dot {
+  width: 26px; height: 26px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  background: var(--dot);
+  cursor: pointer;
+  transition: transform 0.12s, border-color 0.12s, box-shadow 0.12s;
+}
+.accent-dot:hover { transform: scale(1.12); }
+.accent-dot.is-active {
+  border-color: var(--color-text);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--dot) 60%, transparent);
+}
+
+/* ── Info / Future overlays ───────────────────────────────────────────────── */
+.info-body { display: flex; flex-direction: column; gap: var(--space-s); font-size: 13.5px; }
+.info-body p { opacity: 0.9; }
+.info-fineprint { font-size: 12px; color: var(--color-muted); }
+.future-list {
+  list-style: none;
+  display: flex; flex-direction: column; gap: var(--space-s);
+  font-size: 13px;
+}
+.future-list li {
+  padding: 10px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-raise);
+}
+.future-list strong { color: var(--color-accent); }
+
+/* ── Compact mode: only the light ─────────────────────────────────────────
+   The window shrinks to a small borderless square — a little power flame on
+   the desktop. Everything else hides; the whole surface is a drag region;
+   the expand button fades in on hover. */
+body.compact { background: transparent; }
+/* compact-light and the toast live OUTSIDE .app (direct body children), so
+   hiding the app shell can never hide the error channel with it. */
+body.compact .app { display: none !important; }
+body.compact .stars { display: none; }
+.compact-light {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  background: var(--color-bg);
+  border-radius: 22px;
+  border: 1px solid var(--color-border);
+  overflow: hidden;
+}
+.compact-orb {
+  width: 58px; height: 58px;
+}
+.compact-orb::after { inset: 18px; }
+.compact-canvas {
+  height: 44px;
+  margin-top: 0;
+}
+.expand-btn {
+  position: absolute;
+  top: 6px; right: 6px;
+  width: 24px; height: 24px;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--color-border);
+  border-radius: 7px;
+  background: var(--color-raise);
+  color: var(--color-muted);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.compact-light:hover .expand-btn { opacity: 1; }
+.expand-btn:hover { color: var(--color-text); }
+
+/* ── Segmented control (Look: Calm / Pulse) ───────────────────────────────── */
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.seg-btn {
+  font-family: inherit;
+  font-size: 12.5px;
+  padding: 7px 14px;
+  border: none;
+  background: transparent;
+  color: var(--color-muted);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.seg-btn + .seg-btn { border-left: 1px solid var(--color-border); }
+.seg-btn:hover { color: var(--color-text); }
+.seg-btn.is-active {
+  background: color-mix(in srgb, var(--color-accent) 22%, transparent);
+  color: var(--color-text);
+}
+
+/* ── Ask your node ─────────────────────────────────────────────────────── */
+
+.ask-panel { max-width: 480px; }
+
+.ask-intro {
+  margin: 0 0 14px;
+  font-size: 13px;
+  color: var(--color-muted);
+  line-height: 1.5;
+}
+
+.ask-gate {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+}
+.ask-gate p { margin: 0; font-size: 13px; }
+
+.ask-list { display: flex; flex-direction: column; gap: 8px; }
+
+.ask-item {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--color-surface);
+}
+
+.ask-q {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 14px 16px;
+  background: none;
+  border: 0;
+  color: var(--color-text);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+.ask-q:hover { background: var(--color-raise); }
+
+.ask-chev { transition: transform 0.2s ease; opacity: 0.5; }
+.ask-q[aria-expanded="true"] .ask-chev { transform: rotate(180deg); }
+
+.ask-a { padding: 2px 16px 14px; }
+
+.ask-headline {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  margin-bottom: 4px;
+  color: var(--color-accent);
+}
+
+.ask-line {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--color-muted);
+}
+.ask-line + .btn-secondary { margin-top: 10px; }
+.ask-loading { opacity: 0.6; }
+
+.ask-hash {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  word-break: break-all;
+  opacity: 0.7;
+}
+
+.ask-cite {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  font-size: 11px;
+  color: var(--color-muted);
+}
+.cite-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--color-green);
+  box-shadow: 0 0 6px rgba(74, 222, 128, 0.6);
+}
+
+.ask-search { display: flex; gap: 8px; margin-top: 14px; }
+.ask-search input {
+  flex: 1;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--color-border);
+  background: var(--color-raise);
+  color: var(--color-text);
+  font: inherit;
+  font-size: 13px;
+}
+.ask-search input::placeholder { color: var(--color-muted); opacity: 0.6; }
+
+/* ── Wallet view ───────────────────────────────────────────────────────── */
+
+.wallet-txs { margin-top: 14px; display: flex; flex-direction: column; gap: 6px; }
+.wallet-tx {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  font-size: 12px;
+}
+.wallet-tx .amt { font-weight: 700; }
+.wallet-tx .amt.in { color: var(--color-green); }
+/* Money leaving is red, money coming in is green — readable at a glance. */
+.wallet-tx .amt.out { color: #ff6b6b; }
+.wallet-tx .meta { color: var(--color-muted); font-size: 11px; text-align: right; }
+/* Only rows that carry a txid are clickable, so only they look it. */
+.wallet-tx-link { cursor: pointer; transition: border-color 120ms ease; }
+.wallet-tx-link:hover { border-color: var(--color-green); }
+#wallet-forget-btn { margin-top: 14px; }
+.wallet-fineprint { font-size: 11px; opacity: 0.7; margin-top: 6px; }
+#wallet-file { color: var(--color-muted); font-size: 12px; }
+#wallet-import-btn { margin-top: 10px; width: 100%; }
+
+/* ── Wallet: tabs ──────────────────────────────────────────────────────── */
+
+.wallet-tabs {
+  display: flex;
+  gap: 6px;
+  margin: 16px 0 4px;
+  border-bottom: 1px solid var(--color-border);
+}
+.wallet-tab {
+  flex: 1;
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--color-muted);
+  font: inherit;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 8px 4px;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+.wallet-tab:hover { color: var(--color-text); }
+.wallet-tab.is-on {
+  color: var(--color-green);
+  border-bottom-color: var(--color-green);
+}
+
+/* ── Wallet: receive ───────────────────────────────────────────────────── */
+
+.wallet-qr {
+  display: flex;
+  justify-content: center;
+  margin: 16px 0 12px;
+  min-height: 4px; /* no layout jump before the canvas lands */
+}
+.wallet-qr canvas { border-radius: 6px; }
+
+/* ── Wallet: send ──────────────────────────────────────────────────────── */
+
+.wallet-label {
+  display: block;
+  margin: 12px 0 4px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-muted);
+}
+.wallet-input {
+  width: 100%;
+  padding: 9px 12px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  color: var(--color-text);
+  font-family: inherit;
+  font-size: 13px;
+}
+.wallet-input:focus {
+  outline: none;
+  border-color: var(--color-green);
+}
+.wallet-input::placeholder { color: var(--color-muted); opacity: 0.6; }
+.wallet-amt-row { display: flex; gap: 8px; align-items: stretch; }
+.wallet-amt-row .wallet-input { flex: 1; }
+.wallet-amt-row button { flex: 0 0 auto; }
+#wallet-review-btn { margin-top: 14px; width: 100%; }
+.wallet-btn-row { display: flex; gap: 8px; margin-top: 12px; }
+.wallet-btn-row button { flex: 1; }
+
+/* The wallet's own address + close, pinned under whichever tab is open. */
+.wallet-foot {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--color-border);
+}
+.wallet-foot .ask-hash { cursor: pointer; word-break: break-all; }
+.wallet-addr-row { display: flex; align-items: baseline; gap: 8px; }
+#wallet-sent-txid { cursor: pointer; word-break: break-all; }
+
+/* Activity rows: a faint ↗ so it's obvious a row opens the explorer. */
+.wallet-tx-link { position: relative; }
+.wallet-tx-link .meta::after {
+  content: " ↗";
+  color: var(--color-muted);
+  opacity: 0.55;
+}
+.wallet-tx-link:hover .meta::after { opacity: 1; color: var(--color-green); }
+
+/* Foot bar: sound toggle on the left, close on the right. */
+.wallet-foot-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 14px;
+}
+.wallet-foot-bar .btn-secondary { flex: 0 0 auto; }
+.wallet-icon-toggle {
+  background: none;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  color: var(--color-muted);
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 10px;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+.wallet-icon-toggle:hover { color: var(--color-text); border-color: var(--color-muted); }
+.wallet-icon-toggle[aria-pressed="false"] { opacity: 0.7; }
+.wallet-done-btn { margin-top: 12px; width: 100%; }
+
+/* Inline confirm (close-this-wallet): a highlighted box so it reads as a prompt. */
+.wallet-confirm-inline {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--color-green);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--color-green) 8%, transparent);
+}
+.wallet-danger {
+  border-color: color-mix(in srgb, #e0524a 60%, var(--color-border)) !important;
+  color: #e0776f !important;
+}
+.wallet-danger:hover { border-color: #e0524a !important; }
+
+/* Close dialog "remember my choice". */
+.close-remember {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 14px 0 4px;
+  font-size: 12px;
+  color: var(--color-muted);
+  cursor: pointer;
+}
+.close-remember input { accent-color: var(--color-green); }
+
+/* ── Info footprint (what it costs to run) ─────────────────────────────── */
+
+.info-footprint {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+}
+.info-footprint h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-muted);
+}
+.fp-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  padding: 3px 0;
+}
+.fp-row span:last-child { color: var(--color-green); font-weight: 600; }
+
+/* Divider between "create" and "import" in the wallet panel */
+.wallet-or {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 16px 0 8px;
+  color: var(--color-muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.wallet-or::before,
+.wallet-or::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--color-border);
+}
+
+/* Quiet external-link rows (global network stats) */
+.link-row {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: none;
+  border: 0;
+  color: var(--color-muted);
+  font: inherit;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  border-radius: var(--radius);
+  transition: color 0.15s ease, background 0.15s ease;
+}
+.link-row:hover { color: var(--color-text); background: var(--color-raise); }
+.link-ext { opacity: 0.6; }
+.link-row-cite { margin-top: 2px; }
+.cite-dot-ext { background: var(--color-amber); box-shadow: 0 0 6px rgba(251, 191, 36, 0.5); }

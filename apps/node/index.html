@@ -1,0 +1,688 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BTX Node</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <div class="stars" aria-hidden="true"></div>
+    <main class="app" id="app">
+      <!-- ── Header ──────────────────────────────────────────────────── -->
+      <header class="app-header">
+        <div class="app-title">
+          <svg class="brand-mark" viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+            <circle cx="12" cy="12" r="9.2" fill="none" stroke="currentColor" stroke-opacity="0.35" stroke-width="1.4"></circle>
+            <circle cx="12" cy="12" r="4" fill="currentColor"></circle>
+            <circle cx="12" cy="12" r="6.4" fill="none" stroke="currentColor" stroke-opacity="0.18" stroke-width="2.2"></circle>
+          </svg>
+          <span class="brand-name">BTX <em>Node</em></span>
+          <span id="brand-version" class="brand-version" aria-hidden="true"></span>
+        </div>
+        <div class="header-actions">
+        <button id="ask-btn" class="icon-btn" type="button" aria-label="Ask your node" aria-haspopup="dialog" title="Ask your node">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12a8 8 0 1 0-3.1 6.3L21 19l-.7-2.6A7.9 7.9 0 0 0 21 12z"></path>
+            <path d="M9.6 9.5a2.4 2.4 0 0 1 4.7.8c0 1.5-2.3 2-2.3 3.2"></path>
+            <circle cx="12" cy="16.6" r="0.6" fill="currentColor" stroke="none"></circle>
+          </svg>
+        </button>
+        <button id="wallet-btn" class="icon-btn" type="button" aria-label="Wallet" aria-haspopup="dialog" title="Wallet" hidden>
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="6.5" width="18" height="13" rx="2.5"></rect>
+            <path d="M3 9.5V6.8A2.3 2.3 0 0 1 5.3 4.5H17"></path>
+            <circle cx="16.5" cy="13" r="0.7" fill="currentColor" stroke="none"></circle>
+          </svg>
+        </button>
+        <button id="info-btn" class="icon-btn" type="button" aria-label="About BTX Node" aria-haspopup="dialog">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9"></circle>
+            <path d="M12 11v5"></path>
+            <circle cx="12" cy="7.5" r="0.6" fill="currentColor" stroke="none"></circle>
+          </svg>
+        </button>
+        <button id="compact-btn" class="icon-btn" type="button" aria-label="Compact mode" title="Compact mode">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9 4v5H4"></path><path d="M15 4v5h5"></path>
+            <path d="M9 20v-5H4"></path><path d="M15 20v-5h5"></path>
+          </svg>
+        </button>
+        <button id="settings-btn" class="icon-btn" type="button" aria-label="Settings" aria-haspopup="dialog">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
+        </div>
+      </header>
+
+      <!-- ── Update banner (shown the moment a new version is found) ──── -->
+      <section class="update-banner" id="update-banner" hidden aria-live="polite">
+        <span class="update-banner-icon" aria-hidden="true">✨</span>
+        <span id="update-banner-text"><strong>Update available</strong></span>
+      </section>
+
+      <!-- ── Wizard (first run) ──────────────────────────────────────── -->
+      <section id="screen-wizard" class="screen" hidden>
+        <div class="hero">
+          <h1>Run a BTX node.<br />Support the network.</h1>
+          <p class="hero-sub">
+            One click starts a full node from a verified snapshot. It runs
+            quietly in your menu bar. No mining, no account.
+          </p>
+        </div>
+
+        <div class="card wizard-card">
+          <div class="wizard-facts">
+            <div class="fact">
+              <span class="fact-label">Disk needed</span>
+              <span class="fact-value">~105 GB, growing ~1 GB a day</span>
+            </div>
+            <div class="fact">
+              <span class="fact-label">Free on this computer</span>
+              <span class="fact-value" id="wizard-free-disk">—</span>
+            </div>
+          </div>
+          <button id="setup-btn" class="btn-primary" type="button">
+            <span class="btn-spinner" aria-hidden="true"></span>
+            <span class="btn-label" id="setup-btn-label">Set up my node</span>
+          </button>
+          <p class="wizard-note" id="wizard-idle-note">
+            Everything stays on your machine. Stop or remove the node anytime.
+          </p>
+          <!-- Shown while setting up: the "it's working, come back later" cue. -->
+          <p class="wizard-setup-note" id="wizard-setup-note" hidden>
+            This takes a few minutes. You can leave the window and come back,
+            or let it keep going in the menu bar. It's ready when the screen
+            turns green.
+          </p>
+        </div>
+
+        <!-- Setup progress (replaces the button while running) -->
+        <div class="card wizard-progress" id="wizard-progress" hidden>
+          <ol class="steps">
+            <li id="step-download" class="step">
+              <span class="step-dot"></span>
+              <span class="step-text">Downloading blockchain snapshot <span id="download-pct"></span></span>
+            </li>
+            <li id="step-prepare" class="step">
+              <span class="step-dot"></span>
+              <span class="step-text">Preparing the node</span>
+            </li>
+            <li id="step-start" class="step">
+              <span class="step-dot"></span>
+              <span class="step-text">Starting your node</span>
+            </li>
+            <li id="step-load" class="step">
+              <span class="step-dot"></span>
+              <span class="step-text">Loading the snapshot</span>
+            </li>
+          </ol>
+          <div class="progress-track" id="progress-track"><div class="progress-fill" id="setup-progress-fill"></div></div>
+        </div>
+
+        <div class="card error-card" id="wizard-error" hidden>
+          <p id="wizard-error-msg"></p>
+          <button id="retry-btn" class="btn-secondary" type="button">Retry</button>
+        </div>
+      </section>
+
+      <!-- ── Status (running) ────────────────────────────────────────── -->
+      <section id="screen-status" class="screen" hidden>
+        <div class="status-orb-wrap">
+          <div class="status-orb" id="status-orb"></div>
+          <canvas class="ambient-canvas" id="ambient-canvas" aria-hidden="true"></canvas>
+          <canvas class="power-canvas" id="power-canvas" aria-hidden="true"></canvas>
+          <div class="status-badge" id="status-badge">—</div>
+          <div class="status-sub" id="status-sub"></div>
+        </div>
+
+        <div class="stats-grid">
+          <div class="stat">
+            <span class="stat-label">Block height</span>
+            <span class="stat-value" id="stat-height">—</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Peers</span>
+            <span class="stat-value" id="stat-peers">—</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Uptime</span>
+            <span class="stat-value" id="stat-uptime">—</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Node version</span>
+            <span class="stat-value" id="stat-version">—</span>
+          </div>
+        </div>
+
+        <button id="global-stats-link" class="link-row" type="button">
+          Global network stats <span class="link-ext" aria-hidden="true">↗</span>
+        </button>
+
+        <div class="card disk-card" id="disk-card">
+          <div class="disk-row">
+            <span class="disk-label">Chain on disk</span>
+            <span class="disk-value" id="disk-used">—</span>
+          </div>
+          <div class="disk-row">
+            <span class="disk-label">Free space</span>
+            <span class="disk-value" id="disk-free">—</span>
+          </div>
+          <div class="disk-warning" id="disk-warning" hidden></div>
+        </div>
+
+        <!-- What this node GIVES BACK. Deliberately above the Node mode card and
+             deliberately blind to Full vs Basic: both keep the whole chain and
+             both serve it, so both are helping. Backed by btxd's own peer count
+             and upload counter, never by an assumption that a running node is
+             a useful one. -->
+        <div class="card contribution-card" id="contribution-card" hidden>
+          <div class="contribution-row">
+            <span class="contribution-dot" aria-hidden="true"></span>
+            <span class="contribution-headline" id="contribution-headline">—</span>
+          </div>
+          <p class="contribution-detail" id="contribution-detail"></p>
+        </div>
+
+        <!-- How this machine checks the new (MatMul v4.7) proof of work. Filled
+             from btxd's OWN reported policy, never guessed from the platform. -->
+        <div class="card validation-card" id="validation-card" hidden>
+          <div class="validation-row">
+            <span class="validation-label">Node mode</span>
+            <span class="validation-value" id="validation-state">—</span>
+          </div>
+          <p class="validation-note" id="validation-note"></p>
+        </div>
+
+        <div class="card error-card" id="status-error" hidden>
+          <p id="status-error-msg"></p>
+        </div>
+
+        <div class="actions">
+          <button id="toggle-node-btn" class="btn-primary" type="button">Stop node</button>
+        </div>
+      </section>
+
+      <!-- ── Settings (overlay) ──────────────────────────────────────── -->
+      <div class="overlay" id="settings-overlay" hidden>
+        <div class="overlay-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+          <div class="overlay-head">
+            <h2 id="settings-title">Settings</h2>
+            <button id="settings-close" class="icon-btn" type="button" aria-label="Close">✕</button>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Data folder</span>
+              <span class="setting-desc" id="setting-datadir">—</span>
+            </div>
+            <button id="open-datadir-btn" class="btn-secondary" type="button">Open</button>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Launch at login</span>
+              <span class="setting-desc">Start easyBTX Node when you sign in</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="autostart-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Keep computer awake</span>
+              <span class="setting-desc">Prevent sleep while the node runs (display may still sleep)</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="keepawake-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Keeper mode</span>
+              <span class="setting-desc" id="keeper-desc">Small node (~10 GB) that serves signed confirmations — the network's scarcest service</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="keeper-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Serve confirmations</span>
+              <span class="setting-desc">On automatically in Keeper mode — a full node can serve its history here too. Applies on next start</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="serve-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">When you close the window</span>
+              <span class="setting-desc">The red X can ask, keep the node in the menu bar, or quit</span>
+            </div>
+            <div class="seg" id="onclose-seg" role="radiogroup" aria-label="On close">
+              <button class="seg-btn" data-onclose="ask" type="button">Ask</button>
+              <button class="seg-btn" data-onclose="tray" type="button">Menu bar</button>
+              <button class="seg-btn" data-onclose="quit" type="button">Quit</button>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Updates</span>
+              <span class="setting-desc" id="update-check-result">Checks automatically on launch and every 6 hours</span>
+            </div>
+            <button id="update-check-btn" class="btn-secondary" type="button">Check now</button>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Color</span>
+              <span class="setting-desc">The light your node glows with</span>
+            </div>
+            <div class="accent-dots" role="radiogroup" aria-label="Accent color">
+              <button class="accent-dot" data-accent="ember" style="--dot:#f7931a" type="button" aria-label="Ember"></button>
+              <button class="accent-dot" data-accent="btx" style="--dot:#4ade80" type="button" aria-label="BTX green"></button>
+              <button class="accent-dot" data-accent="ocean" style="--dot:#38bdf8" type="button" aria-label="Ocean"></button>
+              <button class="accent-dot" data-accent="nova" style="--dot:#c084fc" type="button" aria-label="Nova"></button>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Look</span>
+              <span class="setting-desc">How your node shows it's alive</span>
+            </div>
+            <div class="seg" role="radiogroup" aria-label="Visual style">
+              <button class="seg-btn" data-visual="calm" type="button">Calm</button>
+              <button class="seg-btn" data-visual="energy" type="button">Pulse</button>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Wallet</span>
+              <span class="setting-desc">Watch a BTX wallet — balances from your own node</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="wallet-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">What's next</span>
+              <span class="setting-desc">What's coming next</span>
+            </div>
+            <button id="future-btn-settings" class="btn-secondary" type="button">See it</button>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Reclaim disk space</span>
+              <span class="setting-desc">Remove data the node no longer needs</span>
+            </div>
+            <button id="reclaim-btn" class="btn-secondary" type="button">Reclaim</button>
+          </div>
+          <p class="setting-result" id="reclaim-result" hidden></p>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Remove node data</span>
+              <span class="setting-desc">Delete the chain and free its disk space — set up again anytime</span>
+            </div>
+            <button id="remove-node-btn" class="btn-secondary" type="button">Remove…</button>
+          </div>
+          <p class="setting-result" id="remove-node-result" hidden></p>
+
+          <p class="settings-footer" id="settings-footer"></p>
+        </div>
+      </div>
+
+      <!-- ── About (info) overlay ────────────────────────────────────── -->
+      <div class="overlay" id="info-overlay" hidden>
+        <div class="overlay-panel" role="dialog" aria-modal="true" aria-labelledby="info-title">
+          <div class="overlay-head">
+            <h2 id="info-title">About BTX Node</h2>
+            <button id="info-close" class="icon-btn" type="button" aria-label="Close">✕</button>
+          </div>
+          <div class="info-body">
+            <p>
+              A full node keeps its own complete, verified copy of the BTX
+              blockchain and checks every block against the rules — no trust in
+              anyone else's server. Nodes relay blocks and transactions between
+              peers and help new nodes join.
+            </p>
+            <p>
+              BTX Node runs one for you: it fast-started from a
+              checksum-verified snapshot, keeps the node healthy in your menu
+              bar, and shows you what it's doing. No wallet, no mining, no
+              account — just you, helping the network stay decentralized.
+            </p>
+            <p class="info-fineprint">
+              The full chain uses about 105 GB of disk and grows roughly
+              1 GB a day right now. BTX has no node rewards today — this one
+              is for the network. Settings can remove the chain data anytime.
+            </p>
+            <div class="info-footprint">
+              <h3>What it costs to run</h3>
+              <div class="fp-row"><span>Processor right now</span><span id="fp-cpu">—</span></div>
+              <div class="fp-row"><span>Memory</span><span id="fp-mem">—</span></div>
+              <div class="fp-row"><span>Chain on disk</span><span id="fp-disk">—</span></div>
+              <p class="info-fineprint" id="fp-note">Start your node to see live numbers.</p>
+            </div>
+          </div>
+          <button id="future-btn" class="btn-secondary" type="button">What's coming next →</button>
+        </div>
+      </div>
+
+      <!-- ── Wallet overlay (optional, off from factory settings) ─────── -->
+      <div class="overlay" id="wallet-overlay" hidden>
+        <div class="overlay-panel ask-panel" role="dialog" aria-modal="true" aria-labelledby="wallet-title">
+          <div class="overlay-head">
+            <h2 id="wallet-title">Wallet</h2>
+            <button id="wallet-close" class="icon-btn" type="button" aria-label="Close">✕</button>
+          </div>
+
+          <div id="wallet-import-section" hidden>
+            <p class="ask-intro">
+              Your own node can make a wallet — or open one you already have.
+              Either way the keys live on this computer and your node answers with
+              the balance and the history. No website, no account, no third party
+              in the middle.
+            </p>
+            <button id="wallet-create-btn" class="btn-primary" type="button">Create a new wallet</button>
+            <p class="ask-line wallet-fineprint">
+              Makes a post-quantum wallet inside your node and saves its
+              <strong>.btxwallet</strong> file to your Desktop — the same file the
+              official BTX browser wallet uses. That file IS your money: store
+              it somewhere safe and never share it.
+            </p>
+            <div class="wallet-or"><span>or import one you already have</span></div>
+            <div class="ask-search">
+              <input id="wallet-file" type="file" accept=".btxwallet,.json,.dat,.txt,application/json,application/octet-stream,text/plain" />
+            </div>
+            <button id="wallet-import-btn" class="btn-secondary" type="button" disabled>Import wallet</button>
+            <p class="ask-line" id="wallet-import-note"></p>
+          </div>
+
+          <div id="wallet-view-section" hidden>
+            <div class="ask-headline" id="wallet-balance">—</div>
+            <div class="ask-line" id="wallet-sub"></div>
+            <div class="ask-cite"><span class="cite-dot"></span> via your own node</div>
+
+            <div class="wallet-tabs" role="tablist">
+              <button id="wallet-tab-activity" class="wallet-tab is-on" type="button" role="tab">Activity</button>
+              <button id="wallet-tab-receive" class="wallet-tab" type="button" role="tab">Receive</button>
+              <button id="wallet-tab-send" class="wallet-tab" type="button" role="tab">Send</button>
+            </div>
+
+            <!-- Activity -->
+            <div id="wallet-pane-activity" role="tabpanel">
+              <div class="wallet-txs" id="wallet-txs"></div>
+              <p class="ask-line" id="wallet-caveat" hidden></p>
+              <p class="ask-line wallet-fineprint">
+                Every row is answered by your node. Click one to open it on the
+                public explorer if you want a second pair of eyes — that's the
+                only time anything leaves this machine, and only the id you clicked.
+              </p>
+            </div>
+
+            <!-- Receive -->
+            <div id="wallet-pane-receive" role="tabpanel" hidden>
+              <div class="wallet-qr" id="wallet-qr"></div>
+              <div class="ask-line"><span class="ask-hash" id="wallet-recv-addr"></span></div>
+              <div class="wallet-btn-row">
+                <button id="wallet-copy-btn" class="btn-secondary" type="button">Copy address</button>
+                <button id="wallet-newaddr-btn" class="btn-secondary" type="button">New address</button>
+              </div>
+              <p class="ask-line wallet-fineprint">
+                A fresh address for each payment keeps your payments from being
+                tied together in public. Every address you've ever been given
+                keeps working — old ones never expire.
+              </p>
+            </div>
+
+            <!-- Send -->
+            <div id="wallet-pane-send" role="tabpanel" hidden>
+              <div id="wallet-send-form">
+                <label class="wallet-label" for="wallet-send-to">To</label>
+                <input id="wallet-send-to" class="wallet-input" type="text" placeholder="btx1z…"
+                       spellcheck="false" autocomplete="off" autocapitalize="off" />
+                <label class="wallet-label" for="wallet-send-amt">Amount in BTX</label>
+                <div class="wallet-amt-row">
+                  <input id="wallet-send-amt" class="wallet-input" type="text" inputmode="decimal"
+                         placeholder="0.00000000" autocomplete="off" />
+                  <button id="wallet-max-btn" class="btn-secondary" type="button">Max</button>
+                </div>
+                <p class="ask-line" id="wallet-send-avail"></p>
+                <button id="wallet-review-btn" class="btn-primary" type="button" disabled>Review</button>
+              </div>
+
+              <div id="wallet-confirm" hidden>
+                <p class="ask-line">You're about to send</p>
+                <div class="ask-headline" id="wallet-confirm-amt">—</div>
+                <p class="ask-line">to</p>
+                <div class="ask-line"><span class="ask-hash" id="wallet-confirm-to"></span></div>
+                <p class="ask-line wallet-fineprint" id="wallet-confirm-note"></p>
+                <div class="wallet-btn-row">
+                  <button id="wallet-send-btn" class="btn-primary" type="button">Send it</button>
+                  <button id="wallet-cancel-btn" class="btn-secondary" type="button">Back</button>
+                </div>
+              </div>
+
+              <div id="wallet-sent" hidden>
+                <p class="ask-line">Sent. Your node broadcast it to the network.</p>
+                <div class="ask-line"><span class="ask-hash" id="wallet-sent-txid"></span></div>
+                <div class="wallet-btn-row">
+                  <button id="wallet-sent-explorer-btn" class="btn-secondary" type="button">Open in explorer ↗</button>
+                  <button id="wallet-sent-copy-btn" class="btn-secondary" type="button">Copy id</button>
+                </div>
+                <p class="ask-line wallet-fineprint" id="wallet-sent-fee"></p>
+                <button id="wallet-sent-done-btn" class="btn-secondary wallet-done-btn" type="button">Done</button>
+              </div>
+
+              <p class="ask-line" id="wallet-send-note"></p>
+            </div>
+
+            <div class="wallet-foot">
+              <div class="wallet-addr-row">
+                <span class="ask-hash" id="wallet-address" title="This wallet's address"></span>
+              </div>
+              <div class="wallet-btn-row">
+                <button id="wallet-addr-explorer-btn" class="btn-secondary" type="button">Address on explorer ↗</button>
+                <button id="wallet-addr-copy-btn" class="btn-secondary" type="button">Copy address</button>
+              </div>
+
+              <div class="wallet-foot-bar">
+                <button id="wallet-sound-btn" class="wallet-icon-toggle" type="button" aria-pressed="true" title="Transaction sounds">🔊 Sound</button>
+                <button id="wallet-forget-btn" class="btn-secondary" type="button">Close this wallet</button>
+              </div>
+
+              <!-- Two-step so a wallet is never dropped on a single stray click. -->
+              <div id="wallet-forget-confirm" class="wallet-confirm-inline" hidden>
+                <p class="ask-line">Close this wallet? It stops showing here. The wallet
+                  itself stays saved in your node's data folder and your keys are never
+                  deleted, so you can reopen it anytime.</p>
+                <div class="wallet-btn-row">
+                  <button id="wallet-forget-yes" class="btn-secondary wallet-danger" type="button">Close wallet</button>
+                  <button id="wallet-forget-no" class="btn-primary" type="button">Keep it open</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="ask-gate" id="wallet-gate" hidden>
+            <p id="wallet-gate-msg">Start your node to see your wallet.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Close dialog (red X → ask each time) ─────────────────────── -->
+      <div class="overlay" id="close-overlay" hidden>
+        <div class="overlay-panel ask-panel" role="dialog" aria-modal="true" aria-labelledby="close-title">
+          <div id="close-ask">
+            <div class="overlay-head">
+              <h2 id="close-title">Close BTX Node?</h2>
+            </div>
+            <p class="ask-intro">
+              Your node can keep running in the menu bar so it keeps supporting the
+              network, or you can stop it and quit. Quitting stops your node until
+              you open the app again.
+            </p>
+            <label class="close-remember">
+              <input type="checkbox" id="close-remember" />
+              Remember my choice (change it later in Settings)
+            </label>
+            <div class="wallet-btn-row">
+              <button id="close-keep-btn" class="btn-primary" type="button">Keep running in the menu bar</button>
+              <button id="close-quit-btn" class="btn-secondary" type="button">Quit BTX Node</button>
+            </div>
+          </div>
+          <div id="close-quitting" hidden>
+            <div class="overlay-head"><h2>Stopping your node safely…</h2></div>
+            <p class="ask-intro">
+              Letting btxd finish writing so your next start is instant. This is
+              quick — the window closes on its own.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Ask your node overlay ───────────────────────────────────── -->
+      <div class="overlay" id="ask-overlay" hidden>
+        <div class="overlay-panel ask-panel" role="dialog" aria-modal="true" aria-labelledby="ask-title">
+          <div class="overlay-head">
+            <h2 id="ask-title">Ask your node</h2>
+            <button id="ask-close" class="icon-btn" type="button" aria-label="Close">✕</button>
+          </div>
+          <p class="ask-intro">
+            Answers come straight from the verified copy of the chain on this
+            computer — no outside service. <span class="cite-dot" aria-hidden="true"></span>
+            means "from your own node".
+          </p>
+
+          <div class="ask-gate" id="ask-gate" hidden>
+            <p>Start your node to ask it questions.</p>
+            <button id="ask-start-btn" class="btn-secondary" type="button">Start node</button>
+          </div>
+
+          <div class="ask-list" id="ask-list">
+            <div class="ask-item" data-ask="chain">
+              <button class="ask-q" type="button" aria-expanded="false">
+                <span>How far along is my chain?</span><span class="ask-chev" aria-hidden="true">▾</span>
+              </button>
+              <div class="ask-a" hidden></div>
+            </div>
+            <div class="ask-item" data-ask="supply">
+              <button class="ask-q" type="button" aria-expanded="false">
+                <span>How much BTX exists so far?</span><span class="ask-chev" aria-hidden="true">▾</span>
+              </button>
+              <div class="ask-a" hidden></div>
+            </div>
+            <div class="ask-item" data-ask="halving">
+              <button class="ask-q" type="button" aria-expanded="false">
+                <span>When's the next halving?</span><span class="ask-chev" aria-hidden="true">▾</span>
+              </button>
+              <div class="ask-a" hidden></div>
+            </div>
+            <div class="ask-item" data-ask="fees">
+              <button class="ask-q" type="button" aria-expanded="false">
+                <span>What are fees like right now?</span><span class="ask-chev" aria-hidden="true">▾</span>
+              </button>
+              <div class="ask-a" hidden></div>
+            </div>
+            <div class="ask-item" data-ask="mining">
+              <button class="ask-q" type="button" aria-expanded="false">
+                <span>How hard is mining right now?</span><span class="ask-chev" aria-hidden="true">▾</span>
+              </button>
+              <div class="ask-a" hidden></div>
+            </div>
+            <div class="ask-item" data-ask="block">
+              <button class="ask-q" type="button" aria-expanded="false">
+                <span>Show me the latest block</span><span class="ask-chev" aria-hidden="true">▾</span>
+              </button>
+              <div class="ask-a" hidden></div>
+            </div>
+            <div class="ask-item" data-ask="tx">
+              <button class="ask-q" type="button" aria-expanded="false">
+                <span>Look up a transaction</span><span class="ask-chev" aria-hidden="true">▾</span>
+              </button>
+              <div class="ask-a" hidden></div>
+            </div>
+          </div>
+
+          <div class="ask-search">
+            <input id="ask-search" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="Block height, block hash, or transaction id…" />
+            <button id="ask-search-btn" class="btn-secondary" type="button">Look up</button>
+          </div>
+
+          <button id="ask-global-stats" class="link-row" type="button">
+            The bigger picture — global network stats <span class="link-ext" aria-hidden="true">↗</span>
+            <span class="ask-cite link-row-cite"><span class="cite-dot cite-dot-ext"></span> via btxprice.com — an external site, not your node</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- ── Future (v0.2) overlay ───────────────────────────────────── -->
+      <div class="overlay" id="future-overlay" hidden>
+        <div class="overlay-panel" role="dialog" aria-modal="true" aria-labelledby="future-title">
+          <div class="overlay-head">
+            <h2 id="future-title">What we're planning</h2>
+            <button id="future-close" class="icon-btn" type="button" aria-label="Close">✕</button>
+          </div>
+          <ul class="future-list">
+            <li><strong>Ask your node</strong> — shipped in v0.2: cited answers about the chain, straight from your own node. Tap the <strong>?</strong> in the header.</li>
+            <li><strong>Node supporter identity</strong> — a way for your node to say "I was here", with stats you can share.</li>
+            <li><strong>Compute contribution</strong> — opt in to donate spare compute to useful network work, using the node's built-in service RPC.</li>
+            <li><strong>Following the chain past 185,000 on any machine</strong> — today that needs an Apple Silicon Mac or one of the newest graphics cards. A mode that works everywhere is being built by the BTX team; when it is safe to leave running unattended, it ships here.</li>
+            <li><strong>Making it worth your while</strong> — if the network adds node incentives, this app is where they land first.</li>
+          </ul>
+          <p class="info-fineprint">
+            These are plans, not promises — order and shape can change. Already
+            shipped: the wallet, and Windows and Linux builds.
+          </p>
+        </div>
+      </div>
+
+
+    </main>
+
+      <!-- ── Compact mode: only the light ────────────────────────────── -->
+      <div class="compact-light" id="compact-light" hidden data-tauri-drag-region>
+        <div class="status-orb compact-orb" id="compact-orb" data-tauri-drag-region></div>
+        <canvas class="ambient-canvas compact-canvas" id="compact-canvas" aria-hidden="true"></canvas>
+        <canvas class="power-canvas compact-power-canvas" id="compact-power-canvas" aria-hidden="true"></canvas>
+        <button id="expand-btn" class="expand-btn" type="button" aria-label="Expand">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 9V4h5"></path><path d="M20 9V4h-5"></path>
+            <path d="M4 15v5h5"></path><path d="M20 15v5h-5"></path>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Toast -->
+      <div class="toast" id="toast" hidden></div>
+
+  </body>
+</html>

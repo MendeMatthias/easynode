@@ -1,0 +1,50 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "easyBTX Node",
+  "version": "0.6.17",
+  "identifier": "com.m2promende.easybtx-node",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1430",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "macOSPrivateApi": false,
+    "windows": [
+      {
+        "title": "BTX Node",
+        "width": 560,
+        "height": 780,
+        "resizable": false,
+        "maximizable": false,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data:; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": ["app", "dmg"],
+    "resources": ["resources/node-pkg/**/*"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVENDM5MkRBNzNCQ0MyQTIKUldTaXdyeHoycEpEWFI0QWNoZllCNURRenZEOFZiSUUzRDg3RnQ0RC9rbTc2eFpJaWtLNlhFOXkK",
+      "endpoints": [
+        "https://easybtx.com/updater/latest-node.json"
+      ]
+    }
+  }
+}

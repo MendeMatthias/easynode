@@ -1,0 +1,42 @@
+# btx-core — the shared BTX node engine extracted from the easyBTX miner
+# (design spec: docs/superpowers/specs/2026-07-10-easybtx-node-design.md).
+#
+# One node engine, two apps: the miner (src-tauri) and easyBTX Node (apps/node)
+# both consume this crate via a plain `path` dependency. There is deliberately
+# NO cargo workspace at the repo root: scripts/release-build.sh, the Linux
+# release script, and the GitHub workflows all reference `src-tauri/target/…`,
+# and a workspace would hoist the target dir to the repo root and break them.
+[package]
+name = "btx-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Matthias Mende"]
+description = "Shared BTX node engine: launch/supervise btxd, JSON-RPC, assumeutxo faststart, sync health, disk maintenance"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "fs", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+thiserror = "1"
+async-trait = "0.1"
+# Verify the assumeutxo snapshot's SHA-256 before the (expensive) loadtxoutset,
+# so a corrupt/partial download fails fast with a clear message.
+sha2 = "0.10"
+# Cross-platform home/data dir resolution (resolves %APPDATA% on Windows).
+dirs = "5"
+libc = "0.2"
+
+# IOKit power assertions (keep-awake while the node runs). macOS-only.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+core-foundation-sys = "0.8.7"
+
+# Win32 FFI for native disk-free queries (GetDiskFreeSpaceExW) + process probes.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
+
+[dev-dependencies]
+mockito = "1"
+tempfile = "3"

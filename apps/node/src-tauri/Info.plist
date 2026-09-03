@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- A support node must never be App-Napped: btxd runs as a child process
+         and the app's supervision timers (status polls, snapshot loader, RPC
+         waits) stop firing when macOS naps a backgrounded app — observed on the
+         miner as a collapsed work rate. Same fix as the miner (0.9.8). -->
+    <key>LSAppNapIsDisabled</key>
+    <true/>
+</dict>
+</plist>

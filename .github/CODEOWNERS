@@ -1,0 +1,36 @@
+# Every path here was checked to exist in THIS repository on 2026-09-03.
+# A CODEOWNERS line that matches nothing protects nothing, silently, so do not
+# copy lines in from elsewhere without checking them.
+#
+# This only works paired with a branch protection rule on main that requires
+# review from code owners. Both, or neither is worth doing.
+
+# Default: the maintainer reviews everything until there are more maintainers.
+*                                       @MendeMatthias
+
+# ---------------------------------------------------------------------------
+# TRUST ANCHORS. Not ordinary files.
+#
+# `pubkey` in tauri.conf.json is the minisign key the in-app updater checks
+# every package against, and `endpoints` is where it looks. Change either and an
+# installed app will accept a package the release key did not sign, or look for
+# updates on a host we do not control. No legitimate pull request edits these.
+# ---------------------------------------------------------------------------
+/apps/node/src-tauri/tauri.conf.json    @MendeMatthias
+
+# The engine pin. This decides which btxd every user runs. Pointing it at a
+# forked tag puts the whole install base on a dead branch.
+/apps/node/src-tauri/src/commands.rs    @MendeMatthias
+
+# CI has access to the signing key. A change here is a change to who can sign.
+/.github/                               @MendeMatthias
+
+# Licensing and attribution.
+/LICENSE                                @MendeMatthias
+/NOTICE.md                              @MendeMatthias
+
+# The wallet. Key handling, send path, backup. A subtle change here costs
+# somebody money and will not show up in a test.
+/crates/btx-core/src/node_api.rs        @MendeMatthias
+/apps/node/src-tauri/src/wallet.rs      @MendeMatthias
+/apps/node/src/wallet.ts                @MendeMatthias
