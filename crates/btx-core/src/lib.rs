@@ -17,6 +17,7 @@
 //! during the extraction — no behavior changed.
 
 pub mod backend;
+pub mod checkin;
 pub mod datadir;
 pub mod disk;
 pub mod error;
