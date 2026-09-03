@@ -16,8 +16,16 @@ fn main() {
 /// v4.7 fork that is the worst possible outcome: the app claims v0.33.2 while
 /// running a fork-blind v0.33.1 that has quietly stopped following the chain.
 ///
-/// Debug builds skip the check so `cargo check`/rust-analyzer still work in a
-/// fresh clone; the tree is gitignored and only release builds ship.
+/// This check is release-only, so it is not what stops a fresh clone from
+/// running `cargo check`.
+///
+/// ⚠ Do not read the line above as "debug builds work in a fresh clone". They
+/// do not, and this comment used to claim they did. `tauri.conf.json` declares
+/// `resources/node-pkg/**/*` as a bundle resource, and `tauri-build` hard
+/// errors on a glob that matches nothing BEFORE this function is reached, at
+/// any profile. So an unstaged clone fails in tauri-build, not here, with a
+/// message about the glob rather than about staging. CI works around it with a
+/// single placeholder file; a contributor should just run the staging script.
 fn assert_node_package_staged() {
     println!("cargo:rerun-if-changed=resources/node-pkg/bin");
     if std::env::var("PROFILE").as_deref() != Ok("release") {

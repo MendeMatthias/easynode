@@ -1,0 +1,7 @@
+# Pin the toolchain so a contributor's local Rust and CI's cannot silently
+# diverge. `stable` rather than a fixed version: this is a small crate with no
+# nightly features, and pinning an exact version means every contributor
+# downloads a second toolchain for no benefit.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

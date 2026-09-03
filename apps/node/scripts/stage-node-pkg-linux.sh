@@ -13,18 +13,25 @@
 # Usage:  apps/node/scripts/stage-node-pkg-linux.sh
 set -euo pipefail
 
-VERSION="0.33.2"
+VERSION="0.34.5"
 TARBALL_URL="https://github.com/btxchain/btx/releases/download/v${VERSION}/btx-${VERSION}-x86_64-linux-gnu.tar.gz"
 # From the release's signed SHA256SUMS. Upstream has re-generated release
 # assets in place before — a silent swap must FAIL here, never ship unnoticed.
-TARBALL_SHA256="3bc67d222f2afa7607b91ba87856206b9975afc5a4c3aec9fe782a26fc9f4310"
-# NOTE: v0.33.2 dropped the `aarch64-linux-gnu` asset that v0.33.1 published, so
-# there is no upstream ARM-Linux node to stage for the MatMul v4.7 fork. This
-# script is x86_64-only by construction and always was; the gap is called out
-# here so nobody spends an afternoon looking for the ARM tarball.
+TARBALL_SHA256="76ad2cab712c29f744c86e93951b4fb09fbbca22f074926d5efb36c3f08c6ba7"
+# NOTE: upstream publishes no `aarch64-linux-gnu` asset, so there is no ARM-Linux
+# node to stage. This script is x86_64-only by construction and always was; the
+# gap is called out here so nobody spends an afternoon looking for the tarball.
+# A CUDA build (btx-0.34.5-x86_64-linux-gnu-cuda12.tar.gz) also exists upstream
+# and is NOT what this stages: the app bundles the plain build and the node app
+# does not mine.
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="$APP_DIR/src-tauri/resources/node-pkg"
+
+# Refuse to stage a version the app will then refuse. See scripts/lib/engine-pin.sh.
+# shellcheck source=lib/engine-pin.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/engine-pin.sh"
+assert_matches_engine_pin "$APP_DIR" "$VERSION"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "error: this stages the LINUX node package and must run on Linux." >&2

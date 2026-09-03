@@ -9,6 +9,10 @@ licensed and this repository is the whole of it.
 Downloads and the auto update feed live in
 [EasyBTX-releases](https://github.com/MendeMatthias/EasyBTX-releases).
 
+**If you read one thing here, read [Always on](docs/always-on.md).** It is the
+argument for the whole project: what BTX is actually short of, what running a
+node really costs you, and what it does not promise in return.
+
 ## Why this exists
 
 BTX needs nodes that are simply on. Not fast, not powerful, on. A trusted mirror
