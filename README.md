@@ -58,7 +58,33 @@ between one role and the next.
   here. Contribution is recognised and recorded, and nothing is owed to you.
 - It will never install an update that was not signed by the release key.
 
-## Build it yourself
+## See it in ten seconds
+
+No Rust, no staging, no package manager. This serves the real UI:
+
+```bash
+cd apps/node
+npm install
+npm run dev        # http://localhost:1430
+```
+
+Measured at under a second to a live page. Anything that has to talk to the node
+will error in a plain browser, because there is no Tauri shell behind it, but
+every screen, state and piece of copy is there to read and change.
+
+## Run the tests
+
+Both suites pass on a fresh clone and neither needs the staging step:
+
+```bash
+cd apps/node && npm test              # 52 tests, under a second
+cd crates/btx-core && cargo test      # 234 tests, about 5 seconds
+```
+
+CI runs exactly these on every pull request, plus `tsc --noEmit` and a
+production `vite build`.
+
+## Build the real app
 
 ```bash
 cd apps/node
@@ -69,16 +95,33 @@ npm run tauri build           # package it
 ```
 
 **The staging step is not optional.** The app bundles the BTX node package
-itself so a user does not need Homebrew or a package manager, and that tree is
+itself, so a user does not need Homebrew or a package manager, and that tree is
 about 25 MB of binaries which do not belong in a source repository. The script
 fetches them from the public upstream release, verifies the SHA-256 against the
 signed sums, and stages them into `src-tauri/resources/node-pkg/`. Without it
 `tauri build` fails with `glob pattern resources/node-pkg/**/* path not found`,
 because `tauri.conf.json` declares that directory as a bundle resource.
 
-Rust and the Tauri prerequisites are required. `crates/btx-core` is the shared
-library that talks to `btxd`; it builds as a path dependency and needs no
-separate step. You can check just that crate quickly with
+The staged engine is BTX v0.34.5, matching `NODE_RELEASE_TAG` in
+`src-tauri/src/commands.rs`. Those two must agree: the app installs the bundled
+package into a directory named after the tag and then checks that the binary
+reports that version, so a mismatch fails first-run setup rather than quietly
+running the wrong engine. The script writes a `.btxd-version` marker recording
+what it actually staged.
+
+Verified on a Mac with no Homebrew installed: v0.34.5 links no Homebrew
+libraries, so staging needs nothing beyond the standard toolchain. Earlier
+releases did, which is why the script still contains the dylib vendoring code.
+
+**This is the contributor path, not the release path.** `stage-node-pkg.sh`
+stages the official upstream release tarball, which is what you want in order to
+build and run the app yourself. Shipped releases are built from a different
+tree, and the two are not interchangeable, so do not assume a local
+`tauri build` reproduces a published artifact byte for byte.
+
+Rust and the Tauri prerequisites are required for this path. `crates/btx-core`
+is the shared library that talks to `btxd`; it builds as a path dependency and
+needs no separate step. You can check just that crate quickly with
 `cd crates/btx-core && cargo check`, which needs no staging.
 
 ## What is in here, and what is not

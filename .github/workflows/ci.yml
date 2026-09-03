@@ -1,0 +1,114 @@
+# CI for easyNode. Read this before approving a change to it.
+#
+# What this workflow can do: check out the public source, install public
+# dependencies from registry.npmjs.org and crates.io, and compile and test.
+#
+# What it cannot do: there is no `secrets.` reference anywhere in this file, no
+# `pull_request_target` trigger, and the token is read-only (see `permissions`
+# below). It therefore cannot sign, publish, release, or push. Any future edit
+# that adds `secrets.`, `permissions: write`, or `pull_request_target` is a
+# change to the trust boundary and should be reviewed as one.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The web layer: typecheck, unit tests, production bundle. ~1 minute.
+  # ---------------------------------------------------------------------------
+  web:
+    name: web (typecheck, tests, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/node
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: apps/node/package-lock.json
+
+      # `npm ci` fails outright if package-lock.json and package.json disagree,
+      # so the lockfile is enforced by the command itself.
+      - run: npm ci
+
+      # `npm run build` is `tsc && vite build`: the typecheck and the bundle.
+      # Run tsc separately so a type error is reported as a type error.
+      - run: npx tsc --noEmit
+      - run: npm test
+      - run: npx vite build
+
+  # ---------------------------------------------------------------------------
+  # The shared engine. No system dependencies, no staged node package, no
+  # network beyond crates.io. This is the crate most contributions will touch.
+  # ---------------------------------------------------------------------------
+  core:
+    name: btx-core (check, test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: crates/btx-core
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/btx-core
+      # --locked makes a PR that edits Cargo.toml without refreshing Cargo.lock
+      # fail here rather than silently resolving to different versions.
+      - run: cargo check --locked --all-targets
+      - run: cargo test --locked
+
+  # ---------------------------------------------------------------------------
+  # The Tauri shell. macOS because the app needs zero extra system packages
+  # there; on Linux this job would first have to apt-install webkit2gtk and
+  # friends. This job does NOT run scripts/stage-node-pkg.sh: that downloads
+  # ~25 MB from an upstream GitHub release, and an upstream asset that gets
+  # regenerated in place would turn every unrelated pull request red.
+  #
+  # tauri.conf.json declares `resources/node-pkg/**/*` as a bundle resource and
+  # tauri-build refuses to run when that glob matches nothing, so the job
+  # creates one placeholder file to satisfy the glob. build.rs already skips its
+  # own "is a real btxd staged?" assertion for non-release profiles, and this
+  # job only ever runs `cargo check` / `cargo test`, never a release build, so
+  # the placeholder cannot reach a shipped artifact.
+  # ---------------------------------------------------------------------------
+  app:
+    name: tauri shell (check, test)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: apps/node/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/node/src-tauri
+      - name: Satisfy the bundle-resource glob (debug builds only)
+        run: |
+          mkdir -p resources/node-pkg
+          echo "CI placeholder. Not a node package. See the job comment." \
+            > resources/node-pkg/CI-PLACEHOLDER
+      - run: cargo check --locked --all-targets
+      - run: cargo test --locked

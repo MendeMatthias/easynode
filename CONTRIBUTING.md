@@ -26,6 +26,20 @@ copyright.
 
 ## Before you open a pull request
 
+Run the tests. CI runs exactly these on your pull request, and both pass on a
+fresh clone without the staging step:
+
+```bash
+cd apps/node && npm test              # 52 tests, under a second
+cd crates/btx-core && cargo test      # 234 tests, about 5 seconds
+```
+
+To see the UI without building anything native, `cd apps/node && npm run dev`
+serves it at http://localhost:1430. Node actions error there because there is no
+Tauri shell behind the page, but every screen and string is editable.
+
+For the full app:
+
 ```bash
 cd apps/node
 npm install
