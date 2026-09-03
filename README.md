@@ -63,13 +63,23 @@ between one role and the next.
 ```bash
 cd apps/node
 npm install
-npm run tauri dev          # run it
-npm run tauri build        # package it
+./scripts/stage-node-pkg.sh   # REQUIRED FIRST, see below
+npm run tauri dev             # run it
+npm run tauri build           # package it
 ```
 
+**The staging step is not optional.** The app bundles the BTX node package
+itself so a user does not need Homebrew or a package manager, and that tree is
+about 25 MB of binaries which do not belong in a source repository. The script
+fetches them from the public upstream release, verifies the SHA-256 against the
+signed sums, and stages them into `src-tauri/resources/node-pkg/`. Without it
+`tauri build` fails with `glob pattern resources/node-pkg/**/* path not found`,
+because `tauri.conf.json` declares that directory as a bundle resource.
+
 Rust and the Tauri prerequisites are required. `crates/btx-core` is the shared
-library that talks to `btxd`; it is built as a path dependency and needs no
-separate step.
+library that talks to `btxd`; it builds as a path dependency and needs no
+separate step. You can check just that crate quickly with
+`cd crates/btx-core && cargo check`, which needs no staging.
 
 ## What is in here, and what is not
 

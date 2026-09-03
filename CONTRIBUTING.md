@@ -29,11 +29,19 @@ copyright.
 ```bash
 cd apps/node
 npm install
+./scripts/stage-node-pkg.sh   # fetches and verifies the bundled node, required
 npm run tauri dev
 ```
 
 Rust and the Tauri prerequisites are needed. `crates/btx-core` builds as a path
 dependency, so there is no separate step for it.
+
+If you skip the staging script the build fails with `glob pattern
+resources/node-pkg/**/* path not found`. That is expected: the bundled node
+binaries are fetched from the public upstream release rather than committed, and
+`tauri.conf.json` declares that directory as a bundle resource. To touch only
+the Rust library you can run `cd crates/btx-core && cargo check`, which needs no
+staging at all.
 
 Please keep the diff to one subject. A pull request that fixes a bug and also
 reformats a file is much harder to review than two pull requests.

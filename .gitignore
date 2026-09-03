@@ -4,3 +4,9 @@ dist/
 .DS_Store
 *.log
 apps/node/src-tauri/gen/
+
+# The staged BTX node package: ~25 MB of binaries fetched from upstream by
+# apps/node/scripts/stage-node-pkg.sh. Binaries do not belong in the source
+# tree. In the private repo this was excluded via .git/info/exclude, which is
+# local only and does not survive a clone, so it is declared properly here.
+apps/node/src-tauri/resources/node-pkg/
