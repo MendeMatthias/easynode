@@ -42,7 +42,7 @@ impl NicknameError {
         match self {
             NicknameError::TooLong { max } => format!("Keep it to {max} characters or fewer."),
             NicknameError::BadChars { first } => format!(
-                "{first} cannot be used. Letters, numbers, spaces, dots, dashes and underscores only."
+                "The character {first:?} cannot be used. Letters, numbers, spaces, dots, dashes and underscores only."
             ),
             NicknameError::Blank => {
                 "That is only spaces. Leave it empty to go back to no nickname.".to_string()
@@ -241,6 +241,10 @@ mod tests {
             assert!(
                 m.ends_with('.'),
                 "shown to a person, so it is a sentence: {m}"
+            );
+            assert!(
+                m.starts_with(char::is_uppercase),
+                "a sentence opens with a capital, not with the offending character: {m}"
             );
         }
     }
