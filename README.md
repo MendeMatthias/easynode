@@ -13,6 +13,21 @@ Downloads and the auto update feed live in
 argument for the whole project: what BTX is actually short of, what running a
 node really costs you, and what it does not promise in return.
 
+## This repository is the app
+
+Not a mirror of one. easyNode is developed here, released from here, and this is
+where a change belongs. If you are looking at a copy of these files somewhere
+else, that copy is downstream of this one.
+
+That means the whole of it is here: the app, the shared engine library, the
+release recipe in [docs/node-release-recipe.md](docs/node-release-recipe.md),
+and the two engine gates in `scripts/` that must both pass before any release
+changes which `btxd` users run. The only thing deliberately absent is the
+signing key, which is not in any repository and never will be.
+
+If you want BTX to have a home client that anyone can audit and anyone can
+improve, this is the one to send patches to.
+
 ## Why this exists
 
 BTX needs nodes that are simply on. Not fast, not powerful, on. A trusted mirror
