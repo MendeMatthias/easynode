@@ -159,6 +159,28 @@ never install a build that was not signed by the release key.
 If you would rather read the argument before installing anything, that is
 [Always on](docs/always-on.md).
 
+### Keeping it up, on a machine you do not sit in front of
+
+`scripts/node-observer.sh` samples the node every couple of minutes, records
+what it saw, and recovers the two things that actually take a home node off the
+network: a btxd that is not running, and a tip that has stopped advancing
+because no connected peer will serve a block body. The second one matters more
+than it sounds — measured 2026-09-04, of 19 peers twelve advertised `NETWORK`
+and exactly **one** was archival *and* current, so a node that falls behind can
+run out of anybody to ask. It dials a peer rather than restarting anything, and
+it never touches a live node.
+
+```bash
+BTX_START_CMD="/path/to/start-my-node.sh" scripts/node-observer.sh &
+```
+
+It is a shell script rather than part of the app on purpose.
+`crates/btx-core/src/watchdog.rs` already *diagnoses* a stall, and does it
+well — it can tell "the body never arrived" from "the body is banked and the
+attestation is missing". What the app does not do is *act*, because restarting
+somebody's node unasked is a consent decision. This is the stopgap, and it is in
+the open so the behaviour can be argued with before any of it moves inside.
+
 ## What this app will never do
 
 - It will never ask for your seed phrase or private key in a web page.
