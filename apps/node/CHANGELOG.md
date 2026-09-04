@@ -74,7 +74,9 @@ as spending too much — and the rejection quoted the same rounded number back.
 ignored which profile you had chosen and demanded room for the whole chain even
 when it was about to install a ~10 GB pruned node. Choosing Keeper on the setup
 screen and being refused for 140 GiB was the single most confusing way to meet
-the tier the network is shortest of.
+the tier the network is shortest of. The setup screen's "Disk needed" now shows
+the figure for the profile you picked, too: 20 GiB for a keeper, instead of
+quoting the full node's 140 to everyone.
 
 **The app stops calling it a menu bar on machines that do not have one.** The
 first-run pitch, the close dialog, the close-behaviour setting and a button all
