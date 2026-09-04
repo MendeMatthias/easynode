@@ -63,6 +63,19 @@ jobs:
       - run: npx vite build
 
   # ---------------------------------------------------------------------------
+  # The publish gate, against the sums file CI actually produces. It shipped
+  # once tested only against a hand-written fixture that matched its author's
+  # assumptions, and could not pass for any real release. ~1 second.
+  # ---------------------------------------------------------------------------
+  publish-gate:
+    name: publish gate (CI-shaped SHA256SUMS fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: bash apps/node/scripts/test-publish-gate.sh
+
+  # ---------------------------------------------------------------------------
   # The shared engine. No system dependencies, no staged node package, no
   # network beyond crates.io. This is the crate most contributions will touch.
   # ---------------------------------------------------------------------------

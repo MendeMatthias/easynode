@@ -126,14 +126,42 @@ sha256_of() {
   else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
 
+# The hash recorded for NAME in a sums file, or nothing. Structural parse:
+# 64 hex, one separator (two spaces, or space-star for binary mode), the rest
+# of the line is the name. Names with spaces are therefore fine, and a CR at
+# the end of the line is ignored. Pure bash 3.2, so it runs on the release Mac.
+sums_lookup() {
+  local name="$1" sums="$2" line hash rest
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    [ "${#line}" -gt 66 ] || continue
+    hash="${line:0:64}"
+    case "$hash" in *[!0-9a-fA-F]*) continue ;; esac
+    rest="${line:64}"
+    case "$rest" in
+      "  "*) rest="${rest:2}" ;;
+      " *"*) rest="${rest:2}" ;;
+      *) continue ;;
+    esac
+    if [ "$rest" = "$name" ]; then
+      printf '%s\n' "$hash" | tr 'A-F' 'a-f'
+      return 0
+    fi
+  done < "$sums"
+  return 0
+}
+
 bad=0
 for f in "${ALL[@]}"; do
   case "$f" in
     *.sig|SHA256SUMS*|*.json) continue ;;
   esac
-  # SHA256SUMS lines are "<hash>  <name>"; match the NAME field exactly so a
-  # substring like BTX-Node_0.6.1_amd64.AppImage cannot satisfy 0.6.18.
-  want="$(awk -v n="$f" '$2 == n || $2 == "*" n { print $1; exit }' "$SUMS")"
+  # A sums line is 64 hex, a separator (two spaces, or space-star for binary
+  # mode), then the NAME, which may contain spaces: it is everything after the
+  # separator, never awk's $2. Compare the whole remainder so a substring like
+  # BTX-Node_0.6.1_amd64.AppImage cannot satisfy 0.6.18, and drop a trailing CR
+  # so a sums file that crossed a Windows box still reads.
+  want="$(sums_lookup "$f" "$SUMS")"
   if [ -z "$want" ]; then
     echo "error: $f is not listed in SHA256SUMS." >&2
     echo "       The gates never saw this file. If it was rebuilt after the run," >&2
@@ -190,6 +218,29 @@ echo
 # node-release-recipe.md records, measured, that the publishing machine has
 # neither gh nor jq. So the offline half now runs everywhere, and the tool is
 # only demanded at the point it is actually used.
+# ── Remember what Latest points at, so we can prove we did not steal it ─────
+# One read-only GET. On a dry run it is a courtesy, not a requirement: a box
+# without gh still gets every offline check and a green exit, which is what the
+# recipe promises and what the publishing box, which has no gh, needs.
+if command -v gh >/dev/null 2>&1; then
+  PREV_LATEST="$(gh api "repos/$REPO/releases/latest" --jq '.tag_name' 2>/dev/null || echo "<none>")"
+  echo "==> repo-global Latest currently: $PREV_LATEST"
+  if [[ "$PREV_LATEST" == node-v* ]]; then
+    echo "    ⚠ Latest is already a NODE release. It should be the miner's."
+    echo "      Someone published a node release without make_latest=false."
+  fi
+  echo
+else
+  PREV_LATEST="<unknown: no gh>"
+fi
+
+if [ "$DO_PUBLISH" -eq 0 ]; then
+  echo "==> DRY RUN complete. Every offline check passes."
+  echo "    Would create draft $TAG on $REPO, upload ${#ALL[@]} asset(s),"
+  echo "    re-download and verify each against the released bytes, then flip it live."
+  exit 0
+fi
+
 command -v gh >/dev/null || {
   echo "error: gh is required from here on (creating the draft, uploading," >&2
   echo "       re-downloading and flipping it live all go through it)." >&2
@@ -197,22 +248,6 @@ command -v gh >/dev/null || {
   echo "       REST sequence in docs/node-release-recipe.md by hand." >&2
   exit 1
 }
-
-# ── Remember what Latest points at, so we can prove we did not steal it ─────
-PREV_LATEST="$(gh api "repos/$REPO/releases/latest" --jq '.tag_name' 2>/dev/null || echo "<none>")"
-echo "==> repo-global Latest currently: $PREV_LATEST"
-if [[ "$PREV_LATEST" == node-v* ]]; then
-  echo "    ⚠ Latest is already a NODE release. It should be the miner's."
-  echo "      Someone published a node release without make_latest=false."
-fi
-echo
-
-if [ "$DO_PUBLISH" -eq 0 ]; then
-  echo "==> DRY RUN complete. Everything checked passes."
-  echo "    Would create draft $TAG on $REPO, upload ${#ALL[@]} asset(s),"
-  echo "    re-download and verify each against the released bytes, then flip it live."
-  exit 0
-fi
 
 # ── Draft, upload, verify, and only then publish ────────────────────────────
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then

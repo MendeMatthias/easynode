@@ -61,7 +61,7 @@ export interface NodeStatusInfo {
   disk_free_mb: number;
   disk_warn_mb: number;
   disk_critical_mb: number;
-  disk_required_fresh_mb: number;
+  disk_required_mb: number;
   datadir_size_mb: number;
   datadir: string;
   node_tag: string;
@@ -85,6 +85,7 @@ export interface NodeStatusInfo {
   archive_service_message: string | null;
   archive_service_needs_attention: boolean;
   node_nickname: string;
+  broadcast_nickname: string | null;
   subversion: string | null;
   peer_nicknames: string[];
   service_report_enabled: boolean;
@@ -367,10 +368,13 @@ function renderWizard(status: NodeStatusInfo) {
   wizardError.hidden = p.phase !== "error";
 
   $("wizard-free-disk").textContent = fmtGB(status.disk_free_mb);
-  // Rendered from the constant the preflight actually gates on, never from a
-  // string in the markup. Those two disagreed by 35 GiB and the user saw the
-  // smaller one right up until the install was refused.
-  $("wizard-disk-needed").textContent = fmtGB(status.disk_required_fresh_mb);
+  // The fresh-install figure for the SELECTED profile, from the same
+  // disk_required the preflight applies — 20 GiB for a keeper, 140 for a full
+  // node — never a string in the markup. It used to render the full-node
+  // constant unconditionally, which told keepers they needed 140 GiB for an
+  // install the preflight would pass at 20. Always the fresh figure: a resume
+  // is gated lower, but overstating is the direction that never strands anyone.
+  $("wizard-disk-needed").textContent = fmtGB(status.disk_required_mb);
 
   switch (p.phase) {
     case "downloading":
@@ -463,7 +467,6 @@ function renderStatus(status: NodeStatusInfo) {
   const sub = $("status-sub");
   const errCard = $("status-error");
 
-  applyTrayTerm(status);
   reflectPeerNames(status);
 
   const mode = visualMode(p, status.rc_stalled);
@@ -598,6 +601,15 @@ async function tick() {
   try {
     const status = await invoke<NodeStatusInfo>("get_node_status");
     lastStatus = status;
+    // From the tick, not from renderStatus: a fresh install never reaches
+    // renderStatus, and the first-run wizard is where a Windows user meets the
+    // close dialog whose button used to read "Keep running in the menu bar".
+    applyTrayTerm(status);
+    // The serve row lives in the Settings overlay, which is reachable from any
+    // screen and stays open across ticks; refresh it here so a verdict that
+    // changes — or vanishes when the node stops — is reflected while it is
+    // being looked at, not only on the next open.
+    reflectArchiveService(status);
     reflectWalletEnabled(status.wallet_enabled);
     if (status.setup_complete) setupDone = true;
 
@@ -818,11 +830,13 @@ function reflectPeerNames(status: NodeStatusInfo): void {
   const el = document.getElementById("peer-names");
   if (!el) return;
   const names = status.peer_nicknames;
-  // Your own name belongs beside theirs: it is the same list, seen from the
-  // other side, and a line that names strangers but not you reads as a list
-  // you are not on. Shown only while the node is up, because the name is only
-  // broadcast then.
-  const me = status.running && status.node_nickname ? status.node_nickname : "";
+  // Your own name belongs beside theirs — but from the WIRE, not the setting.
+  // btxd builds its user agent once at init, so a name saved on a running node
+  // is not broadcast until the next start, and a name cleared on a running
+  // node is still being broadcast. broadcast_nickname is parsed from the real
+  // subversion and is null whenever we do not know what is on the wire; in
+  // that state saying nothing is the honest answer.
+  const me = status.broadcast_nickname ?? "";
   if (names.length === 0 && !me) {
     el.textContent = "";
     el.hidden = true;
@@ -843,11 +857,20 @@ function reflectArchiveService(status: NodeStatusInfo): void {
   const row = $("serve-toggle").closest(".setting-row");
   const desc = row?.querySelector(".setting-desc");
   if (!desc) return;
-  // No verdict yet (node down, or the refresher has not ticked) means we do not
-  // know, and the static copy is the honest thing to leave up.
-  if (!status.archive_service_message) return;
-  desc.textContent = status.archive_service_message;
-  desc.classList.toggle("needs-attention", status.archive_service_needs_attention);
+  // Keep the markup's own sentence the first time through, so it can come
+  // BACK. The previous version overwrote it and then "left it up" on a null
+  // verdict — which left the last live verdict up instead, amber class and
+  // all, on a node that had since stopped. A stopped node claiming to serve
+  // history is the exact lie this row exists to prevent.
+  const el = desc as HTMLElement;
+  el.dataset.staticCopy ??= el.textContent ?? "";
+  if (!status.archive_service_message) {
+    el.textContent = el.dataset.staticCopy;
+    el.classList.remove("needs-attention");
+    return;
+  }
+  el.textContent = status.archive_service_message;
+  el.classList.toggle("needs-attention", status.archive_service_needs_attention);
 }
 
 function reflectKeeperRow(status: NodeStatusInfo) {
@@ -869,9 +892,10 @@ function reflectKeeperRow(status: NodeStatusInfo) {
 // Serving is independent of the profile: Keeper mode implies it, and a FULL
 // node can flip it here too — a full-history node that serves is the most
 // valuable archive the network has (there is currently ~one).
-// Local file only — no network, no identifier. The copy says so, because a
-// node operator has every reason to ask before switching on anything that
-// sounds like telemetry.
+// Local file only — no network, no upload. It records what this node has
+// served, plus the public nickname if one is set (which every peer can already
+// see). The copy says so, because a node operator has every reason to ask
+// before switching on anything that sounds like telemetry.
 $<HTMLInputElement>("report-toggle").addEventListener("change", (e) => {
   const on = (e.target as HTMLInputElement).checked;
   void invoke("set_service_report", { on })

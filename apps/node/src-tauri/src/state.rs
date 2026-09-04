@@ -280,6 +280,21 @@ pub struct AppState {
     pub size_walk_running: Arc<AtomicBool>,
     /// Guards against two concurrent setup pipelines (double-click).
     pub setup_running: Arc<AtomicBool>,
+    /// True while `start_node_inner` is running. The double-spawn guard keys
+    /// on a live child in `state.node`, and there is none for the whole window
+    /// between a stop and the next spawn, during which `Stopped` is an
+    /// actionable phase on both surfaces: a second Start (tray, button,
+    /// explorer toggle) could enter the same start sequence and race the first
+    /// for `btxd.pid`. Held through a drop guard, so a panicking start releases
+    /// it instead of wedging every later one.
+    pub start_in_flight: Arc<AtomicBool>,
+    /// Who the node we ATTACHED to belongs to, when we attached rather than
+    /// spawned. `None` whenever the node in `state.rpc` is our own child or
+    /// there is none. Set on the Attach plan, cleared on every spawn and on
+    /// stop. The destructive commands read this: `state.rpc.is_some()` was the
+    /// wrong proxy for "ours", because in attach mode that slot holds the
+    /// OTHER app's client, which is the exact case the gate exists for.
+    pub attached_to: Arc<Mutex<Option<AttachedTo>>>,
     /// Generation counter for the status refresher: each (re)start bumps it and
     /// stale refresher loops exit when their generation is superseded.
     pub refresher_gen: Arc<AtomicU64>,
@@ -323,6 +338,22 @@ pub struct AppState {
     pub peer_nicknames_cache: Arc<Mutex<Vec<String>>>,
 }
 
+/// Whose node did we attach to? Derived from the `DatadirHolder` seen at the
+/// moment of attaching, and kept as its own small type so the destructive
+/// commands can reason about it without re-probing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachedTo {
+    /// A live btxd with a live parent app: the miner, or another window of
+    /// this app. Never ours to stop, and never ours to delete under.
+    AnotherApp,
+    /// A btxd whose parent is gone: our own previous instance, which this app
+    /// adopts after a self-update relaunch. Ours.
+    OurOrphan,
+    /// RPC answered but the pidfile named nothing we could classify. We are
+    /// using a node we did not start and cannot vouch for.
+    Unknown,
+}
+
 impl AppState {
     /// Clone of the size-cache handle for the background walk task.
     pub fn datadir_size_cache_handle(
@@ -342,6 +373,8 @@ impl AppState {
             datadir_size_cache: Arc::new(std::sync::Mutex::new((0, None))),
             size_walk_running: Arc::new(AtomicBool::new(false)),
             setup_running: Arc::new(AtomicBool::new(false)),
+            start_in_flight: Arc::new(AtomicBool::new(false)),
+            attached_to: Arc::new(Mutex::new(None)),
             refresher_gen: Arc::new(AtomicU64::new(0)),
             quitting: Arc::new(AtomicBool::new(false)),
             rc_status_cache: Arc::new(Mutex::new(None)),

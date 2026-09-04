@@ -416,13 +416,22 @@ jobs:
           env -u LD_LIBRARY_PATH "$apkgdir/bin/btxd" --version | head -1
           echo "path contract OK: runnable btxd in both bundles, no unresolved libs"
 
+      # The names here are the names that SHIP. tauri's productName is
+      # "easyBTX Node", so the bundler emits "easyBTX Node_<ver>_amd64.AppImage",
+      # with a space, and the release convention is BTX-Node_<ver>_<arch>.<ext>.
+      # The rename used to be a manual recipe step performed AFTER this hash,
+      # which meant SHA256SUMS listed names no published asset ever had and the
+      # publish gate that checks it could not pass for any release. Renaming
+      # before hashing makes the sums file, the feed builder's expect_name and
+      # the publish gate agree on one name.
       - name: Collect artifacts + sha256
         run: |
           set -euo pipefail
           out="$GITHUB_WORKSPACE/dist-node-linux"
           mkdir -p "$out"
-          cp apps/node/src-tauri/target/release/bundle/appimage/*.AppImage "$out/"
-          cp apps/node/src-tauri/target/release/bundle/deb/*.deb "$out/"
+          ver="$(python3 -c "import json;print(json.load(open('apps/node/src-tauri/tauri.conf.json'))['version'])")"
+          cp apps/node/src-tauri/target/release/bundle/appimage/*.AppImage "$out/BTX-Node_${ver}_amd64.AppImage"
+          cp apps/node/src-tauri/target/release/bundle/deb/*.deb        "$out/BTX-Node_${ver}_amd64.deb"
           cd "$out" && sha256sum * | tee SHA256SUMS
 
       - name: Upload Linux bundles

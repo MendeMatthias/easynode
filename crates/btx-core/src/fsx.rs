@@ -14,11 +14,17 @@
 //!     an app whose disk preflight exists precisely because volumes fill up.
 //!   * **Power loss inside the writeback window**, which is dirty-page lifetime
 //!     rather than microseconds.
-//!   * **Two processes rewriting one file.** The datadir is shared with the
-//!     miner by design, and `commands.rs` says so explicitly where it re-asserts
-//!     `txindex`: that re-assertion exists to "self-heal a conf the MINER
-//!     rewrote". Two unsynchronised read-modify-rewrites lose content with no
-//!     crash at all.
+//!   * **Two writers at once.** The datadir is shared with the miner by design,
+//!     and inside this app the Settings commands rewrite the conf on their own
+//!     tasks while the start sequence rewrites it too. What this module does
+//!     about that is bounded and worth stating exactly: each writer gets its
+//!     OWN temp file (pid + counter, opened `create_new`), so two writers can
+//!     never share an inode and publish a byte-mixed hybrid — a torn conf is
+//!     the one that stops btxd. What it does NOT do is serialise the
+//!     read-modify-write: both writers read before either writes, so the
+//!     loser's edit is lost. That is a lost update, not a corrupt file, and
+//!     closing it needs a lock around the whole read-modify-write, which is a
+//!     separate decision.
 //!
 //! A truncated `faststart.conf` is not a cosmetic loss. `prune=0` disappearing
 //! means the datadir's own `btx_rw.conf` decides the prune posture instead, and
@@ -40,30 +46,53 @@ use std::path::Path;
 /// content that never reached the disk.
 ///
 /// The temp file is a sibling because rename is only atomic within a
-/// filesystem. A best-effort cleanup removes it if the rename fails, so a
-/// failed write does not litter the datadir.
+/// filesystem. Its name carries the pid and a counter and it is opened
+/// `create_new`, so two concurrent writers of one target get two files rather
+/// than two descriptors on one inode — the earlier fixed `.name.tmp` let a
+/// second writer truncate and overlay the first's bytes, and whichever rename
+/// won published the hybrid. On ANY failure the temp file is removed, so a
+/// failed write never leaves a stray file behind.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "tmp".to_string());
-    let tmp = dir.join(format!(".{name}.tmp"));
+    let pid = std::process::id();
 
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
+    // A unique temp path this writer alone holds. AlreadyExists means a
+    // leftover from a crashed writer with the same pid and counter — possible
+    // across a reboot — so step the counter and try again rather than truncate
+    // a file we cannot prove is ours.
+    let (tmp, mut file) = loop {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!(".{name}.{pid}.{n}.tmp"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => break (tmp, f),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
+    };
+
+    let written = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
+    written
 }
 
 #[cfg(test)]
@@ -99,6 +128,55 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_writers_never_publish_a_hybrid() {
+        // Two threads, two distinct payloads, many rounds. With a shared temp
+        // name this fails: the shorter payload overlays the longer one on a
+        // shared inode and the file ends up as neither. With per-writer temp
+        // files the file is always exactly one of the two.
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("faststart.conf");
+        std::fs::write(
+            &p, "prune=0
+",
+        )
+        .unwrap();
+        let a = "prune=0
+parkdeepreorg=1
+maxreorgdepthpark=6
+"
+        .repeat(40);
+        let b = "x=1
+"
+        .repeat(3);
+        let (pa, pb) = (p.clone(), p.clone());
+        let (aa, bb) = (a.clone(), b.clone());
+        let ta = std::thread::spawn(move || {
+            for _ in 0..200 {
+                atomic_write(&pa, aa.as_bytes()).unwrap();
+            }
+        });
+        let tb = std::thread::spawn(move || {
+            for _ in 0..200 {
+                atomic_write(&pb, bb.as_bytes()).unwrap();
+            }
+        });
+        ta.join().unwrap();
+        tb.join().unwrap();
+        let got = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            got == a || got == b,
+            "hybrid published:
+{got}"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "faststart.conf")
+            .collect();
+        assert!(leftovers.is_empty(), "left {leftovers:?} behind");
+    }
+
+    #[test]
     fn a_failed_write_leaves_the_original_intact() {
         // The whole point. `std::fs::write` truncates first, so a failure here
         // used to leave an empty conf and the caller discarded the error.
@@ -106,12 +184,14 @@ mod tests {
         let p = d.path().join("conf");
         std::fs::write(&p, "prune=0\n").unwrap();
 
-        // A directory in the temp file's place makes File::create fail without
-        // needing a full disk or a permissions dance that root ignores.
-        let tmp = d.path().join(".conf.tmp");
-        std::fs::create_dir(&tmp).unwrap();
-
-        assert!(atomic_write(&p, b"replacement").is_err());
+        // Make the temp file's PARENT unwritable by pointing the target inside
+        // a directory that does not exist: create_new fails, nothing is
+        // written, and the original next door is untouched. (A directory at a
+        // fixed temp name no longer works as a trap, because the temp name is
+        // per-writer now — which is the point.)
+        let missing = d.path().join("no-such-dir").join("conf");
+        assert!(atomic_write(&missing, b"replacement").is_err());
+        assert!(!d.path().join("no-such-dir").exists());
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
             "prune=0\n",

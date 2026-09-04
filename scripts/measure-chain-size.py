@@ -83,38 +83,53 @@ def block_at(base, height):
         return None
 
 
+MIN_VALIDATED = 3
+
+
+def local_rpc(cli, datadir, *args):
+    """One btx-cli call. A non-zero exit is a hard error: an unusable --cli or a
+    wrong --datadir must never be read as "the node does not hold this height"."""
+    r = subprocess.run([cli, "-datadir=%s" % datadir, *args],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise SystemExit("btx-cli %s failed (%d): %s" % (args[0], r.returncode, r.stderr.strip()[:200]))
+    return r.stdout.strip()
+
+
 def validate(base, cli, datadir, heights):
     """Cross-check the explorer against our own node. A mirror that disagrees
-    about a hash is serving a different chain and must not be sampled."""
-    ok = True
+    about a hash is serving a different chain and must not be sampled.
+
+    Returns the number of heights actually COMPARED, or -1 on any mismatch.
+    The previous version returned True after zero comparisons: every
+    local-side failure was skipped with `ok` untouched, so a guard that a
+    maintainer is told to trust could not fail. Counting is what makes it
+    able to."""
+    compared = 0
     for height in heights:
+        our_hash = local_rpc(cli, datadir, "getblockhash", str(height))
+        if not our_hash:
+            print("  %8d  our node returned no hash for this height, skipped" % height)
+            continue
         try:
-            our_hash = subprocess.run(
-                [cli, "-datadir=%s" % datadir, "getblockhash", str(height)],
-                capture_output=True, text=True, timeout=30,
-            ).stdout.strip()
-            if not our_hash:
-                print("  %8d  our node does not hold this height, skipped" % height)
-                continue
-            our = json.loads(subprocess.run(
-                [cli, "-datadir=%s" % datadir, "getblock", our_hash, "1"],
-                capture_output=True, text=True, timeout=30,
-            ).stdout)
-        except Exception as e:
-            print("  %8d  local RPC failed: %s" % (height, e))
+            our = json.loads(local_rpc(cli, datadir, "getblock", our_hash, "1"))
+        except ValueError:
+            # A pruned node answers getblockhash from headers but has no body.
+            print("  %8d  our node does not hold this block (pruned), skipped" % height)
             continue
         got = block_at(base, height)
         if not got:
             print("  %8d  explorer did not answer" % height)
-            ok = False
-            continue
+            return -1
         their_hash, their_size = got
         agree = their_hash == our_hash and their_size == our["size"]
-        ok = ok and agree
         print("  %8d  ours %8d  theirs %8s  %s"
               % (height, our["size"], their_size, "same-hash" if agree else "MISMATCH"))
+        if not agree:
+            return -1
+        compared += 1
         time.sleep(DELAY)
-    return ok
+    return compared
 
 
 def main():
@@ -140,10 +155,29 @@ def main():
             print("--validate needs --datadir", file=sys.stderr)
             return 2
         print("cross-checking against the local node:")
-        step = max(1, tip // 6)
-        if not validate(args.esplora, args.cli, args.datadir, [tip - 1 - k * step for k in range(5)]):
+        # Heights our node can actually answer for: from its prune height (or
+        # 0) to the tip. A fixed tip//6 grid mostly lands below a pruned node's
+        # window and compares nothing. One of them sits at 187,661 deliberately:
+        # the band where verify-esplora.sh has recorded the default source
+        # serving an orphaned block.
+        try:
+            info = json.loads(local_rpc(args.cli, args.datadir, "getblockchaininfo"))
+        except ValueError:
+            print("could not parse getblockchaininfo from the local node", file=sys.stderr)
+            return 1
+        lo = int(info.get("pruneheight") or 0)
+        hi = int(info.get("blocks") or tip) - 1
+        span = max(1, hi - lo)
+        heights = sorted({hi - k * (span // 4) for k in range(4)} | {h for h in (187661,) if lo <= h <= hi})
+        n = validate(args.esplora, args.cli, args.datadir, heights)
+        if n < 0:
             print("explorer disagreed with our node; not sampling it", file=sys.stderr)
             return 1
+        if n < MIN_VALIDATED:
+            print("validated only %d height(s); need %d to trust the explorer. Is the node pruned "
+                  "below every checked height, or --datadir wrong?" % (n, MIN_VALIDATED), file=sys.stderr)
+            return 1
+        print("validated %d of %d heights against the local node" % (n, len(heights)))
         print()
 
     width = tip // args.strata

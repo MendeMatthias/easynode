@@ -33,8 +33,8 @@ height 185,000, and since 2026-08-10 the measured average is 8.4 kB a block —
 about 8 MB a day, where the old comments claimed 1 GB a day.
 
 **Your node can have a name.** Settings has a nickname field. Set one and the
-nodes you connect to see `/BTX:0.34.6(yourname)/` instead of an anonymous
-`/BTX:0.34.6/` — the same idea as worker names in the miner, and the first
+nodes you connect to see `/BTX:0.34.5(yourname)/` instead of an anonymous
+`/BTX:0.34.5/` — the same idea as worker names in the miner, and the first
 actual mechanism behind the recognition this project offers instead of payment.
 The status screen lists the names of peers you are connected to, when they have
 them; today nobody on the network does, so easyNode's will be the first.
@@ -112,7 +112,8 @@ that serve attestations at all.
 **The local service report can be switched on.** It was read on every tick and
 written by nothing, so it could not be enabled. It writes `service-report.json`
 into your data folder every few minutes and does nothing else — no network, no
-upload, no identifier. **Nothing phones home** remains true with it on, which is
+upload — it records only what this node has served, plus the public nickname
+if you set one. **Nothing phones home** remains true with it on, which is
 why it is worded that way in Settings.
 
 **A prune posture that survives an old datadir.** btxd loads the datadir's

@@ -541,8 +541,13 @@ Also expect:
    sign with `npx tauri signer sign -p ""`, verify with `minisign -V` in WSL,
    then `gen-node-feed.py`, which independently re-checks the signature's key id.
 
-5. **Rename to the release convention.** Build outputs are
-   `easyBTX Node_<ver>_…`; assets ship as `BTX-Node_<ver>_<arch>.<ext>`.
+5. **Names are already the release convention.** The Linux and Windows
+   workflows rename the bundler's `easyBTX Node_<ver>_…` outputs to
+   `BTX-Node_<ver>_<arch>.<ext>` *before* hashing, so `SHA256SUMS` lists the
+   names that ship. Do not rename anything after download: a renamed asset no
+   longer matches its sums line and the publish gate refuses it. The mac
+   tarball is built by hand and has no CI sums file. The gate does not cover
+   it, and this page must not be read as saying it does.
 
 6. **Build the feed** (signs the keyless CI artifacts locally and
    minisign-verifies each one against the app's embedded pubkey
@@ -591,7 +596,8 @@ Also expect:
    is created as a draft and only flipped live once its assets are attached,
    every asset is re-downloaded and compared after publishing, and
    `/releases/latest` is re-read at the end. Run it WITHOUT `--publish` first:
-   that does every offline check and stops before the first API call.
+   that does every offline check, peeks at `/releases/latest` if `gh` happens
+   to be installed, and exits green, on a box without `gh` too.
 
    The SHA256SUMS gate is the one the signature cannot stand in for. A signature
    proves "these bytes, signed by our key", which is equally true of a rebuild

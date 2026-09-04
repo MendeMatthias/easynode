@@ -161,11 +161,6 @@ verify() { # <file> — verify the tauri sig against the app's embedded pubkey.
   rm -f "$dec"
 }
 
-# Mac .app.tar.gz.sig is produced by the build; only sign it if it's missing.
-if [ -n "$MAC_TGZ" ]; then
-  [ -f "${MAC_TGZ}.sig" ] || sign "$MAC_TGZ"
-  verify "$MAC_TGZ"
-fi
 # The signature proves "these bytes, signed by our key". It says NOTHING about
 # whether these bytes are the ones the derived URL will point at: gen-node-feed
 # mints every URL from --version, while this script signs whatever PATH the
@@ -193,6 +188,11 @@ expect_name() {
 [ -n "$LINUX_APPIMAGE" ] && expect_name "$LINUX_APPIMAGE" "BTX-Node_${VERSION}_amd64.AppImage"
 [ -n "$WIN_SETUP" ]      && expect_name "$WIN_SETUP"      "BTX-Node_${VERSION}_x64-setup.exe"
 
+# Mac .app.tar.gz.sig is produced by the build; only sign it if it's missing.
+if [ -n "$MAC_TGZ" ]; then
+  [ -f "${MAC_TGZ}.sig" ] || sign "$MAC_TGZ"
+  verify "$MAC_TGZ"
+fi
 if [ -n "$LINUX_APPIMAGE" ]; then sign "$LINUX_APPIMAGE"; verify "$LINUX_APPIMAGE"; fi
 if [ -n "$WIN_SETUP" ]; then sign "$WIN_SETUP"; verify "$WIN_SETUP"; fi
 

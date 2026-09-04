@@ -32,10 +32,15 @@ NICK_OK = re.compile(r"[^A-Za-z0-9 ._-]")
 
 def nickname(subver):
     """The name inside a peer's user agent: /BTX:0.34.6(alice)/ -> alice."""
-    if not subver or "(" not in subver or ")" not in subver:
+    # Mirror nickname.rs exactly: the closing paren must come AFTER the opening
+    # one. Checking that ")" merely exists somewhere let /BTX:0.34.6)x(/, a
+    # string btxd passes through untouched, raise and take the whole census
+    # with it before a single number was printed.
+    o = subver.find("(") if subver else -1
+    c = subver.find(")", o + 1) if o >= 0 else -1
+    if o < 0 or c < 0:
         return None
-    inner = subver[subver.index("(") + 1 : subver.index(")", subver.index("("))]
-    cleaned = NICK_OK.sub("", inner).strip()[:24]
+    cleaned = NICK_OK.sub("", subver[o + 1 : c]).strip()[:24]
     return cleaned or None
 
 

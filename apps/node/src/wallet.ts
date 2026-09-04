@@ -448,7 +448,10 @@ export function initWallet(): void {
   function renderView(d: WalletView): void {
     showOnly("view");
     spendable = d.trusted;
-    $("wallet-balance").textContent = `${fmtBtx(d.trusted)} BTX`;
+    // Exact, like the ceiling and the Max button: the headline and the send
+    // pane are on screen together, and for a balance that rounds UP at six
+    // decimals the rounded headline was a figure the form would refuse.
+    $("wallet-balance").textContent = `${fmtExact(d.trusted)} BTX`;
     $("wallet-address").textContent = d.address ?? "";
     const extras: string[] = [];
     if (d.pending > 0) extras.push(`${fmtBtx(d.pending)} incoming (unconfirmed)`);
