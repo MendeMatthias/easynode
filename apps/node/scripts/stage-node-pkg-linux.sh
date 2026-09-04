@@ -21,9 +21,29 @@ TARBALL_SHA256="76ad2cab712c29f744c86e93951b4fb09fbbca22f074926d5efb36c3f08c6ba7
 # NOTE: upstream publishes no `aarch64-linux-gnu` asset, so there is no ARM-Linux
 # node to stage. This script is x86_64-only by construction and always was; the
 # gap is called out here so nobody spends an afternoon looking for the tarball.
-# A CUDA build (btx-0.34.5-x86_64-linux-gnu-cuda12.tar.gz) also exists upstream
-# and is NOT what this stages: the app bundles the plain build and the node app
-# does not mine.
+# ⚠ THIS DOES NOT PRODUCE A GPU VALIDATOR, AND IT IS NOT THE RELEASE PATH.
+#
+# An earlier version of this comment said the plain build was fine because "the
+# node app does not mine". That reasoning is wrong and worth correcting in
+# place: the node app does not mine, but it DOES validate, and since the MatMul
+# v4.7 fork validation is the thing that needs the GPU. A node staged from the
+# plain tarball has no CUDA backend, so it can never advertise
+# NODE_MATMUL_CONSENSUS no matter what card is in the machine.
+#
+# Two separate reasons this tarball is a developer convenience only:
+#
+#   1. No CUDA. Upstream also publishes btx-0.34.5-x86_64-linux-gnu-cuda12.tar.gz
+#      for that, which this deliberately does not fetch, because see (2).
+#   2. glibc. The official Linux binaries need glibc 2.38, and Ubuntu LTS
+#      machines do not have it, so they will not run for most people anyway.
+#
+# The SHIPPED Linux app is built from the official source tag on Ubuntu 22.04
+# and carries its own GPU maths library and kernels (sm_75 through sm_120)
+# inside the package, which is why the AppImage is around 445 MB. See the 0.6.17
+# entry in apps/node/CHANGELOG.md.
+#
+# So: use this to get a Linux node running for development. Do not use it to
+# build something you intend to validate with, and do not use it for a release.
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="$APP_DIR/src-tauri/resources/node-pkg"
