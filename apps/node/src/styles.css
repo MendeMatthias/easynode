@@ -579,6 +579,43 @@ body {
    when the node advertises the archive bit while btxd has narrowed it to the
    live window: it looks fine from outside and is not serving history. */
 .setting-desc.needs-attention { color: var(--color-amber); }
+
+/* The nickname row needs an input and a button under its label rather than a
+   switch beside it, so it stacks instead of using the row's default two-column
+   layout. */
+.setting-row-stacked {
+  display: block;
+}
+.nickname-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+}
+.nickname-row .wallet-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.nickname-row .btn-secondary { flex: 0 0 auto; }
+/* A refusal is not a success; the shared .setting-result is green. */
+.setting-result.is-error { color: var(--color-danger); }
+/* What the network actually sees, shown verbatim, so it reads as a value and
+   not as prose. */
+/* Who else is out there, under the stat grid. Quiet by design: it is a nice
+   thing to notice, not a number anybody acts on. */
+.peer-names {
+  margin: 10px 2px 0;
+  font-size: 12px;
+  color: var(--color-muted);
+  overflow-wrap: anywhere;
+}
+
+.nickname-wire {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  color: var(--color-muted);
+  overflow-wrap: anywhere;
+}
 .setting-result { font-size: 12.5px; color: var(--color-green); }
 .settings-footer {
   font-size: 11.5px;

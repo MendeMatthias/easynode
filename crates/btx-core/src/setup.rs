@@ -728,6 +728,50 @@ maxreorgdepthwarn=3
 ";
 
     #[test]
+    fn a_nickname_with_spaces_survives_the_conf_round_trip() {
+        // uacomment is the one conf value a person types freely, and the only
+        // one where a value btxd dislikes stops the node STARTING. Spaces are
+        // the case worth pinning: the value is the rest of the line, so a name
+        // must not be truncated at the first space, and re-setting it must
+        // replace rather than append a second uacomment line.
+        let tmp = tempfile::tempdir().unwrap();
+        let conf = tmp.path().join("faststart.conf");
+        std::fs::write(
+            &conf,
+            "server=1
+prune=0
+",
+        )
+        .unwrap();
+
+        set_conf_kv(&conf, "uacomment", Some("Byron Bay node")).unwrap();
+        assert_eq!(
+            conf_kv(&conf, "uacomment").as_deref(),
+            Some("Byron Bay node")
+        );
+
+        set_conf_kv(&conf, "uacomment", Some("alice")).unwrap();
+        let body = std::fs::read_to_string(&conf).unwrap();
+        assert_eq!(
+            body.lines().filter(|l| l.starts_with("uacomment=")).count(),
+            1,
+            "re-naming must replace, not accumulate:
+{body}"
+        );
+        assert_eq!(conf_kv(&conf, "uacomment").as_deref(), Some("alice"));
+
+        // Clearing removes the key entirely. Writing `uacomment=` would give
+        // btxd an empty comment, which it renders as an empty `()`.
+        set_conf_kv(&conf, "uacomment", None).unwrap();
+        assert_eq!(conf_kv(&conf, "uacomment"), None);
+        assert!(!std::fs::read_to_string(&conf)
+            .unwrap()
+            .contains("uacomment"));
+        // And the rest of the conf is untouched throughout.
+        assert!(std::fs::read_to_string(&conf).unwrap().contains("prune=0"));
+    }
+
+    #[test]
     fn a_stub_conf_gets_its_safety_keys_back() {
         // The shape that matters: a conf reduced to the two things the append-
         // only writers put there. Nothing on the start path used to notice, and

@@ -32,6 +32,21 @@ Growth is not what it was, either: blocks left the ~1 MB MatMul mode around
 height 185,000, and since 2026-08-10 the measured average is 8.4 kB a block —
 about 8 MB a day, where the old comments claimed 1 GB a day.
 
+**Your node can have a name.** Settings has a nickname field. Set one and the
+nodes you connect to see `/BTX:0.34.6(yourname)/` instead of an anonymous
+`/BTX:0.34.6/` — the same idea as worker names in the miner, and the first
+actual mechanism behind the recognition this project offers instead of payment.
+The status screen lists the names of peers you are connected to, when they have
+them; today nobody on the network does, so easyNode's will be the first.
+
+It is off by default and it is public: a name follows your node across restarts
+and IP changes, which is what makes it recognisable and why it is a choice. The
+box takes letters, numbers, spaces, dots, dashes and underscores, up to 24
+characters, and refuses anything else rather than writing it — a name the engine
+dislikes does not get ignored, it stops the node starting. Settings shows the
+real user agent your peers are seeing, so you can tell the difference between a
+name you have saved and a name that is live: it applies at the next node start.
+
 **A wallet import can no longer point you at the wrong wallet.** If the default
 name is already taken by a different wallet, your import goes in beside it — and
 the code only adopted that new name when the call *succeeded*. But a wallet.dat

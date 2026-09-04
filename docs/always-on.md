@@ -124,7 +124,16 @@ free.
   selling something.
 
 What you get is recognition and a verifiable public record that your machine was
-there and did the work. And you get the thing itself: a chain that does not
+there and did the work.
+
+Recognition now has an actual mechanism, which it did not before. Settings has a
+**node nickname**: an optional name that rides along in the user agent your node
+introduces itself with, so peers see `/BTX:0.34.6(yourname)/` instead of an
+anonymous `/BTX:0.34.6/`. It is off by default and it is genuinely public — a
+persistent identifier that follows your node across restarts and IP changes,
+which is the whole point and also the reason it is a choice rather than a
+default. Measured across a 20-peer sample on 2026-09-05: nobody on this network
+sets one yet, so the first names out there will be easyNode's. And you get the thing itself: a chain that does not
 quietly go blind because one server in one datacentre had a bad afternoon.
 
 If that is not enough, that is a completely reasonable conclusion and we would

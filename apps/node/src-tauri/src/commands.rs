@@ -605,6 +605,25 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
         eprintln!("[node-app] could not re-apply txindex to the conf: {e}");
     }
 
+    // The public nickname, asserted for the same reason as txindex above: a
+    // provision or an engine upgrade rewrites faststart.conf wholesale and
+    // would otherwise silently drop it, so a user who named their node would
+    // quietly go back to being anonymous at the next release. Empty removes the
+    // key rather than writing `uacomment=`, which btxd renders as `()`.
+    {
+        let nick = settings.node_nickname.trim();
+        if let Err(e) = btx_core::setup::set_conf_kv(
+            &paths.faststart_conf,
+            "uacomment",
+            if nick.is_empty() { None } else { Some(nick) },
+        ) {
+            // Never fatal. A node without its nickname is still a node - and
+            // this is the one conf key where being wrong stops btxd starting,
+            // so failing soft is the right direction.
+            eprintln!("[node-app] could not re-apply the nickname to the conf: {e}");
+        }
+    }
+
     // Attestation serving (opt-in): asserted like txindex so the provision/
     // upgrade path can't silently drop it — but NEVER deleted here. The old
     // `set_conf_kv(.., None)` call REMOVED the key whenever the setting was
@@ -643,6 +662,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     *state.rc_status_cache.lock().await = None;
     *state.stall_verdict.lock().await = None;
     *state.archive_peers_cache.lock().await = None;
+    state.peer_nicknames_cache.lock().await.clear();
     *state.archive_service.lock().await = None;
 
     set_phase(app, state, NodePhase::Starting).await;
@@ -1084,6 +1104,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
     let stall_slot = state.stall_verdict.clone();
     let rc_cache_slot = state.rc_status_cache.clone();
     let archive_slot = state.archive_peers_cache.clone();
+    let nickname_slot = state.peer_nicknames_cache.clone();
     let archive_service_slot = state.archive_service.clone();
     let anchor = snapshot_spec().anchor_height;
 
@@ -1151,11 +1172,22 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                         .as_ref()
                         .map(|ps| btx_core::node_api::summarize_archive_peers(ps));
                     *archive_slot.lock().await = archive_summary.clone();
+                    // Free: the peer objects are already in hand this tick.
+                    *nickname_slot.lock().await = peer_infos
+                        .as_ref()
+                        .map(|ps| {
+                            btx_core::nickname::peer_nicknames(ps.iter().map(|p| p.subver.as_str()))
+                        })
+                        .unwrap_or_default();
                     let readiness = btx_core::health::sync_readiness(&chainstates, &chain, anchor);
                     let new_phase = if readiness.is_near_tip() {
                         NodePhase::Ready {
                             height: readiness.height(),
                             peers,
+                            // Already in hand at this tick and, until now, used
+                            // only to discriminate stalls ninety lines below —
+                            // never shown to the person reading the badge.
+                            blocks_behind: chain.headers.saturating_sub(readiness.height()),
                         }
                     } else {
                         let mut headers = chain.headers;
@@ -1452,6 +1484,7 @@ pub async fn stop_node_inner(state: &AppState) {
     // them made get_node_status report the dead run's stall as live.
     *state.stall_verdict.lock().await = None;
     *state.archive_peers_cache.lock().await = None;
+    state.peer_nicknames_cache.lock().await.clear();
     *state.archive_service.lock().await = None;
     // Release the keep-awake assertion — the Mac may sleep again.
     *state.sleep_guard.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1574,6 +1607,18 @@ pub struct NodeStatusInfo {
     /// copy in TypeScript that drifts from the first.
     pub archive_service_message: Option<String>,
     pub archive_service_needs_attention: bool,
+    /// The nickname the user has chosen (empty = none). This is what WILL be
+    /// broadcast; `subversion` below is what IS.
+    pub node_nickname: String,
+    /// Our user agent exactly as peers see it, e.g. `/BTX:0.34.6(alice)/`.
+    /// `None` when the node is not running or did not answer. Shown rather than
+    /// derived, because btxd builds this once at init: a nickname set after the
+    /// node started is not live until the next start, and the honest way to say
+    /// that is to display the real string beside the setting.
+    pub subversion: Option<String>,
+    /// Nicknames of the peers we are connected to. Untrusted display text
+    /// chosen by strangers — filtered and capped by `btx_core::nickname`.
+    pub peer_nicknames: Vec<String>,
     /// The local service report (`service-report.json` in the datadir) — the
     /// persisted user choice. Local file only; nothing is uploaded.
     pub service_report_enabled: bool,
@@ -1758,13 +1803,15 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
     };
 
     // Same shape and the same degrade-to-None discipline as bytes_sent above.
-    let inbound_peers = match rpc.as_ref() {
-        Some(rpc) => btx_core::node_api::get_connection_counts(rpc)
-            .await
-            .ok()
-            .map(|c| c.inbound),
+    // The whole struct is kept because `subversion` rides along on the same
+    // getnetworkinfo — showing a user exactly what the network sees them as
+    // therefore costs no extra RPC.
+    let net = match rpc.as_ref() {
+        Some(rpc) => btx_core::node_api::get_connection_counts(rpc).await.ok(),
         None => None,
     };
+    let inbound_peers = net.as_ref().map(|c| c.inbound);
+    let subversion = net.map(|c| c.subversion).filter(|s| !s.is_empty());
 
     // Read the frontier verdict ONCE: the payload carries the tagged value for
     // machines and the rendered sentence for people, and taking the lock twice
@@ -1775,6 +1822,12 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
     // refresher's per-tick cache (≤3 s old) instead of running a second full
     // getpeerinfo on every ~1.5 s UI poll. Same degrade-to-None discipline as
     // bytes_sent: no measurement, no claim.
+    let peer_nicknames = if running {
+        state.peer_nicknames_cache.lock().await.clone()
+    } else {
+        Vec::new()
+    };
+
     let archive_peers = if running {
         state.archive_peers_cache.lock().await.clone()
     } else {
@@ -1805,6 +1858,9 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         attestation_serve_enabled: settings.attestation_serve_enabled,
         archive_service: archive_service.clone(),
         archive_service_message: archive_service.as_ref().map(|a| a.message()),
+        node_nickname: settings.node_nickname.clone(),
+        subversion,
+        peer_nicknames,
         archive_service_needs_attention: archive_service
             .as_ref()
             .is_some_and(|a| a.needs_attention()),
@@ -2080,6 +2136,45 @@ pub async fn set_attestation_serve(on: bool) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Set (or clear) the public nickname other nodes see.
+///
+/// Writes `uacomment` into the conf and persists the choice. It applies at the
+/// next node start, like every other conf-level setting — btxd builds its user
+/// agent once at init and there is no RPC to change it live.
+///
+/// Returns the CLEANED value so the settings box can show what was actually
+/// stored: outer whitespace trimmed, inner runs collapsed. An invalid nickname
+/// is refused with a sentence the UI can print verbatim, and nothing is written
+/// — which matters more than usual here, because btxd fails to start on a
+/// comment it rejects, so a bad value would turn a cosmetic setting into a node
+/// that will not come back up.
+#[tauri::command]
+pub async fn set_node_nickname(name: String) -> Result<String, String> {
+    let cleaned = btx_core::nickname::validate_nickname(&name)
+        .map_err(|e| e.message())?
+        .unwrap_or_default();
+
+    let datadir = node_datadir();
+    NodeAppSettings::update(&datadir, |s| s.node_nickname = cleaned.clone());
+
+    let conf = datadir.join("faststart").join("faststart.conf");
+    if conf.exists() {
+        // An empty nickname REMOVES the key rather than writing `uacomment=`,
+        // which btxd would read as an empty comment and render as `()`.
+        btx_core::setup::set_conf_kv(
+            &conf,
+            "uacomment",
+            if cleaned.is_empty() {
+                None
+            } else {
+                Some(cleaned.as_str())
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(cleaned)
 }
 
 /// Turn the local service report on or off.

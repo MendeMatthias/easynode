@@ -26,6 +26,7 @@ pub mod frontier;
 pub mod fsx;
 pub mod health;
 pub mod installer;
+pub mod nickname;
 pub mod node;
 pub mod node_api;
 pub mod platform;

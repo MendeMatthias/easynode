@@ -106,6 +106,18 @@ pub struct NodeAppSettings {
     /// update. Default "full": existing installs keep exactly their behavior.
     #[serde(default = "default_profile")]
     pub node_profile: String,
+    /// Optional public nickname, broadcast to every peer as the user agent
+    /// comment: `/BTX:0.34.6(yourname)/`. Empty = no nickname, which is the
+    /// default and must stay the default.
+    ///
+    /// This is the one setting in this struct that OTHER PEOPLE can see. It is
+    /// a persistent public identifier that follows the node across restarts and
+    /// IP changes, so it is opt-in, easy to clear, and the UI says what it does
+    /// before it is set rather than after. Validation lives in
+    /// `btx_core::nickname`, deliberately stricter than btxd's, because btxd
+    /// refuses to START on a comment it does not like.
+    #[serde(default)]
+    pub node_nickname: String,
 }
 
 fn default_on_close() -> String {
@@ -135,6 +147,9 @@ impl Default for NodeAppSettings {
             attestation_serve_enabled: false,
             service_report_enabled: false,
             node_profile: default_profile(),
+            // No nickname. Anything else would publish an identifier the user
+            // never chose to publish.
+            node_nickname: String::new(),
         }
     }
 }
@@ -218,7 +233,21 @@ pub enum NodePhase {
         peers: i64,
     },
     /// Node running at/near the tip — helping the network.
-    Ready { height: u64, peers: i64 },
+    ///
+    /// `blocks_behind` is how far the active chain trails the best header we
+    /// know about. It is carried because "near tip" is a BOOLEAN with no lag
+    /// term in it: `sync_readiness` returns NearTip the moment a snapshot
+    /// chainstate loads at the anchor, and the anchor is a fixed height in a
+    /// shipped release. On a fresh install the badge therefore flips to LIVE
+    /// while the node is still thousands of blocks short, and stays there while
+    /// it grinds. The verdict is not changed here — that is a product decision
+    /// about what "ready" means — but the number is no longer withheld from the
+    /// screen that claims it.
+    Ready {
+        height: u64,
+        peers: i64,
+        blocks_behind: u64,
+    },
     /// Node deliberately stopped by the user.
     Stopped,
     /// Something failed; message is plain-language and actionable.
@@ -288,6 +317,10 @@ pub struct AppState {
     /// ~1.5 s on top of the refresher's — three duplicate pipelines for the
     /// same numbers. None when stopped or the node did not answer.
     pub archive_peers_cache: Arc<Mutex<Option<btx_core::node_api::ArchivePeerSummary>>>,
+    /// Nicknames of connected peers, from the SAME per-tick getpeerinfo as the
+    /// census above. Cached for the same reason: the UI polls ~1.5 s and a
+    /// second full getpeerinfo for a decorative list would be indefensible.
+    pub peer_nicknames_cache: Arc<Mutex<Vec<String>>>,
 }
 
 impl AppState {
@@ -315,6 +348,7 @@ impl AppState {
             stall_verdict: Arc::new(Mutex::new(None)),
             archive_service: Arc::new(Mutex::new(None)),
             archive_peers_cache: Arc::new(Mutex::new(None)),
+            peer_nicknames_cache: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -423,6 +457,7 @@ mod tests {
         let r = NodePhase::Ready {
             height: 155052,
             peers: 8,
+            blocks_behind: 0,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["phase"], "ready");

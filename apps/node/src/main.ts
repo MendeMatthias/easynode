@@ -50,7 +50,7 @@ type NodePhase =
   | { phase: "warming"; message: string }
   | { phase: "loading_snapshot" }
   | { phase: "syncing"; height: number; headers: number; progress: number; peers: number }
-  | { phase: "ready"; height: number; peers: number }
+  | { phase: "ready"; height: number; peers: number; blocks_behind: number }
   | { phase: "stopped" }
   | { phase: "error"; message: string };
 
@@ -83,6 +83,9 @@ export interface NodeStatusInfo {
   // place. Null until the refresher has completed a tick.
   archive_service_message: string | null;
   archive_service_needs_attention: boolean;
+  node_nickname: string;
+  subversion: string | null;
+  peer_nicknames: string[];
   service_report_enabled: boolean;
   wallet_enabled: boolean;
   on_close: string;
@@ -235,6 +238,12 @@ function setupPhaseLabel(phase: NodePhase): string {
 }
 
 // ── Formatting helpers ───────────────────────────────────────────────────────
+
+// How far behind the best header the active chain has to be before the badge
+// says so. Small enough that a real catch-up shows, large enough that ordinary
+// reorg churn (this chain rebuilds its tip ~91x/day) does not make the line
+// flicker. Presentation only — nothing decides behaviour on it.
+const LAG_WORTH_SAYING = 10;
 
 function fmtGB(mb: number): string {
   if (mb <= 0) return "—";
@@ -453,6 +462,8 @@ function renderStatus(status: NodeStatusInfo) {
   const sub = $("status-sub");
   const errCard = $("status-error");
 
+  reflectPeerNames(status);
+
   const mode = visualMode(p, status.rc_stalled);
   orb.className = `status-orb is-${mode}`;
   errCard.hidden = true;
@@ -477,6 +488,14 @@ function renderStatus(status: NodeStatusInfo) {
       } else if (status.rc_may_fall_behind) {
         badge.textContent = "LIVE";
         sub.textContent = "Your node is helping the network, checking blocks on the processor";
+      } else if (p.blocks_behind >= LAG_WORTH_SAYING) {
+        // "Near tip" is a boolean with no lag term: it flips the moment the
+        // snapshot chainstate loads at a height fixed in the release, so a
+        // fresh install reads LIVE while still thousands of blocks short and
+        // grinding. Still LIVE — it is running and connected — but say the gap
+        // rather than let "helping the network" stand on its own.
+        badge.textContent = "LIVE";
+        sub.textContent = `Your node is live, still catching up — ${fmtInt(p.blocks_behind)} blocks behind`;
       } else {
         // "LIVE", not "READY": the node is running and serving the network now —
         // "ready" reads like it's waiting to do something.
@@ -685,6 +704,7 @@ $("settings-btn").addEventListener("click", async () => {
     // carried it since; nothing displayed it, so a node advertising the archive
     // bit while silently degraded to the live window looked completely fine.
     reflectArchiveService(lastStatus);
+    reflectNickname(lastStatus);
     $<HTMLInputElement>("report-toggle").checked = lastStatus.service_report_enabled;
     $<HTMLInputElement>("wallet-toggle").checked = lastStatus.wallet_enabled;
     reflectOnClose(lastStatus.on_close);
@@ -739,6 +759,50 @@ $<HTMLInputElement>("keeper-toggle").addEventListener("change", (e) => {
  * plainly that it activates with the next node engine update — a stored
  * promise, not a silent no-op.
  */
+function reflectNickname(status: NodeStatusInfo): void {
+  const input = $<HTMLInputElement>("nickname-input");
+  // Never clobber what somebody is in the middle of typing.
+  if (document.activeElement !== input) input.value = status.node_nickname;
+
+  const desc = $("nickname-desc");
+  // Show the REAL user agent, not one derived from the setting. btxd builds it
+  // once at init, so a nickname saved while the node is up is not live until
+  // the next start — and the honest way to say that is to print what peers are
+  // actually seeing right now.
+  if (status.subversion) {
+    desc.textContent = "Other nodes see you as ";
+    const wire = document.createElement("span");
+    wire.className = "nickname-wire";
+    wire.textContent = status.subversion; // textContent: this came off the node
+    desc.append(wire);
+    if (status.node_nickname && !status.subversion.includes(`(${status.node_nickname})`)) {
+      desc.append(" — your new name applies the next time the node starts");
+    }
+  } else {
+    desc.textContent =
+      "Optional. Every node you connect to sees this name. Leave empty to stay anonymous";
+  }
+}
+
+/// Names of the peers we can see. The whole point of a nickname is that other
+/// people have one too, so say how many are out there — including when the
+/// answer is none, which is what it is on this network today.
+function reflectPeerNames(status: NodeStatusInfo): void {
+  const el = document.getElementById("peer-names");
+  if (!el) return;
+  const names = status.peer_nicknames;
+  if (names.length === 0) {
+    el.textContent = "";
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  // textContent throughout: these strings were chosen by strangers and arrived
+  // over the wire. btx_core::nickname filters and caps them; this is the second
+  // layer, and it is the one that makes markup impossible rather than unlikely.
+  el.textContent = `Connected to ${names.join(", ")}`;
+}
+
 function reflectArchiveService(status: NodeStatusInfo): void {
   const row = $("serve-toggle").closest(".setting-row");
   const desc = row?.querySelector(".setting-desc");
@@ -783,6 +847,39 @@ $<HTMLInputElement>("report-toggle").addEventListener("change", (e) => {
       ),
     )
     .catch(() => showToast("Could not change that setting"));
+});
+
+// Saving a nickname is a deliberate act with a Save button, not a live-as-you-
+// type setting. Two reasons: it is written into the conf that starts btxd, and
+// it is the one setting other people can see, so committing to it should be a
+// decision rather than a side effect of tabbing away.
+async function saveNickname(): Promise<void> {
+  const input = $<HTMLInputElement>("nickname-input");
+  const btn = $<HTMLButtonElement>("nickname-save");
+  const result = $("nickname-result");
+  btn.disabled = true;
+  try {
+    const stored = await invoke<string>("set_node_nickname", { name: input.value });
+    input.value = stored;
+    result.classList.remove("is-error");
+    result.textContent = stored
+      ? `Saved. Other nodes will see "${stored}" from the next time your node starts.`
+      : "Nickname cleared. Your node is anonymous again from its next start.";
+    result.hidden = false;
+  } catch (e) {
+    // The Rust side refuses rather than writes on anything btxd would reject,
+    // so this is a sentence about what to type, not a stack trace.
+    result.classList.add("is-error");
+    result.textContent = String(e);
+    result.hidden = false;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$("nickname-save").addEventListener("click", () => void saveNickname());
+$("nickname-input").addEventListener("keydown", (e) => {
+  if ((e as KeyboardEvent).key === "Enter") void saveNickname();
 });
 
 $<HTMLInputElement>("serve-toggle").addEventListener("change", (e) => {
