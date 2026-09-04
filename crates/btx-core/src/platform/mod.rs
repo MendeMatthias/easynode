@@ -91,6 +91,25 @@ pub fn process_is_alive(pid: u32) -> bool {
     imp::process_is_alive(pid)
 }
 
+/// When this machine booted, as an absolute time, or `None` when the platform
+/// cannot tell us. Linux reads `btime` from `/proc/stat`; macOS reads
+/// `kern.boottime` from `sysctl`; Windows returns `None` (see the note in
+/// `platform/windows.rs`).
+///
+/// Used by `node::pidfile_predates_boot` to disqualify a pidfile written before
+/// the current boot: pid numbers are handed out per boot, so a file that
+/// outlived one names a slot the new boot has already reused. `None` disables
+/// that single check and nothing else — confirming the holder is NAMED btxd is
+/// the primary guard, and that one works on every platform.
+///
+/// An answer in the future means we misread it, so it is discarded here rather
+/// than passed on: an unusable clock must degrade to "unknown", never to one
+/// that would declare live pidfiles stale.
+pub fn boot_time() -> Option<std::time::SystemTime> {
+    let t = imp::boot_time()?;
+    (t <= std::time::SystemTime::now()).then_some(t)
+}
+
 /// The executable/command name of `pid` (no path, no extension), or `None` on
 /// any error. unix: `ps -p <pid> -o comm=`; Windows: `tasklist`. Used to confirm
 /// a pid is really btxd before force-killing it, so a reused pid is never killed.

@@ -122,6 +122,29 @@ pub fn process_is_alive(pid: u32) -> bool {
     ok != 0 && code == STILL_ACTIVE
 }
 
+pub fn boot_time() -> Option<std::time::SystemTime> {
+    // NOT IMPLEMENTED, ON PURPOSE, AND THIS IS NOT ANOTHER `parent_pid` STUB.
+    //
+    // The call is one line — `GetTickCount64()` is milliseconds since boot, so
+    // `SystemTime::now() - that` is the boot instant — but it needs
+    // `Win32_System_SystemInformation` added to the windows-sys features, and
+    // this repository has no Windows CI job (ci.yml runs ubuntu, ubuntu,
+    // macos). Nothing here would catch a Windows-only compile error before a
+    // contributor building the first Windows package hit it.
+    //
+    // What `None` costs: `node::pidfile_predates_boot` always answers false, so
+    // a Windows pidfile is never disqualified on age alone. What it does NOT
+    // cost: the primary guard — confirming the pid is a process named btxd,
+    // via `tasklist` in `process_name` — is fully implemented here, and it is
+    // the one that catches a pid recycled inside a single boot, which is how
+    // the 2026-09-04 stand-down actually happened. The parent_pid stub was
+    // different in kind: it silently made two launch plans unreachable.
+    //
+    // Filling this in, together with a windows-latest CI job to keep it honest,
+    // is a good first Windows contribution. See CONTRIBUTING.md.
+    None
+}
+
 pub async fn process_name(pid: u32) -> Option<String> {
     // `tasklist /FI "PID eq <pid>" /FO CSV /NH` → a CSV row whose first field is
     // the image name, e.g. `"btxd.exe","1234",...`. Parse the first quoted field

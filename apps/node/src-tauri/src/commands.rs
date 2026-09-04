@@ -13,7 +13,7 @@ use btx_core::error::AppError;
 use btx_core::installer::{
     install_dir, resolve_bundled_node_pkg, returning_launch_paths, FaststartResult,
 };
-use btx_core::node::{NodeController, BTX_BOOTSTRAP_PEERS};
+use btx_core::node::{DatadirHolder, NodeController, BTX_BOOTSTRAP_PEERS};
 use btx_core::node_api::{get_blockchain_info, get_chainstates};
 use btx_core::rpc::RpcClient;
 use btx_core::setup::{
@@ -218,6 +218,14 @@ const LAUNCH_SURVIVAL_WATCH: std::time::Duration = std::time::Duration::from_sec
 /// failure ended with NO node running precisely because the old flow had zero
 /// retries after a lost lock race.
 const LAUNCH_ATTEMPTS: u32 = 3;
+/// How many times a launch looks again at a holder it must not disturb before
+/// it stops waiting and decides. Six looks, five seconds apart, is about half a
+/// minute: long enough for another app's btxd to finish binding RPC after its
+/// own start (the legitimate reason for this wait), short enough that a person
+/// watching "Starting" does not conclude the app is wedged. Zero would be the
+/// old behaviour — refuse on the first look — which is the bug.
+const HOLDER_RECHECKS: u32 = 6;
+const HOLDER_RECHECK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Flush budget when stopping a node we ATTACHED to rather than spawned. Must
 /// match the managed path's grace: after a self-update relaunch the app is
 /// always attached (it adopted the orphan), so this is the budget most quits
@@ -262,10 +270,19 @@ pub(crate) enum PreLaunchPlan {
     /// shutdown flush, or busy past the probe timeout): stop/wait it out,
     /// then spawn — never race its `.lock`.
     ClearStaleHolder,
-    /// No RPC answer and the holder belongs to a LIVE parent app (the miner's
-    /// solo node, or another instance of this app): hands off — error out
-    /// honestly instead of stopping it or racing its lock.
+    /// No RPC answer and the holder is PROVEN to be a btxd belonging to a live
+    /// parent app (the miner's solo node, or another instance of this app),
+    /// and it stayed that way across the whole recheck budget: hands off —
+    /// error out honestly instead of stopping it or racing its lock.
     ManagedElsewhereNoRpc,
+    /// No RPC answer and a holder we must not disturb — but not one we have
+    /// watched long enough to be sure of. Wait `HOLDER_RECHECK_WAIT` and
+    /// evaluate the whole picture again.
+    RecheckHolder,
+    /// The recheck budget is spent and `btxd.pid` still names a live process we
+    /// could not identify: launch anyway. See `pre_launch_plan` for why this
+    /// beats standing down.
+    AdoptUnprovenHolder,
     /// Nothing holds the datadir: plain spawn.
     SpawnFresh,
 }
@@ -282,35 +299,80 @@ pub(crate) enum PreLaunchPlan {
 /// ("Cannot obtain a lock…"), the old one was stopped by `stop_stale`'s
 /// side-effect, and NOTHING was left running until a manual restart.
 ///
+/// THE 2026-09-04 STAND-DOWN (Linux signer rig). The holder used to be a pair
+/// of booleans derived from `kill(pid, 0)` on `<datadir>/btxd.pid`. After a
+/// restart that file still read 717 from a btxd that had died without cleaning
+/// up, the OS had recycled 717 onto an unrelated process, and so a start with
+/// no btxd on the machine at all — nothing listening on 19334 — planned
+/// `ManagedElsewhereNoRpc`, returned an error naming an app that was not
+/// running, and did it again on every subsequent start. Two things were wrong,
+/// and both are fixed here:
+///
+///   * The holder was COUNTED, not identified. `btx_core::node::datadir_holder`
+///     now requires the pid to be a live process actually named btxd, the same
+///     standard `stop_stale` and the force-kill path already applied before
+///     they signal anything. A recycled pid classifies as `Free` and we launch.
+///   * The refusal was PERMANENT. `ManagedElsewhereNoRpc` disarms the launch
+///     record and returns `Err`, so nothing retried; the app's own message
+///     ("give it a moment") described a wait it never performed. A holder we
+///     must not disturb now buys a bounded wait — `RecheckHolder`, at most
+///     `HOLDER_RECHECKS` looks — and the decision is taken again each time,
+///     because "another app's node is still warming up" is a state that ends.
+///
+/// WHAT HAPPENS WHEN THE BUDGET RUNS OUT depends on what we could prove, and
+/// this is the deliberate part:
+///
+///   * A PROVEN live app's btxd keeps the hands-off refusal. That is not a
+///     failure to recover: bouncing the miner's solo node would fight its own
+///     recovery supervisor, and the message is now true when it prints, so the
+///     user has something they can act on.
+///   * An UNIDENTIFIABLE holder (`ps`/`tasklist` could not name a live pid) is
+///     adopted instead — `AdoptUnprovenHolder`, which spawns. We refuse to keep
+///     a home node off the network on the strength of a number we could not
+///     even attach a name to. The downside is bounded and self-announcing: if
+///     some real btxd does hold the lock, our spawn loses the race, says so,
+///     and `spawn_node_with_lock_retry` retries. Never starting is the only
+///     failure with no way out. Note what this does NOT do: no process is ever
+///     stopped, signalled or killed on the strength of an unproven holder.
+///
 /// Inputs:
 ///   - `rpc_answering`: a node answered `getblockchaininfo` on this datadir.
 ///   - `upgraded_this_start`: THIS call provisioned new-tag binaries (the
 ///     persisted tag moved to `NODE_RELEASE_TAG`); a serving node therefore
 ///     runs the OLD binaries and must be restarted to pick the upgrade up.
-///   - `holder_alive`: `<datadir>/btxd.pid` names a live process.
-///   - `holder_managed`: that holder has a live parent app supervising it
-///     (never stop those — bouncing the miner's solo node starts a restart
-///     fight with its recovery supervisor).
+///   - `holder`: what actually holds the datadir, identified — see
+///     [`DatadirHolder`]. An unidentifiable holder counts as hands-off for the
+///     upgrade-restart question too, which is a small deliberate change: we no
+///     longer bounce a serving node on behalf of an upgrade when we cannot name
+///     the process holding its pidfile. The upgrade lands on its next restart.
+///   - `rechecks_exhausted`: the caller has already spent its `RecheckHolder`
+///     budget on this start, so this decision is final.
 pub(crate) fn pre_launch_plan(
     rpc_answering: bool,
     upgraded_this_start: bool,
-    holder_alive: bool,
-    holder_managed: bool,
+    holder: DatadirHolder,
+    rechecks_exhausted: bool,
 ) -> PreLaunchPlan {
+    // A holder we must not disturb: a btxd another live app supervises, or one
+    // we could not identify at all.
+    let hands_off = matches!(
+        holder,
+        DatadirHolder::ManagedBtxd { .. } | DatadirHolder::Unidentifiable { .. }
+    );
     if rpc_answering {
-        if upgraded_this_start && !holder_managed {
+        if upgraded_this_start && !hands_off {
             PreLaunchPlan::RestartForUpgrade
         } else {
             PreLaunchPlan::Attach
         }
-    } else if holder_alive {
-        if holder_managed {
-            PreLaunchPlan::ManagedElsewhereNoRpc
-        } else {
-            PreLaunchPlan::ClearStaleHolder
-        }
     } else {
-        PreLaunchPlan::SpawnFresh
+        match holder {
+            DatadirHolder::Free => PreLaunchPlan::SpawnFresh,
+            DatadirHolder::OrphanedBtxd { .. } => PreLaunchPlan::ClearStaleHolder,
+            _ if !rechecks_exhausted => PreLaunchPlan::RecheckHolder,
+            DatadirHolder::ManagedBtxd { .. } => PreLaunchPlan::ManagedElsewhereNoRpc,
+            DatadirHolder::Unidentifiable { .. } => PreLaunchPlan::AdoptUnprovenHolder,
+        }
     }
 }
 
@@ -514,34 +576,49 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
 
     set_phase(app, state, NodePhase::Starting).await;
 
-    // Reconcile with whatever btxd may already hold the shared datadir. Four
-    // observable facts feed ONE pure, regression-tested decision
-    // (`pre_launch_plan`) — see its doc comment for the 2026-08-12 self-update
-    // failure this exists to prevent.
-    let probe = rpc_already_answering(&datadir).await;
-    let holder_alive = btx_core::node::btxd_pidfile_alive(&datadir);
-    // "Managed" = the holder has a live parent app supervising it (the miner's
-    // solo node shares this datadir, or a second instance of this app). Only
-    // worth resolving when something actually holds the datadir.
-    let holder_managed = if holder_alive {
-        match std::fs::read_to_string(datadir.join("btxd.pid"))
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-        {
-            Some(pid) => {
-                let ppid = btx_core::platform::parent_pid(pid).await;
-                let parent_alive = ppid
-                    .map(btx_core::platform::process_is_alive)
-                    .unwrap_or(false);
-                !btx_core::node::holder_is_orphaned(ppid, parent_alive)
+    // Reconcile with whatever btxd may already hold the shared datadir. Two
+    // observed facts feed ONE pure, regression-tested decision
+    // (`pre_launch_plan`) — see its doc comment for the two failures this
+    // exists to prevent.
+    //
+    // The loop is the second half of the 2026-09-04 fix: a holder we must not
+    // disturb gets looked at again rather than ending the start on the spot.
+    // Both facts are re-read every pass, because either can change — the other
+    // app's node finishes warming up and answers RPC, or its btxd exits.
+    let mut rechecks = 0u32;
+    let (plan, probe, holder) = loop {
+        let probe = rpc_already_answering(&datadir).await;
+        let holder = btx_core::node::datadir_holder(&datadir).await;
+        let plan = pre_launch_plan(
+            probe.is_some(),
+            upgraded_this_start,
+            holder,
+            rechecks >= HOLDER_RECHECKS,
+        );
+        if plan != PreLaunchPlan::RecheckHolder {
+            if rechecks > 0 {
+                set_phase(app, state, NodePhase::Starting).await;
             }
-            None => false,
+            break (plan, probe, holder);
         }
-    } else {
-        false
+        rechecks += 1;
+        eprintln!(
+            "[node-app] {holder:?} holds this datadir and nothing is answering RPC yet; \
+             looking again in {}s ({rechecks}/{HOLDER_RECHECKS})",
+            HOLDER_RECHECK_WAIT.as_secs()
+        );
+        // A silent "Starting" through this wait reads as a hang. Say what is
+        // being waited for, the same way the lock-race wait does.
+        set_phase(
+            app,
+            state,
+            NodePhase::Warming {
+                message: "Waiting for the node already using this folder…".to_string(),
+            },
+        )
+        .await;
+        tokio::time::sleep(HOLDER_RECHECK_WAIT).await;
     };
-
-    let plan = pre_launch_plan(probe.is_some(), upgraded_this_start, holder_alive, holder_managed);
 
     let rpc = match plan {
         PreLaunchPlan::Attach => {
@@ -561,23 +638,35 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
             }
             client
         }
+        PreLaunchPlan::RecheckHolder => {
+            unreachable!("the loop above only breaks on a final plan")
+        }
         PreLaunchPlan::ManagedElsewhereNoRpc => {
+            // Reachable only for a holder we PROVED is a btxd with a live
+            // parent app, and only after the whole recheck budget: every word
+            // of the message below is now something we checked.
+            let DatadirHolder::ManagedBtxd { pid } = holder else {
+                unreachable!("ManagedElsewhereNoRpc is only planned for a proven btxd holder")
+            };
+            let waited = HOLDER_RECHECKS as u64 * HOLDER_RECHECK_WAIT.as_secs();
             eprintln!(
-                "[node-app] a live app's btxd holds this datadir but isn't answering RPC; \
-                 standing down instead of stopping it or racing its lock"
+                "[node-app] a live app's btxd (pid {pid}) holds this datadir and did not answer \
+                 RPC in {waited}s; standing down instead of stopping it or racing its lock"
             );
             // Hands-off includes quit: with the launch record armed, quitting
             // after this error would gracefully stop the OTHER app's node via
             // the attached-mode stop path. We never adopted it — disarm.
             *state.launch.lock().await = None;
-            return Err(
-                "another easyBTX app (the miner, or a second window of this app) is running \
-                 the node on this datadir and it isn't answering yet — give it a moment, or \
-                 quit that app and try again"
-                    .to_string(),
-            );
+            return Err(format!(
+                "another easyBTX app (the miner, or a second window of this app) is running the \
+                 node in this folder — btxd, process {pid} — and it did not answer in {waited}s. \
+                 Give it another moment, or quit that app and try again"
+            ));
         }
-        PreLaunchPlan::RestartForUpgrade | PreLaunchPlan::ClearStaleHolder | PreLaunchPlan::SpawnFresh => {
+        PreLaunchPlan::RestartForUpgrade
+        | PreLaunchPlan::ClearStaleHolder
+        | PreLaunchPlan::AdoptUnprovenHolder
+        | PreLaunchPlan::SpawnFresh => {
             match plan {
                 PreLaunchPlan::RestartForUpgrade => eprintln!(
                     "[node-app] node upgrade: a node from the previous binaries ({tag_before}) is \
@@ -586,6 +675,13 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
                 PreLaunchPlan::ClearStaleHolder => eprintln!(
                     "[node-app] a btxd nobody manages still holds this datadir without answering \
                      RPC (mid-shutdown, or busy past the probe timeout) — stopping it before launch"
+                ),
+                PreLaunchPlan::AdoptUnprovenHolder => eprintln!(
+                    "[node-app] btxd.pid names a live process we could not identify and nothing \
+                     answered RPC in {}s — launching rather than refusing forever. If a real btxd \
+                     holds the lock this spawn loses the race and says so, which is recoverable; \
+                     never starting is not",
+                    HOLDER_RECHECKS as u64 * HOLDER_RECHECK_WAIT.as_secs()
                 ),
                 _ => {}
             }
@@ -678,7 +774,11 @@ async fn spawn_node_with_lock_retry(
         // long stop-wait below, and whether the post-spawn survival watch runs
         // at all — a CLEAN datadir can't lose a lock race, so the ordinary
         // boot path keeps its instant hand-off to the RPC wait.
-        let raced_holder = btx_core::node::btxd_pidfile_alive(datadir);
+        // Identified, not counted (2026-09-04): a `btxd.pid` whose number has
+        // been recycled onto an unrelated process would otherwise cost every
+        // attempt the full stop grace — minutes of waiting out a daemon that
+        // does not exist — before a spawn that was safe from the first second.
+        let raced_holder = btx_core::node::datadir_holder(datadir).await != DatadirHolder::Free;
         if raced_holder {
             eprintln!(
                 "[node-app] waiting out the btxd holding this datadir (attempt \
@@ -1912,6 +2012,18 @@ pub async fn node_footprint(state: State<'_, AppState>) -> Result<NodeFootprint,
 #[cfg(test)]
 mod tests {
     use super::{pre_launch_plan, PreLaunchPlan};
+    use btx_core::node::DatadirHolder;
+
+    // The four things `<datadir>/btxd.pid` can turn out to mean, named so the
+    // tables below read as sentences. That they carry a pid at all is the
+    // 2026-09-04 change: a holder is a process, not a boolean.
+    const NOTHING: DatadirHolder = DatadirHolder::Free;
+    const AN_ORPHAN: DatadirHolder = DatadirHolder::OrphanedBtxd { pid: 717 };
+    const ANOTHER_APPS: DatadirHolder = DatadirHolder::ManagedBtxd { pid: 717 };
+    const UNNAMEABLE: DatadirHolder = DatadirHolder::Unidentifiable { pid: 717 };
+    // The recheck budget, before and after it is spent.
+    const FIRST_LOOK: bool = false;
+    const BUDGET_SPENT: bool = true;
 
     // ── The tag-migration + attach decision ─────────────────────────────────
     // Regression tests for the 2026-08-12 0.6.1→0.6.2 self-update failure:
@@ -1924,7 +2036,7 @@ mod tests {
     #[test]
     fn upgrade_start_restarts_a_serving_orphan_instead_of_attaching() {
         assert_eq!(
-            pre_launch_plan(true, true, true, false),
+            pre_launch_plan(true, true, AN_ORPHAN, FIRST_LOOK),
             PreLaunchPlan::RestartForUpgrade
         );
     }
@@ -1933,9 +2045,15 @@ mod tests {
     /// node runs the binaries we'd launch — plain attach stays correct.
     #[test]
     fn plain_start_attaches_when_the_tag_did_not_move() {
-        assert_eq!(pre_launch_plan(true, false, true, false), PreLaunchPlan::Attach);
+        assert_eq!(
+            pre_launch_plan(true, false, AN_ORPHAN, FIRST_LOOK),
+            PreLaunchPlan::Attach
+        );
         // Managed by a live app (miner solo): also attach.
-        assert_eq!(pre_launch_plan(true, false, true, true), PreLaunchPlan::Attach);
+        assert_eq!(
+            pre_launch_plan(true, false, ANOTHER_APPS, FIRST_LOOK),
+            PreLaunchPlan::Attach
+        );
     }
 
     /// Never bounce a node another LIVE app supervises, even for an upgrade —
@@ -1943,43 +2061,126 @@ mod tests {
     /// The upgrade lands on that node's next natural restart instead.
     #[test]
     fn upgrade_start_leaves_a_live_apps_node_alone() {
-        assert_eq!(pre_launch_plan(true, true, true, true), PreLaunchPlan::Attach);
+        assert_eq!(
+            pre_launch_plan(true, true, ANOTHER_APPS, FIRST_LOOK),
+            PreLaunchPlan::Attach
+        );
+        // Same restraint when the holder is merely unnameable: an upgrade is
+        // not a reason to bounce a serving node we cannot identify. It lands
+        // on that node's next restart.
+        assert_eq!(
+            pre_launch_plan(true, true, UNNAMEABLE, FIRST_LOOK),
+            PreLaunchPlan::Attach
+        );
     }
 
     /// Flavor B of the regression — the observed crash: the probe missed (old
     /// node busy past the RPC timeout / mid-shutdown), an orphaned btxd still
     /// held the datadir, and the old code spawned straight into the held lock.
-    /// The new plan stops/waits the orphan out first — upgrade or not.
+    /// The new plan stops/waits the orphan out first — upgrade or not, and
+    /// without spending the recheck budget: an orphan is proven and actionable
+    /// on the first look.
     #[test]
     fn an_unmanaged_holder_without_rpc_is_stopped_and_waited_out_not_raced() {
         assert_eq!(
-            pre_launch_plan(false, true, true, false),
+            pre_launch_plan(false, true, AN_ORPHAN, FIRST_LOOK),
             PreLaunchPlan::ClearStaleHolder
         );
         assert_eq!(
-            pre_launch_plan(false, false, true, false),
+            pre_launch_plan(false, false, AN_ORPHAN, FIRST_LOOK),
             PreLaunchPlan::ClearStaleHolder
         );
     }
 
-    /// A live app's node that isn't answering (still starting, or busy) is not
-    /// ours to stop OR to race: fail the start honestly.
+    // ── Identifying the holder, and not refusing forever ────────────────────
+    // Regression tests for the 2026-09-04 stand-down on the Linux signer rig:
+    // see `pre_launch_plan`'s doc comment for the observed sequence.
+
+    /// THE REGRESSION. `btxd.pid` held 717 from a btxd that had died without
+    /// cleaning up; after the restart the OS had given 717 to an unrelated
+    /// process. There was no btxd on the machine and nothing on 19334, yet the
+    /// old code read "a live pid" as another app's node and refused to start —
+    /// every time, forever. A recycled pid holds nothing, so the plan is the
+    /// only one that ends with the user having a node.
     #[test]
-    fn a_live_apps_node_that_is_not_answering_is_left_alone() {
+    fn a_recycled_pid_is_not_a_reason_to_refuse_to_start() {
         assert_eq!(
-            pre_launch_plan(false, true, true, true),
+            pre_launch_plan(false, false, NOTHING, FIRST_LOOK),
+            PreLaunchPlan::SpawnFresh
+        );
+        assert_eq!(
+            pre_launch_plan(false, true, NOTHING, BUDGET_SPENT),
+            PreLaunchPlan::SpawnFresh
+        );
+    }
+
+    /// A live app's node that isn't answering (still starting, or busy) is not
+    /// ours to stop OR to race — but the first look is not the last word. It is
+    /// looked at again for the whole budget, and only a holder still proven to
+    /// be another app's btxd at the end of it fails the start.
+    #[test]
+    fn a_live_apps_node_that_is_not_answering_is_waited_on_then_left_alone() {
+        assert_eq!(
+            pre_launch_plan(false, true, ANOTHER_APPS, FIRST_LOOK),
+            PreLaunchPlan::RecheckHolder
+        );
+        assert_eq!(
+            pre_launch_plan(false, false, ANOTHER_APPS, FIRST_LOOK),
+            PreLaunchPlan::RecheckHolder
+        );
+        assert_eq!(
+            pre_launch_plan(false, true, ANOTHER_APPS, BUDGET_SPENT),
             PreLaunchPlan::ManagedElsewhereNoRpc
         );
         assert_eq!(
-            pre_launch_plan(false, false, true, true),
+            pre_launch_plan(false, false, ANOTHER_APPS, BUDGET_SPENT),
             PreLaunchPlan::ManagedElsewhereNoRpc
+        );
+    }
+
+    /// A holder we could not name gets the same bounded benefit of the doubt,
+    /// and then we launch. Standing down permanently on a pid we could not even
+    /// attach a name to is how a home node stays off the network all day; a
+    /// lost lock race, by contrast, announces itself and is retried.
+    #[test]
+    fn an_unnameable_holder_is_waited_on_then_adopted() {
+        assert_eq!(
+            pre_launch_plan(false, false, UNNAMEABLE, FIRST_LOOK),
+            PreLaunchPlan::RecheckHolder
+        );
+        assert_eq!(
+            pre_launch_plan(false, false, UNNAMEABLE, BUDGET_SPENT),
+            PreLaunchPlan::AdoptUnprovenHolder
+        );
+    }
+
+    /// The budget has to be a real wait and a bounded one. Zero rechecks is the
+    /// old refuse-on-first-look behaviour; a budget of minutes turns "the miner
+    /// is warming up" into an app that looks hung.
+    #[test]
+    fn the_holder_recheck_budget_is_bounded_and_not_zero() {
+        let total = super::HOLDER_RECHECKS as u64 * super::HOLDER_RECHECK_WAIT.as_secs();
+        assert!(
+            super::HOLDER_RECHECKS >= 1,
+            "zero rechecks restores the permanent refusal this exists to fix"
+        );
+        assert!(
+            (10..=120).contains(&total),
+            "the whole recheck budget is {total}s — long enough to be a wait, \
+             short enough that a person does not read it as a hang"
         );
     }
 
     #[test]
     fn nothing_holding_the_datadir_spawns_fresh() {
-        assert_eq!(pre_launch_plan(false, true, false, false), PreLaunchPlan::SpawnFresh);
-        assert_eq!(pre_launch_plan(false, false, false, false), PreLaunchPlan::SpawnFresh);
+        assert_eq!(
+            pre_launch_plan(false, true, NOTHING, FIRST_LOOK),
+            PreLaunchPlan::SpawnFresh
+        );
+        assert_eq!(
+            pre_launch_plan(false, false, NOTHING, FIRST_LOOK),
+            PreLaunchPlan::SpawnFresh
+        );
     }
 
     /// The two quit budgets are INDEPENDENT literals, and their order is the
