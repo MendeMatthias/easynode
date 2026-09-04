@@ -91,7 +91,12 @@ Running a node costs you real things:
 
 - **Electricity**, continuously, forever. Not much, but not nothing, and it is
   yours.
-- **Disk.** Roughly 10 GB for a keeper. More for a full archive.
+- **Disk.** About 10 GB for a keeper. For a full node, which is what the app
+  installs by default, the chain is about **138 GB** of blocks as of
+  2026-09-04, so plan for 150 to 160 GB once the databases and indexes are on
+  top, and give it a 500 GB SSD if you are buying one. An SSD rather than a
+  spinning disk matters more than the size: the first sync validates the whole
+  chain and is disk bound, so it is hours on an SSD and can be days otherwise.
 - **Bandwidth**, mostly upload, which is the direction home connections are
   worst at.
 - **The right to let your machine sleep.** This is the real one. A node that
@@ -135,7 +140,8 @@ GPU.** It passes signed confirmations onward to nodes that need them. **This is
 the tier the network is shortest of**, and almost any always-on machine
 qualifies.
 
-**Archive.** Full chain on disk, real upload, uptime. **Still no GPU.** Serves
+**Archive.** Full chain on disk, about 150 GB today, real upload, uptime.
+**Still no GPU.** Serves
 block bodies and history. Signers refuse historical requests by design, so more
 signers do not add historical capacity. Only archives do.
 

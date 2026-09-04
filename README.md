@@ -51,6 +51,7 @@ an independent validator does, and we would rather say so than flatter you.
 |---|---|---|
 | **Relay** | a connection and an open port | peer introduction and address gossip |
 | **Keeper** | about 10 GB disk, an inbound port, uptime | passes signed confirmations to other nodes |
+| **Full node** | about 150 GB on an SSD (the chain is ~138 GB of blocks, 2026-09-04) | validates everything itself |
 | **Archive** | full chain disk, upload bandwidth, uptime | serves block history to people setting up |
 | **Witness** | a qualifying GPU or Apple Silicon | an **independent opinion** about which chain is real |
 | **Signer** | a qualifying GPU, and above all always on | the attestations mirrors depend on |
