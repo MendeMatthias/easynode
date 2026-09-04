@@ -969,6 +969,180 @@ pub fn holder_is_orphaned(parent_pid: Option<u32>, parent_alive: bool) -> bool {
     }
 }
 
+/// WHAT HOLDS THE DATADIR - identified, not merely counted.
+///
+/// `<datadir>/btxd.pid` is a claim, not a fact. btxd writes it at startup and
+/// removes it at the end of a clean shutdown, so a btxd that is killed - or
+/// that dies with the machine - leaves the file behind naming a pid the OS is
+/// then free to hand to anything else. Asking `kill(pid, 0)` about that file
+/// answers "something is alive", which is not the question.
+///
+/// THE 2026-09-04 STAND-DOWN (Linux signer rig). WSL restarted at 02:46, the
+/// app came up and spawned btxd as pid 717, and that btxd died without
+/// cleaning up, leaving `btxd.pid` = 717. At 03:16 the desktop session was
+/// rebuilt and pid 717 was recycled onto an unrelated process. The launch
+/// decision asked `kill(717, 0)`, got yes, read that pid's parent, found it
+/// alive, and concluded a live app was managing the node: it stood down, told
+/// the user to quit "another easyBTX app (the miner, or a second window)" that
+/// was not running, and never retried. There was no btxd on the box at all and
+/// nothing listening on 19334. Moving the two pid files aside started the node
+/// on the first try. For a project whose whole promise is a node that is
+/// simply on, one reboot plus one recycled pid must not end in a permanent
+/// refusal.
+///
+/// This crate already knew the check: [`NodeController::stop_stale`] and
+/// `force_kill_foreign_btxd` both confirm the command name first, because both
+/// of them can signal a process. The launch decision cannot signal anything,
+/// which is how it was left asking the weaker question - but standing down
+/// FOREVER deserves the same standard of proof as a kill.
+///
+/// THE TWO PIDFILES ARE SUPPOSED TO AGREE. `easybtx-node.pid` (ours, written
+/// by [`NodeController::start`]) and `btxd.pid` (btxd's own) hold the SAME
+/// number whenever this app started the node: we spawn btxd directly - no
+/// `-daemon`, no fork - and record the child's pid while btxd records its own.
+/// Measured on a healthy rig on 2026-09-04, both files read 1788. Equality is
+/// the ordinary signature of an app-managed node, so it must never be used to
+/// disqualify either file. The two differ only when btxd was started outside
+/// this app: `btxd -daemon` forks, so its pidfile names the forked daemon
+/// while ours names a process that has already exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatadirHolder {
+    /// Nothing we owe anything to. No pidfile, an unreadable one, a dead pid -
+    /// or a live pid that is provably NOT btxd (recycled), or a file written
+    /// before this boot. Launching is then the right move: if some btxd really
+    /// does hold the `.lock`, our own spawn loses that race and says so, which
+    /// the caller retries and the user can act on. Never starting at all is
+    /// the failure with no way out.
+    Free,
+    /// A live btxd whose parent app is gone (reparented to init, or its
+    /// recorded parent is dead): ours to stop and wait out before launching.
+    OrphanedBtxd { pid: u32 },
+    /// A live btxd with a live parent app supervising it - the miner's solo
+    /// node, or a second window of this app. Never stop it, never race it.
+    ManagedBtxd { pid: u32 },
+    /// Alive, but its command name could not be read (`ps` / `tasklist`
+    /// failed). We can prove neither that it is btxd nor that it is not. Kept
+    /// distinct from both answers on purpose: the caller must be able to tell
+    /// "proven, hands off" from "unproven, give it a moment", which is the
+    /// difference between a permanent refusal and a bounded wait.
+    Unidentifiable { pid: u32 },
+}
+
+/// Whether `<datadir>/btxd.pid` was written before this machine booted, which
+/// makes the pid inside it meaningless: pid numbers are handed out per boot, so
+/// a file that outlived one names a slot that has already been reissued.
+///
+/// Both clocks must be known for a `true`. An unreadable mtime, or a platform
+/// with no boot time ([`crate::platform::boot_time`] is `None` on Windows),
+/// means "not proven stale" - the conservative answer - and the command-name
+/// check below depends on neither clock.
+///
+/// WHAT THIS DOES AND DOES NOT CATCH. It would NOT have caught the 2026-09-04
+/// stand-down: that pidfile was written nine seconds AFTER the boot it went
+/// stale in (boot 02:46:07, mtime 02:46:16), because the btxd that wrote it
+/// died inside the same session. Reuse within a boot is the command-name
+/// check's job. This covers the other half - a pidfile that survives a reboot,
+/// the textbook pid-reuse case - for the price of one `stat`.
+///
+/// A wrong `true` here is bounded: it makes us ignore a pidfile and launch, so
+/// a real holder costs a lost lock race and an honest error. Nothing is ever
+/// stopped or signalled on the strength of this check.
+pub fn pidfile_predates_boot(
+    pidfile_mtime: Option<std::time::SystemTime>,
+    boot_time: Option<std::time::SystemTime>,
+) -> bool {
+    match (pidfile_mtime, boot_time) {
+        (Some(mtime), Some(boot)) => mtime < boot,
+        _ => false,
+    }
+}
+
+/// Classify the datadir's holder from facts the OS just handed us. Pure, so
+/// the whole table is unit-testable without spawning anything.
+///
+/// Order is the argument: a dead pid ends it; a file older than the boot
+/// carries no usable pid; only then does identity decide, and only a process
+/// actually named btxd counts as a holder.
+pub fn classify_datadir_holder(
+    recorded_pid: Option<u32>,
+    pid_alive: bool,
+    comm: Option<&str>,
+    pidfile_predates_boot: bool,
+    parent_pid: Option<u32>,
+    parent_alive: bool,
+) -> DatadirHolder {
+    let Some(pid) = recorded_pid else {
+        return DatadirHolder::Free;
+    };
+    if !pid_alive || pidfile_predates_boot {
+        return DatadirHolder::Free;
+    }
+    match comm {
+        Some(c) if comm_looks_like_btxd(c) => {
+            if holder_is_orphaned(parent_pid, parent_alive) {
+                DatadirHolder::OrphanedBtxd { pid }
+            } else {
+                DatadirHolder::ManagedBtxd { pid }
+            }
+        }
+        // Alive and definitely something else: the pid was recycled and the
+        // pidfile is litter. We stop believing the file - and that is all. The
+        // process itself is none of our business and is never touched.
+        Some(_) => DatadirHolder::Free,
+        None => DatadirHolder::Unidentifiable { pid },
+    }
+}
+
+/// [`classify_datadir_holder`] against the real filesystem and process table
+/// for `datadir`: one `stat`, one liveness probe and two `ps` calls, run once
+/// per launch decision.
+///
+/// Logs the evidence whenever a LIVE pid is dismissed. "We ignored your
+/// pidfile, and here is why" is exactly the line an operator needs when a node
+/// starts that they expected to be blocked - and the absence of the opposite
+/// line is what made the 2026-09-04 stand-down take half an hour to read.
+pub async fn datadir_holder(datadir: &Path) -> DatadirHolder {
+    let pidfile = datadir.join("btxd.pid");
+    let recorded_pid: Option<u32> = std::fs::read_to_string(&pidfile)
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    let Some(pid) = recorded_pid else {
+        return DatadirHolder::Free;
+    };
+    if !crate::platform::process_is_alive(pid) {
+        return DatadirHolder::Free;
+    }
+    let mtime = std::fs::metadata(&pidfile).and_then(|m| m.modified()).ok();
+    let predates_boot = pidfile_predates_boot(mtime, crate::platform::boot_time());
+    let comm = pid_comm(pid).await;
+    let ppid = crate::platform::parent_pid(pid).await;
+    let parent_alive = ppid.map(crate::platform::process_is_alive).unwrap_or(false);
+    let holder = classify_datadir_holder(
+        Some(pid),
+        true,
+        comm.as_deref(),
+        predates_boot,
+        ppid,
+        parent_alive,
+    );
+    if holder == DatadirHolder::Free {
+        if predates_boot {
+            eprintln!(
+                "[node] btxd.pid names pid {pid} but was written before this boot; pid numbers \
+                 do not survive a reboot, so the file is stale - ignoring it"
+            );
+        } else {
+            eprintln!(
+                "[node] btxd.pid names live pid {pid}, but that process is {:?}, not btxd - the \
+                 pid was recycled and the file is stale. Ignoring the file, and leaving that \
+                 process alone",
+                comm.as_deref().unwrap_or("unknown")
+            );
+        }
+    }
+    holder
+}
+
 /// Filesystem-backed evaluation of [`node_is_ours`] for `datadir`: reads our
 /// pidfile and probes liveness. Best-effort — any read error means "not ours".
 pub fn running_node_is_ours(datadir: &Path) -> bool {
@@ -1810,6 +1984,221 @@ mod tests {
         // a supervised node starts a restart fight).
         assert!(!holder_is_orphaned(None, false));
         assert!(!holder_is_orphaned(None, true));
+    }
+
+    // -- Identifying the holder, not just counting it (the 2026-09-04 fix) ---
+    //
+    // Every case below is a pid that IS alive. That was the whole of the old
+    // check, and it is why one recycled pid could stop a home node from ever
+    // starting again. See `DatadirHolder` for the observed failure.
+
+    /// THE REGRESSION. A stale `btxd.pid` whose number now belongs to some
+    /// unrelated process must hold nothing. The old check stopped at "alive"
+    /// and read this as another app's node.
+    #[test]
+    fn a_recycled_pid_owned_by_something_else_holds_nothing() {
+        assert_eq!(
+            classify_datadir_holder(Some(717), true, Some("bash"), false, Some(1), true),
+            DatadirHolder::Free
+        );
+        // A path is fine - the basename is what is compared - and a name that
+        // merely CONTAINS btxd is still not btxd.
+        assert_eq!(
+            classify_datadir_holder(Some(717), true, Some("btxd-wrapper"), false, Some(1), true),
+            DatadirHolder::Free
+        );
+    }
+
+    #[test]
+    fn a_live_btxd_is_a_holder_and_keeps_the_orphan_distinction() {
+        assert_eq!(
+            classify_datadir_holder(Some(42), true, Some("btxd"), false, Some(4242), true),
+            DatadirHolder::ManagedBtxd { pid: 42 }
+        );
+        assert_eq!(
+            classify_datadir_holder(Some(42), true, Some("/usr/local/bin/btxd"), false, Some(1), true),
+            DatadirHolder::OrphanedBtxd { pid: 42 }
+        );
+    }
+
+    /// Unreadable name = we are blind, which is neither "free" nor "proven".
+    /// Calling it Free would spawn into a lock a real btxd might hold; calling
+    /// it Managed would restore the permanent refusal this fix removes. It gets
+    /// its own answer so the caller can wait, then decide.
+    #[test]
+    fn a_live_holder_we_cannot_name_is_unidentifiable() {
+        assert_eq!(
+            classify_datadir_holder(Some(717), true, None, false, Some(4242), true),
+            DatadirHolder::Unidentifiable { pid: 717 }
+        );
+    }
+
+    #[test]
+    fn a_dead_pid_or_an_absent_pidfile_holds_nothing() {
+        assert_eq!(
+            classify_datadir_holder(Some(717), false, Some("btxd"), false, Some(1), true),
+            DatadirHolder::Free
+        );
+        assert_eq!(
+            classify_datadir_holder(None, false, None, false, None, false),
+            DatadirHolder::Free
+        );
+    }
+
+    /// The cross-boot half of pid reuse: a pidfile that outlived a reboot names
+    /// a pid slot the new boot has already reissued, so it is not evidence even
+    /// when the process now sitting on that number really is a btxd.
+    #[test]
+    fn a_pidfile_written_before_this_boot_holds_nothing() {
+        assert_eq!(
+            classify_datadir_holder(Some(717), true, Some("btxd"), true, Some(4242), true),
+            DatadirHolder::Free
+        );
+    }
+
+    #[test]
+    fn the_boot_comparison_needs_both_clocks_and_only_fires_backwards() {
+        let boot = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_756_950_367);
+        let before = boot - std::time::Duration::from_secs(60);
+        let after = boot + std::time::Duration::from_secs(9);
+        assert!(pidfile_predates_boot(Some(before), Some(boot)));
+        // The 2026-09-04 file itself: written nine seconds AFTER the boot it
+        // went stale in. This guard does not catch that one, and must not
+        // pretend to - the command-name check above is what caught it.
+        assert!(!pidfile_predates_boot(Some(after), Some(boot)));
+        // Either clock unknown (Windows has no boot time yet, an unreadable
+        // mtime) means "not proven stale".
+        assert!(!pidfile_predates_boot(Some(before), None));
+        assert!(!pidfile_predates_boot(None, Some(boot)));
+        assert!(!pidfile_predates_boot(None, None));
+    }
+
+    // -- The same three cases against real processes and a real datadir ------
+
+    /// A live process whose command name IS `btxd`, made by copying the system
+    /// `sleep` binary and running the copy, so `ps -o comm=` reports exactly
+    /// what it would for the daemon. Nothing about the process table is mocked.
+    #[cfg(unix)]
+    fn spawn_a_process_named_btxd(dir: &std::path::Path) -> tokio::process::Child {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = dir.join("btxd");
+        std::fs::copy("/bin/sleep", &fake).expect("copy /bin/sleep");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        tokio::process::Command::new(&fake)
+            .arg("30")
+            .spawn()
+            .expect("spawn the btxd stand-in")
+    }
+
+    /// End to end, on the shape that was actually observed: `btxd.pid` naming a
+    /// live pid that belongs to something else entirely. Before this fix the
+    /// app read that as "another easyBTX app is running the node" and refused
+    /// to start, permanently.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn datadir_holder_ignores_a_pid_recycled_onto_a_non_btxd_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut squatter = tokio::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = squatter.id().unwrap();
+        std::fs::write(tmp.path().join("btxd.pid"), pid.to_string()).unwrap();
+
+        let holder = datadir_holder(tmp.path()).await;
+
+        assert_eq!(
+            holder,
+            DatadirHolder::Free,
+            "a live pid that is not btxd must hold nothing; got {holder:?}"
+        );
+        assert!(
+            crate::platform::process_is_alive(pid),
+            "and the unrelated process must be left completely alone"
+        );
+        let _ = squatter.kill().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn datadir_holder_recognises_a_real_process_named_btxd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut btxd = spawn_a_process_named_btxd(tmp.path());
+        let pid = btxd.id().unwrap();
+        std::fs::write(tmp.path().join("btxd.pid"), format!("{pid}\n")).unwrap();
+
+        // We spawned it, we are alive, so it is supervised - hands off.
+        assert_eq!(
+            datadir_holder(tmp.path()).await,
+            DatadirHolder::ManagedBtxd { pid }
+        );
+        let _ = btxd.kill().await;
+    }
+
+    /// The cross-boot guard against a real process: same live, correctly-named
+    /// btxd as the test above, but the pidfile is dated before the boot. A file
+    /// that old cannot be about any process running now.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn datadir_holder_ignores_a_pidfile_older_than_the_boot() {
+        if crate::platform::boot_time().is_none() {
+            eprintln!("skipped: this platform does not report a boot time");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut btxd = spawn_a_process_named_btxd(tmp.path());
+        let pid = btxd.id().unwrap();
+        let pidfile = tmp.path().join("btxd.pid");
+        std::fs::write(&pidfile, format!("{pid}\n")).unwrap();
+        // `-t` is the touch flag both GNU and BSD accept: 2001-01-01 00:00.
+        let touched = std::process::Command::new("touch")
+            .args(["-t", "200101010000"])
+            .arg(&pidfile)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(touched, "could not backdate the pidfile");
+
+        let holder = datadir_holder(tmp.path()).await;
+
+        assert_eq!(
+            holder,
+            DatadirHolder::Free,
+            "a pidfile predating the boot names a reissued pid slot; got {holder:?}"
+        );
+        let _ = btxd.kill().await;
+    }
+
+    /// BOTH PIDFILES HOLDING THE SAME NUMBER IS HEALTH, NOT CORRUPTION.
+    ///
+    /// It was tempting, after finding `btxd.pid` and `easybtx-node.pid` both
+    /// reading 717, to treat equality as proof that a writer had gone wrong and
+    /// throw both files away. It is the opposite: this app spawns btxd as a
+    /// direct child with no `-daemon` and no fork, records that child's pid in
+    /// its own file, and btxd records the same pid in its own. They agree on
+    /// every app-managed node - the rig read 1788 in both files while healthy.
+    ///
+    /// A rule keying on equality would therefore discard the pidfiles of every
+    /// correctly running node, including the miner's, whose node this app must
+    /// never disturb. This test exists to make that mistake fail loudly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_two_pidfiles_agreeing_is_the_healthy_case_not_corruption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut btxd = spawn_a_process_named_btxd(tmp.path());
+        let pid = btxd.id().unwrap();
+        // Exactly what a healthy app-managed node leaves on disk.
+        std::fs::write(tmp.path().join("btxd.pid"), format!("{pid}\n")).unwrap();
+        std::fs::write(pidfile_path(tmp.path()), pid.to_string()).unwrap();
+
+        assert_eq!(
+            datadir_holder(tmp.path()).await,
+            DatadirHolder::ManagedBtxd { pid },
+            "identical pidfiles are what a running node looks like; the holder \
+             decision must read the process, never whether the files agree"
+        );
+        assert!(
+            running_node_is_ours(tmp.path()),
+            "and our own record still names a live process, so the node is ours"
+        );
+        let _ = btxd.kill().await;
     }
 
     // ── The stop grace is a PARAMETER, not a hardcoded wait ────────────────

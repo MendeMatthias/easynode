@@ -94,6 +94,45 @@ pub fn process_is_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
+pub fn boot_time() -> Option<std::time::SystemTime> {
+    boot_epoch_secs().map(|s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s))
+}
+
+/// Seconds since the epoch at which this boot started.
+///
+/// Linux states it outright: `/proc/stat` carries a `btime <seconds>` line
+/// written by the kernel. Deriving it from `/proc/uptime` instead would be a
+/// subtraction against a clock that NTP moves after boot, which is exactly the
+/// error this check must not make.
+#[cfg(target_os = "linux")]
+fn boot_epoch_secs() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    stat.lines()
+        .find_map(|l| l.strip_prefix("btime "))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// macOS has no `/proc`. `sysctl -n kern.boottime` prints a struct timeval:
+/// `{ sec = 1756900000, usec = 123456 } Fri Sep  4 02:46:07 2026`. We take the
+/// `sec` field. Any surprise in that format parses to `None`, which turns the
+/// pidfile-age check off rather than feeding it a wrong number — see
+/// `platform::boot_time` for why that is the safe direction.
+#[cfg(not(target_os = "linux"))]
+fn boot_epoch_secs() -> Option<u64> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "kern.boottime"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let after_sec = text.split("sec =").nth(1)?;
+    let digits: String = after_sec
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
 pub async fn process_name(pid: u32) -> Option<String> {
     // `ps -p <pid> -o comm=` → command name (Linux) / exe path (macOS). The
     // caller compares the basename, so a path is fine.
