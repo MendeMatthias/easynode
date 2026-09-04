@@ -11,7 +11,7 @@
   on disk (measured: 123.8 GiB of blocks on 2026-09-04, which is more than the
   install gate used to allow). Answers issue #14. Re-measure it with
   `scripts/measure-chain-size.py` and `scripts/blockstore-census.py` rather than
-  quoting the number.
+  quoting the number; CI does so monthly and fails the gate check if it drifts.
 - **[esplora-mode.md](esplora-mode.md)**: the opt-in Esplora API front, the
   route contract a wallet actually requires, and the gate that decides whether an
   endpoint may be advertised.

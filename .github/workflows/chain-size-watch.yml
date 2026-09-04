@@ -1,0 +1,85 @@
+# Re-measure the chain on a schedule and refuse to let the install gate fall
+# below it again.
+#
+# WHY. DISK_REQUIRED_FRESH was set at 120 GiB from a reading taken 2026-07-12.
+# By 2026-09-04 the chain measured 123.8 GiB. Nothing re-measured and nothing
+# compared, so for eight weeks the gate sat BELOW the chain it exists to gate -
+# waving through fresh installs that would fill the disk halfway - and the
+# stale figure had spread to seven places by the time anybody looked. Fixing the
+# number once does not fix that. This is the comparison that was missing.
+#
+# WHAT IT DOES. Samples real block sizes from an archival peer
+# (scripts/measure-chain-size.py: stratified, because BTX block sizes are
+# bimodal and a grid average invents sizes that do not exist), then compares the
+# result against MEASURED_CHAIN_PAYLOAD_GIB and DISK_REQUIRED_FRESH in setup.rs
+# (scripts/check-chain-size-gate.py). Red means one of two things: the shipped
+# constant is stale, or the gate no longer has working room above the chain.
+#
+# WHAT IT CANNOT DO. The measurement depends on a third-party explorer that a
+# volunteer runs. If it cannot be reached, this job is SKIPPED, not failed - an
+# outage on somebody else's server is not a defect in this repository, and a
+# scheduled job that is red for reasons nobody can fix teaches people to ignore
+# red. It also cannot run --validate (cross-checking the explorer against our
+# own node), which needs a local btxd; do that by hand when moving the constant.
+#
+# Schedule only, never on pull requests: it is network-bound and slow (~640
+# polite requests, about ten minutes), and a PR should not go red because a
+# stranger's node is down. Same trust boundary as ci.yml: contents: read, no
+# secrets, no pull_request_target.
+name: Chain size watch
+
+on:
+  schedule:
+    # 06:00 UTC on the 1st of every month. Growth is ~8 MB/day since the fork,
+    # so monthly is generous; the point is that it happens at all.
+    - cron: "0 6 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: measure the chain and check the gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # The explorer is a volunteer's node. If it is not answering, say so and
+      # stop green: nothing below can be trusted without it.
+      - name: Is the explorer reachable?
+        id: reach
+        run: |
+          set -u
+          tip="$(curl -sS --max-time 20 https://esplora.btxbyronbay.com/blocks/tip/height 2>/dev/null || true)"
+          case "$tip" in
+            ''|*[!0-9]*)
+              echo "::warning::esplora.btxbyronbay.com did not return a height; skipping this run rather than failing on somebody else's outage"
+              echo "reachable=false" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "explorer tip: $tip"
+              echo "reachable=true" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Measure
+        if: steps.reach.outputs.reachable == 'true'
+        run: |
+          set -euo pipefail
+          python3 scripts/measure-chain-size.py --strata 40 --per 8 --json chain.json | tee measure.log
+
+      - name: Check the gate against the measurement
+        if: steps.reach.outputs.reachable == 'true'
+        run: |
+          set -euo pipefail
+          python3 scripts/check-chain-size-gate.py chain.json
+
+      - name: Keep the measurement
+        if: always() && steps.reach.outputs.reachable == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: chain-size-${{ github.run_id }}
+          path: |
+            chain.json
+            measure.log
+          retention-days: 400

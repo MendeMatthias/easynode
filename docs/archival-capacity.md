@@ -221,6 +221,13 @@ if the gate is ever set below it.
   one of very few current ones on the network. Not worth improvising on.
 - **Not switched this box to `prune=0`.** It advertises `NETWORK_LIMITED` today:
   it validates and signs, and does not serve history.
+- **Re-measuring is now scheduled, not remembered.** `.github/workflows/
+  chain-size-watch.yml` runs `measure-chain-size.py` on the 1st of every month
+  and `check-chain-size-gate.py` compares the result against the constants the
+  app ships: red if `MEASURED_CHAIN_PAYLOAD_GIB` has gone stale, red if
+  `DISK_REQUIRED_FRESH` no longer has working room above the chain. It skips,
+  not fails, when the explorer is down. This is the comparison that was missing
+  for eight weeks; the number was only ever going to drift again.
 - **Not read `size_on_disk` after a completed un-pruned sync.** The sampled
   measurement above should be checked against one when a spare box exists. It
   would also catch anything the sample cannot see: orphan blocks that a synced
