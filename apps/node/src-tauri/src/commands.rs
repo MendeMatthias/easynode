@@ -188,7 +188,6 @@ use crate::state::{node_datadir, AppState, NodeAppSettings, NodeAppSnapshotFlags
 // snapshot_spec() per the note above. Until then a Linux release either ships
 // an engine that cannot converge or it waits, and that is a release decision
 // rather than something to change quietly here.
-
 pub const NODE_RELEASE_TAG: &str = "v0.34.5";
 
 /// The pinned assumeutxo snapshot this app bootstraps from: the v0.33.2
