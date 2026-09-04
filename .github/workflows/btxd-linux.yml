@@ -245,7 +245,7 @@ jobs:
           # reported version can legitimately lag the tag: a branch that never
           # bumped CLIENT_VERSION_BUILD reports the older number, which is why
           # the package declares what it carries in .btxd-version instead.
-          "$out/btxd" --version | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' > "$out/BTXD_VERSION"
+          "$out/btxd" --version | head -1 | grep -oE 'v[0-9]+(\.[0-9]+)+' > "$out/BTXD_VERSION"
           git rev-parse HEAD > "$out/BTXD_COMMIT"
           "$CUDA_HOME/bin/cuobjdump" --list-elf "$out/btxd" 2>/dev/null \
             | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ' > "$out/BTXD_CUDA_ARCHS"

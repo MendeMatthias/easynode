@@ -78,6 +78,16 @@ pub struct SleepAssertion {
     id: u32,
 }
 
+/// Whether holding a [`SleepAssertion`] actually prevents sleep on this build.
+///
+/// The guard is deliberately a no-op elsewhere so callers stay platform-free,
+/// but a UI cannot be platform-free about it: a switch that is shown, defaults
+/// ON, and does nothing is a promise the machine does not keep. Anything that
+/// OFFERS this to a user must ask here first.
+pub const fn sleep_assertion_supported() -> bool {
+    cfg!(target_os = "macos")
+}
+
 impl SleepAssertion {
     /// Hold a "don't idle-sleep" assertion for `reason` (visible in
     /// `pmset -g assertions`). No-op off macOS.

@@ -68,6 +68,7 @@ export interface NodeStatusInfo {
   installed: boolean;
   setup_complete: boolean;
   keep_awake: boolean;
+  keep_awake_supported: boolean;
   txindex_enabled: boolean;
   /**
    * Serve historical signed confirmations back to the network
@@ -78,6 +79,10 @@ export interface NodeStatusInfo {
   /** What we are really providing: `state` is serving_history |
    *  degraded_to_live_window | not_serving | unknown. */
   archive_service: { state: string; blocks_behind?: number } | null;
+  // The same verdict as a sentence, rendered in Rust so the copy lives in one
+  // place. Null until the refresher has completed a tick.
+  archive_service_message: string | null;
+  archive_service_needs_attention: boolean;
   service_report_enabled: boolean;
   wallet_enabled: boolean;
   on_close: string;
@@ -660,7 +665,26 @@ $("settings-btn").addEventListener("click", async () => {
   if (lastStatus) {
     $("setting-datadir").textContent = lastStatus.datadir;
     $<HTMLInputElement>("keepawake-toggle").checked = lastStatus.keep_awake;
+    // Only macOS can actually hold the assertion. Rather than leave a switch
+    // that is on and inert, say what the machine will really do. The row stays
+    // visible because sleep is still the user's problem to solve — it just
+    // stops claiming this app solves it.
+    const awakeRow = $("keepawake-toggle").closest(".setting-row");
+    if (awakeRow && !lastStatus.keep_awake_supported) {
+        $<HTMLInputElement>("keepawake-toggle").disabled = true;
+        $<HTMLInputElement>("keepawake-toggle").checked = false;
+        const desc = awakeRow.querySelector(".setting-desc");
+        if (desc) {
+            desc.textContent =
+                "Not available on this system — set your computer's own sleep settings to Never";
+        }
+    }
     $<HTMLInputElement>("serve-toggle").checked = lastStatus.attestation_serve_enabled;
+    // What the node is ACTUALLY providing, next to the switch that claims to
+    // control it. frontier.rs has computed this since #21 and the payload has
+    // carried it since; nothing displayed it, so a node advertising the archive
+    // bit while silently degraded to the live window looked completely fine.
+    reflectArchiveService(lastStatus);
     $<HTMLInputElement>("report-toggle").checked = lastStatus.service_report_enabled;
     $<HTMLInputElement>("wallet-toggle").checked = lastStatus.wallet_enabled;
     reflectOnClose(lastStatus.on_close);
@@ -715,6 +739,17 @@ $<HTMLInputElement>("keeper-toggle").addEventListener("change", (e) => {
  * plainly that it activates with the next node engine update — a stored
  * promise, not a silent no-op.
  */
+function reflectArchiveService(status: NodeStatusInfo): void {
+  const row = $("serve-toggle").closest(".setting-row");
+  const desc = row?.querySelector(".setting-desc");
+  if (!desc) return;
+  // No verdict yet (node down, or the refresher has not ticked) means we do not
+  // know, and the static copy is the honest thing to leave up.
+  if (!status.archive_service_message) return;
+  desc.textContent = status.archive_service_message;
+  desc.classList.toggle("needs-attention", status.archive_service_needs_attention);
+}
+
 function reflectKeeperRow(status: NodeStatusInfo) {
   const t = $<HTMLInputElement>("keeper-toggle");
   if (document.activeElement !== t) t.checked = status.node_profile === "keeper";

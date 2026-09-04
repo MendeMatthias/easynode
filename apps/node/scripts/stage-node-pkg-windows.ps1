@@ -98,7 +98,10 @@ if ($ExpectedVersion -and ($verLine -notmatch [regex]::Escape($ExpectedVersion))
 # machine after the ~450 MB snapshot download, not in CI, which is exactly the
 # skew the workflow guards exist to prevent. The mac source-build script writes
 # the same marker; see crates/btx-core/src/installer.rs (BTXD_VERSION_MARKER).
-if ($verLine -match 'v[0-9]+\.[0-9]+\.[0-9]+') {
+# The pattern must accept FOUR segments; a three-segment one silently
+# truncates a reseal tag like v0.33.4.1 to v0.33.4 and provisioning then
+# refuses a package that is exactly right. The mac scripts already do this.
+if ($verLine -match 'v[0-9]+(\.[0-9]+)+') {
     # WriteAllText, NOT Set-Content: under pwsh 7 this writes UTF-8 with NO BOM.
     # A BOM would be fatal here — the Rust side reads the marker and compares it
     # after `.trim()`, and U+FEFF is not whitespace in Rust, so a BOM'd marker

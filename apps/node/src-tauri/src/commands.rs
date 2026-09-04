@@ -1502,6 +1502,11 @@ pub struct NodeStatusInfo {
     pub setup_complete: bool,
     /// Keep-awake toggle state.
     pub keep_awake: bool,
+    /// Whether "keep awake" does anything on this build. The guard is an inert
+    /// zero-sized value off macOS, so on Linux and Windows this switch was
+    /// shown, defaulted ON, and prevented nothing — and toggling it off and
+    /// back on, the obvious recovery, also did nothing and still returned Ok.
+    pub keep_awake_supported: bool,
     /// Explorer mode (txindex) — the persisted user choice.
     pub txindex_enabled: bool,
     /// Attestation serving (`matmulattestationserve=1`) — the persisted user
@@ -1513,6 +1518,16 @@ pub struct NodeStatusInfo {
     /// silently degraded to the live window, or not serving at all. `None`
     /// until the refresher has completed one tick.
     pub archive_service: Option<btx_core::frontier::ArchiveService>,
+    /// The same verdict as one sentence for a human, and whether it is the
+    /// state that deserves attention.
+    ///
+    /// Carried BESIDE the tagged enum rather than inside it, on purpose. The
+    /// enum's wire shape is pinned field-by-field by a test in btx-core, and
+    /// the sentences live in `ArchiveService::message()` — so shipping the
+    /// rendered string keeps the copy in one place instead of growing a second
+    /// copy in TypeScript that drifts from the first.
+    pub archive_service_message: Option<String>,
+    pub archive_service_needs_attention: bool,
     /// The local service report (`service-report.json` in the datadir) — the
     /// persisted user choice. Local file only; nothing is uploaded.
     pub service_report_enabled: bool,
@@ -1704,6 +1719,11 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         None => None,
     };
 
+    // Read the frontier verdict ONCE: the payload carries the tagged value for
+    // machines and the rendered sentence for people, and taking the lock twice
+    // could ship two different ticks in one status.
+    let archive_service = state.archive_service.lock().await.clone();
+
     // Archive-peer census for the trusted-mirror health card: served from the
     // refresher's per-tick cache (≤3 s old) instead of running a second full
     // getpeerinfo on every ~1.5 s UI poll. Same degrade-to-None discipline as
@@ -1733,9 +1753,14 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         node_tag: tag,
         setup_complete: settings.setup_complete,
         keep_awake: settings.keep_awake,
+        keep_awake_supported: btx_core::power::sleep_assertion_supported(),
         txindex_enabled: settings.txindex_enabled,
         attestation_serve_enabled: settings.attestation_serve_enabled,
-        archive_service: state.archive_service.lock().await.clone(),
+        archive_service: archive_service.clone(),
+        archive_service_message: archive_service.as_ref().map(|a| a.message()),
+        archive_service_needs_attention: archive_service
+            .as_ref()
+            .is_some_and(|a| a.needs_attention()),
         service_report_enabled: settings.service_report_enabled,
         wallet_enabled: settings.wallet_enabled,
         on_close: settings.on_close.clone(),

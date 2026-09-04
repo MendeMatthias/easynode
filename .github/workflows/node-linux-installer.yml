@@ -217,7 +217,7 @@ jobs:
           #    This is the check provisioning performs on the user's machine;
           #    doing it here means a mismatch fails CI instead of a stranger's
           #    install.
-          reported=$("$pkg/bin/btxd" --version | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')
+          reported=$("$pkg/bin/btxd" --version | head -1 | grep -oE 'v[0-9]+(\.[0-9]+)+')
           echo "declared=$declared reported=$reported"
           [ "$declared" = "$reported" ] || {
             echo "::error::the package declares $declared but its btxd reports $reported"
