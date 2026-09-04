@@ -1,0 +1,187 @@
+# easyNode Esplora front — Caddy configuration template.
+#
+# Ported from the deployment that serves api.btxscan.io today. The comments are
+# the valuable part: each one records an incident, and they are kept verbatim
+# where the reasoning still applies. What was NOT ported is listed at the bottom.
+#
+# Set the hostname when you run it:
+#     BTX_ESPLORA_HOST=esplora-1.example.com caddy run --config Caddyfile
+#
+# Assumes:
+#     electrs  on 127.0.0.1:3000   (see electrs.service.template)
+#     btxd RPC on 127.0.0.1:19334
+#     the staleness guardian writing /run/btx-{fresh,stale,unverified}
+#
+# ⚠ Do not enable this on a pruned node. electrs indexes from block files on
+#   disk and a pruned datadir deletes them; easyNode refuses the mode outright
+#   (crates/btx-core/src/esplora.rs) and this config would only fail later and
+#   more confusingly. See docs/esplora-mode.md.
+
+{
+	order rate_limit before reverse_proxy
+}
+
+# Shared Esplora API config. Caddy is the SINGLE source of CORS; upstream
+# (electrs --cors) CORS headers are stripped so responses never carry a
+# duplicate Access-Control-Allow-Origin — browsers reject duplicates outright,
+# and that broke the web wallet once already.
+(esplora_api) {
+	encode gzip zstd
+	@options method OPTIONS
+	handle @options {
+		header Access-Control-Allow-Origin "*"
+		header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+		header Access-Control-Allow-Headers "Content-Type"
+		respond 204
+	}
+	header Access-Control-Allow-Origin "*"
+	header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+	header -Server
+	header X-Content-Type-Options "nosniff"
+
+	# ── Full block serialization over HTTP ───────────────────────────────────
+	# Requested by an operator migrating a fleet onto the canonical branch,
+	# whose P2P bulk sync ran at 1-2 blocks/min because MATMUL_CONSENSUS peers
+	# advertise blocks but report synced_blocks=-1 and serve nothing.
+	#
+	# Esplora's /block/<hash>/raw is NOT usable for submitblock. Measured on
+	# block 189000: btxd serialises 383 bytes, esplora returns 381 — identical
+	# for the first 381 and then TRUNCATED by 2. The MatMul proof is not
+	# stripped (that diagnosis was wrong); the truncation breaks
+	# deserialisation, which is why submitblock produced an invalid chain.
+	#
+	# btxd's own REST interface returns the complete serialization, so exactly
+	# that one read-only path is exposed and nothing else.
+	#
+	# SECURITY: btxd serves REST on the SAME port as JSON-RPC (19334). Only GET
+	# requests whose path starts with /rest/block/ are forwarded. RPC is POST to
+	# "/" and can never match this matcher, so the node's RPC stays unreachable
+	# from the internet. Rate limited more tightly than the Esplora API, since
+	# each hit costs a disk read.
+	@rawblock {
+		method GET
+		path /rest/block/*
+	}
+	handle @rawblock {
+		rate_limit {
+			zone rawblock {
+				key {remote_host}
+				events 60
+				window 10s
+			}
+		}
+		header X-Btx-Source "btxd-rest"
+		reverse_proxy 127.0.0.1:19334 {
+			transport http {
+				read_timeout 30s
+				write_timeout 30s
+			}
+		}
+	}
+
+	rate_limit {
+		zone perip {
+			key {remote_host}
+			events 200
+			window 10s
+		}
+	}
+	request_body {
+		max_size 30MB
+	}
+
+	# ── Freshness-gated, never chain-swapped ─────────────────────────────────
+	# The guardian writes exactly one of /run/btx-{fresh,stale,unverified} and
+	# Caddy matches on its presence.
+	#
+	# This exists because a node once stopped following the chain at block
+	# 184,999 and kept answering 200 with stale data. Error-driven failover
+	# cannot see that: a stalled node is not an error, it is a confident wrong
+	# answer.
+	#
+	# ⚠ WE DO NOT FAIL OVER TO ANOTHER CHAIN, and both former fallbacks are
+	# object lessons in why:
+	#
+	#   - explorer.minebtx.com has been HTTP 503 since the fork, so proxying to
+	#     it turned this API into a 503 generator. Its use as the staleness
+	#     REFERENCE was worse: a dead reference silently CLEARED the marker, and
+	#     that accident is the only reason the endpoint kept serving at all.
+	#
+	#   - esplora.btxbyronbay.com follows the heavier UNATTESTED branch —
+	#     identical through 187,660, split at 187,661 (attested ad62b638…,
+	#     byronbay 2d85ef53…) — and its UTXO index under-reports spends in the
+	#     COMMON range, on one address listing 35 outputs as unspent that a good
+	#     node proves spent, overstating that balance by ~4,042 BTX.
+	#
+	# An overstated balance reaching a signing wallet is worse than a stale one.
+	# So always serve your own node and TELL the caller how fresh it is.
+	#
+	# X-Btx-Freshness: fresh | stale | unverified
+	#   unverified = no witness was reachable, we do not know, and we refuse to
+	#   claim we are current.
+	@stale file {
+		root /run
+		try_files btx-stale
+	}
+	handle @stale {
+		header X-Btx-Upstream "local"
+		header X-Btx-Freshness "stale"
+		reverse_proxy 127.0.0.1:3000 {
+			header_down -Access-Control-Allow-Origin
+			header_down -Access-Control-Allow-Methods
+			header_down -Access-Control-Allow-Headers
+			transport http {
+				read_timeout 30s
+				write_timeout 30s
+			}
+		}
+	}
+	@unverified file {
+		root /run
+		try_files btx-unverified
+	}
+	handle @unverified {
+		header X-Btx-Upstream "local"
+		header X-Btx-Freshness "unverified"
+		reverse_proxy 127.0.0.1:3000 {
+			header_down -Access-Control-Allow-Origin
+			header_down -Access-Control-Allow-Methods
+			header_down -Access-Control-Allow-Headers
+			transport http {
+				read_timeout 30s
+				write_timeout 30s
+			}
+		}
+	}
+	handle {
+		header X-Btx-Upstream "local"
+		header X-Btx-Freshness "fresh"
+		reverse_proxy 127.0.0.1:3000 {
+			header_down -Access-Control-Allow-Origin
+			header_down -Access-Control-Allow-Methods
+			header_down -Access-Control-Allow-Headers
+			transport http {
+				read_timeout 30s
+				write_timeout 30s
+			}
+		}
+	}
+}
+
+{$BTX_ESPLORA_HOST} {
+	import esplora_api
+}
+
+# ── DELIBERATELY NOT PORTED FROM THE ORIGINAL ────────────────────────────────
+#
+#   - A `basic_auth` block for a private stats host. It carried a bcrypt
+#     credential, which has no business in a public repository even hashed.
+#   - A second site serving an unrelated internal service.
+#   - A rate-limit exemption for one fixed home IP, added for a specific event
+#     and marked "REMOVE THIS AFTER THE EVENT" in the original.
+#   - The two concrete hostnames of the existing deployment.
+#   - Request logging. The original logs ONLY wallet-User-Agent requests and
+#     strips remote_ip, remote_port and Cookie — anonymous by construction. It
+#     is worth copying if you want usage metrics, and worth copying EXACTLY,
+#     because the filter is what makes it anonymous. It is omitted here so that
+#     nobody inherits logging they did not ask for.
