@@ -337,7 +337,10 @@ mod tests {
     fn settings_roundtrip_and_legacy_load() {
         let dir = tempfile::tempdir().unwrap();
         // Missing file → defaults, never an error.
-        assert_eq!(NodeAppSettings::load(dir.path()), NodeAppSettings::default());
+        assert_eq!(
+            NodeAppSettings::load(dir.path()),
+            NodeAppSettings::default()
+        );
         // Roundtrip.
         let mut s = NodeAppSettings::default();
         s.setup_complete = true;
@@ -356,7 +359,10 @@ mod tests {
         assert!(legacy.keep_awake, "missing keep_awake defaults true");
         // Corrupt file → defaults, never a panic.
         std::fs::write(dir.path().join(SETTINGS_FILE_NAME), b"not-json").unwrap();
-        assert_eq!(NodeAppSettings::load(dir.path()), NodeAppSettings::default());
+        assert_eq!(
+            NodeAppSettings::load(dir.path()),
+            NodeAppSettings::default()
+        );
     }
 
     #[test]
@@ -415,10 +421,7 @@ mod tests {
     fn node_datadir_honors_env_override() {
         // Serialize env mutation: this is the only test touching this var.
         std::env::set_var("EASYBTX_NODE_DATADIR", "/tmp/ebtx-node-e2e-test");
-        assert_eq!(
-            node_datadir(),
-            PathBuf::from("/tmp/ebtx-node-e2e-test")
-        );
+        assert_eq!(node_datadir(), PathBuf::from("/tmp/ebtx-node-e2e-test"));
         std::env::remove_var("EASYBTX_NODE_DATADIR");
         // Without the override we resolve the shared datadir (ends in easybtx).
         let d = node_datadir();

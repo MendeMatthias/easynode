@@ -266,7 +266,10 @@ mod tests {
 
         match result {
             Err(AppError::Http(msg)) => {
-                assert!(msg.contains("401"), "should name the HTTP status, got {msg:?}");
+                assert!(
+                    msg.contains("401"),
+                    "should name the HTTP status, got {msg:?}"
+                );
                 assert!(
                     !msg.contains("supersecret"),
                     "must NOT leak the response body / credential, got {msg:?}"
@@ -309,7 +312,7 @@ mod tests {
         assert_eq!(pct_encode("#"), "%23");
         assert_eq!(pct_encode(" "), "%20");
         assert_eq!(pct_encode(".."), ".."); // dots ARE unreserved — path safety
-        // is handled by the receiving HTTP server, not by encoding.
+                                            // is handled by the receiving HTTP server, not by encoding.
         assert_eq!(pct_encode("../etc"), "..%2Fetc");
         // Multi-byte UTF-8 → byte-by-byte percent encoding (matches browsers).
         // "é" is 0xC3 0xA9.

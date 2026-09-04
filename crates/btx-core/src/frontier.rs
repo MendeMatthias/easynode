@@ -82,19 +82,23 @@ impl ArchiveService {
     /// what it means for other people. No jargon, no blame, no false alarm.
     pub fn message(&self) -> String {
         match self {
-            ArchiveService::ServingHistory =>
-                "At the frontier and serving attestation history to other nodes.".to_string(),
+            ArchiveService::ServingHistory => {
+                "At the frontier and serving attestation history to other nodes.".to_string()
+            }
             ArchiveService::DegradedToLiveWindow { blocks_behind } => format!(
                 "Behind the signed frontier by {blocks_behind} blocks, so this node has \
                  stopped serving attestation history even though it still advertises that \
                  it does. It is still following the chain. Leaving it running and connected \
                  is usually all it needs to catch up."
             ),
-            ArchiveService::NotServing =>
-                "Not serving attestations. This node follows the chain for itself.".to_string(),
-            ArchiveService::Unknown =>
+            ArchiveService::NotServing => {
+                "Not serving attestations. This node follows the chain for itself.".to_string()
+            }
+            ArchiveService::Unknown => {
                 "Serving attestations. Waiting to read the signed frontier before reporting \
-                 whether history is being served.".to_string(),
+                 whether history is being served."
+                    .to_string()
+            }
         }
     }
 }
@@ -124,8 +128,14 @@ mod tests {
 
     #[test]
     fn at_the_frontier_is_the_only_state_that_serves_history() {
-        assert_eq!(archive_service(true, Some(0)), ArchiveService::ServingHistory);
-        assert_eq!(archive_service(true, Some(1)), ArchiveService::ServingHistory);
+        assert_eq!(
+            archive_service(true, Some(0)),
+            ArchiveService::ServingHistory
+        );
+        assert_eq!(
+            archive_service(true, Some(1)),
+            ArchiveService::ServingHistory
+        );
         assert!(archive_service(true, Some(1)).is_serving_history());
     }
 
@@ -134,7 +144,10 @@ mod tests {
         // The exact boundary in net_processing.cpp:18744 is `>= 2`. One block
         // behind still serves; two does not. Getting this off by one would make
         // the app report a healthy archive that answers nothing.
-        assert_eq!(archive_service(true, Some(1)), ArchiveService::ServingHistory);
+        assert_eq!(
+            archive_service(true, Some(1)),
+            ArchiveService::ServingHistory
+        );
         assert_eq!(
             archive_service(true, Some(2)),
             ArchiveService::DegradedToLiveWindow { blocks_behind: 2 }
@@ -146,12 +159,18 @@ mod tests {
     fn being_ahead_of_the_frontier_is_not_a_fault() {
         // The frontier is what has been SIGNED. A node can legitimately hold a
         // tip above it, and that must not read as degraded.
-        assert_eq!(archive_service(true, Some(-3)), ArchiveService::ServingHistory);
+        assert_eq!(
+            archive_service(true, Some(-3)),
+            ArchiveService::ServingHistory
+        );
     }
 
     #[test]
     fn a_node_that_does_not_serve_is_not_reported_as_broken() {
-        assert_eq!(archive_service(false, Some(999)), ArchiveService::NotServing);
+        assert_eq!(
+            archive_service(false, Some(999)),
+            ArchiveService::NotServing
+        );
         assert_eq!(archive_service(false, None), ArchiveService::NotServing);
         assert!(!archive_service(false, Some(999)).needs_attention());
     }
@@ -177,7 +196,10 @@ mod tests {
     #[test]
     fn the_degraded_message_says_what_it_means_for_other_people() {
         let m = archive_service(true, Some(7)).message();
-        assert!(m.contains('7'), "the operator should see how far behind: {m}");
+        assert!(
+            m.contains('7'),
+            "the operator should see how far behind: {m}"
+        );
         // The point of the message is that the node is misrepresenting itself.
         assert!(m.contains("advertises"), "{m}");
         // And it must not read as a crash, because nothing has crashed.
@@ -195,7 +217,12 @@ mod tests {
             let m = s.message();
             assert!(!m.is_empty());
             assert!(m.ends_with('.'), "{m}");
-            for jargon in ["bit 31", "GETMMATTEST", "NODE_MATMUL", "catching_up_behind_frontier"] {
+            for jargon in [
+                "bit 31",
+                "GETMMATTEST",
+                "NODE_MATMUL",
+                "catching_up_behind_frontier",
+            ] {
                 assert!(!m.contains(jargon), "{jargon} must not reach a user: {m}");
             }
         }

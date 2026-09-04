@@ -403,7 +403,9 @@ pub async fn add_node(rpc: &dyn Rpc, host: &str) -> AppResult<()> {
         Err(crate::error::AppError::Rpc { code: -23, .. }) => {} // already added
         Err(e) => return Err(e),
     }
-    rpc.call("addnode", json!([host, "onetry"])).await.map(|_| ())
+    rpc.call("addnode", json!([host, "onetry"]))
+        .await
+        .map(|_| ())
 }
 
 /// What `getmatmulattestedtip` says about the SIGNED frontier: the highest block
@@ -438,7 +440,10 @@ pub struct AttestedTip {
 /// than an error, so a caller can tell "not measured" from "measured as zero".
 pub async fn get_attested_tip(rpc: &dyn Rpc) -> AppResult<AttestedTip> {
     let v = rpc.call("getmatmulattestedtip", json!([])).await?;
-    let sf = v.get("signed_frontier").cloned().unwrap_or(serde_json::Value::Null);
+    let sf = v
+        .get("signed_frontier")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     Ok(AttestedTip {
         height: sf.get("height").and_then(|x| x.as_u64()),
         blocks_behind: sf.get("blocks_behind").and_then(|x| x.as_i64()),
@@ -519,7 +524,9 @@ pub async fn get_new_address(rpc: &dyn Rpc) -> AppResult<String> {
     v.as_str()
         .filter(|s| !s.is_empty())
         .map(String::from)
-        .ok_or_else(|| crate::error::AppError::Decode(format!("getnewaddress: unexpected response {v}")))
+        .ok_or_else(|| {
+            crate::error::AppError::Decode(format!("getnewaddress: unexpected response {v}"))
+        })
 }
 
 /// True if `addr` belongs to the wallet behind `rpc` (`getaddressinfo.ismine`).
@@ -575,7 +582,9 @@ pub async fn send_to_address(
     v.as_str()
         .filter(|s| !s.is_empty())
         .map(String::from)
-        .ok_or_else(|| crate::error::AppError::Decode(format!("sendtoaddress: unexpected response {v}")))
+        .ok_or_else(|| {
+            crate::error::AppError::Decode(format!("sendtoaddress: unexpected response {v}"))
+        })
 }
 
 /// Call `listdescriptors [private]` and return the raw JSON value.
@@ -738,7 +747,10 @@ pub fn tx_summary(v: &serde_json::Value) -> TxSummary {
         confirmations: v["confirmations"].as_u64().unwrap_or(0),
         block_hash: v["blockhash"].as_str().map(String::from),
         block_time: v["blocktime"].as_u64(),
-        vsize: v["vsize"].as_u64().or_else(|| v["size"].as_u64()).unwrap_or(0),
+        vsize: v["vsize"]
+            .as_u64()
+            .or_else(|| v["size"].as_u64())
+            .unwrap_or(0),
         vin_count: v["vin"].as_array().map(|a| a.len()).unwrap_or(0),
         vout_count: v["vout"].as_array().map(|a| a.len()).unwrap_or(0),
         total_out_btx: v["vout"]
@@ -780,8 +792,11 @@ pub async fn restore_wallet_bundle(
     bundle_path: &str,
     rescan: bool,
 ) -> AppResult<serde_json::Value> {
-    rpc.call("restorewalletbundle", json!([name, bundle_path, true, rescan]))
-        .await
+    rpc.call(
+        "restorewalletbundle",
+        json!([name, bundle_path, true, rescan]),
+    )
+    .await
 }
 
 /// `restorewallet "<name>" "<backup_file>" <load_on_startup>` — create + load a
@@ -870,7 +885,10 @@ mod tests {
 
         let s = summarize_archive_peers(&peers);
         assert_eq!(s.archive_bit, 2, "two peers advertise the archive bit");
-        assert_eq!(s.authority, 1, "only the manual/noban archive passes the gate");
+        assert_eq!(
+            s.authority, 1,
+            "only the manual/noban archive passes the gate"
+        );
         assert_eq!(s.feeding_us, 1, "one peer sent us mmattest bytes");
         assert_eq!(s.served_by_us, 2, "we pushed attestations to two peers");
     }
@@ -941,7 +959,10 @@ mod tests {
                 .unwrap();
         assert_eq!(peers[0].id, 7);
         assert!(peers[0].servicesnames.is_empty());
-        assert_eq!(summarize_archive_peers(&peers), ArchivePeerSummary::default());
+        assert_eq!(
+            summarize_archive_peers(&peers),
+            ArchivePeerSummary::default()
+        );
     }
 
     struct FakeRpc {
@@ -1078,12 +1099,18 @@ mod tests {
         assert!(!caught_up.tip_unsafe_to_act_on());
 
         // btxd says stale: do not build a template, even though nothing else moved.
-        let stale = BlockchainInfo { is_stale: true, ..caught_up.clone() };
+        let stale = BlockchainInfo {
+            is_stale: true,
+            ..caught_up.clone()
+        };
         assert!(stale.tip_unsafe_to_act_on());
 
         // Behind by even one block is enough. is_stale only flips after SUSTAINED
         // lag, so this clause catches the window before that.
-        let behind = BlockchainInfo { behind_best_header: 1, ..caught_up.clone() };
+        let behind = BlockchainInfo {
+            behind_best_header: 1,
+            ..caught_up.clone()
+        };
         assert!(behind.tip_unsafe_to_act_on());
     }
 
@@ -1179,7 +1206,9 @@ mod tests {
         // A send that returns no txid string must surface an error, not silently
         // discard the result.
         let empty = FakeRpc::new(&[("sendtoaddress", json!(""))]);
-        assert!(send_to_address(&empty, "btx1zdest", 1.0, true).await.is_err());
+        assert!(send_to_address(&empty, "btx1zdest", 1.0, true)
+            .await
+            .is_err());
     }
 
     // ── getchainstates parsing + readiness ───────────────────────────────────
@@ -1441,7 +1470,9 @@ mod tests {
             "exportwalletbundle",
             json!({"bundle_file": "/tmp/x.btxwallet.json", "keypool_oldest": 1u64}),
         )]);
-        let v = export_wallet_bundle(&rpc, "/tmp/x.btxwallet.json").await.unwrap();
+        let v = export_wallet_bundle(&rpc, "/tmp/x.btxwallet.json")
+            .await
+            .unwrap();
         assert_eq!(v["bundle_file"], "/tmp/x.btxwallet.json");
     }
 

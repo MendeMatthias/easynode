@@ -307,7 +307,11 @@ fn is_already_exists(message: &str) -> bool {
 /// shared Mac that is a window in which any other local account can copy
 /// spending keys. Nothing else in this app sweeps the datadir for these names,
 /// so a crash mid-import would leave the window open forever.
-fn stage_private(dir: &std::path::Path, path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+fn stage_private(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     use std::io::Write;
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
@@ -551,10 +555,9 @@ pub async fn wallet_import(
     // landed before telling anyone their import failed. `rescanned` stays false
     // so the panel says the history is still filling in, which is true.
     let (result, rescanned) = match result {
-        Err(ref e) if import_landed_anyway(&rpc, &target_name, e).await => (
-            Ok(serde_json::json!({ "name": target_name })),
-            false,
-        ),
+        Err(ref e) if import_landed_anyway(&rpc, &target_name, e).await => {
+            (Ok(serde_json::json!({ "name": target_name })), false)
+        }
         other => (other, rescanned),
     };
 
@@ -845,7 +848,11 @@ mod tests {
             }
         }
         fn failing() -> Self {
-            Self { names: Vec::new(), fail: true, calls: Mutex::new(Vec::new()) }
+            Self {
+                names: Vec::new(),
+                fail: true,
+                calls: Mutex::new(Vec::new()),
+            }
         }
     }
     #[async_trait]
@@ -857,9 +864,14 @@ mod tests {
         ) -> Result<serde_json::Value, AppError> {
             self.calls.lock().unwrap().push(method.to_string());
             if self.fail {
-                return Err(AppError::Rpc { code: -1, message: "node down".into() });
+                return Err(AppError::Rpc {
+                    code: -1,
+                    message: "node down".into(),
+                });
             }
-            Ok(serde_json::json!({ "wallets": self.names.iter().map(|n| serde_json::json!({"name": n})).collect::<Vec<_>>() }))
+            Ok(
+                serde_json::json!({ "wallets": self.names.iter().map(|n| serde_json::json!({"name": n})).collect::<Vec<_>>() }),
+            )
         }
     }
 
@@ -869,13 +881,19 @@ mod tests {
         // it. Silently loading the existing one and calling that success is how
         // a user is shown 0.00 and concludes their coins are gone.
         let rpc = DirRpc::with(&["btxnode"]);
-        assert_eq!(next_free_wallet_name(&rpc).await.as_deref(), Some("btxnode-2"));
+        assert_eq!(
+            next_free_wallet_name(&rpc).await.as_deref(),
+            Some("btxnode-2")
+        );
     }
 
     #[tokio::test]
     async fn already_used_alternates_are_skipped_not_reused() {
         let rpc = DirRpc::with(&["btxnode", "btxnode-2", "btxnode-3"]);
-        assert_eq!(next_free_wallet_name(&rpc).await.as_deref(), Some("btxnode-4"));
+        assert_eq!(
+            next_free_wallet_name(&rpc).await.as_deref(),
+            Some("btxnode-4")
+        );
     }
 
     #[tokio::test]
@@ -884,7 +902,11 @@ mod tests {
         all.extend((2..=16).map(|n| format!("btxnode-{n}")));
         let refs: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
         let rpc = DirRpc::with(&refs);
-        assert_eq!(next_free_wallet_name(&rpc).await, None, "refuse, never overwrite");
+        assert_eq!(
+            next_free_wallet_name(&rpc).await,
+            None,
+            "refuse, never overwrite"
+        );
     }
 
     #[tokio::test]

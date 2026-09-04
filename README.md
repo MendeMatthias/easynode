@@ -181,7 +181,7 @@ because "open source" is often read as "no control anywhere".
 See [CONTRIBUTING.md](CONTRIBUTING.md). Security issues go through
 [SECURITY.md](SECURITY.md), never a public issue.
 
-The most useful contributions right now are Windows support, packaging for more
+The most useful contributions right now are resuming Windows releases, packaging for more
 Linux distributions, and anything that makes the "what can my machine do" answer
 more accurate on hardware we do not own.
 

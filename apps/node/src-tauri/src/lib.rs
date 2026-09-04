@@ -9,9 +9,9 @@
 
 mod ask;
 mod commands;
-mod wallet;
 mod state;
 mod tray;
+mod wallet;
 
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 

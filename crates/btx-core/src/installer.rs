@@ -225,7 +225,10 @@ pub fn conf_for_profile(profile: &str, node_release_tag: &str) -> &'static str {
 /// its own). Returns `None` (so the caller falls back to the python installer)
 /// when no `btxd` is found in any candidate — e.g. a build that didn't bundle
 /// the binaries.
-pub fn resolve_bundled_node_bin(resource_dir: Option<&Path>, dev_roots: &[&Path]) -> Option<PathBuf> {
+pub fn resolve_bundled_node_bin(
+    resource_dir: Option<&Path>,
+    dev_roots: &[&Path],
+) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(res) = resource_dir {
         // Tauri's resource layout differs across versions/platforms: some place
@@ -264,8 +267,9 @@ pub fn provision_from_bundle(
     let install_bin = install_dir(release_tag)
         .ok_or_else(|| AppError::Config("HOME unset; cannot resolve install dir".into()))?
         .join("bin");
-    std::fs::create_dir_all(&install_bin)
-        .map_err(|e| AppError::Process(format!("create install dir {}: {e}", install_bin.display())))?;
+    std::fs::create_dir_all(&install_bin).map_err(|e| {
+        AppError::Process(format!("create install dir {}: {e}", install_bin.display()))
+    })?;
 
     for name in BUNDLED_NODE_BINARIES {
         // Bundled filenames carry the platform exe suffix (btxd vs btxd.exe), so
@@ -283,8 +287,7 @@ pub fn provision_from_bundle(
             continue;
         }
         let dst = install_bin.join(&fname);
-        std::fs::copy(&src, &dst)
-            .map_err(|e| AppError::Process(format!("copy {fname}: {e}")))?;
+        std::fs::copy(&src, &dst).map_err(|e| AppError::Process(format!("copy {fname}: {e}")))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -686,12 +689,14 @@ pub fn run_faststart(
     })
 }
 
-
 /// Resolve the directory holding a bundled node PACKAGE tree
 /// (`resources/node-pkg/` → `bin/` wrappers + `libexec/*.real` + metal libs),
 /// the layout BTX ships from v0.32.12 onward. Mirrors
 /// [`resolve_bundled_node_bin`] but probes `bin/btxd` inside the package root.
-pub fn resolve_bundled_node_pkg(resource_dir: Option<&Path>, dev_roots: &[&Path]) -> Option<PathBuf> {
+pub fn resolve_bundled_node_pkg(
+    resource_dir: Option<&Path>,
+    dev_roots: &[&Path],
+) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(res) = resource_dir {
         candidates.push(res.join("node-pkg"));
@@ -790,7 +795,8 @@ pub fn version_output_matches_tag(output: &str, tag: &str) -> bool {
     if tag.is_empty() {
         return false;
     }
-    output.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
+    output
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
         .any(|tok| tok == tag)
 }
 
@@ -929,7 +935,9 @@ pub fn provision_node_package(
 
     Ok(FaststartResult {
         btxd: install_root.join("bin").join(&btxd_name),
-        btx_cli: install_root.join("bin").join(crate::platform::exe_name("btx-cli")),
+        btx_cli: install_root
+            .join("bin")
+            .join(crate::platform::exe_name("btx-cli")),
         faststart_conf: conf_path,
         mining_results_dir: None,
     })
@@ -1226,14 +1234,26 @@ mod tests {
         for (name, digest) in pins {
             assert_eq!(digest.len(), 64, "{name}: digest length");
             assert!(
-                digest.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                digest
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
                 "{name}: digest must be lowercase hex"
             );
         }
         // …and every other tag has none: unknown unsigned cuts stay
         // uninstallable (fail closed on the missing signature) by construction.
-        for other in ["v0.33.1", "v0.33.2", "v0.33.4", "v0.34.0", "", "v29.4.0-public-cli1"] {
-            assert!(unsigned_release_pins(other).is_none(), "{other} must have no pins");
+        for other in [
+            "v0.33.1",
+            "v0.33.2",
+            "v0.33.4",
+            "v0.34.0",
+            "",
+            "v29.4.0-public-cli1",
+        ] {
+            assert!(
+                unsigned_release_pins(other).is_none(),
+                "{other} must have no pins"
+            );
         }
     }
 
@@ -1468,7 +1488,11 @@ mod tests {
         let mut macho = vec![0xcfu8, 0xfa, 0xed, 0xfe];
         macho.extend_from_slice(&[0u8; 64]);
         std::fs::write(root.join("libexec").join("btxd.real"), &macho).unwrap();
-        std::fs::write(root.join("libexec").join("metal").join("kernels.metallib"), b"shaders").unwrap();
+        std::fs::write(
+            root.join("libexec").join("metal").join("kernels.metallib"),
+            b"shaders",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1488,7 +1512,11 @@ mod tests {
         assert!(res.btxd.exists(), "wrapper must be copied");
         assert!(install.join("libexec").join("btxd.real").exists());
         assert!(
-            install.join("libexec").join("metal").join("kernels.metallib").exists(),
+            install
+                .join("libexec")
+                .join("metal")
+                .join("kernels.metallib")
+                .exists(),
             "nested package dirs must be copied"
         );
         #[cfg(unix)]
@@ -1504,7 +1532,10 @@ mod tests {
         }
         let conf = std::fs::read_to_string(&res.faststart_conf).unwrap();
         assert!(conf.contains("prune=0"));
-        assert!(!conf.contains("miningminoutboundpeers"), "node preset must not carry mining keys");
+        assert!(
+            !conf.contains("miningminoutboundpeers"),
+            "node preset must not carry mining keys"
+        );
         assert!(res.mining_results_dir.is_none());
     }
 
@@ -1545,7 +1576,11 @@ mod tests {
         // With resources/node-pkg/bin/btxd present it resolves.
         let pkg = tmp.path().join("resources").join("node-pkg");
         std::fs::create_dir_all(pkg.join("bin")).unwrap();
-        std::fs::write(pkg.join("bin").join(crate::platform::exe_name("btxd")), b"x").unwrap();
+        std::fs::write(
+            pkg.join("bin").join(crate::platform::exe_name("btxd")),
+            b"x",
+        )
+        .unwrap();
         assert_eq!(resolve_bundled_node_pkg(None, &[tmp.path()]), Some(pkg));
     }
 
@@ -1571,7 +1606,6 @@ mod tests {
             "conf=1\n"
         );
     }
-
 }
 
 #[cfg(test)]
@@ -1583,27 +1617,48 @@ mod keeper_profile_tests {
         // Every tag the app has ever pinned predates the two required fixes.
         for old in ["v0.33.3-pr105b", "v0.33.2", "v0.33.1", "v0.33.0"] {
             assert!(!engine_supports_keeper_profile(old), "{old} must be gated");
-            assert_eq!(conf_for_profile("keeper", old), NODE_FASTSTART_CONF,
-                "keeper choice on {old} must provision the SAFE full conf");
+            assert_eq!(
+                conf_for_profile("keeper", old),
+                NODE_FASTSTART_CONF,
+                "keeper choice on {old} must provision the SAFE full conf"
+            );
         }
         // A future re-pin tag passes (the release train adds it deliberately).
         assert!(engine_supports_keeper_profile("v0.33.3-pr105c"));
-        assert_eq!(conf_for_profile("keeper", "v0.33.3-pr105c"), NODE_KEEPER_CONF);
+        assert_eq!(
+            conf_for_profile("keeper", "v0.33.3-pr105c"),
+            NODE_KEEPER_CONF
+        );
     }
 
     #[test]
     fn full_profile_is_always_the_full_conf() {
-        assert_eq!(conf_for_profile("full", "v0.33.3-pr105b"), NODE_FASTSTART_CONF);
-        assert_eq!(conf_for_profile("full", "v0.33.3-pr105c"), NODE_FASTSTART_CONF);
+        assert_eq!(
+            conf_for_profile("full", "v0.33.3-pr105b"),
+            NODE_FASTSTART_CONF
+        );
+        assert_eq!(
+            conf_for_profile("full", "v0.33.3-pr105c"),
+            NODE_FASTSTART_CONF
+        );
         // Unknown strings degrade to the safe default too.
-        assert_eq!(conf_for_profile("banana", "v0.33.3-pr105c"), NODE_FASTSTART_CONF);
+        assert_eq!(
+            conf_for_profile("banana", "v0.33.3-pr105c"),
+            NODE_FASTSTART_CONF
+        );
     }
 
     #[test]
     fn keeper_conf_carries_the_profile_essentials() {
         assert!(NODE_KEEPER_CONF.contains("prune=10000"));
         assert!(NODE_KEEPER_CONF.contains("matmulattestationserve=1"));
-        assert!(NODE_KEEPER_CONF.contains("parkdeepreorg=1"), "reorg posture kept");
-        assert!(NODE_KEEPER_CONF.contains("rpcbind=127.0.0.1"), "rpc stays local");
+        assert!(
+            NODE_KEEPER_CONF.contains("parkdeepreorg=1"),
+            "reorg posture kept"
+        );
+        assert!(
+            NODE_KEEPER_CONF.contains("rpcbind=127.0.0.1"),
+            "rpc stays local"
+        );
     }
 }

@@ -69,10 +69,12 @@ pub fn write_service_report(datadir: &Path, report: &ServiceReport) -> AppResult
         .map_err(|e| AppError::Config(format!("service report encode: {e}")))?;
     {
         use std::io::Write as _;
-        let mut f = std::fs::File::create(&tmp)
-            .map_err(|e| AppError::Config(format!("service report create {}: {e}", tmp.display())))?;
-        f.write_all(&body)
-            .map_err(|e| AppError::Config(format!("service report write {}: {e}", tmp.display())))?;
+        let mut f = std::fs::File::create(&tmp).map_err(|e| {
+            AppError::Config(format!("service report create {}: {e}", tmp.display()))
+        })?;
+        f.write_all(&body).map_err(|e| {
+            AppError::Config(format!("service report write {}: {e}", tmp.display()))
+        })?;
         // fsync BEFORE the rename: rename is atomic for the NAME, not the
         // bytes — without this a crash can leave the report renamed into
         // place with empty/torn content on some filesystems.
@@ -101,13 +103,17 @@ mod tests {
         r.serving_attestations = true;
         write_service_report(tmp.path(), &r).unwrap();
 
-        let read: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(tmp.path().join(SERVICE_REPORT_FILE)).unwrap())
-                .unwrap();
+        let read: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join(SERVICE_REPORT_FILE)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(read["schema"], 1);
         assert_eq!(read["blocks"], 191_583);
         assert_eq!(read["serving_attestations"], true);
         // No tmp file left behind.
-        assert!(!tmp.path().join(format!("{SERVICE_REPORT_FILE}.tmp")).exists());
+        assert!(!tmp
+            .path()
+            .join(format!("{SERVICE_REPORT_FILE}.tmp"))
+            .exists());
     }
 }

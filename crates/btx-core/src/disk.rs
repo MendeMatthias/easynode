@@ -158,7 +158,9 @@ pub fn reclaim_disk(datadir: &Path, conf_path: &Path, snapshot_loaded: bool) -> 
             let bytes = dir_size_bytes(&dir);
             if std::fs::remove_dir_all(&dir).is_ok() {
                 freed_bytes += bytes;
-                report.items.push(format!("{name} index ({} MB)", bytes / MB));
+                report
+                    .items
+                    .push(format!("{name} index ({} MB)", bytes / MB));
             }
         }
     }
@@ -166,7 +168,9 @@ pub fn reclaim_disk(datadir: &Path, conf_path: &Path, snapshot_loaded: bool) -> 
     // 2) Delete the post-load assumeutxo bootstrap snapshot (C3-gated).
     if let Some(bytes) = sweep_loaded_snapshot(datadir, snapshot_loaded) {
         freed_bytes += bytes;
-        report.items.push(format!("assumeutxo snapshot ({} MB)", bytes / MB));
+        report
+            .items
+            .push(format!("assumeutxo snapshot ({} MB)", bytes / MB));
     }
 
     // 3) Cap debug.log (safe: btxd is stopped, so truncation can't race a write).
@@ -520,8 +524,16 @@ mod tests {
         std::fs::create_dir_all(dd.join("indexes").join("coinstats")).unwrap();
         std::fs::create_dir_all(dd.join("indexes").join("txindex")).unwrap(); // must survive
         std::fs::create_dir_all(&fs_dir).unwrap();
-        std::fs::write(dd.join("indexes").join("blockfilter").join("000.ldb"), vec![0u8; 4096]).unwrap();
-        std::fs::write(dd.join("indexes").join("coinstats").join("000.ldb"), vec![0u8; 4096]).unwrap();
+        std::fs::write(
+            dd.join("indexes").join("blockfilter").join("000.ldb"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+        std::fs::write(
+            dd.join("indexes").join("coinstats").join("000.ldb"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
         let conf = fs_dir.join("faststart.conf");
         std::fs::write(&conf, "prune=0\nblockfilterindex=1\ncoinstatsindex=1\n").unwrap();
         std::fs::write(fs_dir.join("snapshot.dat"), vec![0u8; 4096]).unwrap();
@@ -533,7 +545,10 @@ mod tests {
 
         assert!(!dd.join("indexes").join("blockfilter").exists());
         assert!(!dd.join("indexes").join("coinstats").exists());
-        assert!(dd.join("indexes").join("txindex").exists(), "unrelated index must be preserved");
+        assert!(
+            dd.join("indexes").join("txindex").exists(),
+            "unrelated index must be preserved"
+        );
         assert!(!fs_dir.join("snapshot.dat").exists());
         let conf_after = std::fs::read_to_string(&conf).unwrap();
         assert!(!conf_after.contains("blockfilterindex"));
@@ -578,7 +593,10 @@ mod tests {
         let week = 7 * 24 * 60 * 60;
         let entries = vec![("only", now.saturating_sub(week * 10))]; // very old
         let pruned = quarantine_entries_to_prune(entries, now, week);
-        assert!(pruned.is_empty(), "the single newest entry must always be kept");
+        assert!(
+            pruned.is_empty(),
+            "the single newest entry must always be kept"
+        );
     }
 
     #[test]
@@ -589,9 +607,9 @@ mod tests {
         let now = 1_000_000_000u64;
         let week = 7 * 24 * 60 * 60;
         let entries = vec![
-            ("newest", now - 60),              // 1 min old — newest, always kept
-            ("old1", now - (week + 100)),      // 7d+100s — prune
-            ("old2", now - (week * 4)),        // 28d — prune
+            ("newest", now - 60),                        // 1 min old — newest, always kept
+            ("old1", now - (week + 100)),                // 7d+100s — prune
+            ("old2", now - (week * 4)),                  // 28d — prune
             ("recent_but_not_newest", now - (week / 2)), // 3.5d — within window, kept
         ];
         let mut pruned = quarantine_entries_to_prune(entries, now, week);
@@ -608,7 +626,7 @@ mod tests {
         let now = 1_000_000_000u64;
         let week = 7 * 24 * 60 * 60;
         let entries = vec![
-            ("future", now + 10_000),     // mtime > now (clock skew)
+            ("future", now + 10_000), // mtime > now (clock skew)
             ("normal_old", now - (week + 1)),
         ];
         let pruned = quarantine_entries_to_prune(entries, now, week);
@@ -645,9 +663,15 @@ mod tests {
 
         assert_eq!(report.removed_count, 0);
         assert!(dd.join("blocks").is_dir(), "chain data must be untouched");
-        assert!(dd.join("chainstate").is_dir(), "chain data must be untouched");
+        assert!(
+            dd.join("chainstate").is_dir(),
+            "chain data must be untouched"
+        );
         assert!(dd.join("miner").is_dir(), "wallet must be untouched");
-        assert!(dd.join("_corrupt-notes.txt").is_file(), "stray file with prefix must survive");
+        assert!(
+            dd.join("_corrupt-notes.txt").is_file(),
+            "stray file with prefix must survive"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -700,13 +724,22 @@ mod tests {
 
         let report = prune_old_quarantines_at(&dd, synthetic_now);
 
-        assert_eq!(report.removed_count, 2, "exactly 2 stale dirs should be pruned");
+        assert_eq!(
+            report.removed_count, 2,
+            "exactly 2 stale dirs should be pruned"
+        );
         assert_eq!(report.kept_count, 2, "exactly 2 newest dirs should be kept");
         assert!(new_corrupt.exists(), "newest _corrupt-* must survive");
         assert!(new_preserve.exists(), "newest _preserve-* must survive");
         assert!(!old_corrupt.exists(), "older _corrupt-* should be removed");
-        assert!(!old_preserve.exists(), "older _preserve-* should be removed");
-        assert!(dd.join("blocks").exists(), "chain data must NEVER be touched");
+        assert!(
+            !old_preserve.exists(),
+            "older _preserve-* should be removed"
+        );
+        assert!(
+            dd.join("blocks").exists(),
+            "chain data must NEVER be touched"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -730,13 +763,25 @@ mod tests {
         let report = remove_node_data(&dd);
 
         assert!(!dd.join("blocks").exists(), "blocks must be removed");
-        assert!(!dd.join("chainstate").exists(), "chainstate must be removed");
+        assert!(
+            !dd.join("chainstate").exists(),
+            "chainstate must be removed"
+        );
         assert!(!dd.join("indexes").exists(), "indexes must be removed");
-        assert!(!dd.join("faststart").exists(), "faststart dir must be removed");
+        assert!(
+            !dd.join("faststart").exists(),
+            "faststart dir must be removed"
+        );
         assert!(!dd.join("debug.log").exists(), "debug.log must be removed");
-        assert!(dd.join("wallets").join("miner").join("wallet.dat").exists(), "WALLET MUST SURVIVE");
+        assert!(
+            dd.join("wallets").join("miner").join("wallet.dat").exists(),
+            "WALLET MUST SURVIVE"
+        );
         assert!(dd.join("easybtx-state.json").exists(), "state must survive");
-        assert!(!report.items.is_empty(), "at least one deletion should be recorded");
+        assert!(
+            !report.items.is_empty(),
+            "at least one deletion should be recorded"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -750,7 +795,10 @@ mod tests {
         std::fs::write(fs_dir.join("snapshot.dat"), vec![0u8; 4096]).unwrap();
 
         let report = reclaim_disk(&dd, &fs_dir.join("faststart.conf"), false);
-        assert!(fs_dir.join("snapshot.dat").exists(), "snapshot kept while not loaded");
+        assert!(
+            fs_dir.join("snapshot.dat").exists(),
+            "snapshot kept while not loaded"
+        );
         assert!(report.items.is_empty());
 
         let _ = std::fs::remove_dir_all(&tmp);

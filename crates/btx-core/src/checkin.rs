@@ -98,7 +98,9 @@ fn format_id(bytes: [u8; 16]) -> String {
 
 /// True for a well-formed id: 32 lowercase hex characters.
 pub fn is_valid_node_id(s: &str) -> bool {
-    s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() == 32
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn node_id_path(datadir: &Path) -> PathBuf {
@@ -229,7 +231,10 @@ mod tests {
         assert!(!is_valid_node_id(""));
         assert!(!is_valid_node_id(&"a".repeat(31)));
         assert!(!is_valid_node_id(&"a".repeat(33)));
-        assert!(!is_valid_node_id(&"A".repeat(32)), "uppercase is refused server-side");
+        assert!(
+            !is_valid_node_id(&"A".repeat(32)),
+            "uppercase is refused server-side"
+        );
         assert!(!is_valid_node_id(&"g".repeat(32)), "not hex");
     }
 
@@ -267,9 +272,18 @@ mod tests {
     #[test]
     fn services_are_normalised_to_the_wire_shape() {
         assert_eq!(normalize_services("8000000").unwrap(), "0000000008000000");
-        assert_eq!(normalize_services("0x08000000").unwrap(), "0000000008000000");
-        assert_eq!(normalize_services("0000000008000000").unwrap(), "0000000008000000");
-        assert_eq!(normalize_services("  08000000  ").unwrap(), "0000000008000000");
+        assert_eq!(
+            normalize_services("0x08000000").unwrap(),
+            "0000000008000000"
+        );
+        assert_eq!(
+            normalize_services("0000000008000000").unwrap(),
+            "0000000008000000"
+        );
+        assert_eq!(
+            normalize_services("  08000000  ").unwrap(),
+            "0000000008000000"
+        );
         assert_eq!(normalize_services("08000000").unwrap().len(), 16);
     }
 
@@ -277,7 +291,10 @@ mod tests {
     fn a_malformed_services_value_is_dropped_here_not_sent() {
         assert!(normalize_services("").is_none());
         assert!(normalize_services("zzzz").is_none());
-        assert!(normalize_services("00000000000000000").is_none(), "17 chars is too long");
+        assert!(
+            normalize_services("00000000000000000").is_none(),
+            "17 chars is too long"
+        );
     }
 
     #[test]
@@ -315,9 +332,20 @@ mod tests {
     /// `cargo test -- --nocapture wire_payload` prints it.
     #[test]
     fn wire_payload_sample_for_cross_checking_the_endpoint() {
-        println!("WIRE_PAYLOAD_JSON {}", serde_json::to_string(&sample()).unwrap());
-        let no_optional = Checkin { btxd_version: None, bytes_sent: None, listening_port: None, ..sample() };
-        println!("WIRE_PAYLOAD_MIN {}", serde_json::to_string(&no_optional).unwrap());
+        println!(
+            "WIRE_PAYLOAD_JSON {}",
+            serde_json::to_string(&sample()).unwrap()
+        );
+        let no_optional = Checkin {
+            btxd_version: None,
+            bytes_sent: None,
+            listening_port: None,
+            ..sample()
+        };
+        println!(
+            "WIRE_PAYLOAD_MIN {}",
+            serde_json::to_string(&no_optional).unwrap()
+        );
     }
 
     #[test]
@@ -325,10 +353,23 @@ mod tests {
         // The server refuses these outright. This asserts we never grow one.
         let json = serde_json::to_string(&sample()).unwrap();
         for banned in [
-            "address", "wallet", "balance", "privkey", "private_key", "seed",
-            "mnemonic", "xprv", "secret", "passphrase", "user", "email",
+            "address",
+            "wallet",
+            "balance",
+            "privkey",
+            "private_key",
+            "seed",
+            "mnemonic",
+            "xprv",
+            "secret",
+            "passphrase",
+            "user",
+            "email",
         ] {
-            assert!(!json.contains(banned), "payload must not contain {banned}: {json}");
+            assert!(
+                !json.contains(banned),
+                "payload must not contain {banned}: {json}"
+            );
         }
     }
 
@@ -343,9 +384,19 @@ mod tests {
         assert_eq!(
             keys,
             [
-                "agent", "blocks", "btxd_version", "bytes_sent", "headers",
-                "listening_port", "node_id", "peers", "schema", "services",
-                "serving_attestations", "trusted_mirror", "uptime_secs",
+                "agent",
+                "blocks",
+                "btxd_version",
+                "bytes_sent",
+                "headers",
+                "listening_port",
+                "node_id",
+                "peers",
+                "schema",
+                "services",
+                "serving_attestations",
+                "trusted_mirror",
+                "uptime_secs",
             ]
         );
     }
@@ -359,9 +410,13 @@ mod tests {
             .with_status(204)
             .create_async()
             .await;
-        let out = send_checkin(&reqwest::Client::new(), &format!("{}/api/node-checkin", server.url()), &sample())
-            .await
-            .unwrap();
+        let out = send_checkin(
+            &reqwest::Client::new(),
+            &format!("{}/api/node-checkin", server.url()),
+            &sample(),
+        )
+        .await
+        .unwrap();
         assert_eq!(out, CheckinOutcome::Accepted);
         m.assert_async().await;
     }
@@ -369,15 +424,27 @@ mod tests {
     #[tokio::test]
     async fn a_429_is_too_soon_and_a_503_is_transient() {
         let mut server = mockito::Server::new_async().await;
-        let _a = server.mock("POST", "/a").with_status(429).create_async().await;
-        let _b = server.mock("POST", "/b").with_status(503).create_async().await;
+        let _a = server
+            .mock("POST", "/a")
+            .with_status(429)
+            .create_async()
+            .await;
+        let _b = server
+            .mock("POST", "/b")
+            .with_status(503)
+            .create_async()
+            .await;
         let c = reqwest::Client::new();
         assert_eq!(
-            send_checkin(&c, &format!("{}/a", server.url()), &sample()).await.unwrap(),
+            send_checkin(&c, &format!("{}/a", server.url()), &sample())
+                .await
+                .unwrap(),
             CheckinOutcome::TooSoon
         );
         assert_eq!(
-            send_checkin(&c, &format!("{}/b", server.url()), &sample()).await.unwrap(),
+            send_checkin(&c, &format!("{}/b", server.url()), &sample())
+                .await
+                .unwrap(),
             CheckinOutcome::Unavailable
         );
     }
@@ -391,9 +458,13 @@ mod tests {
             .with_body(r#"{"error":"unknown field: lol"}"#)
             .create_async()
             .await;
-        let out = send_checkin(&reqwest::Client::new(), &format!("{}/api/node-checkin", server.url()), &sample())
-            .await
-            .unwrap();
+        let out = send_checkin(
+            &reqwest::Client::new(),
+            &format!("{}/api/node-checkin", server.url()),
+            &sample(),
+        )
+        .await
+        .unwrap();
         match out {
             CheckinOutcome::Rejected { status, reason } => {
                 assert_eq!(status, 422);
@@ -406,7 +477,12 @@ mod tests {
     #[tokio::test]
     async fn a_dead_endpoint_is_an_error_not_a_panic() {
         // Port 1 on localhost refuses immediately.
-        let out = send_checkin(&reqwest::Client::new(), "http://127.0.0.1:1/api/node-checkin", &sample()).await;
+        let out = send_checkin(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1/api/node-checkin",
+            &sample(),
+        )
+        .await;
         assert!(out.is_err());
     }
 }

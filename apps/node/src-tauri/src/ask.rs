@@ -26,7 +26,9 @@ pub enum Ask<T: Serialize> {
     /// RPC_IN_WARMUP (-28): alive but catching up — "ask again in a moment".
     Warming,
     /// Anything else, as one plain sentence.
-    Unavailable { message: String },
+    Unavailable {
+        message: String,
+    },
 }
 
 /// Map an RPC failure to its calm state.
@@ -67,9 +69,7 @@ pub struct ChainProgress {
 }
 
 #[tauri::command]
-pub async fn ask_chain_progress(
-    state: State<'_, AppState>,
-) -> Result<Ask<ChainProgress>, String> {
+pub async fn ask_chain_progress(state: State<'_, AppState>) -> Result<Ask<ChainProgress>, String> {
     let Some(rpc) = rpc_handle(&state).await else {
         return Ok(Ask::Stopped);
     };
@@ -77,10 +77,8 @@ pub async fn ask_chain_progress(
         Ok(c) => c,
         Err(e) => return Ok(degrade(e)),
     };
-    let (chainstates, peers) = tokio::join!(
-        api::get_chainstates(&rpc),
-        api::get_connection_count(&rpc)
-    );
+    let (chainstates, peers) =
+        tokio::join!(api::get_chainstates(&rpc), api::get_connection_count(&rpc));
     let chainstates = chainstates.unwrap_or_default();
     let readiness =
         btx_core::health::sync_readiness(&chainstates, &chain, snapshot_spec().anchor_height);
@@ -273,14 +271,15 @@ fn block_error_to_ask(e: AppError) -> Ask<BlockAnswer> {
         AppError::Rpc { code: -5, .. } | AppError::Rpc { code: -8, .. } => Ask::Unavailable {
             message: "No block with that height or hash on your node.".into(),
         },
-        AppError::Rpc { code: -1, ref message } if message.contains("Block not available") => {
-            Ask::Unavailable {
-                message: "Your node hasn't downloaded that block yet — it's still \
+        AppError::Rpc {
+            code: -1,
+            ref message,
+        } if message.contains("Block not available") => Ask::Unavailable {
+            message: "Your node hasn't downloaded that block yet — it's still \
                           backfilling older history in the background. Ask for a newer \
                           block, or try again later."
-                    .into(),
-            }
-        }
+                .into(),
+        },
         other => degrade(other),
     }
 }
@@ -304,7 +303,9 @@ pub enum TxLookup {
     /// prompt renders from this.
     NeedsIndex,
     /// txindex is on but still building — pct of the chain indexed so far.
-    Building { pct: f64 },
+    Building {
+        pct: f64,
+    },
     NotFound,
 }
 
@@ -375,9 +376,7 @@ pub struct TxIndexAnswer {
 }
 
 #[tauri::command]
-pub async fn ask_tx_index_status(
-    state: State<'_, AppState>,
-) -> Result<Ask<TxIndexAnswer>, String> {
+pub async fn ask_tx_index_status(state: State<'_, AppState>) -> Result<Ask<TxIndexAnswer>, String> {
     let enabled = NodeAppSettings::load(&node_datadir()).txindex_enabled;
     let Some(rpc) = rpc_handle(&state).await else {
         return Ok(Ask::Stopped);
