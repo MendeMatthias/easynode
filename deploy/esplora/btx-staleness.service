@@ -1,0 +1,11 @@
+[Unit]
+Description=easyNode Esplora staleness probe (writes /run/btx-{fresh,stale,unverified})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/btx-staleness-check.sh
+# Deliberately no Restart=: the timer re-runs it. A failed run leaves the
+# previous marker state intact, which is the safe outcome — the whole point of
+# this probe is that losing the witness must never be read as proof of health.

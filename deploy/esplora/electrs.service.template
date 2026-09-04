@@ -1,0 +1,41 @@
+[Unit]
+Description=easyNode Esplora indexer (electrs fork for BTX)
+After=network-online.target btxd.service
+Wants=network-online.target
+# electrs tolerates btxd not being fully synced; it indexes what is available
+# and follows the tip.
+
+[Service]
+# Replace USER and the two data paths for your host.
+User=USER
+Type=simple
+# --daemon-dir supplies the RPC cookie; RPC stays on localhost.
+# --jsonrpc-import imports via getblock RPC rather than reading blk*.dat, which
+#   is safer while btxd is still doing IBD and appending block files. The
+#   blk-file default is faster and is the better choice for a full reindex once
+#   btxd is fully synced.
+# --http-addr binds the Esplora REST API on localhost only; Caddy fronts it.
+# --cors '*' mirrors the incumbent; Caddy STRIPS these headers downstream and
+#   re-emits them once, so the two never collide.
+#
+# ⚠ This requires prune=0. electrs indexes from the block files on disk and a
+#   pruned datadir deletes them. easyNode refuses Esplora mode on a pruned
+#   datadir rather than letting this fail hours into an index it can never
+#   finish — see crates/btx-core/src/esplora.rs.
+ExecStart=/usr/local/bin/electrs \
+  --network mainnet \
+  --daemon-dir /var/lib/btx \
+  --daemon-rpc-addr 127.0.0.1:19334 \
+  --db-dir /var/lib/electrs-db \
+  --http-addr 127.0.0.1:3000 \
+  --electrum-rpc-addr 127.0.0.1:50001 \
+  --cors '*' \
+  --jsonrpc-import \
+  -v
+Restart=on-failure
+RestartSec=15
+# electrs can use significant memory during initial index compaction.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
