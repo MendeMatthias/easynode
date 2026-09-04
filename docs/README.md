@@ -9,6 +9,9 @@
 - **[archival-capacity.md](archival-capacity.md)**: how many peers can still
   serve a block body (measured: one), and what an unpruned node actually costs
   on disk. Answers issue #14.
+- **[esplora-mode.md](esplora-mode.md)**: the opt-in Esplora API front, the
+  route contract a wallet actually requires, and the gate that decides whether an
+  endpoint may be advertised.
 - **[appimage-size.md](appimage-size.md)**: what the 445 MB Linux download is
   made of, and why the per-architecture split that was planned does not pay.
 - **[gpu-qualification-rtx3060.md](gpu-qualification-rtx3060.md)**: a full
