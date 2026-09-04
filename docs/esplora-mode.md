@@ -153,10 +153,10 @@ attested tip *may* trail the mined tip by a few blocks, and that is healthy.
 small gap; do not *assume* one, and do not treat its absence as suspicious.
 
 **5. Opt-in, off by default, honest about cost.** This wants a full archive plus
-the electrs index. We deliberately do **not** quote a total, because this project
-does not have a trustworthy one: `setup.rs` says the unpruned chain is ~105 GB,
-`datadir.rs` says ~50 GB, and neither has been re-measured against a completed
-sync. See [archival-capacity.md](archival-capacity.md).
+the electrs index. The archive half is now measured: **123.8 GiB of blocks on
+2026-09-04**, method in [archival-capacity.md](archival-capacity.md). The electrs
+index on top of it is **not** measured, so we still decline to quote a total —
+but the part we do know, we now say. Treat it as a server-class commitment.
 
 ## The acceptance gate
 

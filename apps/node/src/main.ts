@@ -805,7 +805,8 @@ $<HTMLInputElement>("wallet-toggle").addEventListener("change", (e) => {
 });
 
 // Remove node data: destructive, so a two-step confirm — first click arms,
-// second click (within 6 s) fires. Frees the ~105 GB chain and returns to
+// second click (within 6 s) fires. Frees the chain (~124 GiB for a full node,
+// ~10 GiB for a keeper) and returns to
 // the setup screen; wallets and the miner's files are never touched.
 let removeArmTimer: ReturnType<typeof setTimeout> | undefined;
 $("remove-node-btn").addEventListener("click", async () => {

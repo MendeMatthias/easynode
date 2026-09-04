@@ -97,7 +97,8 @@ pub struct NodeAppSettings {
     /// default.
     #[serde(default)]
     pub service_report_enabled: bool,
-    /// Which node this app runs: "full" (whole chain, ~105 GB) or "keeper"
+    /// Which node this app runs: "full" (whole chain, ~124 GiB measured
+    /// 2026-09-04) or "keeper"
     /// (pruned ~10 GB, serves signed confirmations). The CHOICE persists here;
     /// whether the keeper conf actually activates is the engine gate
     /// (`installer::conf_for_profile`) — an old bundled btxd provisions the
@@ -241,7 +242,7 @@ pub struct AppState {
     pub started_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// Held while the node runs && keep_awake is on.
     pub sleep_guard: std::sync::Mutex<Option<SleepAssertion>>,
-    /// Cached datadir size (MB, last measured) — a recursive walk of a ~50 GB
+    /// Cached datadir size (MB, last measured) — a recursive walk of a ~124 GiB
     /// tree is too heavy for the status poll, so it refreshes at most once a
     /// minute, off-thread (see get_node_status). Arc so the walk task can
     /// write the result back without borrowing AppState.

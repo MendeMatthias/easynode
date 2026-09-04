@@ -1624,7 +1624,8 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         btx_core::platform::home_dir().unwrap_or_else(|| PathBuf::from("."))
     };
     let disk_free_mb = btx_core::disk::free_disk_mb(&disk_probe);
-    // Heavy (recursive walk of a ~50 GB tree): refresh at most once a minute,
+    // Heavy (recursive walk of a ~124 GiB tree on a full node): refresh at most
+    // once a minute,
     // OFF the async executor (spawn_blocking) and WITHOUT holding the cache
     // lock during the walk — a cold-cache walk can take seconds and would
     // otherwise stall every concurrent status poll behind the mutex.
@@ -2473,7 +2474,8 @@ mod tests {
 }
 
 /// Remove the node's chain data entirely and return the app to the setup
-/// screen — the "give me my disk back" lever for a ~105 GB full chain.
+/// screen — the "give me my disk back" lever for a full chain measured at
+/// ~124 GiB (see setup.rs::MEASURED_CHAIN_PAYLOAD_GIB).
 /// Stops the node gracefully first, deletes the chain dirs (btx-core's
 /// remove_node_data: blocks/chainstate/indexes/faststart + debug.log — never
 /// wallets or the miner's state) plus the node's sidecar files, and resets

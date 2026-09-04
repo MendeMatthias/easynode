@@ -193,6 +193,18 @@ of a finished store's size. They are usable here only as a census of block
 | this document | "roughly 30 GB" | ~124 GiB |
 | `CHANGELOG.md` 0.2.1 | ~105 GB | unchanged: it was true on 2026-07-12 and history is not rewritten |
 
+Those were the sites the audit named. Sweeping the rest turned up seven more
+comments still carrying the old figures — `esplora.rs`, `esplora-mode.md`, two
+in `commands.rs`, two in `state.rs`, one in `main.ts` — which is the reason this
+section says "no longer" rather than "never did". A claim that a repository
+agrees with itself is worth exactly as much as the grep behind it.
+
+One of those seven got better rather than merely correct. `esplora.rs` refused
+to quote any disk figure at all, on the grounds that the base was unsettled.
+The base is settled now, so the warning names it — and still declines a total,
+because nobody has measured the electrs index that sits on top. Saying which
+half is known beats both a confident total and a blanket "we don't know".
+
 The gate is the part that mattered. `DISK_REQUIRED_FRESH` was 120 GiB against a
 124 GiB chain, so **the gate had fallen below the thing it exists to gate**.
 That inverts its purpose: instead of refusing an install that could never
