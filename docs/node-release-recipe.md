@@ -558,7 +558,22 @@ Also expect:
    must be attached to the release in step 7 before this feed is deployed in
    step 8.
 
-7. **Publish** with `apps/node/scripts/publish-node-release.sh`:
+7. **Publish.** This is now a script, `apps/node/scripts/publish-node-release.sh`,
+   and you should use it rather than the commands below. It does the draft ->
+   upload -> re-download -> verify -> flip sequence in the right order, refuses
+   an artifact with no signature, refuses one whose signature does not verify
+   against the pubkey in `tauri.conf.json`, and checks afterwards that the
+   repo-global Latest pointer did not move.
+
+   ```bash
+   # checks everything, creates nothing:
+   apps/node/scripts/publish-node-release.sh <ver> <asset-dir>
+   # then, once it is green:
+   apps/node/scripts/publish-node-release.sh <ver> <asset-dir> --publish
+   ```
+
+   The manual sequence, kept because you should understand what the script does:
+
    ```bash
    apps/node/scripts/publish-node-release.sh --version <ver> --sums SHA256SUMS \
      [--linux <.AppImage>] [--mac <.app.tar.gz>] [--win <-setup.exe>] \
