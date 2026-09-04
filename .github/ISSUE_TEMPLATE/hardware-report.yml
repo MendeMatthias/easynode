@@ -1,0 +1,54 @@
+name: Hardware report
+description: The app told you what your machine could do, and it was wrong
+labels: ["hardware"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        CONTRIBUTING says this is the most valuable thing you can send us, and
+        it is true: we cannot test on hardware we do not own. "It said X, my
+        machine is actually Y" is a real bug report, even if nothing crashed.
+
+        Nothing here asks for a key, a seed phrase, an address or a balance.
+        Please do not paste any of those. If a log line contains one, cut it.
+  - type: input
+    id: os
+    attributes:
+      label: OS and version
+      placeholder: macOS 15.2, or Ubuntu 24.04, or Windows 11 23H2
+    validations: { required: true }
+  - type: input
+    id: arch
+    attributes:
+      label: CPU and architecture
+      placeholder: Apple M2 Pro (arm64), or Ryzen 7 5800X (x86_64)
+    validations: { required: true }
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU, if any
+      placeholder: RTX 5080, or Apple integrated, or none
+  - type: textarea
+    id: said
+    attributes:
+      label: What the app said your machine could do
+      description: The role or capability text it showed you. A screenshot is fine.
+    validations: { required: true }
+  - type: textarea
+    id: actual
+    attributes:
+      label: What it actually is, and how you know
+      description: |
+        The bit that makes this actionable. If you have a running node, these
+        two are the most useful things you can paste:
+
+        ```
+        btx-cli getnetworkinfo     # localservices
+        btx-cli getfinalityinfo    # chain_oracle, trusted or consensus
+        ```
+    validations: { required: true }
+  - type: input
+    id: version
+    attributes:
+      label: easyNode version
+      placeholder: 0.6.17

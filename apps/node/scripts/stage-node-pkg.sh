@@ -31,6 +31,11 @@ APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="$APP_DIR/src-tauri/resources/node-pkg"
 
 VERSION="0.34.5"
+# Refuse to stage a version the app will then refuse. See scripts/lib/engine-pin.sh.
+# shellcheck source=lib/engine-pin.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/engine-pin.sh"
+assert_matches_engine_pin "$APP_DIR" "$VERSION"
+
 TARBALL_URL="https://github.com/btxchain/btx/releases/download/v${VERSION}/btx-${VERSION}-arm64-apple-darwin.tar.gz"
 # From the release's signed SHA256SUMS. Upstream has re-generated release assets
 # in place before — a silent swap must FAIL here, never ship unnoticed.
