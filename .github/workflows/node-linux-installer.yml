@@ -24,13 +24,25 @@ name: Build Linux BTX Node (AppImage + deb)
 # Security: no user inputs are interpolated into run: lines.
 
 on:
+  # ⚠ DISPATCH ONLY, ON PURPOSE, AND ONLY FOR NOW.
+  #
+  # This workflow cannot pass until PROVEN_BTXD_RUN_ID names a green
+  # btxd-linux.yml run in THIS repository (see the env block below). Until then
+  # its pin guard fails by design, and on a pull_request trigger it would fail
+  # on every PR that touches apps/node or crates/btx-core.
+  #
+  # style.yml makes the argument against that, about itself: "a gate that is red
+  # on day one does not raise quality: it teaches every contributor that a red
+  # check is normal". So this stays dispatch-only, and the `pull_request` block
+  # below goes back in the SAME commit that sets the pins.
+  #
+  # pull_request:
+  #   branches: [main]
+  #   paths:
+  #     - "apps/node/**"
+  #     - "crates/btx-core/**"
+  #     - ".github/workflows/node-linux-installer.yml"
   workflow_dispatch:
-  pull_request:
-    branches: [main]
-    paths:
-      - "apps/node/**"
-      - "crates/btx-core/**"
-      - ".github/workflows/node-linux-installer.yml"
 
 permissions:
   contents: read
