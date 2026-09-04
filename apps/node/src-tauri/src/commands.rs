@@ -18,7 +18,7 @@ use btx_core::node_api::{get_blockchain_info, get_chainstates};
 use btx_core::rpc::RpcClient;
 use btx_core::setup::{
     enough_free_disk, ensure_addnodes_in_conf, free_disk_bytes, wait_for_node_rpc,
-    DISK_REQUIRED_FRESH, DISK_REQUIRED_RESUME, RPC_URL,
+    DISK_REQUIRED_FRESH, RPC_URL,
 };
 use btx_core::snapshot::SnapshotSpec;
 
@@ -1828,11 +1828,19 @@ async fn run_setup_pipeline(app: &AppHandle, state: &State<'_, AppState>) -> Res
     //    number, its date and its method live on the constant.
     //    "Unknown" free space never blocks.
     let fresh = !datadir.join("blocks").exists();
-    let required = if fresh {
-        DISK_REQUIRED_FRESH
-    } else {
-        DISK_REQUIRED_RESUME
-    };
+    // Which chain are we about to provision? The gate has to read the same
+    // inputs as the conf that gets written twenty lines below, or it judges an
+    // install nobody asked for. It used to gate every fresh install on the full
+    // un-pruned chain while writing `prune=10000` for a keeper — refusing a
+    // ~10 GiB node for want of 140 GiB, on the tier this network is shortest of
+    // and which the app's own copy calls exactly that. The settings gear is in
+    // the global header, outside the wizard screen, so a first-run user can and
+    // does choose Keeper before pressing Install.
+    let pruned = btx_core::installer::conf_for_profile(
+        &NodeAppSettings::load(&datadir).node_profile,
+        NODE_RELEASE_TAG,
+    ) != btx_core::installer::NODE_FASTSTART_CONF;
+    let required = btx_core::setup::disk_required(fresh, pruned);
     if let Some(free) = free_disk_bytes(&datadir) {
         if !enough_free_disk(free, required) {
             let need_gib = required / (1024 * 1024 * 1024);
@@ -2025,6 +2033,38 @@ pub async fn set_keep_awake(state: State<'_, AppState>, on: bool) -> Result<(), 
     Ok(())
 }
 
+/// Refuse a destructive datadir operation when somebody ELSE is running btxd
+/// against it.
+///
+/// `state.rpc.is_some()` answers "is THIS app's node up?", which is not the
+/// question these commands need. The datadir is shared with the miner by
+/// design, and this app reaches states where it is not the holder but a live
+/// btxd is — `ManagedElsewhereNoRpc` is exactly that, and it leaves the
+/// dashboard up with Settings one click away. Deleting LevelDB directories
+/// under a live btxd can crash it, so ask who actually holds the datadir.
+///
+/// Fails CLOSED: it can only refuse an operation that used to proceed. We do
+/// not stop the other node — `start_node`'s holder policy is deliberate that a
+/// btxd proven to belong to a live app is never stopped, signalled or raced.
+async fn refuse_if_another_node_holds(datadir: &Path, we_are_running: bool) -> Result<(), String> {
+    if we_are_running {
+        return Ok(());
+    }
+    match btx_core::node::datadir_holder(datadir).await {
+        DatadirHolder::Free => Ok(()),
+        DatadirHolder::ManagedBtxd { .. } | DatadirHolder::OrphanedBtxd { .. } => Err(
+            "Another node is using this data folder right now - probably the easyBTX \
+             miner, or a second copy of this app. Stop it first, then try again."
+                .to_string(),
+        ),
+        DatadirHolder::Unidentifiable { .. } => Err(
+            "Something is still using this data folder and we could not identify it. \
+             Give it a moment and try again."
+                .to_string(),
+        ),
+    }
+}
+
 /// Reclaim disk: bounce the node if needed, strip the unused indexes + the
 /// (post-load) snapshot + cap debug.log, then bring the node back. Mirrors the
 /// miner's reclaim semantics — deleting LevelDB dirs under a LIVE btxd can
@@ -2037,6 +2077,7 @@ pub async fn reclaim_disk_now(
     let datadir = node_datadir();
     let conf_path = datadir.join("faststart").join("faststart.conf");
     let was_running = state.rpc.lock().await.is_some();
+    refuse_if_another_node_holds(&datadir, was_running).await?;
 
     if was_running {
         stop_node_inner(&state).await;
@@ -2365,6 +2406,11 @@ pub async fn remove_node_data_now(
     state: State<'_, AppState>,
 ) -> Result<btx_core::disk::ReclaimReport, String> {
     let datadir = node_datadir();
+    // stop_node_inner is a no-op against a btxd this app does not own, so
+    // without this the chain dirs come out from under somebody else's live
+    // node. Same reasoning as reclaim_disk_now above.
+    let we_are_running = state.rpc.lock().await.is_some();
+    refuse_if_another_node_holds(&datadir, we_are_running).await?;
     stop_node_inner(&state).await;
 
     let report = {

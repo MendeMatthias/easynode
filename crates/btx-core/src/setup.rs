@@ -52,6 +52,38 @@ pub const MEASURED_CHAIN_PAYLOAD_GIB: u64 = 124;
 pub const DISK_REQUIRED_FRESH: u64 = 140 * 1024 * 1024 * 1024; // measured chain (124 GiB) + working room
 pub const DISK_REQUIRED_RESUME: u64 = 2 * 1024 * 1024 * 1024; // ~2 GiB
 
+/// What a fresh KEEPER install needs. A keeper runs `prune=10000`, so it keeps
+/// under 10 GiB of blocks instead of the whole chain, and gating it on
+/// [`DISK_REQUIRED_FRESH`] turned away every machine that could run the tier
+/// this network is shortest of.
+///
+/// This is an ESTIMATE and must not borrow the provenance of the figure above.
+/// It is built from parts, each measured on one node on 2026-09-04 except the
+/// prune target, which is the setting itself:
+///
+///   ~9.8 GiB   blocks retained at `prune=10000`
+///   ~0.5 GiB   shielded state, block index, chainstate, undo
+///   ~0.5 GiB   the snapshot download, before it is unpacked and removed
+///   ~9   GiB   working room: `debug.log`, growth, and not running a user's
+///              disk to zero on our account
+///
+/// If somebody measures a finished keeper datadir, replace this with that
+/// number and say so, the way `MEASURED_CHAIN_PAYLOAD_GIB` does.
+pub const DISK_REQUIRED_FRESH_PRUNED: u64 = 20 * 1024 * 1024 * 1024;
+
+/// How much free disk an install needs, from the two things that decide it:
+/// whether the datadir already holds a chain, and whether the profile about to
+/// be provisioned prunes. Pure so the decision can be tested without a datadir,
+/// and so the gate and the conf writer cannot drift into judging different
+/// installs — which is what happened when this was inlined and profile-blind.
+pub fn disk_required(fresh: bool, pruned: bool) -> u64 {
+    match (fresh, pruned) {
+        (false, _) => DISK_REQUIRED_RESUME,
+        (true, true) => DISK_REQUIRED_FRESH_PRUNED,
+        (true, false) => DISK_REQUIRED_FRESH,
+    }
+}
+
 /// Whether `available` bytes meets `required`. Pure → unit-testable.
 pub fn enough_free_disk(available: u64, required: u64) -> bool {
     available >= required
@@ -608,6 +640,27 @@ mod tests {
     /// ever set below the chain it is gating, it does the opposite: it waves
     /// through the install that runs out of disk halfway. That is what happened
     /// between 2026-07-12 and 2026-09-04, silently, because nothing checked.
+    #[test]
+    fn a_keeper_install_is_not_gated_on_the_full_chain() {
+        let gib = 1024 * 1024 * 1024;
+        // The tier the network is shortest of keeps under 10 GiB of blocks.
+        // Gating it on the un-pruned chain refused every machine that could
+        // actually run one, which is the opposite of what the gate is for.
+        assert_eq!(disk_required(true, true), DISK_REQUIRED_FRESH_PRUNED);
+        assert_eq!(disk_required(true, false), DISK_REQUIRED_FRESH);
+        // A resume needs headroom either way.
+        assert_eq!(disk_required(false, true), DISK_REQUIRED_RESUME);
+        assert_eq!(disk_required(false, false), DISK_REQUIRED_RESUME);
+        // A 64 GiB laptop can hold a keeper and cannot hold the full chain.
+        // Both halves matter: the first is the fix, the second is the reason
+        // the pruned constant must not be waved through as "small enough".
+        assert!(enough_free_disk(64 * gib, disk_required(true, true)));
+        assert!(!enough_free_disk(64 * gib, disk_required(true, false)));
+        // And the pruned gate must still exceed what a keeper actually stores
+        // (prune=10000 is ~9.8 GiB of blocks) with room to work in.
+        assert!(DISK_REQUIRED_FRESH_PRUNED > 12 * gib);
+    }
+
     #[test]
     fn disk_gate_covers_the_chain() {
         let gib = 1024 * 1024 * 1024;
