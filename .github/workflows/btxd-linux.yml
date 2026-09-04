@@ -1,0 +1,265 @@
+name: Build Linux btxd (CUDA source build, smoked on the runner)
+
+# Builds btxd + btx-cli for Linux x86_64 from a btxchain/btx tag, WITH the CUDA
+# backend, and proves the backend is really in there before uploading.
+#
+# ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+# `stage-node-pkg-linux.sh` downloads the published upstream tarball. That
+# tarball has NO CUDA backend, so a node staged from it can never advertise
+# NODE_MATMUL_CONSENSUS whatever card is in the machine — since the MatMul v4.7
+# fork, block validation is exactly what needs the GPU. It also requires glibc
+# 2.38, which Ubuntu LTS does not have. So the Linux RELEASE path is a source
+# build, and this is that build in CI.
+#
+# ⚠ 22.04 ON PURPOSE. The ELF we produce has to run on strangers' distros, and a
+# binary picks up the glibc of the machine that built it. 22.04 is glibc 2.35,
+# the oldest the fleet runs. A newer runner would silently narrow who can run
+# the release. This is also why upstream's own binaries do not work for us.
+#
+# ⚠ CUDA 13.3, NOT 12.6. nvcc 12.6 segfaults compiling this tree. Measured on
+# the release box, 2026-09-04. The version is pinned below for that reason.
+#
+# ⚠ NEVER patch BTX's source to make a version string look nicer. btxd embeds
+# whether its tree was dirty and then fails its OWN production canary with
+# build_provenance_mismatch, leaving a node that runs, syncs and holds peers
+# while silently refusing to validate. Nothing on screen says so. The "prove the
+# tree is pristine" step below exists to make that impossible to do by accident.
+#
+# ── STATUS ──────────────────────────────────────────────────────────────────
+# Releases 0.6.15 through 0.6.17 were built BY HAND on an Ubuntu 22.04 box,
+# following "Rebuilding the Linux release from nothing" in
+# docs/node-release-recipe.md. This workflow is that procedure transcribed, with
+# the recipe's cmake invocation copied verbatim. It has NOT yet produced a
+# shipped release. Treat its first green run as the thing that proves it, and
+# compare the binary it makes against a known-good hand build before trusting a
+# release to it.
+#
+# Security: the only input is a git ref, consumed by actions/checkout's `ref:`
+# parameter. It is never interpolated into a `run:` line. No secrets, no write
+# permissions.
+
+on:
+  workflow_dispatch:
+    inputs:
+      btxchain_ref:
+        description: "btxchain/btx ref to build (blank = the tag the app pins)"
+        required: false
+        default: ""
+      cuda_architectures:
+        description: "CMAKE_CUDA_ARCHITECTURES (blank = the release set)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  # The release set, from docs/node-release-recipe.md: SASS for Turing through
+  # Blackwell. sm_100 arrives separately via upstream's own isolated MXFP4
+  # rules, which is why it is not listed here and still appears in the binary.
+  DEFAULT_CUDA_ARCHS: "75;86;89;120"
+  CUDA_VERSION: "13-3"
+  CUDA_HOME: "/usr/local/cuda-13.3"
+
+jobs:
+  build-btxd:
+    name: btxd + btx-cli (ubuntu-22.04, glibc 2.35, CUDA 13.3)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout easynode (for the engine pin)
+        uses: actions/checkout@v4
+        with:
+          path: easynode
+
+      # ONE source of truth for which engine we build. The app decides what it
+      # will provision via NODE_RELEASE_TAG; a workflow with its own hardcoded
+      # default drifts from it silently, which is how a release ships an engine
+      # the app then refuses to install.
+      - name: Resolve the engine tag from the app itself
+        id: pin
+        run: |
+          set -euo pipefail
+          cd easynode
+          # shellcheck source=/dev/null
+          . apps/node/scripts/lib/engine-pin.sh
+          pinned="$(engine_pin_tag apps/node)"
+          ref="${{ inputs.btxchain_ref }}"
+          [ -n "$ref" ] || ref="$pinned"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+          # Artifact names cannot contain "/", and a branch name like
+          # pr/0.33.3-network-stability fails the upload AFTER a full build.
+          echo "slug=$(printf '%s' "$ref" | tr '/' '-')" >> "$GITHUB_OUTPUT"
+          echo "building $ref (app pins $pinned)"
+
+      - name: Checkout btxchain/btx
+        uses: actions/checkout@v4
+        with:
+          repository: btxchain/btx
+          ref: ${{ steps.pin.outputs.ref }}
+          path: btx
+          fetch-depth: 0
+
+      - name: Prove the tree is PRISTINE before building
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          # Exactly the set cmake/script/GenerateBuildInfo.cmake watches to
+          # decide BUILD_GIT_DIRTY. If anything shows here, the resulting btxd
+          # fails its own production canary and must never ship.
+          dirty=$(git status --porcelain -uall -- CMakeLists.txt cmake src contrib/matmul-v4)
+          if [ -n "$dirty" ]; then
+            echo "::error::source tree is not pristine — btxd would fail its own"
+            echo "::error::production canary with build_provenance_mismatch"
+            echo "$dirty"
+            exit 1
+          fi
+          echo "tree pristine at $(git rev-parse HEAD)"
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libevent-dev libsqlite3-dev libboost-dev libzmq3-dev patchelf file
+          cmake --version | head -1
+          g++ --version | head -1
+
+      - name: Install CUDA ${{ env.CUDA_VERSION }} toolkit
+        run: |
+          set -euo pipefail
+          # Compiling for a GPU architecture does not require that GPU to be
+          # present, so a runner with no NVIDIA card builds these kernels fine.
+          # What it cannot do is EXECUTE them — see the smoke-test note below.
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-${CUDA_VERSION} \
+            cuda-cudart-dev-${CUDA_VERSION} \
+            libcublas-dev-${CUDA_VERSION} \
+            cuda-nvprune-${CUDA_VERSION}
+          "$CUDA_HOME/bin/nvcc" --version | tail -2
+
+      - name: Configure + build
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          archs="${{ inputs.cuda_architectures }}"
+          [ -n "$archs" ] || archs="$DEFAULT_CUDA_ARCHS"
+          echo "CUDA architectures: $archs"
+          # Copied from docs/node-release-recipe.md, "Rebuilding the Linux
+          # release from nothing", step 1. Wallet ON and sqlite ON or the app's
+          # wallet is dead. CMAKE_IGNORE_PATH is harmless here and kept so this
+          # matches the hand procedure line for line; on the release box it stops
+          # a Windows Anaconda under /mnt/c being picked up for libevent.
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_DAEMON=ON -DBUILD_CLI=ON \
+            -DBUILD_UTIL=OFF -DBUILD_TX=OFF -DBUILD_WALLET_TOOL=OFF \
+            -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_TESTS=OFF \
+            -DBUILD_FUZZ_BINARY=OFF \
+            -DENABLE_WALLET=ON -DWITH_SQLITE=ON -DWITH_ZMQ=ON \
+            -DCMAKE_IGNORE_PATH=/mnt/c \
+            -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
+            -DCMAKE_CUDA_ARCHITECTURES="$archs"
+          ninja -C build
+
+      - name: Confirm the build info the canary reads
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          info=$(find build -name 'bitcoin-build-info.h' | head -1)
+          [ -n "$info" ] || { echo "::error::no build info header produced"; exit 1; }
+          cat "$info"
+          if ! grep -q '#define BUILD_GIT_DIRTY 0' "$info"; then
+            echo "::error::BUILD_GIT_DIRTY is not 0 — this binary would fail its canary"
+            exit 1
+          fi
+
+      # THE GATE THAT MATTERS. Everything above can succeed and still produce a
+      # btxd with no GPU kernels in it, which is precisely the failure that makes
+      # a Linux node look healthy while being unable to validate. Ask the binary.
+      - name: Prove the CUDA kernels are actually in the binary
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          archs="${{ inputs.cuda_architectures }}"
+          [ -n "$archs" ] || archs="$DEFAULT_CUDA_ARCHS"
+          found=$("$CUDA_HOME/bin/cuobjdump" --list-elf build/bin/btxd 2>/dev/null \
+                  | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ')
+          echo "architectures present: ${found:-(none)}"
+          if [ -z "$found" ]; then
+            echo "::error::btxd contains NO device code. A node built from this"
+            echo "::error::cannot advertise NODE_MATMUL_CONSENSUS on any card."
+            exit 1
+          fi
+          missing=""
+          for a in $(printf '%s' "$archs" | tr ';' ' '); do
+            case " $found " in
+              *" sm_$a "*) : ;;
+              *) missing="$missing sm_$a" ;;
+            esac
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::requested architectures missing from btxd:$missing"
+            exit 1
+          fi
+          echo "every requested architecture is present"
+
+      - name: Regtest smoke (boot, wallet, mine one block)
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          # A GitHub runner has no NVIDIA card, so this proves the daemon BOOTS,
+          # its wallet works and it can mine a regtest block — not that the GPU
+          # path executes. Device execution is proven on real hardware; the
+          # transcript from a machine that does it lives in
+          # docs/gpu-qualification-rtx3060.md.
+          d=$(mktemp -d)
+          ./build/bin/btxd --version | head -1
+          ./build/bin/btxd -regtest -datadir="$d" -fallbackfee=0.0001 -daemonwait
+          trap './build/bin/btx-cli -regtest -datadir="'"$d"'" stop || true' EXIT
+          ./build/bin/btx-cli -regtest -datadir="$d" createwallet smoke >/dev/null
+          addr=$(./build/bin/btx-cli -regtest -datadir="$d" -rpcwallet=smoke getnewaddress)
+          [ -n "$addr" ] || { echo "::error::getnewaddress returned nothing"; exit 1; }
+          ./build/bin/btx-cli -regtest -datadir="$d" -rpcwallet=smoke \
+            generatetoaddress 1 "$addr" >/dev/null
+          count=$(./build/bin/btx-cli -regtest -datadir="$d" getblockcount)
+          [ "$count" = "1" ] || { echo "::error::unexpected block count: $count"; exit 1; }
+          echo "SMOKE PASSED: daemon boots, wallet works, mined 1 regtest block"
+
+      - name: Collect binaries + provenance + sha256
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/btxd-dist"
+          mkdir -p "$out"
+          cp build/bin/btxd build/bin/btx-cli "$out/"
+          # NO strip. Stripping removes the GPU kernels; the release path passes
+          # NO_STRIP=true through packaging for the same reason.
+          file "$out/btxd"
+          # Record what the binary REPORTS and which commit it came from, so the
+          # installer workflow verifies both without trusting a filename. The
+          # reported version can legitimately lag the tag: a branch that never
+          # bumped CLIENT_VERSION_BUILD reports the older number, which is why
+          # the package declares what it carries in .btxd-version instead.
+          "$out/btxd" --version | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' > "$out/BTXD_VERSION"
+          git rev-parse HEAD > "$out/BTXD_COMMIT"
+          "$CUDA_HOME/bin/cuobjdump" --list-elf "$out/btxd" 2>/dev/null \
+            | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ' > "$out/BTXD_CUDA_ARCHS"
+          echo "reports $(cat "$out/BTXD_VERSION") from $(cat "$out/BTXD_COMMIT")"
+          echo "cuda: $(cat "$out/BTXD_CUDA_ARCHS")"
+          # Non-system shared libraries a user's distro may not have. The staging
+          # script vendors these with ORIGIN rpaths; listing them here makes a
+          # surprise dependency visible in the build log instead of at runtime.
+          ldd "$out/btxd" || true
+          (cd "$out" && sha256sum btxd btx-cli | tee SHA256SUMS.txt)
+
+      - name: Upload btxd artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: btxd-linux-${{ steps.pin.outputs.slug }}
+          path: btxd-dist/*
+          if-no-files-found: error

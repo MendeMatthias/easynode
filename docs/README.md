@@ -6,6 +6,14 @@
   it, and the parts we have not verified.
 - **[node-release-recipe.md](node-release-recipe.md)**: how a release is cut,
   including the two engine gates that must both pass first.
+- **[archival-capacity.md](archival-capacity.md)**: how many peers can still
+  serve a block body (measured: one), and what an unpruned node actually costs
+  on disk. Answers issue #14.
+- **[appimage-size.md](appimage-size.md)**: what the 445 MB Linux download is
+  made of, and why the per-architecture split that was planned does not pay.
+- **[gpu-qualification-rtx3060.md](gpu-qualification-rtx3060.md)**: a full
+  transcript from an RTX 3060 validating and signing on mainnet, including the
+  part that does not flatter us.
 
 ## About the citations in code comments
 

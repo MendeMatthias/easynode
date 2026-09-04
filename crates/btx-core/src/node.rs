@@ -139,6 +139,28 @@ pub fn resolve_archive_whitelist_ips() -> Vec<String> {
 /// Includes localhost-only RPC binding flags to minimise attack surface.
 /// Each bootstrap peer is appended as `-addnode=<peer>` so a fresh node can
 /// always reach the network even when DNS seeds return no results.
+/// The `prune=` value the given conf asks for, if it states one.
+///
+/// Only a line whose trimmed form STARTS with `prune=` counts. The faststart
+/// conf explains itself in a comment that begins `# prune=0 keeps ALL blocks`,
+/// three lines above the real setting, so a substring match here would read the
+/// prose and get the right answer for the wrong reason — and the wrong answer
+/// the day somebody rewords the comment. Last occurrence wins, which is how
+/// btxd itself resolves a repeated key.
+fn prune_value_in_conf(conf: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(conf).ok()?;
+    let mut found = None;
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("prune=") {
+            let value = rest.trim();
+            if !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()) {
+                found = Some(value.to_string());
+            }
+        }
+    }
+    found
+}
+
 pub fn build_node_command(
     btxd: &Path,
     datadir: &Path,
@@ -181,6 +203,31 @@ pub fn build_node_command(
     // lineage (Knots v29.2 fork) understands -v2transport, and a v1-only peer
     // still gets a v1 connection after the reconnect downgrade.
     args.push("-v2transport=1".to_string());
+    // The prune posture must be EXPLICIT, for the same reason
+    // -matmulvalidation is below: btxd loads the datadir's btx_rw.conf on every
+    // start regardless of -conf, and a READ-WRITE setting outranks a config
+    // FILE one. Both of our profiles state their posture in the conf they
+    // generate (NODE_FASTSTART_CONF prune=0, NODE_KEEPER_CONF prune=10000), so
+    // both were being silently overridden on any datadir that remembers a
+    // different value.
+    //
+    // Measured 2026-09-04 on this box's live validator, from its own debug.log:
+    //     Config file arg: prune="0"
+    //     R/W config file arg: prune="4096"
+    //     Prune configured to target 4096 MiB on disk for block and undo files.
+    // It had been running pruned for weeks against the conf the app wrote, and
+    // nothing in the UI said so. That matters beyond disk: `disk.rs` documents
+    // that this app runs un-pruned on purpose because a pruned node cannot
+    // rebuild shielded state after an unclean shutdown and SIGABRTs instead,
+    // and the faststart conf carries the same warning three lines above the
+    // setting that was being ignored.
+    //
+    // Re-asserting the CONF's OWN value rather than a hardcoded 0 is what keeps
+    // the keeper profile working: the conf is the app's intent, and the command
+    // line is how the intent survives contact with an old datadir.
+    if let Some(prune) = prune_value_in_conf(conf) {
+        args.push(format!("-prune={prune}"));
+    }
     // btxd v0.31.0+ ships its OWN signed source-based auto-updater that, on
     // mainnet, defaults to ON: it polls btx.dev and tries to build + swap itself.
     // EasyBTX downloads, ad-hoc re-signs, and supervises btxd itself, so that
@@ -2798,6 +2845,97 @@ consensus-validator service.";
         assert!(!node_allows_degraded_matmul_start(Path::new(
             "/data/bin/btxd"
         )));
+    }
+
+    #[test]
+    fn the_confs_prune_posture_is_re_asserted_on_the_command_line() {
+        // btxd loads the datadir's btx_rw.conf on every start regardless of
+        // -conf, and a read-write setting outranks a config-file one. Measured
+        // 2026-09-04 on a live validator whose conf said prune=0 and whose
+        // btx_rw.conf said prune=4096: btxd logged both and took 4096, so the
+        // node ran pruned for weeks against the app's written intent. Only an
+        // explicit command-line value outranks btx_rw.conf.
+        let dir = std::env::temp_dir().join(format!("easynode-prune-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The full profile, comment prose and all, as faststart writes it.
+        let full = dir.join("full.conf");
+        std::fs::write(
+            &full,
+            "# prune=0 keeps ALL blocks so btxd can rebuild shielded state\n             prune=0\nserver=1\n",
+        )
+        .unwrap();
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.5/lin/btxd"),
+            Path::new("/dd"),
+            &full,
+            Backend::Cuda,
+        );
+        assert!(
+            args.iter().any(|a| a == "-prune=0"),
+            "the full profile must re-assert prune=0, got {args:?}"
+        );
+
+        // The keeper profile is DELIBERATELY pruned. A hardcoded 0 here would
+        // silently convert every keeper into a full node.
+        let keeper = dir.join("keeper.conf");
+        std::fs::write(&keeper, "prune=10000\nserver=1\n").unwrap();
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.5/lin/btxd"),
+            Path::new("/dd"),
+            &keeper,
+            Backend::Cuda,
+        );
+        assert!(
+            args.iter().any(|a| a == "-prune=10000"),
+            "the keeper profile must keep its own posture, got {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "-prune=0"),
+            "never force a keeper to full, got {args:?}"
+        );
+
+        // A conf that says nothing about pruning gets no flag, so btxd's own
+        // default still applies and this cannot invent a posture.
+        let silent = dir.join("silent.conf");
+        std::fs::write(&silent, "server=1\nlisten=1\n").unwrap();
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.5/lin/btxd"),
+            Path::new("/dd"),
+            &silent,
+            Backend::Cuda,
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("-prune=")),
+            "a silent conf must stay silent, got {args:?}"
+        );
+
+        // A missing conf must not panic: the app starts btxd this way during
+        // first-run setup before the conf is written.
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.5/lin/btxd"),
+            Path::new("/dd"),
+            &dir.join("does-not-exist.conf"),
+            Backend::Cuda,
+        );
+        assert!(!args.iter().any(|a| a.starts_with("-prune=")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_is_read_from_the_setting_not_the_prose() {
+        let dir = std::env::temp_dir().join(format!("easynode-prune-prose-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("c.conf");
+        // Only the comment mentions 4096. Nothing may read it.
+        std::fs::write(&conf, "# do not set prune=4096 here\nprune=0\n").unwrap();
+        assert_eq!(prune_value_in_conf(&conf).as_deref(), Some("0"));
+
+        // A non-numeric value is not a prune posture.
+        std::fs::write(&conf, "prune=yes\n").unwrap();
+        assert_eq!(prune_value_in_conf(&conf), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

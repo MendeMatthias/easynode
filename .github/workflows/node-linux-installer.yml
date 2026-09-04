@@ -1,0 +1,476 @@
+name: Build Linux BTX Node (AppImage + deb)
+
+# Builds the BTX Node app for Linux x86_64 with a SOURCE-BUILT btxd bundled in.
+#
+# Through 0.6.0 this downloaded upstream's release tarball, whose Linux binaries
+# are fully static ELFs. That path is gone: the release engine is a CUDA source
+# build, and
+# the commit that un-wedges a node stuck at 184,999 (upstream's
+# PreferTrustAdjustedHeader defect — unattested header work scores zero, so the
+# best-header pointer parks one block below activation and the continuing
+# chain's bodies are never requested) exists only on a branch. So Linux now
+# consumes an artifact from btxd-linux.yml, exactly as Windows consumes one from
+# btxd-windows.yml.
+#
+# A source build is NOT static, so the staging script vendors the non-system
+# shared libraries and sets an $ORIGIN rpath. The path-contract gate still
+# EXECUTES the bundled btxd from both bundle layouts, which is what proves the
+# vendoring worked.
+#
+# Keyless CI build: updater artifacts disabled via the overlay; a real signed
+# release flips createUpdaterArtifacts with a --config override and signs
+# locally (see docs/node-release-recipe.md).
+#
+# Security: no user inputs are interpolated into run: lines.
+
+on:
+  # ⚠ DISPATCH ONLY, ON PURPOSE, AND ONLY FOR NOW.
+  #
+  # This workflow cannot pass until PROVEN_BTXD_RUN_ID names a green
+  # btxd-linux.yml run in THIS repository (see the env block below). Until then
+  # its pin guard fails by design, and on a pull_request trigger it would fail
+  # on every PR that touches apps/node or crates/btx-core.
+  #
+  # style.yml makes the argument against that, about itself: "a gate that is red
+  # on day one does not raise quality: it teaches every contributor that a red
+  # check is normal". So this stays dispatch-only, and the `pull_request` block
+  # below goes back in the SAME commit that sets the pins.
+  #
+  # pull_request:
+  #   branches: [main]
+  #   paths:
+  #     - "apps/node/**"
+  #     - "crates/btx-core/**"
+  #     - ".github/workflows/node-linux-installer.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Required for the cross-run artifact download below. Declaring this block at
+  # all sets every unlisted scope to `none`, and passing `run-id:` +
+  # `github-token:` to download-artifact forces the REST path
+  # (GET /repos/{owner}/{repo}/actions/runs/{id}/artifacts), which needs
+  # actions: read. Without it the step 403s with "Resource not accessible by
+  # integration", which reads like a bad pin and burns a re-pin cycle.
+  # Same reason node-win-installer.yml and win-app-installer.yml declare it;
+  # btxd-windows.yml does not, and is right not to, because its download is
+  # same-run.
+  actions: read
+
+env:
+  # ── THE ENGINE PIN, AND HOW TO SET IT THE FIRST TIME ────────────────────────
+  # This workflow does not build btxd. It downloads one that btxd-linux.yml
+  # already built, smoke-tested and proved contains GPU kernels, and stages it
+  # into the app. That keeps a 2-3 hour CUDA build off every installer run and
+  # means the bytes we ship are bytes something already vouched for.
+  #
+  # ⚠ BOTH PINS MOVE TOGETHER. The artifact name is minted from the ref
+  # btxd-linux.yml was dispatched with, so bumping only the run id downloads
+  # nothing and the build fails late and confusingly.
+  #
+  # ⚠ THEY ARE EMPTY ON PURPOSE. A run id resolves within the repository the
+  # workflow runs in. The values this workflow carried in the private monorepo
+  # named a run that does not exist here, so they were cleared rather than
+  # inherited — an inherited pin would fail at the download step with a message
+  # about a missing artifact, which reads like a transient error and is not one.
+  #
+  # To bootstrap:
+  #   1. Dispatch btxd-linux.yml. Leave its inputs blank and it builds the tag
+  #      the app already pins (NODE_RELEASE_TAG in commands.rs).
+  #   2. Wait for it to go green. Its regtest smoke must have passed and its
+  #      "Prove the CUDA kernels are actually in the binary" step must have
+  #      listed every requested architecture.
+  #   3. Put that run's id below, and its artifact name (btxd-linux-<tag>, with
+  #      any "/" in the ref replaced by "-").
+  #   4. Optionally set PROVEN_BTXD_COMMIT to the commit that run reported, so
+  #      the guard below can prove the artifact is the one you meant. Two
+  #      different commits can report the SAME version string, so the version is
+  #      not an identity — the mac thread once found a wrong btxd sitting in a
+  #      gitignored staging directory and no version gate could have caught it.
+  PROVEN_BTXD_RUN_ID: ""
+  PROVEN_BTXD_ARTIFACT: ""
+  PROVEN_BTXD_COMMIT: ""
+
+jobs:
+  build-node-linux:
+    name: BTX Node Linux x86_64 (AppImage + deb)
+    runs-on: ubuntu-22.04 # oldest-supported glibc: BOTH the app binary and btxd
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run btx-core tests (shared node engine)
+        working-directory: crates/btx-core
+        run: cargo test --locked
+
+      - name: Install Tauri Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libfuse2 \
+            libevent-dev libsqlite3-dev
+
+      # ^ libevent/libsqlite3 are for the STAGING step, not for building the app.
+      # btxd is now a source build rather than a static ELF, so
+      # stage-node-pkg-linux-source.sh has to find and vendor its shared
+      # libraries on THIS runner. They were installed on btxd-linux.yml's runner,
+      # which is a different machine. Most of the closure happens to exist on the
+      # ubuntu-22.04 image anyway, but libevent_extra-2.1.so.7 has no other
+      # provider, and without it the staging script's unresolved-library check
+      # aborts the build.
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/node/src-tauri
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/node/package-lock.json
+
+      # Pull the btxd built by btxd-linux.yml. Upstream has not tagged v0.33.3,
+      # so there is no release tarball for the commit that un-wedges a node
+      # stuck at 184,999 — this platform is a source build now, like Windows and
+      # macOS. Both pins move TOGETHER: the artifact name is minted from the ref,
+      # so changing only the run id silently downloads nothing.
+      # Fail in one second with a readable message, rather than letting
+      # download-artifact parseInt("REPLACE_WITH_GREEN_RUN_ID") -> NaN and die
+      # obscurely a step later. node-win-installer.yml guards the same way.
+      - name: Guard — the btxd pin must be a real run id
+        run: |
+          set -euo pipefail
+          [[ "${PROVEN_BTXD_RUN_ID}" =~ ^[0-9]+$ ]] || {
+            echo "::error::PROVEN_BTXD_RUN_ID is unset or non-numeric:" \
+                 "'${PROVEN_BTXD_RUN_ID}'."
+            echo "::error::This is expected on a fresh checkout of this repository:"
+            echo "::error::the pin is empty until a btxd-linux.yml run exists HERE"
+            echo "::error::to point at. Dispatch btxd-linux.yml, confirm its regtest"
+            echo "::error::smoke passed AND that it proved the CUDA architectures,"
+            echo "::error::then set this to that run id. PROVEN_BTXD_ARTIFACT moves"
+            echo "::error::with it. See the env block at the top of this file."
+            exit 1; }
+          [ -n "${PROVEN_BTXD_ARTIFACT}" ] || {
+            echo "::error::PROVEN_BTXD_ARTIFACT is empty; it moves with the run id."
+            exit 1; }
+          echo "btxd pin: run ${PROVEN_BTXD_RUN_ID}, artifact ${PROVEN_BTXD_ARTIFACT}"
+
+      - name: Download the proven btxd (from btxd-linux.yml)
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.PROVEN_BTXD_ARTIFACT }}
+          path: btxd-dist
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ env.PROVEN_BTXD_RUN_ID }}
+
+      - name: Stage the source-built btxd package
+        run: |
+          set -euo pipefail
+          chmod +x btxd-dist/btxd btxd-dist/btx-cli
+          apps/node/scripts/stage-node-pkg-linux-source.sh btxd-dist
+
+      # The guard, rewritten. The OLD one was broken twice over:
+      #
+      #  (a) its regex was `NODE_RELEASE_TAG: &str = "v[0-9.]+"`, which requires
+      #      a closing quote straight after digits and dots. The tag is
+      #      `v0.33.3-pr105b`, so it matched NOTHING, `tag` came out empty, and
+      #      the build died with `the app expects  but this workflow pins
+      #      v0.33.2`. Reproduced by running it.
+      #
+      #  (b) more fundamentally, it asserted NODE_RELEASE_TAG == btxd's reported
+      #      version. That has been false BY DESIGN since 0.6.1: our install tag
+      #      has to move for anything to re-provision, while a build of
+      #      pr/0.33.3-network-stability keeps reporting v0.33.2 because upstream
+      #      never bumped CLIENT_VERSION_BUILD. Fixing only the regex would have
+      #      made this guard fail permanently instead of intermittently.
+      #
+      # provision_node_package already resolves this properly
+      # (crates/btx-core/src/installer.rs): the package declares what it really
+      # carries in `.btxd-version`, and provisioning verifies the binary against
+      # THAT, falling back to the install-dir name only when the marker is
+      # absent. So this mirrors that, and separately checks the app's tag is
+      # well-formed for the install path it mints.
+      - name: Guard — the staged package must be internally consistent
+        run: |
+          set -euo pipefail
+          pkg=apps/node/src-tauri/resources/node-pkg
+
+          # 1. The marker must exist. Without it provisioning falls back to
+          #    comparing against the install-dir name, which is the tag, which
+          #    the binary deliberately does not report -> refused on a user's
+          #    machine after the snapshot download.
+          [ -s "$pkg/.btxd-version" ] || {
+            echo "::error::$pkg/.btxd-version missing or empty. provision_node_package"
+            echo "::error::would verify against the install-dir tag instead, which a"
+            echo "::error::branch build never reports."
+            exit 1; }
+          declared=$(cat "$pkg/.btxd-version")
+
+          # 2. What the staged binary actually reports must match the marker.
+          #    This is the check provisioning performs on the user's machine;
+          #    doing it here means a mismatch fails CI instead of a stranger's
+          #    install.
+          reported=$("$pkg/bin/btxd" --version | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')
+          echo "declared=$declared reported=$reported"
+          [ "$declared" = "$reported" ] || {
+            echo "::error::the package declares $declared but its btxd reports $reported"
+            exit 1; }
+
+          # 3. The binary must be the commit we think it is. Every build of this
+          #    branch reports v0.33.2, so the version string cannot distinguish
+          #    two different commits — the mac thread found a WRONG btxd sitting
+          #    in the gitignored staging dir and no version gate could catch it.
+          #    btxd-linux.yml names its artifact after the TAG it built, not
+          #    the commit, so the commit is checked against PROVEN_BTXD_COMMIT
+          #    when one is pinned rather than by reading the artifact name.
+          if [ -f btxd-dist/BTXD_COMMIT ]; then
+            got=$(cat btxd-dist/BTXD_COMMIT)
+            echo "artifact built from commit $got"
+            if [ -n "${PROVEN_BTXD_COMMIT}" ] && [ "$got" != "${PROVEN_BTXD_COMMIT}" ]; then
+              echo "::error::the downloaded engine was built from $got but this"
+              echo "::error::workflow pins ${PROVEN_BTXD_COMMIT}. Two commits can report the"
+              echo "::error::same version string, so the version cannot settle this."
+              exit 1
+            fi
+          fi
+
+          # 4. The app's tag must still parse into the install path it mints.
+          #    Matches ANY tag text, not just bare digits, so a suffixed tag like
+          #    v0.33.3-pr105b is read correctly instead of yielding "".
+          tag=$(grep -oE 'NODE_RELEASE_TAG: &str = "[^"]+"' \
+                apps/node/src-tauri/src/commands.rs | grep -oE '"[^"]+"' | tr -d '"')
+          [ -n "$tag" ] || { echo "::error::could not read NODE_RELEASE_TAG"; exit 1; }
+          echo "NODE_RELEASE_TAG=$tag"
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*) : ;;
+            *) echo "::error::NODE_RELEASE_TAG '$tag' is not vMAJOR.MINOR.PATCH[suffix];"
+               echo "::error::node::parse_tag_version would fail to version-gate the"
+               echo "::error::-matmulrcexecution flag and the node would stall at the fork."
+               exit 1 ;;
+          esac
+
+      # The gate that separates a Linux node which validates from one that only
+      # looks like it does. stage-node-pkg-linux.sh (the NON-source path) stages
+      # an upstream tarball with no CUDA backend at all; a package built that way
+      # syncs, holds peers, reports itself healthy and can never advertise
+      # NODE_MATMUL_CONSENSUS on any card. Nothing at runtime says so. Ask the
+      # staged binary directly, the same way btxd-linux.yml asks the one it built.
+      - name: Guard — the staged engine must carry GPU kernels
+        run: |
+          set -euo pipefail
+          pkg=apps/node/src-tauri/resources/node-pkg
+          if [ -s btxd-dist/BTXD_CUDA_ARCHS ]; then
+            echo "engine was built for: $(cat btxd-dist/BTXD_CUDA_ARCHS)"
+          fi
+          # cuobjdump ships with the CUDA toolkit and is not on this runner, so
+          # look for the fatbinary sections the compiler emits. A btxd with no
+          # device code has none of them.
+          if command -v readelf >/dev/null; then
+            if readelf -S "$pkg/bin/btxd" 2>/dev/null | grep -qE '\.nv_fatbin|__nv_relfatbin|\.nvFatBinSegment'; then
+              echo "OK: btxd carries CUDA fatbinary sections"
+            else
+              echo "::error::the staged btxd contains NO CUDA device code."
+              echo "::error::A Linux node built from this package cannot validate on"
+              echo "::error::any GPU. This is what staging the plain upstream tarball"
+              echo "::error::produces — the release path is stage-node-pkg-linux-source.sh"
+              echo "::error::against a CUDA build from btxd-linux.yml."
+              exit 1
+            fi
+          fi
+
+      - name: Install npm deps
+        working-directory: apps/node
+        run: npm ci
+
+      - name: Frontend unit tests (vitest)
+        working-directory: apps/node
+        run: npm test
+
+      # generate_context! embeds the frontend at COMPILE time, so dist/ must
+      # exist before cargo test (same ordering the miner workflows use).
+      - name: Frontend build (tsc + vite)
+        working-directory: apps/node
+        run: npm run build
+
+      - name: Rust lib tests (the node app suite on a Linux target)
+        working-directory: apps/node/src-tauri
+        run: cargo test --lib --locked
+
+      - name: Build (tauri build → AppImage + deb)
+        working-directory: apps/node
+        env:
+          # linuxdeploy's strip pass chokes on tauri-patched binaries on GitHub
+          # runners; skipping costs a few MB, never correctness.
+          NO_STRIP: "true"
+          # Statically link the C++/gcc runtime so GLIBCXX_* "version not
+          # found" aborts can't bite on older targets.
+          RUSTFLAGS: "-C link-arg=-static-libgcc -C link-arg=-static-libstdc++"
+        run: npx tauri build --bundles appimage deb --verbose
+
+      # WSLg de-bundle: bundled GPU/graphics libs SHADOW WSLg's GL stack and
+      # abort EGL (the node's power-core visual is WebGL, same exposure as the
+      # miner). Strip them so the AppImage uses the system GL. Non-fatal.
+      - name: De-bundle GPU/graphics libs from the AppImage (WSLg fix)
+        run: |
+          set -uo pipefail
+          appdir=apps/node/src-tauri/target/release/bundle/appimage
+          app=$(find "$appdir" -maxdepth 1 -name '*.AppImage' | head -1)
+          [ -n "$app" ] || { echo "::error::no AppImage produced"; exit 1; }
+          cd "$appdir"; base=$(basename "$app"); chmod +x "$base"
+          rm -rf squashfs-root
+          ./"$base" --appimage-extract >/dev/null 2>&1 || { echo "::warning::AppImage extract failed; leaving it as-is"; exit 0; }
+          removed=0
+          for pat in 'libGL.so*' 'libGLX*.so*' 'libGLdispatch.so*' 'libOpenGL.so*' 'libEGL*.so*' 'libgbm.so*' 'libdrm*.so*' 'libvulkan*.so*' 'libgallium*.so*' 'libGLX_mesa*' 'swrast*' 'libwayland-egl.so*' 'libwayland-client.so*' 'libwayland-cursor.so*' 'libwayland-server.so*'; do
+            while IFS= read -r f; do rm -f "$f" && removed=$((removed+1)); done < <(find squashfs-root/usr/lib -maxdepth 1 -name "$pat" 2>/dev/null)
+          done
+          rm -rf squashfs-root/usr/lib/dri squashfs-root/usr/lib/gbm 2>/dev/null || true
+          echo "stripped $removed GPU driver libs (+ dri/gbm dirs)"
+          if curl -fsSL --retry 3 -o /tmp/appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"; then
+            chmod +x /tmp/appimagetool
+            if ARCH=x86_64 /tmp/appimagetool --appimage-extract-and-run --no-appstream squashfs-root "$base"; then
+              chmod +x "$base"; echo "repackaged $base WITHOUT GPU libs ($(du -h "$base" | cut -f1))"
+            else
+              echo "::warning::appimagetool repackage failed — keeping the original"
+            fi
+          else
+            echo "::warning::appimagetool download failed — keeping the original"
+          fi
+          rm -rf squashfs-root
+
+      # The contract: resolve_bundled_node_pkg() probes
+      # <resources>/node-pkg/bin/btxd inside the installed app. Extract both
+      # bundles, assert the tree is there, and EXECUTE the bundled btxd so a
+      # bundler layout change fails HERE.
+      #
+      # Executing it matters MORE now than when btxd was a static ELF. A source
+      # build resolves libevent/libsqlite3 through the $ORIGIN rpath the staging
+      # script set, so this run is also the proof that the vendoring survived
+      # being packed into a .deb and an AppImage. Run with an EMPTY
+      # LD_LIBRARY_PATH so a path this runner happens to export cannot stand in
+      # for a library that will be missing on a user's machine.
+      - name: Path-contract gate (deb + AppImage carry a runnable node-pkg)
+        run: |
+          set -euo pipefail
+          bundle_dir=apps/node/src-tauri/target/release/bundle
+          product=$(jq -r .productName apps/node/src-tauri/tauri.conf.json)
+          echo "productName (usr/lib dir contract): $product"
+
+          deb=$(find "$bundle_dir/deb" -maxdepth 1 -name '*.deb' | head -1)
+          [ -n "$deb" ] || { echo "::error::no .deb produced"; exit 1; }
+          echo "deb Depends: $(dpkg-deb -f "$deb" Depends)"
+          rm -rf /tmp/debx && mkdir -p /tmp/debx
+          dpkg-deb -x "$deb" /tmp/debx
+          pkgdir="/tmp/debx/usr/lib/$product/resources/node-pkg"
+          if [ ! -x "$pkgdir/bin/btxd" ]; then
+            echo "::error::node-pkg/bin/btxd not at usr/lib/$product/resources — actual:"
+            find /tmp/debx -name btxd | head -5 || true
+            exit 1
+          fi
+          # ldd BEFORE executing: a missing library makes --version die with a
+          # bare loader message that names one file and explains nothing, so
+          # check first and report the whole unresolved set.
+          if env -u LD_LIBRARY_PATH ldd "$pkgdir/bin/btxd" 2>&1 | grep "not found"; then
+            echo "::error::the .deb's btxd has unresolved libraries — the \$ORIGIN"
+            echo "::error::rpath vendoring did not survive packaging (listed above)"
+            exit 1
+          fi
+          env -u LD_LIBRARY_PATH "$pkgdir/bin/btxd" --version | head -1
+
+          app=$(find "$bundle_dir/appimage" -maxdepth 1 -name '*.AppImage' | head -1)
+          [ -n "$app" ] || { echo "::error::no AppImage produced"; exit 1; }
+          rm -rf /tmp/appx && mkdir -p /tmp/appx
+          cp "$app" /tmp/appx/app.AppImage
+          cd /tmp/appx && chmod +x app.AppImage && ./app.AppImage --appimage-extract >/dev/null
+          apkgdir="squashfs-root/usr/lib/$product/resources/node-pkg"
+          if [ ! -x "$apkgdir/bin/btxd" ]; then
+            echo "::error::AppImage node-pkg/bin/btxd not at usr/lib/$product/resources — actual:"
+            find squashfs-root -name btxd | head -5 || true
+            exit 1
+          fi
+          if env -u LD_LIBRARY_PATH ldd "$apkgdir/bin/btxd" 2>&1 | grep "not found"; then
+            echo "::error::the AppImage's btxd has unresolved libraries — the \$ORIGIN"
+            echo "::error::rpath vendoring did not survive packaging (listed above)"
+            exit 1
+          fi
+          env -u LD_LIBRARY_PATH "$apkgdir/bin/btxd" --version | head -1
+          echo "path contract OK: runnable btxd in both bundles, no unresolved libs"
+
+      - name: Collect artifacts + sha256
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/dist-node-linux"
+          mkdir -p "$out"
+          cp apps/node/src-tauri/target/release/bundle/appimage/*.AppImage "$out/"
+          cp apps/node/src-tauri/target/release/bundle/deb/*.deb "$out/"
+          cd "$out" && sha256sum * | tee SHA256SUMS
+
+      - name: Upload Linux bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: BTX-Node-linux
+          path: dist-node-linux/*
+          if-no-files-found: error
+
+      # After upload on purpose: a guardrail must never block downloading the
+      # artifact for diagnosis.
+      #
+      # btxd is checked TOO, which it did not need to be while upstream shipped
+      # a fully static ELF. It is a source build now, so it carries whatever
+      # glibc floor its build runner had. btxd-linux.yml pins ubuntu-22.04 for
+      # exactly this reason, and this is the gate that would notice if that ever
+      # stopped being true — otherwise the first report is a stranger's node
+      # refusing to start on an older distro.
+      - name: glibc compatibility gate (app binary + bundled btxd <= 22.04 floor)
+        run: |
+          set -uo pipefail
+          CEIL="2.35"
+          max_glibc() { objdump -T "$1" 2>/dev/null \
+            | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' | sed 's/GLIBC_//' | sort -V | tail -1 || true; }
+          le() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }
+          appbin=$(find /tmp/appx/squashfs-root/usr/bin -maxdepth 1 -type f \
+            -exec sh -c 'file -b "$1" 2>/dev/null | grep -q ELF' _ {} \; -print | head -1 || true)
+          { [ -n "$appbin" ] && [ -f "$appbin" ]; } || { echo "::error::no ELF app binary in AppImage usr/bin"; exit 1; }
+          v=$(max_glibc "$appbin"); v=${v:-0}
+          if ! le "$v" "$CEIL"; then
+            echo "::error::app binary needs GLIBC_$v > $CEIL"
+            exit 1
+          fi
+          echo "app binary GLIBC floor OK ($v <= $CEIL)"
+
+          # The bundled node, and the libraries the staging script vendored
+          # alongside it. A vendored .so is copied from the BUILD runner, so it
+          # carries that runner's floor just as the binaries do.
+          product=$(jq -r .productName apps/node/src-tauri/tauri.conf.json)
+          pkg="/tmp/appx/squashfs-root/usr/lib/$product/resources/node-pkg"
+          [ -d "$pkg" ] || { echo "::error::no node-pkg in the extracted AppImage"; exit 1; }
+          rc=0; seen=0
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            seen=$((seen+1))
+            fv=$(max_glibc "$f"); fv=${fv:-0}
+            if le "$fv" "$CEIL"; then
+              echo "  OK   $(basename "$f") ($fv)"
+            else
+              echo "::error::$(basename "$f") needs GLIBC_$fv > $CEIL"
+              rc=1
+            fi
+          done < <(find "$pkg/bin" -maxdepth 2 -type f \( -name 'btxd' -o -name 'btx-cli' -o -name '*.so*' \))
+          # A find that matches nothing would otherwise leave rc=0 and print a
+          # cheerful OK, so an empty walk has to be the failure it actually is.
+          # btxd and btx-cli are always present; vendored .so files may not be.
+          if [ "$seen" -lt 2 ]; then
+            echo "::error::glibc walk inspected only $seen file(s) under $pkg/bin —"
+            echo "::error::expected at least btxd and btx-cli. The package layout"
+            echo "::error::changed and this gate silently stopped checking anything."
+            find "$pkg/bin" -maxdepth 2 | head -20
+            exit 1
+          fi
+          [ "$rc" -eq 0 ] || exit 1
+          echo "bundled btxd + vendored libs GLIBC floor OK ($seen file(s), <= $CEIL)"

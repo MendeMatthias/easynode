@@ -575,15 +575,30 @@ Also expect:
    The manual sequence, kept because you should understand what the script does:
 
    ```bash
-   gh release create node-v<ver> --repo MendeMatthias/EasyBTX-releases --latest=false ...
+   apps/node/scripts/publish-node-release.sh --version <ver> --sums SHA256SUMS \
+     [--linux <.AppImage>] [--mac <.app.tar.gz>] [--win <-setup.exe>] \
+     [--notes-file NOTES.md] [--dry-run]
    ```
-   `--latest=false` is **mandatory** — otherwise the node release steals the
-   repo-global "Latest" pointer and breaks the *miner's* updater. Check it after
-   publishing: `/releases/latest` must still return the miner's `vX.Y.Z`.
+   It performs every check this step used to ask a human to remember: the
+   artifacts must be listed in the gate run's `SHA256SUMS` with matching hashes
+   and must not be newer than it (a rebuild after the gates is refused), the
+   updater signature must verify against the pubkey the app embeds, the release
+   is created as a draft and only flipped live once its assets are attached,
+   every asset is re-downloaded and compared after publishing, and
+   `/releases/latest` is re-read at the end. Run it with `--dry-run` first: that
+   does every offline check and stops before the first API call.
 
-   Without `gh`, the REST equivalent, which is how 0.6.5 went out. **Create it as
-   a draft, attach the assets, then flip it live**, so there is never a window
-   where the tag resolves but the files 404:
+   It needs only `curl` and `python3`, because the publishing box has neither
+   `gh` nor `jq` (measured 2026-09-04, both sides of the WSL boundary).
+
+   `--latest=false` is **mandatory** — otherwise the node release steals the
+   repo-global "Latest" pointer and breaks the *miner's* updater. The script
+   always sends it and fails if a node tag captured the pointer anyway; if you
+   are ever publishing by hand, check `/releases/latest` yourself.
+
+   The REST calls the script makes, which is also how 0.6.5 went out by hand.
+   **Create it as a draft, attach the assets, then flip it live**, so there is
+   never a window where the tag resolves but the files 404:
    ```
    POST /repos/MendeMatthias/EasyBTX-releases/releases
         {"tag_name":"node-vX.Y.Z","draft":true,"make_latest":"false", ...}
@@ -626,6 +641,57 @@ Also expect:
   file against the local build).
 - Observe a real upgrade: quit and reopen an older app — the check fires on
   launch, otherwise within 6 hours.
+
+## Cutting a release from CI
+
+The four release workflows live here now, alongside the two gates. They were
+ported from the private monorepo on 2026-09-04, and the Linux pair was brought
+forward from the v0.33.2 era in the process — as ported they built an engine
+with **no CUDA backend**, which is the one mistake that produces a Linux node
+that syncs, holds peers, reports itself healthy and cannot validate.
+
+| workflow | what it does |
+|---|---|
+| `btxd-linux.yml` | builds btxd + btx-cli from a btxchain/btx tag **with CUDA**, on ubuntu-22.04, proves the tree was pristine, proves the kernels are in the binary, smokes it on regtest, uploads the artifact |
+| `node-linux-installer.yml` | downloads that artifact, stages it, runs the suites, builds the AppImage and `.deb` |
+| `btxd-windows.yml` | the Windows engine build |
+| `node-win-installer.yml` | the Windows installer |
+
+**The engine pins are empty on a fresh checkout, and that is deliberate.** The
+installers download their engine from a specific Actions *run id*, and a run id
+only resolves inside the repository the workflow runs in. The values these
+carried in the private monorepo named runs that do not exist here. Inheriting
+them would have failed at the download step with a message about a missing
+artifact, which reads like a transient error and is not one.
+
+So the first release cut from this repository runs in this order:
+
+1. **Dispatch `btxd-linux.yml`.** Leave its inputs blank: it reads
+   `NODE_RELEASE_TAG` out of `commands.rs` through
+   `apps/node/scripts/lib/engine-pin.sh`, so the engine it builds is the engine
+   the app will provision, with no second place to keep that number.
+2. **Read its log, do not just look at the tick.** Two steps matter more than
+   the rest: *Prove the tree is PRISTINE* and *Prove the CUDA kernels are
+   actually in the binary*. The second one is the gate that did not exist
+   before; it lists the architectures found in the ELF and fails if any
+   requested one is missing.
+3. **Set the pins** in `node-linux-installer.yml`: `PROVEN_BTXD_RUN_ID` to that
+   run, `PROVEN_BTXD_ARTIFACT` to its artifact name, and optionally
+   `PROVEN_BTXD_COMMIT` so the guard can prove identity. Two different commits
+   can report the same version string, so the version is not an identity.
+4. **Dispatch `node-linux-installer.yml`.** It re-runs both suites, stages,
+   re-checks that the staged engine carries GPU kernels, and builds the bundles.
+5. **Then the steps above**: sign, `publish-node-release.sh`,
+   `build-node-feed.sh`, the site PR.
+
+⚠ **These workflows have not yet cut a shipped release.** 0.6.15 through 0.6.17
+were built by hand on an Ubuntu 22.04 box using the procedure in the next
+section, and this CI is that procedure transcribed rather than a path with a
+track record. Compare the first binary it produces against a known-good hand
+build before trusting a release to it. The hand procedure below stays the
+authority until CI has earned the job.
+
+---
 
 ## Rebuilding the Linux release from nothing, so it never needs re-fixing
 
@@ -683,8 +749,8 @@ glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
 
 6. Sign with `cargo tauri signer sign -f <updater.key> -p ""` (empty
    password), verify with `apps/node/scripts/verify-updater-sig.py`, publish
-   with a script in the shape of `publish-node-*.sh` (token prompted or from
-   the environment, refuses untested bytes, `make_latest=false` always, re
+   with `apps/node/scripts/publish-node-release.sh` (token prompted or from the
+   environment, refuses untested bytes, `make_latest=false` always, re
    downloads and compares after upload), and only THEN move
    `site/public/updater/latest-node.json` and the site pins, regenerating
    the feed with `gen-node-feed.py` so every signature is verified against
