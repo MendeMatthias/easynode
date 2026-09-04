@@ -2084,10 +2084,56 @@ mod tests {
         let fake = dir.join("btxd");
         std::fs::copy("/bin/sleep", &fake).expect("copy /bin/sleep");
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        tokio::process::Command::new(&fake)
-            .arg("30")
-            .spawn()
-            .expect("spawn the btxd stand-in")
+        for attempt in 1..=EXEC_RETRIES {
+            match tokio::process::Command::new(&fake).arg("30").spawn() {
+                Ok(child) => return child,
+                Err(e) if attempt < EXEC_RETRIES && is_text_file_busy(&e) => {
+                    std::thread::sleep(EXEC_RETRY_WAIT);
+                }
+                Err(e) => panic!("spawn the btxd stand-in: {e}"),
+            }
+        }
+        unreachable!("the loop above either returns a child or panics")
+    }
+
+    /// WRITE THEN EXEC, IN A PARALLEL TEST RUNNER: THE ETXTBSY WINDOW.
+    ///
+    /// Several tests here build a small executable in a temp dir and run it.
+    /// That is a race against every other test thread, and it is nobody's bug
+    /// in particular: while our write descriptor on the new file is open, any
+    /// other thread that forks (which is half of what these tests do) hands its
+    /// child a copy of that descriptor. Until that child reaches its own exec,
+    /// the kernel still sees an open writer on our file and refuses to execute
+    /// it: `ETXTBSY`, surfaced by Rust as "Text file busy (os error 26)".
+    ///
+    /// Observed on 2026-09-04 on the Linux rig, three full-suite runs in
+    /// eight, moving between `the_two_pidfiles_agreeing_is_the_healthy_case_not_corruption`
+    /// and `launch_watch_passes_a_child_that_stays_up` depending on which
+    /// thread lost. Nothing is wrong with either file, and the window closes on
+    /// its own in microseconds, so the answer is to look again rather than to
+    /// fail a whole run. Half a second of retries is far longer than the window
+    /// and still fails fast if the file is genuinely not executable.
+    #[cfg(unix)]
+    const EXEC_RETRIES: u32 = 20;
+    #[cfg(unix)]
+    const EXEC_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(25);
+
+    /// Whether a spawn error is the ETXTBSY race above. Matches on the raw
+    /// errno, not the message, because the message is what the C library says
+    /// in the runner's locale.
+    #[cfg(unix)]
+    fn is_text_file_busy(e: &std::io::Error) -> bool {
+        e.raw_os_error() == Some(libc::ETXTBSY)
+    }
+
+    /// Same test, one layer down: by the time `NodeController::start` reports
+    /// the failure it is a stringified `AppError`, so the errno has to be read
+    /// out of the text. Rust always appends "(os error N)" itself, which is the
+    /// part no locale changes.
+    #[cfg(unix)]
+    fn error_is_text_file_busy(e: &AppError) -> bool {
+        e.to_string()
+            .contains(&format!("os error {}", libc::ETXTBSY))
     }
 
     /// End to end, on the shape that was actually observed: `btxd.pid` naming a
@@ -2262,12 +2308,20 @@ mod tests {
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         let conf = dir.join("faststart.conf");
         std::fs::write(&conf, "").unwrap();
-        let mut controller = NodeController::new();
-        controller
-            .start(&shim, dir, &conf, Backend::Cpu, &shim)
-            .await
-            .expect("shim spawn");
-        controller
+        // The shim was just written, so this can lose the ETXTBSY race too —
+        // see the note on `EXEC_RETRIES`. A fresh controller per attempt: a
+        // failed `start` leaves nothing to reuse.
+        for attempt in 1..=EXEC_RETRIES {
+            let mut controller = NodeController::new();
+            match controller.start(&shim, dir, &conf, Backend::Cpu, &shim).await {
+                Ok(()) => return controller,
+                Err(e) if attempt < EXEC_RETRIES && error_is_text_file_busy(&e) => {
+                    tokio::time::sleep(EXEC_RETRY_WAIT).await;
+                }
+                Err(e) => panic!("shim spawn: {e}"),
+            }
+        }
+        unreachable!("the loop above either returns a controller or panics")
     }
 
     #[cfg(unix)]
