@@ -3,8 +3,19 @@
 **Run a real BTX node from home, on the machine you already own.**
 
 easyNode is a desktop app that installs, configures and supervises `btxd`, the
-BTX full node, for someone who does not want to run a daemon by hand. It is MIT
-licensed and this repository is the whole of it.
+BTX full node, for someone who does not want to run a daemon by hand.
+
+**It is open source, as of September 2026, and this repository is the whole of
+it.** MIT licensed: the app, the shared engine library, the release recipe, the
+CI that builds it, and the gates that must pass before any release changes which
+`btxd` your machine runs. The only thing deliberately absent is the signing key,
+which is not in any repository and never will be.
+
+It grew inside a private monorepo next to the easyBTX miner, and it was moved out
+and opened on purpose. Software that asks people to help decide which chain is
+real has no business being unauditable. The miner is a separate product and stays
+closed; the test for whether a file belongs here is whether it is part of running
+a node.
 
 ## Get it
 
@@ -93,6 +104,60 @@ goes quiet is worth more than many powerful ones that sleep.
 the hardware.** Forwarding a port and disabling sleep is usually the difference
 between one role and the next.
 
+## How nodes help each other
+
+A node is not a passive copy of the chain. It talks to the other nodes
+continuously, and most of what makes one worth running is what it hands out.
+
+**Blocks and headers.** The ordinary business of a peer-to-peer network: a new
+node asks its peers for history, an established one serves it. Everybody knows
+about this part. On BTX it is scarcer than it sounds — see below.
+
+**Attestations, which are the interesting part.** Since the MatMul v4.7 fork,
+validating a block means recomputing an RC episode on a GPU. A machine that can
+do that forms an *independent opinion* about which chain is real, signs it, and
+passes the signature to its peers. Nodes that cannot do the maths follow those
+signatures instead. So a witness is not only checking its own copy — it is
+producing the evidence other people's nodes depend on, and a signer that is
+always on is where that evidence comes from.
+
+Measured on one home RTX 3060 on 2026-09-04, while it held the tip:
+
+```
+stored attestations    3,023
+blocks with quorum     3,008
+signed frontier        at the tip, 0 blocks behind
+advertises             MATMUL_CONSENSUS, MATMUL_ATTESTATION_ARCHIVE
+```
+
+The full transcript, including the part that does not flatter us, is in
+[docs/gpu-qualification-rtx3060.md](docs/gpu-qualification-rtx3060.md).
+
+**Serving history, which almost nobody does.** A node that has fallen behind can
+only be rescued by a peer that is both archival *and* current. Measured the same
+day from a node with 19 peers: 12 advertised `NETWORK`, and exactly **one** was
+archival and current. Ten of the twelve were older versions faithfully archiving
+a chain nobody is on any more. The count, and what an unpruned node actually
+costs on disk, is in [docs/archival-capacity.md](docs/archival-capacity.md).
+
+## Run one
+
+BTX is small right now. That is not a reason to wait — it is the whole reason to
+start, because every number on this page is one a single additional machine
+moves measurably. One archival-and-current peer becomes two. One independent
+opinion about the chain becomes two.
+
+You do not need a good computer to help, and the app will tell you honestly what
+yours can do rather than flattering it. If it turns out your machine can be a
+witness, the thing that matters after that is not speed. It is staying on.
+
+**[Get it at easybtx.com/node](https://easybtx.com/node)** — macOS, Linux and
+Windows. It installs and supervises the node for you, updates itself, and will
+never install a build that was not signed by the release key.
+
+If you would rather read the argument before installing anything, that is
+[Always on](docs/always-on.md).
+
 ## What this app will never do
 
 - It will never ask for your seed phrase or private key in a web page.
@@ -120,7 +185,7 @@ Both suites pass on a fresh clone and neither needs the staging step:
 
 ```bash
 cd apps/node && npm test              # 52 tests, under a second
-cd crates/btx-core && cargo test      # 234 tests, about 5 seconds
+cd crates/btx-core && cargo test      # 270 tests, about 5 seconds
 ```
 
 CI runs exactly these on every pull request, plus `tsc --noEmit` and a
