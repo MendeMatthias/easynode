@@ -1,0 +1,82 @@
+# Formatting and the clippy lints that catch bugs rather than taste.
+#
+# WHY THIS IS SPLIT FROM ci.yml. Both of these were red when the repository
+# opened, and a gate that is red on day one does not raise quality: it teaches
+# every contributor that a red check is normal. So the reformat landed first, as
+# its own commit, and only then did this become a gate.
+#
+# WHAT IS AND IS NOT ENFORCED. `cargo fmt --check` is enforced, because it is
+# mechanical and a contributor can fix it with one command. Of clippy, only
+# `correctness` and `suspicious` are enforced: those are the groups that flag
+# probable BUGS. Both were verified to exit 0 on both workspaces before this
+# file was added, so nobody inherits a failure they did not cause.
+#
+# The rest of clippy runs as ADVICE and cannot fail the build. There are around
+# 32 style and pedantic warnings today. They are worth reading and worth fixing
+# gradually; they are not worth blocking somebody's first contribution over.
+#
+# No secrets, no write permissions, no pull_request_target. Same trust boundary
+# as ci.yml.
+name: Style
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: style-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  style:
+    name: fmt and correctness lints
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt (btx-core)
+        working-directory: crates/btx-core
+        run: cargo fmt --all --check
+
+      - name: cargo fmt (tauri shell)
+        working-directory: apps/node/src-tauri
+        run: cargo fmt --all --check
+
+      # The bundle-resource glob must match something or tauri-build refuses to
+      # run, at any profile. One placeholder file, never a release build. Same
+      # reasoning as the app job in ci.yml.
+      - name: Satisfy the bundle-resource glob
+        working-directory: apps/node/src-tauri
+        run: |
+          mkdir -p resources/node-pkg
+          echo "CI placeholder. Not a node package." > resources/node-pkg/CI-PLACEHOLDER
+
+      - name: clippy correctness (btx-core)
+        working-directory: crates/btx-core
+        run: cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious
+
+      - name: clippy correctness (tauri shell)
+        working-directory: apps/node/src-tauri
+        run: cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious
+
+  advice:
+    name: full clippy (advisory, never fails)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+      - working-directory: crates/btx-core
+        run: cargo clippy --locked --all-targets

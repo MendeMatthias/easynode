@@ -5,7 +5,12 @@ what went wrong on hardware we do not own.
 
 ## What is most wanted right now
 
-- **Windows.** There is no native Windows build yet. This is the biggest gap.
+- **Windows.** Not that there is no build: there is one, and that is the
+  problem. `BTX-Node_0.6.6_x64-setup.exe` shipped signed on 2026-08-13 and was
+  the last one. The platform code, the NSIS packaging and the Win32 module are
+  all still here and still compile. What stopped is releasing. The update feed
+  carries no Windows key, so anyone who installed then receives nothing and has
+  no route forward. Picking that back up is real work and a real contribution.
 - **Linux packaging** beyond the AppImage.
 - **Hardware truth.** The app tries to tell a person what their machine can
   usefully do for BTX. On machines we have never seen, it may be wrong. A report
