@@ -32,6 +32,53 @@ Growth is not what it was, either: blocks left the ~1 MB MatMul mode around
 height 185,000, and since 2026-08-10 the measured average is 8.4 kB a block —
 about 8 MB a day, where the old comments claimed 1 GB a day.
 
+**A wallet import can no longer point you at the wrong wallet.** If the default
+name is already taken by a different wallet, your import goes in beside it — and
+the code only adopted that new name when the call *succeeded*. But a wallet.dat
+rescan takes hours and the call gives up after a minute, so failing is the normal
+outcome; the app then checked whether the **old** wallet existed, found that it
+did (of course it did), and showed you that one. You would have been looking at
+somebody else's empty balance while your keys sat safely in the wallet next to
+it. Fixed on both import paths.
+
+**The update banner can admit it failed.** A Linux `.deb` cannot be replaced by
+the built-in updater at all, and the failure was swallowed: the banner said
+"Update available — downloading…" at every launch, forever. It now tells you
+plainly that the automatic update could not install and where to get the build.
+A failed check still stays quiet, because being offline is normal.
+
+**Your balance stops going stale after a send.** One successful send latched the
+wallet into keeping the last screen it had, so a stopped node kept showing the
+old balance under "verified by your node" for the rest of the session.
+
+**The send form prints a number it will actually accept.** "Ready to spend" was
+rounded up, so typing exactly the figure the wallet showed you could be rejected
+as spending too much — and the rejection quoted the same rounded number back.
+
+**Keeper mode is installable again on a normal laptop.** The free-space check
+ignored which profile you had chosen and demanded room for the whole chain even
+when it was about to install a ~10 GB pruned node. Choosing Keeper on the setup
+screen and being refused for 140 GiB was the single most confusing way to meet
+the tier the network is shortest of.
+
+**Reclaim and Remove data now check whether something else is using your data
+folder** — the miner, or a second copy of the app — and refuse instead of
+deleting out from under a running node.
+
+**"Keep computer awake" no longer pretends.** Off macOS it never did anything,
+while being shown, switched on, and silently doing nothing when you toggled it.
+It now says so, and points at your system's own sleep settings.
+
+**Settings shows what your node is really providing.** A node can advertise that
+it serves history while quietly having stopped, and nothing said so. That verdict
+was computed but never displayed; it now sits next to the switch that controls
+it, in amber when it needs you.
+
+Under the hood: the config file that launches your node, and the file holding
+your settings, are now written so they cannot end up half-written; a failed
+restart can no longer leave both Start buttons disabled; and the dashboard no
+longer freezes when the node accepts a connection and then stops answering.
+
 **The node now says what it is actually providing to the network.**
 `crates/btx-core/src/frontier.rs` could always answer that question and nothing
 called it: the signed frontier was read only from inside the stall watchdog, on
