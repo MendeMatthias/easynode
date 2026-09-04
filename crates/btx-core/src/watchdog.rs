@@ -289,19 +289,37 @@ mod tests {
     #[test]
     fn healthy_and_guarded_states_get_no_verdict() {
         // Not a mirror.
-        assert_eq!(discriminate(&StallFacts { trusted_mirror: false, ..base() }), None);
+        assert_eq!(
+            discriminate(&StallFacts {
+                trusted_mirror: false,
+                ..base()
+            }),
+            None
+        );
         // Presync / snapshot load (blocks==0) — the guard that keeps the
         // watchdog from shooting a node mid-loadtxoutset.
-        assert_eq!(discriminate(&StallFacts { blocks: 0, ..base() }), None);
+        assert_eq!(
+            discriminate(&StallFacts {
+                blocks: 0,
+                ..base()
+            }),
+            None
+        );
         // Not frozen long enough.
         assert_eq!(
-            discriminate(&StallFacts { frozen_secs: FROZEN_VERDICT_SECS - 1, ..base() }),
+            discriminate(&StallFacts {
+                frozen_secs: FROZEN_VERDICT_SECS - 1,
+                ..base()
+            }),
             None
         );
         // At the frontier with a healthy census: nothing to connect, freeze
         // is normal block cadence (or a paused network).
         assert_eq!(
-            discriminate(&StallFacts { headers: 190_500, ..base() }),
+            discriminate(&StallFacts {
+                headers: 190_500,
+                ..base()
+            }),
             None
         );
     }
@@ -320,9 +338,19 @@ mod tests {
             retryable_marker: false,
             ..base()
         };
-        assert_eq!(discriminate(&f), None, "at the frontier there is nothing to fetch");
+        assert_eq!(
+            discriminate(&f),
+            None,
+            "at the frontier there is nothing to fetch"
+        );
         // Ahead of the frontier has even less to fetch.
-        assert_eq!(discriminate(&StallFacts { frontier_lag: Some(-3), ..f.clone() }), None);
+        assert_eq!(
+            discriminate(&StallFacts {
+                frontier_lag: Some(-3),
+                ..f.clone()
+            }),
+            None
+        );
     }
 
     /// THE REGRESSION THIS FILE EXISTS FOR. An isolated node reports
@@ -353,7 +381,10 @@ mod tests {
             archive_authority: Some(2),
             ..base()
         };
-        assert_eq!(discriminate(&banked).unwrap().class, StallClass::AttestationMissing);
+        assert_eq!(
+            discriminate(&banked).unwrap().class,
+            StallClass::AttestationMissing
+        );
         // Class D outranks both and must survive the guard as well.
         let spinning = StallFacts {
             cpu_pct_one_core: Some(99),
@@ -362,7 +393,10 @@ mod tests {
             retryable_marker: true,
             ..base()
         };
-        assert_eq!(discriminate(&spinning).unwrap().class, StallClass::MsghandSpin);
+        assert_eq!(
+            discriminate(&spinning).unwrap().class,
+            StallClass::MsghandSpin
+        );
         // A frontier known to be on a fork is not evidence of anything.
         let forked = StallFacts {
             frontier_lag: Some(0),
@@ -370,17 +404,30 @@ mod tests {
             archive_authority: Some(3),
             ..base()
         };
-        assert_eq!(discriminate(&forked).unwrap().class, StallClass::BodyMissing);
+        assert_eq!(
+            discriminate(&forked).unwrap().class,
+            StallClass::BodyMissing
+        );
     }
 
     /// An unmeasured frontier must change nothing: older engines and failed
     /// RPCs fall back to the height-only rules rather than going silent.
     #[test]
     fn an_unmeasured_frontier_degrades_to_the_old_behaviour() {
-        let f = StallFacts { frontier_lag: None, ..base() };
+        let f = StallFacts {
+            frontier_lag: None,
+            ..base()
+        };
         assert_eq!(discriminate(&f).unwrap().class, StallClass::BodyMissing);
-        let f = StallFacts { frontier_lag: None, archive_authority: Some(0), ..base() };
-        assert_eq!(discriminate(&f).unwrap().class, StallClass::NoQualifyingPeer);
+        let f = StallFacts {
+            frontier_lag: None,
+            archive_authority: Some(0),
+            ..base()
+        };
+        assert_eq!(
+            discriminate(&f).unwrap().class,
+            StallClass::NoQualifyingPeer
+        );
     }
 
     /// Total isolation: at the frontier the node stops hearing about new
@@ -394,7 +441,10 @@ mod tests {
             archive_authority: Some(0),
             ..base()
         };
-        assert_eq!(discriminate(&f).unwrap().class, StallClass::NoQualifyingPeer);
+        assert_eq!(
+            discriminate(&f).unwrap().class,
+            StallClass::NoQualifyingPeer
+        );
         // Unknown census at the frontier: not proof of isolation — no verdict.
         let f = StallFacts {
             headers: 190_500,
@@ -413,18 +463,30 @@ mod tests {
             retryable_marker: true,
             ..base()
         };
-        assert_eq!(discriminate(&f).unwrap().class, StallClass::NoQualifyingPeer);
+        assert_eq!(
+            discriminate(&f).unwrap().class,
+            StallClass::NoQualifyingPeer
+        );
     }
 
     #[test]
     fn class_b_attestation_missing_on_marker_with_authority_present() {
-        let f = StallFacts { retryable_marker: true, ..base() };
-        assert_eq!(discriminate(&f).unwrap().class, StallClass::AttestationMissing);
+        let f = StallFacts {
+            retryable_marker: true,
+            ..base()
+        };
+        assert_eq!(
+            discriminate(&f).unwrap().class,
+            StallClass::AttestationMissing
+        );
     }
 
     #[test]
     fn class_a_body_missing_is_the_quiet_default() {
-        assert_eq!(discriminate(&base()).unwrap().class, StallClass::BodyMissing);
+        assert_eq!(
+            discriminate(&base()).unwrap().class,
+            StallClass::BodyMissing
+        );
     }
 
     #[test]
@@ -441,8 +503,15 @@ mod tests {
     #[test]
     fn unknown_cpu_or_peers_degrade_gracefully() {
         // No CPU sample: spin undetectable, falls through to the peer facts.
-        let f = StallFacts { cpu_pct_one_core: None, archive_authority: Some(0), ..base() };
-        assert_eq!(discriminate(&f).unwrap().class, StallClass::NoQualifyingPeer);
+        let f = StallFacts {
+            cpu_pct_one_core: None,
+            archive_authority: Some(0),
+            ..base()
+        };
+        assert_eq!(
+            discriminate(&f).unwrap().class,
+            StallClass::NoQualifyingPeer
+        );
         // No peer info either: an unknown census is NOT "zero peers" — class B/A
         // still classify from the log marker alone.
         let f = StallFacts {
@@ -451,7 +520,10 @@ mod tests {
             retryable_marker: true,
             ..base()
         };
-        assert_eq!(discriminate(&f).unwrap().class, StallClass::AttestationMissing);
+        assert_eq!(
+            discriminate(&f).unwrap().class,
+            StallClass::AttestationMissing
+        );
     }
 
     #[test]
@@ -459,7 +531,9 @@ mod tests {
         // Verbatim shape from the incident logs.
         let line = "2026-08-16T20:15:01Z ActivateBestChainStep: retryable MatMul failure connecting 3ab1… (leaving candidate)";
         assert!(log_tail_has_retryable_marker(line));
-        assert!(!log_tail_has_retryable_marker("UpdateTip: new best=… height=1"));
+        assert!(!log_tail_has_retryable_marker(
+            "UpdateTip: new best=… height=1"
+        ));
     }
 
     #[test]
@@ -501,7 +575,10 @@ mod tests {
     fn unmeasured_in_flight_degrades_to_the_old_behaviour() {
         // An old node app, or a getpeerinfo that did not answer, must not be
         // told the scheduler is gated on the strength of a missing number.
-        let f = StallFacts { blocks_in_flight: None, ..base() };
+        let f = StallFacts {
+            blocks_in_flight: None,
+            ..base()
+        };
         assert_eq!(discriminate(&f).unwrap().class, StallClass::BodyMissing);
     }
 
@@ -515,14 +592,20 @@ mod tests {
             blocks_in_flight: Some(0),
             ..base()
         };
-        assert_eq!(discriminate(&isolated).unwrap().class, StallClass::NoQualifyingPeer);
+        assert_eq!(
+            discriminate(&isolated).unwrap().class,
+            StallClass::NoQualifyingPeer
+        );
         // And a banked body waiting on its signature is class B regardless.
         let banked = StallFacts {
             retryable_marker: true,
             blocks_in_flight: Some(0),
             ..base()
         };
-        assert_eq!(discriminate(&banked).unwrap().class, StallClass::AttestationMissing);
+        assert_eq!(
+            discriminate(&banked).unwrap().class,
+            StallClass::AttestationMissing
+        );
     }
 
     #[test]

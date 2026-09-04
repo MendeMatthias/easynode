@@ -240,7 +240,11 @@ pub fn verify_file_sha256(path: &Path, expected_hex: &str) -> Result<bool, Strin
         }
         hasher.update(&buf[..n]);
     }
-    let hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     Ok(hex.eq_ignore_ascii_case(expected_hex))
 }
 
@@ -373,7 +377,11 @@ pub async fn download_snapshot(
     }
     drop(file);
 
-    let hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     if !hex.eq_ignore_ascii_case(&spec.sha256) {
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(format!(
@@ -642,7 +650,10 @@ mod tests {
         // Absent must NOT report stale: a fresh install has no file and there is
         // nothing to refresh. Only an EXISTING wrong file is stale.
         let dir = tempfile::tempdir().unwrap();
-        assert!(!snapshot_file_is_stale_for_spec(&v0_34_5_spec(), dir.path()));
+        assert!(!snapshot_file_is_stale_for_spec(
+            &v0_34_5_spec(),
+            dir.path()
+        ));
         assert!(!snapshot_file_matches_spec(&v0_34_5_spec(), dir.path()));
     }
 
@@ -690,7 +701,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn verify_file_sha256_matches_and_rejects() {
         let dir = tempfile::tempdir().unwrap();
@@ -734,7 +744,9 @@ mod tests {
                 *g = r;
             }
         };
-        download_snapshot(&spec, dir.path(), &progress).await.unwrap();
+        download_snapshot(&spec, dir.path(), &progress)
+            .await
+            .unwrap();
 
         let dest = dir.path().join("faststart").join("snapshot.dat");
         assert_eq!(std::fs::read(&dest).unwrap(), body);
@@ -743,7 +755,11 @@ mod tests {
             "progress must reach 1.0"
         );
         // No .partial left behind.
-        assert!(!dir.path().join("faststart").join("snapshot.dat.partial").exists());
+        assert!(!dir
+            .path()
+            .join("faststart")
+            .join("snapshot.dat.partial")
+            .exists());
     }
 
     #[tokio::test]
@@ -769,7 +785,11 @@ mod tests {
         );
         // Neither the final file nor the partial may survive.
         assert!(!dir.path().join("faststart").join("snapshot.dat").exists());
-        assert!(!dir.path().join("faststart").join("snapshot.dat.partial").exists());
+        assert!(!dir
+            .path()
+            .join("faststart")
+            .join("snapshot.dat.partial")
+            .exists());
     }
 
     #[tokio::test]

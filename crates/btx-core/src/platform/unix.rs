@@ -40,7 +40,10 @@ pub fn open_path(path: &std::path::Path) -> std::io::Result<()> {
     } else {
         "open"
     };
-    std::process::Command::new(program).arg(path).spawn().map(|_| ())
+    std::process::Command::new(program)
+        .arg(path)
+        .spawn()
+        .map(|_| ())
 }
 
 pub fn open_url(url: &str) -> std::io::Result<()> {
@@ -49,7 +52,10 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
     } else {
         "open"
     };
-    std::process::Command::new(program).arg(url).spawn().map(|_| ())
+    std::process::Command::new(program)
+        .arg(url)
+        .spawn()
+        .map(|_| ())
 }
 
 /// (program, args) to reveal `path` in the file manager — pure, for tests.
@@ -65,7 +71,10 @@ fn reveal_command(path: &std::path::Path) -> (&'static str, Vec<std::ffi::OsStri
 
 pub fn reveal_path(path: &std::path::Path) -> std::io::Result<()> {
     let (program, args) = reveal_command(path);
-    std::process::Command::new(program).args(args).spawn().map(|_| ())
+    std::process::Command::new(program)
+        .args(args)
+        .spawn()
+        .map(|_| ())
 }
 
 pub fn open_private_append(path: &std::path::Path) -> std::io::Result<std::fs::File> {

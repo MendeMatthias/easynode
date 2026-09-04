@@ -417,7 +417,9 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
                 .map_err(|e| format!("upgrade provisioning panicked: {e}"))?;
                 match provisioned {
                     Ok(_) => {
-                        eprintln!("[node-app] provisioned node binaries {tag} → {NODE_RELEASE_TAG}");
+                        eprintln!(
+                            "[node-app] provisioned node binaries {tag} → {NODE_RELEASE_TAG}"
+                        );
                         // A new engine may ship the ExactReplay golden this Mac
                         // was missing, so re-measure instead of inheriting the
                         // old verdict. Without this a Mac downgraded to a
@@ -497,7 +499,9 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
         .collect();
     let pruned = btx_core::setup::prune_retired_addnodes_in_conf(&paths.faststart_conf, &retired);
     if pruned > 0 {
-        eprintln!("[node-app] conf: dropped {pruned} retired addnode line(s) left by an earlier version");
+        eprintln!(
+            "[node-app] conf: dropped {pruned} retired addnode line(s) left by an earlier version"
+        );
     }
 
     let whitelist_ips =
@@ -551,11 +555,9 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
         eprintln!("[node-app] adopted matmulattestationserve=1 from the conf into settings");
     }
     if serve_on {
-        if let Err(e) = btx_core::setup::set_conf_kv(
-            &paths.faststart_conf,
-            "matmulattestationserve",
-            Some("1"),
-        ) {
+        if let Err(e) =
+            btx_core::setup::set_conf_kv(&paths.faststart_conf, "matmulattestationserve", Some("1"))
+        {
             eprintln!("[node-app] could not re-apply matmulattestationserve to the conf: {e}");
         }
     }
@@ -1065,8 +1067,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                         .as_ref()
                         .map(|ps| btx_core::node_api::summarize_archive_peers(ps));
                     *archive_slot.lock().await = archive_summary.clone();
-                    let readiness =
-                        btx_core::health::sync_readiness(&chainstates, &chain, anchor);
+                    let readiness = btx_core::health::sync_readiness(&chainstates, &chain, anchor);
                     let new_phase = if readiness.is_near_tip() {
                         NodePhase::Ready {
                             height: readiness.height(),
@@ -1158,8 +1159,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                         // Mirrors only: the strict-device stall has its own
                         // existing path (rc_stalled), and non-mirror sync
                         // hiccups are not this discriminator's business.
-                        if trusted_mirror
-                            && frozen_secs >= btx_core::watchdog::FROZEN_VERDICT_SECS
+                        if trusted_mirror && frozen_secs >= btx_core::watchdog::FROZEN_VERDICT_SECS
                         {
                             // This tick's census — the shared fetch above, no
                             // second getpeerinfo.
@@ -1263,8 +1263,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                             r.stall = stall_slot.lock().await.clone();
                             r.trusted_mirror = trusted_mirror;
                             r.serving_attestations = settings.attestation_serve_enabled;
-                            if let Err(e) =
-                                btx_core::service_report::write_service_report(&dd, &r)
+                            if let Err(e) = btx_core::service_report::write_service_report(&dd, &r)
                             {
                                 eprintln!("[node-app] service report write failed: {e}");
                             }
@@ -1529,7 +1528,9 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
             .datadir_size_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let stale = measured_at.map(|t| t.elapsed().as_secs() >= 60).unwrap_or(true);
+        let stale = measured_at
+            .map(|t| t.elapsed().as_secs() >= 60)
+            .unwrap_or(true);
         let walking = state.size_walk_running.clone();
         if stale
             && walking
@@ -1702,20 +1703,35 @@ pub(crate) async fn guarded_setup(
     state.setup_running.store(false, Ordering::SeqCst);
     if let Err(msg) = &result {
         setup_log(&node_datadir(), &format!("ERROR: {msg}"));
-        set_phase(app, state, NodePhase::Error { message: msg.clone() }).await;
+        set_phase(
+            app,
+            state,
+            NodePhase::Error {
+                message: msg.clone(),
+            },
+        )
+        .await;
     }
     result
 }
 
 async fn run_setup_pipeline(app: &AppHandle, state: &State<'_, AppState>) -> Result<(), String> {
     let datadir = node_datadir();
-    std::fs::create_dir_all(&datadir).map_err(|e| format!("couldn't create {}: {e}", datadir.display()))?;
-    setup_log(&datadir, &format!("setup started (app v{})", env!("CARGO_PKG_VERSION")));
+    std::fs::create_dir_all(&datadir)
+        .map_err(|e| format!("couldn't create {}: {e}", datadir.display()))?;
+    setup_log(
+        &datadir,
+        &format!("setup started (app v{})", env!("CARGO_PKG_VERSION")),
+    );
 
     // 1. Disk preflight. Fresh install (no chain yet) needs the full ~18 GiB;
     //    a resume only operating headroom. "Unknown" free space never blocks.
     let fresh = !datadir.join("blocks").exists();
-    let required = if fresh { DISK_REQUIRED_FRESH } else { DISK_REQUIRED_RESUME };
+    let required = if fresh {
+        DISK_REQUIRED_FRESH
+    } else {
+        DISK_REQUIRED_RESUME
+    };
     if let Some(free) = free_disk_bytes(&datadir) {
         if !enough_free_disk(free, required) {
             let need_gb = required / (1024 * 1024 * 1024);
@@ -1806,7 +1822,14 @@ pub async fn start_node(app: AppHandle, state: State<'_, AppState>) -> Result<()
     }
     let result = start_node_inner(&app, &state).await;
     if let Err(msg) = &result {
-        set_phase(&app, &state, NodePhase::Error { message: msg.clone() }).await;
+        set_phase(
+            &app,
+            &state,
+            NodePhase::Error {
+                message: msg.clone(),
+            },
+        )
+        .await;
     }
     result
 }
@@ -1921,7 +1944,6 @@ pub async fn reclaim_disk_now(
     }
     Ok(report)
 }
-
 
 // ── Footprint: what the node costs to run right now ─────────────────────────
 
@@ -2202,8 +2224,7 @@ mod tests {
 
     #[test]
     fn proc_stats_reads_our_own_process() {
-        let (cpu, rss_kb) =
-            super::proc_stats(std::process::id()).expect("stats for our own pid");
+        let (cpu, rss_kb) = super::proc_stats(std::process::id()).expect("stats for our own pid");
         #[cfg(unix)]
         assert!(cpu.expect("unix measures cpu%") >= 0.0);
         #[cfg(windows)]
@@ -2234,10 +2255,7 @@ pub async fn remove_node_data_now(
             // Node sidecars btx-core's helper leaves behind (it serves the
             // miner's lite-pool too): snapshot-era dirs + p2p/mempool state +
             // this app's node logs. All rebuilt by a fresh setup.
-            for name in [
-                "chainstate_snapshot",
-                "shielded_state",
-            ] {
+            for name in ["chainstate_snapshot", "shielded_state"] {
                 let dir = dd.join(name);
                 if dir.is_dir() {
                     let bytes = btx_core::disk::dir_size_bytes(&dir);
@@ -2291,6 +2309,5 @@ pub async fn remove_node_data_now(
 #[tauri::command]
 pub async fn open_global_stats() -> Result<(), String> {
     const URL: &str = "https://btxprice.com/stats";
-    btx_core::platform::open_url(URL)
-        .map_err(|e| format!("couldn't open the stats page: {e}"))
+    btx_core::platform::open_url(URL).map_err(|e| format!("couldn't open the stats page: {e}"))
 }

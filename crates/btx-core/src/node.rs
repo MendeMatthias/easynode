@@ -385,8 +385,8 @@ pub fn build_node_command(
         // anyway. Metal keeps its mirror routing untouched: the marker path
         // exists for engines that refuse a not-yet-goldened Mac at init, and
         // slow manifest-admitted Apple hosts are a mac lane decision.
-        let consensus_replaces_mirror_here = !matches!(backend, Backend::Metal)
-            && node_allows_degraded_matmul_start(btxd);
+        let consensus_replaces_mirror_here =
+            !matches!(backend, Backend::Metal) && node_allows_degraded_matmul_start(btxd);
         // Consensus mode must be EXPLICIT, not the absence of a flag. Measured
         // 2026-09-01 on this box's real 0.6.5-era install: btxd persists its
         // runtime settings in the datadir's btx_rw.conf (the fork's read-write
@@ -766,8 +766,7 @@ pub const MATMUL_MISSING_GOLDEN_MARKER: &str = "canary=missing_golden";
 /// device fault, and answering THAT with a trusted mirror would hide a broken
 /// GPU behind someone else's attestations.
 pub fn log_shows_matmul_consensus_refused(text: &str) -> bool {
-    text.contains(MATMUL_CONSENSUS_REFUSED_MARKER)
-        && text.contains(MATMUL_MISSING_GOLDEN_MARKER)
+    text.contains(MATMUL_CONSENSUS_REFUSED_MARKER) && text.contains(MATMUL_MISSING_GOLDEN_MARKER)
 }
 
 /// Verbatim from btxd's init refusal when a datadir still carries block files
@@ -1698,7 +1697,9 @@ impl NodeController {
                 .map(comm_looks_like_btxd)
                 .unwrap_or(false);
             if is_btxd {
-                eprintln!("[node] stale btxd pid {pid} found; attempting graceful stop via btx-cli");
+                eprintln!(
+                    "[node] stale btxd pid {pid} found; attempting graceful stop via btx-cli"
+                );
                 let mut stop_cmd = Command::new(btx_cli);
                 stop_cmd
                     .arg(format!("-datadir={}", datadir.display()))
@@ -1917,8 +1918,8 @@ impl NodeController {
         let _ = stop_cmd.status().await;
 
         if let Some(mut c) = self.child.take() {
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS);
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS);
             let mut exited = false;
             while std::time::Instant::now() < deadline {
                 // try_wait returns Ok(Some(status)) once the child has exited
@@ -2016,7 +2017,14 @@ mod tests {
             DatadirHolder::ManagedBtxd { pid: 42 }
         );
         assert_eq!(
-            classify_datadir_holder(Some(42), true, Some("/usr/local/bin/btxd"), false, Some(1), true),
+            classify_datadir_holder(
+                Some(42),
+                true,
+                Some("/usr/local/bin/btxd"),
+                false,
+                Some(1),
+                true
+            ),
             DatadirHolder::OrphanedBtxd { pid: 42 }
         );
     }
@@ -2144,7 +2152,10 @@ mod tests {
     #[tokio::test]
     async fn datadir_holder_ignores_a_pid_recycled_onto_a_non_btxd_process() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut squatter = tokio::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut squatter = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
         let pid = squatter.id().unwrap();
         std::fs::write(tmp.path().join("btxd.pid"), pid.to_string()).unwrap();
 
@@ -2270,7 +2281,11 @@ mod tests {
             .arg("30")
             .spawn()
             .unwrap();
-        std::fs::write(tmp.path().join("btxd.pid"), holder.id().unwrap().to_string()).unwrap();
+        std::fs::write(
+            tmp.path().join("btxd.pid"),
+            holder.id().unwrap().to_string(),
+        )
+        .unwrap();
 
         let grace = std::time::Duration::from_secs(2);
         let started = std::time::Instant::now();
@@ -2313,7 +2328,10 @@ mod tests {
         // failed `start` leaves nothing to reuse.
         for attempt in 1..=EXEC_RETRIES {
             let mut controller = NodeController::new();
-            match controller.start(&shim, dir, &conf, Backend::Cpu, &shim).await {
+            match controller
+                .start(&shim, dir, &conf, Backend::Cpu, &shim)
+                .await
+            {
                 Ok(()) => return controller,
                 Err(e) if attempt < EXEC_RETRIES && error_is_text_file_busy(&e) => {
                     tokio::time::sleep(EXEC_RETRY_WAIT).await;
@@ -2329,12 +2347,12 @@ mod tests {
     async fn launch_watch_detects_an_immediate_child_death() {
         let tmp = tempfile::tempdir().unwrap();
         let mut controller = start_shim(tmp.path(), "exit 1").await;
-        let survived = child_survives_launch_watch(
-            &mut controller,
-            std::time::Duration::from_secs(3),
-        )
-        .await;
-        assert!(!survived, "a child that exited within the window must be reported dead");
+        let survived =
+            child_survives_launch_watch(&mut controller, std::time::Duration::from_secs(3)).await;
+        assert!(
+            !survived,
+            "a child that exited within the window must be reported dead"
+        );
     }
 
     #[cfg(unix)]
@@ -2343,12 +2361,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // kill_on_drop(true) reaps the sleeper when the controller drops.
         let mut controller = start_shim(tmp.path(), "exec sleep 30").await;
-        let survived = child_survives_launch_watch(
-            &mut controller,
-            std::time::Duration::from_secs(1),
-        )
-        .await;
-        assert!(survived, "a child alive at the end of the window owns its launch");
+        let survived =
+            child_survives_launch_watch(&mut controller, std::time::Duration::from_secs(1)).await;
+        assert!(
+            survived,
+            "a child alive at the end of the window owns its launch"
+        );
     }
 
     /// Verbatim from a real v0.33.2 regtest run (2026-08-10), so the parser is
@@ -2386,7 +2404,10 @@ workspace_required=5164972400 workspace_capacity=9534836736";
         let log = format!("{REAL_RC_LINE}\n{REAL_MAINNET_RC_LINE}\n");
         let p = parse_rc_execution_policy(&log).expect("should parse");
         assert_eq!(p.mode, "strict-device");
-        assert!(p.validates_independently(), "qualified Metal = real full node");
+        assert!(
+            p.validates_independently(),
+            "qualified Metal = real full node"
+        );
         assert!(!p.may_fall_behind());
         assert_eq!(
             p.provider.as_deref(),
@@ -2534,7 +2555,9 @@ consensus-validator service.";
         // BOTH signers, always. One alone rejects roughly half of what it
         // receives and the node stalls anyway, which is the whole finding.
         for pubkey in BTX_TRUSTED_ATTESTATION_PUBKEYS {
-            assert!(args.iter().any(|a| a == &format!("-matmultrustedpubkey={pubkey}")));
+            assert!(args
+                .iter()
+                .any(|a| a == &format!("-matmultrustedpubkey={pubkey}")));
         }
         assert!(args.iter().any(|a| a == "-matmultrustedthreshold=1"));
         assert!(args.iter().any(|a| a == "-matmulrcexecution=strict-device"));
@@ -2563,15 +2586,13 @@ consensus-validator service.";
     #[test]
     fn the_pin_carries_upstreams_published_second_key() {
         assert!(
-            BTX_TRUSTED_ATTESTATION_PUBKEYS.contains(
-                &"0224e80df33697385b54b3c69bae1f097f533c0c43e93c29f73ee97319d4a5e04c"
-            ),
+            BTX_TRUSTED_ATTESTATION_PUBKEYS
+                .contains(&"0224e80df33697385b54b3c69bae1f097f533c0c43e93c29f73ee97319d4a5e04c"),
             "upstream's published second attestor key must be pinned"
         );
         assert!(
-            BTX_TRUSTED_ATTESTATION_PUBKEYS.contains(
-                &"03d90c148db37da28ce47ce15bade88a177728d663da4bc9ba765943b7d4e4f0aa"
-            ),
+            BTX_TRUSTED_ATTESTATION_PUBKEYS
+                .contains(&"03d90c148db37da28ce47ce15bade88a177728d663da4bc9ba765943b7d4e4f0aa"),
             "upstream's published first attestor key must be pinned"
         );
         // btxd rejects a repeated key outright ("Duplicate -matmultrustedpubkey
@@ -2607,10 +2628,8 @@ consensus-validator service.";
         // and a different reason. Answering that with a trusted mirror would
         // hide a hardware fault behind someone else's attestations, so it must
         // NOT match.
-        let device_fault = REAL_M5_REFUSAL.replace(
-            "canary=missing_golden",
-            "canary=local_accelerator_failure",
-        );
+        let device_fault =
+            REAL_M5_REFUSAL.replace("canary=missing_golden", "canary=local_accelerator_failure");
         assert!(!log_shows_matmul_consensus_refused(&device_fault));
 
         // Neither marker alone is enough.
@@ -2646,18 +2665,18 @@ consensus-validator service.";
         // An unrecognised tail must yield None so the caller says it does not
         // know, rather than blaming a lock it never checked.
         assert!(launch_failure_hint("").is_none());
-        assert!(launch_failure_hint(
-            "2026-08-30T21:17:13Z Shutdown: done"
-        )
-        .is_none());
+        assert!(launch_failure_hint("2026-08-30T21:17:13Z Shutdown: done").is_none());
 
         // A consensus refusal is a different cause and must not be reported as
         // the pruned one.
         let matmul = launch_failure_hint(
-            "MatMul consensus startup refused: no qualified ExactReplay provider is ready"
+            "MatMul consensus startup refused: no qualified ExactReplay provider is ready",
         )
         .expect("the consensus refusal must be recognised");
-        assert!(!matmul.contains("Remove node data"), "wrong cause: {matmul}");
+        assert!(
+            !matmul.contains("Remove node data"),
+            "wrong cause: {matmul}"
+        );
     }
 
     /// The measured verdict must survive into the launch command, and must not
@@ -2687,7 +2706,9 @@ consensus-validator service.";
         );
         assert!(args.iter().any(|a| a == "-matmulvalidation=trusted"));
         for pubkey in BTX_TRUSTED_ATTESTATION_PUBKEYS {
-            assert!(args.iter().any(|a| a == &format!("-matmultrustedpubkey={pubkey}")));
+            assert!(args
+                .iter()
+                .any(|a| a == &format!("-matmultrustedpubkey={pubkey}")));
         }
         assert!(args.iter().any(|a| a == "-matmultrustedthreshold=1"));
 
@@ -2774,7 +2795,9 @@ consensus-validator service.";
             "/x/btx/v0.35.0/lin/btxd"
         )));
         // No tag component → fail safe to the historical mirror behaviour.
-        assert!(!node_allows_degraded_matmul_start(Path::new("/data/bin/btxd")));
+        assert!(!node_allows_degraded_matmul_start(Path::new(
+            "/data/bin/btxd"
+        )));
     }
 
     #[test]
@@ -2897,8 +2920,12 @@ consensus-validator service.";
         let conf = PathBuf::from("/dd/btx.conf");
 
         // v0.33.2 + CPU → clean refusal, and the quorum carries it past the fork.
-        let (_, args, _) =
-            build_node_command(Path::new("/x/btx/v0.33.2/lin/btxd"), &dd, &conf, Backend::Cpu);
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.33.2/lin/btxd"),
+            &dd,
+            &conf,
+            Backend::Cpu,
+        );
         assert!(args.iter().any(|a| a == "-matmulrcexecution=strict-device"));
 
         // v0.33.2 + Metal → no flag; btxd's strict-device default is what we want.
@@ -2911,8 +2938,12 @@ consensus-validator service.";
         assert!(!args.iter().any(|a| a.starts_with("-matmulrcexecution")));
 
         // v0.33.1 + CPU → NO flag at any cost; the old node dies on an unknown arg.
-        let (_, args, _) =
-            build_node_command(Path::new("/x/btx/v0.33.1/lin/btxd"), &dd, &conf, Backend::Cpu);
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.33.1/lin/btxd"),
+            &dd,
+            &conf,
+            Backend::Cpu,
+        );
         assert!(!args.iter().any(|a| a.starts_with("-matmulrcexecution")));
     }
 
@@ -2932,7 +2963,10 @@ consensus-validator service.";
             Some((5, 0.0))
         );
         // No header lines → None.
-        assert_eq!(parse_presync_line("UpdateTip: new best=abc height=42\n"), None);
+        assert_eq!(
+            parse_presync_line("UpdateTip: new best=abc height=42\n"),
+            None
+        );
     }
 
     // ── pure command-builder tests ──────────────────────────────────────────
@@ -2956,7 +2990,10 @@ consensus-validator service.";
                 ("BTX_MATMUL_GPU_INPUTS".to_string(), "0".to_string()),
                 ("BTX_MATMUL_PREPARE_WORKERS".to_string(), "8".to_string()),
                 ("BTX_MATMUL_SOLVER_THREADS".to_string(), "4".to_string()),
-                ("BTX_MATMUL_PREPARE_PREFETCH_DEPTH".to_string(), "8".to_string()),
+                (
+                    "BTX_MATMUL_PREPARE_PREFETCH_DEPTH".to_string(),
+                    "8".to_string()
+                ),
                 ("BTX_MATMUL_PIPELINE_ASYNC".to_string(), "1".to_string()),
                 ("BTX_MATMUL_SOLVE_BATCH_SIZE".to_string(), "128".to_string()),
             ]
@@ -3203,7 +3240,7 @@ matmul: metal runtime_probe_ok, selecting metal\n\
             "/Users/me/.easybtx/install/btx-0.30.1/bin/btxd"
         ));
         assert!(comm_looks_like_btxd("  btxd  ")); // surrounding whitespace tolerated
-        // An unrelated process that reused the pid must NOT be force-killed.
+                                                   // An unrelated process that reused the pid must NOT be force-killed.
         assert!(!comm_looks_like_btxd("Safari"));
         assert!(!comm_looks_like_btxd("/sbin/launchd"));
         assert!(!comm_looks_like_btxd(""));

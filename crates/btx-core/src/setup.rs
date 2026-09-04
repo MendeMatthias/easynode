@@ -90,8 +90,9 @@ pub fn ensure_addnodes_in_conf(conf_path: &Path, peers: &[&str]) -> AppResult<()
 
     // Ensure we start on a fresh line if the existing file doesn't end with one.
     if !existing.is_empty() && !existing.ends_with('\n') {
-        file.write_all(b"\n")
-            .map_err(|e| AppError::Config(format!("cannot write conf {}: {e}", conf_path.display())))?;
+        file.write_all(b"\n").map_err(|e| {
+            AppError::Config(format!("cannot write conf {}: {e}", conf_path.display()))
+        })?;
     }
     file.write_all(to_append.as_bytes())
         .map_err(|e| AppError::Config(format!("cannot write conf {}: {e}", conf_path.display())))?;
@@ -158,7 +159,10 @@ pub fn prune_retired_addnodes_in_conf(conf_path: &Path, keep: &[&str]) -> usize 
     if rewritten == original {
         return 0;
     }
-    let removed = original.lines().count().saturating_sub(rewritten.lines().count());
+    let removed = original
+        .lines()
+        .count()
+        .saturating_sub(rewritten.lines().count());
     if std::fs::write(conf_path, rewritten).is_ok() {
         removed
     } else {
@@ -353,18 +357,29 @@ mod tests {
         let conf = "server=1\nlisten=1\naddnode=139.59.106.83:19335\naddnode=207.56.229.99:19335\nprune=0\n";
         let keep = ["207.56.229.99:19335"];
         let out = super::prune_retired_addnodes_str(conf, &keep);
-        assert!(!out.contains("139.59.106.83"), "the retired seed must be gone");
-        assert!(out.contains("addnode=207.56.229.99:19335"), "a shipped seed stays");
-        assert!(out.contains("server=1") && out.contains("listen=1") && out.contains("prune=0"),
-                "every non-addnode line is preserved");
+        assert!(
+            !out.contains("139.59.106.83"),
+            "the retired seed must be gone"
+        );
+        assert!(
+            out.contains("addnode=207.56.229.99:19335"),
+            "a shipped seed stays"
+        );
+        assert!(
+            out.contains("server=1") && out.contains("listen=1") && out.contains("prune=0"),
+            "every non-addnode line is preserved"
+        );
     }
 
     #[test]
     fn prune_is_a_no_op_when_the_conf_is_already_correct() {
         let conf = "server=1\naddnode=a:1\naddnode=b:2\n";
         let keep = ["a:1", "b:2"];
-        assert_eq!(super::prune_retired_addnodes_str(conf, &keep), conf,
-                   "an already-correct conf must come back byte identical");
+        assert_eq!(
+            super::prune_retired_addnodes_str(conf, &keep),
+            conf,
+            "an already-correct conf must come back byte identical"
+        );
     }
 
     #[test]
@@ -373,22 +388,36 @@ mod tests {
         // somebody's reasoning out of their own file.
         let conf = "# addnode=1.2.3.4:19335 banned by jpp, kept for the record\naddnode=a:1\n";
         let out = super::prune_retired_addnodes_str(conf, &["a:1"]);
-        assert!(out.contains("# addnode=1.2.3.4:19335 banned by jpp"),
-                "a comment is not configuration");
+        assert!(
+            out.contains("# addnode=1.2.3.4:19335 banned by jpp"),
+            "a comment is not configuration"
+        );
     }
 
     #[test]
     fn prune_preserves_the_trailing_newline_either_way() {
-        assert!(super::prune_retired_addnodes_str("addnode=a:1\naddnode=b:2\n", &["a:1"]).ends_with('\n'));
-        assert!(!super::prune_retired_addnodes_str("addnode=a:1\naddnode=b:2", &["a:1"]).ends_with('\n'));
+        assert!(
+            super::prune_retired_addnodes_str("addnode=a:1\naddnode=b:2\n", &["a:1"])
+                .ends_with('\n')
+        );
+        assert!(
+            !super::prune_retired_addnodes_str("addnode=a:1\naddnode=b:2", &["a:1"])
+                .ends_with('\n')
+        );
     }
 
     #[test]
     fn prune_tolerates_whitespace_and_crlf_the_way_ensure_does() {
         let conf = "  addnode=a:1  \r\naddnode=b:2\r\n";
         let out = super::prune_retired_addnodes_str(conf, &["a:1"]);
-        assert!(out.contains("addnode=a:1"), "a padded line still matches its peer");
-        assert!(!out.contains("b:2"), "and a padded retired line is still dropped");
+        assert!(
+            out.contains("addnode=a:1"),
+            "a padded line still matches its peer"
+        );
+        assert!(
+            !out.contains("b:2"),
+            "and a padded retired line is still dropped"
+        );
     }
 
     #[test]
@@ -437,8 +466,12 @@ mod tests {
         std::fs::write(&conf, "# preset: node\nserver=1\naddnode=1.2.3.4:19335\n").unwrap();
         set_managed_whitelist_block(&conf, &ips(&["207.56.229.99", "185.204.25.227"])).unwrap();
         let s = std::fs::read_to_string(&conf).unwrap();
-        assert!(s.lines().any(|l| l == "whitelist=in,out,noban@207.56.229.99"));
-        assert!(s.lines().any(|l| l == "whitelist=in,out,noban@185.204.25.227"));
+        assert!(s
+            .lines()
+            .any(|l| l == "whitelist=in,out,noban@207.56.229.99"));
+        assert!(s
+            .lines()
+            .any(|l| l == "whitelist=in,out,noban@185.204.25.227"));
         assert!(s.contains("# preset: node"), "comments survive");
         assert!(s.contains("addnode=1.2.3.4:19335"), "other lines survive");
         // Idempotent: second call produces identical bytes.
@@ -507,7 +540,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let conf = tmp.path().join("faststart.conf");
         std::fs::write(&conf, "server=1\nmatmulattestationserve=1\n").unwrap();
-        assert_eq!(conf_kv(&conf, "matmulattestationserve").as_deref(), Some("1"));
+        assert_eq!(
+            conf_kv(&conf, "matmulattestationserve").as_deref(),
+            Some("1")
+        );
         assert_eq!(conf_kv(&conf, "server").as_deref(), Some("1"));
         assert_eq!(conf_kv(&conf, "txindex"), None);
         assert_eq!(conf_kv(&tmp.path().join("absent.conf"), "server"), None);
@@ -592,7 +628,10 @@ mod tests {
         let content = std::fs::read_to_string(&conf).expect("file must exist");
         // The first peer must appear exactly once.
         let count = content.matches("addnode=1.2.3.4:19335").count();
-        assert_eq!(count, 1, "peer must not be duplicated; content: {content:?}");
+        assert_eq!(
+            count, 1,
+            "peer must not be duplicated; content: {content:?}"
+        );
         // The second peer must have been appended.
         assert!(content.contains("addnode=5.6.7.8:19335"));
     }

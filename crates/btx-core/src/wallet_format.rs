@@ -130,13 +130,18 @@ mod tests {
     fn binary_that_is_not_a_wallet_is_unknown_rather_than_guessed() {
         // A PNG. Previously this reached the node as "not JSON" and produced a
         // message naming only .btxwallet.
-        let f = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0, 0, 0, 0];
+        let f = [
+            0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0, 0, 0, 0,
+        ];
         assert_eq!(detect(&f), WalletFileKind::Unknown);
     }
 
     #[test]
     fn prose_is_unknown_not_a_bundle() {
-        assert_eq!(detect(b"my seed phrase is written down somewhere"), WalletFileKind::Unknown);
+        assert_eq!(
+            detect(b"my seed phrase is written down somewhere"),
+            WalletFileKind::Unknown
+        );
     }
 
     #[test]
@@ -228,7 +233,9 @@ mod tests {
         // picker will happily hand us the archive. We do NOT unpack it: writing
         // an attacker-chosen archive out is a different risk from writing one
         // file. The user has to unzip first, so the advice has to say so.
-        let zip = [0x50u8, 0x4b, 0x03, 0x04, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let zip = [
+            0x50u8, 0x4b, 0x03, 0x04, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         assert_eq!(detect(&zip), WalletFileKind::Unknown);
     }
 

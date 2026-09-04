@@ -14,7 +14,9 @@ pub fn home_dir() -> Option<PathBuf> {
 
 pub fn data_dir() -> Option<PathBuf> {
     // %APPDATA%\easyBTX (Roaming). Falls back to %USERPROFILE%\easyBTX.
-    dirs::data_dir().or_else(home_dir).map(|d| d.join("easyBTX"))
+    dirs::data_dir()
+        .or_else(home_dir)
+        .map(|d| d.join("easyBTX"))
 }
 
 pub fn free_disk_bytes(path: &std::path::Path) -> u64 {
@@ -110,8 +112,8 @@ pub fn process_is_alive(pid: u32) -> bool {
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     const STILL_ACTIVE: u32 = 259; // STATUS_PENDING — the process has not exited.
-    // SAFETY: OpenProcess returns a null handle on failure (process gone / no
-    // access). On success we read its exit code and always close the handle.
+                                   // SAFETY: OpenProcess returns a null handle on failure (process gone / no
+                                   // access). On success we read its exit code and always close the handle.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
         return false;
