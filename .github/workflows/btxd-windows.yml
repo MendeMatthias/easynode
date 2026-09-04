@@ -1,0 +1,379 @@
+name: Build Windows btxd (mingw cross, smoked on Windows)
+
+# Builds btxd.exe + btx-cli.exe for Windows from the btxchain/btx release tag
+# via the MINGW CROSS-COMPILE path (doc/build-windows.md — the same toolchain
+# the creators' own prebuilt zip was made with: *-x86_64-w64-mingw32, and the
+# official upstream-Bitcoin Windows release path).
+#
+# Why not the MSVC wrapper (contrib/devtools/build-btx-windows.ps1)? The tree
+# does not compile under MSVC: src/shielded/smile2/membership.cpp uses the
+# GCC/Clang-only __int128 (error C4235) and kernel/chainparams.cpp trips MSVC
+# consteval strictness (error C7595) — on v0.33.1 AND on their default branch
+# (runs 29292301839 / 29292513937). mingw-gcc supports __int128 natively.
+#
+# A second job then runs the creators' regtest smoke (ported from their
+# wrapper: daemon boot → createwallet → getnewaddress → generatetoaddress 1 →
+# block count 1) on a REAL windows-latest runner — a consensus binary that
+# can't mine a regtest block must never ship.
+#
+# Upstream's release tooling already enumerates windows-x86_64; when official
+# Windows assets appear, this build becomes a pinned download.
+#
+# Security: the only input is a git ref consumed by actions/checkout's ref:
+# parameter (not interpolated into any run: line).
+
+# The default is the ref we actually SHIP, not upstream v0.33.2.
+#
+# It used to be v0.33.2, and that is a trap rather than a convenience. Run #16
+# was dispatched with no input, so it built upstream v0.33.2 and produced
+# `btxd-windows-v0.33.2`. Pinning that would have swapped the fleet's node back
+# to the build WITHOUT the fixes for the park at 184,999, and nothing would have
+# caught it: both builds report v0.33.2, so PROVEN_BTXD_VERSION passes, and
+# PROVEN_BTXD_TAG is checked against the install tag rather than the artifact.
+# A default that silently produces an unshippable artifact is the wrong default.
+#
+# 1e51f0d1 is btxchain's pr/0.33.3-network-stability. NEVER move this past it
+# without re-reading node-win-installer.yml's pin block: f3098105 makes a
+# GPU-less node refuse to start at init.
+on:
+  workflow_dispatch:
+    inputs:
+      btxchain_ref:
+        description: "btxchain/btx ref to build"
+        required: false
+        default: "1e51f0d1ccc594b8fe215a6af3dcc7c118d7d1ca"
+  # Self-service trigger. This workflow is dispatch-only, which means a 50 minute
+  # build that everything else pins against can only start from a browser, and a
+  # release stalls whenever nobody is at a keyboard. Scoped to a throwaway branch
+  # prefix so ordinary work never fires it.
+  push:
+    branches:
+      - "ci/btxd-windows-*"
+permissions:
+  contents: read
+
+# ONE source of truth for the ref. `inputs` is EMPTY on a push trigger, so an
+# inline `inputs.btxchain_ref || '<default>'` silently resolves to the literal
+# fallback there. That is how a build ends up producing an artifact nobody can
+# ship. Every consumer below reads BTXCHAIN_REF instead.
+env:
+  BTXCHAIN_REF: ${{ inputs.btxchain_ref || '1e51f0d1ccc594b8fe215a6af3dcc7c118d7d1ca' }}
+
+jobs:
+  build-btxd:
+    name: cross-compile btxd.exe + btx-cli.exe (mingw-w64)
+    runs-on: ubuntu-24.04 # mingw gcc 13 — the v29 tree needs g++ >= 11 (22.04 ships 10)
+    timeout-minutes: 120
+    steps:
+      - name: Checkout btxchain/btx
+        uses: actions/checkout@v4
+        with:
+          repository: btxchain/btx
+          ref: ${{ env.BTXCHAIN_REF }}
+          path: btx
+
+      - name: Install mingw-w64 toolchain (posix threads)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64-posix cmake make curl git
+          # Bitcoin's build docs require the POSIX-threads mingw variant.
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix || true
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix || true
+          x86_64-w64-mingw32-g++ --version | head -1
+
+      # The depends system compiles boost/libevent/sqlite/zmq for win64 —
+      # the cold half of this workflow. Cache it keyed on the depends tree.
+      # Split restore/save on purpose: plain actions/cache only saves when the
+      # JOB SUCCEEDS, and every failed bring-up round here fails AFTER depends
+      # has been built. That silently threw away ~25 minutes of work on each of
+      # the v0.33.2 rounds — `gh cache list` showed no btxd-mingw-depends entry
+      # at all. Saving with `if: always()` means a compile or link failure still
+      # banks the expensive half.
+      - name: Restore depends cache
+        id: depends_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            btx/depends/built
+            btx/depends/sources
+            btx/depends/x86_64-w64-mingw32
+          key: btxd-mingw-depends-${{ env.BTXCHAIN_REF }}-${{ hashFiles('btx/depends/packages/*.mk') }}
+          restore-keys: btxd-mingw-depends-
+
+      - name: Build depends (win64, no Qt)
+        working-directory: btx
+        run: make -C depends HOST=x86_64-w64-mingw32 NO_QT=1 -j"$(nproc)"
+
+      # `always()` is the whole point — see the restore step above.
+      - name: Save depends cache
+        if: always() && steps.depends_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            btx/depends/built
+            btx/depends/sources
+            btx/depends/x86_64-w64-mingw32
+          key: ${{ steps.depends_cache.outputs.cache-primary-key }}
+
+      # mingw's windef.h defines STRICT=1 by default (unless NO_STRICT), and
+      # the tree's ReorgProtectionProfile enum has a STRICT enumerator — the
+      # macro rewrites it into "expected identifier before numeric constant"
+      # soup at the header AND every usage site (runs 29293830053,
+      # 29294558635; same collision the miner's solver workflow patches for
+      # MSVC). NO_STRICT disarms it globally: handle types lose their strict
+      # typing (void*), which this codebase never relies on.
+      # Build ONLY what the node app ships: btxd + btx-cli. The side tools
+      # can't link with GNU ld's order-sensitive static archives:
+      # btx-wallet.exe needs node symbols the standalone tool doesn't link
+      # (run 29295909567 — the creators' wrapper also turns it off), and
+      # btx-util.exe/btx-tx.exe pull shielded serialization headers without
+      # libbitcoin_shielded (run 29297551973). btxd links node+wallet+shielded
+      # together; btx-cli is a plain RPC client — both are fine.
+      # v0.33.2 (MatMul v4.7) added `const bool near{...}` in net_processing.cpp's
+      # RC speculative-hash sweep. `near` is a legacy 16-bit Windows memory-model
+      # macro from mingw's windef.h, so it expands to nothing and the declaration
+      # collapses into "expected primary-expression before 'const'" at the
+      # declaration and "before ')'" at the use (run 31351252726, lines 3651 and
+      # 3660). Same family as the STRICT collision above, but NO_STRICT does not
+      # cover it.
+      #
+      # Two occurrences, renamed by content rather than line number so upstream
+      # edits nearby do not silently misapply this. Upstream already uses the safe
+      # name `near_tip` elsewhere in the very same file, so this is a portability
+      # slip on their side and worth reporting. The guard below fails the build if
+      # a bare `bool near` survives, so a future upstream fix cannot leave this
+      # patch quietly half-applied.
+      - name: Patch mingw `near` macro collision (upstream portability slip)
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          sed -i 's/const bool near{/const bool near_tip_ok{/' src/net_processing.cpp
+          sed -i 's/if (!near) stale\.push_back(hash);/if (!near_tip_ok) stale.push_back(hash);/' \
+            src/net_processing.cpp
+          if grep -nE 'bool[[:space:]]+near[[:space:]]*\{' src/net_processing.cpp; then
+            echo "::error::a bare 'bool near{' survives — the mingw macro will eat it"
+            exit 1
+          fi
+          echo "patched: $(grep -c 'near_tip_ok' src/net_processing.cpp) site(s)"
+
+          # v0.33.2's RC verify bakeoff includes <sys/resource.h> unconditionally
+          # and calls getrusage() — both POSIX-only, neither guarded (run
+          # 31352382959). It is a diagnostic peak-RSS helper that already returns
+          # 0 when the query fails, so on Windows we simply take that path: no
+          # behaviour is lost anywhere else, and the file already carries
+          # __APPLE__ / Linux branches so per-platform handling is its own idiom.
+      # v0.33.2's new MatMul RC files include <sys/resource.h> and call
+      # getrusage() with no platform guard — both POSIX-only. It appears in at
+      # least matmul_v4_rc_verify_bakeoff.cpp:12 and matmul_v4_rc_gkr.cpp:20 as
+      # a copy-pasted peak-RSS helper, and patching them one at a time was pure
+      # whack-a-mole (runs 31352382959, 31353852669).
+      #
+      # So instead of editing sources, hand mingw a tiny <sys/resource.h> on the
+      # include path. Every call site already treats a non-zero getrusage() as
+      # "unknown" and returns 0, so a stub that fails is exactly the behaviour
+      # those helpers document — and it covers files we have not tripped over
+      # yet. Pre-existing Bitcoin Core users of this header (ioprio, lockedpool,
+      # subprocess, leveldb's env_posix) never reach the include on Windows,
+      # since v0.33.1 built here fine, so nothing else can pick this up.
+      - name: Shim POSIX <sys/resource.h> for mingw
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          mkdir -p win-compat/sys
+          h=win-compat/sys/resource.h
+          : > "$h"
+          echo '#ifndef EASYBTX_WIN_COMPAT_SYS_RESOURCE_H' >> "$h"
+          echo '#define EASYBTX_WIN_COMPAT_SYS_RESOURCE_H' >> "$h"
+          echo '// Minimal stand-in so BTX v0.33.2 compiles under mingw. getrusage()' >> "$h"
+          echo '// always fails, which every BTX call site already handles by' >> "$h"
+          echo '// reporting an unknown peak RSS (return 0).' >> "$h"
+          echo '#define RUSAGE_SELF 0' >> "$h"
+          echo '#define RUSAGE_CHILDREN (-1)' >> "$h"
+          echo 'struct rusage { long ru_maxrss; };' >> "$h"
+          echo 'inline int getrusage(int, struct rusage* ru) { if (ru) ru->ru_maxrss = 0; return -1; }' >> "$h"
+          echo '#endif' >> "$h"
+          cat "$h"
+          test -f win-compat/sys/resource.h
+
+      # The Ascend backend is missing its fail-closed digest stub, so btxd does
+      # not LINK (run 31355612603): accel_v4.cpp takes the address of
+      # matmul_v4::ascend::{ComputeDigestAccel, ComputeDigestsBatchedAccel,
+      # ComputeDigestsBMX4CAccel} for Kind::ASCEND, but with the default
+      # BTX_ENABLE_ASCEND=OFF nothing defines them. cuda/, metal/ and hip/ each
+      # ship exactly such a stub; ascend/ ships only an LT one.
+      #
+      # accel_v4.cpp says the intent outright, three times: "A weak stub always
+      # provides a definition, so these are never dangling; a stub simply
+      # returns false and the dispatcher falls back." So this adds the missing
+      # file, mirroring upstream's own cuda/matmul_v4_accel_stub.cpp verbatim in
+      # shape: decline, and the caller uses the CPU reference. It is reachable
+      # only if someone selects the Ascend backend explicitly, which cannot
+      # happen on a Windows node with no Ascend NPU.
+      #
+      # (ELF builds get away with it because the address-taken reference in an
+      # unreachable branch folds away; PE/COFF emits a .refptr indirection that
+      # keeps the reference alive, so mingw is where it surfaces.)
+      - name: Add the missing Ascend fail-closed digest stub
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          s=src/ascend/matmul_v4_accel_stub_btx.cpp
+          : > "$s"
+          echo '// Fail-closed Ascend digest stub (added by easyBTX CI: upstream ships' >> "$s"
+          echo '// cuda/metal/hip equivalents but not this one, so btxd does not link).' >> "$s"
+          echo '#include <uint256.h>' >> "$s"
+          echo '#include <cstdint>' >> "$s"
+          echo '#include <vector>' >> "$s"
+          echo 'class CBlockHeader;' >> "$s"
+          echo 'namespace matmul_v4::ascend {' >> "$s"
+          echo 'bool ComputeDigestAccel(const CBlockHeader&, uint32_t, uint32_t, uint256&,' >> "$s"
+          echo '                        std::vector<unsigned char>&) { return false; }' >> "$s"
+          echo 'bool ComputeDigestsBatchedAccel(const std::vector<CBlockHeader>&, uint32_t, uint32_t,' >> "$s"
+          echo '                                std::vector<uint256>&,' >> "$s"
+          echo '                                std::vector<std::vector<unsigned char>>&) { return false; }' >> "$s"
+          echo 'bool ComputeDigestsBMX4CAccel(const std::vector<CBlockHeader>&, uint32_t, uint32_t,' >> "$s"
+          echo '                              std::vector<uint256>&,' >> "$s"
+          echo '                              std::vector<std::vector<unsigned char>>&) { return false; }' >> "$s"
+          echo '} // namespace matmul_v4::ascend' >> "$s"
+          cat "$s"
+          # Register it in the BTX_ENABLE_ASCEND=OFF branch, next to the LT stub.
+          perl -0777 -pi -e 's|(    ascend/matmul_v4_lt_accel_stub\.cpp\n)|$1    ascend/matmul_v4_accel_stub_btx.cpp\n|' src/CMakeLists.txt
+          grep -q 'ascend/matmul_v4_accel_stub_btx.cpp' src/CMakeLists.txt || {
+            echo "::error::failed to register the ascend stub in src/CMakeLists.txt"; exit 1; }
+          echo "registered:"; grep -n 'ascend/matmul_v4' src/CMakeLists.txt
+
+      - name: Configure + build (depends toolchain, NO_STRICT)
+        working-directory: btx
+        run: |
+          cmake -B build-win --toolchain depends/x86_64-w64-mingw32/toolchain.cmake \
+            -DBUILD_DAEMON=ON -DBUILD_CLI=ON -DBUILD_UTIL=OFF -DBUILD_TX=OFF \
+            -DBUILD_WALLET_TOOL=OFF -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_TESTS=OFF \
+            -DENABLE_WALLET=ON -DWITH_SQLITE=ON -DWARN_INCOMPATIBLE_BDB=OFF \
+            -DAPPEND_CPPFLAGS="-DNO_STRICT -I$(pwd)/win-compat"
+          cmake --build build-win -j"$(nproc)"
+
+      - name: Collect binaries + sha256
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          btxd=$(find build-win -name btxd.exe | head -1)
+          cli=$(find build-win -name btx-cli.exe | head -1)
+          [ -n "$btxd" ] || { echo "::error::btxd.exe not produced"; find build-win -name '*.exe' | head; exit 1; }
+          [ -n "$cli" ] || { echo "::error::btx-cli.exe not produced"; exit 1; }
+          out="$GITHUB_WORKSPACE/btxd-dist"
+          mkdir -p "$out"
+          cp "$btxd" "$cli" "$out/"
+          # mingw builds carry full debug info (btxd.exe ~838 MB unstripped —
+          # run 29299032020); upstream's own release zips ship stripped.
+          x86_64-w64-mingw32-strip "$out/btxd.exe" "$out/btx-cli.exe"
+
+          # Vendor the mingw runtime DLLs, transitively.
+          #
+          # This build is NOT static. btxd links libgomp (OpenMP) dynamically,
+          # and libgomp in turn pulls libgcc_s_seh and libwinpthread. 0.6.6
+          # shipped without them: btxd.exe died at load time with 0xC0000135
+          # STATUS_DLL_NOT_FOUND on every machine that was not this runner, the
+          # app's `btxd --version` probe HUNG rather than failing, and the app
+          # silently fell back to the previous node while reporting the new
+          # version. Nothing caught it because this runner has mingw on PATH.
+          #
+          # Walking the import table beats hardcoding names: it keeps working if
+          # upstream adds a dependency or the toolchain changes. Windows system
+          # DLLs (KERNEL32, msvcrt, ...) simply do not exist under the mingw
+          # sysroot, so "not found here" is the filter for "ships with Windows".
+          # Fail loudly rather than vendoring nothing: a silent no-op here would
+          # only surface later, as a staging-gate failure with a confusing cause.
+          OBJDUMP=x86_64-w64-mingw32-objdump
+          command -v "$OBJDUMP" >/dev/null 2>&1 || OBJDUMP=objdump
+          command -v "$OBJDUMP" >/dev/null 2>&1 || { echo "::error::no objdump available to walk btxd.exe imports"; exit 1; }
+
+          roots="/usr/lib/gcc/x86_64-w64-mingw32 /usr/x86_64-w64-mingw32/lib /usr/x86_64-w64-mingw32/bin"
+          queue="btxd.exe btx-cli.exe"
+          seen=""
+          while [ -n "$queue" ]; do
+            next=""
+            for f in $queue; do
+              case " $seen " in *" $f "*) continue ;; esac
+              seen="$seen $f"
+              [ -f "$out/$f" ] || continue
+              for d in $("$OBJDUMP" -p "$out/$f" | awk '/DLL Name:/ {print $3}'); do
+                if [ -f "$out/$d" ]; then continue; fi
+                # CI installs the POSIX-threads mingw variant, so prefer that
+                # flavour when a name exists under both -posix and -win32.
+                # `|| true` on both: this step runs under `set -euo pipefail`,
+                # and a grep/find that matches nothing (every system DLL) exits
+                # non-zero, which would otherwise abort the whole build.
+                src=$(find $roots -name "$d" 2>/dev/null | grep -- '-posix/' | head -1 || true)
+                if [ -z "$src" ]; then
+                  src=$(find $roots -name "$d" 2>/dev/null | head -1 || true)
+                fi
+                if [ -n "$src" ]; then
+                  cp "$src" "$out/"
+                  echo "vendored $d <- $src"
+                  next="$next $d"
+                fi
+              done
+            done
+            queue="$next"
+          done
+
+          file "$out/btxd.exe"
+          ls -la "$out"
+          (cd "$out" && sha256sum btxd.exe btx-cli.exe $(ls *.dll 2>/dev/null) | tee SHA256SUMS.txt)
+
+      - name: Upload btxd artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: btxd-windows-${{ env.BTXCHAIN_REF }}
+          path: btxd-dist/*
+          if-no-files-found: error
+
+  smoke-windows:
+    name: regtest smoke on real Windows
+    needs: build-btxd
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download the cross-built binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: btxd-windows-${{ env.BTXCHAIN_REF }}
+          path: btxd-dist
+
+      # The creators' wrapper smoke, ported 1:1 (Invoke-SmokeTest in
+      # contrib/devtools/build-btx-windows.ps1): boot the daemon on regtest,
+      # wait for RPC, create a wallet, mine one block, assert the count.
+      - name: Regtest smoke (boot → wallet → mine 1 block)
+        shell: pwsh
+        run: |
+          $daemon = Resolve-Path "btxd-dist\btxd.exe"
+          $cli = Resolve-Path "btxd-dist\btx-cli.exe"
+          & $daemon --version | Select-Object -First 1
+          $smokeDir = Join-Path $env:TEMP "btx-smoke"
+          New-Item -ItemType Directory -Path $smokeDir -Force | Out-Null
+          $node = Start-Process -FilePath $daemon -ArgumentList @(
+            "-regtest", "-datadir=$smokeDir", "-fallbackfee=0.0001"
+          ) -PassThru -WindowStyle Hidden
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 90; $i++) {
+              & $cli "-regtest" "-datadir=$smokeDir" getblockcount *> $null
+              if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+              Start-Sleep -Seconds 1
+            }
+            if (-not $ready) { throw "regtest node did not become RPC-ready" }
+            & $cli "-regtest" "-datadir=$smokeDir" createwallet smoke | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "createwallet failed" }
+            $addr = (& $cli "-regtest" "-datadir=$smokeDir" "-rpcwallet=smoke" getnewaddress).Trim()
+            if (-not $addr) { throw "getnewaddress returned nothing" }
+            Write-Host "mining one regtest block to $addr"
+            & $cli "-regtest" "-datadir=$smokeDir" "-rpcwallet=smoke" generatetoaddress 1 $addr | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "generatetoaddress failed" }
+            $count = (& $cli "-regtest" "-datadir=$smokeDir" getblockcount).Trim()
+            if ($count -ne "1") { throw "unexpected block count after mining: $count" }
+            Write-Host "SMOKE PASSED: daemon boots, wallet works, mined 1 regtest block on Windows"
+          } finally {
+            & $cli "-regtest" "-datadir=$smokeDir" stop *> $null
+            Start-Sleep -Seconds 3
+            if (-not $node.HasExited) { Stop-Process -Id $node.Id -Force -ErrorAction SilentlyContinue }
+          }

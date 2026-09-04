@@ -1,0 +1,201 @@
+name: Build Windows BTX Node installer (NSIS)
+
+# Bundles the CI-built btxd.exe/btx-cli.exe (btxd-windows.yml, creators'
+# wrapper, static) into the BTX Node app and produces the NSIS setup.exe.
+# UNSIGNED (SmartScreen will warn) + updater artifacts disabled — keyless CI;
+# a real release signs and flips createUpdaterArtifacts.
+#
+# ⚠️ PROVEN_BTXD_RUN_ID pins the exact green btxd build (never "latest
+# successful" — 2026-06-12 miner incident). Bump only after a run passed the
+# wrapper's regtest smoke AND a real-machine fast-start.
+#
+# Security: the only input is a numeric run id consumed via env, never
+# interpolated into a run: line unquoted; no github.event.* content is used.
+
+on:
+  workflow_dispatch:
+    inputs:
+      btxd_run_id:
+        description: "btxd-windows run id (blank = PROVEN_BTXD_RUN_ID)"
+        required: false
+        default: ""
+
+# 31357980939 = v0.33.2 @ mingw-w64 gcc13, NO_STRICT, stripped; regtest smoke
+# (boot → wallet → mine 1 block) passed on windows-latest against these exact
+# bytes. btxd.exe f8943727…, btx-cli.exe c2597f72… (SHA256SUMS.txt in the
+# artifact; provenance table in docs/2026-07-14-btx-node-cross-platform-notes.md).
+#
+# This is the FORK-AWARE build: BTX replaced its proof of work at mainnet block
+# 185,000 (MatMul v4.7) and a v0.33.1 node stops following the chain there.
+# Upstream publishes NO Windows binaries at all, so btxd-windows.yml is the only
+# Windows btxd source in existence — and v0.33.2 does not compile there as
+# published. Four patches live in that workflow (a `near` macro collision, a
+# POSIX <sys/resource.h> shim, and the fail-closed Ascend digest stub upstream
+# omitted). See docs/2026-08-10-btx-v0.33.2-windows-portability-bugs.md.
+#
+# All four values below move TOGETHER on every re-pin: the artifact name is
+# minted from the ref by the producer, so changing only the run id silently
+# downloads nothing, and changing only the name breaks the fetch.
+#
+# ⚠ VERSION and TAG are two DIFFERENT things and must not be collapsed again.
+# A branch build reports the version of the release it forked from: BTX's
+# `pr/0.33.3-network-stability` never bumped CLIENT_VERSION_BUILD, so a build of
+# it reports v0.33.2 while the app installs it under the tag v0.33.3-pr105b
+# (our own install-dir key, which HAS to move or nothing re-provisions).
+#   PROVEN_BTXD_VERSION = what the binary reports  → asserted by the staging
+#                         script's -ExpectedVersion against btxd.exe --version.
+#   PROVEN_BTXD_TAG     = the app install tag this build is FOR → asserted by
+#                         the guard below against NODE_RELEASE_TAG.
+# They were one value until 0.6.1, which is why the old guard could not pass:
+# it compared an install tag against a binary version and they had diverged.
+env:
+  # 31611484867 = the pr/0.33.3-network-stability branch at 1e51f0d1, built
+  # mingw + NO_STRICT and smoked on real Windows (boot → wallet → mine 1
+  # regtest block) on 2026-08-12. This is the build that carries the fixes for
+  # the fleet-wide park one block below Epoch-A (height 184,999).
+  # ⚠ THE PINS BELOW ARE EMPTY ON PURPOSE. They named runs in the private
+  # monorepo this workflow was ported from, and a run id only resolves inside the
+  # repository the workflow runs in. To bootstrap: dispatch btxd-windows.yml,
+  # wait for it to go green, confirm its smoke job passed, then set these from
+  # that run. All of them move TOGETHER — the artifact name is minted from the
+  # ref, so bumping only the run id downloads nothing and fails late.
+  PROVEN_BTXD_RUN_ID: ""
+  PROVEN_BTXD_ARTIFACT: ""
+  PROVEN_BTXD_VERSION: ""
+  PROVEN_BTXD_TAG: ""
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build-node-installer:
+    name: BTX Node Windows installer (NSIS)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run btx-core tests (shared node engine)
+        working-directory: crates/btx-core
+        run: cargo test --locked
+
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/node/src-tauri
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/node/package-lock.json
+
+      # Fail HERE, in CI, if the pinned btxd version and the app's
+      # NODE_RELEASE_TAG have drifted apart. NODE_RELEASE_TAG decides the install
+      # directory, and provision_node_package now executes the staged btxd and
+      # refuses a tree that does not report the tag its directory claims. Without
+      # this gate that mismatch surfaces on a USER's machine, after the 452 MB
+      # snapshot download, as an unrecoverable "staged node package is not
+      # vX.Y.Z" — Retry re-enters the same path and fails identically.
+      - name: Guard — NODE_RELEASE_TAG must match the pinned btxd
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Capture whatever is between the quotes. The old pattern hardcoded
+          # v[0-9.]+ and so could not match a SUFFIXED tag like v0.33.3-pr105b:
+          # it matched nothing, $tag came out EMPTY, and the guard then failed
+          # with "the app expects  but this workflow pins ..." — a real skew and
+          # an unparseable tag were indistinguishable. Every node PR since
+          # 2026-08-11 died here.
+          tag=$(grep -oE 'NODE_RELEASE_TAG: &str = "[^"]+"' \
+                apps/node/src-tauri/src/commands.rs \
+                | sed -E 's/.*"([^"]+)"/\1/' | head -1)
+          if [ -z "$tag" ]; then
+            echo "::error::could not read NODE_RELEASE_TAG from commands.rs —" \
+                 "the constant's shape changed; fix this guard, do not skip it."
+            exit 1
+          fi
+          echo "NODE_RELEASE_TAG=$tag  PROVEN_BTXD_TAG=$PROVEN_BTXD_TAG" \
+               " (binary reports PROVEN_BTXD_VERSION=$PROVEN_BTXD_VERSION)"
+          # Compare the app's install tag against the TAG this btxd was pinned
+          # for — NOT against the version the binary reports. For branch builds
+          # those differ by design (see the env block above).
+          if [ "$tag" != "$PROVEN_BTXD_TAG" ]; then
+            echo "::error::tag skew — the app installs under $tag but this workflow pins" \
+                 "a btxd built for $PROVEN_BTXD_TAG. Build btxd for $tag (btxd-windows.yml)" \
+                 "and move PROVEN_BTXD_RUN_ID, PROVEN_BTXD_ARTIFACT, PROVEN_BTXD_VERSION" \
+                 "and PROVEN_BTXD_TAG together."
+            exit 1
+          fi
+
+      - name: Pull the pinned btxd build + stage it
+        shell: pwsh
+        env:
+          BTXD_RUN_ID: ${{ inputs.btxd_run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          $rid = $env:BTXD_RUN_ID
+          if (-not $rid) { $rid = $env:PROVEN_BTXD_RUN_ID }
+          if (-not $rid -or $rid -eq "FILL_FROM_TASK_8") { throw "no pinned btxd run id" }
+          if ($rid -notmatch '^\d+$') { throw "btxd run id must be numeric, got: $rid" }
+          $art = $env:PROVEN_BTXD_ARTIFACT
+          if (-not $art) { throw "no pinned btxd artifact name" }
+          if ($art -notmatch '^[A-Za-z0-9._-]+$') { throw "bad artifact name: $art" }
+          Write-Host "pulling btxd artifact $art from run $rid"
+          gh run download $rid --repo $env:REPO --name $art --dir btxd-art
+          if ($LASTEXITCODE -ne 0) { throw "artifact download failed for run $rid ($art)" }
+          .\apps\node\scripts\stage-node-pkg-windows.ps1 `
+            -SourceDir btxd-art -VerifyShaFile btxd-art\SHA256SUMS.txt `
+            -ExpectedVersion $env:PROVEN_BTXD_VERSION
+
+      - name: Install npm deps
+        working-directory: apps/node
+        run: npm ci
+
+      - name: Frontend unit tests (vitest)
+        working-directory: apps/node
+        run: npm test
+
+      - name: Frontend build (tsc + vite)
+        working-directory: apps/node
+        run: npm run build
+
+      - name: Rust lib tests (the node app suite on native Windows)
+        working-directory: apps/node/src-tauri
+        run: cargo test --lib --locked
+
+      - name: Build the installer (tauri build → NSIS)
+        working-directory: apps/node
+        run: npx tauri build
+
+      - name: Collect the NSIS installer
+        shell: pwsh
+        run: |
+          $out = "$env:GITHUB_WORKSPACE\installer-dist"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $setup = Get-ChildItem -Recurse apps/node/src-tauri/target -Filter "*-setup.exe" |
+            Where-Object { $_.FullName -match "nsis" } | Select-Object -First 1
+          if (-not $setup) {
+            Write-Host "no NSIS installer found; .exe files under target:"
+            Get-ChildItem -Recurse apps/node/src-tauri/target -Filter "*.exe" -ErrorAction SilentlyContinue | Select-Object FullName
+            throw "no NSIS *-setup.exe produced"
+          }
+          Copy-Item $setup.FullName $out -Force
+          Write-Host "installer: $($setup.Name) ($([math]::Round($setup.Length/1MB,1)) MB)"
+          Get-FileHash $setup.FullName -Algorithm SHA256 | Format-List
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: BTX-Node-windows-installer
+          path: installer-dist/*-setup.exe
+          if-no-files-found: error

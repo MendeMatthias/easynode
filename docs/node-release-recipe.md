@@ -627,6 +627,57 @@ Also expect:
 - Observe a real upgrade: quit and reopen an older app — the check fires on
   launch, otherwise within 6 hours.
 
+## Cutting a release from CI
+
+The four release workflows live here now, alongside the two gates. They were
+ported from the private monorepo on 2026-09-04, and the Linux pair was brought
+forward from the v0.33.2 era in the process — as ported they built an engine
+with **no CUDA backend**, which is the one mistake that produces a Linux node
+that syncs, holds peers, reports itself healthy and cannot validate.
+
+| workflow | what it does |
+|---|---|
+| `btxd-linux.yml` | builds btxd + btx-cli from a btxchain/btx tag **with CUDA**, on ubuntu-22.04, proves the tree was pristine, proves the kernels are in the binary, smokes it on regtest, uploads the artifact |
+| `node-linux-installer.yml` | downloads that artifact, stages it, runs the suites, builds the AppImage and `.deb` |
+| `btxd-windows.yml` | the Windows engine build |
+| `node-win-installer.yml` | the Windows installer |
+
+**The engine pins are empty on a fresh checkout, and that is deliberate.** The
+installers download their engine from a specific Actions *run id*, and a run id
+only resolves inside the repository the workflow runs in. The values these
+carried in the private monorepo named runs that do not exist here. Inheriting
+them would have failed at the download step with a message about a missing
+artifact, which reads like a transient error and is not one.
+
+So the first release cut from this repository runs in this order:
+
+1. **Dispatch `btxd-linux.yml`.** Leave its inputs blank: it reads
+   `NODE_RELEASE_TAG` out of `commands.rs` through
+   `apps/node/scripts/lib/engine-pin.sh`, so the engine it builds is the engine
+   the app will provision, with no second place to keep that number.
+2. **Read its log, do not just look at the tick.** Two steps matter more than
+   the rest: *Prove the tree is PRISTINE* and *Prove the CUDA kernels are
+   actually in the binary*. The second one is the gate that did not exist
+   before; it lists the architectures found in the ELF and fails if any
+   requested one is missing.
+3. **Set the pins** in `node-linux-installer.yml`: `PROVEN_BTXD_RUN_ID` to that
+   run, `PROVEN_BTXD_ARTIFACT` to its artifact name, and optionally
+   `PROVEN_BTXD_COMMIT` so the guard can prove identity. Two different commits
+   can report the same version string, so the version is not an identity.
+4. **Dispatch `node-linux-installer.yml`.** It re-runs both suites, stages,
+   re-checks that the staged engine carries GPU kernels, and builds the bundles.
+5. **Then the steps above**: sign, `publish-node-release.sh`,
+   `build-node-feed.sh`, the site PR.
+
+⚠ **These workflows have not yet cut a shipped release.** 0.6.15 through 0.6.17
+were built by hand on an Ubuntu 22.04 box using the procedure in the next
+section, and this CI is that procedure transcribed rather than a path with a
+track record. Compare the first binary it produces against a known-good hand
+build before trusting a release to it. The hand procedure below stays the
+authority until CI has earned the job.
+
+---
+
 ## Rebuilding the Linux release from nothing, so it never needs re-fixing
 
 Everything below was executed end to end on the Windows box's WSL Ubuntu
