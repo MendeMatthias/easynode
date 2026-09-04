@@ -76,6 +76,11 @@ when it was about to install a ~10 GB pruned node. Choosing Keeper on the setup
 screen and being refused for 140 GiB was the single most confusing way to meet
 the tier the network is shortest of.
 
+**The app stops calling it a menu bar on machines that do not have one.** The
+first-run pitch, the close dialog, the close-behaviour setting and a button all
+said "menu bar" — macOS's word — while asking Windows and Linux users to choose
+a place they do not have. It now uses whatever your system calls it.
+
 **Reclaim and Remove data now check whether something else is using your data
 folder** — the miner, or a second copy of the app — and refuse instead of
 deleting out from under a running node.

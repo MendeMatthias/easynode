@@ -1586,6 +1586,16 @@ pub struct NodeStatusInfo {
     /// shown, defaulted ON, and prevented nothing — and toggling it off and
     /// back on, the obvious recovery, also did nothing and still returned Ok.
     pub keep_awake_supported: bool,
+    /// What this platform calls the place a closed window keeps running: the
+    /// "menu bar" on macOS, the "system tray" everywhere else.
+    ///
+    /// The copy said "menu bar" unconditionally - in the first-run pitch, the
+    /// close dialog, the close-behaviour setting and a button label. On Windows
+    /// and Linux that is a place the user does not have, in a dialog asking
+    /// them to choose it. The frontend has no platform signal of its own, so
+    /// the noun is supplied here and swapped into the sentence rather than the
+    /// sentences being duplicated per platform.
+    pub tray_term: String,
     /// Explorer mode (txindex) — the persisted user choice.
     pub txindex_enabled: bool,
     /// Attestation serving (`matmulattestationserve=1`) — the persisted user
@@ -1854,6 +1864,11 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         setup_complete: settings.setup_complete,
         keep_awake: settings.keep_awake,
         keep_awake_supported: btx_core::power::sleep_assertion_supported(),
+        tray_term: if cfg!(target_os = "macos") {
+            "menu bar".to_string()
+        } else {
+            "system tray".to_string()
+        },
         txindex_enabled: settings.txindex_enabled,
         attestation_serve_enabled: settings.attestation_serve_enabled,
         archive_service: archive_service.clone(),

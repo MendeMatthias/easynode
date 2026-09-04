@@ -76,7 +76,7 @@
           <h1>Run a BTX node.<br />Support the network.</h1>
           <p class="hero-sub">
             One click starts a full node from a verified snapshot. It runs
-            quietly in your menu bar. No mining, no account.
+            quietly in your <span data-tray-term>menu bar</span>. No mining, no account.
           </p>
         </div>
 
@@ -101,7 +101,7 @@
           <!-- Shown while setting up: the "it's working, come back later" cue. -->
           <p class="wizard-setup-note" id="wizard-setup-note" hidden>
             This takes a few minutes. You can leave the window and come back,
-            or let it keep going in the menu bar. It's ready when the screen
+            or let it keep going in the <span data-tray-term>menu bar</span>. It's ready when the screen
             turns green.
           </p>
         </div>
@@ -302,11 +302,11 @@
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">When you close the window</span>
-              <span class="setting-desc">The red X can ask, keep the node in the menu bar, or quit</span>
+              <span class="setting-desc" data-tray-term>The red X can ask, keep the node in the menu bar, or quit</span>
             </div>
             <div class="seg" id="onclose-seg" role="radiogroup" aria-label="On close">
               <button class="seg-btn" data-onclose="ask" type="button">Ask</button>
-              <button class="seg-btn" data-onclose="tray" type="button">Menu bar</button>
+              <button class="seg-btn" data-onclose="tray" type="button" data-tray-term>Menu bar</button>
               <button class="seg-btn" data-onclose="quit" type="button">Quit</button>
             </div>
           </div>
@@ -572,7 +572,7 @@
               <h2 id="close-title">Close BTX Node?</h2>
             </div>
             <p class="ask-intro">
-              Your node can keep running in the menu bar so it keeps supporting the
+              Your node can keep running in the <span data-tray-term>menu bar</span> so it keeps supporting the
               network, or you can stop it and quit. Quitting stops your node until
               you open the app again.
             </p>
@@ -581,7 +581,7 @@
               Remember my choice (change it later in Settings)
             </label>
             <div class="wallet-btn-row">
-              <button id="close-keep-btn" class="btn-primary" type="button">Keep running in the menu bar</button>
+              <button id="close-keep-btn" class="btn-primary" type="button" data-tray-term>Keep running in the menu bar</button>
               <button id="close-quit-btn" class="btn-secondary" type="button">Quit BTX Node</button>
             </div>
           </div>

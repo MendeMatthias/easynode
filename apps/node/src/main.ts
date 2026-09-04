@@ -69,6 +69,7 @@ export interface NodeStatusInfo {
   setup_complete: boolean;
   keep_awake: boolean;
   keep_awake_supported: boolean;
+  tray_term: string;
   txindex_enabled: boolean;
   /**
    * Serve historical signed confirmations back to the network
@@ -462,6 +463,7 @@ function renderStatus(status: NodeStatusInfo) {
   const sub = $("status-sub");
   const errCard = $("status-error");
 
+  applyTrayTerm(status);
   reflectPeerNames(status);
 
   const mode = visualMode(p, status.rc_stalled);
@@ -759,6 +761,31 @@ $<HTMLInputElement>("keeper-toggle").addEventListener("change", (e) => {
  * plainly that it activates with the next node engine update — a stored
  * promise, not a silent no-op.
  */
+// Swap the platform's own word for the tray into every string that names it.
+//
+// The copy is macOS-native throughout - "menu bar" in the first-run pitch, the
+// close dialog, the close-behaviour setting and a button label - and on Windows
+// and Linux that is a place the user does not have, in a dialog asking them to
+// choose it. The sentences stay in the markup and only the noun moves, so there
+// is one copy of each string rather than one per platform.
+//
+// Runs once: the term cannot change while the app is open.
+let trayTermApplied = false;
+function applyTrayTerm(status: NodeStatusInfo): void {
+  if (trayTermApplied || !status.tray_term || status.tray_term === "menu bar") {
+    // "menu bar" is what the markup already says, so macOS needs no pass at all.
+    trayTermApplied = true;
+    return;
+  }
+  const title = status.tray_term.charAt(0).toUpperCase() + status.tray_term.slice(1);
+  for (const el of document.querySelectorAll<HTMLElement>("[data-tray-term]")) {
+    // textContent, and only these marked elements: this rewrites shipped copy,
+    // so it must not be able to touch markup or an element nobody vetted.
+    el.textContent = el.textContent!.replace(/Menu bar/g, title).replace(/menu bar/g, status.tray_term);
+  }
+  trayTermApplied = true;
+}
+
 function reflectNickname(status: NodeStatusInfo): void {
   const input = $<HTMLInputElement>("nickname-input");
   // Never clobber what somebody is in the middle of typing.
