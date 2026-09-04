@@ -20,8 +20,23 @@ Usage:
 import argparse
 import collections
 import json
+import re
 import subprocess
 import sys
+
+# Same character set btx_core::nickname accepts from our own user. A peer's
+# nickname is a string a stranger chose and sent over the wire, so it is
+# filtered here too rather than printed as received.
+NICK_OK = re.compile(r"[^A-Za-z0-9 ._-]")
+
+
+def nickname(subver):
+    """The name inside a peer's user agent: /BTX:0.34.6(alice)/ -> alice."""
+    if not subver or "(" not in subver or ")" not in subver:
+        return None
+    inner = subver[subver.index("(") + 1 : subver.index(")", subver.index("("))]
+    cleaned = NICK_OK.sub("", inner).strip()[:24]
+    return cleaned or None
 
 
 def cli(binary, datadir, *args):
@@ -69,6 +84,7 @@ def main():
             for p in current
         ],
         "versions": dict(collections.Counter(p.get("subver", "?") for p in peers)),
+        "named_peers": sorted({n for n in (nickname(p.get("subver", "")) for p in peers) if n}),
     }
 
     if args.json:
@@ -90,6 +106,20 @@ def main():
     print("peer versions:")
     for v, n in collections.Counter(p.get("subver", "?") for p in peers).most_common():
         print("   %-18s %d" % (v, n))
+
+    # Who is out there by name. btxd's -uacomment puts an operator's chosen
+    # nickname in the user agent, and easyNode sets it from Settings. Measured
+    # 2026-09-05: nobody on this network had one, which is the state that makes
+    # a peer list a wall of version strings.
+    named = sorted({(nickname(p.get("subver", "")), p.get("addr", "?")) for p in peers
+                    if nickname(p.get("subver", ""))})
+    print()
+    if named:
+        print("named peers (%d of %d):" % (len(named), len(peers)))
+        for nick, addr in named:
+            print("   %-24s %s" % (nick, addr))
+    else:
+        print("named peers: none — every peer is an anonymous version string")
     return 0
 
 

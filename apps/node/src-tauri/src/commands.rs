@@ -1417,6 +1417,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                             r.stall = stall_slot.lock().await.clone();
                             r.trusted_mirror = trusted_mirror;
                             r.serving_attestations = settings.attestation_serve_enabled;
+                            r.nickname = settings.node_nickname.clone();
                             if let Err(e) = btx_core::service_report::write_service_report(&dd, &r)
                             {
                                 eprintln!("[node-app] service report write failed: {e}");

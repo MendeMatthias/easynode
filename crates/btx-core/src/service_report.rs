@@ -18,7 +18,9 @@ use std::path::Path;
 pub const SERVICE_REPORT_FILE: &str = "service-report.json";
 
 /// Bump when the shape changes so readers can dispatch.
-pub const SERVICE_REPORT_SCHEMA: u32 = 1;
+///
+/// 2 adds `nickname`.
+pub const SERVICE_REPORT_SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ServiceReport {
@@ -41,6 +43,14 @@ pub struct ServiceReport {
     /// Whether this node serves historical attestations
     /// (`matmulattestationserve=1` asserted by the app).
     pub serving_attestations: bool,
+    /// The operator's chosen public nickname, empty when they have not set one.
+    ///
+    /// Already public by construction: it is broadcast to every peer in the user
+    /// agent, so a local file that records it discloses nothing new. It is here
+    /// because this report is the seed for a keepers dashboard that READS it,
+    /// and a dashboard of anonymous rows is the problem the nickname exists to
+    /// solve.
+    pub nickname: String,
 }
 
 impl ServiceReport {
@@ -57,6 +67,7 @@ impl ServiceReport {
             stall: None,
             trusted_mirror: false,
             serving_attestations: false,
+            nickname: String::new(),
         }
     }
 }
@@ -101,15 +112,19 @@ mod tests {
         r.bytes_sent = Some(1_900_000);
         r.trusted_mirror = true;
         r.serving_attestations = true;
+        r.nickname = "Byron Bay node".into();
         write_service_report(tmp.path(), &r).unwrap();
 
         let read: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(tmp.path().join(SERVICE_REPORT_FILE)).unwrap(),
         )
         .unwrap();
-        assert_eq!(read["schema"], 1);
+        // Pinned against the constant, not a literal: a reader dispatches on
+        // this, and the point of bumping it is that it moves with the shape.
+        assert_eq!(read["schema"], SERVICE_REPORT_SCHEMA);
         assert_eq!(read["blocks"], 191_583);
         assert_eq!(read["serving_attestations"], true);
+        assert_eq!(read["nickname"], "Byron Bay node");
         // No tmp file left behind.
         assert!(!tmp
             .path()
