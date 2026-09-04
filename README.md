@@ -6,8 +6,31 @@ easyNode is a desktop app that installs, configures and supervises `btxd`, the
 BTX full node, for someone who does not want to run a daemon by hand. It is MIT
 licensed and this repository is the whole of it.
 
-Downloads and the auto update feed live in
-[EasyBTX-releases](https://github.com/MendeMatthias/EasyBTX-releases).
+## Get it
+
+**[easybtx.com/node](https://easybtx.com/node)** — the download page always
+points at the current release for macOS (Apple Silicon), Linux (x86-64
+`.AppImage` and `.deb`) and Windows. Verified 2026-09-04: every link on it
+returns 200.
+
+The app updates itself from there afterwards, and will only ever install a build
+signed by the release key.
+
+> ⚠ **Do not use the "Latest" button on the releases repo.**
+> [EasyBTX-releases](https://github.com/MendeMatthias/EasyBTX-releases) hosts
+> both this app and the easyBTX *miner*, which is a different product, and the
+> repo-global Latest pointer belongs to the miner on purpose — a node release
+> that captured it would break the miner's updater. Node releases are tagged
+> `node-vX.Y.Z`. Pick one of those, or just use the download page.
+
+If you want to know what the app itself will fetch, without installing anything,
+the update feed is public:
+[`easybtx.com/updater/latest-node.json`](https://easybtx.com/updater/latest-node.json).
+
+**Windows lags.** macOS and Linux are on the current release; the last Windows
+build is 0.6.6 and there is no update path from it yet. The code compiles on
+Windows — what is missing is a release. See
+[docs/node-release-recipe.md](docs/node-release-recipe.md).
 
 **If you read one thing here, read [Always on](docs/always-on.md).** It is the
 argument for the whole project: what BTX is actually short of, what running a
@@ -146,8 +169,35 @@ an independent validator whatever card is in the machine. It also needs glibc
 official source tag on Ubuntu 22.04 with its own GPU maths and kernels inside
 the package, which is why that download is around 445 MB.
 
-If you want a Linux node that actually validates, install the released app
-rather than building one. Building from here is for working on the app itself.
+**The Linux path that does validate is also in this repository.** Releases are
+staged with `scripts/stage-node-pkg-linux-source.sh`, which takes a btxd you
+compiled yourself rather than a downloaded tarball, so the GPU maths ends up
+inside the package. The full procedure — the cmake invocation, the CUDA
+version, the gates — is "Rebuilding the Linux release from nothing" in
+[docs/node-release-recipe.md](docs/node-release-recipe.md), and it was executed
+on an Ubuntu 22.04 box for 0.6.15 through 0.6.17.
+
+```bash
+# 1. build btxd from a PRISTINE checkout of btxchain/btx at the tag
+#    (see the recipe for the exact cmake flags and the CUDA requirement)
+# 2. stage what you built, instead of stage-node-pkg.sh:
+./scripts/stage-node-pkg-linux-source.sh ~/btx/build v0.34.5
+# 3. then the usual npm ci && npm run tauri build
+```
+
+Three things bite in that order, and all three are silent:
+
+- **Build from a pristine tree.** btxd records whether its source tree was
+  dirty and fails its own provenance canary if it was. That node runs, syncs
+  and holds peers while not validating, and nothing on screen says so.
+- **Build on the oldest glibc you intend to support.** The official binaries
+  need 2.38; building on 22.04 (glibc 2.35) is why the AppImage runs anywhere.
+- **Check what you got.** `getnetworkinfo.subversion` is the truth about which
+  engine is running — not the app UI, and not the install directory name.
+
+Installing the released app is still the easy answer if you only want to run a
+node. Building is for people who want to verify what they run, which on a
+consensus validator is a reasonable thing to want.
 
 Rust and the Tauri prerequisites are required for this path. `crates/btx-core`
 is the shared library that talks to `btxd`; it builds as a path dependency and
