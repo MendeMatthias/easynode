@@ -938,6 +938,10 @@ infoOverlay.addEventListener("click", (e) => {
 });
 $("future-btn").addEventListener("click", () => {
   infoOverlay.hidden = true;
+  // Every other way of leaving the info overlay stops the poll; this one did
+  // not, so ps/tasklist kept being spawned every 3 s for the rest of the
+  // session to update a panel nobody was looking at.
+  stopFootprint();
   futureOverlay.hidden = false;
 });
 $("future-btn-settings").addEventListener("click", () => {

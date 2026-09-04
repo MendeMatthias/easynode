@@ -118,7 +118,13 @@ const fmtBtx = (n: number) =>
   n.toLocaleString("en-US", { maximumFractionDigits: n >= 1000 ? 2 : 6 });
 /** Exact BTX amount — up to 8 decimals (BTX's smallest unit), trailing zeros
  *  trimmed. `fmtBtx` rounds for readable balances; a spend confirmation must
- *  show the figure the node will actually spend, so it uses this instead. */
+ *  show the figure the node will actually spend, so it uses this instead.
+ *
+ *  Also the spendable CEILING. `fmtBtx` rounds half-up, so it can print a
+ *  number strictly larger than the balance — and the guard compares against the
+ *  unrounded one. The panel advertised a ceiling it would then refuse, and the
+ *  rejection quoted the same rounded figure back, so a user typing exactly what
+ *  the wallet printed was told it was too much. */
 export const fmtExact = (n: number) => n.toFixed(8).replace(/\.?0+$/, "");
 
 /** Parse a typed BTX amount to a number, or NaN if it isn't a clean amount.
@@ -300,7 +306,7 @@ export function initWallet(): void {
     $("wallet-sent").hidden = true;
     showingSent = false;
     sendNote.textContent = "";
-    $("wallet-send-avail").textContent = `${fmtBtx(spendable)} BTX ready to spend.`;
+    $("wallet-send-avail").textContent = `${fmtExact(spendable)} BTX ready to spend.`;
     validateSend();
   }
 
@@ -320,11 +326,16 @@ export function initWallet(): void {
     // Tell the user WHY Review is off, so a rejected amount isn't a dead button.
     const rawAmt = sendAmt.value.trim();
     if (typed && Number.isFinite(amt) && amt > spendable + 1e-12) {
-      sendNote.textContent = `That's more than the ${fmtBtx(spendable)} BTX you can spend right now.`;
+      sendNote.textContent = `That's more than the ${fmtExact(spendable)} BTX you can spend right now.`;
+    } else if (rawAmt && /\.\d{9,}$/.test(rawAmt.replace(",", "."))) {
+      // BEFORE the generic branch, not after. parseBtxAmount already returns
+      // NaN for more than 8 decimals, so this test could never be reached
+      // second and the specific explanation never appeared: someone pasting a
+      // figure with more precision than BTX has was told to "enter a plain
+      // number", which is exactly what they had done.
+      sendNote.textContent = "BTX goes to 8 decimal places.";
     } else if (typed && !Number.isFinite(amt)) {
       sendNote.textContent = "Enter a plain number, like 0.5.";
-    } else if (rawAmt && /\.\d{9,}$/.test(rawAmt.replace(",", "."))) {
-      sendNote.textContent = "BTX goes to 8 decimal places.";
     } else {
       sendNote.textContent = "";
     }
@@ -505,7 +516,7 @@ export function initWallet(): void {
         "Your node is still backfilling older history in the background — the balance and list may still be filling in, so hold off on sending your whole balance until it settles.";
     }
     if (!$("wallet-pane-send").hidden) {
-      $("wallet-send-avail").textContent = `${fmtBtx(spendable)} BTX ready to spend.`;
+      $("wallet-send-avail").textContent = `${fmtExact(spendable)} BTX ready to spend.`;
     }
 
     chimeForTxChanges(d.txs);
