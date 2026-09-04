@@ -242,8 +242,8 @@ pub fn discriminate(f: &StallFacts) -> Option<StallVerdict> {
             class: StallClass::BlockFetchGated,
             summary: "this node can see the next blocks and is not asking any peer for them \
                       (a known upstream scheduler bug); adding or redialling peers will NOT \
-                      help — the fix is to request the next blocks by name, which the \
-                      guardian does automatically",
+                      help — the fix is to request the next blocks by name with \
+                      getblockfrompeer, which nothing in this app does yet",
         });
     }
     // A: body missing. Requests ARE outstanding (or we could not measure), so
@@ -560,6 +560,14 @@ mod tests {
         // The operator-facing half of the lesson: this must not send anyone
         // back to the peer list, because that is where 75 minutes went.
         assert!(v.summary.contains("will NOT"));
+        // And it must not promise a repair nothing performs. The copy used to
+        // end "which the guardian does automatically"; there is no
+        // getblockfrompeer call anywhere in this workspace, so the sentence
+        // told a stuck operator to wait for a fix that was never coming.
+        assert!(
+            !v.summary.contains("automatically"),
+            "do not claim an automatic fix unless something in the tree performs it"
+        );
     }
 
     #[test]

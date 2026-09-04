@@ -1001,24 +1001,61 @@ function setUpdateResult(text: string): void {
   $("update-check-result").textContent = text;
 }
 
+// Failing to CHECK and failing to INSTALL are different events and must not
+// share a catch. A failed check is usually just being offline, and there is
+// nothing for the user to do about it. A failed INSTALL is permanent for that
+// build — a Linux .deb cannot be replaced by the updater at all — and the old
+// single catch swallowed it on the automatic path, leaving the banner reading
+// "Update available: vX — downloading…" indefinitely, repainted identically at
+// every launch and every six-hour tick. That is worse than silence: it is an
+// aria-live region asserting that something is in progress which has already
+// failed and will fail again.
+const MANUAL_DOWNLOAD = "easybtx.com/node";
+
 async function updateCheck(manual = false): Promise<void> {
+  let update: Awaited<ReturnType<typeof checkForUpdate>>;
   try {
-    const update = await checkForUpdate();
-    if (update) {
-      showUpdateBanner(`Update available: v${update.version}`, "— downloading…");
-      setUpdateResult(`Update available: v${update.version} — downloading…`);
-      await update.downloadAndInstall();
-      showUpdateBanner(`v${update.version} ready`, "— restarting…");
-      await relaunch();
-    } else if (manual) {
+    update = await checkForUpdate();
+  } catch (e) {
+    // Quiet on the automatic path; a MANUAL check must never end in silence,
+    // because that reads as a dead button.
+    if (manual) setUpdateResult(`Couldn't check right now — are you online? (${String(e).slice(0, 80)})`);
+    return;
+  }
+
+  if (!update) {
+    if (manual) {
       setUpdateResult(
         appVersion ? `You're on the latest version (v${appVersion}).` : "You're on the latest version."
       );
     }
+    return;
+  }
+
+  showUpdateBanner(`Update available: v${update.version}`, "— downloading…");
+  setUpdateResult(`Update available: v${update.version} — downloading…`);
+
+  try {
+    await update.downloadAndInstall();
   } catch (e) {
-    // Automatic checks stay quiet (offline is normal); a MANUAL check must
-    // never end in silence — that reads as a dead button.
-    if (manual) setUpdateResult(`Couldn't check right now — are you online? (${String(e).slice(0, 80)})`);
+    // Always visible, manual or not, and never worded as a network problem:
+    // the common cause is a package format this updater cannot replace.
+    showUpdateBanner(
+      `Update v${update.version} couldn't install`,
+      `— download it from ${MANUAL_DOWNLOAD}`
+    );
+    setUpdateResult(
+      `Automatic update failed — get v${update.version} from ${MANUAL_DOWNLOAD} (${String(e).slice(0, 80)})`
+    );
+    return;
+  }
+
+  showUpdateBanner(`v${update.version} ready`, "— restarting…");
+  try {
+    await relaunch();
+  } catch (e) {
+    showUpdateBanner(`v${update.version} is installed`, "— restart the app to finish");
+    setUpdateResult(`Installed. Restart to finish. (${String(e).slice(0, 80)})`);
   }
 }
 

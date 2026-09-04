@@ -198,8 +198,18 @@ export function initWallet(): void {
    *  replay a coin for every tx that already existed. */
   const txConfs = new Map<string, number>();
   let soundBaseline = false;
+  let showingSent = false;
   /** setInterval handle for the open-panel poll; null when the panel is closed. */
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  // Is the send confirmation the thing the user is actually looking at?
+  //
+  // This used to be read back out of the DOM as `!$("wallet-sent").hidden`,
+  // which is not the same question. Switching tabs hides the send PANE without
+  // touching that element, so after one successful send the flag stayed true for
+  // the rest of the session — and every later hard refresh took the early return
+  // meant to protect the confirmation screen. A stopped node then kept rendering
+  // the last known balance under "verified by your node", which this file calls
+  // the most damaging sentence the panel can print.
 
   function showOnly(section: "import" | "view" | "gate"): void {
     importSection.hidden = section !== "import";
@@ -214,6 +224,8 @@ export function initWallet(): void {
       $(`wallet-pane-${t}`).hidden = t !== tab;
       $(`wallet-tab-${t}`).classList.toggle("is-on", t === tab);
     }
+    // Navigating anywhere means the confirmation is no longer on screen.
+    showingSent = false;
     if (tab === "receive") void ensureReceiveAddr();
     if (tab === "send") resetSend();
   }
@@ -286,6 +298,7 @@ export function initWallet(): void {
     $("wallet-send-form").hidden = false;
     $("wallet-confirm").hidden = true;
     $("wallet-sent").hidden = true;
+    showingSent = false;
     sendNote.textContent = "";
     $("wallet-send-avail").textContent = `${fmtBtx(spendable)} BTX ready to spend.`;
     validateSend();
@@ -347,6 +360,7 @@ export function initWallet(): void {
       if (res.state === "ready") {
         $("wallet-confirm").hidden = true;
         $("wallet-sent").hidden = false;
+        showingSent = true;
         $("wallet-sent-txid").textContent = res.data.txid;
         $("wallet-sent-fee").textContent =
           res.data.fee != null
@@ -531,7 +545,7 @@ export function initWallet(): void {
     const soft = opts?.soft === true;
     // A just-completed send shows the "sent" confirmation with a clickable txid;
     // a transient non-ready status must not tear that screen down either.
-    const keepSent = !$("wallet-sent").hidden;
+    const keepSent = showingSent;
     try {
       const st = await invoke<Ask<WalletView>>("wallet_status");
       if (st.state === "ready") {
@@ -752,6 +766,7 @@ export function initWallet(): void {
   });
   function closeOverlay(): void {
     overlay.hidden = true;
+    showingSent = false;
     forgetConfirm.hidden = true; // reset the two-step so it starts collapsed next time
     stopPoll();
   }
