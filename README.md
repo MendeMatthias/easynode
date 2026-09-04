@@ -123,6 +123,17 @@ build and run the app yourself. Shipped releases are built from a different
 tree, and the two are not interchangeable, so do not assume a local
 `tauri build` reproduces a published artifact byte for byte.
 
+**On Linux it also does not produce a node that can validate.** The upstream
+plain tarball carries no CUDA backend, and since the MatMul v4.7 fork
+validation is exactly what needs the GPU, a node staged that way can never be
+an independent validator whatever card is in the machine. It also needs glibc
+2.38, which Ubuntu LTS does not have. The shipped Linux app is built from the
+official source tag on Ubuntu 22.04 with its own GPU maths and kernels inside
+the package, which is why that download is around 445 MB.
+
+If you want a Linux node that actually validates, install the released app
+rather than building one. Building from here is for working on the app itself.
+
 Rust and the Tauri prerequisites are required for this path. `crates/btx-core`
 is the shared library that talks to `btxd`; it builds as a path dependency and
 needs no separate step. You can check just that crate quickly with
