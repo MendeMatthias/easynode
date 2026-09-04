@@ -271,6 +271,12 @@ pub struct AppState {
     /// never shows a stale stall (a previous run's verdict used to survive a
     /// manual stop/start and render as current on a freshly booted node).
     pub stall_verdict: Arc<Mutex<Option<btx_core::watchdog::StallVerdict>>>,
+    /// What this node is really providing to other nodes: computed once per
+    /// refresher tick from the signed frontier, and ONLY when attestation
+    /// serving is on — a node that does not serve has no frontier question to
+    /// answer. Cleared on every stop/start alongside the stall verdict, so a
+    /// previous run's answer never renders as current. See `btx_core::frontier`.
+    pub archive_service: Arc<Mutex<Option<btx_core::frontier::ArchiveService>>>,
     /// The archive-peer census, computed ONCE per refresher tick from a single
     /// getpeerinfo and shared by the status snapshot, the watchdog and the
     /// service report. The UI poll used to run its own full getpeerinfo every
@@ -302,6 +308,7 @@ impl AppState {
             quitting: Arc::new(AtomicBool::new(false)),
             rc_status_cache: Arc::new(Mutex::new(None)),
             stall_verdict: Arc::new(Mutex::new(None)),
+            archive_service: Arc::new(Mutex::new(None)),
             archive_peers_cache: Arc::new(Mutex::new(None)),
         }
     }

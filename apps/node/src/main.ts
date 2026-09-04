@@ -74,6 +74,10 @@ export interface NodeStatusInfo {
    * flag; a change applies on the next node (re)start.
    */
   attestation_serve_enabled: boolean;
+  /** What we are really providing: `state` is serving_history |
+   *  degraded_to_live_window | not_serving | unknown. */
+  archive_service: { state: string; blocks_behind?: number } | null;
+  service_report_enabled: boolean;
   wallet_enabled: boolean;
   on_close: string;
   /** btxd's OWN MatMul RC execution mode. Null until it has logged one. */
@@ -649,6 +653,7 @@ $("settings-btn").addEventListener("click", async () => {
     $("setting-datadir").textContent = lastStatus.datadir;
     $<HTMLInputElement>("keepawake-toggle").checked = lastStatus.keep_awake;
     $<HTMLInputElement>("serve-toggle").checked = lastStatus.attestation_serve_enabled;
+    $<HTMLInputElement>("report-toggle").checked = lastStatus.service_report_enabled;
     $<HTMLInputElement>("wallet-toggle").checked = lastStatus.wallet_enabled;
     reflectOnClose(lastStatus.on_close);
     reflectKeeperRow(lastStatus);
@@ -721,6 +726,22 @@ function reflectKeeperRow(status: NodeStatusInfo) {
 // Serving is independent of the profile: Keeper mode implies it, and a FULL
 // node can flip it here too — a full-history node that serves is the most
 // valuable archive the network has (there is currently ~one).
+// Local file only — no network, no identifier. The copy says so, because a
+// node operator has every reason to ask before switching on anything that
+// sounds like telemetry.
+$<HTMLInputElement>("report-toggle").addEventListener("change", (e) => {
+  const on = (e.target as HTMLInputElement).checked;
+  void invoke("set_service_report", { on })
+    .then(() =>
+      showToast(
+        on
+          ? "Writing a local service report every few minutes"
+          : "Service report off",
+      ),
+    )
+    .catch(() => showToast("Could not change that setting"));
+});
+
 $<HTMLInputElement>("serve-toggle").addEventListener("change", (e) => {
   const on = (e.target as HTMLInputElement).checked;
   void invoke("set_attestation_serve", { on })

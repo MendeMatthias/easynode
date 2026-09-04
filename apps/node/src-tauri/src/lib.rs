@@ -37,6 +37,7 @@ pub fn run() {
             commands::set_keep_awake,
             commands::set_node_profile,
             commands::set_attestation_serve,
+            commands::set_service_report,
             commands::reclaim_disk_now,
             commands::node_footprint,
             commands::remove_node_data_now,

@@ -611,6 +611,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     *state.rc_status_cache.lock().await = None;
     *state.stall_verdict.lock().await = None;
     *state.archive_peers_cache.lock().await = None;
+    *state.archive_service.lock().await = None;
 
     set_phase(app, state, NodePhase::Starting).await;
 
@@ -1037,6 +1038,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
     let stall_slot = state.stall_verdict.clone();
     let rc_cache_slot = state.rc_status_cache.clone();
     let archive_slot = state.archive_peers_cache.clone();
+    let archive_service_slot = state.archive_service.clone();
     let anchor = snapshot_spec().anchor_height;
 
     tauri::async_runtime::spawn(async move {
@@ -1156,6 +1158,44 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                             .and_then(|c| c.0.as_ref().map(|p| p.trusted_mirror))
                             .unwrap_or(false)
                     };
+
+                    // ── What is this node actually providing? ───────────────
+                    // frontier.rs could answer this from the day it was written
+                    // and nothing called it. get_attested_tip was reachable ONLY
+                    // from the watchdog branch below — inside `else`, inside a
+                    // trusted_mirror test, inside a sustained-freeze test — so
+                    // the signed frontier was read only on a mirror that had
+                    // ALREADY frozen. A healthy node could advertise the archive
+                    // bit, sit far enough behind the frontier that btxd had
+                    // quietly narrowed it to the live window, and say nothing.
+                    // That is the one state worth reporting, and it was the one
+                    // state unreachable.
+                    //
+                    // The fix costs one RPC. Measured on the release box
+                    // 2026-09-04: getmatmulattestedtip runs ~10 ms, the same
+                    // order as the getblockchaininfo (7 ms), getnetworkinfo
+                    // (6 ms) and getpeerinfo (8 ms) this tick already makes,
+                    // against a 3-second period. About a third of one percent.
+                    //
+                    // And only nodes it can tell something ever pay it: a node
+                    // that does not serve attestations is given the answer
+                    // directly and the RPC is skipped. That is also why the
+                    // settings read below is not wasteful — on a non-serving
+                    // node it REPLACES the RPC rather than adding to it.
+                    {
+                        let serving =
+                            NodeAppSettings::load(&node_datadir()).attestation_serve_enabled;
+                        let blocks_behind = if serving {
+                            btx_core::node_api::get_attested_tip(&rpc)
+                                .await
+                                .ok()
+                                .and_then(|t| t.blocks_behind)
+                        } else {
+                            None
+                        };
+                        *archive_service_slot.lock().await =
+                            Some(btx_core::frontier::archive_service(serving, blocks_behind));
+                    }
 
                     // ── Trusted-mirror stall watchdog tick ──────────────────
                     let heights = (readiness.height(), chain.headers);
@@ -1366,6 +1406,7 @@ pub async fn stop_node_inner(state: &AppState) {
     // them made get_node_status report the dead run's stall as live.
     *state.stall_verdict.lock().await = None;
     *state.archive_peers_cache.lock().await = None;
+    *state.archive_service.lock().await = None;
     // Release the keep-awake assertion — the Mac may sleep again.
     *state.sleep_guard.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
@@ -1462,6 +1503,14 @@ pub struct NodeStatusInfo {
     /// choice, or a hand-set conf flag the start path adopted. A change
     /// applies on the next node (re)start.
     pub attestation_serve_enabled: bool,
+    /// What this node is really providing to other nodes right now: at the
+    /// signed frontier and serving history, advertising the archive bit while
+    /// silently degraded to the live window, or not serving at all. `None`
+    /// until the refresher has completed one tick.
+    pub archive_service: Option<btx_core::frontier::ArchiveService>,
+    /// The local service report (`service-report.json` in the datadir) — the
+    /// persisted user choice. Local file only; nothing is uploaded.
+    pub service_report_enabled: bool,
     /// Wallet view toggle (Settings) — drives the header icon's visibility.
     pub wallet_enabled: bool,
     /// What the red X does: "ask" | "tray" | "quit" (Settings segmented control).
@@ -1676,6 +1725,8 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         keep_awake: settings.keep_awake,
         txindex_enabled: settings.txindex_enabled,
         attestation_serve_enabled: settings.attestation_serve_enabled,
+        archive_service: state.archive_service.lock().await.clone(),
+        service_report_enabled: settings.service_report_enabled,
         wallet_enabled: settings.wallet_enabled,
         on_close: settings.on_close.clone(),
         rc_mode: rc_policy.as_ref().map(|p| p.mode.clone()),
@@ -1902,6 +1953,24 @@ pub async fn set_attestation_serve(on: bool) -> Result<(), String> {
         btx_core::setup::set_conf_kv(&conf, "matmulattestationserve", on.then_some("1"))
             .map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+/// Turn the local service report on or off.
+///
+/// It writes `service-report.json` into the datadir every ~5 minutes and does
+/// NOTHING else: no network call, no upload, no identifier. It is the opt-in
+/// seed for a keepers dashboard that would READ it, and "Nothing phones home"
+/// stays true with this switched on.
+///
+/// ⚠ Why this exists at all. `service_report_enabled` has been read on every
+/// refresher tick since it was added and written by nothing, so the report
+/// could not be turned on — the branch ran, looked complete, and was
+/// unreachable. That is worse than either shipping the feature or deleting it,
+/// because it reads as done. This is the "expose it" half of that choice.
+#[tauri::command]
+pub async fn set_service_report(on: bool) -> Result<(), String> {
+    NodeAppSettings::update(&node_datadir(), |s| s.service_report_enabled = on);
     Ok(())
 }
 
