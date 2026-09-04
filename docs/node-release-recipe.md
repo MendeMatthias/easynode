@@ -558,17 +558,32 @@ Also expect:
    must be attached to the release in step 7 before this feed is deployed in
    step 8.
 
-7. **Publish:**
+7. **Publish** with `apps/node/scripts/publish-node-release.sh`:
    ```bash
-   gh release create node-v<ver> --repo MendeMatthias/EasyBTX-releases --latest=false ...
+   apps/node/scripts/publish-node-release.sh --version <ver> --sums SHA256SUMS \
+     [--linux <.AppImage>] [--mac <.app.tar.gz>] [--win <-setup.exe>] \
+     [--notes-file NOTES.md] [--dry-run]
    ```
-   `--latest=false` is **mandatory** — otherwise the node release steals the
-   repo-global "Latest" pointer and breaks the *miner's* updater. Check it after
-   publishing: `/releases/latest` must still return the miner's `vX.Y.Z`.
+   It performs every check this step used to ask a human to remember: the
+   artifacts must be listed in the gate run's `SHA256SUMS` with matching hashes
+   and must not be newer than it (a rebuild after the gates is refused), the
+   updater signature must verify against the pubkey the app embeds, the release
+   is created as a draft and only flipped live once its assets are attached,
+   every asset is re-downloaded and compared after publishing, and
+   `/releases/latest` is re-read at the end. Run it with `--dry-run` first: that
+   does every offline check and stops before the first API call.
 
-   Without `gh`, the REST equivalent, which is how 0.6.5 went out. **Create it as
-   a draft, attach the assets, then flip it live**, so there is never a window
-   where the tag resolves but the files 404:
+   It needs only `curl` and `python3`, because the publishing box has neither
+   `gh` nor `jq` (measured 2026-09-04, both sides of the WSL boundary).
+
+   `--latest=false` is **mandatory** — otherwise the node release steals the
+   repo-global "Latest" pointer and breaks the *miner's* updater. The script
+   always sends it and fails if a node tag captured the pointer anyway; if you
+   are ever publishing by hand, check `/releases/latest` yourself.
+
+   The REST calls the script makes, which is also how 0.6.5 went out by hand.
+   **Create it as a draft, attach the assets, then flip it live**, so there is
+   never a window where the tag resolves but the files 404:
    ```
    POST /repos/MendeMatthias/EasyBTX-releases/releases
         {"tag_name":"node-vX.Y.Z","draft":true,"make_latest":"false", ...}
@@ -668,8 +683,8 @@ glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
 
 6. Sign with `cargo tauri signer sign -f <updater.key> -p ""` (empty
    password), verify with `apps/node/scripts/verify-updater-sig.py`, publish
-   with a script in the shape of `publish-node-*.sh` (token prompted or from
-   the environment, refuses untested bytes, `make_latest=false` always, re
+   with `apps/node/scripts/publish-node-release.sh` (token prompted or from the
+   environment, refuses untested bytes, `make_latest=false` always, re
    downloads and compares after upload), and only THEN move
    `site/public/updater/latest-node.json` and the site pins, regenerating
    the feed with `gen-node-feed.py` so every signature is verified against
