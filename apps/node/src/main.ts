@@ -818,16 +818,25 @@ function reflectPeerNames(status: NodeStatusInfo): void {
   const el = document.getElementById("peer-names");
   if (!el) return;
   const names = status.peer_nicknames;
-  if (names.length === 0) {
+  // Your own name belongs beside theirs: it is the same list, seen from the
+  // other side, and a line that names strangers but not you reads as a list
+  // you are not on. Shown only while the node is up, because the name is only
+  // broadcast then.
+  const me = status.running && status.node_nickname ? status.node_nickname : "";
+  if (names.length === 0 && !me) {
     el.textContent = "";
     el.hidden = true;
     return;
   }
   el.hidden = false;
-  // textContent throughout: these strings were chosen by strangers and arrived
+  // textContent throughout: peer strings were chosen by strangers and arrived
   // over the wire. btx_core::nickname filters and caps them; this is the second
   // layer, and it is the one that makes markup impossible rather than unlikely.
-  el.textContent = `Connected to ${names.join(", ")}`;
+  const parts: string[] = [];
+  if (me) parts.push(`You are ${me}`);
+  if (names.length > 0) parts.push(`connected to ${names.join(", ")}`);
+  else if (me) parts.push("no other named nodes in sight yet");
+  el.textContent = parts.join(" · ");
 }
 
 function reflectArchiveService(status: NodeStatusInfo): void {
