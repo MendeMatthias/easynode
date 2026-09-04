@@ -1949,16 +1949,24 @@ async fn run_setup_pipeline(app: &AppHandle, state: &State<'_, AppState>) -> Res
 
 // ── Start / stop ────────────────────────────────────────────────────────────
 
-#[tauri::command]
-pub async fn start_node(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    if state.rpc.lock().await.is_some() {
-        return Ok(()); // already running
-    }
-    let result = start_node_inner(&app, &state).await;
+/// `start_node_inner`, with a failure projected into [`NodePhase::Error`].
+///
+/// Use this from EVERY path that restarts the node. `set_phase` is documented
+/// as the single writer of the phase, and a start that fails without writing
+/// one leaves whatever was there before standing — which for the restart paths
+/// meant `Stopped` at best and a green `Ready { height, peers }` over a dead
+/// RPC at worst. Both control surfaces key on the phase (the tray's Start/Stop
+/// and the window's own button), so a failure that writes nothing disables the
+/// two places a user would go to recover.
+pub async fn start_node_projected(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+) -> Result<(), String> {
+    let result = start_node_inner(app, state).await;
     if let Err(msg) = &result {
         set_phase(
-            &app,
-            &state,
+            app,
+            state,
             NodePhase::Error {
                 message: msg.clone(),
             },
@@ -1966,6 +1974,30 @@ pub async fn start_node(app: AppHandle, state: State<'_, AppState>) -> Result<()
         .await;
     }
     result
+}
+
+/// Stop the node and start it again, leaving the phase truthful at every step.
+///
+/// The intermediate `Stopped` matters: without it an early bail inside the start
+/// leaves the pre-stop `Ready { height, peers }` standing over an RPC that is
+/// now `None`, which renders as a green LIVE readout on a node that is not
+/// running. Callers that bounce the node for a config change should use this
+/// rather than open-coding stop-then-start.
+pub async fn restart_node_projected(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+) -> Result<(), String> {
+    stop_node_inner(state).await;
+    set_phase(app, state, NodePhase::Stopped).await;
+    start_node_projected(app, state).await
+}
+
+#[tauri::command]
+pub async fn start_node(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if state.rpc.lock().await.is_some() {
+        return Ok(()); // already running
+    }
+    start_node_projected(&app, &state).await
 }
 
 #[tauri::command]
@@ -2125,7 +2157,7 @@ pub async fn reclaim_disk_now(
         .unwrap_or_else(|e| e.into_inner()) = (0, None);
 
     if was_running {
-        start_node_inner(&app, &state).await?;
+        start_node_projected(&app, &state).await?;
     }
     Ok(report)
 }

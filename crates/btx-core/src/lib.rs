@@ -23,6 +23,7 @@ pub mod disk;
 pub mod error;
 pub mod esplora;
 pub mod frontier;
+pub mod fsx;
 pub mod health;
 pub mod installer;
 pub mod node;

@@ -222,7 +222,7 @@ pub fn prune_retired_addnodes_in_conf(conf_path: &Path, keep: &[&str]) -> usize 
         .lines()
         .count()
         .saturating_sub(rewritten.lines().count());
-    if std::fs::write(conf_path, rewritten).is_ok() {
+    if crate::fsx::atomic_write(conf_path, rewritten.as_bytes()).is_ok() {
         removed
     } else {
         0
@@ -306,7 +306,9 @@ pub fn set_managed_whitelist_block(conf_path: &Path, ips: &[String]) -> AppResul
 
     let mut content = out.join("\n");
     content.push('\n');
-    std::fs::write(conf_path, content)
+    // Atomic: this is a read-modify-REWRITE of the file that launches btxd, and
+    // a plain write commits the truncation before the bytes. See crate::fsx.
+    crate::fsx::atomic_write(conf_path, content.as_bytes())
         .map_err(|e| AppError::Config(format!("cannot write conf {}: {e}", conf_path.display())))
 }
 
@@ -354,7 +356,9 @@ pub fn set_conf_kv(conf_path: &Path, key: &str, value: Option<&str>) -> AppResul
     }
     let mut content = out.join("\n");
     content.push('\n');
-    std::fs::write(conf_path, content)
+    // Atomic: this is a read-modify-REWRITE of the file that launches btxd, and
+    // a plain write commits the truncation before the bytes. See crate::fsx.
+    crate::fsx::atomic_write(conf_path, content.as_bytes())
         .map_err(|e| AppError::Config(format!("cannot write conf {}: {e}", conf_path.display())))
 }
 

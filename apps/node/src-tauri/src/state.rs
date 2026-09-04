@@ -150,7 +150,11 @@ impl NodeAppSettings {
         std::fs::create_dir_all(datadir)?;
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        std::fs::write(datadir.join(SETTINGS_FILE_NAME), json)
+        // Atomic. `load` maps any unreadable or unparseable file to defaults,
+        // so a torn settings file does not fail loudly — it silently resets
+        // every choice the user has made, including which wallet the panel
+        // points at and whether the node serves at all.
+        btx_core::fsx::atomic_write(&datadir.join(SETTINGS_FILE_NAME), json.as_bytes())
     }
 
     /// Load-modify-save under the settings lock.

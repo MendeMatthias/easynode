@@ -13,7 +13,7 @@ use btx_core::node_api as api;
 use btx_core::rpc::RpcClient;
 use btx_core::supply;
 
-use crate::commands::{snapshot_spec, start_node_inner, stop_node_inner};
+use crate::commands::snapshot_spec;
 use crate::state::{node_datadir, AppState, NodeAppSettings};
 
 /// Wire shape: `{state: "ready", data: T} | {state: "stopped"} | …`.
@@ -420,8 +420,11 @@ pub async fn set_explorer_mode(
         .map_err(|e| e.to_string())?;
     NodeAppSettings::update(&datadir, |s| s.txindex_enabled = on);
     if state.rpc.lock().await.is_some() {
-        stop_node_inner(&state).await;
-        start_node_inner(&app, &state).await?;
+        // Not a bare stop-then-start: a start that fails here used to write no
+        // phase at all, so the tray's Start/Stop and the window's own button —
+        // both of which key on the phase — were disabled together with no way
+        // back except quitting the app.
+        crate::commands::restart_node_projected(&app, &state).await?;
     }
     Ok(())
 }
