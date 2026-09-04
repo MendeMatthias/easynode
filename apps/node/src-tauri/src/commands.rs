@@ -1485,6 +1485,11 @@ pub struct NodeStatusInfo {
     /// hardcoding numbers that could drift from the Rust side.
     pub disk_warn_mb: u64,
     pub disk_critical_mb: u64,
+    /// What a FRESH install needs free, from the same constant the preflight
+    /// gates on. The wizard renders this instead of a hardcoded string: the
+    /// two numbers were "~105 GB" and 140 GiB at the same time, and a user
+    /// read the smaller one, clicked through, and was refused by the larger.
+    pub disk_required_fresh_mb: u64,
     /// Size of the datadir in MB (cached, refreshed ≤ every 60 s).
     pub datadir_size_mb: u64,
     /// The datadir path (Settings display).
@@ -1665,34 +1670,38 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         (None, false)
     };
 
-    // Cheap counter read on a live node; skipped entirely when stopped. Any
-    // failure degrades to None so a node that does not answer simply drops the
-    // claim rather than reporting a zero it never earned.
-    let bytes_sent = if running {
-        let guard = state.rpc.lock().await;
-        match guard.as_ref() {
-            Some(rpc) => btx_core::node_api::get_net_totals(rpc)
-                .await
-                .ok()
-                .map(|t| t.total_bytes_sent),
-            None => None,
-        }
+    // Take a CLONE of the handle and drop the guard before any await. Holding
+    // `state.rpc` across a network round-trip is what every other call site in
+    // this file avoids (ask.rs, wallet.rs, and the refresher below all clone
+    // first), and this was the one place that did not: two of these blocks in
+    // a row each held the shared mutex across an RPC whose timeout is 60 s.
+    // A btxd that accepts the connection and never answers therefore froze the
+    // dashboard on stale numbers and starved the refresher that is supposed to
+    // notice and say "The node stopped responding."
+    let rpc = if running {
+        state.rpc.lock().await.clone()
     } else {
         None
     };
 
+    // Cheap counter read on a live node; skipped entirely when stopped. Any
+    // failure degrades to None so a node that does not answer simply drops the
+    // claim rather than reporting a zero it never earned.
+    let bytes_sent = match rpc.as_ref() {
+        Some(rpc) => btx_core::node_api::get_net_totals(rpc)
+            .await
+            .ok()
+            .map(|t| t.total_bytes_sent),
+        None => None,
+    };
+
     // Same shape and the same degrade-to-None discipline as bytes_sent above.
-    let inbound_peers = if running {
-        let guard = state.rpc.lock().await;
-        match guard.as_ref() {
-            Some(rpc) => btx_core::node_api::get_connection_counts(rpc)
-                .await
-                .ok()
-                .map(|c| c.inbound),
-            None => None,
-        }
-    } else {
-        None
+    let inbound_peers = match rpc.as_ref() {
+        Some(rpc) => btx_core::node_api::get_connection_counts(rpc)
+            .await
+            .ok()
+            .map(|c| c.inbound),
+        None => None,
     };
 
     // Archive-peer census for the trusted-mirror health card: served from the
@@ -1714,6 +1723,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         disk_free_mb,
         disk_warn_mb: btx_core::disk::NODE_DISK_WARN_MB,
         disk_critical_mb: btx_core::disk::NODE_DISK_CRITICAL_MB,
+        disk_required_fresh_mb: DISK_REQUIRED_FRESH / (1024 * 1024),
         datadir_size_mb,
         datadir: datadir.display().to_string(),
         // setup_complete implies provisioned binaries; the recursive

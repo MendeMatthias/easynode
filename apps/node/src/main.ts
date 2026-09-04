@@ -61,6 +61,7 @@ export interface NodeStatusInfo {
   disk_free_mb: number;
   disk_warn_mb: number;
   disk_critical_mb: number;
+  disk_required_fresh_mb: number;
   datadir_size_mb: number;
   datadir: string;
   node_tag: string;
@@ -232,7 +233,10 @@ function setupPhaseLabel(phase: NodePhase): string {
 
 function fmtGB(mb: number): string {
   if (mb <= 0) return "—";
-  return `${(mb / 1024).toFixed(1)} GB`;
+  // The value is mebibytes and the divisor is 1024, so the unit is GiB. It said
+  // GB, which understated every figure it printed by about 7% against the
+  // backend's own message for the same quantity.
+  return `${(mb / 1024).toFixed(1)} GiB`;
 }
 
 function fmtUptime(secs: number): string {
@@ -348,6 +352,10 @@ function renderWizard(status: NodeStatusInfo) {
   wizardError.hidden = p.phase !== "error";
 
   $("wizard-free-disk").textContent = fmtGB(status.disk_free_mb);
+  // Rendered from the constant the preflight actually gates on, never from a
+  // string in the markup. Those two disagreed by 35 GiB and the user saw the
+  // smaller one right up until the install was refused.
+  $("wizard-disk-needed").textContent = fmtGB(status.disk_required_fresh_mb);
 
   switch (p.phase) {
     case "downloading":

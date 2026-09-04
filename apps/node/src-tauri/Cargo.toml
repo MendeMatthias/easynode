@@ -21,7 +21,6 @@ btx-core = { path = "../../../crates/btx-core" }
 # tray and the node keeps running; the tray is the always-there control surface.
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 base64 = "0.21"
-tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 # Launch at login (spec: menu-bar tray + launch-at-login + keep-awake).

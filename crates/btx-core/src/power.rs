@@ -1,6 +1,9 @@
-//! Hold a macOS power assertion (`PreventUserIdleSystemSleep`) while mining, so a
-//! Mac configured to sleep when idle does not system-sleep mid-mine and stop
-//! earning. This is the companion to `LSAppNapIsDisabled` (Info.plist): App Nap
+//! Hold a macOS power assertion (`PreventUserIdleSystemSleep`) for as long as
+//! the work must keep running, so a Mac configured to sleep when idle does not
+//! system-sleep out from under it. This crate is shared: the miner holds it for
+//! a mining session, and the NODE app holds it for as long as btxd is up (a
+//! node that sleeps is not a node). The comments below said "mining" because
+//! that was the first caller, not because it is the only one. This is the companion to `LSAppNapIsDisabled` (Info.plist): App Nap
 //! suppression keeps the mining loop from being THROTTLED when the app is
 //! backgrounded/locked; this assertion keeps the machine from SLEEPING when the
 //! user is away. Display sleep is intentionally NOT prevented — the GPU keeps

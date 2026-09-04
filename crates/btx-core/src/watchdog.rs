@@ -55,7 +55,13 @@ pub struct StallFacts {
     /// Active-chain height and best-header height this tick.
     pub blocks: u64,
     pub headers: u64,
-    /// How long blocks AND headers have both been unchanged (any-change rule).
+    /// How long the node has been failing to make progress, under the
+    /// GAP-AWARE rule this module's header mandates: headers moving while
+    /// blocks do not is a node falling behind, not a healthy node, so it does
+    /// not reset the clock. The superseded any-change rule (reset whenever
+    /// EITHER number moved) could not see that case at all, which is why the
+    /// fixture below holds a 1000-block gap for 900 s on a chain minting a
+    /// header every ~90 s and still expects a verdict.
     pub frozen_secs: u64,
     /// The retryable-failure marker was seen in the bounded log tail.
     pub retryable_marker: bool,
