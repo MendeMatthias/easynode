@@ -24,6 +24,24 @@ That appends a `Signed-off-by` line, which is you saying you have the right to
 submit the code under the MIT licence. There is no CLA and you keep your
 copyright.
 
+## Where releases come from
+
+This repository. easyNode is built and released from here, and the process is
+written down in [docs/node-release-recipe.md](docs/node-release-recipe.md) so
+that it is auditable rather than folklore.
+
+Two gates in `scripts/` must both pass before a release changes which `btxd`
+users run:
+
+```bash
+./scripts/check-engine-tag.sh          # does this engine follow the majority chain
+./scripts/check-engine-fleet-ready.sh  # can the fleet actually start on it
+```
+
+Neither needs a secret and both are worth running if you touch the engine pin.
+They exist because an engine that passes one and fails the other is exactly the
+release that strands people, and that has happened.
+
 ## Before you open a pull request
 
 Run the tests. CI runs exactly these on your pull request, and both pass on a
