@@ -92,11 +92,15 @@ Running a node costs you real things:
 - **Electricity**, continuously, forever. Not much, but not nothing, and it is
   yours.
 - **Disk.** About 10 GB for a keeper. For a full node, which is what the app
-  installs by default, the chain is about **138 GB** of blocks as of
-  2026-09-04, so plan for 150 to 160 GB once the databases and indexes are on
-  top, and give it a 500 GB SSD if you are buying one. An SSD rather than a
-  spinning disk matters more than the size: the first sync validates the whole
-  chain and is disk bound, so it is hours on an SSD and can be days otherwise.
+  installs by default, the chain is **123.8 GiB of blocks measured on
+  2026-09-04** (about 133 GB the way a file manager counts), and roughly
+  124 GiB once the indexes and databases are on top. Plan for 150 GB, which is
+  what the app's install gate now requires, and give it a 500 GB SSD if you are
+  buying one. [archival-capacity.md](archival-capacity.md) shows how that was
+  measured; `scripts/measure-chain-size.py` re-measures it in minutes, and it is
+  worth re-running before you quote it. An SSD rather than a spinning disk
+  matters more than the size: the first sync validates the whole chain and is
+  disk bound, so it is hours on an SSD and can be days otherwise.
 - **Bandwidth**, mostly upload, which is the direction home connections are
   worst at.
 - **The right to let your machine sleep.** This is the real one. A node that
@@ -140,7 +144,8 @@ GPU.** It passes signed confirmations onward to nodes that need them. **This is
 the tier the network is shortest of**, and almost any always-on machine
 qualifies.
 
-**Archive.** Full chain on disk, about 150 GB today, real upload, uptime.
+**Archive.** Full chain on disk, about 124 GiB today and measured rather than
+estimated, real upload, uptime.
 **Still no GPU.** Serves
 block bodies and history. Signers refuse historical requests by design, so more
 signers do not add historical capacity. Only archives do.

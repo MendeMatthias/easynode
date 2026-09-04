@@ -1811,8 +1811,12 @@ async fn run_setup_pipeline(app: &AppHandle, state: &State<'_, AppState>) -> Res
         &format!("setup started (app v{})", env!("CARGO_PKG_VERSION")),
     );
 
-    // 1. Disk preflight. Fresh install (no chain yet) needs the full ~18 GiB;
-    //    a resume only operating headroom. "Unknown" free space never blocks.
+    // 1. Disk preflight. A fresh install (no chain yet) must fit the whole
+    //    un-pruned chain, so it gates on DISK_REQUIRED_FRESH; a resume needs only
+    //    operating headroom. Do NOT restate the chain size here — this comment
+    //    carried the pre-2026-07 18 GiB figure long after the gate moved. The
+    //    number, its date and its method live on the constant.
+    //    "Unknown" free space never blocks.
     let fresh = !datadir.join("blocks").exists();
     let required = if fresh {
         DISK_REQUIRED_FRESH
@@ -1821,11 +1825,11 @@ async fn run_setup_pipeline(app: &AppHandle, state: &State<'_, AppState>) -> Res
     };
     if let Some(free) = free_disk_bytes(&datadir) {
         if !enough_free_disk(free, required) {
-            let need_gb = required / (1024 * 1024 * 1024);
-            let free_gb = free / (1024 * 1024 * 1024);
+            let need_gib = required / (1024 * 1024 * 1024);
+            let free_gib = free / (1024 * 1024 * 1024);
             return Err(format!(
-                "Not enough free disk space: the node needs about {need_gb} GB \
-                 and this volume has {free_gb} GB free. Free up some space, then try again."
+                "Not enough free disk space: the node needs about {need_gib} GiB \
+                 and this volume has {free_gib} GiB free. Free up some space, then try again."
             ));
         }
     }

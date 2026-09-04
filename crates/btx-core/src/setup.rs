@@ -13,16 +13,43 @@ use std::path::Path;
 /// datadir lock and the cookie wait timed out.
 pub const RPC_URL: &str = "http://127.0.0.1:19334";
 
+/// The un-pruned chain's BLOCK PAYLOAD, measured 2026-09-04 and stated in GiB.
+///
+/// Method, because this number has been wrong in four places at once: BTX block
+/// sizes are bimodal — a block is either ~367 bytes or ~1,049,000 bytes, the
+/// large mode being the MatMul PoW payload rather than transaction traffic
+/// (height 120000 is 1,048,948 bytes and carries one transaction). So the figure
+/// comes from a stratified sample of real block sizes across the whole height
+/// range, taken from an archival peer that was first cross-checked hash-for-hash
+/// and byte-for-byte against this node for the heights this node still holds.
+/// Three independent runs gave 123.5, 123.8 and 125.2 GiB; the large-block
+/// region carried 245 samples with no exceptions. `docs/archival-capacity.md`
+/// has the write-up and `scripts/measure-chain-size.py` re-runs it in minutes.
+///
+/// Re-measure it rather than adjusting it by feel. `disk_gate_covers_the_chain`
+/// fails if the install gate is ever set below it.
+pub const MEASURED_CHAIN_PAYLOAD_GIB: u64 = 124;
+
 /// Free-disk thresholds for the first-run preflight. A FRESH install must
 /// download + unpack the snapshot and write the chain + headers/index/overhead.
 /// We run UN-PRUNED (prune=0 — see the faststart conf) so btxd keeps every
-/// block (required for a restart-safe shielded-state rebuild). The full BTX
-/// chain measured ~105 GB on 2026-07-12 (btxd size_on_disk after a complete
-/// backfill; ~1 MB blocks every 90 s grow it ~1 GB/day), so the old 18 GiB
-/// gate let installs start that could never finish — 120 GiB covers today's
-/// chain plus months of growth and working room. A RESUME only needs
-/// operating headroom.
-pub const DISK_REQUIRED_FRESH: u64 = 120 * 1024 * 1024 * 1024; // un-pruned full chain (~105 GB) + growth
+/// block (required for a restart-safe shielded-state rebuild).
+///
+/// 120 GiB was set from a ~105 GB reading taken 2026-07-12, and the chain has
+/// since grown past it: the gate was BELOW the chain it exists to gate, so a
+/// fresh install could pass the preflight and then run out of disk — the exact
+/// failure the 18 GiB → 120 GiB change was made to prevent. 140 GiB covers the
+/// measured 124 GiB plus the snapshot unpack, `debug.log`, and working room,
+/// and it matches the "plan for 150 to 160 GB" this project already tells
+/// people in `docs/always-on.md`.
+///
+/// The growth term that used to justify the headroom is gone: blocks left the
+/// large mode at the fork around height 185,000, and since 2026-08-10 the
+/// measured mean is 8.4 kB/block — about 8 MB/day, not the 1 GB/day this
+/// comment claimed. The headroom is for the chain that exists, not for growth.
+///
+/// A RESUME only needs operating headroom.
+pub const DISK_REQUIRED_FRESH: u64 = 140 * 1024 * 1024 * 1024; // measured chain (124 GiB) + working room
 pub const DISK_REQUIRED_RESUME: u64 = 2 * 1024 * 1024 * 1024; // ~2 GiB
 
 /// Whether `available` bytes meets `required`. Pure → unit-testable.
@@ -577,11 +604,26 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "txindex=1\n");
     }
 
+    /// The gate exists to refuse an install that could never finish. If it is
+    /// ever set below the chain it is gating, it does the opposite: it waves
+    /// through the install that runs out of disk halfway. That is what happened
+    /// between 2026-07-12 and 2026-09-04, silently, because nothing checked.
+    #[test]
+    fn disk_gate_covers_the_chain() {
+        let gib = 1024 * 1024 * 1024;
+        assert!(
+            DISK_REQUIRED_FRESH >= MEASURED_CHAIN_PAYLOAD_GIB * gib,
+            "fresh-install gate is {} GiB but the measured chain is {} GiB: re-measure with scripts/measure-chain-size.py, then raise the gate",
+            DISK_REQUIRED_FRESH / gib,
+            MEASURED_CHAIN_PAYLOAD_GIB
+        );
+    }
+
     #[test]
     fn disk_preflight_gates_on_threshold() {
         let gb = 1024 * 1024 * 1024;
-        // A comfortable disk passes the fresh-install gate (un-pruned chain is ~105 GB).
-        assert!(enough_free_disk(150 * gb, DISK_REQUIRED_FRESH));
+        // A comfortable disk passes the fresh-install gate.
+        assert!(enough_free_disk(200 * gb, DISK_REQUIRED_FRESH));
         // A disk that could not hold the full chain fails the gate.
         assert!(!enough_free_disk(40 * gb, DISK_REQUIRED_FRESH));
         // Exactly the requirement is acceptable.

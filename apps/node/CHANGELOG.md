@@ -11,6 +11,27 @@ root).
 Nothing here has shipped to a user yet. The app version is still 0.6.17 and the
 updater feed still points at it; this section is what a 0.6.18 would carry.
 
+**The install now asks for enough disk to finish.** The free-space check was
+set at 120 GiB from a chain that measured about 105 GB in July. The chain has
+grown since, and nothing re-checked, so the gate had quietly fallen **below the
+chain it exists to gate** — it stopped refusing installs that could never finish
+and started waving through installs that fill the disk halfway, which is the
+failure it was raised to prevent. The chain is now measured at **123.8 GiB of
+blocks** (2026-09-04) and the gate is 140 GiB. If you were going to run out of
+space, you now find out before the download instead of during it.
+
+The measurement is in `docs/archival-capacity.md` with its method, and
+`scripts/measure-chain-size.py` re-runs it in minutes, because this number has
+been wrong in the repository in both directions and the only defence is that
+re-measuring is cheap. A test now fails the build if the gate is ever set below
+the measured chain again. The disk message also says GiB where it was dividing
+by 1024 and printing "GB", which was making the app understate what it wanted by
+about 7%.
+
+Growth is not what it was, either: blocks left the ~1 MB MatMul mode around
+height 185,000, and since 2026-08-10 the measured average is 8.4 kB a block —
+about 8 MB a day, where the old comments claimed 1 GB a day.
+
 **The node now says what it is actually providing to the network.**
 `crates/btx-core/src/frontier.rs` could always answer that question and nothing
 called it: the signed frontier was read only from inside the stall watchdog, on
