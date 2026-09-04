@@ -208,7 +208,7 @@ Both suites pass on a fresh clone and neither needs the staging step:
 
 ```bash
 cd apps/node && npm test              # 52 tests, under a second
-cd crates/btx-core && cargo test      # 270 tests, about 5 seconds
+cd crates/btx-core && cargo test      # 280 tests, about 5 seconds
 ```
 
 CI runs exactly these on every pull request, plus `tsc --noEmit` and a

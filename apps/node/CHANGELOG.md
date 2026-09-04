@@ -6,6 +6,55 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
+## [Unreleased]
+
+Nothing here has shipped to a user yet. The app version is still 0.6.17 and the
+updater feed still points at it; this section is what a 0.6.18 would carry.
+
+**The node now says what it is actually providing to the network.**
+`crates/btx-core/src/frontier.rs` could always answer that question and nothing
+called it: the signed frontier was read only from inside the stall watchdog, on
+a mirror that had already frozen. A healthy node could advertise the archive bit,
+sit far enough behind the frontier that btxd had quietly narrowed it to the live
+window, look completely fine, and tell nobody. Settings now shows the honest
+answer, and the cost was measured rather than assumed — one
+`getmatmulattestedtip` at ~10 ms against a 3-second refresher, and only on nodes
+that serve attestations at all.
+
+**The local service report can be switched on.** It was read on every tick and
+written by nothing, so it could not be enabled. It writes `service-report.json`
+into your data folder every few minutes and does nothing else — no network, no
+upload, no identifier. **Nothing phones home** remains true with it on, which is
+why it is worded that way in Settings.
+
+**A prune posture that survives an old datadir.** btxd loads the datadir's
+`btx_rw.conf` on every start regardless of `-conf`, and a read-write setting
+outranks a config-file one — so on any install carrying a remembered prune value,
+neither the full nor the keeper posture actually applied. Measured on a live
+validator: the conf said `prune=0`, the datadir said `prune=4096`, and 4096 won
+for weeks with nothing on screen saying so. The app now re-asserts the conf's own
+value on the command line, which keeps the keeper profile pruned on purpose and
+the full profile un-pruned as intended.
+
+**An opt-in Esplora front, gated before it can waste your time.** An easyNode can
+serve the REST API that wallets read, but only from an unpruned archive — electrs
+indexes from block files that a pruned node deletes. The app refuses the mode up
+front and says which of the three cases you are in, rather than letting an index
+fail hours later. `scripts/verify-esplora.sh` decides whether an endpoint is fit
+to advertise, and `deploy/esplora/` carries the proxy, indexer and freshness
+guardian.
+
+**Also:** the seed list gained a consented operator node (`/BTX:0.34.6/`, at the
+tip, verified before it was added); `scripts/node-observer.sh` publishes the
+unattended recovery that previously existed on one machine; and the two Tauri
+plugins moved forward with their JS and Rust halves kept in lockstep.
+
+**Known and unchanged:** the pinned engine is still v0.34.5, which cannot keep up
+with the chain — measured 0.68 blocks/min against a 0.95 blocks/min chain, where
+0.34.6 does 3.80. The pin does not move because upstream has not tagged 0.34.6;
+`release/0.34.6` exists only as a branch. The reasoning sits next to
+`NODE_RELEASE_TAG` for whoever moves it.
+
 ## [0.6.17] - 2026-09-01 · mac AND linux LIVE
 
 **One number that contains everything, so bytes and versions stay one to
