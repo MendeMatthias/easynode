@@ -44,6 +44,25 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // A retired seed costs one failed dial; the checkpoint gate (planned) makes
     // that cost zero.
     "71.172.72.46:50098",
+    // BTX pool operator's node, offered 2026-09-04 and verified from our own
+    // validator the same day before it was added here: /BTX:0.34.6/, at the tip
+    // (its headers 210257 against our 210253), outbound dial accepted, and
+    // advertising MATMUL_CONSENSUS + MATMUL_ATTESTATION_ARCHIVE. It validates in
+    // consensus mode and serves attestations, which is the scarce half.
+    //
+    // ⚠ It is NOT an archive and is deliberately absent from BTX_ARCHIVE_PEERS.
+    // It advertises NETWORK_LIMITED (prune=5000), so it will not serve deep
+    // historical bodies — the operator said so himself when offering it rather
+    // than leaving us to discover it. The archive list carries a `noban`
+    // authority grant via BTX_ARCHIVE_WHITELIST_IPS, and that grant belongs only
+    // to peers that can actually answer a deep body request. Putting a pruned
+    // node there would bless it as a download source it cannot be.
+    //
+    // He is evaluating a separate prune=0 archive. If that lands, it is an
+    // ARCHIVE_PEERS candidate and a far scarcer one: measured 2026-09-04 from a
+    // node with 19 peers, twelve advertised NETWORK and exactly ONE was archival
+    // AND current (docs/archival-capacity.md).
+    "109.199.124.187:19335",
     "89.167.80.220:19335",
     "51.15.18.10:19335",
 ];
@@ -3153,11 +3172,14 @@ consensus-validator service.";
                 "expected {expected} in args; got: {args:?}"
             );
         }
-        // Sanity: the full set of known peers should be present.
+        // A tripwire, not a fact about the network: the count is pinned so that
+        // adding or dropping a seed cannot pass unnoticed. Every entry is
+        // something a fresh install dials on first start, so a change here
+        // deserves the moment it takes to update this number deliberately.
         assert_eq!(
             BTX_BOOTSTRAP_PEERS.len(),
-            8,
-            "BTX_BOOTSTRAP_PEERS should have 8 entries"
+            9,
+            "BTX_BOOTSTRAP_PEERS should have 9 entries"
         );
     }
 
