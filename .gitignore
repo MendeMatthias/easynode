@@ -10,3 +10,8 @@ apps/node/src-tauri/gen/
 # tree. In the private repo this was excluded via .git/info/exclude, which is
 # local only and does not survive a clone, so it is declared properly here.
 apps/node/src-tauri/resources/node-pkg/
+
+# Generated update feed. build-node-feed.sh writes latest-node.json here; it is
+# an artifact of a release, not source, and it carries signatures produced on
+# the maintainer's machine.
+apps/node/dist-feed/

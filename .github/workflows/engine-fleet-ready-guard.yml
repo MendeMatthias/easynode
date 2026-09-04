@@ -1,0 +1,89 @@
+name: Engine fleet-ready guard
+
+# Runs scripts/check-engine-fleet-ready.sh, which answers a different question
+# from the engine tag guard next door: would our USERS' MACHINES actually start
+# on the engine tag we pin?
+#
+# WHY A SECOND GUARD. check-engine-tag.sh asks whether a tag carries the
+# withdrawn mainnet stall-recovery height. v0.34.4 passes that cleanly, five
+# assignments out of five on the disabled sentinel. It also refuses to start on
+# most of the fleet, in two ways that guard cannot see:
+#
+#   1. Its src/init.cpp exits at init when the host's device class is not a row
+#      in the sealed golden manifest. That manifest ships two rows, cuda/sm_120
+#      and metal/m4_class. Measured on an RTX 3060 (cuda/sm_86) on 2026-08-29:
+#      the node would not start at all.
+#   2. crates/btx-core/src/node.rs sends every non-Metal host to
+#      -matmulvalidation=trusted with -matmultrustedthreshold=1, and every 0.34
+#      tag refuses a 1-of-1 mirror on mainnet.
+#
+# Either one turns a node bump into a fleet-wide outage, and a node that will
+# not start is worse for a user than a stale node that runs. So this exists.
+#
+# Cheap by design: ubuntu, no toolchain, two curls of two files from
+# raw.githubusercontent.com (the script prefers a local btx clone when it finds
+# one, which a runner never has).
+#
+# Security: no github.event.* content is interpolated into any run: step.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/node/src-tauri/src/commands.rs"
+      - "crates/btx-core/src/node.rs"
+      - "scripts/check-engine-fleet-ready.sh"
+      - ".github/workflows/engine-fleet-ready-guard.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/node/src-tauri/src/commands.rs"
+      - "crates/btx-core/src/node.rs"
+      - "scripts/check-engine-fleet-ready.sh"
+      - ".github/workflows/engine-fleet-ready-guard.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fleet-ready:
+    name: Users can start the pinned engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # PROVE THE GUARD CAN FAIL, before believing anything it says.
+      #
+      # Every check is run against text that must trip it and text that must
+      # not. This repo has twice shipped breakage behind a guard that quietly
+      # stopped matching and kept exiting 0.
+      - name: Self-test the checks
+        run: bash scripts/check-engine-fleet-ready.sh --self-test
+
+      # A KNOWN-BAD TAG MUST FAIL.
+      #
+      # There is deliberately no known-good tag pinned here yet, because as of
+      # 2026-08-29 no TAGGED engine is fleet-startable: every 0.34.x tag through
+      # v0.34.4 exits at init on a machine outside the golden manifest, and
+      # 0.34.5, which fixes exactly that, is still an open pull request. When
+      # 0.34.5 is tagged, add it below as the must-PASS case. Until then the
+      # --self-test step above is what proves the checks are not vacuous.
+      - name: A tag that refuses to start must be rejected
+        run: |
+          set -uo pipefail
+          # env -u GITHUB_ACTIONS so the expected failure does not emit a red
+          # ::error:: annotation on a job that is passing.
+          echo "--- v0.34.4 must FAIL (it exits at init outside the manifest) ---"
+          if env -u GITHUB_ACTIONS bash scripts/check-engine-fleet-ready.sh v0.34.4; then
+            echo "::error::the guard ACCEPTS v0.34.4, which refuses to start on any"
+            echo "machine whose device class is not in the golden manifest. The guard"
+            echo "is toothless and would let a fleet-wide outage ship."
+            exit 1
+          fi
+          echo
+          echo "guard self-check passed: it rejects an engine our users cannot start."
+
+      - name: Would our users start on the pinned engine?
+        run: bash scripts/check-engine-fleet-ready.sh

@@ -52,6 +52,28 @@ EXPECT="${2:-}"
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="$APP_DIR/src-tauri/resources/node-pkg"
 
+# The engine pin, defaulted rather than optional.
+#
+# ⚠ THIS IS THE RELEASE PATH, and until 2026-09-04 it was the ONE staging path
+# with no pin check at all. `EXPECT` was optional, so omitting the argument
+# staged whatever btxd happened to be in the build dir, and the app then
+# installed it into a directory named after NODE_RELEASE_TAG and derived its
+# version-gated flags from that name. The guard added to the two upstream
+# tarball scripts did not cover this one, which is the only one a release
+# actually uses.
+#
+# So: with no argument, the expected version IS the pin. With an argument, the
+# argument must agree with the pin. There is no longer a way to stage a release
+# engine without saying which one and being checked on it.
+# shellcheck source=lib/engine-pin.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/engine-pin.sh"
+if [[ -z "$EXPECT" ]]; then
+  EXPECT="$(engine_pin_tag "$APP_DIR")"
+  echo "==> no version given; using the engine pin $EXPECT"
+else
+  assert_matches_engine_pin "$APP_DIR" "${EXPECT#v}"
+fi
+
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "error: this stages the LINUX node package and must run on Linux." >&2
   echo "       macOS source staging is stage-node-pkg-mac-source.sh." >&2

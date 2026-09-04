@@ -7,9 +7,14 @@
 > - `site/public/updater/latest-node.json` is the update feed. It is served from
 >   the website, which is a separate deployment, so that step happens there.
 >   Everything before it happens in this repository.
-> - `scripts/release/verify_release_btxd.py` does not exist in any repository.
->   It was written down as an intention and never built. Do not go looking for
->   it. The checks that DO exist and must both pass are
+> - `scripts/release/verify_release_btxd.py` is **upstream's** script, in the
+>   `btxchain/btx` tree, 498 lines at v0.34.5. An earlier version of this note
+>   said it existed nowhere. That was wrong: it had only been looked for in this
+>   repository and the private monorepo, not in upstream, where the recipe was
+>   always pointing. Run it from a btx checkout. It is a real ship blocker
+>   check, not an optional one.
+>
+>   The two checks that live HERE, and that must both pass, are
 >   `scripts/check-engine-tag.sh` and `scripts/check-engine-fleet-ready.sh`.
 >
 > The signing key is not in this repository and never will be. The recipe names

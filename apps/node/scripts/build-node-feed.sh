@@ -90,7 +90,18 @@ KEY="${EASYBTX_UPDATER_KEY:-$HOME/.tauri/easybtx.key}"
 PUBKEY="RWSiwrxz2pJDXR4AchfYB5DQzvD8VbIE3D87Ft4D/km76xZIikK6XE9y"
 HERE="$(cd "$(dirname "$0")" && pwd)"          # apps/node/scripts
 REPO_ROOT="$(cd "$HERE/../../.." && pwd)"       # repo root
-OUT_DIR="$REPO_ROOT/site/public/updater"
+# Where the finished feed lands.
+#
+# ⚠ This used to be "$REPO_ROOT/site/public/updater", which is a path in the
+# WEBSITE repo. In easynode there is no site/ directory, so `mkdir -p` below
+# created an empty one, the script reported success, and the feed sat in a
+# folder nothing serves and nothing ignores. A release step that cannot fail is
+# not a release step.
+#
+# Default to a build-output path inside this repo and let the caller override
+# it, so publishing to the site is an explicit act rather than an assumption
+# about where you are standing.
+OUT_DIR="${FEED_OUT_DIR:-$REPO_ROOT/apps/node/dist-feed}"
 TAG="node-v${VERSION}"
 
 [ -f "$KEY" ] || {
