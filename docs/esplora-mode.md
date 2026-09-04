@@ -231,6 +231,9 @@ bottleneck is that there is **one** source, and (a) fixes that this month.
 
 **Built and tested in this repository:**
 
+- [`deploy/esplora/`](../deploy/esplora/) — the Caddy front, the electrs unit,
+  and the freshness guardian with its timer, ported from the deployment behind
+  api.btxscan.io. Its README lists what was deliberately left behind.
 - `crates/btx-core/src/esplora.rs` — the precondition gate, with the three-way
   distinction above and 8 tests.
 - `scripts/verify-esplora.sh` — the acceptance gate, exercised against both a
