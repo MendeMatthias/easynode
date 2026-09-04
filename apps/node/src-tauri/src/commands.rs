@@ -152,6 +152,42 @@ use crate::state::{node_datadir, AppState, NodeAppSettings, NodeAppSnapshotFlags
 // stays 0.33.4, so the provisioning version gate matches on the tag directly.
 // The `.btxd-version` marker in the staged package is what that gate actually
 // reads — keep the staging script's regex able to capture four segments.
+// ── THE SECOND QUESTION: CAN THIS ENGINE KEEP UP? ──────────────────────────
+//
+// Everything above answers "does this tag diverge at 199299". It does not, and
+// two gates enforce that. Nothing above answers a question that matters just as
+// much to somebody running a node, and the answer is uncomfortable.
+//
+// Measured 2026-09-02 on one box, ONE variable changed — same datadir, same
+// arguments, same peers, only the binary swapped:
+//
+//     v0.34.5    0.68 blocks/min while connected
+//     v0.34.6    3.80 blocks/min while connected
+//     the chain  0.95 blocks/min produced
+//
+// v0.34.5 ingests more slowly than the chain produces. A node on it that falls
+// behind does not catch up — it loses ground permanently, and it does so
+// QUIETLY. It does not error. It downloads blocks, reports itself healthy, and
+// the gap grows. One was watched sitting 950 behind with in_flight_global=0 on
+// 45,298 of 45,914 log samples.
+//
+// ⚠ SO WHY IS THE PIN STILL v0.34.5? Because there is nothing to move it to.
+// Verified against the upstream API on 2026-09-04: the newest TAG on
+// btxchain/btx is v0.34.5 and the newest RELEASE is v0.34.5. `release/0.34.6`
+// exists only as a BRANCH, head 9eb4e005. This constant names a tag that
+// staging fetches a release tarball for and that both gates read files from, so
+// pointing it at an untagged branch breaks the release path rather than fixing
+// the fleet.
+//
+// The machine that measured this runs a source build of that branch installed
+// over the shipped binaries, which is why it converges and why its app UI still
+// says v0.34.5. That is a local workaround on one box, not a shipped fix, and
+// it should not be mistaken for one.
+//
+// WHEN 0.34.6 TAGS: run both gates on it, then move this constant and re-check
+// snapshot_spec() per the note above. Until then a Linux release either ships
+// an engine that cannot converge or it waits, and that is a release decision
+// rather than something to change quietly here.
 pub const NODE_RELEASE_TAG: &str = "v0.34.5";
 
 /// The pinned assumeutxo snapshot this app bootstraps from: the v0.33.2
