@@ -127,6 +127,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_wire_shape_is_what_the_ui_declares() {
+        // apps/node/src/main.ts types this as
+        //     archive_service: { state: string; blocks_behind?: number } | null
+        // and reads `.state` to choose what to show. The internal tag and the
+        // snake_case renaming are therefore load-bearing across a language
+        // boundary that no compiler checks.
+        //
+        // `it_serialises_with_a_state_tag_the_ui_can_switch_on` below already
+        // checks two of the variants field by field. This one asserts the WHOLE
+        // object for all four, which is the stronger claim: a field quietly
+        // added to a variant, or a fifth variant appearing untagged, passes a
+        // field-by-field check and fails this one.
+        let j = |a: ArchiveService| serde_json::to_value(a).unwrap();
+
+        assert_eq!(
+            j(ArchiveService::ServingHistory),
+            serde_json::json!({ "state": "serving_history" })
+        );
+        assert_eq!(
+            j(ArchiveService::NotServing),
+            serde_json::json!({ "state": "not_serving" })
+        );
+        assert_eq!(
+            j(ArchiveService::Unknown),
+            serde_json::json!({ "state": "unknown" })
+        );
+        // The one variant that carries a payload the UI reads by name.
+        assert_eq!(
+            j(ArchiveService::DegradedToLiveWindow { blocks_behind: 7 }),
+            serde_json::json!({ "state": "degraded_to_live_window", "blocks_behind": 7 })
+        );
+    }
+
+    #[test]
+    fn a_non_serving_node_costs_no_frontier_rpc_to_classify() {
+        // The refresher skips getmatmulattestedtip entirely when serving is off
+        // and passes None. That shortcut is only sound if the answer does not
+        // depend on the frontier in that case — so pin it here rather than
+        // leaving the optimisation resting on a reading of the match arms.
+        for behind in [None, Some(0), Some(2), Some(9_999)] {
+            assert_eq!(
+                archive_service(false, behind),
+                ArchiveService::NotServing,
+                "a node that does not serve is NotServing whatever the frontier says"
+            );
+        }
+    }
+
+    #[test]
     fn at_the_frontier_is_the_only_state_that_serves_history() {
         assert_eq!(
             archive_service(true, Some(0)),
