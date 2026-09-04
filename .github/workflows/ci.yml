@@ -3,6 +3,14 @@
 # What this workflow can do: check out the public source, install public
 # dependencies from registry.npmjs.org and crates.io, and compile and test.
 #
+# ACTION PINS. Every `uses:` in every workflow here is pinned to a full commit
+# SHA with the human version in a trailing comment. A tag is a mutable pointer:
+# `@v4` is whatever the action's owner decides it is at the moment the job runs,
+# and these workflows build and sign the bytes users install. `.github/
+# dependabot.yml` moves the pins on a weekly PR, because a frozen action stops
+# getting its own security fixes - the pin is there so the change is REVIEWED,
+# not so it never happens. Do not reintroduce a tag ref.
+#
 # What it cannot do: there is no `secrets.` reference anywhere in this file, no
 # `pull_request_target` trigger, and the token is read-only (see `permissions`
 # below). It therefore cannot sign, publish, release, or push. Any future edit
@@ -37,8 +45,8 @@ jobs:
       run:
         working-directory: apps/node
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '24'
           cache: npm
@@ -66,10 +74,10 @@ jobs:
       run:
         working-directory: crates/btx-core
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Show toolchain
         run: rustc --version && cargo --version
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: crates/btx-core
       # --locked makes a PR that edits Cargo.toml without refreshing Cargo.lock
@@ -99,10 +107,10 @@ jobs:
       run:
         working-directory: apps/node/src-tauri
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Show toolchain
         run: rustc --version && cargo --version
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: apps/node/src-tauri
       - name: Satisfy the bundle-resource glob (debug builds only)
