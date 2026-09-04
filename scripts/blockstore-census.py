@@ -108,7 +108,16 @@ def main():
         print("not a directory: %s" % d, file=sys.stderr)
         return 2
     r = census(d)
-    n = r["records"] or 1
+    # A directory with no block files must not report "0 bytes" and exit 0. A
+    # census that silently succeeds on nothing is how a wrong size gets quoted.
+    if r["files"] == 0:
+        print("no blk*.dat files in %s - is this a blocks/ directory?" % d, file=sys.stderr)
+        return 1
+    if r["records"] == 0:
+        print("%d blk*.dat files in %s but no readable block records - wrong magic, "
+              "or an xor.dat that does not match these files" % (r["files"], d), file=sys.stderr)
+        return 1
+    n = r["records"]
     fmt = lambda t: datetime.datetime.utcfromtimestamp(t).strftime("%Y-%m-%d %H:%M") if t else "n/a"
     print("dir              : %s" % d)
     print("blk files        : %d" % r["files"])
