@@ -37,6 +37,53 @@ behind.
 So the network's archival capacity is not merely thin. Most of it is on the
 wrong side of a fork, and advertising `NETWORK` the whole time.
 
+### Say what "current" means, or you will get a different answer
+
+The census above did not define its currency threshold, and that is enough to
+change the headline. Re-run the same query at 23:5x UTC the same day, from
+height 210344 with 20 peers:
+
+| | |
+|---|---:|
+| peers connected | 20 |
+| advertise `NETWORK` | 12 |
+| `NETWORK` with zero headers synced to us | 10 |
+| archival and within 6 blocks | **0** |
+| archival and within 20 blocks | **1** |
+
+The one is `89.85.40.184` again, 10 blocks back. Nothing about the network
+changed between those two readings; only the threshold did. **Define it: a peer
+is current if `synced_headers` is within 20 of your own height**, which is about
+half an hour of chain at 90 s a block, and state your own height beside the
+count. A number without both is not reproducible.
+
+### The seed nodes were the ones behind
+
+The same reading, sorted by height, showed something the count hides. All three
+official seeds were stopped at the same height:
+
+| peer | version | headers | behind |
+|---|---|---:|---:|
+| 109.199.124.187 | `/BTX:0.34.6/` | 210344 | 0 |
+| 89.85.40.184 | `/BTX:0.34.5/` | 210334 | 10 |
+| `node.btx.dev` | `/BTX:0.34.5/` | 209476 | 868 |
+| `node.btxchain.org` | `/BTX:0.34.5/` | 209476 | 868 |
+| `node.btx.tools` | `/BTX:0.34.5/` | 209476 | 868 |
+| 20.86.181.203 | `/BTX:0.34.5/` | 209476 | 868 |
+| 195.137.245.82 | `/BTX:0.34.4/` | 209476 | 868 |
+
+Five peers stopped at *exactly* 209476, three of them the seeds a new node is
+handed on first run. Five nodes at one height is not five independent stalls,
+and 0.34.5 not being able to keep up is the documented behaviour of that engine
+(`docs/node-release-recipe.md`: 0.68 blocks/min against a chain producing 0.95,
+failing silently while reporting itself healthy).
+
+This is one sample from one peer set at one moment and it should be re-run
+before it is quoted. What it is evidence for is narrow and worth saying anyway:
+the peers a fresh install is pointed at were, at that moment, the ones furthest
+behind, and the only peer at the tip was running an engine that has no tag.
+
+
 This matches what it feels like in practice. This node sat 824 blocks behind for
 over an hour with no peer willing to serve a body; a single `addnode` to a known
 archival peer fixed it instantly. Since 0.34.6 the engine says so itself, in a
@@ -175,14 +222,15 @@ if the gate is ever set below it.
 ## Reproducing the census
 
 ```bash
-btx-cli -datadir=<datadir> getpeerinfo \
-  | python3 -c 'import sys,json;ps=json.load(sys.stdin);
-n=[p for p in ps if "NETWORK" in p.get("servicesnames",[])];
-print(len(ps),"peers,",len(n),"archival")'
+python3 scripts/archival-census.py --datadir ~/.easybtx
+python3 scripts/archival-census.py --datadir ~/.easybtx --within 6 --json
 ```
 
-Compare each peer's `synced_headers` against your own `getblockcount`: a peer
-whose headers are far from your tip advertises history it cannot help you with.
+It prints your own height, the service split, how many `NETWORK` peers have
+synced no headers with you at all, and the archival-and-current count under an
+explicit threshold. Both numbers matter: a peer advertising `NETWORK` with
+`synced_headers` far from your tip is advertising history it cannot help you
+with, and on this network most of them are.
 
 ## Why this is in the easyNode repository
 
