@@ -35,6 +35,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Formatting needs no build, and btx-core has no system dependencies, so both
+  # run on the cheap runner.
   style:
     name: fmt and correctness lints
     runs-on: ubuntu-latest
@@ -43,6 +45,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/btx-core
 
       - name: cargo fmt (btx-core)
         working-directory: crates/btx-core
@@ -52,18 +56,40 @@ jobs:
         working-directory: apps/node/src-tauri
         run: cargo fmt --all --check
 
+      - name: clippy correctness (btx-core)
+        working-directory: crates/btx-core
+        run: cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious
+
+  # ⚠ macOS, and not to be "moved to ubuntu to save minutes".
+  #
+  # The Tauri crate does not COMPILE on a bare ubuntu runner: gio-2.0 is absent
+  # and gio-sys fails the build before any lint runs. That is the same reason
+  # ci.yml puts the tauri shell job on macOS. Linting it on ubuntu would need an
+  # apt step for webkit2gtk, gtk-3, ayatana-appindicator, rsvg and libsoup, which
+  # is a lot of surface to maintain for a lint job.
+  #
+  # This was learned the direct way: the first version of this file ran the step
+  # on ubuntu and failed with "The system library `gio-2.0` required by crate
+  # `gio-sys` was not found."
+  style-app:
+    name: correctness lints (tauri shell)
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/node/src-tauri
+
       # The bundle-resource glob must match something or tauri-build refuses to
-      # run, at any profile. One placeholder file, never a release build. Same
+      # run, at any profile. One placeholder, never a release build. Same
       # reasoning as the app job in ci.yml.
       - name: Satisfy the bundle-resource glob
         working-directory: apps/node/src-tauri
         run: |
           mkdir -p resources/node-pkg
           echo "CI placeholder. Not a node package." > resources/node-pkg/CI-PLACEHOLDER
-
-      - name: clippy correctness (btx-core)
-        working-directory: crates/btx-core
-        run: cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious
 
       - name: clippy correctness (tauri shell)
         working-directory: apps/node/src-tauri
@@ -78,5 +104,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup component add clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/btx-core
       - working-directory: crates/btx-core
         run: cargo clippy --locked --all-targets
