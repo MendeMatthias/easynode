@@ -2250,7 +2250,7 @@ pub async fn node_footprint(state: State<'_, AppState>) -> Result<NodeFootprint,
 
 #[cfg(test)]
 mod tests {
-    use super::{pre_launch_plan, PreLaunchPlan};
+    use super::{pre_launch_plan, PreLaunchPlan, NODE_RELEASE_TAG};
     use btx_core::node::DatadirHolder;
 
     // The four things `<datadir>/btxd.pid` can turn out to mean, named so the
@@ -2436,6 +2436,28 @@ mod tests {
             "stop grace {:?} must fit inside the quit backstop {:?}",
             super::ATTACHED_STOP_GRACE,
             super::QUIT_GRACE
+        );
+    }
+
+    /// The keeper gate is a DENYLIST, so a pin bump silently changes its answer.
+    /// It answered NO for v0.33.3-pr105b, the docs said so in the present tense,
+    /// and when the pin moved to v0.34.5 the answer flipped to YES with nothing
+    /// recording that anyone decided it. Assert the value this release intends,
+    /// so the next bump has to look at this line.
+    #[test]
+    fn the_shipped_pin_makes_a_deliberate_keeper_decision() {
+        assert!(
+            btx_core::installer::engine_supports_keeper_profile(NODE_RELEASE_TAG),
+            "pin {NODE_RELEASE_TAG} no longer admits the keeper conf; if that is              intended, update this assertion and say so in the CHANGELOG"
+        );
+        // And the conf that follows from it, so the two cannot drift apart.
+        assert_eq!(
+            btx_core::installer::conf_for_profile("keeper", NODE_RELEASE_TAG),
+            btx_core::installer::NODE_KEEPER_CONF
+        );
+        assert_eq!(
+            btx_core::installer::conf_for_profile("full", NODE_RELEASE_TAG),
+            btx_core::installer::NODE_FASTSTART_CONF
         );
     }
 

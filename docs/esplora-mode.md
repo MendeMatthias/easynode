@@ -102,9 +102,18 @@ its test, and more than one entry in the curated list. It is a wallet change, no
 an architecture change. But it must be *planned*, because the server work alone
 buys none of the capability this was started for.
 
-`scripts/verify-esplora.sh` therefore checks both sets and labels them: the eight
-the wallet requires **today**, and the two the witness capability will require
-**once the wallet permits them**.
+`scripts/verify-esplora.sh` therefore separates the two sets. Routes the wallet
+requires **today** are PASS/FAIL and decide the verdict; the witness routes
+(`/blocks`, `/block-height/<h>`) are labelled **FUTURE**, counted separately, and
+cannot refuse an endpoint. Getting that wrong withheld wallet-fit endpoints for
+failing a capability no wallet can use yet, on a network whose whole problem is
+that there is one source left.
+
+Be exact about coverage: the gate probes `/blocks/tip/height`, `/mempool`,
+`/address/<a>/utxo`, `/tx/<t>/outspend/<v>` and `POST /tx` out of the eight, plus
+CORS, freshness headers and a UTXO-set comparison. The remaining three are
+served by the same electrs and stand or fall with it, but they are not
+independently proven and this document should not imply they are.
 
 ## Hard requirements
 
@@ -171,9 +180,15 @@ scripts/verify-esplora.sh https://my-node.example <addr-with-spend-history> ...
 minebtx: that host answers 503, and a dead reference silently turns every
 comparison into a pass.
 
-**Proof the gate works.** Run against Byron Bay it fails 9 checks and refuses the
-endpoint; run against the reference it passes 16 and fails only the deliberate
-refusal to bless an endpoint whose UTXO sets were never compared.
+**Proof the gate works.** Run against Byron Bay it refuses the endpoint, on the
+routes the wallet actually calls: no CORS headers, no freshness headers, and a
+UTXO set it will not bless without a comparison. Its `/blocks` 404 and its two
+diverging heights are reported as FUTURE notes and do not contribute to that
+refusal — before the split they did, which is how a wallet-fit endpoint could be
+turned away for a capability no wallet can use.
+
+Re-run it rather than quoting a count from here; the numbers moved once the two
+sets were separated, and they will move again.
 
 Note that Byron's `/blocks` 404 is reported by the gate as a **future** problem,
 not a current one: the wallet cannot call `/blocks` today. It is worth serving
