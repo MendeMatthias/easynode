@@ -23,8 +23,11 @@
 # that mac would be offered 0.6.5, download 0.6.4 bytes, verify them, install
 # them, still report 0.6.4, and be offered 0.6.5 again forever. Nothing errors.
 # gen-node-feed.py makes that unrepresentable: it DERIVES every URL from the
-# version being published, so a key is only ever present for an asset that
-# exists at this version.
+# version being published, so a key is only ever present for a NAME that belongs
+# to this version. Deriving a name is not the same as the asset existing, and it
+# is not the same as the signed bytes being that asset - the `expect_name` check
+# below closes the second gap, and "those assets MUST be attached to the tag"
+# at the end of this script is the first one, still done by a human.
 #
 # This script and gen-node-feed.py both used to demand all three platforms,
 # which is exactly why the last three releases hand-assembled the feed instead
@@ -163,6 +166,33 @@ if [ -n "$MAC_TGZ" ]; then
   [ -f "${MAC_TGZ}.sig" ] || sign "$MAC_TGZ"
   verify "$MAC_TGZ"
 fi
+# The signature proves "these bytes, signed by our key". It says NOTHING about
+# whether these bytes are the ones the derived URL will point at: gen-node-feed
+# mints every URL from --version, while this script signs whatever PATH the
+# operator handed it. Hand it last release's AppImage with this release's
+# --version and both halves succeed - a correctly signed manifest pointing at a
+# name that is not this file. The usual outcome is a 404, which is loud; the bad
+# one needs a second slip (a stale file renamed to the derived name) and gives
+# the silent update loop the header above describes.
+#
+# So assert the two agree before signing anything. This catches the mismatched
+# NAME; it cannot catch stale BYTES under a correct name, which would need the
+# version read out of the artifact itself.
+expect_name() {
+  local path="$1" want="$2"
+  local got; got="$(basename "$path")"
+  if [ "$got" != "$want" ]; then
+    echo "error: $path is named '$got', but the feed will publish a URL ending" >&2
+    echo "       in '$want' (derived from --version $VERSION)." >&2
+    echo "       Signing this would produce a valid signature over a file the" >&2
+    echo "       feed does not point at. Rename it, or pass the right --version." >&2
+    exit 1
+  fi
+}
+[ -n "$MAC_TGZ" ]        && expect_name "$MAC_TGZ"        "BTX-Node_${VERSION}_aarch64.app.tar.gz"
+[ -n "$LINUX_APPIMAGE" ] && expect_name "$LINUX_APPIMAGE" "BTX-Node_${VERSION}_amd64.AppImage"
+[ -n "$WIN_SETUP" ]      && expect_name "$WIN_SETUP"      "BTX-Node_${VERSION}_x64-setup.exe"
+
 if [ -n "$LINUX_APPIMAGE" ]; then sign "$LINUX_APPIMAGE"; verify "$LINUX_APPIMAGE"; fi
 if [ -n "$WIN_SETUP" ]; then sign "$WIN_SETUP"; verify "$WIN_SETUP"; fi
 

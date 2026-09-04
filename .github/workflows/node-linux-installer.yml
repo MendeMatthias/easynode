@@ -332,7 +332,21 @@ jobs:
           done
           rm -rf squashfs-root/usr/lib/dri squashfs-root/usr/lib/gbm 2>/dev/null || true
           echo "stripped $removed GPU driver libs (+ dri/gbm dirs)"
-          if curl -fsSL --retry 3 -o /tmp/appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"; then
+          # PINNED AND VERIFIED. This is the last thing to touch the bytes a
+          # user installs, and it used to be fetched from the `continuous` tag
+          # - a moving target, downloaded over the network, chmod +x, and run
+          # over the release AppImage. Pin the release and check the hash
+          # BEFORE making it executable; a mismatch keeps the original image
+          # rather than repackaging with an unknown tool.
+          #
+          # sha256 measured by download on 2026-09-05 and matching the digest
+          # GitHub publishes for the asset. To move it: bump the version, fetch
+          # the asset, sha256sum it, and put the result here.
+          APPIMAGETOOL_VERSION="1.9.1"
+          APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+          url="https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage"
+          if curl -fsSL --retry 3 -o /tmp/appimagetool "$url" \
+             && echo "${APPIMAGETOOL_SHA256}  /tmp/appimagetool" | sha256sum -c - >/dev/null 2>&1; then
             chmod +x /tmp/appimagetool
             if ARCH=x86_64 /tmp/appimagetool --appimage-extract-and-run --no-appstream squashfs-root "$base"; then
               chmod +x "$base"; echo "repackaged $base WITHOUT GPU libs ($(du -h "$base" | cut -f1))"
@@ -340,7 +354,7 @@ jobs:
               echo "::warning::appimagetool repackage failed — keeping the original"
             fi
           else
-            echo "::warning::appimagetool download failed — keeping the original"
+            echo "::warning::appimagetool download failed or did not match its pinned sha256 — keeping the original"
           fi
           rm -rf squashfs-root
 

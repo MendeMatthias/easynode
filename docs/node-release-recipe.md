@@ -575,21 +575,35 @@ Also expect:
    The manual sequence, kept because you should understand what the script does:
 
    ```bash
-   apps/node/scripts/publish-node-release.sh --version <ver> --sums SHA256SUMS \
-     [--linux <.AppImage>] [--mac <.app.tar.gz>] [--win <-setup.exe>] \
-     [--notes-file NOTES.md] [--dry-run]
+   apps/node/scripts/publish-node-release.sh <version> <asset-dir>            # checks only
+   apps/node/scripts/publish-node-release.sh <version> <asset-dir> --publish
    ```
+   Two positionals, not the flag interface an earlier draft of this page
+   described. The asset dir holds the artifacts, their `.sig` files, and the
+   gate run's `SHA256SUMS`.
+
    It performs every check this step used to ask a human to remember: the
    artifacts must be listed in the gate run's `SHA256SUMS` with matching hashes
-   and must not be newer than it (a rebuild after the gates is refused), the
+   (a rebuild after the gates is refused; a file that is merely NEWER than the
+   sums while still matching them is a copy, not a rebuild, and is called out
+   rather than refused), the
    updater signature must verify against the pubkey the app embeds, the release
    is created as a draft and only flipped live once its assets are attached,
    every asset is re-downloaded and compared after publishing, and
-   `/releases/latest` is re-read at the end. Run it with `--dry-run` first: that
-   does every offline check and stops before the first API call.
+   `/releases/latest` is re-read at the end. Run it WITHOUT `--publish` first:
+   that does every offline check and stops before the first API call.
 
-   It needs only `curl` and `python3`, because the publishing box has neither
-   `gh` nor `jq` (measured 2026-09-04, both sides of the WSL boundary).
+   The SHA256SUMS gate is the one the signature cannot stand in for. A signature
+   proves "these bytes, signed by our key", which is equally true of a rebuild
+   made ten minutes after the gates went green. Byte-identity to the run's
+   SHA256SUMS is what connects "the gates passed" to "this is what ships".
+
+   ⚠ It needs `gh` from the API half onward, and the publishing box has neither
+   `gh` nor `jq` (measured 2026-09-04, both sides of the WSL boundary). The
+   offline half — the version check, the signatures, and the SHA256SUMS gate —
+   runs anywhere, deliberately, so those checks are usable on the box that
+   cannot finish the job. Finishing it needs `gh` installed, or the REST
+   sequence below run by hand.
 
    `--latest=false` is **mandatory** — otherwise the node release steals the
    repo-global "Latest" pointer and breaks the *miner's* updater. The script
@@ -749,9 +763,10 @@ glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
 
 6. Sign with `cargo tauri signer sign -f <updater.key> -p ""` (empty
    password), verify with `apps/node/scripts/verify-updater-sig.py`, publish
-   with `apps/node/scripts/publish-node-release.sh` (token prompted or from the
-   environment, refuses untested bytes, `make_latest=false` always, re
-   downloads and compares after upload), and only THEN move
+   with `apps/node/scripts/publish-node-release.sh` (authenticates through `gh`,
+   which it never prompts for; refuses bytes the gates did not produce, refuses
+   unsigned artifacts, `make_latest=false` always, re-downloads and compares
+   after upload), and only THEN move
    `site/public/updater/latest-node.json` and the site pins, regenerating
    the feed with `gen-node-feed.py` so every signature is verified against
    the app pubkey.
