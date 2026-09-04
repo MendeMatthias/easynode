@@ -926,11 +926,7 @@ pub fn provision_node_package(
     //
     // Packages without the marker keep the old behaviour: verify against the
     // install-root tag.
-    let expected = std::fs::read_to_string(bundled_pkg_dir.join(BTXD_VERSION_MARKER))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| release_tag_from_install_root(install_root));
+    let expected = expected_btxd_version(bundled_pkg_dir, install_root);
     if let Some(expected) = expected {
         let btxd_path = install_root.join("bin").join(&btxd_name);
         verify_btxd_reports_tag(&btxd_path, &expected)?;
@@ -953,6 +949,29 @@ pub fn provision_node_package(
         faststart_conf: conf_path,
         mining_results_dir: None,
     })
+}
+
+/// Which btxd version this package claims to carry, and therefore what the
+/// staged binary must report: the `.btxd-version` marker if the package has a
+/// usable one, else the tag in the install root.
+///
+/// Split out of `provision_node_package` so the precedence is testable without
+/// executing a binary. It had NO coverage — both provision tests use tag-less
+/// install roots, so `expected` was always `None` and the gate was never
+/// entered — while in production `install_dir` always builds `.../btx/<tag>/…`
+/// and therefore always yields an expectation. A future edit to this precedence
+/// would have landed green.
+///
+/// An EMPTY marker falls through to the tag rather than expecting `""`. That is
+/// a real staging failure mode, not a hypothetical: three staging scripts wrote
+/// the marker through a pipeline that could not fail, so a btxd that would not
+/// run produced an empty file and the package shipped.
+fn expected_btxd_version(bundled_pkg_dir: &Path, install_root: &Path) -> Option<String> {
+    std::fs::read_to_string(bundled_pkg_dir.join(BTXD_VERSION_MARKER))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| release_tag_from_install_root(install_root))
 }
 
 #[cfg(test)]
@@ -986,6 +1005,64 @@ mod tests {
         // Degenerate input never counts as a match.
         assert!(!version_output_matches_tag(real, ""));
         assert!(!version_output_matches_tag("", "v0.33.2"));
+    }
+
+    #[test]
+    fn the_marker_outranks_the_tag_and_an_empty_marker_falls_back() {
+        let pkg = tempfile::tempdir().unwrap();
+        let root = Path::new("/h/.local/btx/v0.34.5/linux-x86_64");
+
+        // No marker at all: fall back to the install-root tag.
+        assert_eq!(
+            expected_btxd_version(pkg.path(), root).as_deref(),
+            Some("v0.34.5")
+        );
+
+        // A marker WINS over the tag. Branch builds legitimately differ: BTX's
+        // 0.33.3 PR never bumped CLIENT_VERSION_BUILD, so the binary reports a
+        // version the install tag does not match, and the marker is the truth.
+        std::fs::write(
+            pkg.path().join(BTXD_VERSION_MARKER),
+            "v0.34.6
+",
+        )
+        .unwrap();
+        assert_eq!(
+            expected_btxd_version(pkg.path(), root).as_deref(),
+            Some("v0.34.6")
+        );
+
+        // A four-segment reseal tag survives intact — the case three staging
+        // scripts used to truncate to three segments.
+        std::fs::write(pkg.path().join(BTXD_VERSION_MARKER), "v0.33.4.1").unwrap();
+        assert_eq!(
+            expected_btxd_version(pkg.path(), root).as_deref(),
+            Some("v0.33.4.1")
+        );
+
+        // An EMPTY or whitespace-only marker is a staging failure, not an
+        // expectation of "": fall back rather than demanding the binary report
+        // an empty version, which nothing can satisfy.
+        for junk in [
+            "", "   ", "
+
+",
+        ] {
+            std::fs::write(pkg.path().join(BTXD_VERSION_MARKER), junk).unwrap();
+            assert_eq!(
+                expected_btxd_version(pkg.path(), root).as_deref(),
+                Some("v0.34.5"),
+                "empty marker {junk:?} must fall back to the tag"
+            );
+        }
+
+        // Neither a usable marker nor a tagged root: skip the assert rather
+        // than invent an expectation.
+        std::fs::write(pkg.path().join(BTXD_VERSION_MARKER), "").unwrap();
+        assert_eq!(
+            expected_btxd_version(pkg.path(), Path::new("/opt/node")),
+            None
+        );
     }
 
     #[test]

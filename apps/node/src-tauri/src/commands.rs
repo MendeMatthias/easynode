@@ -796,7 +796,21 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     // place first. Awaited rather than spawned for the same ordering reason. A
     // failure is logged and startup continues: the node still syncs the slow way,
     // which is exactly what it would have done with no snapshot at all.
-    if btx_core::snapshot::snapshot_file_is_stale_for_spec(&spec, &datadir) {
+    //
+    // ...but not for a node that has already loaded one. `ensure_snapshot_loaded`
+    // returns on its fast path when `snapshot_loaded` is set, so nothing would
+    // ever read the file we just fetched: the download is ~452 MB spent to
+    // produce a file the very next call ignores, on every start until the pin
+    // moves again. The staleness refresh exists to make the LOAD correct, so it
+    // is only worth doing when a load can still happen.
+    let already_loaded = NodeAppSettings::load(&datadir).snapshot_loaded;
+    if already_loaded && btx_core::snapshot::snapshot_file_is_stale_for_spec(&spec, &datadir) {
+        eprintln!(
+            "[snapshot] snapshot.dat is from an older pin, but this node has \
+             already loaded one; not re-downloading a file nothing would read"
+        );
+    }
+    if !already_loaded && btx_core::snapshot::snapshot_file_is_stale_for_spec(&spec, &datadir) {
         eprintln!(
             "[snapshot] snapshot.dat on disk is not the pinned one (anchor {}); refreshing",
             spec.anchor_height
