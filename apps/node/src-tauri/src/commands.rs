@@ -553,6 +553,38 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
 
     // Re-assert the app-owned conf keys on EVERY start, not just after setup.
     //
+    // Before the opt-in keys below: put back anything missing from the BASE
+    // conf. Nothing on this path used to do that. `provision_node_package`
+    // writes faststart.conf once — at first setup, or when the pinned tag moves
+    // — and after that the only writers read-modify-rewrite it, plus the miner
+    // through the shared datadir. So a conf that loses its body never got it
+    // back, and btxd launched with the datadir's own remembered `prune` value
+    // and no reorg parking, silently and with nothing on screen.
+    //
+    // Only ever ADDS a missing key; a present value is never overwritten, so a
+    // keeper stays pruned and a hand-tuned value survives. See
+    // `ensure_base_conf_keys` for why these five and not the whole conf.
+    match btx_core::setup::ensure_base_conf_keys(
+        &paths.faststart_conf,
+        btx_core::installer::conf_for_profile(&settings.node_profile, NODE_RELEASE_TAG),
+    ) {
+        Ok(added) if !added.is_empty() => {
+            // Loud on purpose. Healing this silently would hide a conf that is
+            // being damaged repeatedly by something we have not found yet.
+            eprintln!(
+                "[node-app] faststart.conf was missing {} base key(s), restored: {}",
+                added.len(),
+                added.join(" ")
+            );
+            setup_log(
+                &datadir,
+                &format!("restored missing conf keys: {}", added.join(" ")),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[node-app] could not restore base conf keys: {e}"),
+    }
+
     // `provision_node_package` writes faststart.conf unconditionally, so the
     // node-upgrade path above (which fires whenever NODE_RELEASE_TAG moves —
     // e.g. v0.33.1 → v0.33.2 for the MatMul v4.7 fork) silently drops

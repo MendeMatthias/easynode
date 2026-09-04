@@ -312,6 +312,74 @@ pub fn set_managed_whitelist_block(conf_path: &Path, ips: &[String]) -> AppResul
         .map_err(|e| AppError::Config(format!("cannot write conf {}: {e}", conf_path.display())))
 }
 
+/// Keys whose ABSENCE from `faststart.conf` silently changes what the node is,
+/// with no error and nothing on screen.
+///
+/// Nothing on the start path re-asserts the base conf. `provision_node_package`
+/// writes it once, at first setup or when the pinned tag moves; after that the
+/// only writers are three helpers that read-modify-rewrite it, plus the miner
+/// through the shared datadir. A conf that loses its body therefore never gets
+/// it back, and each of these five costs something specific:
+///
+///   * `prune` — btxd loads the datadir's own `btx_rw.conf` on every start and a
+///     read-write setting outranks a config-file one. With no `prune=` line
+///     [`crate::node`] passes no `-prune`, so a remembered `prune=4096` wins.
+///     That is measured behaviour on a live validator, not a hypothetical, and
+///     an unexpectedly pruned node cannot rebuild shielded state after an
+///     unclean shutdown — the bricked-datadir scar `prune=0` exists for.
+///   * `parkdeepreorg`, `maxreorgdepthpark`, `maxreorgdepthwarn` — btxd ships
+///     these DISABLED in every built-in profile, so without them the node
+///     follows whichever branch carries the most work, on a chain measured at
+///     roughly one sibling every 25 blocks.
+///   * `retainshieldedcommitmentindex` — the index the shielded rebuild needs.
+///
+/// Deliberately NOT everything in the canonical conf: `addnode` lines and the
+/// whitelist block have their own managers, and re-inserting them here would
+/// fight [`prune_retired_addnodes_in_conf`] and
+/// [`set_managed_whitelist_block`].
+pub const BASE_CONF_SAFETY_KEYS: [&str; 5] = [
+    "prune",
+    "parkdeepreorg",
+    "maxreorgdepthpark",
+    "maxreorgdepthwarn",
+    "retainshieldedcommitmentindex",
+];
+
+/// Re-insert any [`BASE_CONF_SAFETY_KEYS`] missing from `conf_path`, taking the
+/// value from `canonical` (the profile's own conf text). Returns the keys it
+/// had to add, so the caller can say so out loud.
+///
+/// TWO GUARANTEES, both load-bearing, because this runs on every start of every
+/// install and rewrites the file that launches the node:
+///
+///   1. It only ever ADDS a key that is absent. A present value is the
+///      operator's — or the profile's — and is never overwritten. A keeper's
+///      `prune=10000` is left alone precisely because `canonical` for a keeper
+///      says the same thing, and a hand-tuned value survives either way.
+///   2. It reports what it changed rather than healing silently, so a bad
+///      deploy shows up in the log instead of quietly rewriting every conf in
+///      the fleet.
+///
+/// A key absent from `canonical` too is not invented.
+pub fn ensure_base_conf_keys(conf_path: &Path, canonical: &str) -> AppResult<Vec<String>> {
+    let mut added = Vec::new();
+    for key in BASE_CONF_SAFETY_KEYS {
+        if conf_kv(conf_path, key).is_some() {
+            continue;
+        }
+        let prefix = format!("{key}=");
+        let Some(value) = canonical.lines().find_map(|l| {
+            let l = l.trim();
+            l.strip_prefix(&prefix).map(str::to_string)
+        }) else {
+            continue;
+        };
+        set_conf_kv(conf_path, key, Some(&value))?;
+        added.push(format!("{key}={value}"));
+    }
+    Ok(added)
+}
+
 /// Read the value of the first `key=value` line in a conf file (`None` when
 /// the file or the key is absent). Companion to [`set_conf_kv`] — lets the
 /// start path ADOPT a hand-set flag instead of overwriting it.
@@ -644,6 +712,128 @@ mod tests {
     /// ever set below the chain it is gating, it does the opposite: it waves
     /// through the install that runs out of disk halfway. That is what happened
     /// between 2026-07-12 and 2026-09-04, silently, because nothing checked.
+    const FULL: &str = "server=1
+prune=0
+retainshieldedcommitmentindex=1
+                        parkdeepreorg=1
+maxreorgdepthpark=6
+maxreorgdepthwarn=3
+";
+    const KEEPER: &str = "server=1
+prune=10000
+retainshieldedcommitmentindex=1
+                          parkdeepreorg=1
+maxreorgdepthpark=6
+maxreorgdepthwarn=3
+";
+
+    #[test]
+    fn a_stub_conf_gets_its_safety_keys_back() {
+        // The shape that matters: a conf reduced to the two things the append-
+        // only writers put there. Nothing on the start path used to notice, and
+        // btxd would launch with the datadir's remembered prune value and no
+        // reorg parking at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let conf = tmp.path().join("faststart.conf");
+        std::fs::write(
+            &conf,
+            "addnode=1.2.3.4:19335
+whitelist=127.0.0.1
+",
+        )
+        .unwrap();
+
+        let added = ensure_base_conf_keys(&conf, FULL).unwrap();
+        assert_eq!(added.len(), 5, "added {added:?}");
+
+        let out = std::fs::read_to_string(&conf).unwrap();
+        for expect in [
+            "prune=0",
+            "parkdeepreorg=1",
+            "maxreorgdepthpark=6",
+            "maxreorgdepthwarn=3",
+            "retainshieldedcommitmentindex=1",
+        ] {
+            assert!(
+                out.contains(expect),
+                "missing {expect} in:
+{out}"
+            );
+        }
+        // And it did not touch what was already there.
+        assert!(out.contains("addnode=1.2.3.4:19335"));
+        assert!(out.contains("whitelist=127.0.0.1"));
+    }
+
+    #[test]
+    fn it_never_overwrites_a_value_that_is_already_set() {
+        // This runs on every start of every install. Overwriting would rewrite
+        // the launch posture of the whole fleet at once, and would stamp a
+        // keeper back to prune=0 the moment the canonical conf disagreed.
+        let tmp = tempfile::tempdir().unwrap();
+        let conf = tmp.path().join("faststart.conf");
+        std::fs::write(
+            &conf,
+            "prune=10000
+maxreorgdepthwarn=9
+",
+        )
+        .unwrap();
+
+        let added = ensure_base_conf_keys(&conf, FULL).unwrap();
+        assert!(!added.iter().any(|a| a.starts_with("prune=")), "{added:?}");
+        assert!(
+            !added.iter().any(|a| a.starts_with("maxreorgdepthwarn=")),
+            "{added:?}"
+        );
+
+        let out = std::fs::read_to_string(&conf).unwrap();
+        assert!(
+            out.contains("prune=10000"),
+            "a keeper stays a keeper:
+{out}"
+        );
+        assert!(
+            out.contains("maxreorgdepthwarn=9"),
+            "a hand-tuned value survives:
+{out}"
+        );
+    }
+
+    #[test]
+    fn a_complete_conf_is_left_exactly_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conf = tmp.path().join("faststart.conf");
+        std::fs::write(&conf, KEEPER).unwrap();
+        let before = std::fs::read_to_string(&conf).unwrap();
+
+        let added = ensure_base_conf_keys(&conf, KEEPER).unwrap();
+
+        assert!(added.is_empty(), "nothing to do, but added {added:?}");
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), before);
+    }
+
+    #[test]
+    fn the_keeper_profile_keeps_its_own_prune_value() {
+        // Same stub, keeper canonical: the restored value must be the keeper's,
+        // not the full node's. Restoring prune=0 onto a keeper would silently
+        // turn a ~10 GiB node into a ~124 GiB one.
+        let tmp = tempfile::tempdir().unwrap();
+        let conf = tmp.path().join("faststart.conf");
+        std::fs::write(
+            &conf,
+            "addnode=1.2.3.4:19335
+",
+        )
+        .unwrap();
+
+        ensure_base_conf_keys(&conf, KEEPER).unwrap();
+
+        let out = std::fs::read_to_string(&conf).unwrap();
+        assert!(out.contains("prune=10000"), "{out}");
+        assert!(!out.contains("prune=0"), "{out}");
+    }
+
     #[test]
     fn a_keeper_install_is_not_gated_on_the_full_chain() {
         let gib = 1024 * 1024 * 1024;
