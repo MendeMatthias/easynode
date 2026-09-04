@@ -22,7 +22,13 @@
 # forked tag puts the whole install base on a dead branch.
 /apps/node/src-tauri/src/commands.rs    @MendeMatthias
 
-# CI has access to the signing key. A change here is a change to who can sign.
+# CI must NEVER hold the signing key, and today it does not: this repository has
+# no Actions secrets and no environments, and the workflow references none.
+# An earlier version of this line said "CI has access to the signing key", which
+# was untrue and read as permission to arrange it. Releases are signed on the
+# maintainer's machine and that is the design.
+# What this rule guards against is a change that adds `secrets.`,
+# `permissions: write`, or a `pull_request_target` trigger.
 /.github/                               @MendeMatthias
 
 # Licensing and attribution.

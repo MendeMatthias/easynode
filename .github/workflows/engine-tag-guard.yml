@@ -1,0 +1,93 @@
+name: Engine tag guard
+
+# Runs scripts/check-engine-tag.sh, which answers one question: does the upstream
+# engine tag we pin in apps/node/src-tauri/src/commands.rs carry the withdrawn
+# mainnet rule nMatMulStallRecoveryHeight = 199'299?
+#
+# A node built from a tag that carries it diverges from the majority chain at
+# exactly block 199299 and needs a manual rollback, not just an upgrade. Shipping
+# one to users is the most expensive mistake this app can make, and until now the
+# only defence was a sentence in doc/node-release-recipe.md telling a human to
+# run a git grep. That sentence's stated criterion, "safe tags print
+# std::numeric_limits<int32_t>::max()", is satisfied by a FORKED tag: mainnet
+# prints the number first and the four other networks print max() after it. So
+# the recipe would wave v0.34.1 straight through. The script replaces "some
+# assignment is the sentinel" with "every assignment is", and fails loudly when
+# it finds none at all rather than passing vacuously.
+#
+# ⚠ That escape hatch is now CLOSED, and this note records why it existed.
+# The script carries an ACKNOWLEDGED_FORKED_TAG line which warns instead of
+# failing for one named tag, so that a knowingly-forked pin did not turn main
+# red and block every unrelated pull request for a state no unrelated pull
+# request caused. It was set to v0.33.4.1.
+#
+# The pin is now v0.34.5, which checks out clean, and ACKNOWLEDGED_FORKED_TAG is
+# empty. So this gate fails hard on any forked tag, with no exception, which is
+# the posture you want. If you ever need to set it again, read the tradeoff in
+# the script header first, and treat re-opening it as the temporary thing it is.
+#
+# Cheap by design: ubuntu, no toolchain, one curl of one file from
+# raw.githubusercontent.com (the script prefers a local btx clone when it finds
+# one, which a runner never has).
+#
+# Security: no github.event.* content is interpolated into any run: step.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/node/src-tauri/src/commands.rs"
+      - "scripts/check-engine-tag.sh"
+      - ".github/workflows/engine-tag-guard.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/node/src-tauri/src/commands.rs"
+      - "scripts/check-engine-tag.sh"
+      - ".github/workflows/engine-tag-guard.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  engine-tag:
+    name: Pinned engine tag is not on the 199299 fork
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Does the pinned engine tag carry the withdrawn stall-recovery height?
+        run: bash scripts/check-engine-tag.sh
+
+      # PROVE THE GUARD STILL WORKS, on every run.
+      #
+      # The check above passing tells you nothing on its own while the pin is the
+      # acknowledged forked tag: a broken script that always exits 0 looks exactly
+      # the same. So run it against two tags with known, opposite answers and
+      # require both. If upstream ever reshapes chainparams.cpp, this step goes red
+      # while the real check is still quietly saying OK, which is the warning we
+      # want. These two tags are frozen history and will not change under us.
+      - name: Self-check the guard against a known-safe and a known-forked tag
+        run: |
+          set -uo pipefail
+          # env -u GITHUB_ACTIONS so the expected failure below does not emit a
+          # red ::error:: annotation on a job that is passing. The exit codes are
+          # what this step reads.
+          echo "--- v0.34.4 must PASS (the rule was withdrawn in v0.34.2) ---"
+          if ! env -u GITHUB_ACTIONS bash scripts/check-engine-tag.sh v0.34.4; then
+            echo "::error::the guard rejects v0.34.4, a tag that does not carry the fork."
+            echo "It has stopped reading chainparams.cpp correctly. Fix the guard."
+            exit 1
+          fi
+          echo
+          echo "--- v0.34.1 must FAIL (it assigns 199'299 on mainnet) ---"
+          if env -u GITHUB_ACTIONS bash scripts/check-engine-tag.sh v0.34.1; then
+            echo "::error::the guard ACCEPTS v0.34.1, which carries the withdrawn"
+            echo "stall-recovery height. The guard is toothless and would let a forked"
+            echo "engine ship. Fix it before merging anything that moves the pin."
+            exit 1
+          fi
+          echo
+          echo "guard self-check passed: it accepts a clean tag and rejects a forked one."

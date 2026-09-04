@@ -8,6 +8,11 @@ Use GitHub's private vulnerability reporting on this repository: the **Security*
 tab, then **Report a vulnerability**. That opens a private thread visible only to
 the maintainer, and it works without either of us publishing an email address.
 
+If that button is not there for you, open a normal issue saying only that you
+have something to report and asking for a private channel, with no details in
+it. A missing button is our bug, not your problem, and you should never be left
+choosing between silence and a public disclosure.
+
 If that is unavailable to you, open a public issue saying only that you have
 something to report and asking for a private channel. Do not include details.
 
