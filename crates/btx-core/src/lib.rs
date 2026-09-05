@@ -22,6 +22,7 @@ pub mod datadir;
 pub mod disk;
 pub mod error;
 pub mod esplora;
+pub mod fork;
 pub mod frontier;
 pub mod fsx;
 pub mod health;

@@ -773,6 +773,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     *state.archive_peers_cache.lock().await = None;
     state.peer_nicknames_cache.lock().await.clear();
     *state.archive_service.lock().await = None;
+    *state.fork.lock().await = None;
 
     set_phase(app, state, NodePhase::Starting).await;
 
@@ -1225,6 +1226,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
     let archive_slot = state.archive_peers_cache.clone();
     let nickname_slot = state.peer_nicknames_cache.clone();
     let archive_service_slot = state.archive_service.clone();
+    let fork_slot = state.fork.clone();
     let anchor = snapshot_spec().anchor_height;
 
     tauri::async_runtime::spawn(async move {
@@ -1247,6 +1249,14 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
         let mut wd_last_dial_ok = true;
         // Service report (opt-in, local JSON): write every ~100 ticks (~5 min).
         let mut report_tick: u32 = 0;
+        // Fork detector state (btx_core::fork). getchaintips is read every
+        // FORK_CHECK_EVERY ticks; the headers/blocks gap window and the moment
+        // the current verdict was first seen persist across ticks.
+        const FORK_CHECK_EVERY: u32 = 10;
+        let mut fork_tick: u32 = 0;
+        let mut gap_since: Option<(std::time::Instant, u64)> = None;
+        let mut fork_first_seen: Option<std::time::Instant> = None;
+        let mut fork_tips: Vec<btx_core::fork::ChainTip> = Vec::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             if gen_counter.load(Ordering::SeqCst) != gen {
@@ -1392,6 +1402,52 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                         };
                         *archive_service_slot.lock().await =
                             Some(btx_core::frontier::archive_service(serving, blocks_behind));
+                    }
+
+                    // ── Is there a longer chain this node cannot obtain? ────
+                    // The 2026-09-05 failure: a green status on a minority
+                    // branch for hours (docs/incident-2026-09-05-fork.md).
+                    // btx_core::fork decides; this only feeds it. getchaintips
+                    // costs 30–40 ms on the release box against a 3-second
+                    // tick, so it is read every tenth tick — a fork is a
+                    // matter of minutes, not seconds — while the gap window
+                    // advances every tick from the getblockchaininfo this tick
+                    // already made. Never judged during initial block
+                    // download, when headers lead blocks by design.
+                    {
+                        let behind = chain.headers.saturating_sub(chain.blocks);
+                        if behind > btx_core::fork::HEADERS_AHEAD_ALARM {
+                            gap_since.get_or_insert((std::time::Instant::now(), behind));
+                        } else {
+                            gap_since = None;
+                        }
+                        fork_tick = fork_tick.wrapping_add(1);
+                        if fork_tick % FORK_CHECK_EVERY == 1 {
+                            if let Ok(tips) = btx_core::node_api::get_chain_tips(&rpc).await {
+                                fork_tips = tips;
+                            }
+                        }
+                        let gap = gap_since.map(|(t, b)| btx_core::fork::GapWindow {
+                            since_secs: t.elapsed().as_secs(),
+                            behind_at_start: b,
+                        });
+                        let verdict = if chain.initial_block_download {
+                            None
+                        } else {
+                            btx_core::fork::fork_alarm(&fork_tips, chain.blocks, chain.headers, gap)
+                        };
+                        let verdict = match verdict {
+                            Some(v) => {
+                                let first =
+                                    *fork_first_seen.get_or_insert_with(std::time::Instant::now);
+                                Some(v.with_since(first.elapsed().as_secs()))
+                            }
+                            None => {
+                                fork_first_seen = None;
+                                None
+                            }
+                        };
+                        *fork_slot.lock().await = verdict;
                     }
 
                     // ── Trusted-mirror stall watchdog tick ──────────────────
@@ -1607,6 +1663,7 @@ pub async fn stop_node_inner(state: &AppState) {
     *state.archive_peers_cache.lock().await = None;
     state.peer_nicknames_cache.lock().await.clear();
     *state.archive_service.lock().await = None;
+    *state.fork.lock().await = None;
     // Release the keep-awake assertion — the Mac may sleep again.
     *state.sleep_guard.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
@@ -1743,6 +1800,13 @@ pub struct NodeStatusInfo {
     /// copy in TypeScript that drifts from the first.
     pub archive_service_message: Option<String>,
     pub archive_service_needs_attention: bool,
+    /// A longer chain this node cannot obtain blocks for (`btx_core::fork`),
+    /// or `None` when healthy or not yet measured. The 2026-09-05 lesson: a
+    /// node on a minority branch must not look like a healthy node on a quiet
+    /// network. The tagged value for machines and the rendered sentence for
+    /// people, for the same reason `archive_service` ships both.
+    pub fork: Option<btx_core::fork::ForkAlarm>,
+    pub fork_message: Option<String>,
     /// The nickname the user has chosen (empty = none). This is what WILL be
     /// broadcast; `subversion` below is what IS.
     pub node_nickname: String,
@@ -1959,6 +2023,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
     // machines and the rendered sentence for people, and taking the lock twice
     // could ship two different ticks in one status.
     let archive_service = state.archive_service.lock().await.clone();
+    let fork = state.fork.lock().await.clone();
 
     // Archive-peer census for the trusted-mirror health card: served from the
     // refresher's per-tick cache (≤3 s old) instead of running a second full
@@ -2009,6 +2074,8 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         attestation_serve_enabled: settings.attestation_serve_enabled,
         archive_service: archive_service.clone(),
         archive_service_message: archive_service.as_ref().map(|a| a.message()),
+        fork_message: fork.as_ref().map(|f| f.message()),
+        fork,
         node_nickname: settings.node_nickname.clone(),
         broadcast_nickname: subversion
             .as_deref()

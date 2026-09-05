@@ -84,6 +84,11 @@ export interface NodeStatusInfo {
   // place. Null until the refresher has completed a tick.
   archive_service_message: string | null;
   archive_service_needs_attention: boolean;
+  /** A longer chain this node cannot obtain blocks for; null when healthy or
+   *  not yet measured. `kind` is longer_branch | headers_ahead. The sentence
+   *  is rendered in Rust (fork_message), like archive_service_message. */
+  fork: { kind: string; since_secs?: number } | null;
+  fork_message: string | null;
   node_nickname: string;
   broadcast_nickname: string | null;
   subversion: string | null;
@@ -468,6 +473,7 @@ function renderStatus(status: NodeStatusInfo) {
   const errCard = $("status-error");
 
   reflectPeerNames(status);
+  reflectFork(status);
 
   const mode = visualMode(p, status.rc_stalled);
   orb.className = `status-orb is-${mode}`;
@@ -871,6 +877,25 @@ function reflectArchiveService(status: NodeStatusInfo): void {
   }
   el.textContent = status.archive_service_message;
   el.classList.toggle("needs-attention", status.archive_service_needs_attention);
+}
+
+/**
+ * A longer chain exists that this node cannot obtain blocks for. Shown in
+ * amber beside the height and never guessed: the sentence is btx_core::fork's,
+ * the facts are btxd's own getchaintips. Hidden the moment the verdict
+ * clears, so a stale alarm never outlives the condition, and hidden on any
+ * phase that is not running: a stopped node has no view of the chain to be
+ * behind with.
+ */
+function reflectFork(status: NodeStatusInfo): void {
+  const card = $("fork-card");
+  const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
+  if (!running || !status.fork_message) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  $("fork-msg").textContent = status.fork_message;
 }
 
 function reflectKeeperRow(status: NodeStatusInfo) {

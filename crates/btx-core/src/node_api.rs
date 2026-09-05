@@ -851,6 +851,15 @@ pub async fn export_wallet_bundle(
     rpc.call("exportwalletbundle", json!([bundle_path])).await
 }
 
+/// `getchaintips`: every branch the node knows headers for, with its status.
+/// Feeds `crate::fork`. Measured on the release box 2026-09-05 (btx-cli, a
+/// block index of 210k+ entries): 30–40 ms, so the refresher reads it every
+/// tenth tick rather than every 3-second one.
+pub async fn get_chain_tips(rpc: &dyn Rpc) -> AppResult<Vec<crate::fork::ChainTip>> {
+    let v = rpc.call("getchaintips", json!([])).await?;
+    serde_json::from_value(v).map_err(|e| crate::error::AppError::Decode(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

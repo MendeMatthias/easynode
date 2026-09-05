@@ -33,6 +33,23 @@
 #      archival AND current (docs/archival-capacity.md). The fix is a peer, not
 #      a restart, so this dials one and never bounces the node.
 #
+# ── WHAT IT ALARMS ON, SINCE 2026-09-05 ─────────────────────────────────────
+#
+#   4. A FORK. On 2026-09-05 this script wrote `behind` climbing from 2 to 302
+#      over four hours, state `ok` on every row, while a release was cut from
+#      the same box (docs/incident-2026-09-05-fork.md). A log nobody reads is
+#      not an alarm. So the state column now says FORK, and one line goes to
+#      stderr, when either holds:
+#        - a headers-only branch in `getchaintips` is more than FORK_LEAD (6)
+#          blocks longer than the active chain since their common ancestor
+#          (the same rule crates/btx-core/src/fork.rs applies in the app), or
+#        - headers are more than FORK_BEHIND (20) ahead of blocks for
+#          FORK_ROWS (5) consecutive samples, ten minutes at the default
+#          interval.
+#      Nothing is recovered: which chain is right is not this script's call.
+#      scripts/observer-ok.sh reads the state column, and the release scripts
+#      refuse to run on anything but a fresh `ok`.
+#
 # ⚠ IT NEVER KILLS A LIVE btxd. Every recovery path above is gated on the node
 # being absent or provably stuck; none of them stops a node that is working.
 #
@@ -47,6 +64,9 @@
 #                  script REPORTS the outage and does not try to fix it
 #   BTX_ARCHIVE_PEER  archival peer to dial on a stall (host, no port)
 #   BTX_INTERVAL   seconds between samples   (default: 120)
+#   BTX_FORK_LEAD    blocks a headers-only branch must lead ours by (default 6)
+#   BTX_FORK_BEHIND  headers-minus-blocks that starts the clock (default 20)
+#   BTX_FORK_ROWS    consecutive samples over it that mean FORK (default 5)
 set -uo pipefail
 
 CLI="${BTX_CLI:-$HOME/.local/btx/v0.34.5/linux-x86_64/bin/btx-cli}"
@@ -58,6 +78,9 @@ INTERVAL="${BTX_INTERVAL:-120}"
 ARCHIVE_PEER="${BTX_ARCHIVE_PEER:-134.199.150.193}"
 ARCHIVE_PORT="${BTX_ARCHIVE_PORT:-19335}"
 START_CMD="${BTX_START_CMD:-}"
+FORK_LEAD="${BTX_FORK_LEAD:-6}"
+FORK_BEHIND="${BTX_FORK_BEHIND:-20}"
+FORK_ROWS="${BTX_FORK_ROWS:-5}"
 
 TSV="${BTX_OBSERVER_TSV:-$HOME/node-observer.tsv}"
 LOG="${BTX_OBSERVER_LOG:-$HOME/node-observer.log}"
@@ -90,6 +113,35 @@ print(n)
 ' "${1:-0}" 2>/dev/null || echo 0
 }
 
+# The largest lead of a headers-only branch over the active chain since their
+# common ancestor, or 0. Same arithmetic as crates/btx-core/src/fork.rs: a
+# branch whose fork point is at or past our tip merely extends our chain and is
+# lag, not a fork; a branch shorter than ours since the split is a stale
+# sibling. Only `headers-only` and `valid-headers` count: those are the tips
+# whose bodies this node has never had.
+fork_lead() {
+  "$CLI" "${A[@]}" getchaintips 2>/dev/null | python3 -c '
+import sys, json
+try:
+    tips = json.load(sys.stdin)
+except Exception:
+    print(0); raise SystemExit
+active = [t for t in tips if t.get("status") == "active"]
+if not active:
+    print(0); raise SystemExit
+active = int(active[0]["height"])
+best = 0
+for t in tips:
+    if t.get("status") not in ("headers-only", "valid-headers"):
+        continue
+    fork = int(t["height"]) - int(t["branchlen"])
+    if fork >= active:
+        continue
+    best = max(best, int(t["branchlen"]) - (active - fork))
+print(best)
+' 2>/dev/null || echo 0
+}
+
 json_int() { python3 -c '
 import sys, json
 try:
@@ -98,7 +150,7 @@ except Exception:
     print("")
 ' "$1" 2>/dev/null; }
 
-last_blocks=""; stuck=0
+last_blocks=""; stuck=0; behind_rows=0; fork_said=0
 while true; do
   now="$(date -u +%FT%TZ)"; state=ok
 
@@ -148,6 +200,7 @@ while true; do
   att="$("$CLI" "${A[@]}" getmatmultrustedstatus 2>/dev/null | json_int stored_attestations)"
 
   if [ "$blocks" = "$last_blocks" ]; then stuck=$((stuck+1)); else stuck=0; fi
+  if [ "$behind" -gt "$FORK_BEHIND" ]; then behind_rows=$((behind_rows+1)); else behind_rows=0; fi
   last_blocks="$blocks"
 
   # Ten samples with no new block AND measurably behind. At the default
@@ -166,6 +219,24 @@ while true; do
       say "STALL at $blocks with ${arch} archival peer(s) present; not a peer problem"
     fi
     stuck=0
+  fi
+
+  # ── FORK (easynode#37) ─────────────────────────────────────────────────────
+  # Overrides ok and the stall states: a stall on a fork is a fork first. Said
+  # on stderr when it starts and every 15 samples (30 minutes) while it holds,
+  # so a long one is not a single line lost in scrollback.
+  lead="$(fork_lead)"
+  if [ "${lead:-0}" -gt "$FORK_LEAD" ] || [ "$behind_rows" -ge "$FORK_ROWS" ]; then
+    state=FORK
+    if [ $((fork_said % 15)) -eq 0 ]; then
+      msg="FORK: blocks $blocks, headers $headers, behind $behind for $behind_rows sample(s); longest branch this node cannot obtain leads ours by $lead"
+      say "$msg"
+      printf 'node-observer: %s\n' "$msg" >&2
+    fi
+    fork_said=$((fork_said+1))
+  else
+    [ "$fork_said" -gt 0 ] && say "fork condition cleared at blocks $blocks, headers $headers"
+    fork_said=0
   fi
 
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \

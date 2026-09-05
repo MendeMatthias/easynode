@@ -93,6 +93,12 @@ KEY="${EASYBTX_UPDATER_KEY:-$HOME/.tauri/easybtx.key}"
 PUBKEY="RWSiwrxz2pJDXR4AchfYB5DQzvD8VbIE3D87Ft4D/km76xZIikK6XE9y"
 HERE="$(cd "$(dirname "$0")" && pwd)"          # apps/node/scripts
 REPO_ROOT="$(cd "$HERE/../../.." && pwd)"       # repo root
+
+# ── The box's own node must be on the chain it claims (easynode#37) ─────────
+# A feed signed here on 2026-09-05 went out while this box's validator had been
+# 300 blocks behind a longer chain for hours. The observer knew; nothing read
+# it. Now nothing is signed unless its last row is a fresh `ok`.
+"$REPO_ROOT/scripts/observer-ok.sh" || exit 1
 # Where the finished feed lands.
 #
 # ⚠ This used to be "$REPO_ROOT/site/public/updater", which is a path in the

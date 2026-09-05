@@ -474,6 +474,29 @@ Also expect:
 - `-matmulvalidation=relay` is new: ADDR-only discovery, no attestation serving.
   A candidate Keeper profile for Macs that cannot validate.
 
+## The box's own node must be on the chain it claims
+
+Added 2026-09-05, the day 0.6.18 was cut from a validator that had been
+150–300 blocks behind a longer chain for hours while `~/node-observer.tsv` said
+so every two minutes (`docs/incident-2026-09-05-fork.md`, easynode#35). Before
+anything is signed, published or flipped live:
+
+1. `btx-cli getchaintips` and `getblockchaininfo` on the box's node, read within
+   the last 10 minutes. Any `headers-only` branch longer than the active chain
+   since their common ancestor, or `headers − blocks` > 20 for over 10 minutes,
+   blocks the release and blocks any public sentence about chain position.
+2. `scripts/observer-ok.sh` must exit 0: the observer's last row is younger
+   than five minutes and its state is `ok` (`node-observer.sh` writes `FORK`
+   for the two conditions above). `build-node-feed.sh` and
+   `publish-node-release.sh` run it first and refuse otherwise, in the dry run
+   too. A manual flip (`gh_release.py publish …`) is not covered by a script,
+   so run `scripts/observer-ok.sh` by hand immediately before it.
+   `OBSERVER_OVERRIDE=1` skips the gate and says so loudly; it is for the day
+   the observer is what is broken, never the day the node is.
+3. Two independent sources for "at the tip": the node's own `getchaintips`
+   plus one node known to be on the live chain, never an explorer alone, and
+   never btxscan.io alone.
+
 ## Steps
 
 1. **Bump the version** in `apps/node/package.json`, `package-lock.json`,

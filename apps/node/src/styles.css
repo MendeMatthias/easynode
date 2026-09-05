@@ -535,6 +535,9 @@ body {
 }
 .error-card p { color: var(--color-danger); }
 
+.fork-card { border-color: rgba(251, 191, 36, 0.5); font-size: 13px; }
+.fork-card p { color: var(--color-amber); margin: 0; line-height: 1.45; }
+
 /* ── Settings overlay ─────────────────────────────────────────────────────── */
 .overlay {
   position: fixed;
