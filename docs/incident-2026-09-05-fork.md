@@ -113,7 +113,24 @@ hdr=209476 blk=209476 /BTX:0.34.4/ 195.137.245.82
 `https://api.btxscan.io/blocks/tip/height` → **210865** (the explorer is on our
 branch). `esplora.btxbyronbay.com` answers `not found`.
 
-## Interpretation (not fact)
+## 19:30Z: the owner settles it
+
+**Owner's statement, 2026-09-05 ~19:30Z: btxscan.io is not on top any more and
+is being served the wrong chain.** With that, reading 1 below is the working
+truth: the 210865 branch that this node, the other `/BTX:0.34.6/` node, the
+three official seeds and btxscan.io follow is a **minority fork from 210496**,
+and the live chain is the 211167 branch this side holds only headers for.
+Consequences: any 0.6.18 node peered like this one does not follow the live
+chain; the site's "follows the live chain" is false until that is fixed;
+nothing read from btxscan.io is a source of truth until it is back on the live
+chain, and it is never again the only source. The plan is in the evening
+handoff (`HANDOFF-easynode-2026-09-05-evening.md`, "First tasks"): find the
+live chain's nodes, decide with the owner how this validator gets their blocks
+(`addnode`, possibly a restart; the datadir is otherwise untouchable), check
+what a fresh install peers with, add a fork detector to the app and an alarm to
+the observer, then correct the site.
+
+## Interpretation, as written at 18:55Z before the owner's statement
 
 Two chains extend from 210496. Every peer this node can reach, and the
 explorer, follow the shorter one; the longer one (~65 % of blocks since the
