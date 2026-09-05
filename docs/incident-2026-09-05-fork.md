@@ -1,5 +1,7 @@
 # 2026-09-05: a longer header chain from height 210496 that no peer serves
 
+**Tracking issue: [#35](https://github.com/MendeMatthias/easynode/issues/35)** — status, checklist, and where to help. Sub-issues: #36 fork detector in the app, #37 observer alarm + release-script guard, #38 peering / seed list.
+
 Raw facts first, read-only, from the project's Linux validator on the release
 box (`~/.easybtx`, btxd 0.34.6 at `9eb4e005`, hand-launched). Every number here
 was read from that node between 18:41Z and 19:05Z on 2026-09-05; nothing on the

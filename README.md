@@ -1,5 +1,13 @@
 # easyNode
 
+> **Status, 2026-09-05.** Our nodes — the project's validator, the official
+> seeds and the explorer we linked — are on a **minority fork** since height
+> 210496, and 0.6.18 shipped that morning saying "follows the live chain". What
+> happened, what "fixed" means, and where you can help are in
+> [issue #35](https://github.com/MendeMatthias/easynode/issues/35); the raw facts
+> are in [`docs/incident-2026-09-05-fork.md`](docs/incident-2026-09-05-fork.md).
+> This note comes down when #35 closes.
+
 **Run a real BTX node from home, on the machine you already own.**
 
 easyNode is a desktop app that installs, configures and supervises `btxd`, the

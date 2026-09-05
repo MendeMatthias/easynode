@@ -36,4 +36,4 @@ always written out in the comment.
 
 If a specific measurement matters to a change you are making, open an issue and
 ask. We would rather publish the relevant note than have you guess.
-- **[incident-2026-09-05-fork.md](incident-2026-09-05-fork.md)**: the longer header chain from height 210496 that no peer served on release day, raw facts from the validator and what settles it
+- **[incident-2026-09-05-fork.md](incident-2026-09-05-fork.md)**: the longer header chain from height 210496 that no peer served on release day, raw facts from the validator and what settles it (tracking: issue #35)
