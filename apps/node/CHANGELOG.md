@@ -8,8 +8,25 @@ root).
 
 ## [Unreleased]
 
-Nothing here has shipped to a user yet. The app version is still 0.6.17 and the
-updater feed still points at it; this section is what a 0.6.18 would carry.
+Nothing yet.
+
+## [0.6.18] - 2026-09-05 · linux
+
+**The node engine can keep up again.** Every 0.6.17 install that was not hand-
+patched has been running an engine (v0.34.5) that connects 0.68 blocks a minute
+against a chain producing 0.95: it falls behind for good, downloads blocks the
+whole time, and reports itself healthy. Measured on one machine, same data,
+only the binary changed, the 0.34.6 engine does 3.80. 0.6.18 bundles it.
+
+Being honest about what that is: upstream has not tagged 0.34.6. This is the
+`release/0.34.6` branch at commit `9eb4e005`, built from a pristine tree on
+Ubuntu 22.04, the same build that has held the tip on the project's own
+validator since 2 September and that at least one other operator on the network
+runs. Both engine gates verify that exact commit. If upstream later tags 0.34.6
+at a different commit, the pin is re-checked rather than renamed.
+
+Linux only in this release; the Mac and Windows builds follow and their update
+feeds are untouched until they do.
 
 **The install now asks for enough disk to finish.** The free-space check was
 set at 120 GiB from a chain that measured about 105 GB in July. The chain has

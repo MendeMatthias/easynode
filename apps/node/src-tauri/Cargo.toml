@@ -1,6 +1,6 @@
 [package]
 name = "easybtx-node"
-version = "0.6.17"
+version = "0.6.18"
 description = "easyBTX Node — run a BTX full node in one click and support the network"
 authors = ["Matthias Mende"]
 license = "MIT"

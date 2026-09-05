@@ -90,6 +90,15 @@ COMMANDS_RS="$ROOT/apps/node/src-tauri/src/commands.rs"
 CHAINPARAMS="src/kernel/chainparams.cpp"
 BTX_CLONE="${BTX_CLONE:-/Users/bonuz/repos/btx}"
 RAW_BASE="https://raw.githubusercontent.com/btxchain/btx"
+
+# An UNTAGGED pin. When commands.rs also declares NODE_RELEASE_COMMIT, the tag
+# string may not exist upstream yet (0.34.6 shipped from release/0.34.6 before
+# upstream tagged it). The guard then fetches source at that SHA instead, so an
+# untagged pin gets exactly the check a tagged one gets. It never substitutes a
+# branch name: a branch moves, a SHA does not. Empty when the tag is real.
+pin_commit() {
+  sed -n 's/^pub const NODE_RELEASE_COMMIT: &str = "\([0-9a-f]\{40\}\)";.*$/\1/p' "$1" | head -1
+}
 SENTINEL='std::numeric_limits<int32_t>::max()'
 # One assignment per network: mainnet, testnet, testnet4, signet, regtest.
 # Measured as 5 on v0.33.4, v0.33.4.1, v0.33.4.2, v0.34, v0.34.1, v0.34.2,
@@ -138,15 +147,28 @@ trap 'rm -rf "$WORK"' EXIT
 FILE="$WORK/chainparams.cpp"
 SOURCE=""
 
+# The ref we fetch. Normally the tag itself; for an untagged pin (see
+# pin_commit above) the commit the tag name stands for. An explicit override
+# argument is always taken literally, so `check-engine-tag.sh v0.34.7` still
+# means "that upstream tag" and nothing else.
+REF="$TAG"
+if [ -z "$OVERRIDE_TAG" ]; then
+  PIN_COMMIT="$(pin_commit "$COMMANDS_RS")"
+  if [ -n "$PIN_COMMIT" ]; then
+    REF="$PIN_COMMIT"
+    echo "untagged pin: verifying $TAG at commit $REF"
+  fi
+fi
+
 if [ -d "$BTX_CLONE/.git" ] \
-   && git -C "$BTX_CLONE" rev-parse --verify --quiet "$TAG^{commit}" >/dev/null 2>&1 \
-   && git -C "$BTX_CLONE" show "$TAG:$CHAINPARAMS" > "$FILE" 2>/dev/null; then
+   && git -C "$BTX_CLONE" rev-parse --verify --quiet "$REF^{commit}" >/dev/null 2>&1 \
+   && git -C "$BTX_CLONE" show "$REF:$CHAINPARAMS" > "$FILE" 2>/dev/null; then
   SOURCE="local clone $BTX_CLONE"
 else
-  # No clone, or the tag is not in it (a CI runner, or a tag fetched after the
+  # No clone, or the ref is not in it (a CI runner, or a tag fetched after the
   # clone was last updated). curl --max-time, NOT timeout: timeout does not
   # exist on macOS and this script runs on both.
-  URL="$RAW_BASE/$TAG/$CHAINPARAMS"
+  URL="$RAW_BASE/$REF/$CHAINPARAMS"
   if curl -fsSL --max-time 60 "$URL" -o "$FILE" 2>/dev/null; then
     SOURCE="$URL"
   else
