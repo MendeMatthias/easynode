@@ -378,3 +378,55 @@ A live smoke run at 20:28Z against seven nodes: chain A at 211260, most work,
 one node; chain B at 210880, forked at 210496, five nodes; split. The page
 shows both, names nodes by the nickname they broadcast, and never says which
 chain is right.
+
+### Correction at 20:35Z: who actually served the chain, and why it could not before
+
+The manual peer that connected at 20:23:08Z and served every body (peer 373)
+is **not** 13.140.141.180. `getpeerinfo` at 20:35:13Z:
+
+```
+89.85.40.184:19335  /BTX:0.34.6/  manual  NETWORK, MATMUL_CONSENSUS
+                    synced_headers 211262  synced_blocks 210730  inflight 4  122.7 MB received
+```
+
+That is one of the SHIPPED seeds (`BTX_BOOTSTRAP_PEERS`), a full archive on
+the live chain, running the same engine as this box. It did not answer the
+19:49Z probe, and `13.140.141.180` (added 20:09Z) has still not been dialed:
+the `addnode` list carries every conf entry twice (the app passes the same
+peers on the command line), so removing an entry once leaves a twin that
+reconnects, and the eight manual slots stay full. The seed-list comment for
+89.85.40.184 in easynode#40 ("no answer, and on the validator's banlist") is
+right about the probe and wrong about what the node is; the next change to
+`node.rs` says so.
+
+**Why this box could not reach the live chain all afternoon, in full.** The
+engine's body gate (above) is half of it. The other half is that this node
+**banned the live-chain peers itself**. `debug.log`, the only five lines of
+their kind today:
+
+```
+16:20:33Z Aggressive P2P is penalized: aggressive getmmattest, disconnecting peer=304
+16:23:52Z Aggressive P2P is penalized: aggressive getmmattest, disconnecting peer=322
+16:33:33Z Aggressive P2P is penalized: aggressive getmmattest, disconnecting peer=328
+17:45:35Z Aggressive P2P is penalized: aggressive getmmattest, disconnecting peer=343
+```
+
+`banlist.json` gained `108.165.189.109` at 16:20:33Z, `89.85.40.184` at
+16:23:52Z, `185.204.52.141` at 16:33:33Z and `176.112.239.19` at 17:45:35Z,
+each for 24 hours. Peer 322 was the outbound full-relay peer that advertised
+211068 at 16:02Z; peer 343 advertised 211127 at 17:25Z. Between 16:15Z and
+16:23Z peer 322 sent 14 `getmmattest` that this node answered
+`no_such_block` and 6 answered `not_canonical`: a consensus node on the live
+chain asking the only question it can ask, about blocks this node did not
+have. `AggressiveGetMmAttestShouldBan` counts every ignored request
+(btxchain/btx#142 reports exactly this) and `BanHammeringPeer` banned it. So a
+live-chain node that connected to us was first refused as a body source
+(never served us, not manual) and then banned for asking about its own
+chain. Every automatic reconnection to it was then refused for a day; only
+`addnode`, which bypasses the ban for outbound dials, got through. The four
+bans were lifted at 20:37Z (`setban <ip> remove`).
+
+Consequence for easynode#38: the shipped seed list DID contain a live-chain
+node; the engine's own peer policy made it unreachable. A fresh install with
+the same engine would do the same. That is an engine question for upstream
+(#142, and the body gate) before it is a seed-list question.
