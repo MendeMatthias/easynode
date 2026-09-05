@@ -142,6 +142,15 @@ this node still holds:
 `scripts/measure-chain-size.py --validate` runs both halves in minutes. Do that
 rather than quoting this table in six months.
 
+One more thing the validator found once it was made able to fail (2026-09-05):
+at height 187661 this node holds a 378-byte block and the explorer serves a
+410-byte one. That is the orphan `verify-esplora.sh` already records Byron Bay
+keeping after a reorg, confirmed here by a second, independent tool. It cannot
+move a 124 GiB total by more than a few hundred bytes, and every height above
+190000 agreed exactly, so the measurement stands. But it is why `--validate` now
+refuses that source outright rather than averaging over it: a mirror wrong at
+one height is not one this tool will vouch for.
+
 ### What the datadir costs on top of the blocks
 
 Measured on this box:

@@ -171,7 +171,14 @@ def main():
         heights = sorted({hi - k * (span // 4) for k in range(4)} | {h for h in (187661,) if lo <= h <= hi})
         n = validate(args.esplora, args.cli, args.datadir, heights)
         if n < 0:
-            print("explorer disagreed with our node; not sampling it", file=sys.stderr)
+            print("explorer disagreed with our node at a height listed above; not sampling it.",
+                  file=sys.stderr)
+            print("  A different hash at one height means its index kept an orphaned block "
+                  "(esplora.btxbyronbay.com has done so at 187661 since a reorg; measured "
+                  "2026-09-05). One 400-byte block cannot move a 124 GiB total, but a source "
+                  "that is wrong at one height may be wrong at others, so this tool will not "
+                  "vouch for it. Pass --esplora <other source>, or measure without --validate "
+                  "and say so where the number is quoted.", file=sys.stderr)
             return 1
         if n < MIN_VALIDATED:
             print("validated only %d height(s); need %d to trust the explorer. Is the node pruned "
