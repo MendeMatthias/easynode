@@ -111,24 +111,19 @@ rpcallowip=127.0.0.1
 # turns every hard restart into a multi-hour re-sync. Do not re-enable pruning.
 prune=0
 retainshieldedcommitmentindex=1
-# Deep-reorg protection. btxd ships this DISABLED in every built-in profile, so
-# without these lines a node follows whichever branch carries the most chainwork.
-# During the 2026-08-11 split that was the WRONG one: a competing branch forked
-# at 185544 and ran longer in headers (186234 against the canonical 186011), so
-# following chainwork alone meant a ~464-block reorg onto a chain whose blocks
-# the rest of the network does not count.
-#
-# Parking at depth 6 makes the node refuse to auto-switch that far and hold its
-# tip instead. That is the safe direction: a node that stops is recoverable and
-# visible, a node that silently reorganises onto a dead branch looks perfectly
-# healthy while being useless. Depths follow the BTX team's own guidance issued
-# during the incident.
-#
-# ⚠ This protects a node going FORWARD. It does NOT rescue one already sunk on a
-# stale branch — chainwork keeps those locked, and recovery needs
-# `invalidateblock` plus blocks from a known-good peer.
-parkdeepreorg=1
-maxreorgdepthpark=6
+# Deep-reorg parking, OFF since easyNode 0.6.19. From 2026-08-12 to 0.6.18 these
+# lines read parkdeepreorg=1 / maxreorgdepthpark=6: after the 2026-08-11 split a
+# node that refused to auto-switch more than 6 blocks stayed off a dead branch.
+# On 2026-09-05 the same setting did the opposite. The network split at 210496,
+# every node we could reach followed the minority branch, and a node parked at
+# depth 6 could never rejoin the live chain 383 blocks away without an operator
+# typing invalidateblock. The app now passes -parkdeepreorg=0 explicitly (the
+# command line outranks this file and the datadir's btx_rw.conf), so the node
+# follows the chain with the most work, which is what the rest of the network
+# counts, and the fork detector in the app says out loud when a longer chain
+# exists that the node cannot obtain. The warn depth stays: a deep reorg is
+# still worth a log line. docs/incident-2026-09-05-fork.md has both days.
+parkdeepreorg=0
 maxreorgdepthwarn=3
 ";
 
@@ -164,9 +159,9 @@ prune=10000
 retainshieldedcommitmentindex=1
 # Serve signed confirmations — the point of the profile.
 matmulattestationserve=1
-# Deep-reorg protection: same posture as the full-node preset (2026-08-11 split).
-parkdeepreorg=1
-maxreorgdepthpark=6
+# Deep-reorg parking OFF, same posture and same reason as the full-node preset
+# (the 2026-09-05 split; see NODE_FASTSTART_CONF).
+parkdeepreorg=0
 maxreorgdepthwarn=3
 ";
 
@@ -1742,8 +1737,12 @@ mod keeper_profile_tests {
         assert!(NODE_KEEPER_CONF.contains("prune=10000"));
         assert!(NODE_KEEPER_CONF.contains("matmulattestationserve=1"));
         assert!(
-            NODE_KEEPER_CONF.contains("parkdeepreorg=1"),
-            "reorg posture kept"
+            NODE_KEEPER_CONF.contains("parkdeepreorg=0"),
+            "reorg posture: follow the most-work chain (0.6.19)"
+        );
+        assert!(
+            !NODE_KEEPER_CONF.contains("maxreorgdepthpark"),
+            "no park depth: parking is off, not merely deep"
         );
         assert!(
             NODE_KEEPER_CONF.contains("rpcbind=127.0.0.1"),

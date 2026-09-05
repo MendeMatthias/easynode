@@ -357,10 +357,11 @@ pub fn set_managed_whitelist_block(conf_path: &Path, ips: &[String]) -> AppResul
 ///     That is measured behaviour on a live validator, not a hypothetical, and
 ///     an unexpectedly pruned node cannot rebuild shielded state after an
 ///     unclean shutdown — the bricked-datadir scar `prune=0` exists for.
-///   * `parkdeepreorg`, `maxreorgdepthpark`, `maxreorgdepthwarn` — btxd ships
-///     these DISABLED in every built-in profile, so without them the node
-///     follows whichever branch carries the most work, on a chain measured at
-///     roughly one sibling every 25 blocks.
+///   * `parkdeepreorg`, `maxreorgdepthpark`, `maxreorgdepthwarn` — since 0.6.19
+///     the canonical confs say parkdeepreorg=0 (the node follows the most-work
+///     chain, see the flag in [`crate::node`]); the keys stay managed so an old
+///     conf that lost them is repaired to the current posture, and a conf that
+///     still says parkdeepreorg=1 is overruled by the command line anyway.
 ///   * `retainshieldedcommitmentindex` — the index the shielded rebuild needs.
 ///
 /// Deliberately NOT everything in the canonical conf: `addnode` lines and the

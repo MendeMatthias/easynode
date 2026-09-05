@@ -72,9 +72,10 @@ impl ChainTip {
 }
 
 /// Blocks a headers-only branch must lead our chain by, counted from their
-/// common ancestor, before it is called a longer chain. Six is the engine's
-/// own emergency park depth (`maxreorgdepthpark=6` in the shipped conf): the
-/// depth at which btxd itself stops treating a rewrite as routine.
+/// common ancestor, before it is called a longer chain. Six is the depth at
+/// which btxd's emergency profile used to park a rewrite (the shipped conf
+/// carried `maxreorgdepthpark=6` until 0.6.19): the depth at which the engine
+/// itself stops treating a rewrite as routine.
 pub const FORK_LEAD_ALARM: u64 = 6;
 
 /// `headers - blocks` above which the gap is worth timing.
