@@ -262,6 +262,19 @@ pub fn build_node_command(
     // lineage (Knots v29.2 fork) understands -v2transport, and a v1-only peer
     // still gets a v1 connection after the reconnect downgrade.
     args.push("-v2transport=1".to_string());
+    // Follow the chain with the most work. EXPLICIT, on the command line,
+    // because the datadir's btx_rw.conf and any conf written before 0.6.19
+    // still carry parkdeepreorg=1 / maxreorgdepthpark=6, and a read-write
+    // setting outranks a conf file while the command line outranks both.
+    // Why it changed: on 2026-09-05 the network split at 210496, every node
+    // this app could reach followed the minority branch, and a node parked at
+    // depth 6 could not rejoin the live chain 383 blocks away without an
+    // operator running invalidateblock. Parking was added after 2026-08-11 to
+    // keep nodes OFF a dead branch; on 2026-09-05 it would have kept them ON
+    // one. Between those two days the honest posture is the engine's own
+    // default: the most-work chain, with the fork detector (btx_core::fork)
+    // saying out loud when a longer chain exists that this node cannot get.
+    args.push("-parkdeepreorg=0".to_string());
     // The prune posture must be EXPLICIT, for the same reason
     // -matmulvalidation is below: btxd loads the datadir's btx_rw.conf on every
     // start regardless of -conf, and a READ-WRITE setting outranks a config

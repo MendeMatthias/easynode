@@ -10,6 +10,19 @@ root).
 
 ## [0.6.19] - 2026-09-06 · linux
 
+**The node follows the chain with the most work again.** Since 0.6.7 the
+shipped conf parked any reorganisation deeper than six blocks
+(`parkdeepreorg=1`, `maxreorgdepthpark=6`), added after the 11 August split
+kept nodes off a dead branch. On 5 September the same setting would have done
+the opposite: with every reachable node on the minority branch, a parked node
+could never rejoin the live chain 383 blocks away without an operator running
+`invalidateblock`. The app now passes `-parkdeepreorg=0` on the command line,
+which outranks every conf and the datadir's remembered settings, so an updated
+node that finds a live-chain peer reorganises onto it by itself. The warn
+depth stays. The fork detector below is what tells you when a longer chain
+exists that your node cannot get, which is the honest replacement for a node
+that silently stops.
+
 **What the split taught about the engine, recorded so the seed list is not
 blamed for it.** The shipped seed `89.85.40.184` was on the live chain all
 along and served the validator's entire 383-block reorganisation once it
