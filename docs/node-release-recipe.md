@@ -160,8 +160,10 @@ above ("until a tag exists that upstream itself calls clean"), and it was
 broken on purpose, by the owner, on a measurement rather than an argument:
 on one box, same datadir, same arguments, only the binary changed, v0.34.5
 connected 0.68 blocks/min against a chain producing 0.95 and fell behind for
-good while reporting itself healthy; this build did 3.80, has held the tip on
-the project's validator since 2026-09-02, and at least one other operator
+good while reporting itself healthy; this build did 3.80, held the tip on the
+project's validator from 2026-09-02 until the 2026-09-05 header-chain split at
+height 210496 (`docs/incident-2026-09-05-fork.md`; no reachable peer serves the
+longer chain's blocks, so that is not an engine finding), and at least one other operator
 (`109.199.124.187`, `/BTX:0.34.6/`) runs it. A release on v0.34.5 would have
 shipped the fleet's biggest problem to every fresh install. The second half of
 the rule held: **both guards passed on the box cutting the release**, against
@@ -807,7 +809,9 @@ glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
 4. Gates, always on the EXTRACTED bundles, never the staging tree:
    `.btxd-version` reads the pinned tag name, the bundled btxd and btx-cli execute under
    `env -u LD_LIBRARY_PATH PATH=/usr/bin:/bin`, ldd resolves inside the
-   tree, cuobjdump lists all five architectures, and both engine guards exit
+   tree, cuobjdump lists every pinned architecture (sm_75/86/89/120, plus
+   upstream's own sm_100; the vendored cuBLASLt contributes more, nine in all
+   on 0.6.18), and both engine guards exit
    0 with their OK text actually read.
 
 5. The test that catches what clean rooms cannot: upgrade a REAL datadir

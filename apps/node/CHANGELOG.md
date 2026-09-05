@@ -25,13 +25,18 @@ only the binary changed, the 0.34.6 engine does 3.80. 0.6.18 bundles it.
 
 Being honest about what that is: upstream has not tagged 0.34.6. This is the
 `release/0.34.6` branch at commit `9eb4e005`, built from a pristine tree on
-Ubuntu 22.04, the same build that has held the tip on the project's own
-validator since 2 September and that at least one other operator on the network
-runs. Both engine gates verify that exact commit. If upstream later tags 0.34.6
+Ubuntu 22.04, the same build that has run on the project's own validator since
+2 September (it held the tip until 5 September, when a longer header chain
+forking at height 210,496 appeared that no reachable peer serves blocks for;
+`docs/incident-2026-09-05-fork.md` has the facts, and which chain prevails was
+not settled when this shipped) and that at least one other operator on the
+network runs. Both engine gates verify that exact commit. If upstream later tags 0.34.6
 at a different commit, the pin is re-checked rather than renamed.
 
-Linux only in this release; the Mac and Windows builds follow and their update
-feeds are untouched until they do.
+Linux only in this release. The Mac and Windows builds follow; until they do
+the update feed carries no key for those platforms, so a Mac or Windows copy is
+offered nothing rather than something wrong (a Mac still on 0.6.12 takes 0.6.17
+from the download page by hand meanwhile).
 
 **The install now asks for enough disk to finish.** The free-space check was
 set at 120 GiB from a chain that measured about 105 GB in July. The chain has
@@ -55,8 +60,8 @@ height 185,000, and since 2026-08-10 the measured average is 8.4 kB a block —
 about 8 MB a day, where the old comments claimed 1 GB a day.
 
 **Your node can have a name.** Settings has a nickname field. Set one and the
-nodes you connect to see `/BTX:0.34.5(yourname)/` instead of an anonymous
-`/BTX:0.34.5/` — the same idea as worker names in the miner, and the first
+nodes you connect to see `/BTX:0.34.6(yourname)/` instead of an anonymous
+`/BTX:0.34.6/` — the same idea as worker names in the miner, and the first
 actual mechanism behind the recognition this project offers instead of payment.
 The status screen lists the names of peers you are connected to, when they have
 them; today nobody on the network does, so easyNode's will be the first.
@@ -169,11 +174,11 @@ tip, verified before it was added); `scripts/node-observer.sh` publishes the
 unattended recovery that previously existed on one machine; and the two Tauri
 plugins moved forward with their JS and Rust halves kept in lockstep.
 
-**Known and unchanged:** the pinned engine is still v0.34.5, which cannot keep up
-with the chain — measured 0.68 blocks/min against a 0.95 blocks/min chain, where
-0.34.6 does 3.80. The pin does not move because upstream has not tagged 0.34.6;
-`release/0.34.6` exists only as a branch. The reasoning sits next to
-`NODE_RELEASE_TAG` for whoever moves it.
+**Known:** because upstream has no 0.34.6 tag there is no upstream tarball, so
+the download-based contributor scripts (`stage-node-pkg.sh`,
+`stage-node-pkg-linux.sh`) refuse to stage this engine; contributors build it
+from source at the pinned commit (README, "Building it yourself"). The pin's
+reasoning sits next to `NODE_RELEASE_TAG` for whoever moves it next.
 
 ## [0.6.17] - 2026-09-01 · mac AND linux LIVE
 

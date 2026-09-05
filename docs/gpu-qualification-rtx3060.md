@@ -33,7 +33,9 @@ shipped v0.34.5 binaries. The install directory keeps the v0.34.5 name because
 the app resolves its engine from `NODE_RELEASE_TAG` and re-provisions its
 bundled package if that name changes — so **the app UI displays v0.34.5 while
 running v0.34.6**. Trust `getnetworkinfo.subversion`, never the UI or the
-directory name.
+directory name. (That describes the hand-patched validator on the release box.
+Since 0.6.18 the shipped app pins 0.34.6 itself, installs it into a `v0.34.6`
+directory, and shows v0.34.6.)
 
 ## Chain position
 

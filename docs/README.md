@@ -15,7 +15,7 @@
 - **[esplora-mode.md](esplora-mode.md)**: the opt-in Esplora API front, the
   route contract a wallet actually requires, and the gate that decides whether an
   endpoint may be advertised.
-- **[appimage-size.md](appimage-size.md)**: what the 445 MB Linux download is
+- **[appimage-size.md](appimage-size.md)**: what the ~466 MB (445 MiB) Linux download is
   made of, and why the per-architecture split that was planned does not pay.
 - **[gpu-qualification-rtx3060.md](gpu-qualification-rtx3060.md)**: a full
   transcript from an RTX 3060 validating and signing on mainnet, including the
@@ -36,3 +36,4 @@ always written out in the comment.
 
 If a specific measurement matters to a change you are making, open an issue and
 ask. We would rather publish the relevant note than have you guess.
+- **[incident-2026-09-05-fork.md](incident-2026-09-05-fork.md)**: the longer header chain from height 210496 that no peer served on release day, raw facts from the validator and what settles it

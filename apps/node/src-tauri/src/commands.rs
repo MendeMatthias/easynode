@@ -191,10 +191,14 @@ use crate::state::{
 // is NODE_RELEASE_COMMIT below. The reason to ship it anyway is measured, not
 // argued: on one box, same datadir, same arguments, only the binary changed,
 // v0.34.5 connected 0.68 blocks/min against a chain producing 0.95 and fell
-// behind for good while reporting itself healthy; this build did 3.80. It has
-// held the tip on the Linux validator since 2026-09-02 with dirty=0 and
-// execution policy ready=1 on sm_86, and at least one other operator on the
-// network runs the same build (109.199.124.187, /BTX:0.34.6/). A release on
+// behind for good while reporting itself healthy; this build did 3.80. It held
+// the tip on the Linux validator from 2026-09-02 until 2026-09-05, when a
+// longer header chain forking at height 210496 appeared that no connected peer
+// serves blocks for (docs/incident-2026-09-05-fork.md; the node is in
+// consensus mode and has nothing to validate, so this says nothing about the
+// engine), with dirty=0 and execution policy ready=1 on sm_86; at least one
+// other operator on the network runs the same build (109.199.124.187,
+// /BTX:0.34.6/). A release on
 // v0.34.5 would have put the biggest fleet-wide problem into every fresh
 // install with a fresh coat of paint on it.
 //

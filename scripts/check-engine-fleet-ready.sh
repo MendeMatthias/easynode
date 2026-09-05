@@ -173,16 +173,16 @@ if [ -n "$PIN_COMMIT" ] && [ "$TAG" = "$(sed -n 's/^pub const NODE_RELEASE_TAG: 
   echo "untagged pin: verifying $TAG at commit $REF"
 fi
 SRC_INIT="$(fetch_at_tag "$REF" "$INIT_CPP" "$INIT_FILE")" || die \
-  "could not read $INIT_CPP for tag $TAG" \
-  "Tried $BTX_CLONE and $RAW_BASE/$TAG/$INIT_CPP." \
+  "could not read $INIT_CPP for $TAG (ref $REF)" \
+  "Tried $BTX_CLONE and $RAW_BASE/$REF/$INIT_CPP." \
   "An unverifiable tag is not a safe tag."
-[ -s "$INIT_FILE" ] || die "fetched an empty $INIT_CPP for tag $TAG" "Source was: $SRC_INIT"
+[ -s "$INIT_FILE" ] || die "fetched an empty $INIT_CPP for $TAG (ref $REF)" "Source was: $SRC_INIT"
 
 MANIFEST_FILE="$WORK/manifest.data"
 SRC_MANIFEST="$(fetch_at_tag "$REF" "$MANIFEST" "$MANIFEST_FILE")" || die \
-  "could not read $MANIFEST for tag $TAG" \
-  "Tried $BTX_CLONE and $RAW_BASE/$TAG/$MANIFEST."
-[ -s "$MANIFEST_FILE" ] || die "fetched an empty golden manifest for tag $TAG"
+  "could not read $MANIFEST for $TAG (ref $REF)" \
+  "Tried $BTX_CLONE and $RAW_BASE/$REF/$MANIFEST."
+[ -s "$MANIFEST_FILE" ] || die "fetched an empty golden manifest for $TAG (ref $REF)"
 echo "source: $SRC_INIT"
 echo
 
