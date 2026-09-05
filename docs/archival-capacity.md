@@ -142,9 +142,20 @@ this node still holds:
 `scripts/measure-chain-size.py --validate` runs both halves in minutes. Do that
 rather than quoting this table in six months.
 
-One more thing the validator found once it was made able to fail (2026-09-05):
-at height 187661 this node holds a 378-byte block and the explorer serves a
-410-byte one. That is the orphan `verify-esplora.sh` already records Byron Bay
+Two things the validator found once it was made able to fail (2026-09-05).
+
+**It is also far behind.** Measured 15:38 UTC: our node had headers to 211014
+and `esplora.btxbyronbay.com` reported a tip of 209778 — **1,236 blocks back**.
+That does not move the 124 GiB figure (the missing span is post-fork, where
+blocks are ~400 bytes, so under a megabyte in total), and
+`check-chain-size-gate.py` refuses any measurement that lands below the shipped
+constant, which is the failure a stale source would cause. But it is the second
+independent reason not to treat that host as authoritative, and a third-party
+mirror is a dependency this repository does not control. If a second BTX
+Esplora ever exists, `--esplora` takes it.
+
+**And it holds an orphan.** At height 187661 this node holds a 378-byte block
+and the explorer serves a 410-byte one. That is the orphan `verify-esplora.sh` already records Byron Bay
 keeping after a reorg, confirmed here by a second, independent tool. It cannot
 move a 124 GiB total by more than a few hundred bytes, and every height above
 190000 agreed exactly, so the measurement stands. But it is why `--validate` now

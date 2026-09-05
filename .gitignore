@@ -5,6 +5,12 @@ dist/
 *.log
 apps/node/src-tauri/gen/
 
+# Six Python tools ship in this repo now (scripts/ and apps/node/scripts/), and
+# running any of them leaves bytecode behind. Using a repo's own tools should
+# not dirty its working tree.
+__pycache__/
+*.pyc
+
 # The staged BTX node package: ~25 MB of binaries fetched from upstream by
 # apps/node/scripts/stage-node-pkg.sh. Binaries do not belong in the source
 # tree. In the private repo this was excluded via .git/info/exclude, which is
