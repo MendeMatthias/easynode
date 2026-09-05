@@ -160,8 +160,10 @@ above ("until a tag exists that upstream itself calls clean"), and it was
 broken on purpose, by the owner, on a measurement rather than an argument:
 on one box, same datadir, same arguments, only the binary changed, v0.34.5
 connected 0.68 blocks/min against a chain producing 0.95 and fell behind for
-good while reporting itself healthy; this build did 3.80, has held the tip on
-the project's validator since 2026-09-02, and at least one other operator
+good while reporting itself healthy; this build did 3.80, held the tip on the
+project's validator from 2026-09-02 until the 2026-09-05 header-chain split at
+height 210496 (`docs/incident-2026-09-05-fork.md`; no reachable peer serves the
+longer chain's blocks, so that is not an engine finding), and at least one other operator
 (`109.199.124.187`, `/BTX:0.34.6/`) runs it. A release on v0.34.5 would have
 shipped the fleet's biggest problem to every fresh install. The second half of
 the rule held: **both guards passed on the box cutting the release**, against

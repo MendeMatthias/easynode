@@ -25,9 +25,12 @@ only the binary changed, the 0.34.6 engine does 3.80. 0.6.18 bundles it.
 
 Being honest about what that is: upstream has not tagged 0.34.6. This is the
 `release/0.34.6` branch at commit `9eb4e005`, built from a pristine tree on
-Ubuntu 22.04, the same build that has held the tip on the project's own
-validator since 2 September and that at least one other operator on the network
-runs. Both engine gates verify that exact commit. If upstream later tags 0.34.6
+Ubuntu 22.04, the same build that has run on the project's own validator since
+2 September (it held the tip until 5 September, when a longer header chain
+forking at height 210,496 appeared that no reachable peer serves blocks for;
+`docs/incident-2026-09-05-fork.md` has the facts, and which chain prevails was
+not settled when this shipped) and that at least one other operator on the
+network runs. Both engine gates verify that exact commit. If upstream later tags 0.34.6
 at a different commit, the pin is re-checked rather than renamed.
 
 Linux only in this release. The Mac and Windows builds follow; until they do
