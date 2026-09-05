@@ -83,6 +83,13 @@ first-run pitch, the close dialog, the close-behaviour setting and a button all
 said "menu bar" — macOS's word — while asking Windows and Linux users to choose
 a place they do not have. It now uses whatever your system calls it.
 
+**Switching to a full node checks your disk first.** Going from Keeper to Full
+means holding the whole chain, and the app used to accept the switch and then
+write it into place silently at the next engine update — so a keeper who had
+25 GB free could find their node quietly trying to download 124 GiB. Settings
+now refuses the switch on the spot if the disk cannot hold it, and an engine
+update never changes your node's prune posture unless there is room for it.
+
 **Reclaim and Remove data now check whether something else is using your data
 folder** — the miner, or a second copy of the app — and refuse instead of
 deleting out from under a running node.

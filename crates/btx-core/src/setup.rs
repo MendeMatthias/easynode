@@ -84,6 +84,36 @@ pub fn disk_required(fresh: bool, pruned: bool) -> u64 {
     }
 }
 
+/// Whether an existing conf is pruned: `Some(true)` for a non-zero `prune=`,
+/// `Some(false)` for `prune=0`, `None` when there is no conf or no key.
+pub fn conf_is_pruned(conf_path: &Path) -> Option<bool> {
+    conf_kv(conf_path, "prune").map(|v| v.trim() != "0")
+}
+
+/// What writing a conf with `now_pruned` posture needs on disk, given what the
+/// datadir already is. [`disk_required`] gates the FIRST install; the paths
+/// that rewrite the conf later must gate too, or a keeper who switched to Full
+/// and then took an app update gets `prune=0` written silently and starts
+/// backfilling the whole chain into a disk that held 25 GiB.
+///
+/// Going pruned never needs more than resume headroom: btxd deletes blocks, it
+/// does not fetch them. Going un-pruned on a datadir that is pruned, or whose
+/// posture is unknown, is a fresh full install's worth of disk regardless of
+/// the blocks already present. Already un-pruned with a chain on disk needs
+/// only headroom.
+pub fn disk_required_for_conf(has_blocks: bool, was_pruned: Option<bool>, now_pruned: bool) -> u64 {
+    if !has_blocks {
+        return disk_required(true, now_pruned);
+    }
+    if now_pruned {
+        return DISK_REQUIRED_RESUME;
+    }
+    match was_pruned {
+        Some(false) => DISK_REQUIRED_RESUME,
+        Some(true) | None => DISK_REQUIRED_FRESH,
+    }
+}
+
 /// Whether `available` bytes meets `required`. Pure → unit-testable.
 pub fn enough_free_disk(available: u64, required: u64) -> bool {
     available >= required
@@ -876,6 +906,56 @@ maxreorgdepthwarn=9
         let out = std::fs::read_to_string(&conf).unwrap();
         assert!(out.contains("prune=10000"), "{out}");
         assert!(!out.contains("prune=0"), "{out}");
+    }
+
+    #[test]
+    fn rewriting_the_conf_is_gated_by_the_posture_change_it_makes() {
+        // No chain yet: same as a fresh install of that posture.
+        assert_eq!(
+            disk_required_for_conf(false, None, false),
+            DISK_REQUIRED_FRESH
+        );
+        assert_eq!(
+            disk_required_for_conf(false, None, true),
+            DISK_REQUIRED_FRESH_PRUNED
+        );
+        // Pruning never fetches anything.
+        assert_eq!(
+            disk_required_for_conf(true, Some(false), true),
+            DISK_REQUIRED_RESUME
+        );
+        assert_eq!(
+            disk_required_for_conf(true, Some(true), true),
+            DISK_REQUIRED_RESUME
+        );
+        // Un-pruning a pruned datadir is the whole chain, whatever is on disk.
+        assert_eq!(
+            disk_required_for_conf(true, Some(true), false),
+            DISK_REQUIRED_FRESH
+        );
+        // Unknown posture with a chain present: assume the expensive case.
+        assert_eq!(
+            disk_required_for_conf(true, None, false),
+            DISK_REQUIRED_FRESH
+        );
+        // Already un-pruned: headroom only.
+        assert_eq!(
+            disk_required_for_conf(true, Some(false), false),
+            DISK_REQUIRED_RESUME
+        );
+    }
+
+    #[test]
+    fn conf_is_pruned_reads_the_posture_or_admits_it_does_not_know() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conf = tmp.path().join("faststart.conf");
+        assert_eq!(conf_is_pruned(&conf), None);
+        std::fs::write(&conf, "server=1\n").unwrap();
+        assert_eq!(conf_is_pruned(&conf), None);
+        std::fs::write(&conf, "server=1\nprune=0\n").unwrap();
+        assert_eq!(conf_is_pruned(&conf), Some(false));
+        std::fs::write(&conf, "server=1\nprune=10000\n").unwrap();
+        assert_eq!(conf_is_pruned(&conf), Some(true));
     }
 
     #[test]

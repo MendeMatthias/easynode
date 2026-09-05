@@ -460,20 +460,55 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
             &[Path::new(env!("CARGO_MANIFEST_DIR"))],
         ) {
             if let Some(install_root) = install_dir(NODE_RELEASE_TAG) {
+                // Which conf goes in is a DISK question before it is a profile
+                // question. This path rewrites faststart.conf wholesale and used
+                // to do so with no free-space check at all, so a keeper who had
+                // switched to Full and then took an app update got `prune=0`
+                // written here and started backfilling ~124 GiB, silently, into
+                // a disk that had held 25. The engine upgrade itself must still
+                // land (it is what keeps the node on the right side of a flag
+                // day), so when the disk cannot take the posture change the
+                // datadir keeps the posture it has, and the change is deferred
+                // with a line in setup.log saying so.
+                let selected =
+                    btx_core::installer::conf_for_profile(&settings.node_profile, NODE_RELEASE_TAG);
+                let conf_path = datadir.join("faststart").join("faststart.conf");
+                let was_pruned = btx_core::setup::conf_is_pruned(&conf_path);
+                let need = btx_core::setup::disk_required_for_conf(
+                    datadir.join("blocks").exists(),
+                    was_pruned,
+                    selected != btx_core::installer::NODE_FASTSTART_CONF,
+                );
+                let disk_ok = match free_disk_bytes(&datadir) {
+                    Some(free) => enough_free_disk(free, need),
+                    None => true, // unmeasured never blocks, as in the preflight
+                };
+                let choice = upgrade_conf_choice(selected, was_pruned, disk_ok);
+                if choice != Some(selected) {
+                    let gib = 1024 * 1024 * 1024;
+                    let msg = format!(
+                        "profile change to '{}' deferred: it needs about {} GiB free and this \
+                         volume has {} GiB; the node keeps its current prune posture",
+                        settings.node_profile,
+                        need / gib,
+                        free_disk_bytes(&datadir).unwrap_or(0) / gib
+                    );
+                    eprintln!("[node-app] {msg}");
+                    setup_log(&datadir, &msg);
+                }
                 let dd = datadir.clone();
-                let provisioned = tauri::async_runtime::spawn_blocking(move || {
-                    btx_core::installer::provision_node_package(
-                        &pkg,
-                        &install_root,
-                        &dd,
-                        btx_core::installer::conf_for_profile(
-                            &NodeAppSettings::load(&dd).node_profile,
-                            NODE_RELEASE_TAG,
-                        ),
-                    )
-                })
-                .await
-                .map_err(|e| format!("upgrade provisioning panicked: {e}"))?;
+                let provisioned = match choice {
+                    Some(conf) => tauri::async_runtime::spawn_blocking(move || {
+                        btx_core::installer::provision_node_package(&pkg, &install_root, &dd, conf)
+                    })
+                    .await
+                    .map_err(|e| format!("upgrade provisioning panicked: {e}"))?,
+                    None => Err(btx_core::error::AppError::Config(
+                        "this engine cannot keep the datadir pruned and there is not enough \
+                         disk to un-prune it; leaving the installed engine alone"
+                            .to_string(),
+                    )),
+                };
                 match provisioned {
                     Ok(_) => {
                         eprintln!(
@@ -2230,6 +2265,39 @@ pub async fn set_attestation_serve(on: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Which conf the engine-upgrade path writes: the selected profile's when the
+/// disk can take it, otherwise the posture the datadir already has. `None`
+/// means there is no safe conf and the engine must not be re-provisioned this
+/// start. Pure, so the four corners are tested rather than trusted.
+///
+/// Selecting keeper is always honoured: pruning frees disk, it never needs
+/// any. The only refused change is un-pruning a pruned datadir without the
+/// room to hold the chain; and if the engine being installed cannot keep a
+/// datadir pruned at all (the keeper gate says no), there is no conf that is
+/// both safe and affordable, so nothing is written.
+pub fn upgrade_conf_choice(
+    selected: &'static str,
+    was_pruned: Option<bool>,
+    disk_ok: bool,
+) -> Option<&'static str> {
+    let selected_pruned = selected != btx_core::installer::NODE_FASTSTART_CONF;
+    if disk_ok || selected_pruned {
+        return Some(selected);
+    }
+    match was_pruned {
+        Some(true) => {
+            let keep = btx_core::installer::conf_for_profile("keeper", NODE_RELEASE_TAG);
+            if keep == btx_core::installer::NODE_FASTSTART_CONF {
+                None
+            } else {
+                Some(keep)
+            }
+        }
+        Some(false) => Some(btx_core::installer::NODE_FASTSTART_CONF),
+        None => None,
+    }
+}
+
 /// The nickname a persisted setting is allowed to put in the conf, or `None`
 /// to leave the key untouched. Pure: this is the whole reason a settings value
 /// cannot reach `faststart.conf` without passing the same validator the
@@ -2304,6 +2372,29 @@ pub async fn set_node_profile(profile: String) -> Result<(), String> {
         return Err(format!("unknown profile: {profile}"));
     }
     let datadir = node_datadir();
+    // Say it NOW, at the moment of choosing, rather than at the next upgrade:
+    // going Full on a pruned datadir means holding the whole chain, and a
+    // choice the disk cannot honour should be refused where the person can
+    // see it, not deferred into a log line months later.
+    if profile == "full" {
+        let conf_path = datadir.join("faststart").join("faststart.conf");
+        let need = btx_core::setup::disk_required_for_conf(
+            datadir.join("blocks").exists(),
+            btx_core::setup::conf_is_pruned(&conf_path),
+            false,
+        );
+        if let Some(free) = free_disk_bytes(&datadir) {
+            if !enough_free_disk(free, need) {
+                let gib = 1024 * 1024 * 1024;
+                return Err(format!(
+                    "A full node needs about {} GiB free to hold the whole chain, and this \
+                     volume has {} GiB. Free some space first, or stay a keeper.",
+                    need / gib,
+                    free / gib
+                ));
+            }
+        }
+    }
     NodeAppSettings::update(&datadir, |s| {
         // Keeper implies serving — that is the profile's point. Choosing full
         // again does NOT clear a separately-made serve choice.
@@ -2746,6 +2837,39 @@ mod tests {
     /// and when the pin moved to v0.34.5 the answer flipped to YES with nothing
     /// recording that anyone decided it. Assert the value this release intends,
     /// so the next bump has to look at this line.
+    #[test]
+    fn the_upgrade_path_never_unprunes_a_datadir_the_disk_cannot_hold() {
+        use super::upgrade_conf_choice;
+        use btx_core::installer::{NODE_FASTSTART_CONF, NODE_KEEPER_CONF};
+        // Disk fine: the selected profile wins, whatever the datadir was.
+        assert_eq!(
+            upgrade_conf_choice(NODE_FASTSTART_CONF, Some(true), true),
+            Some(NODE_FASTSTART_CONF)
+        );
+        assert_eq!(
+            upgrade_conf_choice(NODE_KEEPER_CONF, Some(false), true),
+            Some(NODE_KEEPER_CONF)
+        );
+        // Selecting keeper never needs disk: honoured even when the disk is full.
+        assert_eq!(
+            upgrade_conf_choice(NODE_KEEPER_CONF, Some(false), false),
+            Some(NODE_KEEPER_CONF)
+        );
+        // Full selected, pruned datadir, no room: keep it pruned (the shipped
+        // engine admits the keeper conf, so there IS a safe conf).
+        assert_eq!(
+            upgrade_conf_choice(NODE_FASTSTART_CONF, Some(true), false),
+            Some(NODE_KEEPER_CONF)
+        );
+        // Full selected, already un-pruned, no room: nothing changes posture.
+        assert_eq!(
+            upgrade_conf_choice(NODE_FASTSTART_CONF, Some(false), false),
+            Some(NODE_FASTSTART_CONF)
+        );
+        // Full selected, unknown posture, no room: refuse rather than guess.
+        assert_eq!(upgrade_conf_choice(NODE_FASTSTART_CONF, None, false), None);
+    }
+
     #[test]
     fn destructive_ops_are_allowed_only_for_a_node_that_is_ours_or_nobodys() {
         use super::{destructive_allowed, NodeOwnership::*};
