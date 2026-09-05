@@ -97,7 +97,7 @@ jobs:
     runs-on: ubuntu-22.04 # oldest-supported glibc: BOTH the app binary and btxd
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Run btx-core tests (shared node engine)
         working-directory: crates/btx-core
@@ -122,15 +122,15 @@ jobs:
       # aborts the build.
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-08
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: apps/node/src-tauri
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
           cache: npm
@@ -163,7 +163,7 @@ jobs:
           echo "btxd pin: run ${PROVEN_BTXD_RUN_ID}, artifact ${PROVEN_BTXD_ARTIFACT}"
 
       - name: Download the proven btxd (from btxd-linux.yml)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ${{ env.PROVEN_BTXD_ARTIFACT }}
           path: btxd-dist
@@ -217,7 +217,7 @@ jobs:
           #    This is the check provisioning performs on the user's machine;
           #    doing it here means a mismatch fails CI instead of a stranger's
           #    install.
-          reported=$("$pkg/bin/btxd" --version | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')
+          reported=$("$pkg/bin/btxd" --version | head -1 | grep -oE 'v[0-9]+(\.[0-9]+)+')
           echo "declared=$declared reported=$reported"
           [ "$declared" = "$reported" ] || {
             echo "::error::the package declares $declared but its btxd reports $reported"
@@ -332,7 +332,21 @@ jobs:
           done
           rm -rf squashfs-root/usr/lib/dri squashfs-root/usr/lib/gbm 2>/dev/null || true
           echo "stripped $removed GPU driver libs (+ dri/gbm dirs)"
-          if curl -fsSL --retry 3 -o /tmp/appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"; then
+          # PINNED AND VERIFIED. This is the last thing to touch the bytes a
+          # user installs, and it used to be fetched from the `continuous` tag
+          # - a moving target, downloaded over the network, chmod +x, and run
+          # over the release AppImage. Pin the release and check the hash
+          # BEFORE making it executable; a mismatch keeps the original image
+          # rather than repackaging with an unknown tool.
+          #
+          # sha256 measured by download on 2026-09-05 and matching the digest
+          # GitHub publishes for the asset. To move it: bump the version, fetch
+          # the asset, sha256sum it, and put the result here.
+          APPIMAGETOOL_VERSION="1.9.1"
+          APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+          url="https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage"
+          if curl -fsSL --retry 3 -o /tmp/appimagetool "$url" \
+             && echo "${APPIMAGETOOL_SHA256}  /tmp/appimagetool" | sha256sum -c - >/dev/null 2>&1; then
             chmod +x /tmp/appimagetool
             if ARCH=x86_64 /tmp/appimagetool --appimage-extract-and-run --no-appstream squashfs-root "$base"; then
               chmod +x "$base"; echo "repackaged $base WITHOUT GPU libs ($(du -h "$base" | cut -f1))"
@@ -340,7 +354,7 @@ jobs:
               echo "::warning::appimagetool repackage failed — keeping the original"
             fi
           else
-            echo "::warning::appimagetool download failed — keeping the original"
+            echo "::warning::appimagetool download failed or did not match its pinned sha256 — keeping the original"
           fi
           rm -rf squashfs-root
 
@@ -402,17 +416,26 @@ jobs:
           env -u LD_LIBRARY_PATH "$apkgdir/bin/btxd" --version | head -1
           echo "path contract OK: runnable btxd in both bundles, no unresolved libs"
 
+      # The names here are the names that SHIP. tauri's productName is
+      # "easyBTX Node", so the bundler emits "easyBTX Node_<ver>_amd64.AppImage",
+      # with a space, and the release convention is BTX-Node_<ver>_<arch>.<ext>.
+      # The rename used to be a manual recipe step performed AFTER this hash,
+      # which meant SHA256SUMS listed names no published asset ever had and the
+      # publish gate that checks it could not pass for any release. Renaming
+      # before hashing makes the sums file, the feed builder's expect_name and
+      # the publish gate agree on one name.
       - name: Collect artifacts + sha256
         run: |
           set -euo pipefail
           out="$GITHUB_WORKSPACE/dist-node-linux"
           mkdir -p "$out"
-          cp apps/node/src-tauri/target/release/bundle/appimage/*.AppImage "$out/"
-          cp apps/node/src-tauri/target/release/bundle/deb/*.deb "$out/"
+          ver="$(python3 -c "import json;print(json.load(open('apps/node/src-tauri/tauri.conf.json'))['version'])")"
+          cp apps/node/src-tauri/target/release/bundle/appimage/*.AppImage "$out/BTX-Node_${ver}_amd64.AppImage"
+          cp apps/node/src-tauri/target/release/bundle/deb/*.deb        "$out/BTX-Node_${ver}_amd64.deb"
           cd "$out" && sha256sum * | tee SHA256SUMS
 
       - name: Upload Linux bundles
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: BTX-Node-linux
           path: dist-node-linux/*

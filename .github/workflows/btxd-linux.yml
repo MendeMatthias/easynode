@@ -34,9 +34,22 @@ name: Build Linux btxd (CUDA source build, smoked on the runner)
 # compare the binary it makes against a known-good hand build before trusting a
 # release to it.
 #
-# Security: the only input is a git ref, consumed by actions/checkout's `ref:`
-# parameter. It is never interpolated into a `run:` line. No secrets, no write
-# permissions.
+# Security: workflow_dispatch only, `permissions: contents: read`, no secrets.
+#
+# There are TWO inputs, and both reach shell steps. They are passed through each
+# step's `env:` and dereferenced as ordinary shell variables, never expanded by
+# the ${{ }} templater into the script text - the same discipline
+# node-win-installer.yml and btxd-windows.yml already use. Expanding into script
+# text means the input becomes CODE before bash ever sees it, so a value
+# containing a newline or a $(...) is executed rather than compared.
+#
+# Nobody who can dispatch this could not also edit the workflow, so this crosses
+# no privilege boundary today. It is written this way because
+# node-linux-installer.yml has a `pull_request:` block sitting commented out
+# waiting to be re-enabled, and because a header that describes a discipline the
+# body does not follow is worse than no header. `btxchain_ref` also does NOT
+# reach checkout's `ref:` as the old text claimed: it is read in a shell at the
+# pin step and reaches checkout via `steps.pin.outputs.ref`.
 
 on:
   workflow_dispatch:
@@ -68,7 +81,7 @@ jobs:
     timeout-minutes: 180
     steps:
       - name: Checkout easynode (for the engine pin)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: easynode
 
@@ -78,13 +91,15 @@ jobs:
       # the app then refuses to install.
       - name: Resolve the engine tag from the app itself
         id: pin
+        env:
+          BTXCHAIN_REF: ${{ inputs.btxchain_ref }}
         run: |
           set -euo pipefail
           cd easynode
           # shellcheck source=/dev/null
           . apps/node/scripts/lib/engine-pin.sh
           pinned="$(engine_pin_tag apps/node)"
-          ref="${{ inputs.btxchain_ref }}"
+          ref="$BTXCHAIN_REF"
           [ -n "$ref" ] || ref="$pinned"
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
           echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
@@ -94,7 +109,7 @@ jobs:
           echo "building $ref (app pins $pinned)"
 
       - name: Checkout btxchain/btx
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: btxchain/btx
           ref: ${{ steps.pin.outputs.ref }}
@@ -145,9 +160,11 @@ jobs:
 
       - name: Configure + build
         working-directory: btx
+        env:
+          CUDA_ARCHS_INPUT: ${{ inputs.cuda_architectures }}
         run: |
           set -euo pipefail
-          archs="${{ inputs.cuda_architectures }}"
+          archs="$CUDA_ARCHS_INPUT"
           [ -n "$archs" ] || archs="$DEFAULT_CUDA_ARCHS"
           echo "CUDA architectures: $archs"
           # Copied from docs/node-release-recipe.md, "Rebuilding the Linux
@@ -183,9 +200,11 @@ jobs:
       # a Linux node look healthy while being unable to validate. Ask the binary.
       - name: Prove the CUDA kernels are actually in the binary
         working-directory: btx
+        env:
+          CUDA_ARCHS_INPUT: ${{ inputs.cuda_architectures }}
         run: |
           set -euo pipefail
-          archs="${{ inputs.cuda_architectures }}"
+          archs="$CUDA_ARCHS_INPUT"
           [ -n "$archs" ] || archs="$DEFAULT_CUDA_ARCHS"
           found=$("$CUDA_HOME/bin/cuobjdump" --list-elf build/bin/btxd 2>/dev/null \
                   | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ')
@@ -245,7 +264,7 @@ jobs:
           # reported version can legitimately lag the tag: a branch that never
           # bumped CLIENT_VERSION_BUILD reports the older number, which is why
           # the package declares what it carries in .btxd-version instead.
-          "$out/btxd" --version | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' > "$out/BTXD_VERSION"
+          "$out/btxd" --version | head -1 | grep -oE 'v[0-9]+(\.[0-9]+)+' > "$out/BTXD_VERSION"
           git rev-parse HEAD > "$out/BTXD_COMMIT"
           "$CUDA_HOME/bin/cuobjdump" --list-elf "$out/btxd" 2>/dev/null \
             | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ' > "$out/BTXD_CUDA_ARCHS"
@@ -258,7 +277,7 @@ jobs:
           (cd "$out" && sha256sum btxd btx-cli | tee SHA256SUMS.txt)
 
       - name: Upload btxd artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: btxd-linux-${{ steps.pin.outputs.slug }}
           path: btxd-dist/*

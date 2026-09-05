@@ -440,10 +440,15 @@ pub async fn wallet_import(
         None
     };
 
-    // Where this import will actually land. Normally WALLET_NAME. If that name
-    // is taken by a DIFFERENT wallet we import beside it rather than pretending,
+    // The name this import is ATTEMPTED under. Normally WALLET_NAME; if that is
+    // taken by a DIFFERENT wallet we import beside it rather than pretending,
     // because the alternative is telling someone their import worked while
     // showing them a stranger's balance.
+    //
+    // "Attempted" is the load-bearing word, and it is not the same as "succeeded".
+    // Any path that retargets the import MUST set this before it calls btxd: the
+    // failure handling below asks btxd what landed under this name, and on the
+    // path where that question matters most the call has already failed.
     let mut target_name = WALLET_NAME.to_string();
 
     let (result, rescanned) = match kind {
@@ -471,10 +476,13 @@ pub async fn wallet_import(
                     } else {
                         match next_free_wallet_name(&rpc).await {
                             Some(alt) => {
+                                // Adopt the name BEFORE the call, not on success.
+                                // See the wallet.dat branch below for why: on the
+                                // failing return this name is what decides which
+                                // wallet we ask btxd about, and asking about the
+                                // wrong one answers true by definition.
+                                target_name = alt.clone();
                                 let r = api::restore_wallet_bundle(&rpc, &alt, &path, true).await;
-                                if r.is_ok() {
-                                    target_name = alt;
-                                }
                                 (r, true)
                             }
                             None => (
@@ -516,10 +524,21 @@ pub async fn wallet_import(
                     // staring at 0.00 and concluding their coins are gone.
                     match next_free_wallet_name(&rpc).await {
                         Some(alt) => {
+                            // Adopt the name BEFORE the call. `if r.is_ok()` looks
+                            // careful and is the bug: a wallet.dat rescan is
+                            // multi-hour and the transport gives up at 60 s, so
+                            // the FAILING return is the normal outcome here. With
+                            // the name dropped on that path, `import_landed_anyway`
+                            // below asked btxd about WALLET_NAME — which exists by
+                            // definition, since that is what made this a collision
+                            // — got true, and reported success pointing the panel
+                            // at the pre-existing wallet while the user's keys were
+                            // in this one. That is the "staring at 0.00 and
+                            // concluding their coins are gone" failure the whole
+                            // import-beside path exists to prevent, reintroduced by
+                            // the guard that runs after it.
+                            target_name = alt.clone();
                             let r = api::restore_wallet(&rpc, &alt, &path).await;
-                            if r.is_ok() {
-                                target_name = alt;
-                            }
                             (r, true)
                         }
                         None => (
@@ -917,6 +936,48 @@ mod tests {
         // default ever changes, BOTH callers have to be revisited.
         let rpc = DirRpc::failing();
         assert!(!wallet_dir_has(&rpc, "btxnode").await);
+    }
+
+    #[tokio::test]
+    async fn the_landed_anyway_guard_answers_about_the_name_it_is_given() {
+        // This guard turns a transport failure into reported success, so the
+        // name it is handed decides which wallet the panel is pointed at.
+        //
+        // The import-beside path used to hand it a STALE name. `btxnode` is
+        // taken (that is what made the import a collision), the retry goes to
+        // `btxnode-2`, the rescan outruns the 60 s transport limit — the normal
+        // outcome — and the old code kept `target_name` at `btxnode` because the
+        // result was Err. Asking "did btxnode land?" then answers true by
+        // definition and the user is shown the wallet they already had.
+        let timeout = AppError::Http("operation timed out".into());
+
+        // The attempted name did NOT land: say so, do not claim success.
+        let rpc = DirRpc::with(&["btxnode"]);
+        assert!(
+            !import_landed_anyway(&rpc, "btxnode-2", &timeout).await,
+            "btxnode-2 does not exist; the guard must not answer for btxnode"
+        );
+
+        // The attempted name DID land and is still rescanning: report it.
+        let rpc = DirRpc::with(&["btxnode", "btxnode-2"]);
+        assert!(import_landed_anyway(&rpc, "btxnode-2", &timeout).await);
+
+        // The stale name is exactly the question that always answers yes, which
+        // is why passing it was undetectable without this asymmetry.
+        let rpc = DirRpc::with(&["btxnode"]);
+        assert!(import_landed_anyway(&rpc, "btxnode", &timeout).await);
+    }
+
+    #[tokio::test]
+    async fn an_rpc_refusal_is_never_second_guessed() {
+        // Only transport failures are ambiguous. btxd saying no is btxd telling
+        // us something real, and the wallet existing does not make it a success.
+        let rpc = DirRpc::with(&["btxnode", "btxnode-2"]);
+        let refusal = AppError::Rpc {
+            code: -4,
+            message: "Wallet file verification failed".into(),
+        };
+        assert!(!import_landed_anyway(&rpc, "btxnode-2", &refusal).await);
     }
 
     #[test]

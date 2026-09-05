@@ -1,0 +1,22 @@
+# Keep the SHA-pinned actions moving.
+#
+# Pinning every `uses:` to a commit closes the "a tag can be repointed" hole,
+# and opens a second one if nobody ever moves the pins: a frozen action does not
+# get its own security fixes. Dependabot is the other half of that trade - it
+# raises a PR when a pinned action releases, updating both the SHA and the
+# version comment beside it, and a human still reviews and merges.
+#
+# Weekly, not daily: these workflows build and sign the binaries users install,
+# so the point is a reviewed change on a predictable cadence rather than a
+# stream of PRs nobody reads.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies

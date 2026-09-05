@@ -76,24 +76,24 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Run btx-core tests (shared node engine)
         working-directory: crates/btx-core
         run: cargo test --locked
 
       - name: Install Rust (MSVC)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-08
         with:
           targets: x86_64-pc-windows-msvc
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: apps/node/src-tauri
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
           cache: npm
@@ -189,13 +189,22 @@ jobs:
             Get-ChildItem -Recurse apps/node/src-tauri/target -Filter "*.exe" -ErrorAction SilentlyContinue | Select-Object FullName
             throw "no NSIS *-setup.exe produced"
           }
-          Copy-Item $setup.FullName $out -Force
-          Write-Host "installer: $($setup.Name) ($([math]::Round($setup.Length/1MB,1)) MB)"
-          Get-FileHash $setup.FullName -Algorithm SHA256 | Format-List
+          # Ship-name it here and write SHA256SUMS beside it: the publish gate
+          # requires every artifact to be listed in the gate run's sums file,
+          # and this workflow only ever printed the hash to the job log, so
+          # the Windows train had nothing to be gated against.
+          $ver  = (Get-Content apps/node/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $name = "BTX-Node_${ver}_x64-setup.exe"
+          Copy-Item $setup.FullName (Join-Path $out $name) -Force
+          $hash = (Get-FileHash (Join-Path $out $name) -Algorithm SHA256).Hash.ToLower()
+          # sha256sum format, LF, no BOM: "<hash>  <name>".
+          [System.IO.File]::WriteAllText((Join-Path $out "SHA256SUMS"), "$hash  $name`n")
+          Write-Host "installer: $name ($([math]::Round($setup.Length/1MB,1)) MB)"
+          Write-Host "sha256: $hash"
 
       - name: Upload installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: BTX-Node-windows-installer
-          path: installer-dist/*-setup.exe
+          path: installer-dist/*
           if-no-files-found: error

@@ -1,8 +1,9 @@
 //! Shared datadir resolution for every easyBTX app.
 //!
 //! DESIGN DECISION (easyBTX Node spec, risk #1): the miner and the standalone
-//! node app share ONE datadir — the BTX chain is ~50 GB un-pruned and duplicating
-//! it per-app is unacceptable. Both apps therefore resolve the datadir through
+//! node app share ONE datadir — the BTX chain is ~124 GiB of block payload
+//! un-pruned (measured 2026-09-04, see `docs/archival-capacity.md`) and
+//! duplicating it per-app is unacceptable. Both apps therefore resolve it through
 //! this module: the default `~/.easybtx`, overridable via the `~/.easybtx-location`
 //! file (written by the miner's Settings → "Move data" flow). Whichever app the
 //! user relocates the data from, the other app follows automatically.

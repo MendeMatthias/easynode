@@ -130,9 +130,14 @@ mod tests {
     fn the_wire_shape_is_what_the_ui_declares() {
         // apps/node/src/main.ts types this as
         //     archive_service: { state: string; blocks_behind?: number } | null
-        // and reads `.state` to choose what to show. The internal tag and the
-        // snake_case renaming are therefore load-bearing across a language
-        // boundary that no compiler checks.
+        // so the internal tag and the snake_case renaming are load-bearing
+        // across a language boundary that no compiler checks.
+        //
+        // The frontend does NOT re-derive copy from `.state`: the status payload
+        // carries `message()` already rendered, so the sentences stay in one
+        // place. This shape is still what crosses the wire and still has to be
+        // pinned — a field quietly added to a variant is a silent change to a
+        // contract the type declaration above cannot enforce.
         //
         // `it_serialises_with_a_state_tag_the_ui_can_switch_on` below already
         // checks two of the variants field by field. This one asserts the WHOLE

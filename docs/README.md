@@ -8,7 +8,10 @@
   including the two engine gates that must both pass first.
 - **[archival-capacity.md](archival-capacity.md)**: how many peers can still
   serve a block body (measured: one), and what an unpruned node actually costs
-  on disk. Answers issue #14.
+  on disk (measured: 123.8 GiB of blocks on 2026-09-04, which is more than the
+  install gate used to allow). Answers issue #14. Re-measure it with
+  `scripts/measure-chain-size.py` and `scripts/blockstore-census.py` rather than
+  quoting the number; CI does so monthly and fails the gate check if it drifts.
 - **[esplora-mode.md](esplora-mode.md)**: the opt-in Esplora API front, the
   route contract a wallet actually requires, and the gate that decides whether an
   endpoint may be advertised.

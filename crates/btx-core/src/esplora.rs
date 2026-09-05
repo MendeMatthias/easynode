@@ -71,12 +71,19 @@ pub enum EsploraBlocker {
 /// Non-blocking things an operator should be told before they commit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum EsploraWarning {
-    /// Disk is the cost nobody expects. The number is deliberately NOT asserted
-    /// here: this repository does not agree with itself on how large the
-    /// unpruned chain is (`setup.rs` says ~105 GB, `datadir.rs` says ~50 GB),
-    /// and electrs' index is additional on top of whichever is right. Quoting a
-    /// confident total from an unsettled base is how the 120 GB install gate got
-    /// its number. See docs/archival-capacity.md.
+    /// Disk is the cost nobody expects, and it has two parts with very
+    /// different provenance.
+    ///
+    /// The chain is now MEASURED: `setup.rs::MEASURED_CHAIN_PAYLOAD_GIB`, 124
+    /// GiB on 2026-09-04, method in docs/archival-capacity.md. That figure is
+    /// quoted, because refusing to say a number we have is its own kind of
+    /// unhelpful.
+    ///
+    /// electrs' index sits on top of it and is NOT measured by anybody here, so
+    /// no total is quoted. Naming which half is known and which is not beats
+    /// both a confident total and a blanket "we don't know" — a confident total
+    /// from an unsettled base is how the install gate got a number that later
+    /// fell below the chain it was gating.
     DiskUnsettled { free_mb: Option<u64> },
 }
 
@@ -170,17 +177,17 @@ pub fn explain_warning(w: &EsploraWarning) -> String {
     match w {
         EsploraWarning::DiskUnsettled { free_mb } => {
             let have = match free_mb {
-                Some(mb) => format!(" You have about {} GB free.", mb / 1024),
+                Some(mb) => format!(" You have about {} GiB free.", mb / 1024),
                 None => String::new(),
             };
+            let chain = crate::setup::MEASURED_CHAIN_PAYLOAD_GIB;
             format!(
                 "Esplora mode needs the FULL unpruned chain plus an electrs index \
-                 on top of it, and it grows.{have} We will not quote you a total, \
-                 because this project does not yet have a trustworthy one: our own \
-                 code carries two different figures for the unpruned chain and \
-                 neither has been re-measured against a completed sync. Treat this \
-                 as a server-class commitment, not a laptop one, and see \
-                 docs/archival-capacity.md."
+                 on top of it, and it grows.{have} The chain measured {chain} GiB on \
+                 2026-09-04. We will not quote you a total, because nobody has \
+                 measured the electrs index on top of it — so budget above that \
+                 figure, not at it. Treat this as a server-class commitment, not a \
+                 laptop one, and see docs/archival-capacity.md."
             )
         }
     }
@@ -313,9 +320,16 @@ mod tests {
             .first()
             .expect("a disk warning is always attached");
         let msg = explain_warning(w);
-        // The point of the warning is that we do NOT have a trustworthy number.
-        // If somebody later hardcodes one, this test should make them think.
+        // Two halves, and the test pins both. We DO have a measured chain size
+        // now and it would be unhelpful to withhold it; we do NOT have a
+        // measured electrs index, so no total is quoted. If somebody later
+        // hardcodes a total, or drops the figure we actually have, this should
+        // make them think.
         assert!(msg.contains("will not quote you a total"), "{msg}");
+        assert!(
+            msg.contains(&crate::setup::MEASURED_CHAIN_PAYLOAD_GIB.to_string()),
+            "quote the half that IS measured: {msg}"
+        );
         assert!(
             msg.contains("archival-capacity"),
             "point at the evidence: {msg}"

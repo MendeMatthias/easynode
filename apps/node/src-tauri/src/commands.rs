@@ -17,12 +17,13 @@ use btx_core::node::{DatadirHolder, NodeController, BTX_BOOTSTRAP_PEERS};
 use btx_core::node_api::{get_blockchain_info, get_chainstates};
 use btx_core::rpc::RpcClient;
 use btx_core::setup::{
-    enough_free_disk, ensure_addnodes_in_conf, free_disk_bytes, wait_for_node_rpc,
-    DISK_REQUIRED_FRESH, DISK_REQUIRED_RESUME, RPC_URL,
+    enough_free_disk, ensure_addnodes_in_conf, free_disk_bytes, wait_for_node_rpc, RPC_URL,
 };
 use btx_core::snapshot::SnapshotSpec;
 
-use crate::state::{node_datadir, AppState, NodeAppSettings, NodeAppSnapshotFlags, NodePhase};
+use crate::state::{
+    node_datadir, AppState, AttachedTo, NodeAppSettings, NodeAppSnapshotFlags, NodePhase,
+};
 
 /// The BTX release this app installs and runs — the network's current version
 /// (btxprice.com network_update_notice signals when this must move). The
@@ -416,6 +417,28 @@ pub(crate) fn pre_launch_plan(
 /// RPC client armed, snapshot-load guaranteed in the background, keep-awake
 /// held, and the status refresher loop driving the phase.
 pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Result<(), String> {
+    // One start at a time, held through a drop guard so a panic releases it.
+    // The double-spawn guard further down keys on a live child in
+    // `state.node`, and there is none between a stop and the next spawn,
+    // during which `Stopped` is actionable on both surfaces. Two starts in
+    // that window race for btxd.pid; the loser lands on ManagedElsewhereNoRpc,
+    // disarms the shared launch record, and the winner's healthy btxd gets
+    // SIGKILLed at the next stop for want of it.
+    if state
+        .start_in_flight
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("the node is already starting, give it a moment".to_string());
+    }
+    struct InFlight<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let _in_flight = InFlight(&state.start_in_flight);
+
     let datadir = node_datadir();
     let settings = NodeAppSettings::load(&datadir);
     let mut tag = settings
@@ -437,20 +460,55 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
             &[Path::new(env!("CARGO_MANIFEST_DIR"))],
         ) {
             if let Some(install_root) = install_dir(NODE_RELEASE_TAG) {
+                // Which conf goes in is a DISK question before it is a profile
+                // question. This path rewrites faststart.conf wholesale and used
+                // to do so with no free-space check at all, so a keeper who had
+                // switched to Full and then took an app update got `prune=0`
+                // written here and started backfilling ~124 GiB, silently, into
+                // a disk that had held 25. The engine upgrade itself must still
+                // land (it is what keeps the node on the right side of a flag
+                // day), so when the disk cannot take the posture change the
+                // datadir keeps the posture it has, and the change is deferred
+                // with a line in setup.log saying so.
+                let selected =
+                    btx_core::installer::conf_for_profile(&settings.node_profile, NODE_RELEASE_TAG);
+                let conf_path = datadir.join("faststart").join("faststart.conf");
+                let was_pruned = btx_core::setup::conf_is_pruned(&conf_path);
+                let need = btx_core::setup::disk_required_for_conf(
+                    datadir.join("blocks").exists(),
+                    was_pruned,
+                    selected != btx_core::installer::NODE_FASTSTART_CONF,
+                );
+                let disk_ok = match free_disk_bytes(&datadir) {
+                    Some(free) => enough_free_disk(free, need),
+                    None => true, // unmeasured never blocks, as in the preflight
+                };
+                let choice = upgrade_conf_choice(selected, was_pruned, disk_ok);
+                if choice != Some(selected) {
+                    let gib = 1024 * 1024 * 1024;
+                    let msg = format!(
+                        "profile change to '{}' deferred: it needs about {} GiB free and this \
+                         volume has {} GiB; the node keeps its current prune posture",
+                        settings.node_profile,
+                        need / gib,
+                        free_disk_bytes(&datadir).unwrap_or(0) / gib
+                    );
+                    eprintln!("[node-app] {msg}");
+                    setup_log(&datadir, &msg);
+                }
                 let dd = datadir.clone();
-                let provisioned = tauri::async_runtime::spawn_blocking(move || {
-                    btx_core::installer::provision_node_package(
-                        &pkg,
-                        &install_root,
-                        &dd,
-                        btx_core::installer::conf_for_profile(
-                            &NodeAppSettings::load(&dd).node_profile,
-                            NODE_RELEASE_TAG,
-                        ),
-                    )
-                })
-                .await
-                .map_err(|e| format!("upgrade provisioning panicked: {e}"))?;
+                let provisioned = match choice {
+                    Some(conf) => tauri::async_runtime::spawn_blocking(move || {
+                        btx_core::installer::provision_node_package(&pkg, &install_root, &dd, conf)
+                    })
+                    .await
+                    .map_err(|e| format!("upgrade provisioning panicked: {e}"))?,
+                    None => Err(btx_core::error::AppError::Config(
+                        "this engine cannot keep the datadir pruned and there is not enough \
+                         disk to un-prune it; leaving the installed engine alone"
+                            .to_string(),
+                    )),
+                };
                 match provisioned {
                     Ok(_) => {
                         eprintln!(
@@ -553,6 +611,43 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
 
     // Re-assert the app-owned conf keys on EVERY start, not just after setup.
     //
+    // Before the opt-in keys below: put back anything missing from the BASE
+    // conf. Nothing on this path used to do that. `provision_node_package`
+    // writes faststart.conf once — at first setup, or when the pinned tag moves
+    // — and after that the only writers read-modify-rewrite it, plus the miner
+    // through the shared datadir. So a conf that loses its body never got it
+    // back, and btxd launched with the datadir's own remembered `prune` value
+    // and no reorg parking, silently and with nothing on screen.
+    //
+    // Only ever ADDS a missing key; a present value is never overwritten, so a
+    // keeper stays pruned and a hand-tuned value survives. See
+    // `ensure_base_conf_keys` for why these five and not the whole conf.
+    // `&tag`, not NODE_RELEASE_TAG: the binaries this start launches come from
+    // `tag`, which only advances to the pin when this start's provisioning
+    // succeeded. Judging the keeper gate against an engine that is not
+    // installed could restore prune=10000 for one of the four engines the gate
+    // exists to keep the pruned conf away from.
+    match btx_core::setup::ensure_base_conf_keys(
+        &paths.faststart_conf,
+        btx_core::installer::conf_for_profile(&settings.node_profile, &tag),
+    ) {
+        Ok(added) if !added.is_empty() => {
+            // Loud on purpose. Healing this silently would hide a conf that is
+            // being damaged repeatedly by something we have not found yet.
+            eprintln!(
+                "[node-app] faststart.conf was missing {} base key(s), restored: {}",
+                added.len(),
+                added.join(" ")
+            );
+            setup_log(
+                &datadir,
+                &format!("restored missing conf keys: {}", added.join(" ")),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[node-app] could not restore base conf keys: {e}"),
+    }
+
     // `provision_node_package` writes faststart.conf unconditionally, so the
     // node-upgrade path above (which fires whenever NODE_RELEASE_TAG moves —
     // e.g. v0.33.1 → v0.33.2 for the MatMul v4.7 fork) silently drops
@@ -571,6 +666,44 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     ) {
         // Never fatal: a node that starts without the index is still a node.
         eprintln!("[node-app] could not re-apply txindex to the conf: {e}");
+    }
+
+    // The public nickname, asserted for the same reason as txindex above: a
+    // provision or an engine upgrade rewrites faststart.conf wholesale and
+    // would otherwise silently drop it, so a user who named their node would
+    // quietly go back to being anonymous at the next release. Empty removes the
+    // key rather than writing `uacomment=`, which btxd renders as `()`.
+    //
+    // Two rules, both learned the hard way in this same function. The value is
+    // VALIDATED here, not only in the Settings command: this is the path that
+    // runs unattended on every launch, and a settings file edited by hand (or
+    // by the miner, which shares the datadir) is the one route by which a
+    // comment btxd rejects could reach the conf and stop the node starting,
+    // persistently, with nothing on screen naming the cause. And an EMPTY
+    // setting leaves the key alone rather than deleting it: the attestation
+    // block below was fixed for exactly that asymmetry, which silently stripped
+    // an operator's hand-added value on every start. Clearing a nickname is
+    // done explicitly by `set_node_nickname`, where it belongs.
+    match conf_nickname(&settings.node_nickname) {
+        Some(nick) => {
+            if let Err(e) =
+                btx_core::setup::set_conf_kv(&paths.faststart_conf, "uacomment", Some(&nick))
+            {
+                // Never fatal: a node without its nickname is still a node.
+                eprintln!("[node-app] could not re-apply the nickname to the conf: {e}");
+            }
+        }
+        None if !settings.node_nickname.trim().is_empty() => {
+            setup_log(
+                &datadir,
+                "the saved nickname is not one btxd would accept; not writing it to the conf",
+            );
+            eprintln!(
+                "[node-app] saved nickname {:?} rejected by the validator; leaving uacomment alone",
+                settings.node_nickname
+            );
+        }
+        None => {}
     }
 
     // Attestation serving (opt-in): asserted like txindex so the provision/
@@ -611,6 +744,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     *state.rc_status_cache.lock().await = None;
     *state.stall_verdict.lock().await = None;
     *state.archive_peers_cache.lock().await = None;
+    state.peer_nicknames_cache.lock().await.clear();
     *state.archive_service.lock().await = None;
 
     set_phase(app, state, NodePhase::Starting).await;
@@ -665,6 +799,14 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
             // answered (shared datadir: never spawn a second daemon).
             let client = probe.expect("Attach implies an answering RPC probe");
             eprintln!("[node-app] a node is already serving RPC on this datadir; attaching");
+            // Remember WHOSE node this is. `state.rpc` will hold its client
+            // from here on, and that slot is what the destructive commands
+            // used to read as "ours", which in this arm is exactly wrong.
+            *state.attached_to.lock().await = Some(match holder {
+                DatadirHolder::ManagedBtxd { .. } => AttachedTo::AnotherApp,
+                DatadirHolder::OrphanedBtxd { .. } => AttachedTo::OurOrphan,
+                DatadirHolder::Free | DatadirHolder::Unidentifiable { .. } => AttachedTo::Unknown,
+            });
             if upgraded_this_start {
                 // Only reachable when the serving node is another live app's:
                 // never bounce a node out from under its supervisor. The new
@@ -724,6 +866,8 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
                 ),
                 _ => {}
             }
+            // A node we spawn is ours by construction.
+            *state.attached_to.lock().await = None;
             spawn_node_with_lock_retry(app, state, &datadir, &paths).await?
         }
     };
@@ -764,7 +908,21 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     // place first. Awaited rather than spawned for the same ordering reason. A
     // failure is logged and startup continues: the node still syncs the slow way,
     // which is exactly what it would have done with no snapshot at all.
-    if btx_core::snapshot::snapshot_file_is_stale_for_spec(&spec, &datadir) {
+    //
+    // ...but not for a node that has already loaded one. `ensure_snapshot_loaded`
+    // returns on its fast path when `snapshot_loaded` is set, so nothing would
+    // ever read the file we just fetched: the download is ~452 MB spent to
+    // produce a file the very next call ignores, on every start until the pin
+    // moves again. The staleness refresh exists to make the LOAD correct, so it
+    // is only worth doing when a load can still happen.
+    let already_loaded = NodeAppSettings::load(&datadir).snapshot_loaded;
+    if already_loaded && btx_core::snapshot::snapshot_file_is_stale_for_spec(&spec, &datadir) {
+        eprintln!(
+            "[snapshot] snapshot.dat is from an older pin, but this node has \
+             already loaded one; not re-downloading a file nothing would read"
+        );
+    }
+    if !already_loaded && btx_core::snapshot::snapshot_file_is_stale_for_spec(&spec, &datadir) {
         eprintln!(
             "[snapshot] snapshot.dat on disk is not the pinned one (anchor {}); refreshing",
             spec.anchor_height
@@ -1038,6 +1196,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
     let stall_slot = state.stall_verdict.clone();
     let rc_cache_slot = state.rc_status_cache.clone();
     let archive_slot = state.archive_peers_cache.clone();
+    let nickname_slot = state.peer_nicknames_cache.clone();
     let archive_service_slot = state.archive_service.clone();
     let anchor = snapshot_spec().anchor_height;
 
@@ -1105,11 +1264,22 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                         .as_ref()
                         .map(|ps| btx_core::node_api::summarize_archive_peers(ps));
                     *archive_slot.lock().await = archive_summary.clone();
+                    // Free: the peer objects are already in hand this tick.
+                    *nickname_slot.lock().await = peer_infos
+                        .as_ref()
+                        .map(|ps| {
+                            btx_core::nickname::peer_nicknames(ps.iter().map(|p| p.subver.as_str()))
+                        })
+                        .unwrap_or_default();
                     let readiness = btx_core::health::sync_readiness(&chainstates, &chain, anchor);
                     let new_phase = if readiness.is_near_tip() {
                         NodePhase::Ready {
                             height: readiness.height(),
                             peers,
+                            // Already in hand at this tick and, until now, used
+                            // only to discriminate stalls ninety lines below —
+                            // never shown to the person reading the badge.
+                            blocks_behind: chain.headers.saturating_sub(readiness.height()),
                         }
                     } else {
                         let mut headers = chain.headers;
@@ -1339,6 +1509,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                             r.stall = stall_slot.lock().await.clone();
                             r.trusted_mirror = trusted_mirror;
                             r.serving_attestations = settings.attestation_serve_enabled;
+                            r.nickname = settings.node_nickname.clone();
                             if let Err(e) = btx_core::service_report::write_service_report(&dd, &r)
                             {
                                 eprintln!("[node-app] service report write failed: {e}");
@@ -1401,11 +1572,13 @@ pub async fn stop_node_inner(state: &AppState) {
         }
     }
     *state.rpc.lock().await = None;
+    *state.attached_to.lock().await = None;
     *state.started_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // A stopped node has no CURRENT stall verdict or peer census — leaving
     // them made get_node_status report the dead run's stall as live.
     *state.stall_verdict.lock().await = None;
     *state.archive_peers_cache.lock().await = None;
+    state.peer_nicknames_cache.lock().await.clear();
     *state.archive_service.lock().await = None;
     // Release the keep-awake assertion — the Mac may sleep again.
     *state.sleep_guard.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1485,6 +1658,16 @@ pub struct NodeStatusInfo {
     /// hardcoding numbers that could drift from the Rust side.
     pub disk_warn_mb: u64,
     pub disk_critical_mb: u64,
+    /// What a fresh install of the CURRENTLY SELECTED profile needs free,
+    /// from the same `disk_required` the preflight applies, so a keeper reads
+    /// 20 GiB and a full node 140. The wizard renders this instead of a
+    /// hardcoded string: "~105 GB" and 140 GiB were on screen at the same time
+    /// once, and then 140 was shown to keepers the preflight would pass at 20.
+    ///
+    /// Always the FRESH figure, even for a resume gated at 2 GiB: overstating
+    /// is the safe direction, and the resume figure is not what the disk will
+    /// hold once the sync finishes.
+    pub disk_required_mb: u64,
     /// Size of the datadir in MB (cached, refreshed ≤ every 60 s).
     pub datadir_size_mb: u64,
     /// The datadir path (Settings display).
@@ -1497,6 +1680,21 @@ pub struct NodeStatusInfo {
     pub setup_complete: bool,
     /// Keep-awake toggle state.
     pub keep_awake: bool,
+    /// Whether "keep awake" does anything on this build. The guard is an inert
+    /// zero-sized value off macOS, so on Linux and Windows this switch was
+    /// shown, defaulted ON, and prevented nothing — and toggling it off and
+    /// back on, the obvious recovery, also did nothing and still returned Ok.
+    pub keep_awake_supported: bool,
+    /// What this platform calls the place a closed window keeps running: the
+    /// "menu bar" on macOS, the "system tray" everywhere else.
+    ///
+    /// The copy said "menu bar" unconditionally - in the first-run pitch, the
+    /// close dialog, the close-behaviour setting and a button label. On Windows
+    /// and Linux that is a place the user does not have, in a dialog asking
+    /// them to choose it. The frontend has no platform signal of its own, so
+    /// the noun is supplied here and swapped into the sentence rather than the
+    /// sentences being duplicated per platform.
+    pub tray_term: String,
     /// Explorer mode (txindex) — the persisted user choice.
     pub txindex_enabled: bool,
     /// Attestation serving (`matmulattestationserve=1`) — the persisted user
@@ -1508,6 +1706,34 @@ pub struct NodeStatusInfo {
     /// silently degraded to the live window, or not serving at all. `None`
     /// until the refresher has completed one tick.
     pub archive_service: Option<btx_core::frontier::ArchiveService>,
+    /// The same verdict as one sentence for a human, and whether it is the
+    /// state that deserves attention.
+    ///
+    /// Carried BESIDE the tagged enum rather than inside it, on purpose. The
+    /// enum's wire shape is pinned field-by-field by a test in btx-core, and
+    /// the sentences live in `ArchiveService::message()` — so shipping the
+    /// rendered string keeps the copy in one place instead of growing a second
+    /// copy in TypeScript that drifts from the first.
+    pub archive_service_message: Option<String>,
+    pub archive_service_needs_attention: bool,
+    /// The nickname the user has chosen (empty = none). This is what WILL be
+    /// broadcast; `subversion` below is what IS.
+    pub node_nickname: String,
+    /// Our user agent exactly as peers see it, e.g. `/BTX:0.34.6(alice)/`.
+    /// `None` when the node is not running or did not answer. Shown rather than
+    /// derived, because btxd builds this once at init: a nickname set after the
+    /// node started is not live until the next start, and the honest way to say
+    /// that is to display the real string beside the setting.
+    pub subversion: Option<String>,
+    /// The nickname btxd is broadcasting RIGHT NOW, parsed out of `subversion`.
+    /// `None` when the node is down, has not answered, or carries no comment.
+    /// This, not `node_nickname`, is what "you are X" must be rendered from: a
+    /// name saved on a running node is not on the wire until the next start,
+    /// and a name cleared on a running node is still on it.
+    pub broadcast_nickname: Option<String>,
+    /// Nicknames of the peers we are connected to. Untrusted display text
+    /// chosen by strangers — filtered and capped by `btx_core::nickname`.
+    pub peer_nicknames: Vec<String>,
     /// The local service report (`service-report.json` in the datadir) — the
     /// persisted user choice. Local file only; nothing is uploaded.
     pub service_report_enabled: bool,
@@ -1604,7 +1830,8 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         btx_core::platform::home_dir().unwrap_or_else(|| PathBuf::from("."))
     };
     let disk_free_mb = btx_core::disk::free_disk_mb(&disk_probe);
-    // Heavy (recursive walk of a ~50 GB tree): refresh at most once a minute,
+    // Heavy (recursive walk of a ~124 GiB tree on a full node): refresh at most
+    // once a minute,
     // OFF the async executor (spawn_blocking) and WITHOUT holding the cache
     // lock during the walk — a cold-cache walk can take seconds and would
     // otherwise stall every concurrent status poll behind the mutex.
@@ -1665,40 +1892,57 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         (None, false)
     };
 
-    // Cheap counter read on a live node; skipped entirely when stopped. Any
-    // failure degrades to None so a node that does not answer simply drops the
-    // claim rather than reporting a zero it never earned.
-    let bytes_sent = if running {
-        let guard = state.rpc.lock().await;
-        match guard.as_ref() {
-            Some(rpc) => btx_core::node_api::get_net_totals(rpc)
-                .await
-                .ok()
-                .map(|t| t.total_bytes_sent),
-            None => None,
-        }
+    // Take a CLONE of the handle and drop the guard before any await. Holding
+    // `state.rpc` across a network round-trip is what every other call site in
+    // this file avoids (ask.rs, wallet.rs, and the refresher below all clone
+    // first), and this was the one place that did not: two of these blocks in
+    // a row each held the shared mutex across an RPC whose timeout is 60 s.
+    // A btxd that accepts the connection and never answers therefore froze the
+    // dashboard on stale numbers and starved the refresher that is supposed to
+    // notice and say "The node stopped responding."
+    let rpc = if running {
+        state.rpc.lock().await.clone()
     } else {
         None
     };
 
-    // Same shape and the same degrade-to-None discipline as bytes_sent above.
-    let inbound_peers = if running {
-        let guard = state.rpc.lock().await;
-        match guard.as_ref() {
-            Some(rpc) => btx_core::node_api::get_connection_counts(rpc)
-                .await
-                .ok()
-                .map(|c| c.inbound),
-            None => None,
-        }
-    } else {
-        None
+    // Cheap counter read on a live node; skipped entirely when stopped. Any
+    // failure degrades to None so a node that does not answer simply drops the
+    // claim rather than reporting a zero it never earned.
+    let bytes_sent = match rpc.as_ref() {
+        Some(rpc) => btx_core::node_api::get_net_totals(rpc)
+            .await
+            .ok()
+            .map(|t| t.total_bytes_sent),
+        None => None,
     };
+
+    // Same shape and the same degrade-to-None discipline as bytes_sent above.
+    // The whole struct is kept because `subversion` rides along on the same
+    // getnetworkinfo — showing a user exactly what the network sees them as
+    // therefore costs no extra RPC.
+    let net = match rpc.as_ref() {
+        Some(rpc) => btx_core::node_api::get_connection_counts(rpc).await.ok(),
+        None => None,
+    };
+    let inbound_peers = net.as_ref().map(|c| c.inbound);
+    let subversion = net.map(|c| c.subversion).filter(|s| !s.is_empty());
+
+    // Read the frontier verdict ONCE: the payload carries the tagged value for
+    // machines and the rendered sentence for people, and taking the lock twice
+    // could ship two different ticks in one status.
+    let archive_service = state.archive_service.lock().await.clone();
 
     // Archive-peer census for the trusted-mirror health card: served from the
     // refresher's per-tick cache (≤3 s old) instead of running a second full
     // getpeerinfo on every ~1.5 s UI poll. Same degrade-to-None discipline as
     // bytes_sent: no measurement, no claim.
+    let peer_nicknames = if running {
+        state.peer_nicknames_cache.lock().await.clone()
+    } else {
+        Vec::new()
+    };
+
     let archive_peers = if running {
         state.archive_peers_cache.lock().await.clone()
     } else {
@@ -1714,6 +1958,11 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         disk_free_mb,
         disk_warn_mb: btx_core::disk::NODE_DISK_WARN_MB,
         disk_critical_mb: btx_core::disk::NODE_DISK_CRITICAL_MB,
+        disk_required_mb: btx_core::setup::disk_required(
+            true,
+            btx_core::installer::conf_for_profile(&settings.node_profile, NODE_RELEASE_TAG)
+                != btx_core::installer::NODE_FASTSTART_CONF,
+        ) / (1024 * 1024),
         datadir_size_mb,
         datadir: datadir.display().to_string(),
         // setup_complete implies provisioned binaries; the recursive
@@ -1723,9 +1972,25 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         node_tag: tag,
         setup_complete: settings.setup_complete,
         keep_awake: settings.keep_awake,
+        keep_awake_supported: btx_core::power::sleep_assertion_supported(),
+        tray_term: if cfg!(target_os = "macos") {
+            "menu bar".to_string()
+        } else {
+            "system tray".to_string()
+        },
         txindex_enabled: settings.txindex_enabled,
         attestation_serve_enabled: settings.attestation_serve_enabled,
-        archive_service: state.archive_service.lock().await.clone(),
+        archive_service: archive_service.clone(),
+        archive_service_message: archive_service.as_ref().map(|a| a.message()),
+        node_nickname: settings.node_nickname.clone(),
+        broadcast_nickname: subversion
+            .as_deref()
+            .and_then(btx_core::nickname::nickname_from_subver),
+        subversion,
+        peer_nicknames,
+        archive_service_needs_attention: archive_service
+            .as_ref()
+            .is_some_and(|a| a.needs_attention()),
         service_report_enabled: settings.service_report_enabled,
         wallet_enabled: settings.wallet_enabled,
         on_close: settings.on_close.clone(),
@@ -1811,21 +2076,33 @@ async fn run_setup_pipeline(app: &AppHandle, state: &State<'_, AppState>) -> Res
         &format!("setup started (app v{})", env!("CARGO_PKG_VERSION")),
     );
 
-    // 1. Disk preflight. Fresh install (no chain yet) needs the full ~18 GiB;
-    //    a resume only operating headroom. "Unknown" free space never blocks.
+    // 1. Disk preflight. A fresh install (no chain yet) must fit the whole
+    //    un-pruned chain, so it gates on DISK_REQUIRED_FRESH; a resume needs only
+    //    operating headroom. Do NOT restate the chain size here — this comment
+    //    carried the pre-2026-07 18 GiB figure long after the gate moved. The
+    //    number, its date and its method live on the constant.
+    //    "Unknown" free space never blocks.
     let fresh = !datadir.join("blocks").exists();
-    let required = if fresh {
-        DISK_REQUIRED_FRESH
-    } else {
-        DISK_REQUIRED_RESUME
-    };
+    // Which chain are we about to provision? The gate has to read the same
+    // inputs as the conf that gets written twenty lines below, or it judges an
+    // install nobody asked for. It used to gate every fresh install on the full
+    // un-pruned chain while writing `prune=10000` for a keeper — refusing a
+    // ~10 GiB node for want of 140 GiB, on the tier this network is shortest of
+    // and which the app's own copy calls exactly that. The settings gear is in
+    // the global header, outside the wizard screen, so a first-run user can and
+    // does choose Keeper before pressing Install.
+    let pruned = btx_core::installer::conf_for_profile(
+        &NodeAppSettings::load(&datadir).node_profile,
+        NODE_RELEASE_TAG,
+    ) != btx_core::installer::NODE_FASTSTART_CONF;
+    let required = btx_core::setup::disk_required(fresh, pruned);
     if let Some(free) = free_disk_bytes(&datadir) {
         if !enough_free_disk(free, required) {
-            let need_gb = required / (1024 * 1024 * 1024);
-            let free_gb = free / (1024 * 1024 * 1024);
+            let need_gib = required / (1024 * 1024 * 1024);
+            let free_gib = free / (1024 * 1024 * 1024);
             return Err(format!(
-                "Not enough free disk space: the node needs about {need_gb} GB \
-                 and this volume has {free_gb} GB free. Free up some space, then try again."
+                "Not enough free disk space: the node needs about {need_gib} GiB \
+                 and this volume has {free_gib} GiB free. Free up some space, then try again."
             ));
         }
     }
@@ -1902,16 +2179,24 @@ async fn run_setup_pipeline(app: &AppHandle, state: &State<'_, AppState>) -> Res
 
 // ── Start / stop ────────────────────────────────────────────────────────────
 
-#[tauri::command]
-pub async fn start_node(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    if state.rpc.lock().await.is_some() {
-        return Ok(()); // already running
-    }
-    let result = start_node_inner(&app, &state).await;
+/// `start_node_inner`, with a failure projected into [`NodePhase::Error`].
+///
+/// Use this from EVERY path that restarts the node. `set_phase` is documented
+/// as the single writer of the phase, and a start that fails without writing
+/// one leaves whatever was there before standing — which for the restart paths
+/// meant `Stopped` at best and a green `Ready { height, peers }` over a dead
+/// RPC at worst. Both control surfaces key on the phase (the tray's Start/Stop
+/// and the window's own button), so a failure that writes nothing disables the
+/// two places a user would go to recover.
+pub async fn start_node_projected(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+) -> Result<(), String> {
+    let result = start_node_inner(app, state).await;
     if let Err(msg) = &result {
         set_phase(
-            &app,
-            &state,
+            app,
+            state,
             NodePhase::Error {
                 message: msg.clone(),
             },
@@ -1919,6 +2204,30 @@ pub async fn start_node(app: AppHandle, state: State<'_, AppState>) -> Result<()
         .await;
     }
     result
+}
+
+/// Stop the node and start it again, leaving the phase truthful at every step.
+///
+/// The intermediate `Stopped` matters: without it an early bail inside the start
+/// leaves the pre-stop `Ready { height, peers }` standing over an RPC that is
+/// now `None`, which renders as a green LIVE readout on a node that is not
+/// running. Callers that bounce the node for a config change should use this
+/// rather than open-coding stop-then-start.
+pub async fn restart_node_projected(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+) -> Result<(), String> {
+    stop_node_inner(state).await;
+    set_phase(app, state, NodePhase::Stopped).await;
+    start_node_projected(app, state).await
+}
+
+#[tauri::command]
+pub async fn start_node(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if state.rpc.lock().await.is_some() {
+        return Ok(()); // already running
+    }
+    start_node_projected(&app, &state).await
 }
 
 #[tauri::command]
@@ -1956,6 +2265,89 @@ pub async fn set_attestation_serve(on: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Which conf the engine-upgrade path writes: the selected profile's when the
+/// disk can take it, otherwise the posture the datadir already has. `None`
+/// means there is no safe conf and the engine must not be re-provisioned this
+/// start. Pure, so the four corners are tested rather than trusted.
+///
+/// Selecting keeper is always honoured: pruning frees disk, it never needs
+/// any. The only refused change is un-pruning a pruned datadir without the
+/// room to hold the chain; and if the engine being installed cannot keep a
+/// datadir pruned at all (the keeper gate says no), there is no conf that is
+/// both safe and affordable, so nothing is written.
+pub fn upgrade_conf_choice(
+    selected: &'static str,
+    was_pruned: Option<bool>,
+    disk_ok: bool,
+) -> Option<&'static str> {
+    let selected_pruned = selected != btx_core::installer::NODE_FASTSTART_CONF;
+    if disk_ok || selected_pruned {
+        return Some(selected);
+    }
+    match was_pruned {
+        Some(true) => {
+            let keep = btx_core::installer::conf_for_profile("keeper", NODE_RELEASE_TAG);
+            if keep == btx_core::installer::NODE_FASTSTART_CONF {
+                None
+            } else {
+                Some(keep)
+            }
+        }
+        Some(false) => Some(btx_core::installer::NODE_FASTSTART_CONF),
+        None => None,
+    }
+}
+
+/// The nickname a persisted setting is allowed to put in the conf, or `None`
+/// to leave the key untouched. Pure: this is the whole reason a settings value
+/// cannot reach `faststart.conf` without passing the same validator the
+/// Settings box uses, on the path that runs unattended on every start.
+pub fn conf_nickname(setting: &str) -> Option<String> {
+    match btx_core::nickname::validate_nickname(setting) {
+        Ok(Some(n)) => Some(n),
+        _ => None,
+    }
+}
+
+/// Set (or clear) the public nickname other nodes see.
+///
+/// Writes `uacomment` into the conf and persists the choice. It applies at the
+/// next node start, like every other conf-level setting — btxd builds its user
+/// agent once at init and there is no RPC to change it live.
+///
+/// Returns the CLEANED value so the settings box can show what was actually
+/// stored: outer whitespace trimmed, inner runs collapsed. An invalid nickname
+/// is refused with a sentence the UI can print verbatim, and nothing is written
+/// — which matters more than usual here, because btxd fails to start on a
+/// comment it rejects, so a bad value would turn a cosmetic setting into a node
+/// that will not come back up.
+#[tauri::command]
+pub async fn set_node_nickname(name: String) -> Result<String, String> {
+    let cleaned = btx_core::nickname::validate_nickname(&name)
+        .map_err(|e| e.message())?
+        .unwrap_or_default();
+
+    let datadir = node_datadir();
+    NodeAppSettings::update(&datadir, |s| s.node_nickname = cleaned.clone());
+
+    let conf = datadir.join("faststart").join("faststart.conf");
+    if conf.exists() {
+        // An empty nickname REMOVES the key rather than writing `uacomment=`,
+        // which btxd would read as an empty comment and render as `()`.
+        btx_core::setup::set_conf_kv(
+            &conf,
+            "uacomment",
+            if cleaned.is_empty() {
+                None
+            } else {
+                Some(cleaned.as_str())
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(cleaned)
+}
+
 /// Turn the local service report on or off.
 ///
 /// It writes `service-report.json` into the datadir every ~5 minutes and does
@@ -1980,6 +2372,29 @@ pub async fn set_node_profile(profile: String) -> Result<(), String> {
         return Err(format!("unknown profile: {profile}"));
     }
     let datadir = node_datadir();
+    // Say it NOW, at the moment of choosing, rather than at the next upgrade:
+    // going Full on a pruned datadir means holding the whole chain, and a
+    // choice the disk cannot honour should be refused where the person can
+    // see it, not deferred into a log line months later.
+    if profile == "full" {
+        let conf_path = datadir.join("faststart").join("faststart.conf");
+        let need = btx_core::setup::disk_required_for_conf(
+            datadir.join("blocks").exists(),
+            btx_core::setup::conf_is_pruned(&conf_path),
+            false,
+        );
+        if let Some(free) = free_disk_bytes(&datadir) {
+            if !enough_free_disk(free, need) {
+                let gib = 1024 * 1024 * 1024;
+                return Err(format!(
+                    "A full node needs about {} GiB free to hold the whole chain, and this \
+                     volume has {} GiB. Free some space first, or stay a keeper.",
+                    need / gib,
+                    free / gib
+                ));
+            }
+        }
+    }
     NodeAppSettings::update(&datadir, |s| {
         // Keeper implies serving — that is the profile's point. Choosing full
         // again does NOT clear a separately-made serve choice.
@@ -2011,6 +2426,91 @@ pub async fn set_keep_awake(state: State<'_, AppState>, on: bool) -> Result<(), 
     Ok(())
 }
 
+/// Who owns the node on this datadir, from this app's point of view. The one
+/// question the destructive commands need answered, and the one that
+/// `state.rpc.is_some()` answered WRONG: in attach mode that slot holds the
+/// other app's client, so the old check passed precisely when the datadir
+/// belonged to somebody else. And `stop_node_inner` is not a no-op there: it
+/// gracefully stops and then force-kills the attached node before the delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeOwnership {
+    /// We spawned it. Stop it, then proceed.
+    OurChild,
+    /// Our previous instance's orphan, adopted after a self-update relaunch.
+    /// Ours: the stop path handles it and the delete is ours to make.
+    OurAdoptedOrphan,
+    /// The miner's, or another window's. Never stopped, never deleted under.
+    AnotherApp,
+    /// We are attached to a node nobody could classify. Not ours to touch.
+    AttachedToUnknown,
+    /// Our own child is up but has not answered RPC yet (a long rebuild).
+    Warming,
+    /// Nothing holds the datadir. Proceed.
+    Nobody,
+    /// We hold nothing, and a live btxd we did not start does.
+    ForeignLive,
+    /// We hold nothing, and something we cannot identify holds the pidfile.
+    ForeignUnknown,
+}
+
+/// The decision, pure so it can be tested for every variant. Refusals say who
+/// is in the way and what to do, because the previous wording blamed the miner
+/// for this app's own warming node.
+pub fn destructive_allowed(owner: NodeOwnership) -> Result<(), String> {
+    use NodeOwnership::*;
+    match owner {
+        OurChild | OurAdoptedOrphan | Nobody => Ok(()),
+        Warming => Err(
+            "the node is still starting up (this can take a while after an unclean shutdown), \
+             give it a moment and try again"
+                .to_string(),
+        ),
+        AnotherApp | ForeignLive => Err(
+            "Another app is running the node in this data folder, probably the easyBTX \
+             miner or a second copy of this app. Stop it first, then try again."
+                .to_string(),
+        ),
+        AttachedToUnknown | ForeignUnknown => Err(
+            "A node this app did not start is using this data folder and could not be \
+             identified. Stop it first, then try again."
+                .to_string(),
+        ),
+    }
+}
+
+/// Work out [`NodeOwnership`] from what this app knows, probing the datadir
+/// only when it holds nothing itself.
+async fn node_ownership(state: &AppState, datadir: &Path) -> NodeOwnership {
+    if let Some(attached) = *state.attached_to.lock().await {
+        return match attached {
+            AttachedTo::AnotherApp => NodeOwnership::AnotherApp,
+            AttachedTo::OurOrphan => NodeOwnership::OurAdoptedOrphan,
+            AttachedTo::Unknown => NodeOwnership::AttachedToUnknown,
+        };
+    }
+    if state.rpc.lock().await.is_some() {
+        // Not attached and RPC is up: we spawned it.
+        return NodeOwnership::OurChild;
+    }
+    let child_alive = state
+        .node
+        .lock()
+        .await
+        .as_mut()
+        .map(|c| c.child_has_exited() == Some(false))
+        .unwrap_or(false);
+    if child_alive {
+        return NodeOwnership::Warming;
+    }
+    match btx_core::node::datadir_holder(datadir).await {
+        DatadirHolder::Free => NodeOwnership::Nobody,
+        DatadirHolder::ManagedBtxd { .. } | DatadirHolder::OrphanedBtxd { .. } => {
+            NodeOwnership::ForeignLive
+        }
+        DatadirHolder::Unidentifiable { .. } => NodeOwnership::ForeignUnknown,
+    }
+}
+
 /// Reclaim disk: bounce the node if needed, strip the unused indexes + the
 /// (post-load) snapshot + cap debug.log, then bring the node back. Mirrors the
 /// miner's reclaim semantics — deleting LevelDB dirs under a LIVE btxd can
@@ -2022,7 +2522,12 @@ pub async fn reclaim_disk_now(
 ) -> Result<btx_core::disk::ReclaimReport, String> {
     let datadir = node_datadir();
     let conf_path = datadir.join("faststart").join("faststart.conf");
-    let was_running = state.rpc.lock().await.is_some();
+    let owner = node_ownership(&state, &datadir).await;
+    destructive_allowed(owner)?;
+    let was_running = matches!(
+        owner,
+        NodeOwnership::OurChild | NodeOwnership::OurAdoptedOrphan
+    );
 
     if was_running {
         stop_node_inner(&state).await;
@@ -2045,7 +2550,7 @@ pub async fn reclaim_disk_now(
         .unwrap_or_else(|e| e.into_inner()) = (0, None);
 
     if was_running {
-        start_node_inner(&app, &state).await?;
+        start_node_projected(&app, &state).await?;
     }
     Ok(report)
 }
@@ -2138,7 +2643,7 @@ pub async fn node_footprint(state: State<'_, AppState>) -> Result<NodeFootprint,
 
 #[cfg(test)]
 mod tests {
-    use super::{pre_launch_plan, PreLaunchPlan};
+    use super::{pre_launch_plan, PreLaunchPlan, NODE_RELEASE_TAG};
     use btx_core::node::DatadirHolder;
 
     // The four things `<datadir>/btxd.pid` can turn out to mean, named so the
@@ -2327,6 +2832,98 @@ mod tests {
         );
     }
 
+    /// The keeper gate is a DENYLIST, so a pin bump silently changes its answer.
+    /// It answered NO for v0.33.3-pr105b, the docs said so in the present tense,
+    /// and when the pin moved to v0.34.5 the answer flipped to YES with nothing
+    /// recording that anyone decided it. Assert the value this release intends,
+    /// so the next bump has to look at this line.
+    #[test]
+    fn the_upgrade_path_never_unprunes_a_datadir_the_disk_cannot_hold() {
+        use super::upgrade_conf_choice;
+        use btx_core::installer::{NODE_FASTSTART_CONF, NODE_KEEPER_CONF};
+        // Disk fine: the selected profile wins, whatever the datadir was.
+        assert_eq!(
+            upgrade_conf_choice(NODE_FASTSTART_CONF, Some(true), true),
+            Some(NODE_FASTSTART_CONF)
+        );
+        assert_eq!(
+            upgrade_conf_choice(NODE_KEEPER_CONF, Some(false), true),
+            Some(NODE_KEEPER_CONF)
+        );
+        // Selecting keeper never needs disk: honoured even when the disk is full.
+        assert_eq!(
+            upgrade_conf_choice(NODE_KEEPER_CONF, Some(false), false),
+            Some(NODE_KEEPER_CONF)
+        );
+        // Full selected, pruned datadir, no room: keep it pruned (the shipped
+        // engine admits the keeper conf, so there IS a safe conf).
+        assert_eq!(
+            upgrade_conf_choice(NODE_FASTSTART_CONF, Some(true), false),
+            Some(NODE_KEEPER_CONF)
+        );
+        // Full selected, already un-pruned, no room: nothing changes posture.
+        assert_eq!(
+            upgrade_conf_choice(NODE_FASTSTART_CONF, Some(false), false),
+            Some(NODE_FASTSTART_CONF)
+        );
+        // Full selected, unknown posture, no room: refuse rather than guess.
+        assert_eq!(upgrade_conf_choice(NODE_FASTSTART_CONF, None, false), None);
+    }
+
+    #[test]
+    fn destructive_ops_are_allowed_only_for_a_node_that_is_ours_or_nobodys() {
+        use super::{destructive_allowed, NodeOwnership::*};
+        for ok in [OurChild, OurAdoptedOrphan, Nobody] {
+            assert!(destructive_allowed(ok).is_ok(), "{ok:?}");
+        }
+        for refused in [
+            AnotherApp,
+            AttachedToUnknown,
+            Warming,
+            ForeignLive,
+            ForeignUnknown,
+        ] {
+            let msg = destructive_allowed(refused).unwrap_err();
+            assert!(!msg.is_empty(), "{refused:?}");
+        }
+        // The refusal for our own warming node must not blame the miner: that
+        // wording sent people to quit an app that was not running.
+        let warming = destructive_allowed(Warming).unwrap_err();
+        assert!(warming.contains("still starting up"), "{warming}");
+        assert!(!warming.contains("miner"), "{warming}");
+    }
+
+    #[test]
+    fn a_saved_nickname_reaches_the_conf_only_through_the_validator() {
+        use super::conf_nickname;
+        // The Settings box validates; this is the OTHER path, the one that
+        // runs on every start from a file anyone can edit.
+        assert_eq!(conf_nickname("alice").as_deref(), Some("alice"));
+        assert_eq!(conf_nickname("  alice  ").as_deref(), Some("alice"));
+        assert_eq!(conf_nickname(""), None);
+        // btxd refuses to START on these; they must never reach the conf.
+        assert_eq!(conf_nickname("rig/01"), None);
+        assert_eq!(conf_nickname("a(b)"), None);
+        assert_eq!(conf_nickname("a\nrpcallowip=0.0.0.0/0"), None);
+    }
+
+    #[test]
+    fn the_shipped_pin_makes_a_deliberate_keeper_decision() {
+        assert!(
+            btx_core::installer::engine_supports_keeper_profile(NODE_RELEASE_TAG),
+            "pin {NODE_RELEASE_TAG} no longer admits the keeper conf; if that is              intended, update this assertion and say so in the CHANGELOG"
+        );
+        // And the conf that follows from it, so the two cannot drift apart.
+        assert_eq!(
+            btx_core::installer::conf_for_profile("keeper", NODE_RELEASE_TAG),
+            btx_core::installer::NODE_KEEPER_CONF
+        );
+        assert_eq!(
+            btx_core::installer::conf_for_profile("full", NODE_RELEASE_TAG),
+            btx_core::installer::NODE_FASTSTART_CONF
+        );
+    }
+
     #[test]
     fn proc_stats_reads_our_own_process() {
         let (cpu, rss_kb) = super::proc_stats(std::process::id()).expect("stats for our own pid");
@@ -2339,7 +2936,8 @@ mod tests {
 }
 
 /// Remove the node's chain data entirely and return the app to the setup
-/// screen — the "give me my disk back" lever for a ~105 GB full chain.
+/// screen — the "give me my disk back" lever for a full chain measured at
+/// ~124 GiB (see setup.rs::MEASURED_CHAIN_PAYLOAD_GIB).
 /// Stops the node gracefully first, deletes the chain dirs (btx-core's
 /// remove_node_data: blocks/chainstate/indexes/faststart + debug.log — never
 /// wallets or the miner's state) plus the node's sidecar files, and resets
@@ -2351,6 +2949,10 @@ pub async fn remove_node_data_now(
     state: State<'_, AppState>,
 ) -> Result<btx_core::disk::ReclaimReport, String> {
     let datadir = node_datadir();
+    // Ownership first, before the stop: in attach mode stop_node_inner is NOT
+    // a no-op, it gracefully stops and then force-kills the attached node, so
+    // the order here is what keeps another app's btxd out of the delete.
+    destructive_allowed(node_ownership(&state, &datadir).await)?;
     stop_node_inner(&state).await;
 
     let report = {

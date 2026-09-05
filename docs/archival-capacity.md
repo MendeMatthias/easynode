@@ -4,7 +4,8 @@
 [always-on.md](always-on.md), which counted hash publishers; this counts the
 machines that can still hand you a block body. The disk section continues
 what PR #14 started in [always-on.md](always-on.md) — "roughly 10 GB for a
-keeper, more for a full archive" — by trying to put a number on "more".*
+keeper, more for a full archive" — and as of 2026-09-04 it has a measured number
+for "more": 123.8 GiB of block payload, method below.*
 
 ---
 
@@ -36,6 +37,53 @@ behind.
 So the network's archival capacity is not merely thin. Most of it is on the
 wrong side of a fork, and advertising `NETWORK` the whole time.
 
+### Say what "current" means, or you will get a different answer
+
+The census above did not define its currency threshold, and that is enough to
+change the headline. Re-run the same query at 23:5x UTC the same day, from
+height 210344 with 20 peers:
+
+| | |
+|---|---:|
+| peers connected | 20 |
+| advertise `NETWORK` | 12 |
+| `NETWORK` with zero headers synced to us | 10 |
+| archival and within 6 blocks | **0** |
+| archival and within 20 blocks | **1** |
+
+The one is `89.85.40.184` again, 10 blocks back. Nothing about the network
+changed between those two readings; only the threshold did. **Define it: a peer
+is current if `synced_headers` is within 20 of your own height**, which is about
+half an hour of chain at 90 s a block, and state your own height beside the
+count. A number without both is not reproducible.
+
+### The seed nodes were the ones behind
+
+The same reading, sorted by height, showed something the count hides. All three
+official seeds were stopped at the same height:
+
+| peer | version | headers | behind |
+|---|---|---:|---:|
+| 109.199.124.187 | `/BTX:0.34.6/` | 210344 | 0 |
+| 89.85.40.184 | `/BTX:0.34.5/` | 210334 | 10 |
+| `node.btx.dev` | `/BTX:0.34.5/` | 209476 | 868 |
+| `node.btxchain.org` | `/BTX:0.34.5/` | 209476 | 868 |
+| `node.btx.tools` | `/BTX:0.34.5/` | 209476 | 868 |
+| 20.86.181.203 | `/BTX:0.34.5/` | 209476 | 868 |
+| 195.137.245.82 | `/BTX:0.34.4/` | 209476 | 868 |
+
+Five peers stopped at *exactly* 209476, three of them the seeds a new node is
+handed on first run. Five nodes at one height is not five independent stalls,
+and 0.34.5 not being able to keep up is the documented behaviour of that engine
+(`docs/node-release-recipe.md`: 0.68 blocks/min against a chain producing 0.95,
+failing silently while reporting itself healthy).
+
+This is one sample from one peer set at one moment and it should be re-run
+before it is quoted. What it is evidence for is narrow and worth saying anyway:
+the peers a fresh install is pointed at were, at that moment, the ones furthest
+behind, and the only peer at the tip was running an engine that has no tag.
+
+
 This matches what it feels like in practice. This node sat 824 blocks behind for
 over an hour with no peer willing to serve a body; a single `addnode` to a known
 archival peer fixed it instantly. Since 0.34.6 the engine says so itself, in a
@@ -45,53 +93,134 @@ the answer is usually a peer, not a restart.
 
 ## What being archival costs
 
-Less than we thought, and the number that has been quoted was measuring the
-wrong directory.
+**123.8 GiB of block payload, measured 2026-09-04.** Call it 124 GiB, or about
+133 GB the way a file manager counts. This is the measurement the earlier draft
+of this document said it was missing, and it did not need the spare box and the
+several days that a full un-pruned sync was going to cost.
 
-The datadir on this box is 27 GB, and that figure has been repeated as "the
-pruned chain". It is not. Measured:
+It is also the opposite of the answer this document expected. It expected to
+find the install gate too strict and turning capable machines away. The gate was
+too loose.
+
+### How it was measured, because this number keeps moving
+
+BTX block sizes are **bimodal**. A block is either about 367 bytes or about
+1,049,000 bytes, and there is essentially nothing in between. The large mode is
+the MatMul PoW payload rather than transaction traffic — height 120000 is
+1,048,948 bytes and carries exactly one transaction. Any method that averages a
+coarse grid therefore invents blocks of an intermediate size that does not
+exist, which is one way this number has gone wrong before.
+
+So the estimator is not "mean block size". It is "what fraction of each height
+band is in the large mode", which is the only quantity that moves the total:
+
+| heights | mode | measured |
+|---|---|---|
+| 0 to ~47,000 | small | 366-367 B, 72 samples, no exceptions |
+| ~47,000 to ~63,000 | mixed | p(large) 0.175, 0.025, 0.375 over three bands, n=40 each |
+| ~63,000 to ~184,000 | large | ~1.05 MB, **245 samples, no exceptions** |
+| ~184,000 to ~189,000 | mixed | p(large) 0.300, n=40 |
+| ~189,000 to tip | small | 374-851 B, 32 samples, no exceptions |
+
+Three independent runs over different grids gave **123.5, 123.8 and 125.2 GiB**.
+The large region is at least 98.8 % saturated at 95 % confidence, so the error
+budget is roughly +/- 2 GiB and nearly all of it sits in the four transition
+bands.
+
+The source was `esplora.btxbyronbay.com`, and it was **validated before it was
+trusted** — hash for hash and byte for byte against this node, at every height
+this node still holds:
+
+| height | our node | explorer |
+|---|---|---|
+| 190000 | 300 | 300 |
+| 195000 | 390 | 390 |
+| 200000 | 367 | 367 |
+| 205000 | 395 | 395 |
+| 208000 | 383 | 383 |
+
+`scripts/measure-chain-size.py --validate` runs both halves in minutes. Do that
+rather than quoting this table in six months.
+
+One more thing the validator found once it was made able to fail (2026-09-05):
+at height 187661 this node holds a 378-byte block and the explorer serves a
+410-byte one. That is the orphan `verify-esplora.sh` already records Byron Bay
+keeping after a reorg, confirmed here by a second, independent tool. It cannot
+move a 124 GiB total by more than a few hundred bytes, and every height above
+190000 agreed exactly, so the measurement stands. But it is why `--validate` now
+refuses that source outright rather than averaging over it: a mirror wrong at
+one height is not one this tool will vouch for.
+
+### What the datadir costs on top of the blocks
+
+Measured on this box:
 
 | | |
 |---|---:|
-| `blocks/` (the live pruned chain, 25k blocks retained) | 284 MB |
+| block payload (the figure above) | 123.8 GiB |
+| block index (LevelDB, all 210k headers) | 56 MB |
+| undo data, all `rev*.dat` | ~10 MB |
 | `chainstate/` | 13 MB |
 | `shielded_state/` | 447 MB |
-| `engines/` | 960 MB |
-| `blocks.preadopt-1788268845/` | **26 GB** |
+| **datadir total, un-pruned** | **~124.3 GiB** |
+| `engines/` (the app's binaries, not chain data) | 960 MB |
 
-The 26 GB is a backup the node kept when it adopted a faststart snapshot: 202
-block files from an earlier full download, with the undo data essentially empty
-(202 `rev*.dat` totalling 9.2 MB, so those blocks were fetched but never
-connected). It is not the chain the node is running on, and nothing reads it.
+Undo data is small because most blocks carry one transaction. `debug.log` is the
+component that can surprise you, and `disk.rs` is the code that deals with it.
 
-It is tempting to read that 25 GB as the price of a full history, and this
-document said so in an earlier draft. It does not support that claim, for a
-reason visible in the same measurement: those blocks were downloaded and never
-connected, and the sync was abandoned in favour of a snapshot. A store that was
-never finished is not evidence of a finished store's size. BTX also keeps
-orphaned blocks, and it forks hard enough for that to matter — 638 competing
-branches were known to this node in a day.
+### The growth rate in the old comments is dead
 
-**The repository does not agree with itself here either**, which is worth fixing
-before anybody quotes any of it:
+`setup.rs` justified its headroom with "~1 MB blocks every 90 s grow it ~1 GB a
+day". That stopped being true at the fork. Blocks left the large mode around
+height 185,000, and the two block stores on this box are a census of either side
+of it:
 
-| where | what it says |
-|---|---|
-| `crates/btx-core/src/setup.rs:20` | chain measured **~105 GB** on 2026-07-12, from `size_on_disk` after a complete sync |
-| `crates/btx-core/src/setup.rs:25` | `DISK_REQUIRED_FRESH` = **120 GB**, the fresh-install gate |
-| `crates/btx-core/src/datadir.rs:4` | the chain is **~50 GB** un-pruned |
-| `apps/node/CHANGELOG.md:881` | about **105 GB** today, growing |
+| store | records | payload | mean | large |
+|---|---:|---:|---:|---:|
+| `blocks/`, 2026-08-10 to 2026-09-04 | 27,013 | 0.21 GiB | 8.4 kB | 0.5 % |
+| `blocks.preadopt-*`, 2026-03-19 to 2026-08-29 | 85,297 | 24.96 GiB | 314 kB | 29.3 % |
 
-105 and 50 cannot both be right, and the 105 GB one is the only one with a date
-and a method attached, so it is the one to trust until somebody re-measures.
+8.4 kB a block at 90 s is about **8 MB a day, not 1 GB a day** — a factor of
+125. Headroom on the install gate is for the chain that already exists, not for
+growth. Reproduce with `scripts/blockstore-census.py`, which walks the record
+framing rather than trusting `du` on preallocated files.
 
-That gate is the part that matters. `DISK_REQUIRED_FRESH` is 120 GB, so a fresh
-install is refused on any machine with less free space than that. If the real
-figure is nearer 50 GB — or nearer what this box suggests — then the app is
-turning away home machines that could comfortably run a node, which is the exact
-opposite of what this project is for. Nobody should adjust that constant from an
-inference. Somebody should run one unpruned sync to completion and read
-`size_on_disk`, and that is the measurement this document is missing.
+Note what the second row does **not** say. Those 85,297 records are 25 GiB of
+blocks that were downloaded and never connected, and they are still not evidence
+of a finished store's size. They are usable here only as a census of block
+*sizes* over a known time span, which is a different claim.
+
+### The repository no longer disagrees with itself
+
+| where | said | now |
+|---|---|---|
+| `commands.rs` preflight comment | "the full ~18 GiB" | cites the constant, states no size of its own |
+| `datadir.rs:4` | ~50 GB | ~124 GiB, dated, with a pointer here |
+| `setup.rs:20` | ~105 GB, 2026-07-12 | `MEASURED_CHAIN_PAYLOAD_GIB` = 124, 2026-09-04, with the method |
+| `setup.rs` `DISK_REQUIRED_FRESH` | 120 GiB | 140 GiB |
+| `always-on.md` | 138 GB | the measured figure |
+| this document | "roughly 30 GB" | ~124 GiB |
+| `CHANGELOG.md` 0.2.1 | ~105 GB | unchanged: it was true on 2026-07-12 and history is not rewritten |
+
+Those were the sites the audit named. Sweeping the rest turned up seven more
+comments still carrying the old figures — `esplora.rs`, `esplora-mode.md`, two
+in `commands.rs`, two in `state.rs`, one in `main.ts` — which is the reason this
+section says "no longer" rather than "never did". A claim that a repository
+agrees with itself is worth exactly as much as the grep behind it.
+
+One of those seven got better rather than merely correct. `esplora.rs` refused
+to quote any disk figure at all, on the grounds that the base was unsettled.
+The base is settled now, so the warning names it — and still declines a total,
+because nobody has measured the electrs index that sits on top. Saying which
+half is known beats both a confident total and a blanket "we don't know".
+
+The gate is the part that mattered. `DISK_REQUIRED_FRESH` was 120 GiB against a
+124 GiB chain, so **the gate had fallen below the thing it exists to gate**.
+That inverts its purpose: instead of refusing an install that could never
+finish, it waved through the install that fills the disk halfway. Nothing
+detected it, because nothing compared the two numbers. Now `setup.rs` carries
+the measurement as a constant and `disk_gate_covers_the_chain` fails the build
+if the gate is ever set below it.
 
 ## What we have not done
 
@@ -101,10 +230,19 @@ inference. Somebody should run one unpruned sync to completion and read
   one of very few current ones on the network. Not worth improvising on.
 - **Not switched this box to `prune=0`.** It advertises `NETWORK_LIMITED` today:
   it validates and signs, and does not serve history.
-- **Not measured a completed unpruned sync.** That is the one number that
-  would settle the table above and tell us whether the 120 GB install gate is
-  keeping capable machines out. It needs a spare box and a few days, not a
-  clever argument.
+- **Re-measuring is now scheduled, not remembered.** `.github/workflows/
+  chain-size-watch.yml` runs `measure-chain-size.py` on the 1st of every month
+  and `check-chain-size-gate.py` compares the result against the constants the
+  app ships: red if `MEASURED_CHAIN_PAYLOAD_GIB` has gone stale, red if
+  `DISK_REQUIRED_FRESH` no longer has working room above the chain. It skips,
+  not fails, when the explorer is down. This is the comparison that was missing
+  for eight weeks; the number was only ever going to drift again.
+- **Not read `size_on_disk` after a completed un-pruned sync.** The sampled
+  measurement above should be checked against one when a spare box exists. It
+  would also catch anything the sample cannot see: orphan blocks that a synced
+  node keeps and a height-indexed sample never visits. BTX forks hard enough for
+  that to be a real term — 638 competing branches were known to this node in a
+  day — so treat 124 GiB as a floor for a store that keeps them.
 - **Not re-run the census over time.** It is one sample from one node's peer
   set at one moment. BTX peer sets churn; treat the shape as the finding and
   re-measure the number before quoting it.
@@ -112,22 +250,25 @@ inference. Somebody should run one unpruned sync to completion and read
 ## Reproducing the census
 
 ```bash
-btx-cli -datadir=<datadir> getpeerinfo \
-  | python3 -c 'import sys,json;ps=json.load(sys.stdin);
-n=[p for p in ps if "NETWORK" in p.get("servicesnames",[])];
-print(len(ps),"peers,",len(n),"archival")'
+python3 scripts/archival-census.py --datadir ~/.easybtx
+python3 scripts/archival-census.py --datadir ~/.easybtx --within 6 --json
 ```
 
-Compare each peer's `synced_headers` against your own `getblockcount`: a peer
-whose headers are far from your tip advertises history it cannot help you with.
+It prints your own height, the service split, how many `NETWORK` peers have
+synced no headers with you at all, and the archival-and-current count under an
+explicit threshold. Both numbers matter: a peer advertising `NETWORK` with
+`synced_headers` far from your tip is advertising history it cannot help you
+with, and on this network most of them are.
 
 ## Why this is in the easyNode repository
 
 Because it is a fleet question before it is an ops question. easyNode decides
 what a machine advertises, and right now every easyNode installation is
 `NETWORK_LIMITED`. If the app offered "keep the whole chain" as a deliberate,
-costed choice — roughly 30 GB, shown honestly before it is switched on — the
-scarcest resource on this network is one a home machine can actually supply.
+costed choice — about 124 GiB today, shown honestly before it is switched on —
+then the scarcest resource on this network is one a home machine can actually
+supply. That cost is real, and four times what an earlier draft of this page
+guessed, which is exactly why it has to be shown rather than defaulted on.
 
 That is a product decision and a consent decision, not something to default on.
 It is written down here so it can be decided rather than rediscovered.

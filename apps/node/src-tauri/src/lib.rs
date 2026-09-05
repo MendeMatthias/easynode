@@ -20,7 +20,6 @@ use crate::state::{node_datadir, AppState, NodeAppSettings, NodePhase};
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
@@ -37,6 +36,7 @@ pub fn run() {
             commands::set_keep_awake,
             commands::set_node_profile,
             commands::set_attestation_serve,
+            commands::set_node_nickname,
             commands::set_service_report,
             commands::reclaim_disk_now,
             commands::node_footprint,

@@ -11,6 +11,103 @@ root).
 Nothing here has shipped to a user yet. The app version is still 0.6.17 and the
 updater feed still points at it; this section is what a 0.6.18 would carry.
 
+**The install now asks for enough disk to finish.** The free-space check was
+set at 120 GiB from a chain that measured about 105 GB in July. The chain has
+grown since, and nothing re-checked, so the gate had quietly fallen **below the
+chain it exists to gate** — it stopped refusing installs that could never finish
+and started waving through installs that fill the disk halfway, which is the
+failure it was raised to prevent. The chain is now measured at **123.8 GiB of
+blocks** (2026-09-04) and the gate is 140 GiB. If you were going to run out of
+space, you now find out before the download instead of during it.
+
+The measurement is in `docs/archival-capacity.md` with its method, and
+`scripts/measure-chain-size.py` re-runs it in minutes, because this number has
+been wrong in the repository in both directions and the only defence is that
+re-measuring is cheap. A test now fails the build if the gate is ever set below
+the measured chain again. The disk message also says GiB where it was dividing
+by 1024 and printing "GB", which was making the app understate what it wanted by
+about 7%.
+
+Growth is not what it was, either: blocks left the ~1 MB MatMul mode around
+height 185,000, and since 2026-08-10 the measured average is 8.4 kB a block —
+about 8 MB a day, where the old comments claimed 1 GB a day.
+
+**Your node can have a name.** Settings has a nickname field. Set one and the
+nodes you connect to see `/BTX:0.34.5(yourname)/` instead of an anonymous
+`/BTX:0.34.5/` — the same idea as worker names in the miner, and the first
+actual mechanism behind the recognition this project offers instead of payment.
+The status screen lists the names of peers you are connected to, when they have
+them; today nobody on the network does, so easyNode's will be the first.
+
+It is off by default and it is public: a name follows your node across restarts
+and IP changes, which is what makes it recognisable and why it is a choice. The
+box takes letters, numbers, spaces, dots, dashes and underscores, up to 24
+characters, and refuses anything else rather than writing it — a name the engine
+dislikes does not get ignored, it stops the node starting. Settings shows the
+real user agent your peers are seeing, so you can tell the difference between a
+name you have saved and a name that is live: it applies at the next node start.
+
+**A wallet import can no longer point you at the wrong wallet.** If the default
+name is already taken by a different wallet, your import goes in beside it — and
+the code only adopted that new name when the call *succeeded*. But a wallet.dat
+rescan takes hours and the call gives up after a minute, so failing is the normal
+outcome; the app then checked whether the **old** wallet existed, found that it
+did (of course it did), and showed you that one. You would have been looking at
+somebody else's empty balance while your keys sat safely in the wallet next to
+it. Fixed on both import paths.
+
+**The update banner can admit it failed.** A Linux `.deb` cannot be replaced by
+the built-in updater at all, and the failure was swallowed: the banner said
+"Update available — downloading…" at every launch, forever. It now tells you
+plainly that the automatic update could not install and where to get the build.
+A failed check still stays quiet, because being offline is normal.
+
+**Your balance stops going stale after a send.** One successful send latched the
+wallet into keeping the last screen it had, so a stopped node kept showing the
+old balance under "verified by your node" for the rest of the session.
+
+**The send form prints a number it will actually accept.** "Ready to spend" was
+rounded up, so typing exactly the figure the wallet showed you could be rejected
+as spending too much — and the rejection quoted the same rounded number back.
+
+**Keeper mode is installable again on a normal laptop.** The free-space check
+ignored which profile you had chosen and demanded room for the whole chain even
+when it was about to install a ~10 GB pruned node. Choosing Keeper on the setup
+screen and being refused for 140 GiB was the single most confusing way to meet
+the tier the network is shortest of. The setup screen's "Disk needed" now shows
+the figure for the profile you picked, too: 20 GiB for a keeper, instead of
+quoting the full node's 140 to everyone.
+
+**The app stops calling it a menu bar on machines that do not have one.** The
+first-run pitch, the close dialog, the close-behaviour setting and a button all
+said "menu bar" — macOS's word — while asking Windows and Linux users to choose
+a place they do not have. It now uses whatever your system calls it.
+
+**Switching to a full node checks your disk first.** Going from Keeper to Full
+means holding the whole chain, and the app used to accept the switch and then
+write it into place silently at the next engine update — so a keeper who had
+25 GB free could find their node quietly trying to download 124 GiB. Settings
+now refuses the switch on the spot if the disk cannot hold it, and an engine
+update never changes your node's prune posture unless there is room for it.
+
+**Reclaim and Remove data now check whether something else is using your data
+folder** — the miner, or a second copy of the app — and refuse instead of
+deleting out from under a running node.
+
+**"Keep computer awake" no longer pretends.** Off macOS it never did anything,
+while being shown, switched on, and silently doing nothing when you toggled it.
+It now says so, and points at your system's own sleep settings.
+
+**Settings shows what your node is really providing.** A node can advertise that
+it serves history while quietly having stopped, and nothing said so. That verdict
+was computed but never displayed; it now sits next to the switch that controls
+it, in amber when it needs you.
+
+Under the hood: the config file that launches your node, and the file holding
+your settings, are now written so they cannot end up half-written; a failed
+restart can no longer leave both Start buttons disabled; and the dashboard no
+longer freezes when the node accepts a connection and then stops answering.
+
 **The node now says what it is actually providing to the network.**
 `crates/btx-core/src/frontier.rs` could always answer that question and nothing
 called it: the signed frontier was read only from inside the stall watchdog, on
@@ -24,7 +121,8 @@ that serve attestations at all.
 **The local service report can be switched on.** It was read on every tick and
 written by nothing, so it could not be enabled. It writes `service-report.json`
 into your data folder every few minutes and does nothing else — no network, no
-upload, no identifier. **Nothing phones home** remains true with it on, which is
+upload — it records only what this node has served, plus the public nickname
+if you set one. **Nothing phones home** remains true with it on, which is
 why it is worded that way in Settings.
 
 **A prune posture that survives an old datadir.** btxd loads the datadir's

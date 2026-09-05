@@ -97,7 +97,8 @@ pub struct NodeAppSettings {
     /// default.
     #[serde(default)]
     pub service_report_enabled: bool,
-    /// Which node this app runs: "full" (whole chain, ~105 GB) or "keeper"
+    /// Which node this app runs: "full" (whole chain, ~124 GiB measured
+    /// 2026-09-04) or "keeper"
     /// (pruned ~10 GB, serves signed confirmations). The CHOICE persists here;
     /// whether the keeper conf actually activates is the engine gate
     /// (`installer::conf_for_profile`) — an old bundled btxd provisions the
@@ -105,6 +106,18 @@ pub struct NodeAppSettings {
     /// update. Default "full": existing installs keep exactly their behavior.
     #[serde(default = "default_profile")]
     pub node_profile: String,
+    /// Optional public nickname, broadcast to every peer as the user agent
+    /// comment: `/BTX:0.34.6(yourname)/`. Empty = no nickname, which is the
+    /// default and must stay the default.
+    ///
+    /// This is the one setting in this struct that OTHER PEOPLE can see. It is
+    /// a persistent public identifier that follows the node across restarts and
+    /// IP changes, so it is opt-in, easy to clear, and the UI says what it does
+    /// before it is set rather than after. Validation lives in
+    /// `btx_core::nickname`, deliberately stricter than btxd's, because btxd
+    /// refuses to START on a comment it does not like.
+    #[serde(default)]
+    pub node_nickname: String,
 }
 
 fn default_on_close() -> String {
@@ -134,6 +147,9 @@ impl Default for NodeAppSettings {
             attestation_serve_enabled: false,
             service_report_enabled: false,
             node_profile: default_profile(),
+            // No nickname. Anything else would publish an identifier the user
+            // never chose to publish.
+            node_nickname: String::new(),
         }
     }
 }
@@ -150,7 +166,11 @@ impl NodeAppSettings {
         std::fs::create_dir_all(datadir)?;
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        std::fs::write(datadir.join(SETTINGS_FILE_NAME), json)
+        // Atomic. `load` maps any unreadable or unparseable file to defaults,
+        // so a torn settings file does not fail loudly — it silently resets
+        // every choice the user has made, including which wallet the panel
+        // points at and whether the node serves at all.
+        btx_core::fsx::atomic_write(&datadir.join(SETTINGS_FILE_NAME), json.as_bytes())
     }
 
     /// Load-modify-save under the settings lock.
@@ -213,7 +233,21 @@ pub enum NodePhase {
         peers: i64,
     },
     /// Node running at/near the tip — helping the network.
-    Ready { height: u64, peers: i64 },
+    ///
+    /// `blocks_behind` is how far the active chain trails the best header we
+    /// know about. It is carried because "near tip" is a BOOLEAN with no lag
+    /// term in it: `sync_readiness` returns NearTip the moment a snapshot
+    /// chainstate loads at the anchor, and the anchor is a fixed height in a
+    /// shipped release. On a fresh install the badge therefore flips to LIVE
+    /// while the node is still thousands of blocks short, and stays there while
+    /// it grinds. The verdict is not changed here — that is a product decision
+    /// about what "ready" means — but the number is no longer withheld from the
+    /// screen that claims it.
+    Ready {
+        height: u64,
+        peers: i64,
+        blocks_behind: u64,
+    },
     /// Node deliberately stopped by the user.
     Stopped,
     /// Something failed; message is plain-language and actionable.
@@ -237,7 +271,7 @@ pub struct AppState {
     pub started_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// Held while the node runs && keep_awake is on.
     pub sleep_guard: std::sync::Mutex<Option<SleepAssertion>>,
-    /// Cached datadir size (MB, last measured) — a recursive walk of a ~50 GB
+    /// Cached datadir size (MB, last measured) — a recursive walk of a ~124 GiB
     /// tree is too heavy for the status poll, so it refreshes at most once a
     /// minute, off-thread (see get_node_status). Arc so the walk task can
     /// write the result back without borrowing AppState.
@@ -246,6 +280,21 @@ pub struct AppState {
     pub size_walk_running: Arc<AtomicBool>,
     /// Guards against two concurrent setup pipelines (double-click).
     pub setup_running: Arc<AtomicBool>,
+    /// True while `start_node_inner` is running. The double-spawn guard keys
+    /// on a live child in `state.node`, and there is none for the whole window
+    /// between a stop and the next spawn, during which `Stopped` is an
+    /// actionable phase on both surfaces: a second Start (tray, button,
+    /// explorer toggle) could enter the same start sequence and race the first
+    /// for `btxd.pid`. Held through a drop guard, so a panicking start releases
+    /// it instead of wedging every later one.
+    pub start_in_flight: Arc<AtomicBool>,
+    /// Who the node we ATTACHED to belongs to, when we attached rather than
+    /// spawned. `None` whenever the node in `state.rpc` is our own child or
+    /// there is none. Set on the Attach plan, cleared on every spawn and on
+    /// stop. The destructive commands read this: `state.rpc.is_some()` was the
+    /// wrong proxy for "ours", because in attach mode that slot holds the
+    /// OTHER app's client, which is the exact case the gate exists for.
+    pub attached_to: Arc<Mutex<Option<AttachedTo>>>,
     /// Generation counter for the status refresher: each (re)start bumps it and
     /// stale refresher loops exit when their generation is superseded.
     pub refresher_gen: Arc<AtomicU64>,
@@ -283,6 +332,26 @@ pub struct AppState {
     /// ~1.5 s on top of the refresher's — three duplicate pipelines for the
     /// same numbers. None when stopped or the node did not answer.
     pub archive_peers_cache: Arc<Mutex<Option<btx_core::node_api::ArchivePeerSummary>>>,
+    /// Nicknames of connected peers, from the SAME per-tick getpeerinfo as the
+    /// census above. Cached for the same reason: the UI polls ~1.5 s and a
+    /// second full getpeerinfo for a decorative list would be indefensible.
+    pub peer_nicknames_cache: Arc<Mutex<Vec<String>>>,
+}
+
+/// Whose node did we attach to? Derived from the `DatadirHolder` seen at the
+/// moment of attaching, and kept as its own small type so the destructive
+/// commands can reason about it without re-probing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachedTo {
+    /// A live btxd with a live parent app: the miner, or another window of
+    /// this app. Never ours to stop, and never ours to delete under.
+    AnotherApp,
+    /// A btxd whose parent is gone: our own previous instance, which this app
+    /// adopts after a self-update relaunch. Ours.
+    OurOrphan,
+    /// RPC answered but the pidfile named nothing we could classify. We are
+    /// using a node we did not start and cannot vouch for.
+    Unknown,
 }
 
 impl AppState {
@@ -304,12 +373,15 @@ impl AppState {
             datadir_size_cache: Arc::new(std::sync::Mutex::new((0, None))),
             size_walk_running: Arc::new(AtomicBool::new(false)),
             setup_running: Arc::new(AtomicBool::new(false)),
+            start_in_flight: Arc::new(AtomicBool::new(false)),
+            attached_to: Arc::new(Mutex::new(None)),
             refresher_gen: Arc::new(AtomicU64::new(0)),
             quitting: Arc::new(AtomicBool::new(false)),
             rc_status_cache: Arc::new(Mutex::new(None)),
             stall_verdict: Arc::new(Mutex::new(None)),
             archive_service: Arc::new(Mutex::new(None)),
             archive_peers_cache: Arc::new(Mutex::new(None)),
+            peer_nicknames_cache: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -418,6 +490,7 @@ mod tests {
         let r = NodePhase::Ready {
             height: 155052,
             peers: 8,
+            blocks_behind: 0,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["phase"], "ready");

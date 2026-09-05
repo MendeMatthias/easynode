@@ -1228,12 +1228,25 @@ pub fn running_node_is_ours(datadir: &Path) -> bool {
 /// Gracefully stop a FOREIGN btxd (one we did NOT start) that is running against
 /// `datadir`, e.g. the env-less `btxd -daemon` the faststart installer launches.
 ///
-/// Issues `btx-cli stop` and waits briefly for the process to release the
-/// datadir lock so our [`NodeController::start`] can spawn a fresh daemon WITH
+/// Issues `btx-cli stop` and waits for the process to release the datadir lock
+/// so our [`NodeController::start`] can spawn a fresh daemon WITH
 /// `BTX_MATMUL_BACKEND`. Best-effort: errors are logged and ignored.
+///
+/// The grace is [`SHUTDOWN_GRACE_SECS`], not the 10 s this used to pass. btxd's
+/// flush is measured at 90-120 s at height ~185k, and `stop_unmanaged_node`
+/// SIGKILLs the moment the grace expires — so the old value force-killed a
+/// healthy node mid-flush every time, leaving an in-flight mutation marker in
+/// `shielded_state/` and a multi-minute rebuild on the next start. The app's
+/// own call sites were repaired for exactly that reason (see `ATTACHED_STOP_GRACE`
+/// in the node app); this helper kept shipping the number that caused it.
 pub async fn stop_foreign_node(datadir: &Path, btx_cli: &Path) {
     eprintln!("[node] a btxd not started by EasyBTX is running; stopping it so we can relaunch with the GPU backend env");
-    stop_unmanaged_node(datadir, btx_cli, std::time::Duration::from_secs(10)).await;
+    stop_unmanaged_node(
+        datadir,
+        btx_cli,
+        std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS),
+    )
+    .await;
 }
 
 /// Gracefully stop a btxd that nobody in THIS process manages (an orphan from

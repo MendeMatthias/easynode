@@ -725,6 +725,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_fast_path_returns_without_asking_the_node_anything() {
+        // ensure_snapshot_loaded had no test at all, and its fast path is what
+        // keeps an already-synced node out of an up-to-10-minute header-anchor
+        // wait on every relaunch.
+        //
+        // The assertion is a mock that must receive ZERO requests. An earlier
+        // version of this test checked that the marker file appeared, which
+        // proved nothing: the marker is written just BEFORE the early return,
+        // so deleting the return left the test green. Verified by deleting it.
+        //
+        // Everything downstream is set up to be attractive to a fall-through: a
+        // snapshot.dat exists, so a node that got past the fast path would have
+        // real work to do rather than bailing on a missing file.
+        let mut server = mockito::Server::new_async().await;
+        let never = server
+            .mock("POST", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let faststart = dir.path().join("faststart");
+        std::fs::create_dir_all(&faststart).unwrap();
+        std::fs::write(faststart.join("snapshot.dat"), b"pretend snapshot").unwrap();
+
+        struct AlreadyLoaded;
+        impl SnapshotFlags for AlreadyLoaded {
+            fn loaded(&self) -> bool {
+                true
+            }
+            fn mark_loaded(&self) {
+                panic!("the fast path must not re-mark a flag that is already set");
+            }
+        }
+
+        ensure_snapshot_loaded(
+            RpcClient::new(server.url(), "u", "p"),
+            PathBuf::from("/nonexistent/btx-cli"),
+            dir.path().to_path_buf(),
+            203_000,
+            Arc::new(AlreadyLoaded),
+        );
+
+        // The call spawns. Wait for the effect the fast path DOES have, then
+        // assert the one it must not have.
+        for _ in 0..100 {
+            if snapshot_marker_present(dir.path()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            snapshot_marker_present(dir.path()),
+            "the fast path backfills the cross-process marker so reclaim can              tell a loaded snapshot from an unfinished one"
+        );
+        // Give a fall-through time to make its first call before judging.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        never.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_right_size_wrong_sha_file_is_deleted_and_refetched() {
+        // The M13 branch, previously untested. The skip is keyed on SIZE first,
+        // so a corrupt or truncated-then-padded snapshot.dat of exactly the
+        // right length would be skipped as "already present" if the SHA check
+        // were ever dropped or inverted - and the node would loadtxoutset a file
+        // that is not the pinned snapshot. Size alone must never be enough.
+        let mut server = mockito::Server::new_async().await;
+        let body = b"snapshot-bytes-snapshot-bytes".to_vec();
+        let _m = server
+            .mock("GET", "/snapshot.dat")
+            .with_status(200)
+            .with_body(body.clone())
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let spec = test_spec(&server.url(), &body);
+
+        // Same length, different bytes: passes the size gate, fails the SHA.
+        let faststart = dir.path().join("faststart");
+        std::fs::create_dir_all(&faststart).unwrap();
+        let dest = faststart.join("snapshot.dat");
+        let impostor = vec![b'x'; body.len()];
+        std::fs::write(&dest, &impostor).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().len(),
+            spec.size_bytes,
+            "the fixture must hit the size gate, or this tests nothing"
+        );
+
+        download_snapshot(&spec, dir.path(), &|_| {}).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            body,
+            "the impostor must be replaced by the served bytes"
+        );
+        assert!(!dir
+            .path()
+            .join("faststart")
+            .join("snapshot.dat.partial")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn a_matching_file_is_skipped_without_touching_the_network() {
+        // The other side of the same gate: a file that is byte-identical to the
+        // pin must not be re-downloaded. No mockito server at all, so any HTTP
+        // attempt fails the test by failing the call.
+        let dir = tempfile::tempdir().unwrap();
+        let body = b"snapshot-bytes-snapshot-bytes".to_vec();
+        let spec = test_spec("http://127.0.0.1:1/unreachable", &body);
+
+        let faststart = dir.path().join("faststart");
+        std::fs::create_dir_all(&faststart).unwrap();
+        std::fs::write(faststart.join("snapshot.dat"), &body).unwrap();
+
+        download_snapshot(&spec, dir.path(), &|_| {})
+            .await
+            .expect("a verified file must skip the download, not attempt it");
+    }
+
+    #[tokio::test]
     async fn download_snapshot_writes_verified_file_and_reports_progress() {
         let mut server = mockito::Server::new_async().await;
         let body = b"snapshot-bytes-snapshot-bytes".to_vec();

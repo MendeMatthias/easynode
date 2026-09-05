@@ -129,7 +129,10 @@ fn strip_unused_index_conf(conf_path: &Path) -> bool {
     if rewritten == original {
         return false;
     }
-    std::fs::write(conf_path, rewritten).is_ok()
+    // Atomic, like the other three writers of this same file in crate::setup:
+    // reclaim runs on a volume the user is already short of space on, which is
+    // exactly when a truncate-then-write loses the conf.
+    crate::fsx::atomic_write(conf_path, rewritten.as_bytes()).is_ok()
 }
 
 /// Reclaim disk in `datadir`. MUST be called with btxd NOT holding these files.

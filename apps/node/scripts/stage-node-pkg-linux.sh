@@ -100,8 +100,17 @@ echo "==> staged node package: $(du -sh "$DEST" | cut -f1) at $DEST"
 # the mismatch refuses the whole tree on the USER's machine, after the ~450 MB
 # snapshot download. Harmless for a plain tagged release (marker == tag).
 # See crates/btx-core/src/installer.rs (BTXD_VERSION_MARKER).
+# The regex must accept FOUR segments. `v[0-9]+\.[0-9]+\.[0-9]+` truncates a reseal
+# tag: btxd v0.33.4.1 reports "BTX daemon version v0.33.4.1" and that pattern
+# captures `v0.33.4`. Provisioning compares this marker against the binary's
+# banner with a whole-token match, so every install is then refused as "not
+# v0.33.4" on a package that is in fact exactly right - and on the returning-user
+# upgrade path that refusal is SWALLOWED, so the app just keeps launching the
+# old tag. The mac scripts were fixed; these were not. See commands.rs, which
+# states the invariant in prose: "keep the staging script's regex able to
+# capture four segments".
 if ! "$DEST/bin/btxd" --version 2>/dev/null | head -1 \
-     | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' > "$DEST/.btxd-version"; then
+     | grep -oE 'v[0-9]+(\.[0-9]+)+' > "$DEST/.btxd-version"; then
   echo "error: could not parse a version out of bin/btxd --version" >&2
   exit 1
 fi

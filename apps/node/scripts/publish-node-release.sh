@@ -54,7 +54,6 @@ if [ "$DO_PUBLISH" -eq 0 ]; then
   echo
 fi
 
-command -v gh >/dev/null || { echo "error: gh is required" >&2; exit 1; }
 [[ -f "$CONF" ]]      || { echo "error: no tauri.conf.json at $CONF" >&2; exit 1; }
 [[ -x "$VERIFY" ]] || [[ -f "$VERIFY" ]] || { echo "error: no verify-updater-sig.py" >&2; exit 1; }
 [[ -d "$ASSET_DIR" ]] || { echo "error: no asset dir at $ASSET_DIR" >&2; exit 1; }
@@ -102,6 +101,98 @@ for f in "${ALL[@]}"; do
 done
 [ "$missing" -eq 0 ] || exit 1
 
+# ── The bytes must be the bytes the gates ran against ───────────────────────
+# docs/node-release-recipe.md has promised this since it was written and nothing
+# performed it. It is the one check the signature CANNOT stand in for: a
+# signature proves "these bytes, signed by our key", which is equally true of a
+# rebuild made ten minutes after the gates passed. Byte-identity to the gate
+# run's SHA256SUMS is what connects "the gates went green" to "this is what you
+# are shipping".
+#
+# The workflow writes SHA256SUMS beside the artifacts it produced, so it travels
+# in the asset dir with them.
+SUMS="$ASSET_DIR/SHA256SUMS"
+if [[ ! -f "$SUMS" ]]; then
+  echo "error: no SHA256SUMS in $ASSET_DIR." >&2
+  echo "       It comes from the gate run that built these artifacts, and without" >&2
+  echo "       it there is nothing tying these bytes to a run that passed. Fetch" >&2
+  echo "       it from the run, or rebuild through the workflow." >&2
+  exit 1
+fi
+
+# Portable sha256: the release Mac has shasum, Linux boxes have sha256sum.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# The hash recorded for NAME in a sums file, or nothing. Structural parse:
+# 64 hex, one separator (two spaces, or space-star for binary mode), the rest
+# of the line is the name. Names with spaces are therefore fine, and a CR at
+# the end of the line is ignored. Pure bash 3.2, so it runs on the release Mac.
+sums_lookup() {
+  local name="$1" sums="$2" line hash rest
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    [ "${#line}" -gt 66 ] || continue
+    hash="${line:0:64}"
+    case "$hash" in *[!0-9a-fA-F]*) continue ;; esac
+    rest="${line:64}"
+    case "$rest" in
+      "  "*) rest="${rest:2}" ;;
+      " *"*) rest="${rest:2}" ;;
+      *) continue ;;
+    esac
+    if [ "$rest" = "$name" ]; then
+      printf '%s\n' "$hash" | tr 'A-F' 'a-f'
+      return 0
+    fi
+  done < "$sums"
+  return 0
+}
+
+bad=0
+for f in "${ALL[@]}"; do
+  case "$f" in
+    *.sig|SHA256SUMS*|*.json) continue ;;
+  esac
+  # A sums line is 64 hex, a separator (two spaces, or space-star for binary
+  # mode), then the NAME, which may contain spaces: it is everything after the
+  # separator, never awk's $2. Compare the whole remainder so a substring like
+  # BTX-Node_0.6.1_amd64.AppImage cannot satisfy 0.6.18, and drop a trailing CR
+  # so a sums file that crossed a Windows box still reads.
+  want="$(sums_lookup "$f" "$SUMS")"
+  if [ -z "$want" ]; then
+    echo "error: $f is not listed in SHA256SUMS." >&2
+    echo "       The gates never saw this file. If it was rebuilt after the run," >&2
+    echo "       that rebuild is what has to be published, gates and all." >&2
+    bad=1
+    continue
+  fi
+  got="$(sha256_of "$ASSET_DIR/$f")"
+  if [ "$want" != "$got" ]; then
+    echo "error: $f does not match the gate run." >&2
+    echo "       SHA256SUMS: $want" >&2
+    echo "       this file : $got" >&2
+    bad=1
+    continue
+  fi
+  # A file newer than the sums it matches is possible (touch, a copy) and is not
+  # itself proof of anything, but it means the provenance story is not what it
+  # looks like. Say so rather than pass silently.
+  if [ "$ASSET_DIR/$f" -nt "$SUMS" ]; then
+    echo "warning: $f is newer than SHA256SUMS but its hash matches." >&2
+    echo "         Same bytes, later timestamp - a copy rather than a rebuild." >&2
+  fi
+  echo "      $f matches the gate run"
+done
+[ "$bad" -eq 0 ] || {
+  echo >&2
+  echo "Refusing to publish artifacts the gates did not produce." >&2
+  exit 1
+}
+echo
+
 # ── Verify the LOCAL signatures before uploading anything ───────────────────
 # Not the real check, which happens against the released bytes below, but there
 # is no point uploading 450 MB to discover the signature was wrong.
@@ -119,21 +210,44 @@ for s in "${SIGNED[@]}"; do
 done
 echo
 
+# ── Everything above here is OFFLINE ────────────────────────────────────────
+# The gh requirement lives HERE, not at the top, because the recipe promises a
+# dry run "does every offline check and stops before the first API call" - and
+# with the check at the top, a box without gh got `error: gh is required` and
+# performed no checks at all. That is the box this script is for:
+# node-release-recipe.md records, measured, that the publishing machine has
+# neither gh nor jq. So the offline half now runs everywhere, and the tool is
+# only demanded at the point it is actually used.
 # ── Remember what Latest points at, so we can prove we did not steal it ─────
-PREV_LATEST="$(gh api "repos/$REPO/releases/latest" --jq '.tag_name' 2>/dev/null || echo "<none>")"
-echo "==> repo-global Latest currently: $PREV_LATEST"
-if [[ "$PREV_LATEST" == node-v* ]]; then
-  echo "    ⚠ Latest is already a NODE release. It should be the miner's."
-  echo "      Someone published a node release without make_latest=false."
+# One read-only GET. On a dry run it is a courtesy, not a requirement: a box
+# without gh still gets every offline check and a green exit, which is what the
+# recipe promises and what the publishing box, which has no gh, needs.
+if command -v gh >/dev/null 2>&1; then
+  PREV_LATEST="$(gh api "repos/$REPO/releases/latest" --jq '.tag_name' 2>/dev/null || echo "<none>")"
+  echo "==> repo-global Latest currently: $PREV_LATEST"
+  if [[ "$PREV_LATEST" == node-v* ]]; then
+    echo "    ⚠ Latest is already a NODE release. It should be the miner's."
+    echo "      Someone published a node release without make_latest=false."
+  fi
+  echo
+else
+  PREV_LATEST="<unknown: no gh>"
 fi
-echo
 
 if [ "$DO_PUBLISH" -eq 0 ]; then
-  echo "==> DRY RUN complete. Everything checked passes."
+  echo "==> DRY RUN complete. Every offline check passes."
   echo "    Would create draft $TAG on $REPO, upload ${#ALL[@]} asset(s),"
   echo "    re-download and verify each against the released bytes, then flip it live."
   exit 0
 fi
+
+command -v gh >/dev/null || {
+  echo "error: gh is required from here on (creating the draft, uploading," >&2
+  echo "       re-downloading and flipping it live all go through it)." >&2
+  echo "       Every offline check above has passed. Install gh, or run the" >&2
+  echo "       REST sequence in docs/node-release-recipe.md by hand." >&2
+  exit 1
+}
 
 # ── Draft, upload, verify, and only then publish ────────────────────────────
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then

@@ -13,17 +13,106 @@ use std::path::Path;
 /// datadir lock and the cookie wait timed out.
 pub const RPC_URL: &str = "http://127.0.0.1:19334";
 
+/// The un-pruned chain's BLOCK PAYLOAD, measured 2026-09-04 and stated in GiB.
+///
+/// Method, because this number has been wrong in four places at once: BTX block
+/// sizes are bimodal — a block is either ~367 bytes or ~1,049,000 bytes, the
+/// large mode being the MatMul PoW payload rather than transaction traffic
+/// (height 120000 is 1,048,948 bytes and carries one transaction). So the figure
+/// comes from a stratified sample of real block sizes across the whole height
+/// range, taken from an archival peer that was first cross-checked hash-for-hash
+/// and byte-for-byte against this node for the heights this node still holds.
+/// Three independent runs gave 123.5, 123.8 and 125.2 GiB; the large-block
+/// region carried 245 samples with no exceptions. `docs/archival-capacity.md`
+/// has the write-up and `scripts/measure-chain-size.py` re-runs it in minutes.
+///
+/// Re-measure it rather than adjusting it by feel. `disk_gate_covers_the_chain`
+/// fails if the install gate is ever set below it.
+pub const MEASURED_CHAIN_PAYLOAD_GIB: u64 = 124;
+
 /// Free-disk thresholds for the first-run preflight. A FRESH install must
 /// download + unpack the snapshot and write the chain + headers/index/overhead.
 /// We run UN-PRUNED (prune=0 — see the faststart conf) so btxd keeps every
-/// block (required for a restart-safe shielded-state rebuild). The full BTX
-/// chain measured ~105 GB on 2026-07-12 (btxd size_on_disk after a complete
-/// backfill; ~1 MB blocks every 90 s grow it ~1 GB/day), so the old 18 GiB
-/// gate let installs start that could never finish — 120 GiB covers today's
-/// chain plus months of growth and working room. A RESUME only needs
-/// operating headroom.
-pub const DISK_REQUIRED_FRESH: u64 = 120 * 1024 * 1024 * 1024; // un-pruned full chain (~105 GB) + growth
+/// block (required for a restart-safe shielded-state rebuild).
+///
+/// 120 GiB was set from a ~105 GB reading taken 2026-07-12, and the chain has
+/// since grown past it: the gate was BELOW the chain it exists to gate, so a
+/// fresh install could pass the preflight and then run out of disk — the exact
+/// failure the 18 GiB → 120 GiB change was made to prevent. 140 GiB covers the
+/// measured 124 GiB plus the snapshot unpack, `debug.log`, and working room,
+/// and it matches the "plan for 150 to 160 GB" this project already tells
+/// people in `docs/always-on.md`.
+///
+/// The growth term that used to justify the headroom is gone: blocks left the
+/// large mode at the fork around height 185,000, and since 2026-08-10 the
+/// measured mean is 8.4 kB/block — about 8 MB/day, not the 1 GB/day this
+/// comment claimed. The headroom is for the chain that exists, not for growth.
+///
+/// A RESUME only needs operating headroom.
+pub const DISK_REQUIRED_FRESH: u64 = 140 * 1024 * 1024 * 1024; // measured chain (124 GiB) + working room
 pub const DISK_REQUIRED_RESUME: u64 = 2 * 1024 * 1024 * 1024; // ~2 GiB
+
+/// What a fresh KEEPER install needs. A keeper runs `prune=10000`, so it keeps
+/// under 10 GiB of blocks instead of the whole chain, and gating it on
+/// [`DISK_REQUIRED_FRESH`] turned away every machine that could run the tier
+/// this network is shortest of.
+///
+/// This is an ESTIMATE and must not borrow the provenance of the figure above.
+/// It is built from parts, each measured on one node on 2026-09-04 except the
+/// prune target, which is the setting itself:
+///
+///   ~9.8 GiB   blocks retained at `prune=10000`
+///   ~0.5 GiB   shielded state, block index, chainstate, undo
+///   ~0.5 GiB   the snapshot download, before it is unpacked and removed
+///   ~9   GiB   working room: `debug.log`, growth, and not running a user's
+///              disk to zero on our account
+///
+/// If somebody measures a finished keeper datadir, replace this with that
+/// number and say so, the way `MEASURED_CHAIN_PAYLOAD_GIB` does.
+pub const DISK_REQUIRED_FRESH_PRUNED: u64 = 20 * 1024 * 1024 * 1024;
+
+/// How much free disk an install needs, from the two things that decide it:
+/// whether the datadir already holds a chain, and whether the profile about to
+/// be provisioned prunes. Pure so the decision can be tested without a datadir,
+/// and so the gate and the conf writer cannot drift into judging different
+/// installs — which is what happened when this was inlined and profile-blind.
+pub fn disk_required(fresh: bool, pruned: bool) -> u64 {
+    match (fresh, pruned) {
+        (false, _) => DISK_REQUIRED_RESUME,
+        (true, true) => DISK_REQUIRED_FRESH_PRUNED,
+        (true, false) => DISK_REQUIRED_FRESH,
+    }
+}
+
+/// Whether an existing conf is pruned: `Some(true)` for a non-zero `prune=`,
+/// `Some(false)` for `prune=0`, `None` when there is no conf or no key.
+pub fn conf_is_pruned(conf_path: &Path) -> Option<bool> {
+    conf_kv(conf_path, "prune").map(|v| v.trim() != "0")
+}
+
+/// What writing a conf with `now_pruned` posture needs on disk, given what the
+/// datadir already is. [`disk_required`] gates the FIRST install; the paths
+/// that rewrite the conf later must gate too, or a keeper who switched to Full
+/// and then took an app update gets `prune=0` written silently and starts
+/// backfilling the whole chain into a disk that held 25 GiB.
+///
+/// Going pruned never needs more than resume headroom: btxd deletes blocks, it
+/// does not fetch them. Going un-pruned on a datadir that is pruned, or whose
+/// posture is unknown, is a fresh full install's worth of disk regardless of
+/// the blocks already present. Already un-pruned with a chain on disk needs
+/// only headroom.
+pub fn disk_required_for_conf(has_blocks: bool, was_pruned: Option<bool>, now_pruned: bool) -> u64 {
+    if !has_blocks {
+        return disk_required(true, now_pruned);
+    }
+    if now_pruned {
+        return DISK_REQUIRED_RESUME;
+    }
+    match was_pruned {
+        Some(false) => DISK_REQUIRED_RESUME,
+        Some(true) | None => DISK_REQUIRED_FRESH,
+    }
+}
 
 /// Whether `available` bytes meets `required`. Pure → unit-testable.
 pub fn enough_free_disk(available: u64, required: u64) -> bool {
@@ -163,7 +252,7 @@ pub fn prune_retired_addnodes_in_conf(conf_path: &Path, keep: &[&str]) -> usize 
         .lines()
         .count()
         .saturating_sub(rewritten.lines().count());
-    if std::fs::write(conf_path, rewritten).is_ok() {
+    if crate::fsx::atomic_write(conf_path, rewritten.as_bytes()).is_ok() {
         removed
     } else {
         0
@@ -247,8 +336,78 @@ pub fn set_managed_whitelist_block(conf_path: &Path, ips: &[String]) -> AppResul
 
     let mut content = out.join("\n");
     content.push('\n');
-    std::fs::write(conf_path, content)
+    // Atomic: this is a read-modify-REWRITE of the file that launches btxd, and
+    // a plain write commits the truncation before the bytes. See crate::fsx.
+    crate::fsx::atomic_write(conf_path, content.as_bytes())
         .map_err(|e| AppError::Config(format!("cannot write conf {}: {e}", conf_path.display())))
+}
+
+/// Keys whose ABSENCE from `faststart.conf` silently changes what the node is,
+/// with no error and nothing on screen.
+///
+/// Nothing on the start path re-asserts the base conf. `provision_node_package`
+/// writes it once, at first setup or when the pinned tag moves; after that the
+/// only writers are three helpers that read-modify-rewrite it, plus the miner
+/// through the shared datadir. A conf that loses its body therefore never gets
+/// it back, and each of these five costs something specific:
+///
+///   * `prune` — btxd loads the datadir's own `btx_rw.conf` on every start and a
+///     read-write setting outranks a config-file one. With no `prune=` line
+///     [`crate::node`] passes no `-prune`, so a remembered `prune=4096` wins.
+///     That is measured behaviour on a live validator, not a hypothetical, and
+///     an unexpectedly pruned node cannot rebuild shielded state after an
+///     unclean shutdown — the bricked-datadir scar `prune=0` exists for.
+///   * `parkdeepreorg`, `maxreorgdepthpark`, `maxreorgdepthwarn` — btxd ships
+///     these DISABLED in every built-in profile, so without them the node
+///     follows whichever branch carries the most work, on a chain measured at
+///     roughly one sibling every 25 blocks.
+///   * `retainshieldedcommitmentindex` — the index the shielded rebuild needs.
+///
+/// Deliberately NOT everything in the canonical conf: `addnode` lines and the
+/// whitelist block have their own managers, and re-inserting them here would
+/// fight [`prune_retired_addnodes_in_conf`] and
+/// [`set_managed_whitelist_block`].
+pub const BASE_CONF_SAFETY_KEYS: [&str; 5] = [
+    "prune",
+    "parkdeepreorg",
+    "maxreorgdepthpark",
+    "maxreorgdepthwarn",
+    "retainshieldedcommitmentindex",
+];
+
+/// Re-insert any [`BASE_CONF_SAFETY_KEYS`] missing from `conf_path`, taking the
+/// value from `canonical` (the profile's own conf text). Returns the keys it
+/// had to add, so the caller can say so out loud.
+///
+/// TWO GUARANTEES, both load-bearing, because this runs on every start of every
+/// install and rewrites the file that launches the node:
+///
+///   1. It only ever ADDS a key that is absent. A present value is the
+///      operator's — or the profile's — and is never overwritten. A keeper's
+///      `prune=10000` is left alone precisely because `canonical` for a keeper
+///      says the same thing, and a hand-tuned value survives either way.
+///   2. It reports what it changed rather than healing silently, so a bad
+///      deploy shows up in the log instead of quietly rewriting every conf in
+///      the fleet.
+///
+/// A key absent from `canonical` too is not invented.
+pub fn ensure_base_conf_keys(conf_path: &Path, canonical: &str) -> AppResult<Vec<String>> {
+    let mut added = Vec::new();
+    for key in BASE_CONF_SAFETY_KEYS {
+        if conf_kv(conf_path, key).is_some() {
+            continue;
+        }
+        let prefix = format!("{key}=");
+        let Some(value) = canonical.lines().find_map(|l| {
+            let l = l.trim();
+            l.strip_prefix(&prefix).map(str::to_string)
+        }) else {
+            continue;
+        };
+        set_conf_kv(conf_path, key, Some(&value))?;
+        added.push(format!("{key}={value}"));
+    }
+    Ok(added)
 }
 
 /// Read the value of the first `key=value` line in a conf file (`None` when
@@ -295,7 +454,9 @@ pub fn set_conf_kv(conf_path: &Path, key: &str, value: Option<&str>) -> AppResul
     }
     let mut content = out.join("\n");
     content.push('\n');
-    std::fs::write(conf_path, content)
+    // Atomic: this is a read-modify-REWRITE of the file that launches btxd, and
+    // a plain write commits the truncation before the bytes. See crate::fsx.
+    crate::fsx::atomic_write(conf_path, content.as_bytes())
         .map_err(|e| AppError::Config(format!("cannot write conf {}: {e}", conf_path.display())))
 }
 
@@ -577,11 +738,263 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "txindex=1\n");
     }
 
+    /// The gate exists to refuse an install that could never finish. If it is
+    /// ever set below the chain it is gating, it does the opposite: it waves
+    /// through the install that runs out of disk halfway. That is what happened
+    /// between 2026-07-12 and 2026-09-04, silently, because nothing checked.
+    const FULL: &str = "server=1
+prune=0
+retainshieldedcommitmentindex=1
+                        parkdeepreorg=1
+maxreorgdepthpark=6
+maxreorgdepthwarn=3
+";
+    const KEEPER: &str = "server=1
+prune=10000
+retainshieldedcommitmentindex=1
+                          parkdeepreorg=1
+maxreorgdepthpark=6
+maxreorgdepthwarn=3
+";
+
+    #[test]
+    fn a_nickname_with_spaces_survives_the_conf_round_trip() {
+        // uacomment is the one conf value a person types freely, and the only
+        // one where a value btxd dislikes stops the node STARTING. Spaces are
+        // the case worth pinning: the value is the rest of the line, so a name
+        // must not be truncated at the first space, and re-setting it must
+        // replace rather than append a second uacomment line.
+        let tmp = tempfile::tempdir().unwrap();
+        let conf = tmp.path().join("faststart.conf");
+        std::fs::write(
+            &conf,
+            "server=1
+prune=0
+",
+        )
+        .unwrap();
+
+        set_conf_kv(&conf, "uacomment", Some("Byron Bay node")).unwrap();
+        assert_eq!(
+            conf_kv(&conf, "uacomment").as_deref(),
+            Some("Byron Bay node")
+        );
+
+        set_conf_kv(&conf, "uacomment", Some("alice")).unwrap();
+        let body = std::fs::read_to_string(&conf).unwrap();
+        assert_eq!(
+            body.lines().filter(|l| l.starts_with("uacomment=")).count(),
+            1,
+            "re-naming must replace, not accumulate:
+{body}"
+        );
+        assert_eq!(conf_kv(&conf, "uacomment").as_deref(), Some("alice"));
+
+        // Clearing removes the key entirely. Writing `uacomment=` would give
+        // btxd an empty comment, which it renders as an empty `()`.
+        set_conf_kv(&conf, "uacomment", None).unwrap();
+        assert_eq!(conf_kv(&conf, "uacomment"), None);
+        assert!(!std::fs::read_to_string(&conf)
+            .unwrap()
+            .contains("uacomment"));
+        // And the rest of the conf is untouched throughout.
+        assert!(std::fs::read_to_string(&conf).unwrap().contains("prune=0"));
+    }
+
+    #[test]
+    fn a_stub_conf_gets_its_safety_keys_back() {
+        // The shape that matters: a conf reduced to the two things the append-
+        // only writers put there. Nothing on the start path used to notice, and
+        // btxd would launch with the datadir's remembered prune value and no
+        // reorg parking at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let conf = tmp.path().join("faststart.conf");
+        std::fs::write(
+            &conf,
+            "addnode=1.2.3.4:19335
+whitelist=127.0.0.1
+",
+        )
+        .unwrap();
+
+        let added = ensure_base_conf_keys(&conf, FULL).unwrap();
+        assert_eq!(added.len(), 5, "added {added:?}");
+
+        let out = std::fs::read_to_string(&conf).unwrap();
+        for expect in [
+            "prune=0",
+            "parkdeepreorg=1",
+            "maxreorgdepthpark=6",
+            "maxreorgdepthwarn=3",
+            "retainshieldedcommitmentindex=1",
+        ] {
+            assert!(
+                out.contains(expect),
+                "missing {expect} in:
+{out}"
+            );
+        }
+        // And it did not touch what was already there.
+        assert!(out.contains("addnode=1.2.3.4:19335"));
+        assert!(out.contains("whitelist=127.0.0.1"));
+    }
+
+    #[test]
+    fn it_never_overwrites_a_value_that_is_already_set() {
+        // This runs on every start of every install. Overwriting would rewrite
+        // the launch posture of the whole fleet at once, and would stamp a
+        // keeper back to prune=0 the moment the canonical conf disagreed.
+        let tmp = tempfile::tempdir().unwrap();
+        let conf = tmp.path().join("faststart.conf");
+        std::fs::write(
+            &conf,
+            "prune=10000
+maxreorgdepthwarn=9
+",
+        )
+        .unwrap();
+
+        let added = ensure_base_conf_keys(&conf, FULL).unwrap();
+        assert!(!added.iter().any(|a| a.starts_with("prune=")), "{added:?}");
+        assert!(
+            !added.iter().any(|a| a.starts_with("maxreorgdepthwarn=")),
+            "{added:?}"
+        );
+
+        let out = std::fs::read_to_string(&conf).unwrap();
+        assert!(
+            out.contains("prune=10000"),
+            "a keeper stays a keeper:
+{out}"
+        );
+        assert!(
+            out.contains("maxreorgdepthwarn=9"),
+            "a hand-tuned value survives:
+{out}"
+        );
+    }
+
+    #[test]
+    fn a_complete_conf_is_left_exactly_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conf = tmp.path().join("faststart.conf");
+        std::fs::write(&conf, KEEPER).unwrap();
+        let before = std::fs::read_to_string(&conf).unwrap();
+
+        let added = ensure_base_conf_keys(&conf, KEEPER).unwrap();
+
+        assert!(added.is_empty(), "nothing to do, but added {added:?}");
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), before);
+    }
+
+    #[test]
+    fn the_keeper_profile_keeps_its_own_prune_value() {
+        // Same stub, keeper canonical: the restored value must be the keeper's,
+        // not the full node's. Restoring prune=0 onto a keeper would silently
+        // turn a ~10 GiB node into a ~124 GiB one.
+        let tmp = tempfile::tempdir().unwrap();
+        let conf = tmp.path().join("faststart.conf");
+        std::fs::write(
+            &conf,
+            "addnode=1.2.3.4:19335
+",
+        )
+        .unwrap();
+
+        ensure_base_conf_keys(&conf, KEEPER).unwrap();
+
+        let out = std::fs::read_to_string(&conf).unwrap();
+        assert!(out.contains("prune=10000"), "{out}");
+        assert!(!out.contains("prune=0"), "{out}");
+    }
+
+    #[test]
+    fn rewriting_the_conf_is_gated_by_the_posture_change_it_makes() {
+        // No chain yet: same as a fresh install of that posture.
+        assert_eq!(
+            disk_required_for_conf(false, None, false),
+            DISK_REQUIRED_FRESH
+        );
+        assert_eq!(
+            disk_required_for_conf(false, None, true),
+            DISK_REQUIRED_FRESH_PRUNED
+        );
+        // Pruning never fetches anything.
+        assert_eq!(
+            disk_required_for_conf(true, Some(false), true),
+            DISK_REQUIRED_RESUME
+        );
+        assert_eq!(
+            disk_required_for_conf(true, Some(true), true),
+            DISK_REQUIRED_RESUME
+        );
+        // Un-pruning a pruned datadir is the whole chain, whatever is on disk.
+        assert_eq!(
+            disk_required_for_conf(true, Some(true), false),
+            DISK_REQUIRED_FRESH
+        );
+        // Unknown posture with a chain present: assume the expensive case.
+        assert_eq!(
+            disk_required_for_conf(true, None, false),
+            DISK_REQUIRED_FRESH
+        );
+        // Already un-pruned: headroom only.
+        assert_eq!(
+            disk_required_for_conf(true, Some(false), false),
+            DISK_REQUIRED_RESUME
+        );
+    }
+
+    #[test]
+    fn conf_is_pruned_reads_the_posture_or_admits_it_does_not_know() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conf = tmp.path().join("faststart.conf");
+        assert_eq!(conf_is_pruned(&conf), None);
+        std::fs::write(&conf, "server=1\n").unwrap();
+        assert_eq!(conf_is_pruned(&conf), None);
+        std::fs::write(&conf, "server=1\nprune=0\n").unwrap();
+        assert_eq!(conf_is_pruned(&conf), Some(false));
+        std::fs::write(&conf, "server=1\nprune=10000\n").unwrap();
+        assert_eq!(conf_is_pruned(&conf), Some(true));
+    }
+
+    #[test]
+    fn a_keeper_install_is_not_gated_on_the_full_chain() {
+        let gib = 1024 * 1024 * 1024;
+        // The tier the network is shortest of keeps under 10 GiB of blocks.
+        // Gating it on the un-pruned chain refused every machine that could
+        // actually run one, which is the opposite of what the gate is for.
+        assert_eq!(disk_required(true, true), DISK_REQUIRED_FRESH_PRUNED);
+        assert_eq!(disk_required(true, false), DISK_REQUIRED_FRESH);
+        // A resume needs headroom either way.
+        assert_eq!(disk_required(false, true), DISK_REQUIRED_RESUME);
+        assert_eq!(disk_required(false, false), DISK_REQUIRED_RESUME);
+        // A 64 GiB laptop can hold a keeper and cannot hold the full chain.
+        // Both halves matter: the first is the fix, the second is the reason
+        // the pruned constant must not be waved through as "small enough".
+        assert!(enough_free_disk(64 * gib, disk_required(true, true)));
+        assert!(!enough_free_disk(64 * gib, disk_required(true, false)));
+        // And the pruned gate must still exceed what a keeper actually stores
+        // (prune=10000 is ~9.8 GiB of blocks) with room to work in.
+        assert!(DISK_REQUIRED_FRESH_PRUNED > 12 * gib);
+    }
+
+    #[test]
+    fn disk_gate_covers_the_chain() {
+        let gib = 1024 * 1024 * 1024;
+        assert!(
+            DISK_REQUIRED_FRESH >= MEASURED_CHAIN_PAYLOAD_GIB * gib,
+            "fresh-install gate is {} GiB but the measured chain is {} GiB: re-measure with scripts/measure-chain-size.py, then raise the gate",
+            DISK_REQUIRED_FRESH / gib,
+            MEASURED_CHAIN_PAYLOAD_GIB
+        );
+    }
+
     #[test]
     fn disk_preflight_gates_on_threshold() {
         let gb = 1024 * 1024 * 1024;
-        // A comfortable disk passes the fresh-install gate (un-pruned chain is ~105 GB).
-        assert!(enough_free_disk(150 * gb, DISK_REQUIRED_FRESH));
+        // A comfortable disk passes the fresh-install gate.
+        assert!(enough_free_disk(200 * gb, DISK_REQUIRED_FRESH));
         // A disk that could not hold the full chain fails the gate.
         assert!(!enough_free_disk(40 * gb, DISK_REQUIRED_FRESH));
         // Exactly the requirement is acceptable.

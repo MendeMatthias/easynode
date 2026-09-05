@@ -85,7 +85,7 @@ an independent validator does, and we would rather say so than flatter you.
 |---|---|---|
 | **Relay** | a connection and an open port | peer introduction and address gossip |
 | **Keeper** | about 10 GB disk, an inbound port, uptime | passes signed confirmations to other nodes |
-| **Full node** | about 150 GB on an SSD (the chain is ~138 GB of blocks, 2026-09-04) | validates everything itself |
+| **Full node** | about 150 GB on an SSD (the chain measured 124 GiB of blocks on 2026-09-04 — [method](docs/archival-capacity.md)) | validates everything itself |
 | **Archive** | full chain disk, upload bandwidth, uptime | serves block history to people setting up |
 | **Witness** | a qualifying GPU or Apple Silicon | an **independent opinion** about which chain is real |
 | **Signer** | a qualifying GPU, and above all always on | the attestations mirrors depend on |
@@ -125,7 +125,7 @@ always on is where that evidence comes from.
 Measured on one home RTX 3060 on 2026-09-04, while it held the tip:
 
 ```
-stored attestations    3,023
+stored attestations    3,008
 blocks with quorum     3,008
 signed frontier        at the tip, 0 blocks behind
 advertises             MATMUL_CONSENSUS, MATMUL_ATTESTATION_ARCHIVE
@@ -207,8 +207,8 @@ every screen, state and piece of copy is there to read and change.
 Both suites pass on a fresh clone and neither needs the staging step:
 
 ```bash
-cd apps/node && npm test              # 52 tests, under a second
-cd crates/btx-core && cargo test      # 280 tests, about 5 seconds
+cd apps/node && npm test              # the web suite, under a second
+cd crates/btx-core && cargo test      # the core suite, about 5 seconds
 ```
 
 CI runs exactly these on every pull request, plus `tsc --noEmit` and a

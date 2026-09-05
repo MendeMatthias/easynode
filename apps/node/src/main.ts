@@ -50,7 +50,7 @@ type NodePhase =
   | { phase: "warming"; message: string }
   | { phase: "loading_snapshot" }
   | { phase: "syncing"; height: number; headers: number; progress: number; peers: number }
-  | { phase: "ready"; height: number; peers: number }
+  | { phase: "ready"; height: number; peers: number; blocks_behind: number }
   | { phase: "stopped" }
   | { phase: "error"; message: string };
 
@@ -61,12 +61,15 @@ export interface NodeStatusInfo {
   disk_free_mb: number;
   disk_warn_mb: number;
   disk_critical_mb: number;
+  disk_required_mb: number;
   datadir_size_mb: number;
   datadir: string;
   node_tag: string;
   installed: boolean;
   setup_complete: boolean;
   keep_awake: boolean;
+  keep_awake_supported: boolean;
+  tray_term: string;
   txindex_enabled: boolean;
   /**
    * Serve historical signed confirmations back to the network
@@ -77,6 +80,14 @@ export interface NodeStatusInfo {
   /** What we are really providing: `state` is serving_history |
    *  degraded_to_live_window | not_serving | unknown. */
   archive_service: { state: string; blocks_behind?: number } | null;
+  // The same verdict as a sentence, rendered in Rust so the copy lives in one
+  // place. Null until the refresher has completed a tick.
+  archive_service_message: string | null;
+  archive_service_needs_attention: boolean;
+  node_nickname: string;
+  broadcast_nickname: string | null;
+  subversion: string | null;
+  peer_nicknames: string[];
   service_report_enabled: boolean;
   wallet_enabled: boolean;
   on_close: string;
@@ -230,9 +241,18 @@ function setupPhaseLabel(phase: NodePhase): string {
 
 // ── Formatting helpers ───────────────────────────────────────────────────────
 
+// How far behind the best header the active chain has to be before the badge
+// says so. Small enough that a real catch-up shows, large enough that ordinary
+// reorg churn (this chain rebuilds its tip ~91x/day) does not make the line
+// flicker. Presentation only — nothing decides behaviour on it.
+const LAG_WORTH_SAYING = 10;
+
 function fmtGB(mb: number): string {
   if (mb <= 0) return "—";
-  return `${(mb / 1024).toFixed(1)} GB`;
+  // The value is mebibytes and the divisor is 1024, so the unit is GiB. It said
+  // GB, which understated every figure it printed by about 7% against the
+  // backend's own message for the same quantity.
+  return `${(mb / 1024).toFixed(1)} GiB`;
 }
 
 function fmtUptime(secs: number): string {
@@ -348,6 +368,13 @@ function renderWizard(status: NodeStatusInfo) {
   wizardError.hidden = p.phase !== "error";
 
   $("wizard-free-disk").textContent = fmtGB(status.disk_free_mb);
+  // The fresh-install figure for the SELECTED profile, from the same
+  // disk_required the preflight applies — 20 GiB for a keeper, 140 for a full
+  // node — never a string in the markup. It used to render the full-node
+  // constant unconditionally, which told keepers they needed 140 GiB for an
+  // install the preflight would pass at 20. Always the fresh figure: a resume
+  // is gated lower, but overstating is the direction that never strands anyone.
+  $("wizard-disk-needed").textContent = fmtGB(status.disk_required_mb);
 
   switch (p.phase) {
     case "downloading":
@@ -440,6 +467,8 @@ function renderStatus(status: NodeStatusInfo) {
   const sub = $("status-sub");
   const errCard = $("status-error");
 
+  reflectPeerNames(status);
+
   const mode = visualMode(p, status.rc_stalled);
   orb.className = `status-orb is-${mode}`;
   errCard.hidden = true;
@@ -464,6 +493,14 @@ function renderStatus(status: NodeStatusInfo) {
       } else if (status.rc_may_fall_behind) {
         badge.textContent = "LIVE";
         sub.textContent = "Your node is helping the network, checking blocks on the processor";
+      } else if (p.blocks_behind >= LAG_WORTH_SAYING) {
+        // "Near tip" is a boolean with no lag term: it flips the moment the
+        // snapshot chainstate loads at a height fixed in the release, so a
+        // fresh install reads LIVE while still thousands of blocks short and
+        // grinding. Still LIVE — it is running and connected — but say the gap
+        // rather than let "helping the network" stand on its own.
+        badge.textContent = "LIVE";
+        sub.textContent = `Your node is live, still catching up — ${fmtInt(p.blocks_behind)} blocks behind`;
       } else {
         // "LIVE", not "READY": the node is running and serving the network now —
         // "ready" reads like it's waiting to do something.
@@ -564,6 +601,15 @@ async function tick() {
   try {
     const status = await invoke<NodeStatusInfo>("get_node_status");
     lastStatus = status;
+    // From the tick, not from renderStatus: a fresh install never reaches
+    // renderStatus, and the first-run wizard is where a Windows user meets the
+    // close dialog whose button used to read "Keep running in the menu bar".
+    applyTrayTerm(status);
+    // The serve row lives in the Settings overlay, which is reachable from any
+    // screen and stays open across ticks; refresh it here so a verdict that
+    // changes — or vanishes when the node stops — is reflected while it is
+    // being looked at, not only on the next open.
+    reflectArchiveService(status);
     reflectWalletEnabled(status.wallet_enabled);
     if (status.setup_complete) setupDone = true;
 
@@ -652,7 +698,27 @@ $("settings-btn").addEventListener("click", async () => {
   if (lastStatus) {
     $("setting-datadir").textContent = lastStatus.datadir;
     $<HTMLInputElement>("keepawake-toggle").checked = lastStatus.keep_awake;
+    // Only macOS can actually hold the assertion. Rather than leave a switch
+    // that is on and inert, say what the machine will really do. The row stays
+    // visible because sleep is still the user's problem to solve — it just
+    // stops claiming this app solves it.
+    const awakeRow = $("keepawake-toggle").closest(".setting-row");
+    if (awakeRow && !lastStatus.keep_awake_supported) {
+        $<HTMLInputElement>("keepawake-toggle").disabled = true;
+        $<HTMLInputElement>("keepawake-toggle").checked = false;
+        const desc = awakeRow.querySelector(".setting-desc");
+        if (desc) {
+            desc.textContent =
+                "Not available on this system — set your computer's own sleep settings to Never";
+        }
+    }
     $<HTMLInputElement>("serve-toggle").checked = lastStatus.attestation_serve_enabled;
+    // What the node is ACTUALLY providing, next to the switch that claims to
+    // control it. frontier.rs has computed this since #21 and the payload has
+    // carried it since; nothing displayed it, so a node advertising the archive
+    // bit while silently degraded to the live window looked completely fine.
+    reflectArchiveService(lastStatus);
+    reflectNickname(lastStatus);
     $<HTMLInputElement>("report-toggle").checked = lastStatus.service_report_enabled;
     $<HTMLInputElement>("wallet-toggle").checked = lastStatus.wallet_enabled;
     reflectOnClose(lastStatus.on_close);
@@ -707,6 +773,106 @@ $<HTMLInputElement>("keeper-toggle").addEventListener("change", (e) => {
  * plainly that it activates with the next node engine update — a stored
  * promise, not a silent no-op.
  */
+// Swap the platform's own word for the tray into every string that names it.
+//
+// The copy is macOS-native throughout - "menu bar" in the first-run pitch, the
+// close dialog, the close-behaviour setting and a button label - and on Windows
+// and Linux that is a place the user does not have, in a dialog asking them to
+// choose it. The sentences stay in the markup and only the noun moves, so there
+// is one copy of each string rather than one per platform.
+//
+// Runs once: the term cannot change while the app is open.
+let trayTermApplied = false;
+function applyTrayTerm(status: NodeStatusInfo): void {
+  if (trayTermApplied || !status.tray_term || status.tray_term === "menu bar") {
+    // "menu bar" is what the markup already says, so macOS needs no pass at all.
+    trayTermApplied = true;
+    return;
+  }
+  const title = status.tray_term.charAt(0).toUpperCase() + status.tray_term.slice(1);
+  for (const el of document.querySelectorAll<HTMLElement>("[data-tray-term]")) {
+    // textContent, and only these marked elements: this rewrites shipped copy,
+    // so it must not be able to touch markup or an element nobody vetted.
+    el.textContent = el.textContent!.replace(/Menu bar/g, title).replace(/menu bar/g, status.tray_term);
+  }
+  trayTermApplied = true;
+}
+
+function reflectNickname(status: NodeStatusInfo): void {
+  const input = $<HTMLInputElement>("nickname-input");
+  // Never clobber what somebody is in the middle of typing.
+  if (document.activeElement !== input) input.value = status.node_nickname;
+
+  const desc = $("nickname-desc");
+  // Show the REAL user agent, not one derived from the setting. btxd builds it
+  // once at init, so a nickname saved while the node is up is not live until
+  // the next start — and the honest way to say that is to print what peers are
+  // actually seeing right now.
+  if (status.subversion) {
+    desc.textContent = "Other nodes see you as ";
+    const wire = document.createElement("span");
+    wire.className = "nickname-wire";
+    wire.textContent = status.subversion; // textContent: this came off the node
+    desc.append(wire);
+    if (status.node_nickname && !status.subversion.includes(`(${status.node_nickname})`)) {
+      desc.append(" — your new name applies the next time the node starts");
+    }
+  } else {
+    desc.textContent =
+      "Optional. Every node you connect to sees this name. Leave empty to stay anonymous";
+  }
+}
+
+/// Names of the peers we can see. The whole point of a nickname is that other
+/// people have one too, so say how many are out there — including when the
+/// answer is none, which is what it is on this network today.
+function reflectPeerNames(status: NodeStatusInfo): void {
+  const el = document.getElementById("peer-names");
+  if (!el) return;
+  const names = status.peer_nicknames;
+  // Your own name belongs beside theirs — but from the WIRE, not the setting.
+  // btxd builds its user agent once at init, so a name saved on a running node
+  // is not broadcast until the next start, and a name cleared on a running
+  // node is still being broadcast. broadcast_nickname is parsed from the real
+  // subversion and is null whenever we do not know what is on the wire; in
+  // that state saying nothing is the honest answer.
+  const me = status.broadcast_nickname ?? "";
+  if (names.length === 0 && !me) {
+    el.textContent = "";
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  // textContent throughout: peer strings were chosen by strangers and arrived
+  // over the wire. btx_core::nickname filters and caps them; this is the second
+  // layer, and it is the one that makes markup impossible rather than unlikely.
+  const parts: string[] = [];
+  if (me) parts.push(`You are ${me}`);
+  if (names.length > 0) parts.push(`connected to ${names.join(", ")}`);
+  else if (me) parts.push("no other named nodes in sight yet");
+  el.textContent = parts.join(" · ");
+}
+
+function reflectArchiveService(status: NodeStatusInfo): void {
+  const row = $("serve-toggle").closest(".setting-row");
+  const desc = row?.querySelector(".setting-desc");
+  if (!desc) return;
+  // Keep the markup's own sentence the first time through, so it can come
+  // BACK. The previous version overwrote it and then "left it up" on a null
+  // verdict — which left the last live verdict up instead, amber class and
+  // all, on a node that had since stopped. A stopped node claiming to serve
+  // history is the exact lie this row exists to prevent.
+  const el = desc as HTMLElement;
+  el.dataset.staticCopy ??= el.textContent ?? "";
+  if (!status.archive_service_message) {
+    el.textContent = el.dataset.staticCopy;
+    el.classList.remove("needs-attention");
+    return;
+  }
+  el.textContent = status.archive_service_message;
+  el.classList.toggle("needs-attention", status.archive_service_needs_attention);
+}
+
 function reflectKeeperRow(status: NodeStatusInfo) {
   const t = $<HTMLInputElement>("keeper-toggle");
   if (document.activeElement !== t) t.checked = status.node_profile === "keeper";
@@ -726,9 +892,10 @@ function reflectKeeperRow(status: NodeStatusInfo) {
 // Serving is independent of the profile: Keeper mode implies it, and a FULL
 // node can flip it here too — a full-history node that serves is the most
 // valuable archive the network has (there is currently ~one).
-// Local file only — no network, no identifier. The copy says so, because a
-// node operator has every reason to ask before switching on anything that
-// sounds like telemetry.
+// Local file only — no network, no upload. It records what this node has
+// served, plus the public nickname if one is set (which every peer can already
+// see). The copy says so, because a node operator has every reason to ask
+// before switching on anything that sounds like telemetry.
 $<HTMLInputElement>("report-toggle").addEventListener("change", (e) => {
   const on = (e.target as HTMLInputElement).checked;
   void invoke("set_service_report", { on })
@@ -740,6 +907,39 @@ $<HTMLInputElement>("report-toggle").addEventListener("change", (e) => {
       ),
     )
     .catch(() => showToast("Could not change that setting"));
+});
+
+// Saving a nickname is a deliberate act with a Save button, not a live-as-you-
+// type setting. Two reasons: it is written into the conf that starts btxd, and
+// it is the one setting other people can see, so committing to it should be a
+// decision rather than a side effect of tabbing away.
+async function saveNickname(): Promise<void> {
+  const input = $<HTMLInputElement>("nickname-input");
+  const btn = $<HTMLButtonElement>("nickname-save");
+  const result = $("nickname-result");
+  btn.disabled = true;
+  try {
+    const stored = await invoke<string>("set_node_nickname", { name: input.value });
+    input.value = stored;
+    result.classList.remove("is-error");
+    result.textContent = stored
+      ? `Saved. Other nodes will see "${stored}" from the next time your node starts.`
+      : "Nickname cleared. Your node is anonymous again from its next start.";
+    result.hidden = false;
+  } catch (e) {
+    // The Rust side refuses rather than writes on anything btxd would reject,
+    // so this is a sentence about what to type, not a stack trace.
+    result.classList.add("is-error");
+    result.textContent = String(e);
+    result.hidden = false;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$("nickname-save").addEventListener("click", () => void saveNickname());
+$("nickname-input").addEventListener("keydown", (e) => {
+  if ((e as KeyboardEvent).key === "Enter") void saveNickname();
 });
 
 $<HTMLInputElement>("serve-toggle").addEventListener("change", (e) => {
@@ -762,7 +962,8 @@ $<HTMLInputElement>("wallet-toggle").addEventListener("change", (e) => {
 });
 
 // Remove node data: destructive, so a two-step confirm — first click arms,
-// second click (within 6 s) fires. Frees the ~105 GB chain and returns to
+// second click (within 6 s) fires. Frees the chain (~124 GiB for a full node,
+// ~10 GiB for a keeper) and returns to
 // the setup screen; wallets and the miner's files are never touched.
 let removeArmTimer: ReturnType<typeof setTimeout> | undefined;
 $("remove-node-btn").addEventListener("click", async () => {
@@ -895,6 +1096,10 @@ infoOverlay.addEventListener("click", (e) => {
 });
 $("future-btn").addEventListener("click", () => {
   infoOverlay.hidden = true;
+  // Every other way of leaving the info overlay stops the poll; this one did
+  // not, so ps/tasklist kept being spawned every 3 s for the rest of the
+  // session to update a panel nobody was looking at.
+  stopFootprint();
   futureOverlay.hidden = false;
 });
 $("future-btn-settings").addEventListener("click", () => {
@@ -993,24 +1198,61 @@ function setUpdateResult(text: string): void {
   $("update-check-result").textContent = text;
 }
 
+// Failing to CHECK and failing to INSTALL are different events and must not
+// share a catch. A failed check is usually just being offline, and there is
+// nothing for the user to do about it. A failed INSTALL is permanent for that
+// build — a Linux .deb cannot be replaced by the updater at all — and the old
+// single catch swallowed it on the automatic path, leaving the banner reading
+// "Update available: vX — downloading…" indefinitely, repainted identically at
+// every launch and every six-hour tick. That is worse than silence: it is an
+// aria-live region asserting that something is in progress which has already
+// failed and will fail again.
+const MANUAL_DOWNLOAD = "easybtx.com/node";
+
 async function updateCheck(manual = false): Promise<void> {
+  let update: Awaited<ReturnType<typeof checkForUpdate>>;
   try {
-    const update = await checkForUpdate();
-    if (update) {
-      showUpdateBanner(`Update available: v${update.version}`, "— downloading…");
-      setUpdateResult(`Update available: v${update.version} — downloading…`);
-      await update.downloadAndInstall();
-      showUpdateBanner(`v${update.version} ready`, "— restarting…");
-      await relaunch();
-    } else if (manual) {
+    update = await checkForUpdate();
+  } catch (e) {
+    // Quiet on the automatic path; a MANUAL check must never end in silence,
+    // because that reads as a dead button.
+    if (manual) setUpdateResult(`Couldn't check right now — are you online? (${String(e).slice(0, 80)})`);
+    return;
+  }
+
+  if (!update) {
+    if (manual) {
       setUpdateResult(
         appVersion ? `You're on the latest version (v${appVersion}).` : "You're on the latest version."
       );
     }
+    return;
+  }
+
+  showUpdateBanner(`Update available: v${update.version}`, "— downloading…");
+  setUpdateResult(`Update available: v${update.version} — downloading…`);
+
+  try {
+    await update.downloadAndInstall();
   } catch (e) {
-    // Automatic checks stay quiet (offline is normal); a MANUAL check must
-    // never end in silence — that reads as a dead button.
-    if (manual) setUpdateResult(`Couldn't check right now — are you online? (${String(e).slice(0, 80)})`);
+    // Always visible, manual or not, and never worded as a network problem:
+    // the common cause is a package format this updater cannot replace.
+    showUpdateBanner(
+      `Update v${update.version} couldn't install`,
+      `— download it from ${MANUAL_DOWNLOAD}`
+    );
+    setUpdateResult(
+      `Automatic update failed — get v${update.version} from ${MANUAL_DOWNLOAD} (${String(e).slice(0, 80)})`
+    );
+    return;
+  }
+
+  showUpdateBanner(`v${update.version} ready`, "— restarting…");
+  try {
+    await relaunch();
+  } catch (e) {
+    showUpdateBanner(`v${update.version} is installed`, "— restart the app to finish");
+    setUpdateResult(`Installed. Restart to finish. (${String(e).slice(0, 80)})`);
   }
 }
 

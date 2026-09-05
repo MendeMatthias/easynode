@@ -76,7 +76,7 @@
           <h1>Run a BTX node.<br />Support the network.</h1>
           <p class="hero-sub">
             One click starts a full node from a verified snapshot. It runs
-            quietly in your menu bar. No mining, no account.
+            quietly in your <span data-tray-term>menu bar</span>. No mining, no account.
           </p>
         </div>
 
@@ -84,7 +84,7 @@
           <div class="wizard-facts">
             <div class="fact">
               <span class="fact-label">Disk needed</span>
-              <span class="fact-value">~105 GB, growing ~1 GB a day</span>
+              <span class="fact-value" id="wizard-disk-needed">—</span>
             </div>
             <div class="fact">
               <span class="fact-label">Free on this computer</span>
@@ -101,7 +101,7 @@
           <!-- Shown while setting up: the "it's working, come back later" cue. -->
           <p class="wizard-setup-note" id="wizard-setup-note" hidden>
             This takes a few minutes. You can leave the window and come back,
-            or let it keep going in the menu bar. It's ready when the screen
+            or let it keep going in the <span data-tray-term>menu bar</span>. It's ready when the screen
             turns green.
           </p>
         </div>
@@ -163,6 +163,8 @@
             <span class="stat-value" id="stat-version">—</span>
           </div>
         </div>
+
+        <p class="peer-names" id="peer-names" hidden></p>
 
         <button id="global-stats-link" class="link-row" type="button">
           Global network stats <span class="link-ext" aria-hidden="true">↗</span>
@@ -250,6 +252,20 @@
             </label>
           </div>
 
+          <div class="setting-row setting-row-stacked">
+            <div class="setting-text">
+              <span class="setting-name">Node nickname</span>
+              <span class="setting-desc" id="nickname-desc">Optional. Every node you connect to sees this name. Leave empty to stay anonymous</span>
+            </div>
+            <div class="nickname-row">
+              <input id="nickname-input" class="wallet-input" type="text" maxlength="24"
+                     placeholder="unnamed" autocomplete="off" spellcheck="false"
+                     aria-describedby="nickname-desc" />
+              <button id="nickname-save" class="btn-secondary" type="button">Save</button>
+            </div>
+            <p class="setting-result" id="nickname-result" hidden></p>
+          </div>
+
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Keeper mode</span>
@@ -286,11 +302,11 @@
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">When you close the window</span>
-              <span class="setting-desc">The red X can ask, keep the node in the menu bar, or quit</span>
+              <span class="setting-desc" data-tray-term>The red X can ask, keep the node in the menu bar, or quit</span>
             </div>
             <div class="seg" id="onclose-seg" role="radiogroup" aria-label="On close">
               <button class="seg-btn" data-onclose="ask" type="button">Ask</button>
-              <button class="seg-btn" data-onclose="tray" type="button">Menu bar</button>
+              <button class="seg-btn" data-onclose="tray" type="button" data-tray-term>Menu bar</button>
               <button class="seg-btn" data-onclose="quit" type="button">Quit</button>
             </div>
           </div>
@@ -389,9 +405,10 @@
               account — just you, helping the network stay decentralized.
             </p>
             <p class="info-fineprint">
-              The full chain uses about 105 GB of disk and grows roughly
-              1 GB a day right now. BTX has no node rewards today — this one
-              is for the network. Settings can remove the chain data anytime.
+              The full chain measured 124 GiB on 2026-09-04 and now grows
+              about 8 MB a day, so the space it needs is mostly the history it
+              already has. BTX has no node rewards today — this one is for the
+              network. Settings can remove the chain data anytime.
             </p>
             <div class="info-footprint">
               <h3>What it costs to run</h3>
@@ -555,7 +572,7 @@
               <h2 id="close-title">Close BTX Node?</h2>
             </div>
             <p class="ask-intro">
-              Your node can keep running in the menu bar so it keeps supporting the
+              Your node can keep running in the <span data-tray-term>menu bar</span> so it keeps supporting the
               network, or you can stop it and quit. Quitting stops your node until
               you open the app again.
             </p>
@@ -564,7 +581,7 @@
               Remember my choice (change it later in Settings)
             </label>
             <div class="wallet-btn-row">
-              <button id="close-keep-btn" class="btn-primary" type="button">Keep running in the menu bar</button>
+              <button id="close-keep-btn" class="btn-primary" type="button" data-tray-term>Keep running in the menu bar</button>
               <button id="close-quit-btn" class="btn-secondary" type="button">Quit BTX Node</button>
             </div>
           </div>

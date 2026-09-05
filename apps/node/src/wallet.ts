@@ -118,7 +118,13 @@ const fmtBtx = (n: number) =>
   n.toLocaleString("en-US", { maximumFractionDigits: n >= 1000 ? 2 : 6 });
 /** Exact BTX amount — up to 8 decimals (BTX's smallest unit), trailing zeros
  *  trimmed. `fmtBtx` rounds for readable balances; a spend confirmation must
- *  show the figure the node will actually spend, so it uses this instead. */
+ *  show the figure the node will actually spend, so it uses this instead.
+ *
+ *  Also the spendable CEILING. `fmtBtx` rounds half-up, so it can print a
+ *  number strictly larger than the balance — and the guard compares against the
+ *  unrounded one. The panel advertised a ceiling it would then refuse, and the
+ *  rejection quoted the same rounded figure back, so a user typing exactly what
+ *  the wallet printed was told it was too much. */
 export const fmtExact = (n: number) => n.toFixed(8).replace(/\.?0+$/, "");
 
 /** Parse a typed BTX amount to a number, or NaN if it isn't a clean amount.
@@ -198,8 +204,18 @@ export function initWallet(): void {
    *  replay a coin for every tx that already existed. */
   const txConfs = new Map<string, number>();
   let soundBaseline = false;
+  let showingSent = false;
   /** setInterval handle for the open-panel poll; null when the panel is closed. */
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  // Is the send confirmation the thing the user is actually looking at?
+  //
+  // This used to be read back out of the DOM as `!$("wallet-sent").hidden`,
+  // which is not the same question. Switching tabs hides the send PANE without
+  // touching that element, so after one successful send the flag stayed true for
+  // the rest of the session — and every later hard refresh took the early return
+  // meant to protect the confirmation screen. A stopped node then kept rendering
+  // the last known balance under "verified by your node", which this file calls
+  // the most damaging sentence the panel can print.
 
   function showOnly(section: "import" | "view" | "gate"): void {
     importSection.hidden = section !== "import";
@@ -214,6 +230,8 @@ export function initWallet(): void {
       $(`wallet-pane-${t}`).hidden = t !== tab;
       $(`wallet-tab-${t}`).classList.toggle("is-on", t === tab);
     }
+    // Navigating anywhere means the confirmation is no longer on screen.
+    showingSent = false;
     if (tab === "receive") void ensureReceiveAddr();
     if (tab === "send") resetSend();
   }
@@ -286,8 +304,9 @@ export function initWallet(): void {
     $("wallet-send-form").hidden = false;
     $("wallet-confirm").hidden = true;
     $("wallet-sent").hidden = true;
+    showingSent = false;
     sendNote.textContent = "";
-    $("wallet-send-avail").textContent = `${fmtBtx(spendable)} BTX ready to spend.`;
+    $("wallet-send-avail").textContent = `${fmtExact(spendable)} BTX ready to spend.`;
     validateSend();
   }
 
@@ -307,11 +326,16 @@ export function initWallet(): void {
     // Tell the user WHY Review is off, so a rejected amount isn't a dead button.
     const rawAmt = sendAmt.value.trim();
     if (typed && Number.isFinite(amt) && amt > spendable + 1e-12) {
-      sendNote.textContent = `That's more than the ${fmtBtx(spendable)} BTX you can spend right now.`;
+      sendNote.textContent = `That's more than the ${fmtExact(spendable)} BTX you can spend right now.`;
+    } else if (rawAmt && /\.\d{9,}$/.test(rawAmt.replace(",", "."))) {
+      // BEFORE the generic branch, not after. parseBtxAmount already returns
+      // NaN for more than 8 decimals, so this test could never be reached
+      // second and the specific explanation never appeared: someone pasting a
+      // figure with more precision than BTX has was told to "enter a plain
+      // number", which is exactly what they had done.
+      sendNote.textContent = "BTX goes to 8 decimal places.";
     } else if (typed && !Number.isFinite(amt)) {
       sendNote.textContent = "Enter a plain number, like 0.5.";
-    } else if (rawAmt && /\.\d{9,}$/.test(rawAmt.replace(",", "."))) {
-      sendNote.textContent = "BTX goes to 8 decimal places.";
     } else {
       sendNote.textContent = "";
     }
@@ -347,6 +371,7 @@ export function initWallet(): void {
       if (res.state === "ready") {
         $("wallet-confirm").hidden = true;
         $("wallet-sent").hidden = false;
+        showingSent = true;
         $("wallet-sent-txid").textContent = res.data.txid;
         $("wallet-sent-fee").textContent =
           res.data.fee != null
@@ -423,7 +448,10 @@ export function initWallet(): void {
   function renderView(d: WalletView): void {
     showOnly("view");
     spendable = d.trusted;
-    $("wallet-balance").textContent = `${fmtBtx(d.trusted)} BTX`;
+    // Exact, like the ceiling and the Max button: the headline and the send
+    // pane are on screen together, and for a balance that rounds UP at six
+    // decimals the rounded headline was a figure the form would refuse.
+    $("wallet-balance").textContent = `${fmtExact(d.trusted)} BTX`;
     $("wallet-address").textContent = d.address ?? "";
     const extras: string[] = [];
     if (d.pending > 0) extras.push(`${fmtBtx(d.pending)} incoming (unconfirmed)`);
@@ -491,7 +519,7 @@ export function initWallet(): void {
         "Your node is still backfilling older history in the background — the balance and list may still be filling in, so hold off on sending your whole balance until it settles.";
     }
     if (!$("wallet-pane-send").hidden) {
-      $("wallet-send-avail").textContent = `${fmtBtx(spendable)} BTX ready to spend.`;
+      $("wallet-send-avail").textContent = `${fmtExact(spendable)} BTX ready to spend.`;
     }
 
     chimeForTxChanges(d.txs);
@@ -531,7 +559,7 @@ export function initWallet(): void {
     const soft = opts?.soft === true;
     // A just-completed send shows the "sent" confirmation with a clickable txid;
     // a transient non-ready status must not tear that screen down either.
-    const keepSent = !$("wallet-sent").hidden;
+    const keepSent = showingSent;
     try {
       const st = await invoke<Ask<WalletView>>("wallet_status");
       if (st.state === "ready") {
@@ -752,6 +780,7 @@ export function initWallet(): void {
   });
   function closeOverlay(): void {
     overlay.hidden = true;
+    showingSent = false;
     forgetConfirm.hidden = true; // reset the two-step so it starts collapsed next time
     stopPoll();
   }

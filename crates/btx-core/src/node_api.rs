@@ -269,6 +269,15 @@ pub struct ConnectionCounts {
     pub inbound: u64,
     #[serde(rename = "connections_out", default)]
     pub outbound: u64,
+    /// Our own user agent, exactly as every peer sees it - including the
+    /// nickname comment if one is set (`/BTX:0.34.6(alice)/`).
+    ///
+    /// It rides along on a `getnetworkinfo` the app already makes, so showing a
+    /// user what the network sees costs no extra RPC. Do not derive this from
+    /// the setting: btxd builds the user agent once at init, so the setting is
+    /// what WILL be broadcast and this is what IS.
+    #[serde(default)]
+    pub subversion: String,
 }
 
 /// The per-peer subset a trusted mirror's health depends on (`getpeerinfo`).
@@ -310,6 +319,11 @@ pub struct PeerInfo {
     /// peers were never the problem. Defaults so old peer objects still decode.
     #[serde(default)]
     pub inflight: Vec<i64>,
+    /// The peer's user agent. Carries a nickname when they set one; see
+    /// [`crate::nickname::nickname_from_subver`], and treat it as untrusted
+    /// text chosen by a stranger.
+    #[serde(default)]
+    pub subver: String,
 }
 
 pub async fn get_peer_info(rpc: &dyn Rpc) -> AppResult<Vec<PeerInfo>> {
