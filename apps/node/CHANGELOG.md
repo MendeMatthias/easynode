@@ -8,7 +8,12 @@ root).
 
 ## [Unreleased]
 
-Nothing yet.
+**CI can build the untagged engine.** `engine-pin.sh` gained `engine_pin_ref`:
+the commit named by `NODE_RELEASE_COMMIT` when the pin is untagged, else the
+tag. `btxd-linux.yml` checks that out instead of a tag upstream does not have,
+which is what it was about to do for 0.34.6. README and the release recipe say
+what 0.6.18 actually shipped and how, including the two build traps and the two
+gate-script traps hit on the way.
 
 ## [0.6.18] - 2026-09-05 · linux
 

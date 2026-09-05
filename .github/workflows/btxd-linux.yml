@@ -89,7 +89,12 @@ jobs:
       # will provision via NODE_RELEASE_TAG; a workflow with its own hardcoded
       # default drifts from it silently, which is how a release ships an engine
       # the app then refuses to install.
-      - name: Resolve the engine tag from the app itself
+      #
+      # The ref we CHECK OUT is engine_pin_ref: the tag, or, while upstream has
+      # not tagged the pinned version, the exact commit named by
+      # NODE_RELEASE_COMMIT (0.6.18 shipped 0.34.6 that way). Checking out the
+      # tag name in that state fails here with a ref that does not exist.
+      - name: Resolve the engine ref from the app itself
         id: pin
         env:
           BTXCHAIN_REF: ${{ inputs.btxchain_ref }}
@@ -99,14 +104,19 @@ jobs:
           # shellcheck source=/dev/null
           . apps/node/scripts/lib/engine-pin.sh
           pinned="$(engine_pin_tag apps/node)"
+          pinned_ref="$(engine_pin_ref apps/node)"
           ref="$BTXCHAIN_REF"
-          [ -n "$ref" ] || ref="$pinned"
+          [ -n "$ref" ] || ref="$pinned_ref"
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
           echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
           # Artifact names cannot contain "/", and a branch name like
           # pr/0.33.3-network-stability fails the upload AFTER a full build.
           echo "slug=$(printf '%s' "$ref" | tr '/' '-')" >> "$GITHUB_OUTPUT"
-          echo "building $ref (app pins $pinned)"
+          if [ "$pinned_ref" != "$pinned" ]; then
+            echo "building $ref (app pins $pinned, an UNTAGGED pin = commit $pinned_ref)"
+          else
+            echo "building $ref (app pins $pinned)"
+          fi"
 
       - name: Checkout btxchain/btx
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

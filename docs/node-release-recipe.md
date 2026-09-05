@@ -152,6 +152,40 @@ Two 0.34.5 specifics a release cutter needs:
   below the Epoch-A height. The release notes must say which machines
   validate and which only follow. Do not imply everyone is a validator.
 
+### 2026-09-05: the pin moved PAST the newest tag, and why that was allowed
+
+0.6.18 ships **0.34.6 from `release/0.34.6` at `9eb4e0050e08ea3ef768bac276dac9cbd2e84542`**,
+and upstream has not tagged 0.34.6. That breaks the first half of the rule
+above ("until a tag exists that upstream itself calls clean"), and it was
+broken on purpose, by the owner, on a measurement rather than an argument:
+on one box, same datadir, same arguments, only the binary changed, v0.34.5
+connected 0.68 blocks/min against a chain producing 0.95 and fell behind for
+good while reporting itself healthy; this build did 3.80, has held the tip on
+the project's validator since 2026-09-02, and at least one other operator
+(`109.199.124.187`, `/BTX:0.34.6/`) runs it. A release on v0.34.5 would have
+shipped the fleet's biggest problem to every fresh install. The second half of
+the rule held: **both guards passed on the box cutting the release**, against
+that exact commit.
+
+What that changed mechanically, so the next cutter is not surprised:
+
+* `NODE_RELEASE_TAG` is still the NAME (`v0.34.6`: install directory, the
+  version btxd reports, the guards' label). `NODE_RELEASE_COMMIT` beside it is
+  the identity. Clear it when upstream tags 0.34.6 **at that commit**; if
+  upstream tags a different commit, re-run both guards on the tag and compare
+  trees before moving anything. The comment above the constants says the same.
+* Both guards fetch source **by SHA** when `NODE_RELEASE_COMMIT` is set
+  (raw.githubusercontent accepts a SHA where a tag would go). A branch name is
+  never substituted. An explicit override argument is still taken literally.
+* `engine_pin_ref` in `apps/node/scripts/lib/engine-pin.sh` returns the commit
+  when there is one, else the tag; `btxd-linux.yml` checks that out. The
+  download-based staging scripts (`stage-node-pkg.sh`, `stage-node-pkg-linux.sh`)
+  cannot stage an untagged engine (no upstream tarball) and refuse via
+  `assert_matches_engine_pin`; only the `-source` scripts work in this state.
+* `node-win-installer.yml`'s guard compares `NODE_RELEASE_TAG` with the proven
+  Windows btxd and will fail until a Windows btxd exists at this commit. That
+  is the guard doing its job; Windows stays on 0.6.6 meanwhile.
+
 ### The fork check: necessary, never sufficient
 
 `consensus.nMatMulStallRecoveryHeight = 199'299` is an ASERT re-anchor at a
@@ -704,7 +738,7 @@ So the first release cut from this repository runs in this order:
 5. **Then the steps above**: sign, `publish-node-release.sh`,
    `build-node-feed.sh`, the site PR.
 
-⚠ **These workflows have not yet cut a shipped release.** 0.6.15 through 0.6.17
+⚠ **These workflows have not yet cut a shipped release.** 0.6.15 through 0.6.18
 were built by hand on an Ubuntu 22.04 box using the procedure in the next
 section, and this CI is that procedure transcribed rather than a path with a
 track record. Compare the first binary it produces against a known-good hand
@@ -716,17 +750,21 @@ authority until CI has earned the job.
 ## Rebuilding the Linux release from nothing, so it never needs re-fixing
 
 Everything below was executed end to end on the Windows box's WSL Ubuntu
-22.04 on 2026-08-31 and 2026-09-01 for 0.6.15 through 0.6.17. It assumes
+22.04 on 2026-08-31 and 2026-09-01 for 0.6.15 through 0.6.17, and again on
+2026-09-05 for 0.6.18 (the untagged 0.34.6 pin; deviations noted inline). It assumes
 only: a checkout of this repo, a clone of btxchain/btx with tags, CUDA 13.3
 (nvcc 12.6 segfaults on the tree), and the updater key. Build on the OLDEST
 glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
 2.38 and will not run there, which is why we build at all.
 
-1. Engine, from a PRISTINE worktree at the tag (the provenance canary fails
-   on any dirty file and the node then runs while silently not validating):
+1. Engine, from a PRISTINE worktree at the pinned ref (the provenance canary
+   fails on any dirty file and the node then runs while silently not
+   validating). The ref is the tag, or for an untagged pin the
+   `NODE_RELEASE_COMMIT` SHA; `engine_pin_ref apps/node` prints it:
 
    ```
-   git -C <btx-clone> worktree add --detach ~/btx-ship v0.34.5
+   git -C <btx-clone> worktree add --detach ~/btx-ship "$(. apps/node/scripts/lib/engine-pin.sh; engine_pin_ref apps/node)"
+   # 0.6.18: 9eb4e0050e08ea3ef768bac276dac9cbd2e84542
    cd ~/btx-ship
    cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
      -DBUILD_DAEMON=ON -DBUILD_CLI=ON \
@@ -743,10 +781,22 @@ glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
    SASS for Turing through Blackwell (an extra sm_100 arrives via upstream's
    own isolated MXFP4 rules). Verify `BUILD_GIT_DIRTY 0` and that
    `BUILD_GIT_SOURCE_TREE_FINGERPRINT` equals the tag's seal in
-   `build/src/bitcoin-build-info.h` before going further.
+   `build/src/bitcoin-build-info.h` before going further (0.6.18's engine:
+   `BUILD_GIT_COMMIT "9eb4e0050e08"`, fingerprint `a7bf4bd74375b269…`).
+
+   Two traps hit on 2026-09-05 that the staging script's header already warns
+   about and that still cost two failed configures: `cmake` on the WSL box is
+   pip-installed under `~/.local/bin` and is not on a non-login PATH; and WSL
+   appends the Windows PATH, so cmake found anaconda's `LibeventConfig.cmake`
+   under `/mnt/c` despite `-DCMAKE_IGNORE_PATH=/mnt/c`. What worked: a
+   Linux-only PATH (`$HOME/.local/bin:/usr/local/cuda-13.3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`),
+   `-DCMAKE_IGNORE_PREFIX_PATH` on the anaconda directories as well, and
+   `rm -rf build` before re-configuring; a half-configured build dir keeps the
+   bad cache.
 
 2. Stage into the app: `apps/node/scripts/stage-node-pkg-linux-source.sh
-   ~/btx-ship/build v0.34.5`. It vendors the whole non system library
+   ~/btx-ship/build v0.34.6`; the second argument is the version btxd REPORTS,
+   i.e. the tag name, not the commit. It vendors the whole non system library
    closure (including the ~490 MB cuBLASLt) with ORIGIN rpaths and refuses
    anything unresolved.
 
@@ -755,7 +805,7 @@ glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
    NO_STRIP keeps the GPU kernels intact through AppImage packaging.
 
 4. Gates, always on the EXTRACTED bundles, never the staging tree:
-   `.btxd-version` reads v0.34.5, the bundled btxd and btx-cli execute under
+   `.btxd-version` reads the pinned tag name, the bundled btxd and btx-cli execute under
    `env -u LD_LIBRARY_PATH PATH=/usr/bin:/bin`, ldd resolves inside the
    tree, cuobjdump lists all five architectures, and both engine guards exit
    0 with their OK text actually read.
@@ -776,6 +826,18 @@ glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
    `site/public/updater/latest-node.json` and the site pins, regenerating
    the feed with `gen-node-feed.py` so every signature is verified against
    the app pubkey.
+
+   Two things from the 0.6.18 gate run, for whoever scripts step 4: the
+   bundle path contains a space (`usr/lib/easyBTX Node/…`), so never
+   word-split `ldd` output; and `cuobjdump` exits 255 on an ELF with no CUDA in
+   it, which is the one exit status that makes `xargs` abort the whole run.
+   Loop with `find -exec sh -c '… || true'` instead. And for step 6 on a box
+   without `gh`: the live half of `publish-node-release.sh` is four REST
+   calls in the same order (create DRAFT with `make_latest` the STRING
+   "false", upload, re-download every asset and byte-compare against
+   SHA256SUMS, PATCH `draft=false`), then assert `/releases/latest` is still
+   the miner's. On Git Bash, `curl -o /dev/null` fails with exit 23; write to
+   a real file.
 
 Numbers with a shelf life (sizes, heights, seed lists) live in the code and
 the changelog, not here. This section is the procedure, and the procedure is

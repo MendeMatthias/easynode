@@ -128,8 +128,8 @@ there and did the work.
 
 Recognition now has an actual mechanism, which it did not before. Settings has a
 **node nickname**: an optional name that rides along in the user agent your node
-introduces itself with, so peers see `/BTX:0.34.5(yourname)/` instead of an
-anonymous `/BTX:0.34.5/`. It is off by default and it is genuinely public — a
+introduces itself with, so peers see `/BTX:0.34.6(yourname)/` instead of an
+anonymous `/BTX:0.34.6/`. It is off by default and it is genuinely public — a
 persistent identifier that follows your node across restarts and IP changes,
 which is the whole point and also the reason it is a choice rather than a
 default. Measured across a 20-peer sample on 2026-09-05: nobody on this network
