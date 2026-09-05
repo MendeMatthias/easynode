@@ -326,6 +326,11 @@ pub struct AppState {
     /// answer. Cleared on every stop/start alongside the stall verdict, so a
     /// previous run's answer never renders as current. See `btx_core::frontier`.
     pub archive_service: Arc<Mutex<Option<btx_core::frontier::ArchiveService>>>,
+    /// The fork detector's verdict — a longer chain this node cannot obtain
+    /// blocks for — computed by the refresher from `getchaintips` and the
+    /// headers/blocks gap. Cleared on every stop/start like the others, so a
+    /// dead run's fork never renders as current. See `btx_core::fork`.
+    pub fork: Arc<Mutex<Option<btx_core::fork::ForkAlarm>>>,
     /// The archive-peer census, computed ONCE per refresher tick from a single
     /// getpeerinfo and shared by the status snapshot, the watchdog and the
     /// service report. The UI poll used to run its own full getpeerinfo every
@@ -380,6 +385,7 @@ impl AppState {
             rc_status_cache: Arc::new(Mutex::new(None)),
             stall_verdict: Arc::new(Mutex::new(None)),
             archive_service: Arc::new(Mutex::new(None)),
+            fork: Arc::new(Mutex::new(None)),
             archive_peers_cache: Arc::new(Mutex::new(None)),
             peer_nicknames_cache: Arc::new(Mutex::new(Vec::new())),
         }

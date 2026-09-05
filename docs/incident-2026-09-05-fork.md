@@ -166,3 +166,158 @@ the node is not stalled on validation, it has nothing to validate.
 Everything above is reproducible read-only with `btx-cli getchaintips`,
 `getpeerinfo`, `getblockheader`, `getmatmultrustedstatus`, and
 `tail ~/node-observer.tsv`.
+
+## 19:49Z: who is on which chain, measured from outside the node
+
+Read-only, and not through this node's own peer table: a standalone P2P
+handshake probe (`~/btx_probe.py` on the release box; v1 transport, `version`,
+then `getheaders` from block 210496, then one `getdata` for the live branch's
+first block) against every address the node knows (`getnodeaddresses 0`, 1,079
+entries), its 20 current peers, the shipped seeds, and the one address upstream
+issue btxchain/btx#143 names. 1,090 addresses, 49 answered a handshake. Read
+2026-09-05 19:49Z. Full result: `~/btx-probe-20260905T194948Z.json`.
+
+The branch test is the first header each peer returns after 210496: our
+210497 is `80a27935…` (timestamp 00:33:33Z), the live branch's 210497 is
+`2d816071…` (00:39:20Z), and the two long headers-only branches share those
+first 580 blocks before splitting again at 211076.
+
+| address | engine | height | branch | serves live bodies | services |
+|---|---|---|---|---|---|
+| **13.140.141.180:19335** | /BTX:0.34.5/ | **211197** | **live** | **yes** (block 210497, 383 B) | CONSENSUS, NETWORK_LIMITED |
+| 108.165.189.105–108:19335 (four) | /BTX:0.34.6/ | 210871–210872 | ours | – | TRUSTED_MIRROR, ATTESTATION_ARCHIVE |
+| 185.204.52.17, 31.210.170.124, 31.210.171.63 | /BTX:0.34.6/ | 210872 | ours | – | TRUSTED_MIRROR, ATTESTATION_ARCHIVE |
+| 37.230.134.222:19335 | /BTX:0.34.6/ | 210872 | ours | – | NETWORK, CONSENSUS, ATTESTATION_ARCHIVE |
+| 194.93.48.158:19335 | /BTX:0.34.5/ | 210872 | ours | – | NETWORK, CONSENSUS |
+| 20.86.181.203:19338, 61.32.91.194:16935 | 0.34.5 | 210872 | ours | – | |
+| 109.199.124.187:19335 (pool operator) | /BTX:0.34.6/ | 210862 | not asked (no headers reply) | – | CONSENSUS, ATTESTATION_ARCHIVE |
+| node.btx.dev, node.btxchain.org, node.btx.tools | /BTX:0.34.5/ | 199294–199300 | parked below the fork | – | |
+| 134.199.150.193 (Byron) | /BTX:0.34.6/ | 209778 | below the fork | – | NETWORK, TRUSTED_MIRROR |
+| 71.172.72.46:50098 | /BTX:0.34.5/ | 209447 | below the fork | – | |
+| 213.224.31.105:19335 (from #143) | – | – | no answer | – | |
+| 24 others | 0.30–0.33 | 125600–191690 | pre-fork dead branches | – | |
+
+So: **one** reachable node carries the live chain and will hand over its
+blocks, and it is pruned (`NETWORK_LIMITED`). Eleven reachable nodes, including
+every archive and every trusted mirror we know, carry ours. The three official
+DNS seeds are parked at 199,29x and serve nothing above it. `207.56.229.99`,
+`114.150.94.235` and `89.85.40.184` from the shipped seed list did not answer
+(the first has refused every dial from this node all day: `connect() …
+Connection refused`, hundreds of lines in `debug.log`).
+
+Chainwork, from our own headers (`getblockheader`), read 19:48Z:
+
+```
+live branch tip 211167   chainwork …030b5024961e6c   newest header 18:22:07Z
+second branch   211077   chainwork …030b50237a9580
+our tip         210872   chainwork …030b501ef36bd2   19:23:06Z
+```
+
+The live branch is heavier. Its peer reported 211197 at 19:49Z, so it has
+grown 30 blocks since our last header from it at 18:22Z (about one block
+every three minutes); ours grew 7 in the same 87 minutes. Both are far below
+the ~0.95 a minute the network produced before the split, which is consistent
+with the hashrate being divided and part of it idle.
+
+### Upstream's view, and a pool that chose our branch
+
+btxchain/btx#143 (opened 15:41Z today by `trokl1`, a pool operator with 74
+rigs) describes this exact branch from the other side: at 11:28Z a
+`/BTX:0.34.6/` peer at `213.224.31.105` connected inbound to their v0.34.5 node
+(tip 210738) and sent 314 headers starting at `2d816071…` height 210497 — the
+live branch's first block. Their node never fetched a body
+(`FindNextBlocksToDownload skip … no_body_availability`), their pool's mining
+gate saw a heavier competitor and paused for 47 minutes, and they recovered by
+running `invalidateblock` on the branch root. They call it an attack shape:
+"a branch whose bodies are never served", "a private branch mined at low
+difficulty is enough". So at least one pool with real hashrate is on our
+branch by operator decision, and treats the live branch as hostile. The owner
+has decided the opposite from their sources. This file records both; the
+owner's decision stands.
+
+### Why the live branch's peers were never asked, from the engine source
+
+`net_processing.cpp` in the 0.34.6 tree (`FindNextBlocksToDownload`):
+
+```
+// SF-3: claimed nChainWork of a HEADER_ONLY BestKnown is not body
+// availability. Once any peer has delivered a body, skip peers that
+// never have — unless they are manual/noban or the GPU/frontier source.
+if (node::HeaderSyncSkipPeerWithoutBodyAvailability(
+        state->m_has_served_block,
+        state->m_manual || state->m_noban,
+        this_peer_frontier_source || this_peer_gpu,
+        any_served)) {
+    log_skip("no_body_availability");
+```
+
+That is the whole mechanism. Between 16:02Z and 17:25Z this node had four
+**outbound** full-relay peers on the live branch (ids 322, 332, 337, 343,
+advertising 210985–211127) — not only the two inbound relay-only ones — and
+asked none of them for a body, because they were automatic connections that
+had never served us a block while other peers had. A **manual** (`addnode`)
+peer passes the gate. So the fix is one manual connection to a node that
+serves the branch, which the probe has now identified.
+
+Deep-reorg parking is **off** on this node: `btx_rw.conf` carries
+`parkdeepreorg=0`, the R/W layer wins over `faststart.conf`'s
+`parkdeepreorg=1` (same precedence the prune setting showed), and the engine
+logged it at the last start: `Deep-reorg parking is disabled
+(profile=emergency). This node will auto-follow rewrites deeper than the
+emergency PARK depth of 6`. Every deep-reorg event since (4 to 13 blocks, ten
+of them on 2026-09-04) reads `Following the most-work chain (warn-only)`. So
+once the bodies arrive and validate, the node reorganises without a restart.
+A **fresh** 0.6.18 install ships `parkdeepreorg=1` / `maxreorgdepthpark=6` in
+`faststart.conf` and would park instead; that is a separate decision, noted
+under "Fresh installs" below.
+
+### Proposed, not done: one command, owner's go required
+
+```
+btx-cli -datadir=/home/bonuz/.easybtx addnode 13.140.141.180:19335 add
+```
+
+`add`, not `onetry`: a manual peer is what passes the body gate, and `add`
+keeps redialling if the connection drops. No restart, no file in `~/.easybtx`
+touched, no flag changed. Expected sequence, watched with `getchaintips` and
+`debug.log`: a manual outbound connection; `getdata` for 210497 onward on the
+heavier branch; GPU validation of each body; at the point the branch's
+chainwork exceeds ours with bodies in hand, a reorganisation of the 376 blocks
+from 210497 to 210872 (deeper by then), the 211167 branch turning `active`,
+and `blocks` climbing to the live tip. If a body fails MatMul consensus, the
+branch turns `invalid` in `getchaintips`, the peer is penalised, and the
+answer is a different one — that outcome is as visible as success and is the
+reason to watch rather than assume. Reverting the decision later is
+`addnode 13.140.141.180:19335 remove`, then `invalidateblock 2d8160719cb…`
+(the live branch's 210497) to return to this branch, and `reconsiderblock` to
+undo that.
+
+What it does not solve: the node stays a validator that can reach the live
+chain through **one** pruned peer. A second source is wanted; none was found
+among 1,090 addresses at 19:49Z.
+
+### Fresh installs (task 3), measured against the same probe
+
+`crates/btx-core/src/node.rs` `BTX_BOOTSTRAP_PEERS`, which the app passes as
+`-addnode` (manual, so they do pass the body gate): `207.56.229.99` (refusing
+dials), `37.230.134.222` (ours), `114.150.94.235` (no answer), `89.85.40.184`
+(no answer, and banned by this node), `194.93.48.158` (ours), `71.172.72.46`
+(209447, below the fork), `109.199.124.187` (ours), `89.167.80.220` and
+`51.15.18.10` (both 0.32.12, parked at 185,109 on a dead branch, answering
+2,000 headers of it to anyone who asks). Plus the DNS seeds at 199,29x. **A
+fresh 0.6.18 install has no route to the live chain**: every seed that answers
+is on our branch or below the fork. It would sync history from the archives
+(correct up to 210496, which both chains share), take 210497 onward from our
+branch's peers, and sit on the minority fork with a green status.
+
+Two things follow, done in the 0.6.19 change: `13.140.141.180:19335` joins
+the seed list as the one verified live-chain peer (post-fork bodies; the
+pre-fork history still comes from the archives, which is fine because it is
+the same history), the two 0.32.12 dead-branch fallbacks and the parked
+operator node leave it, and the app gains the fork detector so that a node
+which lands on the wrong side says so. One thing does not follow
+automatically and is the owner's: a fresh install with `parkdeepreorg=1`
+that connects our branch's 210497 first will **park** when the heavier live
+branch's bodies arrive, exactly as designed after 2026-08-11 — the same
+setting that protected nodes then would strand them now. Whether new installs
+should ship with parking on is a policy question this file only raises.

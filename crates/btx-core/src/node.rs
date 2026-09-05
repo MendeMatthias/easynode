@@ -26,10 +26,35 @@ use tokio::process::{Child, Command};
 /// Several seeds on purpose, not one: after the first successful connection
 /// btxd learns the remaining NODE_NETWORK addresses via addr gossip, so this
 /// list only has to get a fresh node past the pruned default set.
+///
+/// MEASURED AGAIN 2026-09-05 19:49Z, the day of the 210496 split
+/// (docs/incident-2026-09-05-fork.md): a standalone handshake probe of 1,090
+/// addresses found exactly ONE reachable node on the live chain that serves
+/// its blocks, and every seed below that answered was on the minority branch
+/// or below the fork. A fresh install had no route to the live chain. The
+/// engine takes bodies for a competing branch only from manual/noban peers
+/// once any peer has served it (net_processing.cpp, `no_body_availability`),
+/// and `-addnode` is manual, so the live-chain entry here is what lets a
+/// fresh node fetch the branch at all; history up to the split is the same on
+/// both chains and still comes from the archives.
 pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
+    // The one node found on the live chain 2026-09-05 19:49Z: /BTX:0.34.5/,
+    // MATMUL_CONSENSUS, at 211197 while every other reachable node was at or
+    // below 210872, and it answered `getdata` for the live branch's first
+    // block (210497, 2d816071…) with the body. NETWORK_LIMITED — recent
+    // blocks only — so it carries the post-split chain, not deep history.
+    "13.140.141.180:19335",
+    // Refused every dial from the validator on 2026-09-05 ("Connection
+    // refused", hundreds of debug.log lines) and did not answer the probe.
+    // Kept: it is the only full-history archive the census ever found, and a
+    // retired seed costs one failed dial.
     "207.56.229.99:19335",
+    // 2026-09-05 19:49Z: answered at 210872 on the minority branch. Still a
+    // NETWORK archive for the shared history.
     "37.230.134.222:19335",
+    // 2026-09-05 19:49Z: no answer to the probe.
     "114.150.94.235:19335",
+    // 2026-09-05 19:49Z: no answer, and on the validator's banlist.
     "89.85.40.184:19335",
     // 139.59.106.83 REMOVED 2026-09-01. Three independent confirmations that it
     // sits on a stale branch: an operator caught it serving header 8b4842ee at
@@ -38,12 +63,16 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // restarts on the spot. It is a trusted mirror that followed a bad attested
     // tip; its BODIES were valid, which is exactly why it looked healthy. A
     // seed that wedges fresh header presync is disqualified regardless.
+    // 2026-09-05 19:49Z: answered at 210872 on the minority branch; NETWORK.
     "194.93.48.158:19335",
     // Operator node, at tip, open inbound, consented to being a seed 2026-09-01
     // with the honest caveat that it is a rented box he cannot promise forever.
     // A retired seed costs one failed dial; the checkpoint gate (planned) makes
     // that cost zero.
-    "71.172.72.46:50098",
+    // RETIRED 2026-09-05: the probe found it at 209447, more than a thousand
+    // blocks below the split, answering no headers past it. A seed that is
+    // itself parked cannot lead a fresh node anywhere.
+    // "71.172.72.46:50098",
     // BTX pool operator's node, offered 2026-09-04 and verified from our own
     // validator the same day before it was added here: /BTX:0.34.6/, at the tip
     // (its headers 210257 against our 210253), outbound dial accepted, and
@@ -62,9 +91,13 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // ARCHIVE_PEERS candidate and a far scarcer one: measured 2026-09-04 from a
     // node with 19 peers, twelve advertised NETWORK and exactly ONE was archival
     // AND current (docs/archival-capacity.md).
+    // 2026-09-05 19:49Z: answered at 210862 (minority branch, ten behind it).
     "109.199.124.187:19335",
-    "89.167.80.220:19335",
-    "51.15.18.10:19335",
+    // 89.167.80.220 and 51.15.18.10 REMOVED 2026-09-05. Both /BTX:0.32.12/,
+    // both measured parked at 185,109 on a pre-fork dead branch and answering
+    // 2,000 headers of it to anyone who asks; the validator has carried both
+    // as manual peers for days with synced_headers -1. Diversity from a node
+    // that cannot follow the chain is not diversity.
 ];
 
 /// Attestation ARCHIVE peers — the peers a TRUSTED MIRROR cannot live without.
@@ -3189,10 +3222,12 @@ consensus-validator service.";
         // adding or dropping a seed cannot pass unnoticed. Every entry is
         // something a fresh install dials on first start, so a change here
         // deserves the moment it takes to update this number deliberately.
+        // 2026-09-05: 9 became 7 — one live-chain node in, three parked or
+        // dead-branch nodes out (see the list's comments and the incident file).
         assert_eq!(
             BTX_BOOTSTRAP_PEERS.len(),
-            9,
-            "BTX_BOOTSTRAP_PEERS should have 9 entries"
+            7,
+            "BTX_BOOTSTRAP_PEERS should have 7 entries"
         );
     }
 

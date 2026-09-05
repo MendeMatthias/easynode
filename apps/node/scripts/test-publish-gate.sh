@@ -17,6 +17,18 @@ VER="$(python3 -c "import json;print(json.load(open('$HERE/../src-tauri/tauri.co
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 A="$T/assets"; mkdir -p "$A"
 
+# The observer gate (scripts/observer-ok.sh, easynode#37) runs FIRST in the
+# publish script, and a CI runner has no observer. Feed it a row written now
+# with state `ok`, so the sums fixtures below run through the real gate rather
+# than around it; the last case then hands it a FORK row and expects the
+# publish script to refuse before it looks at a single asset.
+export BTX_OBSERVER_TSV="$T/observer.tsv"
+observer_row() {  # <state>
+  printf 'utc\tblocks\theaders\tbehind\tpeers\tarchival_at_tip\tstored_attestations\tstate\n%s\t210816\t210816\t0\t20\t1\t3650\t%s\n' \
+    "$(date -u +%FT%TZ)" "$1" > "$BTX_OBSERVER_TSV"
+}
+observer_row ok
+
 printf 'appimage bytes' > "$A/BTX-Node_${VER}_amd64.AppImage"
 printf 'sig'            > "$A/BTX-Node_${VER}_amd64.AppImage.sig"
 printf 'setup bytes'    > "$A/BTX-Node_${VER}_x64-setup.exe"
@@ -35,6 +47,7 @@ grep -q "BTX-Node_${VER}_amd64.AppImage matches the gate run" "$T/out" || { echo
 grep -q "BTX-Node_${VER}_x64-setup.exe matches the gate run" "$T/out"  || { echo "FAIL: setup.exe not matched (star/CRLF line)"; cat "$T/out"; exit 1; }
 grep -q "is not listed in SHA256SUMS" "$T/out" && { echo "FAIL: a listed asset was reported missing"; cat "$T/out"; exit 1; }
 grep -q "does not match the gate run" "$T/out" && { echo "FAIL: a matching asset was reported tampered"; cat "$T/out"; exit 1; }
+grep -q "observer-ok: .* state=ok" "$T/out" || { echo "FAIL: the observer gate did not report the fresh ok row"; cat "$T/out"; exit 1; }
 echo "   pass"
 
 echo "== tampered bytes: refused =="
@@ -48,5 +61,12 @@ echo "== an asset the gates never saw: refused =="
 printf 'orphan' > "$A/BTX-Node_${VER}_aarch64.app.tar.gz"; printf 'sig' > "$A/BTX-Node_${VER}_aarch64.app.tar.gz.sig"
 run
 grep -q "BTX-Node_${VER}_aarch64.app.tar.gz is not listed in SHA256SUMS" "$T/out" || { echo "FAIL: unlisted asset not caught"; cat "$T/out"; exit 1; }
+echo "   pass"
+
+echo "== the box's own node on a fork: refused before any asset is read =="
+observer_row FORK
+run
+grep -q "observer-ok: the last state is 'FORK'" "$T/out" || { echo "FAIL: a FORK row was not refused"; cat "$T/out"; exit 1; }
+grep -q "matches the gate run" "$T/out" && { echo "FAIL: assets were examined despite the fork"; cat "$T/out"; exit 1; }
 echo "   pass"
 echo "publish gate: all fixtures behave"

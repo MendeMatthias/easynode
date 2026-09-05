@@ -8,6 +8,37 @@ root).
 
 ## [Unreleased]
 
+**A node on a minority branch stops looking healthy.** On 5 September the
+project's own validator sat on a minority fork for hours with a green status:
+`headers` 300 ahead of `blocks`, a headers-only branch of 671 blocks in
+`getchaintips`, and nothing in the app said so
+(`docs/incident-2026-09-05-fork.md`, easynode#35). The status now carries a
+fork verdict (`btx_core::fork`), read from the node's own `getchaintips` every
+30 seconds and from the headers/blocks gap every tick. A headers-only branch
+more than six blocks longer than ours since the two split, or headers more than
+twenty ahead of blocks for ten minutes without the gap closing, shows in amber
+beside the height: "A longer chain exists (height …) that your node cannot
+obtain blocks for. Your view of the chain may be behind." No guess about which
+chain is right. A node catching up after time offline does not alarm, because
+its gap closes. (#36)
+
+**The observer alarms, and the release scripts listen.**
+`scripts/node-observer.sh` writes `FORK` in its state column, and says so on
+stderr, under the same two conditions. The new `scripts/observer-ok.sh` exits 0
+only when the observer's last row is younger than five minutes and `ok`;
+`build-node-feed.sh` and `publish-node-release.sh` run it first, so nothing is
+signed or published from a box whose own node is on a fork, down, or
+unobserved. `OBSERVER_OVERRIDE=1` skips it and is echoed loudly. (#37)
+
+**A fresh install can reach the live chain.** Measured 5 September 19:49Z
+against 1,090 known addresses: every shipped seed that answered was on the
+minority branch or parked below the split, so a fresh 0.6.18 had no route to
+the live chain. The one reachable node found carrying the live chain and
+serving its blocks, `13.140.141.180`, joins the seed list; the two 0.32.12
+fallbacks parked at 185,109 and the operator node parked at 209,447 leave it.
+The engine only fetches a competing branch's bodies from manual peers, and the
+seeds are manual, which is why this is the fix and not merely a hint. (#38)
+
 **CI can build the untagged engine.** `engine-pin.sh` gained `engine_pin_ref`:
 the commit named by `NODE_RELEASE_COMMIT` when the pin is untagged, else the
 tag. `btxd-linux.yml` checks that out instead of a tag upstream does not have,

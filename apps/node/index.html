@@ -164,6 +164,15 @@
           </div>
         </div>
 
+        <!-- A longer chain exists that this node cannot obtain blocks for
+             (btx_core::fork). The 2026-09-05 lesson: a node on a minority
+             branch must not look like a healthy node on a quiet network.
+             Amber, not red: a fact about what this node can see, not a
+             verdict on which chain is right. -->
+        <div class="card fork-card" id="fork-card" hidden>
+          <p id="fork-msg"></p>
+        </div>
+
         <p class="peer-names" id="peer-names" hidden></p>
 
         <button id="global-stats-link" class="link-row" type="button">

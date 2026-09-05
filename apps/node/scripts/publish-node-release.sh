@@ -54,6 +54,11 @@ if [ "$DO_PUBLISH" -eq 0 ]; then
   echo
 fi
 
+# ── The box's own node must be on the chain it claims (easynode#37) ─────────
+# In the dry run too: it is a check, and the earliest one worth failing. The
+# 2026-09-05 release was published from a box whose own node was on a fork.
+"$APP_DIR/../../scripts/observer-ok.sh" || exit 1
+
 [[ -f "$CONF" ]]      || { echo "error: no tauri.conf.json at $CONF" >&2; exit 1; }
 [[ -x "$VERIFY" ]] || [[ -f "$VERIFY" ]] || { echo "error: no verify-updater-sig.py" >&2; exit 1; }
 [[ -d "$ASSET_DIR" ]] || { echo "error: no asset dir at $ASSET_DIR" >&2; exit 1; }
