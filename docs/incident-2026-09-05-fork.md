@@ -321,3 +321,112 @@ that connects our branch's 210497 first will **park** when the heavier live
 branch's bodies arrive, exactly as designed after 2026-08-11 — the same
 setting that protected nodes then would strand them now. Whether new installs
 should ship with parking on is a policy question this file only raises.
+
+## 20:32Z: the validator follows the live chain
+
+The owner gave the go at ~20:07Z by running the proposed command from the
+desktop app (it failed there, `btx-cli` is not on the Windows PATH, and was
+then run inside WSL). What it took, all runtime RPC, nothing in `~/.easybtx`
+touched, no restart:
+
+```
+20:09:33Z  btx-cli addnode 13.140.141.180:19335 add          # accepted, never dialed
+20:22:52Z  addnode … remove + disconnectnode for three manual peers that had
+           never served a header (71.172.72.46, 89.167.80.220, 134.199.150.193),
+           and addnode … remove for six entries that do not answer
+           (207.56.229.99, 37.230.134.222, 114.150.94.235, 89.85.40.184,
+           51.15.18.10, 139.59.106.83)
+20:23:08Z  "New manual v2 peer connected: version: 800002, blocks=211257, peer=373"
+20:23:09Z  first live-branch bodies retained from peer 373 (root-first order)
+20:32:12Z  "Deep reorg detected: a branch would reorganize 383 blocks
+           (profile=emergency; warn=3; park=6; tip=210879, fork=210496,
+           candidate=210719). Following the most-work chain (warn-only)."
+20:32:26Z  UpdateTip height=210720 on the live branch; 210721 at 20:32:49Z
+```
+
+Why the thirteen-minute gap between `addnode` and the first dial: btxd has
+`MAX_ADDNODE_CONNECTIONS = 8` (`src/net.h`), the conf carried fourteen
+`addnode=` lines with ten connected, and the added-connections thread takes
+one slot per attempt and stops when none is free. It only ever retried the
+first entry that was not connected (207.56.229.99, refusing: 29 attempts in
+eight minutes) and never reached the new one. `getaddednodeinfo` showed the
+entry as accepted the whole time; nothing said it was starved. Freeing three
+slots got the live peer connected within sixteen seconds. The removed
+entries return from `faststart.conf` on the next restart; the seed-list
+change in 0.6.19 (easynode#40) is what makes the conf itself right.
+
+Verified at 20:33:01Z: `getblockhash` at 210497, 210600 and 210700 equals the
+live branch's header at those heights (`~/live-branch-headers.json`, saved
+from `getchaintips` before any change). The former active chain is now the
+384-block `headers-only` tip at 210880 in `getchaintips`. Reorg depth: **383
+blocks** (210497 to 210879). The node is validating the remaining 541 blocks
+on the GPU at roughly its measured 3.8 a minute; the observer (now the merged
+script, report-only) writes `FORK` until `headers − blocks` is back under 20,
+which is the release gate holding as designed while the node catches up.
+
+Also done at 20:09Z: the observer on the box was switched to the merged
+`scripts/node-observer.sh` (old copy kept as `~/node-observer.sh.pre-fork-alarm-*`),
+without `BTX_START_CMD`, so it reports and never launches the app on this box.
+Its first row after the swap read `FORK … leads ours by 290`.
+
+### The chain census on easybtx.com/nodes (site PR #461)
+
+The same headers method, run from Vercel every 30 minutes for every
+reachable node: a locator over the heaviest chain's recent hashes, one
+`getheaders` per node, nodes grouped by where their headers leave that chain.
+A live smoke run at 20:28Z against seven nodes: chain A at 211260, most work,
+one node; chain B at 210880, forked at 210496, five nodes; split. The page
+shows both, names nodes by the nickname they broadcast, and never says which
+chain is right.
+
+### Correction at 20:35Z: who actually served the chain, and why it could not before
+
+The manual peer that connected at 20:23:08Z and served every body (peer 373)
+is **not** 13.140.141.180. `getpeerinfo` at 20:35:13Z:
+
+```
+89.85.40.184:19335  /BTX:0.34.6/  manual  NETWORK, MATMUL_CONSENSUS
+                    synced_headers 211262  synced_blocks 210730  inflight 4  122.7 MB received
+```
+
+That is one of the SHIPPED seeds (`BTX_BOOTSTRAP_PEERS`), a full archive on
+the live chain, running the same engine as this box. It did not answer the
+19:49Z probe, and `13.140.141.180` (added 20:09Z) has still not been dialed:
+the `addnode` list carries every conf entry twice (the app passes the same
+peers on the command line), so removing an entry once leaves a twin that
+reconnects, and the eight manual slots stay full. The seed-list comment for
+89.85.40.184 in easynode#40 ("no answer, and on the validator's banlist") is
+right about the probe and wrong about what the node is; the next change to
+`node.rs` says so.
+
+**Why this box could not reach the live chain all afternoon, in full.** The
+engine's body gate (above) is half of it. The other half is that this node
+**banned the live-chain peers itself**. `debug.log`, the only five lines of
+their kind today:
+
+```
+16:20:33Z Aggressive P2P is penalized: aggressive getmmattest, disconnecting peer=304
+16:23:52Z Aggressive P2P is penalized: aggressive getmmattest, disconnecting peer=322
+16:33:33Z Aggressive P2P is penalized: aggressive getmmattest, disconnecting peer=328
+17:45:35Z Aggressive P2P is penalized: aggressive getmmattest, disconnecting peer=343
+```
+
+`banlist.json` gained `108.165.189.109` at 16:20:33Z, `89.85.40.184` at
+16:23:52Z, `185.204.52.141` at 16:33:33Z and `176.112.239.19` at 17:45:35Z,
+each for 24 hours. Peer 322 was the outbound full-relay peer that advertised
+211068 at 16:02Z; peer 343 advertised 211127 at 17:25Z. Between 16:15Z and
+16:23Z peer 322 sent 14 `getmmattest` that this node answered
+`no_such_block` and 6 answered `not_canonical`: a consensus node on the live
+chain asking the only question it can ask, about blocks this node did not
+have. `AggressiveGetMmAttestShouldBan` counts every ignored request
+(btxchain/btx#142 reports exactly this) and `BanHammeringPeer` banned it. So a
+live-chain node that connected to us was first refused as a body source
+(never served us, not manual) and then banned for asking about its own
+chain. Every automatic reconnection to it was then refused for a day; only
+`addnode`, which bypasses the ban for outbound dials, got through. The four
+bans were lifted at 20:37Z (`setban <ip> remove`).
+
+Consequence for easynode#38: the shipped seed list DID contain a live-chain
+node; the engine's own peer policy made it unreachable. A fresh install with
+the same engine would do the same. That is an engine question for upstream
+(#142, and the body gate) before it is a seed-list question.
