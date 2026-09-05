@@ -8,6 +8,20 @@ root).
 
 ## [Unreleased]
 
+## [0.6.19] - 2026-09-06 · linux
+
+**What the split taught about the engine, recorded so the seed list is not
+blamed for it.** The shipped seed `89.85.40.184` was on the live chain all
+along and served the validator's entire 383-block reorganisation once it
+was dialled as a manual peer at 20:23Z on 5 September. It could not help
+before because the validator had banned it at 16:23Z for "aggressive
+getmmattest": a consensus node asking for attestations of blocks this
+node did not have, counted as hostile after 32 ignored requests
+(btxchain/btx#142). Four live-chain peers were banned that way in one
+afternoon. A fresh install with this engine does the same, so the fork
+detector above is the honest protection until upstream changes the rule.
+`docs/incident-2026-09-05-fork.md` has the log lines.
+
 **A node on a minority branch stops looking healthy.** On 5 September the
 project's own validator sat on a minority fork for hours with a green status:
 `headers` 300 ahead of `blocks`, a headers-only branch of 671 blocks in

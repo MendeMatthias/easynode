@@ -54,7 +54,14 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     "37.230.134.222:19335",
     // 2026-09-05 19:49Z: no answer to the probe.
     "114.150.94.235:19335",
-    // 2026-09-05 19:49Z: no answer, and on the validator's banlist.
+    // 2026-09-05 19:49Z: no answer to the probe, and on the validator's
+    // banlist. Both were this side's doing: at 20:23Z the same node, dialled
+    // as a manual peer, was /BTX:0.34.6/ with NETWORK + MATMUL_CONSENSUS on
+    // the live chain and served the validator's whole 383-block
+    // reorganisation (docs/incident-2026-09-05-fork.md). The ban was the
+    // engine's getmmattest hammer (btxchain/btx#142) for asking about
+    // blocks we did not have. The one shipped seed proven on the live
+    // chain with full history.
     "89.85.40.184:19335",
     // 139.59.106.83 REMOVED 2026-09-01. Three independent confirmations that it
     // sits on a stale branch: an operator caught it serving header 8b4842ee at
