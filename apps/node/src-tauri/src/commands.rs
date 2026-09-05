@@ -185,11 +185,34 @@ use crate::state::{
 // says v0.34.5. That is a local workaround on one box, not a shipped fix, and
 // it should not be mistaken for one.
 //
-// WHEN 0.34.6 TAGS: run both gates on it, then move this constant and re-check
-// snapshot_spec() per the note above. Until then a Linux release either ships
-// an engine that cannot converge or it waits, and that is a release decision
-// rather than something to change quietly here.
-pub const NODE_RELEASE_TAG: &str = "v0.34.5";
+// DECIDED 2026-09-05, by the owner, for 0.6.18: ship the 0.34.6 branch build.
+//
+// Upstream has still not tagged 0.34.6; `release/0.34.6` is a branch whose tip
+// is NODE_RELEASE_COMMIT below. The reason to ship it anyway is measured, not
+// argued: on one box, same datadir, same arguments, only the binary changed,
+// v0.34.5 connected 0.68 blocks/min against a chain producing 0.95 and fell
+// behind for good while reporting itself healthy; this build did 3.80. It has
+// held the tip on the Linux validator since 2026-09-02 with dirty=0 and
+// execution policy ready=1 on sm_86, and at least one other operator on the
+// network runs the same build (109.199.124.187, /BTX:0.34.6/). A release on
+// v0.34.5 would have put the biggest fleet-wide problem into every fresh
+// install with a fresh coat of paint on it.
+//
+// Both gates verify the COMMIT: the guards fetch chainparams.cpp, init.cpp and
+// the golden manifest by SHA when the tag string does not exist upstream, so
+// an untagged pin gets the same fork check and fleet-start check a tagged one
+// gets. If upstream later tags 0.34.6 at a different commit, this pin does not
+// move by itself; that is a deliberate re-check, not a rename.
+//
+// snapshot_spec() is unchanged on purpose: the 203000 assumeutxo base is
+// compiled into this commit (chainparams.cpp, "main assumeutxo snapshot at
+// height 203'000 (0.34.5 release …)"), verified in the tree at this SHA.
+pub const NODE_RELEASE_TAG: &str = "v0.34.6";
+
+/// The exact upstream commit NODE_RELEASE_TAG names. Set only while the tag
+/// does not exist upstream; the guards read it and fetch source by SHA. Clear
+/// it (or make it match the tag object) once upstream tags the release.
+pub const NODE_RELEASE_COMMIT: &str = "9eb4e0050e08ea3ef768bac276dac9cbd2e84542";
 
 /// The pinned assumeutxo snapshot this app bootstraps from: the v0.33.2
 /// release's own asset (height 179000), pinned from its snapshot.manifest.json.

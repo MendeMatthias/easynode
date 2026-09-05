@@ -826,7 +826,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "easybtx-node"
-version = "0.6.17"
+version = "0.6.18"
 dependencies = [
  "async-trait",
  "base64 0.21.7",

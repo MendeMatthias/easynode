@@ -69,6 +69,15 @@ MANIFEST="src/matmul/matmul_v4_rc_production_golden_manifest.data"
 BTX_CLONE="${BTX_CLONE:-/Users/bonuz/repos/btx}"
 RAW_BASE="https://raw.githubusercontent.com/btxchain/btx"
 
+# An UNTAGGED pin. When commands.rs also declares NODE_RELEASE_COMMIT, the tag
+# string may not exist upstream yet (0.34.6 shipped from release/0.34.6 before
+# upstream tagged it). The guard then fetches source at that SHA instead, so an
+# untagged pin gets exactly the check a tagged one gets. It never substitutes a
+# branch name: a branch moves, a SHA does not. Empty when the tag is real.
+pin_commit() {
+  sed -n 's/^pub const NODE_RELEASE_COMMIT: &str = "\([0-9a-f]\{40\}\)";.*$/\1/p' "$1" | head -1
+}
+
 # 0.34.5 introduced this line. Its presence means an off-manifest host starts.
 # Measured across every tag on 2026-08-29: absent on v0.33.3 through v0.34.4,
 # present on PR #128. Do NOT use the refusal message as the discriminator: that
@@ -157,14 +166,20 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 INIT_FILE="$WORK/init.cpp"
-SRC_INIT="$(fetch_at_tag "$TAG" "$INIT_CPP" "$INIT_FILE")" || die \
+REF="$TAG"
+PIN_COMMIT="$(pin_commit "$COMMANDS_RS")"
+if [ -n "$PIN_COMMIT" ] && [ "$TAG" = "$(sed -n 's/^pub const NODE_RELEASE_TAG: &str = "\([^"]*\)";.*$/\1/p' "$COMMANDS_RS" | head -1)" ]; then
+  REF="$PIN_COMMIT"
+  echo "untagged pin: verifying $TAG at commit $REF"
+fi
+SRC_INIT="$(fetch_at_tag "$REF" "$INIT_CPP" "$INIT_FILE")" || die \
   "could not read $INIT_CPP for tag $TAG" \
   "Tried $BTX_CLONE and $RAW_BASE/$TAG/$INIT_CPP." \
   "An unverifiable tag is not a safe tag."
 [ -s "$INIT_FILE" ] || die "fetched an empty $INIT_CPP for tag $TAG" "Source was: $SRC_INIT"
 
 MANIFEST_FILE="$WORK/manifest.data"
-SRC_MANIFEST="$(fetch_at_tag "$TAG" "$MANIFEST" "$MANIFEST_FILE")" || die \
+SRC_MANIFEST="$(fetch_at_tag "$REF" "$MANIFEST" "$MANIFEST_FILE")" || die \
   "could not read $MANIFEST for tag $TAG" \
   "Tried $BTX_CLONE and $RAW_BASE/$TAG/$MANIFEST."
 [ -s "$MANIFEST_FILE" ] || die "fetched an empty golden manifest for tag $TAG"
