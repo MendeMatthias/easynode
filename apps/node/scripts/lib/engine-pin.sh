@@ -30,6 +30,27 @@ engine_pin_tag() {
   printf '%s\n' "$tag"
 }
 
+# Read NODE_RELEASE_COMMIT out of commands.rs: the exact upstream commit the tag
+# NAME stands for while upstream has not tagged it (0.6.18 shipped 0.34.6 from
+# release/0.34.6 this way). Prints the 40-hex SHA, or nothing when the pin is a
+# real tag.
+engine_pin_commit() {
+  local app_dir="$1"
+  local src="$app_dir/src-tauri/src/commands.rs"
+  [[ -f "$src" ]] || { echo "error: no commands.rs at $src" >&2; return 1; }
+  grep -oE 'NODE_RELEASE_COMMIT: &str = "[0-9a-f]{40}"' "$src" \
+    | grep -oE '[0-9a-f]{40}' | head -1
+  return 0
+}
+# The ref to CHECK OUT to build the pinned engine: the commit when there is
+# one, else the tag. A branch name is never substituted; a branch moves and a
+# SHA does not. This is what CI's engine build and any worktree should use;
+# engine_pin_tag stays the NAME (install directory, version string, guards).
+engine_pin_ref() {
+  local app_dir="$1" commit
+  commit="$(engine_pin_commit "$app_dir")" || return 1
+  if [[ -n "$commit" ]]; then printf '%s\n' "$commit"; else engine_pin_tag "$app_dir"; fi
+}
 # Fail unless this script's VERSION matches the pin. $1 = app dir, $2 = VERSION
 # (without the leading v).
 assert_matches_engine_pin() {
