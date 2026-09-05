@@ -27,6 +27,13 @@ returns 200.
 The app updates itself from there afterwards, and will only ever install a build
 signed by the release key.
 
+> **On Linux, pick the `.AppImage` if you want automatic updates.** The updater
+> can replace an AppImage in place; it cannot replace a `.deb`, because the
+> installed files live under `/usr` and belong to root. A `.deb` install is a
+> perfectly good node — it just tells you when a new version exists and leaves
+> the install to you and `dpkg`. That is a real difference between the two
+> downloads, so it is said here rather than discovered later.
+
 > ⚠ **Do not use the "Latest" button on the releases repo.**
 > [EasyBTX-releases](https://github.com/MendeMatthias/EasyBTX-releases) hosts
 > both this app and the easyBTX *miner*, which is a different product, and the

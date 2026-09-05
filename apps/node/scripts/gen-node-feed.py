@@ -58,6 +58,15 @@ import tempfile
 
 REPO = "https://github.com/MendeMatthias/EasyBTX-releases/releases/download"
 # Release asset names follow the node convention BTX-Node_<ver>_<arch>.<ext>.
+#
+# linux-x86_64 is the AppImage, deliberately, and there is no `.deb` key: the
+# updater cannot install one. BundleType::Deb reaches install_deb and fails
+# InvalidUpdaterFormat, and when bundle detection returns None it falls through
+# to install_appimage, which renames over a root-owned /usr path and gets
+# EACCES. Adding a deb entry here would not give deb users an update path; it
+# would make every one of them download ~450 MB on a six-hour timer to reach a
+# guaranteed failure. They are told to update by hand instead (README, and the
+# banner the app shows when an install fails).
 ASSET = {
     "darwin-aarch64": "BTX-Node_{v}_aarch64.app.tar.gz",
     "linux-x86_64": "BTX-Node_{v}_amd64.AppImage",
