@@ -321,3 +321,60 @@ that connects our branch's 210497 first will **park** when the heavier live
 branch's bodies arrive, exactly as designed after 2026-08-11 — the same
 setting that protected nodes then would strand them now. Whether new installs
 should ship with parking on is a policy question this file only raises.
+
+## 20:32Z: the validator follows the live chain
+
+The owner gave the go at ~20:07Z by running the proposed command from the
+desktop app (it failed there, `btx-cli` is not on the Windows PATH, and was
+then run inside WSL). What it took, all runtime RPC, nothing in `~/.easybtx`
+touched, no restart:
+
+```
+20:09:33Z  btx-cli addnode 13.140.141.180:19335 add          # accepted, never dialed
+20:22:52Z  addnode … remove + disconnectnode for three manual peers that had
+           never served a header (71.172.72.46, 89.167.80.220, 134.199.150.193),
+           and addnode … remove for six entries that do not answer
+           (207.56.229.99, 37.230.134.222, 114.150.94.235, 89.85.40.184,
+           51.15.18.10, 139.59.106.83)
+20:23:08Z  "New manual v2 peer connected: version: 800002, blocks=211257, peer=373"
+20:23:09Z  first live-branch bodies retained from peer 373 (root-first order)
+20:32:12Z  "Deep reorg detected: a branch would reorganize 383 blocks
+           (profile=emergency; warn=3; park=6; tip=210879, fork=210496,
+           candidate=210719). Following the most-work chain (warn-only)."
+20:32:26Z  UpdateTip height=210720 on the live branch; 210721 at 20:32:49Z
+```
+
+Why the thirteen-minute gap between `addnode` and the first dial: btxd has
+`MAX_ADDNODE_CONNECTIONS = 8` (`src/net.h`), the conf carried fourteen
+`addnode=` lines with ten connected, and the added-connections thread takes
+one slot per attempt and stops when none is free. It only ever retried the
+first entry that was not connected (207.56.229.99, refusing: 29 attempts in
+eight minutes) and never reached the new one. `getaddednodeinfo` showed the
+entry as accepted the whole time; nothing said it was starved. Freeing three
+slots got the live peer connected within sixteen seconds. The removed
+entries return from `faststart.conf` on the next restart; the seed-list
+change in 0.6.19 (easynode#40) is what makes the conf itself right.
+
+Verified at 20:33:01Z: `getblockhash` at 210497, 210600 and 210700 equals the
+live branch's header at those heights (`~/live-branch-headers.json`, saved
+from `getchaintips` before any change). The former active chain is now the
+384-block `headers-only` tip at 210880 in `getchaintips`. Reorg depth: **383
+blocks** (210497 to 210879). The node is validating the remaining 541 blocks
+on the GPU at roughly its measured 3.8 a minute; the observer (now the merged
+script, report-only) writes `FORK` until `headers − blocks` is back under 20,
+which is the release gate holding as designed while the node catches up.
+
+Also done at 20:09Z: the observer on the box was switched to the merged
+`scripts/node-observer.sh` (old copy kept as `~/node-observer.sh.pre-fork-alarm-*`),
+without `BTX_START_CMD`, so it reports and never launches the app on this box.
+Its first row after the swap read `FORK … leads ours by 290`.
+
+### The chain census on easybtx.com/nodes (site PR #461)
+
+The same headers method, run from Vercel every 30 minutes for every
+reachable node: a locator over the heaviest chain's recent hashes, one
+`getheaders` per node, nodes grouped by where their headers leave that chain.
+A live smoke run at 20:28Z against seven nodes: chain A at 211260, most work,
+one node; chain B at 210880, forked at 210496, five nodes; split. The page
+shows both, names nodes by the nickname they broadcast, and never says which
+chain is right.
