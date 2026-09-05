@@ -1,5 +1,9 @@
 # Why the Linux AppImage is 445 MB, and what actually shrinks it
 
+> Units: every size in this note is MiB, as `ls -lh` and `du -h` print them.
+> The 0.6.18 AppImage is 466,078,200 bytes = 444.5 MiB = 466 MB; the
+> user-facing pages say "about 466 MB" for that reason.
+
 Measured on the WSL Ubuntu 22.04 box (RTX 3060, sm_86) on 2026-09-04 against
 the released `BTX-Node_0.6.15_amd64.AppImage`
 (sha256 `b65bcb2344b479c443a65c553acd888047c8cbea58a0f7460cd981444ee2f5b3`;

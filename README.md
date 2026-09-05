@@ -268,7 +268,8 @@ validation is exactly what needs the GPU, a node staged that way can never be
 an independent validator whatever card is in the machine. It also needs glibc
 2.38, which Ubuntu LTS does not have. The shipped Linux app is built from the
 official source tag on Ubuntu 22.04 with its own GPU maths and kernels inside
-the package, which is why that download is around 445 MB.
+the package, which is why that download is around 466 MB (444 MiB; the
+0.6.18 AppImage is 466,078,200 bytes).
 
 **The Linux path that does validate is also in this repository.** Releases are
 staged with `scripts/stage-node-pkg-linux-source.sh`, which takes a btxd you

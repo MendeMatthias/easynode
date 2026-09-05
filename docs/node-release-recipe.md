@@ -807,7 +807,9 @@ glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
 4. Gates, always on the EXTRACTED bundles, never the staging tree:
    `.btxd-version` reads the pinned tag name, the bundled btxd and btx-cli execute under
    `env -u LD_LIBRARY_PATH PATH=/usr/bin:/bin`, ldd resolves inside the
-   tree, cuobjdump lists all five architectures, and both engine guards exit
+   tree, cuobjdump lists every pinned architecture (sm_75/86/89/120, plus
+   upstream's own sm_100; the vendored cuBLASLt contributes more, nine in all
+   on 0.6.18), and both engine guards exit
    0 with their OK text actually read.
 
 5. The test that catches what clean rooms cannot: upgrade a REAL datadir
