@@ -2650,6 +2650,18 @@ pub async fn set_esplora(state: State<'_, AppState>, on: bool) -> Result<String,
     }
     let electrs = find_binary(ELECTRS_BIN).ok_or_else(|| missing_binary_message(ELECTRS_BIN))?;
     let caddy = find_binary(CADDY_BIN).ok_or_else(|| missing_binary_message(CADDY_BIN))?;
+    // NAMED caddy is not the same as CAN READ THIS CONFIG. find_binary returns
+    // the first executable called caddy on PATH, /usr/local/bin, /usr/bin,
+    // /opt/homebrew/bin, ~/.local/bin, ~/.cargo/bin or ~/go/bin, and a stock
+    // Caddy in any of those refuses this Caddyfile on its first directive
+    // (`unrecognized directive: rate_limit`). Reported as success before this
+    // check: the row showed the listen address while Caddy had already exited,
+    // and 30-60s later the guardian killed electrs too and said only "the Caddy
+    // front exited". deploy/esplora/test-front.sh has gated on this since it
+    // was written; the app had not.
+    if !btx_core::esplora_sidecar::caddy_has_required_module(&caddy) {
+        return Err(btx_core::esplora_sidecar::wrong_caddy_message(&caddy));
+    }
     NodeAppSettings::update(&datadir, |s| s.esplora_enabled = true);
     let running = state.rpc.lock().await.is_some();
     if !running {
