@@ -324,6 +324,22 @@ pub struct PeerInfo {
     /// text chosen by a stranger.
     #[serde(default)]
     pub subver: String,
+    /// UNIX time this connection was established. The clock for any "we have
+    /// heard nothing" judgement: silence from a peer connected two minutes ago
+    /// means nothing at all, and the same silence after six hours is evidence.
+    #[serde(default)]
+    pub conntime: i64,
+    /// Whether the peer wants transactions from us (their `fRelay`). A peer
+    /// that does not is not evidence of anything when transactions are missing.
+    #[serde(default)]
+    pub relaytxes: bool,
+    /// The peer's advertised minimum fee rate, in BTX per kvB, as
+    /// `getpeerinfo` reports it. Measured on mainnet 2026-09-06: three of
+    /// twenty-two peers advertised 0.09170997, which is 9,171 sat per byte —
+    /// thousands of times the 1 to 4 sat per byte the network actually pays.
+    /// A peer at that price accepts nothing anyone is sending.
+    #[serde(default)]
+    pub minfeefilter: f64,
 }
 
 pub async fn get_peer_info(rpc: &dyn Rpc) -> AppResult<Vec<PeerInfo>> {
@@ -396,6 +412,144 @@ pub fn summarize_archive_peers(peers: &[PeerInfo]) -> ArchivePeerSummary {
         }
     }
     s
+}
+
+/// What the peer set says about TRANSACTION relay, in numbers the UI can show.
+///
+/// A node can be perfectly healthy by every existing measure — synced, many
+/// peers, serving blocks — and still never see a transaction. Measured across
+/// two independent public BTX nodes on 2026-09-06: 21 of 22 peers had never
+/// sent one, the two nodes' mempools shared none of their 10 and 32 entries,
+/// and valid transactions paying twice the going rate had waited four days
+/// while blocks were mined empty. Nothing on either node reported a problem,
+/// because nothing was measuring this.
+///
+/// The counters are the evidence, not an inference: `bytesrecv_per_msg["tx"]`
+/// is transaction bytes this peer actually delivered. Pure summary of
+/// `getpeerinfo` — pairs with `get_peer_info`, same shape as
+/// [`summarize_archive_peers`].
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+pub struct TxRelaySummary {
+    /// Peers considered (all of them).
+    pub peers: usize,
+    /// Peers that have delivered at least one transaction to us.
+    pub sending_us_tx: usize,
+    /// Peers we have delivered at least one transaction to.
+    pub taking_our_tx: usize,
+    /// Peers that told us they want transactions (`fRelay`). Silence from a
+    /// peer that does not want them is not evidence of a relay problem.
+    pub want_tx_from_us: usize,
+    /// Peers whose advertised minimum fee is so far above what the network
+    /// pays that they can accept nothing being sent (see `minfeefilter`).
+    pub priced_out: usize,
+    /// Transaction bytes in and out, across every peer.
+    pub tx_bytes_in: u64,
+    pub tx_bytes_out: u64,
+    /// Seconds since the OLDEST current connection was made. This is the clock
+    /// the verdict uses; 0 when no peer reports a connection time.
+    pub longest_connection_secs: i64,
+}
+
+/// Summarise transaction relay across the peer set. `now_unix` is passed in so
+/// the function stays pure and testable.
+pub fn summarize_tx_relay(peers: &[PeerInfo], now_unix: i64) -> TxRelaySummary {
+    // Above this the peer's own minimum fee is not a fee policy, it is a wall.
+    // The network pays 1 to 4 sat per byte; this is 1,000 sat per byte, which
+    // no honest sender on BTX has ever paid.
+    const PRICED_OUT_BTX_PER_KVB: f64 = 0.01;
+    let mut s = TxRelaySummary {
+        peers: peers.len(),
+        ..Default::default()
+    };
+    for p in peers {
+        let inb = p.bytesrecv_per_msg.get("tx").copied().unwrap_or(0);
+        let outb = p.bytessent_per_msg.get("tx").copied().unwrap_or(0);
+        s.tx_bytes_in += inb;
+        s.tx_bytes_out += outb;
+        if inb > 0 {
+            s.sending_us_tx += 1;
+        }
+        if outb > 0 {
+            s.taking_our_tx += 1;
+        }
+        if p.relaytxes {
+            s.want_tx_from_us += 1;
+        }
+        if p.minfeefilter > PRICED_OUT_BTX_PER_KVB {
+            s.priced_out += 1;
+        }
+        // conntime 0 means the peer object did not carry one (an older btxd):
+        // unknown, so it must not be read as "connected since the epoch".
+        if p.conntime > 0 && now_unix > p.conntime {
+            s.longest_connection_secs = s.longest_connection_secs.max(now_unix - p.conntime);
+        }
+    }
+    s
+}
+
+/// The verdict on transaction relay.
+///
+/// `Unknown` is a first-class answer and the default. A node that has just
+/// started, or has almost no peers, has not observed anything yet, and a check
+/// that cannot evaluate must never read as a check that passed — the same rule
+/// the explorer health monitor was rewritten around after it printed GREEN for
+/// weeks about a node eleven thousand blocks behind.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TxRelayHealth {
+    /// Not enough observation yet to say anything. Carries why, in words a
+    /// person can read.
+    Unknown { reason: String },
+    /// Transactions are arriving from peers. This is the healthy answer.
+    Receiving {
+        peers_sending: usize,
+        tx_bytes_in: u64,
+    },
+    /// Peers have been connected long enough that hearing no transaction at
+    /// all is evidence, not chance.
+    Isolated {
+        peers: usize,
+        hours_connected: i64,
+        peers_wanting_tx: usize,
+        priced_out: usize,
+    },
+}
+
+/// Judge relay from a summary.
+///
+/// The window is deliberately long. BTX carries roughly ten transactions an
+/// hour network-wide (121 user transactions in 500 blocks, measured
+/// 2026-09-04), so a quiet half hour is ordinary and proves nothing. Six hours
+/// is on the order of sixty transactions; a connected node hearing none of
+/// them is not experiencing a quiet network.
+pub fn judge_tx_relay(s: &TxRelaySummary) -> TxRelayHealth {
+    const MIN_PEERS: usize = 3;
+    const MIN_SECS: i64 = 6 * 3600;
+    if s.sending_us_tx > 0 {
+        return TxRelayHealth::Receiving {
+            peers_sending: s.sending_us_tx,
+            tx_bytes_in: s.tx_bytes_in,
+        };
+    }
+    if s.peers < MIN_PEERS {
+        return TxRelayHealth::Unknown {
+            reason: format!("only {} peers connected", s.peers),
+        };
+    }
+    if s.longest_connection_secs < MIN_SECS {
+        return TxRelayHealth::Unknown {
+            reason: format!(
+                "connected {} minutes; transactions are rare enough on BTX that this proves nothing yet",
+                s.longest_connection_secs / 60
+            ),
+        };
+    }
+    TxRelayHealth::Isolated {
+        peers: s.peers,
+        hours_connected: s.longest_connection_secs / 3600,
+        peers_wanting_tx: s.want_tx_from_us,
+        priced_out: s.priced_out,
+    }
 }
 
 /// `addnode <host> add` + an immediate `onetry` dial.
@@ -862,6 +1016,129 @@ pub async fn get_chain_tips(rpc: &dyn Rpc) -> AppResult<Vec<crate::fork::ChainTi
 
 #[cfg(test)]
 mod tests {
+
+    /// Shapes taken from a LIVE `getpeerinfo` on the public explorer node
+    /// (btx-esplora-1, btxd 0.34.5, 2026-09-06 01:0x UTC): 22 peers, 14 of
+    /// which wanted transactions from us, three advertising a 0.09170997
+    /// minimum fee, 39,370 transaction bytes sent to peers and ZERO received
+    /// from any of them.
+    fn measured_mainnet_peers(now: i64) -> Vec<PeerInfo> {
+        let six_hours_ago = now - 6 * 3600 - 60;
+        serde_json::from_value(serde_json::json!([
+            {
+                "id": 1, "addr": "62.238.22.167:19335", "inbound": false, "subver": "/BTX:0.34.5/",
+                "conntime": six_hours_ago, "relaytxes": true, "minfeefilter": 0.09170997,
+                "bytesrecv_per_msg": { "inv": 2726, "block": 91000 },
+                "bytessent_per_msg": { "inv": 2726 }
+            },
+            {
+                "id": 2, "addr": "37.230.134.222:19335", "inbound": false, "subver": "/BTX:0.34.6/",
+                "conntime": now - 1800, "relaytxes": true, "minfeefilter": 0.00001,
+                "bytesrecv_per_msg": { "inv": 58 },
+                "bytessent_per_msg": { "tx": 7874, "inv": 1508 }
+            },
+            {
+                "id": 3, "addr": "109.199.124.187:19335", "inbound": false, "subver": "/BTX:0.34.6/",
+                "conntime": now - 1800, "relaytxes": false, "minfeefilter": 0.0,
+                "bytesrecv_per_msg": {}, "bytessent_per_msg": { "inv": 116 }
+            },
+            {
+                "id": 4, "addr": "173.249.29.226:19335", "inbound": false, "subver": "/BTX:0.33.2/",
+                "conntime": now - 1800, "relaytxes": true, "minfeefilter": 0.09171,
+                "bytesrecv_per_msg": {}, "bytessent_per_msg": {}
+            }
+        ]))
+        .expect("live-shaped peer objects must decode")
+    }
+
+    #[test]
+    fn tx_relay_summary_reads_the_message_byte_counters_not_an_inference() {
+        let now = 1_788_657_000;
+        let s = summarize_tx_relay(&measured_mainnet_peers(now), now);
+        assert_eq!(s.peers, 4);
+        assert_eq!(s.tx_bytes_in, 0, "not one peer delivered a transaction");
+        assert_eq!(s.sending_us_tx, 0);
+        assert_eq!(s.tx_bytes_out, 7874, "we sent ours out; the silence is one-directional");
+        assert_eq!(s.taking_our_tx, 1);
+        assert_eq!(s.want_tx_from_us, 3);
+        assert_eq!(s.priced_out, 2, "0.0917 BTX/kvB is 9,171 sat per byte");
+        assert_eq!(s.longest_connection_secs, 6 * 3600 + 60);
+    }
+
+    #[test]
+    fn judge_tx_relay_reports_isolated_on_the_measured_mainnet_shape() {
+        let now = 1_788_657_000;
+        let v = judge_tx_relay(&summarize_tx_relay(&measured_mainnet_peers(now), now));
+        match v {
+            TxRelayHealth::Isolated { peers, hours_connected, peers_wanting_tx, priced_out } => {
+                assert_eq!(peers, 4);
+                assert_eq!(hours_connected, 6);
+                assert_eq!(peers_wanting_tx, 3);
+                assert_eq!(priced_out, 2);
+            }
+            other => panic!("expected Isolated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn judge_tx_relay_says_receiving_the_moment_one_peer_delivers() {
+        let now = 1_788_657_000;
+        let mut peers = measured_mainnet_peers(now);
+        peers[3].bytesrecv_per_msg.insert("tx".into(), 3916);
+        let v = judge_tx_relay(&summarize_tx_relay(&peers, now));
+        assert_eq!(
+            v,
+            TxRelayHealth::Receiving { peers_sending: 1, tx_bytes_in: 3916 },
+            "one real transaction is proof relay works; it does not need to be many"
+        );
+    }
+
+    #[test]
+    fn judge_tx_relay_will_not_accuse_the_network_before_it_has_watched() {
+        let now = 1_788_657_000;
+        // Same peers, all connected half an hour ago. BTX carries ~10
+        // transactions an hour network-wide, so this is silence that proves
+        // nothing, and the check must SAY it cannot tell rather than pass.
+        let mut peers = measured_mainnet_peers(now);
+        for p in peers.iter_mut() {
+            p.conntime = now - 1800;
+        }
+        match judge_tx_relay(&summarize_tx_relay(&peers, now)) {
+            TxRelayHealth::Unknown { reason } => assert!(reason.contains("30 minutes")),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn judge_tx_relay_needs_a_real_peer_set_before_it_judges() {
+        let now = 1_788_657_000;
+        let peers = measured_mainnet_peers(now);
+        match judge_tx_relay(&summarize_tx_relay(&peers[..2], now)) {
+            TxRelayHealth::Unknown { reason } => assert!(reason.contains("2 peers")),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        assert!(matches!(
+            judge_tx_relay(&summarize_tx_relay(&[], now)),
+            TxRelayHealth::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn a_peer_object_without_conntime_is_unknown_not_connected_since_the_epoch() {
+        // An older btxd omits conntime. Reading a missing field as 0 would make
+        // every such peer look connected since 1970 and turn a fresh node into
+        // an accusation against the network.
+        let now = 1_788_657_000;
+        let peers: Vec<PeerInfo> = serde_json::from_value(serde_json::json!([
+            { "id": 1, "addr": "a:1", "relaytxes": true },
+            { "id": 2, "addr": "b:1", "relaytxes": true },
+            { "id": 3, "addr": "c:1", "relaytxes": true }
+        ]))
+        .unwrap();
+        let s = summarize_tx_relay(&peers, now);
+        assert_eq!(s.longest_connection_secs, 0);
+        assert!(matches!(judge_tx_relay(&s), TxRelayHealth::Unknown { .. }));
+    }
     use super::*;
     use crate::rpc::Rpc;
     use async_trait::async_trait;

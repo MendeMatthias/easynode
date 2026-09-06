@@ -8,6 +8,20 @@ root).
 
 ## [Unreleased]
 
+**Your node now says whether it is exchanging transactions, not just blocks.**
+A node can be synced, well connected, serving blocks and reported healthy by
+every existing measure while never once receiving a transaction from a peer.
+Measured across two independent public BTX nodes on 2026-09-06: 21 of 22 peers
+had never sent one, the two nodes' mempools shared none of their 10 and 32
+entries, and valid transactions paying twice the going rate had waited four days
+while blocks were mined empty. Nothing reported a problem, because nothing was
+measuring it. The local service report now carries a `tx_relay` verdict read
+straight from the per-peer message byte counters, at no extra cost: it rides the
+peer census the app already runs. It answers `receiving`, `isolated`, or
+`unknown`, and `unknown` is the default — a node that has just started, or has
+almost no peers, has observed nothing, and a check that cannot evaluate must
+never read as a check that passed.
+
 **Esplora mode: serve wallets from your own node.** A "Serve wallets
 (Esplora API)" switch in Settings runs electrs and a Caddy front beside btxd,
 so the BTX wallet can read balances from a full node you run instead of from

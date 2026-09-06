@@ -1306,6 +1306,18 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                         .as_ref()
                         .map(|ps| btx_core::node_api::summarize_archive_peers(ps));
                     *archive_slot.lock().await = archive_summary.clone();
+                    // Free, from the same peer objects: is this node actually
+                    // exchanging transactions, or only blocks? A node can be
+                    // synced, well peered and serving, and never receive one.
+                    let tx_relay = peer_infos.as_ref().map(|ps| {
+                        btx_core::node_api::judge_tx_relay(&btx_core::node_api::summarize_tx_relay(
+                            ps,
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0),
+                        ))
+                    });
                     // Free: the peer objects are already in hand this tick.
                     *nickname_slot.lock().await = peer_infos
                         .as_ref()
@@ -1594,6 +1606,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                                 .map(|t| t.total_bytes_sent);
                             // This tick's shared census — no dedicated fetch.
                             r.archive_peers = archive_summary.clone();
+                            r.tx_relay = tx_relay.clone();
                             r.stall = stall_slot.lock().await.clone();
                             r.trusted_mirror = trusted_mirror;
                             r.serving_attestations = settings.attestation_serve_enabled;
