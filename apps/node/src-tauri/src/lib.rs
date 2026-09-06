@@ -140,7 +140,30 @@ pub fn run() {
                 // the first request we hold the exit, run the async quit flow
                 // (which shows "stopping…" then exits), and let the *second*
                 // ExitRequested — the one our flow triggers — proceed.
-                RunEvent::ExitRequested { api, .. } => {
+                RunEvent::ExitRequested { api, code, .. } => {
+                    // AN UPDATER RELAUNCH IS NOT A QUIT. `relaunch()` reaches
+                    // the runtime as ExitRequested with tauri's
+                    // RESTART_EXIT_CODE (i32::MAX, tauri/src/app.rs), and
+                    // `prevent_exit()` is a documented no-op for that code
+                    // (`if self.code != Some(RESTART_EXIT_CODE)`), so the exit
+                    // cannot be held anyway. This arm discarded `code` and ran
+                    // the graceful quit regardless, which meant every automatic
+                    // update raced a `btx-cli stop` against the process
+                    // restart: the node the new instance is supposed to adopt
+                    // was being shut down underneath it, the frontend swapped
+                    // its "restarting…" banner for the full-screen "Stopping
+                    // safely…" overlay, and a tray-hidden window was popped
+                    // open to show it.
+                    //
+                    // main.ts says what is supposed to happen: "The relaunch
+                    // does NOT interrupt the node: the new instance attaches to
+                    // the running btxd over RPC." Leave btxd alone and let the
+                    // restart proceed. The new instance finds it as
+                    // `AttachedTo::OurOrphan` and adopts it, which is exactly
+                    // the case the attached-mode stop path was written for.
+                    if code == Some(tauri::RESTART_EXIT_CODE) {
+                        return;
+                    }
                     let state = app.state::<AppState>();
                     if !state.quitting.load(std::sync::atomic::Ordering::SeqCst) {
                         api.prevent_exit();

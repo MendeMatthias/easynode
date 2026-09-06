@@ -1225,7 +1225,6 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
     let gen = state.refresher_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let gen_counter = state.refresher_gen.clone();
     let rpc_slot = state.rpc.clone();
-    let node_slot = state.node.clone();
     let phase_slot = state.phase.clone();
     let stall_slot = state.stall_verdict.clone();
     let rc_cache_slot = state.rc_status_cache.clone();
@@ -1615,33 +1614,51 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                     // ~1 min of continuous silence → tell the user instead of
                     // freezing on a stale number. No destructive action.
                     if consecutive_failures >= 20 {
-                        // Unwedge so Start actually works: clear the RPC slot
-                        // (start_node's already-running guard keys on it) and
-                        // drop the controller — kill_on_drop reaps the wedged
-                        // btxd so a fresh spawn doesn't lose the datadir-lock
-                        // race. Leaving rpc set here made Start a permanent
-                        // no-op with the UI stuck on this very error.
-                        // Everything that serves FROM this node has to go
-                        // with it. Without this the witness kept answering
-                        // from an RpcClient holding the dead node's cookie —
-                        // and `answer()` maps an RPC error on /block-height to
-                        // 404, so a wallet read a dead witness as "behind"
-                        // rather than as gone, and its fork check stopped
-                        // silently. The orphan also held the port, so the
-                        // "Press Start" this phase suggests could not rebind.
-                        {
-                            let state = app.state::<AppState>();
-                            stop_witness(&state).await;
-                            stop_esplora(&state).await;
-                        }
-                        *rpc_slot.lock().await = None;
-                        *node_slot.lock().await = None;
+                        // Say it on screen first: the stop below can take the
+                        // full flush grace, and the user should not watch a
+                        // stale number for 90 s before being told.
                         let p = NodePhase::Error {
                             message: "The node stopped responding. Press Start to relaunch it."
                                 .into(),
                         };
                         *phase_slot.lock().await = p.clone();
                         crate::tray::reflect_phase(&app, &p);
+
+                        // THEN STOP IT THE WAY `Stop` DOES — btx-cli stop, wait
+                        // out the flush, SIGKILL only if it never exits.
+                        //
+                        // This block used to do `*node_slot = None` and nothing
+                        // else, under a comment that said "No destructive
+                        // action". It was the most destructive line in the file:
+                        // the controller is built with `kill_on_drop(true)`
+                        // (btx_core::node), so dropping it SIGKILLs btxd on the
+                        // spot, with no `btx-cli stop` and no grace, after ~60 s
+                        // of RPC silence.
+                        //
+                        // RPC silence is not death. btxd holds cs_main through
+                        // the background `loadtxoutset` this same start path
+                        // kicks off, through a heavy ConnectBlock and through a
+                        // large reorg, and answers nothing meanwhile. So the
+                        // node most likely to be killed here was a HEALTHY one
+                        // in the middle of the longest operation it ever does.
+                        // node.rs sizes the grace for exactly that: 90 s,
+                        // because "a too-small grace turns a graceful stop of a
+                        // HEALTHY node into a SIGKILL mid-flush, and the next
+                        // start into a long Verifying blocks rebuild" — and on
+                        // a pruned keeper that rebuild cannot read the blocks it
+                        // needs at all.
+                        //
+                        // `stop_node_inner` is that path, and it also clears the
+                        // state this arm used to leave standing: the macOS
+                        // keep-awake assertion (held forever with no node
+                        // running, so the Mac never idle-slept again), the
+                        // uptime clock, and the stall, fork and archive-service
+                        // verdicts, which otherwise kept rendering as CURRENT
+                        // facts about a node that was gone. One canonical stop,
+                        // so "the refresher gave up" and "the user pressed
+                        // Stop" leave the app in the same state.
+                        let state = app.state::<AppState>();
+                        stop_node_inner(&state).await;
                         return;
                     }
                 }
