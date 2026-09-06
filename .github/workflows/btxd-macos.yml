@@ -131,7 +131,13 @@ jobs:
           brew install --quiet cmake ninja pkgconf boost libevent sqlite zeromq libsodium libomp
           cmake --version | head -1
           clang++ --version | head -1
-          xcodebuild -version | head -1
+          # NOT `xcodebuild -version | head -1`. head closes the pipe after the
+          # first line, xcodebuild takes SIGPIPE, and being an Objective-C app it
+          # turns that into an uncaught NSFileHandleOperationException and aborts
+          # with exit 134 — which under `set -euo pipefail` fails this step after
+          # every dependency has already installed cleanly. Measured on
+          # macos-14, run 34061556534. It prints two lines; print both.
+          xcodebuild -version
 
       - name: Configure + build
         working-directory: btx
