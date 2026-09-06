@@ -32,6 +32,13 @@ name: Build macOS btxd (Metal source build, smoked on the runner)
 # below exists to make that impossible to do by accident. Same rule, same
 # wording, as the Linux workflow.
 #
+# ⚠ THE TREE'S OWN depends/, NOT HOMEBREW, for Boost and friends. The tree pins
+# Boost 1.81.0; Homebrew shipped 1.92.0, and `txmempool.h`'s boost::multi_index
+# will not instantiate against it — a wall of static assertions inside Boost,
+# measured on run 34062662183 after seven minutes of compiling. depends/ is what
+# upstream's build system is for, and it takes "what did brew upgrade this week"
+# out of the release path entirely.
+#
 # ⚠ THE RUNNER'S OWN APPLE CLANG, deliberately, and this took three runs to
 # settle. Homebrew's LLVM does compile the P0960 the tree needs, but pairing a
 # very new clang with an older Xcode SDK then fails INSIDE Apple's own headers:
@@ -143,10 +150,32 @@ jobs:
           # sodium would re-introduce an /opt/homebrew load command.
           # libomp likewise: src/CMakeLists.txt refuses to configure under
           # AppleClang without a static libomp.a plus omp.h.
-          brew install --quiet cmake ninja pkgconf boost libevent sqlite zeromq libsodium libomp
+          # ONLY libomp comes from Homebrew, and only because
+          # src/CMakeLists.txt hardcodes its path for AppleClang and no -D
+          # redirects it. Everything else comes from the tree's own depends/ —
+          # see the Boost note in the header.
+          brew install --quiet cmake ninja pkgconf libomp
           cmake --version | head -1
           clang++ --version | head -1
           xcodebuild -version
+
+      - name: Build the tree's own depends (Boost, libevent, sqlite, zeromq)
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          # depends/hosts/darwin.mk hardcodes an extracted-SDK path. Point it at
+          # the real SDK rather than editing the tree, which would set
+          # BUILD_GIT_DIRTY. depends/ is gitignored, so this leaves no trace.
+          mkdir -p depends/SDKs
+          ln -sfn "$(xcrun --show-sdk-path)" \
+            depends/SDKs/Xcode-15.0-15A240d-extracted-SDK-with-libcxx-headers
+          make -C depends -j"$(sysctl -n hw.ncpu)" HOST=arm64-apple-darwin \
+            NO_QT=1 NO_BDB=1 NO_UPNP=1 NO_USDT=1
+          ls -la depends/arm64-apple-darwin/lib
+          # The tree must still be pristine: depends/ output is gitignored, and
+          # a stray file here would fail the canary later for a silly reason.
+          dirty=$(git status --porcelain -uall -- CMakeLists.txt cmake src contrib/matmul-v4)
+          [ -z "$dirty" ] || { echo "::error::depends dirtied the build-relevant tree"; echo "$dirty"; exit 1; }
           # NOT `xcodebuild -version | head -1`. head closes the pipe after the
           # first line, xcodebuild takes SIGPIPE, and being an Objective-C app it
           # turns that into an uncaught NSFileHandleOperationException and aborts
@@ -173,7 +202,14 @@ jobs:
           # clang builds the tree, so src/CMakeLists.txt takes its own AppleClang
           # branch and finds Homebrew's static libomp where it expects it. That
           # is the configuration the tree is written for.
+          #
+          # The toolchain file and the project-include are what let the tree's
+          # Homebrew-only find modules see the depends archives instead.
+          # apps/node/scripts/mac-engine/README.md explains both.
+          SHIMS="$GITHUB_WORKSPACE/easynode/apps/node/scripts/mac-engine"
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=depends/arm64-apple-darwin/toolchain.cmake \
+            -DCMAKE_PROJECT_INCLUDE="$SHIMS/zmq-depends.cmake" \
             -DBUILD_DAEMON=ON -DBUILD_CLI=ON \
             -DBUILD_UTIL=OFF -DBUILD_TX=OFF -DBUILD_WALLET_TOOL=OFF \
             -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_TESTS=OFF \
