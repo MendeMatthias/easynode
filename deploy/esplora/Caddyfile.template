@@ -17,21 +17,45 @@
 #     BTX_ESPLORA_RUN    where the freshness guardian writes its markers.
 #                        Default /run (the systemd deployment); the app uses
 #                        <datadir>/esplora/run because it does not run as root.
+#     BTX_ESPLORA_ELECTRS   the electrs REST address. Default 127.0.0.1:3000.
+#     BTX_ESPLORA_BTXD_RPC  btxd's REST+RPC address. Default 127.0.0.1:19334.
 #
 #     BTX_ESPLORA_HOST=esplora-1.example.com caddy run --config Caddyfile.template --adapter caddyfile
 #
+# The last two default to exactly the addresses this file used to hardcode, so
+# a deployment that sets neither behaves as before. They exist because a
+# hardcoded upstream cannot be tested: deploy/esplora/test-front.sh runs this
+# very file against stubs on free ports, and before that this configuration had
+# never been started at all, let alone asked what header it emits. They also
+# let a second instance run beside a live one.
+#
 # Assumes:
-#     electrs  on 127.0.0.1:3000   (see electrs.service.template)
-#     btxd RPC on 127.0.0.1:19334
+#     electrs  on $BTX_ESPLORA_ELECTRS  (see electrs.service.template)
+#     btxd RPC on $BTX_ESPLORA_BTXD_RPC
 #     the staleness guardian writing $BTX_ESPLORA_RUN/btx-{fresh,stale,unverified}
 #
 # ⚠ Do not enable this on a pruned node. electrs indexes from block files on
 #   disk and a pruned datadir deletes them; easyNode refuses the mode outright
 #   (crates/btx-core/src/esplora.rs) and this config would only fail later and
 #   more confusingly. See docs/esplora-mode.md.
-
 {
-	order rate_limit before reverse_proxy
+	# BEFORE `handle`, and this is load-bearing. The original read
+	# `order rate_limit before reverse_proxy`, which worked there because its
+	# rate_limit sat inside a `route` block. This port dropped that wrapper
+	# along with the home-IP exemption it existed for, leaving a bare
+	# `rate_limit` beside the `handle` blocks — and `handle` sorts BEFORE
+	# `reverse_proxy`, so the limiter was ordered after a directive that
+	# terminates routing and never ran at all.
+	#
+	# It failed silently and looked completely fine: every request was served,
+	# every header was correct, and the endpoint had no rate limit. Measured by
+	# deploy/esplora/test-front.sh, which is the only reason this is not still
+	# true — a 300-request burst returned 300 successes before, and 116 of them
+	# are 429 now.
+	#
+	# The ordering is a total order, so `before handle` also keeps rate_limit
+	# ahead of `reverse_proxy` inside the @rawblock handler below.
+	order rate_limit before handle
 }
 
 # Shared Esplora API config. Caddy is the SINGLE source of CORS; upstream
@@ -84,7 +108,7 @@
 			}
 		}
 		header X-Btx-Source "btxd-rest"
-		reverse_proxy 127.0.0.1:19334 {
+		reverse_proxy {$BTX_ESPLORA_BTXD_RPC:127.0.0.1:19334} {
 			transport http {
 				read_timeout 30s
 				write_timeout 30s
@@ -146,7 +170,7 @@
 	handle @stale {
 		header X-Btx-Upstream "local"
 		header X-Btx-Freshness "stale"
-		reverse_proxy 127.0.0.1:3000 {
+		reverse_proxy {$BTX_ESPLORA_ELECTRS:127.0.0.1:3000} {
 			header_down -Access-Control-Allow-Origin
 			header_down -Access-Control-Allow-Methods
 			header_down -Access-Control-Allow-Headers
@@ -163,7 +187,7 @@
 	handle @fresh {
 		header X-Btx-Upstream "local"
 		header X-Btx-Freshness "fresh"
-		reverse_proxy 127.0.0.1:3000 {
+		reverse_proxy {$BTX_ESPLORA_ELECTRS:127.0.0.1:3000} {
 			header_down -Access-Control-Allow-Origin
 			header_down -Access-Control-Allow-Methods
 			header_down -Access-Control-Allow-Headers
@@ -176,7 +200,7 @@
 	handle {
 		header X-Btx-Upstream "local"
 		header X-Btx-Freshness "unverified"
-		reverse_proxy 127.0.0.1:3000 {
+		reverse_proxy {$BTX_ESPLORA_ELECTRS:127.0.0.1:3000} {
 			header_down -Access-Control-Allow-Origin
 			header_down -Access-Control-Allow-Methods
 			header_down -Access-Control-Allow-Headers

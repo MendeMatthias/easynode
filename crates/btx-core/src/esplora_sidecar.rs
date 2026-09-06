@@ -172,12 +172,16 @@ pub fn caddy_args(caddyfile: &Path) -> Vec<String> {
     ]
 }
 
-/// The two placeholders the template reads (`{$BTX_ESPLORA_HOST}`,
-/// `{$BTX_ESPLORA_RUN:/run}`).
+/// Every placeholder the template reads. The upstream addresses are passed
+/// explicitly rather than left to the template's defaults, so the app and the
+/// config can never disagree about where electrs is: one constant decides, and
+/// `electrs_args` and this function both read it.
 pub fn caddy_env(listen: &str, run_dir: &Path) -> Vec<(String, String)> {
     vec![
         ("BTX_ESPLORA_HOST".into(), listen.to_string()),
         ("BTX_ESPLORA_RUN".into(), run_dir.display().to_string()),
+        ("BTX_ESPLORA_ELECTRS".into(), ELECTRS_HTTP.to_string()),
+        ("BTX_ESPLORA_BTXD_RPC".into(), BTXD_RPC.to_string()),
     ]
 }
 
@@ -385,15 +389,54 @@ mod tests {
 
     #[test]
     fn the_template_carries_the_placeholders_the_app_sets() {
-        assert!(CADDYFILE_TEMPLATE.contains("{$BTX_ESPLORA_HOST}"));
-        assert!(CADDYFILE_TEMPLATE.contains("{$BTX_ESPLORA_RUN:/run}"));
+        for p in [
+            "{$BTX_ESPLORA_HOST}",
+            "{$BTX_ESPLORA_RUN:/run}",
+            "{$BTX_ESPLORA_ELECTRS:127.0.0.1:3000}",
+            "{$BTX_ESPLORA_BTXD_RPC:127.0.0.1:19334}",
+        ] {
+            assert!(CADDYFILE_TEMPLATE.contains(p), "the template lost {p}");
+        }
         let env = caddy_env("http://127.0.0.1:3080", Path::new("/x/run"));
         let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(names, vec!["BTX_ESPLORA_HOST", "BTX_ESPLORA_RUN"]);
+        assert_eq!(
+            names,
+            vec![
+                "BTX_ESPLORA_HOST",
+                "BTX_ESPLORA_RUN",
+                "BTX_ESPLORA_ELECTRS",
+                "BTX_ESPLORA_BTXD_RPC"
+            ]
+        );
+        // One constant decides where electrs listens; the flag we pass electrs
+        // and the address we hand the front must never drift apart.
+        let by_name = |k: &str| {
+            env.iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(by_name("BTX_ESPLORA_ELECTRS"), ELECTRS_HTTP);
+        assert!(electrs_args(Path::new("/d")).contains(&ELECTRS_HTTP.to_string()));
         // The front needs the plugin; the message for a missing caddy says so.
         assert!(CADDYFILE_TEMPLATE.contains("rate_limit"));
         assert!(missing_binary_message(CADDY_BIN).contains("rate-limit plugin"));
         assert!(missing_binary_message(ELECTRS_BIN).contains("build-electrs.sh"));
+    }
+
+    #[test]
+    fn the_rate_limit_is_ordered_ahead_of_the_directive_that_terminates_routing() {
+        // A bare `rate_limit` beside `handle` blocks is ordered AFTER them by
+        // `order rate_limit before reverse_proxy`, because `handle` sorts
+        // before `reverse_proxy` — and `handle` terminates routing, so the
+        // limiter never runs. It fails silently: every request is served, every
+        // header is right, and there is no rate limit. Caught by
+        // deploy/esplora/test-front.sh; pinned here so a future edit of the
+        // ordering line has to argue with a test.
+        assert!(
+            CADDYFILE_TEMPLATE.contains("order rate_limit before handle"),
+            "rate_limit must be ordered before `handle`, or it is dead configuration"
+        );
     }
 
     #[test]

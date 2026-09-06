@@ -42,6 +42,40 @@ jobs:
       - run: for f in deploy/esplora/*.sh scripts/verify-esplora.sh; do bash -n "$f"; done
       - run: shellcheck -S error deploy/esplora/*.sh scripts/verify-esplora.sh
 
+  # The Caddy front, actually started and asked what it does. Until this job
+  # existed the configuration had never been run: the three freshness states,
+  # "CORS exactly once" and "btxd's RPC stays unreachable" were comments. The
+  # first run of it found a rate limit that was ordered after a directive which
+  # terminates routing, so it never ran at all.
+  #
+  # It needs a Caddy carrying the rate-limit plugin, which no distribution
+  # ships, so the job builds one with xcaddy. Everything else is stubs on
+  # localhost: no node, no chain, no network.
+  front:
+    name: Caddy front (integration)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: 'stable'
+          cache: false
+      - name: Build caddy with the rate-limit plugin
+        run: |
+          go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+          "$HOME/go/bin/xcaddy" build --with github.com/mholt/caddy-ratelimit \
+            --output "$HOME/.local/bin/caddy"
+          "$HOME/.local/bin/caddy" list-modules | grep -qx 'http.handlers.rate_limit'
+      - name: Run the front against stubs
+        run: deploy/esplora/test-front.sh
+        env:
+          # Free ports: the runner has nothing on these, and the defaults would
+          # collide with a real deployment if this ever ran on one.
+          FRONT_PORT: '13080'
+          ELECTRS_PORT: '13000'
+          BTXD_PORT: '13334'
+
   rust-btx:
     name: rust-btx (test)
     runs-on: ubuntu-latest
