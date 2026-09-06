@@ -40,6 +40,18 @@ when its address is in the wallet's own built-in list, so turning this on does
 not by itself put your node to work; and it answers block hashes and refuses
 every other question.
 
+**What has not changed: the engine, and how much of the fleet validates for
+itself.** The engine stays v0.34.6 at commit `9eb4e005`, as in 0.6.18 and
+0.6.19. Two device classes validate the MatMul fork independently: NVIDIA
+`sm_120` and Apple M4-class. Every other machine starts, follows, and stalls
+below the fork rather than validating it. That is a property of the engine
+rather than of this release, and it is worth saying beside a witness feature:
+a node that follows reports the chain it was handed, so several witnesses
+following one source are one source wearing several hats. Comparing block
+hashes tells a wallet that two sources agree. It never tells it either is
+right, which is why the wallet asks more than one and why this answers the
+question it can answer instead of the ones it cannot.
+
 **Esplora mode: serve wallets from your own node.** A "Serve wallets
 (Esplora API)" switch in Settings runs electrs and a Caddy front beside btxd,
 so the BTX wallet can read balances from a full node you run instead of from
