@@ -143,6 +143,24 @@ export interface NodeStatusInfo {
   esplora_message: string | null;
 }
 
+/**
+ * What `esplora_preflight` answers: can this machine serve Esplora, what will
+ * it cost, and are the two binaries even here. Read BEFORE the operator flips
+ * the switch, which is the only moment any of it is useful.
+ */
+interface EsploraPreflight {
+  allowed: boolean;
+  /** The gate's sentence when it refuses: a pruning conf, an already-pruned
+   *  datadir, or the keeper profile. Each needs a different conversation. */
+  blocker: string | null;
+  /** Non-blocking costs, chiefly the disk one. */
+  warnings: string[];
+  /** Where the binaries were found, or null when they are not installed. */
+  electrs_found: string | null;
+  caddy_found: string | null;
+  listen: string;
+}
+
 interface ReclaimReport {
   freed_mb: number;
   items: string[];
@@ -740,6 +758,10 @@ $("settings-btn").addEventListener("click", async () => {
     reflectKeeperRow(lastStatus);
     reflectEsploraRow(lastStatus);
   }
+  // The preflight is a question about the machine, so it is asked when the
+  // panel opens rather than on the status poll: it reads the conf, the node
+  // and the disk, and none of that changes second to second.
+  void refreshEsploraPreflight();
   try {
     $<HTMLInputElement>("autostart-toggle").checked = await isEnabled();
   } catch {
@@ -802,6 +824,7 @@ $<HTMLInputElement>("esplora-toggle").addEventListener("change", async (e) => {
     result.textContent = String(err); // the Rust side's sentence, not a stack trace
   }
   result.hidden = false;
+  void refreshEsploraPreflight();
 });
 
 async function saveEsploraListen(): Promise<void> {
@@ -821,6 +844,42 @@ $("esplora-listen-save").addEventListener("click", () => void saveEsploraListen(
 $("esplora-listen").addEventListener("keydown", (e) => {
   if ((e as KeyboardEvent).key === "Enter") void saveEsploraListen();
 });
+
+/**
+ * Ask whether this machine can serve Esplora, and say so under the switch.
+ *
+ * Everything here was already computed and thrown away: the prune gate's
+ * three-way refusal, the measured disk cost, and whether electrs and caddy are
+ * installed at all. Rendering it before the switch is flipped is the whole
+ * point of a preflight — the alternative is an operator learning the answer
+ * from a refusal.
+ */
+async function refreshEsploraPreflight(): Promise<void> {
+  const el = $("esplora-preflight");
+  let p: EsploraPreflight;
+  try {
+    p = await invoke<EsploraPreflight>("esplora_preflight");
+  } catch {
+    el.hidden = true; // never a scary line for a failure the operator cannot act on
+    return;
+  }
+  const lines: string[] = [];
+  el.classList.toggle("is-error", !p.allowed);
+  if (!p.allowed && p.blocker) {
+    lines.push(p.blocker);
+  } else {
+    // Name what is missing and the script that builds it. Nothing is
+    // downloaded by the app, so this is the operator's next command.
+    const missing: string[] = [];
+    if (!p.electrs_found) missing.push("electrs (deploy/esplora/build-electrs.sh)");
+    if (!p.caddy_found) missing.push("caddy with the rate-limit plugin (deploy/esplora/build-caddy.sh)");
+    if (missing.length) lines.push("Not installed yet: " + missing.join("; ") + ".");
+    else lines.push(`Ready: electrs at ${p.electrs_found}, caddy at ${p.caddy_found}.`);
+  }
+  for (const w of p.warnings) lines.push(w);
+  el.textContent = lines.join(" ");
+  el.hidden = lines.length === 0;
+}
 
 const ESPLORA_STATIC_COPY =
   "Serve the Esplora API to wallets from your own full node. Needs the whole chain on disk (never a pruned node), electrs and Caddy built from deploy/esplora, and disk for the index";
