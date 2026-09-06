@@ -1612,7 +1612,8 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                 Err(_) => {
                     consecutive_failures += 1;
                     // ~1 min of continuous silence → tell the user instead of
-                    // freezing on a stale number. No destructive action.
+                    // freezing on a stale number, and stop the node the way
+                    // Stop does rather than dropping it onto a SIGKILL.
                     if consecutive_failures >= 20 {
                         // Say it on screen first: the stop below can take the
                         // full flush grace, and the user should not watch a
