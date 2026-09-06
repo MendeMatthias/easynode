@@ -258,6 +258,48 @@ pub fn fork_alarm(
 
 #[cfg(test)]
 mod tests {
+
+    /// THE CARD MUST NOT SAY "0 minutes" ABOUT A TEN-MINUTE CONDITION.
+    ///
+    /// `headers_ahead` cannot fire before the gap has been open for
+    /// HEADERS_AHEAD_ALARM_SECS, so the alarm it returns already carries a
+    /// truthful age. The refresher used to overwrite it with time-since-first-
+    /// seen, which is ~0 on the very tick the alarm appears — the exact moment
+    /// the sentence is first shown to the user.
+    #[test]
+    fn headers_ahead_carries_the_gap_age_it_measured() {
+        let gap = GapWindow {
+            since_secs: 20 * 60,
+            behind_at_start: 100,
+        };
+        let alarm = headers_ahead(1000, 1200, Some(gap)).expect("a stuck 200-block gap must alarm");
+        match alarm {
+            ForkAlarm::HeadersAhead { since_secs, .. } => assert_eq!(since_secs, 20 * 60),
+            other => panic!("expected HeadersAhead, got {other:?}"),
+        }
+        assert!(
+            alarm.message().contains("20 minutes"),
+            "the sentence must report the measured age: {}",
+            alarm.message()
+        );
+    }
+
+    /// The other variant genuinely has no clock of its own: a branch in
+    /// `getchaintips` carries no age, so the caller supplies one and
+    /// `with_since` is correct there.
+    #[test]
+    fn longer_branch_starts_with_no_age_and_takes_the_callers() {
+        let tips = vec![tip(210865, 0, "active"), tip(211167, 671, "headers-only")];
+        let alarm = longer_branch(&tips).expect("the 2026-09-05 shape must alarm");
+        match alarm {
+            ForkAlarm::LongerBranch { since_secs, .. } => assert_eq!(since_secs, 0),
+            other => panic!("expected LongerBranch, got {other:?}"),
+        }
+        match alarm.with_since(900) {
+            ForkAlarm::LongerBranch { since_secs, .. } => assert_eq!(since_secs, 900),
+            other => panic!("expected LongerBranch, got {other:?}"),
+        }
+    }
     use super::*;
 
     fn tip(height: u64, branchlen: u64, status: &str) -> ChainTip {
