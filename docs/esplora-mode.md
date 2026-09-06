@@ -393,6 +393,40 @@ settled pairs it read `unverified`. It now reads `fresh`, proven at the settled
 block 211398, and both the Rust and the shell say so with the height that
 proved it.
 
+## The software is proven; the deployment is not
+
+Those are different claims and this document used to have no way to make the
+first one. `deploy/esplora/test-stack.sh` runs the whole stack against a real
+BTX node on a throwaway **regtest** chain: btxd mines it, the vendored electrs
+indexes it and serves the wallet's routes, and the Caddy front sits in front.
+
+That matters because until it ran, the fork of Blockstream's indexer and the
+BTX consensus decode crate beside it had been vendored, compiled and
+unit-tested, and never once asked to index a chain and answer a wallet. Eleven
+checks, all passing, in about thirty seconds:
+
+| | |
+|---|---|
+| btxd on regtest | answers RPC; a P2MR address encodes to something it accepts |
+| mining | 20 blocks — regtest needs no GPU for the MatMul proof |
+| electrs | indexes to the tip |
+| **`/block-height/<h>`** | **equals btxd's own `getblockhash`** |
+| `/blocks`, `/mempool` | 200 |
+| `/address/<a>/utxo` | lists the coinbase outputs: the address index works |
+| the front | same tip end to end, `X-Btx-Freshness: fresh`, CORS exactly once |
+
+The fourth row is the one worth pausing on. It is `rust-btx` decoding real BTX
+blocks — a 182-byte header with a trailing MatMul payload, a shape upstream
+rust-bitcoin cannot read — and arriving at the same hash as the node that made
+them. That is the assumption the whole port rests on, and it had never been
+checked outside the crate's own tests.
+
+**What it does not prove**, said plainly so nobody quotes it as an acceptance:
+nothing about mainnet scale, nothing about a mainnet index, and nothing about
+an endpoint's correctness against another source. Regtest blocks are trivial
+and there are twenty of them. That is `scripts/verify-esplora.sh` against a
+full unpruned node, below.
+
 ## Acceptance status, 2026-09-06
 
 `scripts/verify-esplora.sh` was **not** run against an easyNode endpoint,
@@ -405,7 +439,18 @@ because none exists yet that can pass its precondition:
 - The box has 54 GB free against a 124 GiB chain plus an unmeasured index, so
   a second unpruned datadir cannot live there either.
 
-What was run instead, all on 2026-09-05/06 and all in the pull request:
+What was run instead, all on 2026-09-05/06 and all in the pull requests:
+
+- the whole stack on a regtest chain (above): 11 checks, including electrs
+  agreeing with btxd on a block hash and the address index returning real
+  outputs;
+- the Caddy front against stubs: 17 checks. Its first run found the per-IP rate
+  limit had never been in force, because a bare `rate_limit` beside `handle`
+  blocks is ordered after a directive that terminates routing. A 300-request
+  burst was served in full; it is now 184 served and 116 refused;
+- the freshness guardian against stubs: 10 checks, pinning that the shell
+  agrees with the Rust, which had been asserted since the port and never
+  tested;
 
 - rust-btx's suite in its vendored location: 25 tests, pass.
 - `build-electrs.sh` on this box with no root, which is how it found that the

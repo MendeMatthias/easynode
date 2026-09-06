@@ -19,6 +19,7 @@ is worth doing at all.
 | `install-systemd.sh` | installs the units for the server path, refusing a pruned node first |
 | `test-front.sh` | starts the real Caddyfile against stubs and checks every claim in it |
 | `test-guardian.sh` | runs the freshness guardian against stubs and pins that it agrees with the Rust |
+| `test-stack.sh` | the whole stack against a REAL btxd on a throwaway regtest chain |
 | `Caddyfile.template` | the TLS + CORS + freshness front. Reads `BTX_ESPLORA_HOST` and `BTX_ESPLORA_RUN` |
 | `electrs.service.template` | the indexer as a systemd unit. Replace `USER` and the two data paths |
 | `btxd.service.template` | btxd as a unit, for a server that does not run the easyNode app |
@@ -78,6 +79,18 @@ Both moving parts have their own tests, which need no node and no network:
 deploy/esplora/test-front.sh      # the Caddyfile, started, against stubs
 deploy/esplora/test-guardian.sh   # the freshness rules, executed
 ```
+
+And one that needs a btxd binary but no chain, no GPU and no network — it mines
+its own regtest chain in a temporary directory and throws it away:
+
+```bash
+deploy/esplora/test-stack.sh      # btxd -> electrs -> the front, end to end
+```
+
+That is the one that proves electrs actually works for BTX: it checks that the
+hash electrs serves at a height is the hash btxd reports there, which is
+`rust-btx` decoding real 182-byte headers with their trailing MatMul payloads
+and agreeing with the node that made them.
 
 ## Four things that will bite
 
