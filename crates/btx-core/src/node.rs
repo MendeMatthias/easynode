@@ -1357,7 +1357,37 @@ pub async fn stop_unmanaged_node(datadir: &Path, btx_cli: &Path, grace: std::tim
 /// does NOT. This gates a SIGKILL, so the match must be precise. Pure →
 /// unit-testable without spawning a process.
 fn comm_looks_like_btxd(comm: &str) -> bool {
-    comm.trim().rsplit('/').next().unwrap_or("") == "btxd"
+    let base = comm.trim().rsplit('/').next().unwrap_or("");
+    // `btxd.real` is btxd. Since upstream 0.34.1 the released macOS and Linux
+    // packages ship `bin/btxd` as a `#!/bin/sh` wrapper that execs
+    // `../libexec/btxd.real`, so the RUNNING process is named `btxd.real` and
+    // the process table never shows `btxd` at all. Our own source-built
+    // packages have no wrapper, which is why this went unnoticed: it only bites
+    // a datadir whose engine came from an upstream tarball.
+    //
+    // MEASURED 2026-09-06, walking the 0.6.17 -> 0.6.19 mac upgrade on a real
+    // 0.6.17-era datadir. 0.6.17 bundles the official v0.34.5 mac binaries, so
+    // its node runs as `btxd.real`. The app updated itself, provisioned
+    // v0.34.6, and then could not recognise its OWN node:
+    //
+    //     btxd.pid names live pid 86244, but that process is
+    //     ".../v0.34.5/macos-arm64/bin/../libexec/btxd.real", not btxd - the
+    //     pid was recycled and the file is stale. Ignoring the file, and
+    //     leaving that process alone
+    //     pidfile pid 86244 is alive but not btxd (pid reused?); removing the
+    //     stale pidfile without stopping it
+    //     btxd exited within 5s of spawning, attempt 1/3 ... 2/3 ... 3/3
+    //
+    // The old engine kept the datadir lock, the new one lost the race three
+    // times, and the user was left with a dead node and an orphan still
+    // running on the OLD engine. `force_kill_foreign_btxd` refused for the same
+    // reason, so the last-resort recovery was dead too.
+    //
+    // STILL NARROW, deliberately. This function gates a SIGKILL, and it was
+    // tightened from a `contains()` check precisely because that killed
+    // `btxd-wrapper` and `stop-btxd.sh`. Two exact names, no prefix or suffix
+    // matching: `btxd.real` is upstream's own file name, not a pattern.
+    base == "btxd" || base == "btxd.real"
 }
 
 /// The command name of `pid` (basename, no extension), via the platform layer
@@ -3468,7 +3498,15 @@ matmul: metal runtime_probe_ok, selecting metal\n\
             "/Users/me/.easybtx/install/btx-0.30.1/bin/btxd"
         ));
         assert!(comm_looks_like_btxd("  btxd  ")); // surrounding whitespace tolerated
-                                                   // An unrelated process that reused the pid must NOT be force-killed.
+        // The upstream 0.34.1+ wrapper layout: `bin/btxd` is a sh wrapper and
+        // the process that actually runs is `libexec/btxd.real`. Verbatim from
+        // the process table on 2026-09-06 while the 0.6.17 -> 0.6.19 mac
+        // upgrade was failing.
+        assert!(comm_looks_like_btxd("btxd.real"));
+        assert!(comm_looks_like_btxd(
+            "/Users/bonuz/.local/btx/v0.34.5/macos-arm64/bin/../libexec/btxd.real"
+        ));
+        // An unrelated process that reused the pid must NOT be force-killed.
         assert!(!comm_looks_like_btxd("Safari"));
         assert!(!comm_looks_like_btxd("/sbin/launchd"));
         assert!(!comm_looks_like_btxd(""));
@@ -3477,6 +3515,40 @@ matmul: metal runtime_probe_ok, selecting metal\n\
         assert!(!comm_looks_like_btxd("btxd-wrapper"));
         assert!(!comm_looks_like_btxd("run-btxd-tests.sh"));
         assert!(!comm_looks_like_btxd("/Users/dev/scripts/stop-btxd.sh"));
+        // Widening to `btxd.real` must not widen to anything else: this gates a
+        // SIGKILL and the two accepted names are exact, not prefixes.
+        assert!(!comm_looks_like_btxd("btxd.real.bak"));
+        assert!(!comm_looks_like_btxd("btxd.realtime"));
+        assert!(!comm_looks_like_btxd("notbtxd.real"));
+        assert!(!comm_looks_like_btxd("btxd.old"));
+    }
+
+    /// THE 2026-09-06 UPGRADE REGRESSION, as the holder table sees it.
+    ///
+    /// A live `btxd.real` from an upstream-tarball engine IS this datadir's
+    /// holder. Reading it as `Free` is what let the app delete the pidfile,
+    /// leave the old engine holding the lock, and then fail to launch the new
+    /// one three times over.
+    #[test]
+    fn the_upstream_wrapper_process_is_a_holder_not_a_recycled_pid() {
+        assert_eq!(
+            classify_datadir_holder(
+                Some(86244),
+                true,
+                Some("/Users/bonuz/.local/btx/v0.34.5/macos-arm64/bin/../libexec/btxd.real"),
+                false,
+                Some(86235),
+                true,
+            ),
+            DatadirHolder::ManagedBtxd { pid: 86244 }
+        );
+        // And once the app that spawned it is gone, the same process is an
+        // orphan we own and must stop — which is exactly the state the failing
+        // upgrade left behind, reparented to init.
+        assert_eq!(
+            classify_datadir_holder(Some(86244), true, Some("btxd.real"), false, Some(1), true),
+            DatadirHolder::OrphanedBtxd { pid: 86244 }
+        );
     }
 
     // ── node_is_ours ownership decision ─────────────────────────────────────
