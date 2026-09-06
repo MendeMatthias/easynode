@@ -34,10 +34,15 @@ if ! "$CADDY" list-modules 2>/dev/null | grep -q '^http.handlers.rate_limit$'; t
   exit 0
 fi
 
-# Ports are overridable so this can run beside a real deployment.
-FRONT_PORT="${FRONT_PORT:-3080}"
-ELECTRS_PORT="${ELECTRS_PORT:-3000}"
-BTXD_PORT="${BTXD_PORT:-19334}"
+# Ports in a range nothing else uses, because everything this talks to is a
+# stub. The defaults were the REAL deployment's (3080/3000/19334), which meant
+# the script skipped itself on any machine actually running a node — including
+# the one it was written on, where the live validator holds 19334. A test that
+# silently opts out on exactly the machines that have the software is not a
+# test. Override them if these ever collide.
+FRONT_PORT="${FRONT_PORT:-13080}"
+ELECTRS_PORT="${ELECTRS_PORT:-13000}"
+BTXD_PORT="${BTXD_PORT:-13334}"
 # Caddy's admin endpoint. It defaults to 127.0.0.1:2019 and Caddy REFUSES TO
 # START when that address is taken. That is a real deployment failure, not a
 # test artifact: on this machine a Windows process holds 2019 and WSL2 shares
