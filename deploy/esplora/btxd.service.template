@@ -1,0 +1,27 @@
+[Unit]
+Description=BTX full node (btxd) behind an easyNode Esplora endpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Replace USER and the paths. The easyNode app supervises btxd itself and does
+# not use this unit; it is for a server that serves Esplora without the app,
+# the shape api.btxscan.io runs. Ported from btx-esplora's btxd.service.
+User=USER
+Type=simple
+# prune=0 is not advice, it is the precondition: electrs indexes from the block
+# files and refuses a pruned node outright ("pruned node is not supported").
+# It is stated on the command line as well as in the conf because btxd also
+# reads the datadir's own btx_rw.conf, and a remembered prune value there
+# outranks the conf file (measured on the release box on 2026-09-04). The
+# command line outranks both. -parkdeepreorg=0 for the reason easyNode 0.6.19
+# gives: a parked node could not rejoin the live chain after the 2026-09-05
+# split without an operator.
+ExecStart=/usr/local/bin/btxd -datadir=/var/lib/btx -conf=/var/lib/btx/btx.conf -prune=0 -parkdeepreorg=0
+ExecStop=/usr/local/bin/btx-cli -datadir=/var/lib/btx stop
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

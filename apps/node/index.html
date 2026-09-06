@@ -310,6 +310,31 @@
 
           <div class="setting-row">
             <div class="setting-text">
+              <span class="setting-name">Serve wallets (Esplora API)</span>
+              <span class="setting-desc" id="esplora-desc">Serve the Esplora API to wallets from your own full node. Needs the whole chain on disk (never a pruned node), electrs and Caddy built from deploy/esplora, and disk for the index</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="esplora-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="setting-row setting-row-stacked">
+            <div class="setting-text">
+              <span class="setting-name">Esplora address</span>
+              <span class="setting-desc">Where the front listens. Localhost until you give it a hostname, which gets its own certificate. Applies the next time the node starts</span>
+            </div>
+            <div class="nickname-row">
+              <input id="esplora-listen" class="wallet-input" type="text" maxlength="253"
+                     placeholder="http://127.0.0.1:3080" autocomplete="off" spellcheck="false"
+                     aria-label="Esplora address" />
+              <button id="esplora-listen-save" class="btn-secondary" type="button">Save</button>
+            </div>
+            <p class="setting-result" id="esplora-result" hidden></p>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
               <span class="setting-name">When you close the window</span>
               <span class="setting-desc" data-tray-term>The red X can ask, keep the node in the menu bar, or quit</span>
             </div>

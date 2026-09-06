@@ -1,0 +1,75 @@
+# The vendored Esplora stack under deploy/esplora: rust-btx (pure Rust, a
+# minute) and electrs (rocksdb compiled from source, long). Both run only when
+# those trees change, so an unrelated pull request pays nothing.
+#
+# Same trust boundary as ci.yml: read-only token, no secrets, no
+# pull_request_target. Action pins are the same commit SHAs ci.yml uses; see
+# its header for why a tag is not enough.
+name: Esplora stack
+
+on:
+  pull_request:
+    paths:
+      - 'deploy/esplora/**'
+      - 'scripts/verify-esplora.sh'
+      - '.github/workflows/esplora.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/esplora/**'
+      - 'scripts/verify-esplora.sh'
+      - '.github/workflows/esplora.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: esplora-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The hand-ported shell: parse every script, and let shellcheck refuse the
+  # error class (unquoted globs in rm, unreachable code, that family).
+  scripts:
+    name: deploy scripts (parse, shellcheck)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: for f in deploy/esplora/*.sh scripts/verify-esplora.sh; do bash -n "$f"; done
+      - run: shellcheck -S error deploy/esplora/*.sh scripts/verify-esplora.sh
+
+  rust-btx:
+    name: rust-btx (test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: deploy/esplora/rust-btx
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: deploy/esplora/rust-btx
+      - run: cargo test --locked --all-targets
+
+  # `cargo check` still runs librocksdb-sys's build script, which compiles
+  # rocksdb, so this is the slow job. rust-toolchain.toml in the directory pins
+  # the toolchain and rustup on the runner installs it.
+  electrs:
+    name: electrs (check)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: deploy/esplora/electrs
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang cmake
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: deploy/esplora/electrs
+      - run: cargo check --locked --bin electrs

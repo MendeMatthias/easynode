@@ -118,6 +118,16 @@ pub struct NodeAppSettings {
     /// refuses to START on a comment it does not like.
     #[serde(default)]
     pub node_nickname: String,
+    /// Serve the Esplora REST API to wallets: electrs and the Caddy front run
+    /// beside btxd (`btx_core::esplora_sidecar`). Off by default. Refused on a
+    /// pruned datadir by `btx_core::esplora`, and the refusal is shown where
+    /// the switch is, never logged away.
+    #[serde(default)]
+    pub esplora_enabled: bool,
+    /// Where the front listens. Plain HTTP on localhost until an operator
+    /// gives it a hostname, which gets automatic HTTPS.
+    #[serde(default = "default_esplora_listen")]
+    pub esplora_listen: String,
 }
 
 fn default_on_close() -> String {
@@ -130,6 +140,10 @@ fn default_profile() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_esplora_listen() -> String {
+    btx_core::esplora_sidecar::DEFAULT_LISTEN.to_string()
 }
 
 impl Default for NodeAppSettings {
@@ -150,6 +164,8 @@ impl Default for NodeAppSettings {
             // No nickname. Anything else would publish an identifier the user
             // never chose to publish.
             node_nickname: String::new(),
+            esplora_enabled: false,
+            esplora_listen: default_esplora_listen(),
         }
     }
 }
@@ -341,6 +357,19 @@ pub struct AppState {
     /// census above. Cached for the same reason: the UI polls ~1.5 s and a
     /// second full getpeerinfo for a decorative list would be indefensible.
     pub peer_nicknames_cache: Arc<Mutex<Vec<String>>>,
+    /// electrs and the Caddy front, while Esplora mode is on and the node
+    /// runs; `None` otherwise. Dropping the value kills both children.
+    pub esplora: Arc<Mutex<Option<btx_core::esplora_sidecar::EsploraSidecars>>>,
+    /// The freshness guardian's last verdict for the served endpoint. Cleared
+    /// with the sidecars, so a dead front never renders as fresh.
+    pub esplora_verdict: Arc<Mutex<Option<btx_core::esplora_freshness::Verdict>>>,
+    /// Why the front is not running although the setting is on: the prune
+    /// gate's sentence, a missing binary, a child that exited. Shown beside
+    /// the switch. `None` when running or off.
+    pub esplora_error: Arc<Mutex<Option<String>>>,
+    /// Generation counter for the guardian loop, bumped on every sidecar
+    /// start; a loop whose generation is superseded exits.
+    pub esplora_gen: Arc<AtomicU64>,
 }
 
 /// Whose node did we attach to? Derived from the `DatadirHolder` seen at the
@@ -388,6 +417,10 @@ impl AppState {
             fork: Arc::new(Mutex::new(None)),
             archive_peers_cache: Arc::new(Mutex::new(None)),
             peer_nicknames_cache: Arc::new(Mutex::new(Vec::new())),
+            esplora: Arc::new(Mutex::new(None)),
+            esplora_verdict: Arc::new(Mutex::new(None)),
+            esplora_error: Arc::new(Mutex::new(None)),
+            esplora_gen: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -407,6 +440,12 @@ mod tests {
         assert!(!s.wallet_enabled, "wallet is OFF from factory settings");
         assert!(s.wallet_name.is_none());
         assert_eq!(s.on_close, "ask", "the red X asks until the user decides");
+        assert!(!s.esplora_enabled, "Esplora mode is opt-in, never default");
+        assert_eq!(
+            s.esplora_listen,
+            btx_core::esplora_sidecar::DEFAULT_LISTEN,
+            "the front starts on localhost until an operator names it"
+        );
     }
 
     #[test]

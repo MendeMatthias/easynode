@@ -193,9 +193,44 @@ pub fn explain_warning(w: &EsploraWarning) -> String {
     }
 }
 
+/// The `prune=` value the app's own conf asks for: `None` when the conf or the
+/// key is absent, which the gate treats as unmeasured rather than as zero.
+pub fn conf_prune(conf: &std::path::Path) -> Option<u64> {
+    crate::setup::conf_kv(conf, "prune").and_then(|v| v.trim().parse().ok())
+}
+
+/// `pruned` and `pruneheight` from a running node's `getblockchaininfo`. Both
+/// `None` when the node did not answer. Read straight from the JSON rather
+/// than through `node_api::BlockchainInfo`, so the gate can see a field that
+/// struct does not carry without widening a type the whole app decodes.
+pub async fn node_prune_posture(rpc: &dyn crate::rpc::Rpc) -> (Option<bool>, Option<u64>) {
+    match rpc.call("getblockchaininfo", serde_json::json!([])).await {
+        Ok(v) => (
+            v.get("pruned").and_then(|p| p.as_bool()),
+            v.get("pruneheight").and_then(|h| h.as_u64()),
+        ),
+        Err(_) => (None, None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conf_prune_reads_the_setting_and_admits_when_there_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("faststart.conf");
+        assert_eq!(conf_prune(&conf), None, "no conf is unmeasured, not zero");
+        std::fs::write(&conf, "server=1\nprune=0\n").unwrap();
+        assert_eq!(conf_prune(&conf), Some(0));
+        std::fs::write(&conf, "server=1\nprune=4096\n").unwrap();
+        assert_eq!(conf_prune(&conf), Some(4096));
+        std::fs::write(&conf, "server=1\n").unwrap();
+        assert_eq!(conf_prune(&conf), None);
+        std::fs::write(&conf, "prune=yes\n").unwrap();
+        assert_eq!(conf_prune(&conf), None, "a non-number is not a posture");
+    }
 
     fn facts() -> EsploraFacts {
         EsploraFacts {
