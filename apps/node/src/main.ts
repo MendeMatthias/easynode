@@ -11,6 +11,7 @@ import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { AmbientLine } from "./ambient";
 import { validationView } from "./validation";
+import { classifyCheckFailure, checkFailureMessage } from "./update-check";
 import { contributionView } from "./contribution";
 import { mountPowerCore } from "./power-core";
 import { initAsk } from "./ask";
@@ -1535,8 +1536,16 @@ async function updateCheck(manual = false): Promise<void> {
     update = await checkForUpdate();
   } catch (e) {
     // Quiet on the automatic path; a MANUAL check must never end in silence,
-    // because that reads as a dead button.
-    if (manual) setUpdateResult(`Couldn't check right now — are you online? (${String(e).slice(0, 80)})`);
+    // because that reads as a dead button. But WHAT it says matters: a release
+    // that has no build for this platform is not a connectivity problem, and
+    // saying it was sent Mac owners hunting a fault that did not exist on the
+    // day 0.6.20 shipped Linux-only. classifyCheckFailure tells the two apart
+    // by the plugin's own wording; update-check.test.ts pins both strings.
+    if (manual) {
+      setUpdateResult(
+        checkFailureMessage(classifyCheckFailure(e), appVersion, MANUAL_DOWNLOAD),
+      );
+    }
     return;
   }
 
