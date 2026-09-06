@@ -46,9 +46,6 @@ jobs:
       # and change the other" is not a mechanism. Stubs only: no node, no
       # chain, no network.
       - run: deploy/esplora/test-guardian.sh
-        env:
-          LOCAL_PORT: '13100'
-          CENSUS_PORT: '13101'
 
   # The Caddy front, actually started and asked what it does. Until this job
   # existed the configuration had never been run: the three freshness states,
@@ -77,12 +74,6 @@ jobs:
           "$HOME/.local/bin/caddy" list-modules | grep -qx 'http.handlers.rate_limit'
       - name: Run the front against stubs
         run: deploy/esplora/test-front.sh
-        env:
-          # Free ports: the runner has nothing on these, and the defaults would
-          # collide with a real deployment if this ever ran on one.
-          FRONT_PORT: '13080'
-          ELECTRS_PORT: '13000'
-          BTXD_PORT: '13334'
 
   rust-btx:
     name: rust-btx (test)
