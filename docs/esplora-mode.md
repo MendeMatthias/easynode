@@ -44,70 +44,81 @@ GET  /address/<addr>/txs/chain/<txid>
 GET  /tx/<txid>
 GET  /mempool
 GET  /blocks/tip/height       -> a bare decimal integer, nothing else
+GET  /blocks                  -> the recent block listing (chain age)
+GET  /block-height/<height>   -> the block hash there, bare 64 hex
 POST /tx
 ```
 
-**Eight routes. Serve them at the root of the origin, with no `/api` prefix.**
+**Ten routes. Serve them at the root of the origin, with no `/api` prefix.**
 Verified against the live reference: `api.btxscan.io/blocks/tip/height` answers
 200 and `api.btxscan.io/api/blocks/tip/height` answers 404. The wallet agrees —
 `AZURE_ESPLORA` is commented "our own node — Esplora at ROOT, no /api". Only
 minebtx ever served under `/api`, which is why the wallet keeps the path in its
 UI list and pins only scheme+host in the Rust gate.
 
-### ⚠ The witness route is not in that list, and that is the finding
+### ⚠ The witness half is BUILT, and this section used to say it was not
 
-An earlier version of this document, following the brief it came from, listed
-ten routes including `GET /blocks` and `GET /block-height/<height>`, and called
-the latter "THE WITNESS ROUTE — do not skip it".
+**Corrected 2026-09-06 against `MendeMatthias/pq-wallet@169b413`.** Every
+paragraph that used to stand here was written from the wallet as it was on
+2026-09-04 and is now wrong. It said the wallet denied `/blocks` and
+`/block-height`, with tests pinning the denial; that the divergence check
+compared heights across `OFFICIAL_EXPLORERS`; that a one-element list made it
+inert; and that the witness half therefore had to be planned and built. Anyone
+following that would plan work that already exists.
 
-**The wallet does not permit either one.** They are not omitted, they are
-actively denied, and there are tests pinning the denial:
+What the wallet actually does today, read from its source:
 
-```rust
-assert!(validate_esplora_route("GET", "/blocks", None).is_err());          // block listing
-assert!(validate_esplora_route("GET", "/blocks/tip/hash", None).is_err()); // not needed
-```
+- `validate_esplora_route` **permits** `GET /blocks` and
+  `GET /block-height/<h>`. The height gate, `is_height_segment`, is stricter
+  than anything this document asked for: ASCII digits only, one to nine of
+  them, no leading zero so a padded encoding cannot smuggle extra capacity,
+  and exactly three path segments. Its comment sizes the residual at about 30
+  bits.
+- Divergence does **not** run over `OFFICIAL_EXPLORERS`. There is a separate
+  `CHAIN_WITNESSES` list, and the separation is the design: a witness answers
+  one question, whether an independent source holds the same block hash at a
+  height both hold, and is never asked about balances, UTXOs, fees or history.
+  That is why Byron Bay is still useful there while it is banned from the money
+  path — wrong about money, sound about blocks.
+- The comparison is two requests, `/blocks/tip/height` then
+  `/block-height/<h>`, at the **highest shared height**. That is a correction
+  to this document's own instinct: comparing low returns "agree" on a genuinely
+  forked chain, because every block below a fork point is byte-identical on
+  both sides.
+- `judgeDivergence` returns `agree | differ | unknown`, and its comment says
+  what matters most: "a check that did not run is not a check that passed".
 
-`/block-height` appears nowhere in the wallet at all — not in the validator, not
-in the UI, not in a test.
-
-So the claim that Byron's `/blocks` 404 "silently broke the wallet's divergence
-check" cannot be right in that form: the wallet never calls `/blocks`, and its
-own gate would refuse the attempt. What the divergence check actually does, in
-`ui/main.js::checkTipFreshness`, is fetch `/blocks/tip/height` from every entry
-in `OFFICIAL_EXPLORERS` and compare the **heights**.
-
-Which is worse than described, for a different reason. `OFFICIAL_EXPLORERS`
-currently has **one entry**. Byron and minebtx were removed from it on
-2026-08-19, with a comment saying not to restore either without re-running the
-UTXO set comparison. A one-element list compared against itself is not a weak
-divergence check, it is an inert one — and no server-side change fixes that.
+So the sentence at the top of this document, that when Byron goes nothing can
+settle a fork for the wallet, is right about the **network** and wrong about
+the **code**. The machinery exists and has exactly one witness, which is
+retiring.
 
 ### What this means for the work
 
-Serving Esplora from the fleet takes **two halves, and neither alone is enough**:
+The two halves are still two halves, but only one of them is unbuilt:
 
-| half | where | what it needs |
+| half | where | state |
 |---|---|---|
-| data | easyNode | serve the eight routes above; this is the part an operator can do today |
-| witness | the wallet | permit `/block-height/<h>`, and carry more than one endpoint |
+| data | easyNode | built here: `deploy/esplora/`, the app switch, the gate |
+| witness machinery | the wallet | **already built** (`ui/tipwatch.js`, the three block routes) |
+| witnesses to point it at | the wallet's lists | **the actual gap**: `CHAIN_WITNESSES` has one entry, Byron Bay, which is retiring |
 
-A height alone proves nothing — on 2026-08-24 two mirrors agreed on 199,296 and
-both were wrong — so the witness half has to compare **hashes**, and the wallet
-cannot ask for a hash today. Building only the server side yields more copies of
-the same data and no fork-settling ability whatsoever.
+The remaining wallet change is therefore not an arm in a validator and not an
+architecture change. It is one or two entries in `CHAIN_WITNESSES` (and, for a
+node fit to serve money routes too, in `OFFICIAL_EXPLORERS` plus
+`PRODUCTION_EXPLORER_ORIGINS`, which the endpoints test keeps in lockstep). It
+is blocked on the same two things as everything else here: a DNS name, and an
+acceptance PASS behind it. Adding a name that does not resolve buys nothing and
+risks a user selecting a dead endpoint, so it waits.
 
-The good news is that the second half is small: one arm in `validate_esplora_route`,
-its test, and more than one entry in the curated list. It is a wallet change, not
-an architecture change. But it must be *planned*, because the server work alone
-buys none of the capability this was started for.
-
-`scripts/verify-esplora.sh` therefore separates the two sets. Routes the wallet
-requires **today** are PASS/FAIL and decide the verdict; the witness routes
-(`/blocks`, `/block-height/<h>`) are labelled **FUTURE**, counted separately, and
-cannot refuse an endpoint. Getting that wrong withheld wallet-fit endpoints for
-failing a capability no wallet can use yet, on a network whose whole problem is
-that there is one source left.
+`scripts/verify-esplora.sh` treats all three block routes as **required**, and
+did not before. It labelled them FUTURE, on the finding above, and counted them
+separately so they could not refuse an endpoint. That was right while the
+wallet denied them and is wrong now: an endpoint that 404s `/blocks` breaks the
+chain-age reading, and one that cannot answer `/block-height/<h>` cannot
+witness at all, which is the single capability this whole mode exists to
+restore. Byron Bay would now fail the gate on that route, which is correct: it
+is a witness the wallet already cannot rely on.
 
 Be exact about coverage: the gate probes `/blocks/tip/height`, `/mempool`,
 `/address/<a>/utxo`, `/tx/<t>/outspend/<v>` and `POST /tx` out of the eight, plus
@@ -182,18 +193,20 @@ comparison into a pass.
 
 **Proof the gate works.** Run against Byron Bay it refuses the endpoint, on the
 routes the wallet actually calls: no CORS headers, no freshness headers, and a
-UTXO set it will not bless without a comparison. Its `/blocks` 404 and its two
-diverging heights are reported as FUTURE notes and do not contribute to that
-refusal — before the split they did, which is how a wallet-fit endpoint could be
-turned away for a capability no wallet can use.
+UTXO set it will not bless without a comparison. Since 2026-09-06 its `/blocks`
+404 and its diverging heights count too, because the wallet now calls those
+routes. That is the second time this line has moved, in both directions, and
+the rule behind it is the stable part: the gate requires exactly what the
+wallet actually calls, and reads the wallet's own validator to find out.
 
 Re-run it rather than quoting a count from here; the numbers moved once the two
 sets were separated, and they will move again.
 
-Note that Byron's `/blocks` 404 is reported by the gate as a **future** problem,
-not a current one: the wallet cannot call `/blocks` today. It is worth serving
-anyway, because the witness half needs it and because an endpoint that already
-answers it is one less thing to coordinate when the wallet changes.
+Byron's `/blocks` 404 is reported by the gate as a **current** failure since
+2026-09-06, and used to be reported as a future one. The wallet calls that
+route today (the correction above), so an endpoint that does not answer it
+cannot serve this wallet, and saying otherwise would hand a wallet an endpoint
+that half-works.
 
 The reorg check is worth stating exactly, because the boundary was described
 wrongly before. Measured across three sources:
@@ -404,9 +417,14 @@ owner's to do, in this order, after an acceptance PASS:
 3. Re-run the gate against `https://esplora-1.easybtx.com`. PASS, or stop.
 4. Repeat for `esplora-2` with a different operator, so the wallet has two
    sources to compare hashes between.
-5. Only then: the wallet change (`OFFICIAL_EXPLORERS` and
-   `PRODUCTION_EXPLORER_ORIGINS`, prepared in the pq-wallet pull request), a
-   wallet release, and the link from the site.
+5. Only then: the wallet change, a wallet release, and the link from the site.
+   The change is two list entries, not machinery — the machinery is already
+   there (the correction above). A node that has passed the gate goes in
+   `CHAIN_WITNESSES`; one that should also serve balances goes in
+   `OFFICIAL_EXPLORERS` **and** `PRODUCTION_EXPLORER_ORIGINS`, which
+   `ui/endpoints.test.js` keeps in lockstep. Witnessing is the scarcer job:
+   `CHAIN_WITNESSES` has one entry today and it is Byron Bay, which is
+   retiring.
 
 Repointing a name at another operator later is a DNS change, not an app
 release. That is the whole reason for (a).

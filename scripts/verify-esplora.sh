@@ -58,12 +58,17 @@ ok()   { printf '  \033[32mPASS\033[0m  %s\n' "$*"; pass=$((pass+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; fail=$((fail+1)); }
 info() { printf '        %s\n' "$*"; }
 
-# A route the WITNESS capability will need once the wallet permits it, but that
-# the wallet cannot call today. docs/esplora-mode.md is explicit that these are
-# reported as future problems, not current ones: the wallet's own egress
-# validator permits eight routes and DENIES /blocks and /block-height, with
-# tests pinning the denial. Failing an otherwise wallet-fit endpoint on them
-# withheld exactly the capacity this network has one of.
+# A capability the wallet does not have yet. Kept because this line has moved in
+# both directions and will move again: the rule is that the gate requires
+# exactly what the wallet actually calls, read from its own egress validator,
+# and reports anything else separately so it cannot refuse a wallet-fit
+# endpoint for a capability nobody can use.
+#
+# ⚠ /blocks and /block-height were reported here until 2026-09-06, because
+# validate_esplora_route DENIED them. It does not any more (pq-wallet@169b413:
+# both are permitted, is_height_segment gates the height, and the chain-health
+# feature calls /blocks/tip/height then /block-height/<h> against a witness).
+# They are required checks below.
 future() { printf '  \033[33mFUTURE\033[0m  %s\n' "$*"; futurefail=$((futurefail+1)); }
 
 get()  { curl -sS --max-time "$TIMEOUT" "$1" 2>/dev/null; }
@@ -194,17 +199,17 @@ case "$cand_tip" in
                fi ;;
 esac
 
-# /blocks is a WITNESS route, not a wallet route. The wallet's egress validator
-# denies it outright (docs/esplora-mode.md), so a 404 here does not break
-# anything a wallet does today - it means this endpoint cannot yet serve the
-# hash-comparison the witness capability needs. Reported, not fatal.
+# /blocks is a REQUIRED route since 2026-09-06. The wallet reads the recent
+# block listing to judge how old the chain's newest block is, which is the
+# signal that caught a source answering 200 from a chain that had stopped 29.5
+# hours earlier. An endpoint that 404s it (Byron Bay does) breaks that reading.
 blocks_code="$(code "$CAND/blocks")"
 if [ "$blocks_code" = "200" ]; then
   n=$(get "$CAND/blocks" | grep -o '"height"' | wc -l)
-  ok "/blocks -> 200 with $n entries"
-  [ "$n" -ge 1 ] || future "/blocks returned 200 but no blocks"
+  if [ "$n" -ge 1 ]; then ok "/blocks -> 200 with $n entries"
+  else bad "/blocks returned 200 but no blocks: the wallet cannot read the chain's age from it"; fi
 else
-  future "/blocks -> $blocks_code: no witness hash comparison from this endpoint yet (the wallet cannot call it either way)"
+  bad "/blocks -> $blocks_code: the wallet reads this route for the chain's age (esplora.btxbyronbay.com 404s it, which is why it fails here)"
 fi
 
 for r in "/mempool"; do
@@ -214,8 +219,9 @@ done
 
 echo
 echo "── the witness route: /block-height/<h> ──"
-# This is what lets the fleet replace Byron Bay as a fork witness. A height alone
-# proves nothing: on 2026-08-24 two mirrors agreed on 199,296 and both were wrong.
+# This is what lets the fleet replace Byron Bay as a fork witness, and the wallet
+# calls it today. A height alone proves nothing: on 2026-08-24 two mirrors agreed
+# on 199,296 and both were wrong.
 if [ -n "$census_tip" ]; then
   cand_deep="$(on_deep_branch "$CAND")"
   if [ -n "$cand_deep" ]; then
@@ -238,11 +244,11 @@ for h in $WITNESS_HEIGHTS; do
   b="$(get "$REF/block-height/$h"  | tr -d '\r\n')"
   case "$a" in
     [0-9a-f]*) : ;;
-    *) future "/block-height/$h did not return a bare 64-hex hash (got: ${a:0:60})"; wfail=1; continue ;;
+    *) bad "/block-height/$h did not return a bare 64-hex hash (got: ${a:0:60})"; wfail=1; continue ;;
   esac
-  if [ "${#a}" -ne 64 ]; then future "/block-height/$h returned ${#a} chars, expected 64"; wfail=1; continue; fi
+  if [ "${#a}" -ne 64 ]; then bad "/block-height/$h returned ${#a} chars, expected 64"; wfail=1; continue; fi
   if [ "$a" = "$b" ]; then ok "/block-height/$h matches reference (${a:0:16}…)"
-  else future "/block-height/$h DIVERGES: candidate ${a:0:16}… reference ${b:0:16}…"
+  else bad "/block-height/$h DIVERGES: candidate ${a:0:16}… reference ${b:0:16}…"
        info "this is the Byron Bay defect: an index that never rolled back after a reorg"
        wfail=1; fi
 done
@@ -363,11 +369,12 @@ printf '\n'
 if [ "$fail" -eq 0 ]; then
   echo "  This endpoint may be advertised to a wallet."
   if [ "$futurefail" -gt 0 ]; then
-    echo "  It cannot yet serve the WITNESS capability (/blocks, /block-height)."
-    echo "  That needs BOTH halves: these routes here, and a wallet change to"
-    echo "  permit them - its egress validator denies them today, with tests"
-    echo "  pinning the denial. Server work alone buys none of the capability."
+    echo "  Some capability notes above are not failures; read them."
   fi
+  echo "  Advertising it is a second step: the wallet reaches an endpoint only"
+  echo "  through its curated lists, so the origin must also be added there"
+  echo "  (pq-wallet CHAIN_WITNESSES, or OFFICIAL_EXPLORERS +"
+  echo "  PRODUCTION_EXPLORER_ORIGINS for the money routes) and released."
   exit 0
 fi
 echo "  DO NOT advertise this endpoint to a wallet."
