@@ -52,8 +52,11 @@ jobs:
           cache: npm
           cache-dependency-path: apps/node/package-lock.json
 
-      # `npm ci` fails outright if package-lock.json and package.json disagree,
-      # so the lockfile is enforced by the command itself.
+      # `npm ci` fails outright if the DEPENDENCY graph in package-lock.json
+      # and package.json disagree. It does NOT check the root version field: a
+      # lockfile left behind on the previous release installs cleanly and says
+      # nothing, which is how 0.6.20 nearly shipped a lockfile reading 0.6.19.
+      # The release recipe lists that file; nothing here enforces it.
       - run: npm ci
 
       # `npm run build` is `tsc && vite build`: the typecheck and the bundle.

@@ -63,17 +63,108 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// Where the witness server listens. Loopback only: a reverse proxy in front
-/// of it owns TLS, CORS and rate limiting, exactly as it does for electrs.
+/// Where the witness server listens.
+///
+/// The systemd deployment puts Caddy in front, which owns TLS, CORS and rate
+/// limiting exactly as it does for electrs. The app's own switch does NOT: it
+/// binds this server directly, and on `0.0.0.0` there is no proxy in the path
+/// at all. So the limits that protect the node have to live here — see
+/// `MAX_INFLIGHT`, the connection deadline and the tip cache below — rather
+/// than being assumed of whatever is in front.
 pub const WITNESS_ADDR: &str = "127.0.0.1:3081";
+
+/// Whether a bind address accepts connections from outside this machine.
+/// The UI needs this to say what a setting actually does, rather than leaving
+/// an operator to work out what 0.0.0.0 means.
+pub fn is_public_bind(addr: &str) -> bool {
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    // Every other spelling of loopback (127.0.0.0/8, ::ffff:127.0.0.1) is
+    // reported public. That over-warns, which is the safe direction: this
+    // decides whether the UI shows an exposure warning, and a missing warning
+    // is worse than one too many. `validate_bind` refuses names outright, and
+    // callers pass the address actually bound wherever they have it.
+    !(host == "127.0.0.1" || host == "::1")
+}
+
+/// A bind address the witness server will accept: `host:port`, where host is
+/// an IPv4 literal or a bracketed IPv6 literal.
+///
+/// Deliberately NOT a hostname, `localhost` included. A name goes through the
+/// system resolver at bind time and takes the first address that works, so it
+/// can land somewhere other than where it was read as meaning — and
+/// `is_public_bind` would still be judging the string. A hosts file or a
+/// resolver that answers a bare label from a search domain is enough to make
+/// `localhost` a public bind that the UI calls private, which is the one
+/// direction this must never be wrong in. 0.6.20 is the first release with
+/// this setting, so nothing persisted can be a name. Returns the trimmed
+/// value.
+pub fn validate_bind(s: &str) -> Result<String, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err("the address is empty".into());
+    }
+    if t.chars()
+        .any(|c| c.is_whitespace() || c == '/' || c == '\\')
+    {
+        return Err("an address is host:port, with no path".into());
+    }
+    let (host, port) = t
+        .rsplit_once(':')
+        .ok_or_else(|| "an address needs a port, like 127.0.0.1:3081".to_string())?;
+    match port.parse::<u16>() {
+        Ok(0) | Err(_) => return Err(format!("'{port}' is not a port")),
+        Ok(p) if p < 1024 => {
+            return Err(format!(
+                "port {p} needs privileges this app does not have; pick one above 1023"
+            ))
+        }
+        Ok(_) => {}
+    }
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let ok =
+        bare.parse::<std::net::Ipv4Addr>().is_ok() || bare.parse::<std::net::Ipv6Addr>().is_ok();
+    if !ok {
+        return Err(format!(
+            "'{bare}' must be an address like 127.0.0.1 or 0.0.0.0, not a name"
+        ));
+    }
+    Ok(t.to_string())
+}
 
 /// The largest request head this will read. A witness request is about sixty
 /// bytes; anything approaching this is not one, and reading unboundedly from a
 /// socket is how a trivial server becomes a memory bug.
 const MAX_HEAD: usize = 8 * 1024;
 
-/// How long one connection may take to send its request line.
+/// How long one connection may take, from accept to its request line being
+/// read. This is a deadline for the whole read, not a per-read idle timeout: a
+/// client that sends one byte every nine seconds must be cut off, not renewed.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many requests may be in flight at once.
+///
+/// This bound protects the NODE, not this server. Each request in flight is at
+/// most one JSON-RPC call, and btxd's defaults are `rpcthreads=4` with
+/// `rpcworkqueue=16`; past that it answers 503, which the app's status poll
+/// counts as a failure, and twenty consecutive failures make the app conclude
+/// the node is wedged and reap it. An unbounded accept loop therefore hands
+/// anyone who can reach this port a way to kill the node it serves from, and
+/// have the app blame the node for it. Eight leaves btxd's queue mostly to the
+/// app's own polling, and eight concurrent block-hash lookups is still
+/// thousands of answers a second.
+const MAX_INFLIGHT: usize = 8;
+
+/// How long a tip height is reused instead of asked for again.
+///
+/// `/blocks/tip/height` is the route a caller polls, and its answer cannot
+/// change faster than a block. This is a cache for the node's benefit, not the
+/// caller's: it bounds what a flood of tip requests can push onto btxd.
+const TIP_TTL: Duration = Duration::from_secs(1);
+
+/// How long, and how much, is drained off a socket before it is closed.
+const DRAIN_GRACE: Duration = Duration::from_millis(100);
+const MAX_DRAIN: usize = 64 * 1024;
 
 /// The routes a witness answers. Everything else is a 404, by construction
 /// rather than by omission.
@@ -201,11 +292,18 @@ fn is_block_hash(s: &str) -> bool {
 /// Read the request head, up to the blank line, bounded and with a timeout.
 /// Returns the first line, which is all this server reads: no header is
 /// consulted, so none can change what is served.
-async fn read_request_line(stream: &mut TcpStream) -> Result<String, u16> {
+/// `deadline` covers the whole read. Timing each read separately would let a
+/// client hold a connection open forever by trickling a byte before every
+/// expiry, which costs the attacker nothing and costs the node a task, a
+/// socket and one of MAX_INFLIGHT slots.
+async fn read_request_line(
+    stream: &mut TcpStream,
+    deadline: tokio::time::Instant,
+) -> Result<String, u16> {
     let mut buf = Vec::with_capacity(256);
     let mut chunk = [0u8; 1024];
     loop {
-        let n = match tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk)).await {
+        let n = match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
             Ok(Ok(0)) => return Err(400),
             Ok(Ok(n)) => n,
             Ok(Err(_)) | Err(_) => return Err(400),
@@ -221,21 +319,81 @@ async fn read_request_line(stream: &mut TcpStream) -> Result<String, u16> {
     }
 }
 
-async fn serve_one(rpc: Arc<dyn Rpc>, mut stream: TcpStream) {
-    let (status, body) = match read_request_line(&mut stream).await {
+/// Take whatever the client sent after the request line off the socket, then
+/// close the write side.
+///
+/// Nothing reads those bytes — no header can change what is served — but they
+/// cannot be left unread. Closing a socket that still holds received data
+/// sends RST rather than FIN, and an arriving RST discards what the peer has
+/// buffered and not yet read: the client loses the response it was already
+/// sent and sees a connection reset instead. Any browser request carries
+/// enough header bytes past the first read to trigger it, and the failure
+/// looks exactly like "this witness is down" — the one thing a fork check must
+/// not report wrongly. Bounded by its own short grace and by MAX_DRAIN, so
+/// draining can never be how a connection is held open.
+async fn finish(stream: &mut TcpStream) {
+    let until = tokio::time::Instant::now() + DRAIN_GRACE;
+    let mut sink = [0u8; 1024];
+    let mut seen = 0usize;
+    while seen < MAX_DRAIN {
+        match tokio::time::timeout_at(until, stream.read(&mut sink)).await {
+            Ok(Ok(n)) if n > 0 => seen += n,
+            _ => break,
+        }
+    }
+    let _ = stream.shutdown().await;
+}
+
+/// A one-second memory of the tip height. Only successful answers are stored,
+/// so a node that is failing is never remembered as one that answered.
+#[derive(Default)]
+struct TipCache(std::sync::Mutex<Option<(tokio::time::Instant, String)>>);
+
+impl TipCache {
+    fn get(&self) -> Option<String> {
+        let guard = self.0.lock().ok()?;
+        let (at, body) = guard.as_ref()?;
+        (at.elapsed() < TIP_TTL).then(|| body.clone())
+    }
+
+    fn put(&self, body: &str) {
+        if let Ok(mut guard) = self.0.lock() {
+            *guard = Some((tokio::time::Instant::now(), body.to_string()));
+        }
+    }
+}
+
+async fn serve_one(rpc: Arc<dyn Rpc>, tip: Arc<TipCache>, mut stream: TcpStream) {
+    let deadline = tokio::time::Instant::now() + READ_TIMEOUT;
+    let (status, body) = match read_request_line(&mut stream, deadline).await {
         Err(code) => (code, String::new()),
         Ok(line) => match parse_request_line(&line).and_then(|(m, p)| route(m, p)) {
+            Some(WitnessRoute::TipHeight) => match tip.get() {
+                Some(cached) => (200, cached),
+                None => {
+                    let answered = answer(rpc.as_ref(), WitnessRoute::TipHeight).await;
+                    if answered.0 == 200 {
+                        tip.put(&answered.1);
+                    }
+                    answered
+                }
+            },
             Some(r) => answer(rpc.as_ref(), r).await,
             None => (404, "not found".to_string()),
         },
     };
     let _ = stream.write_all(&http_response(status, &body)).await;
     let _ = stream.flush().await;
+    finish(&mut stream).await;
 }
 
-/// A running witness server. Dropping the handle stops it: the accept loop
-/// exits with the task, so a stop is a drop and there is no half-serving state
-/// to reason about.
+/// A running witness server. `stop()` ends it, and so does dropping it.
+///
+/// The second half of that needs the `Drop` below to be true: dropping a
+/// `JoinHandle` DETACHES the task, it does not cancel it. Without an explicit
+/// abort, a server replaced in a slot goes on listening on its port, answering
+/// from an RPC client belonging to a node that may no longer exist, with no
+/// handle left to stop it.
 pub struct WitnessServer {
     task: tokio::task::JoinHandle<()>,
     pub addr: SocketAddr,
@@ -253,16 +411,31 @@ impl WitnessServer {
             crate::error::AppError::Config(format!("witness server has no address: {e}"))
         })?;
         let task = tokio::spawn(async move {
+            let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT));
+            let tip = Arc::new(TipCache::default());
             loop {
+                // The permit is taken BEFORE accept, deliberately. At the bound
+                // the connections wait in the kernel's backlog and the callers
+                // wait with them, which is backpressure; accepting first and
+                // then queueing would move the flood inside the process, where
+                // it becomes tasks, sockets and work for btxd.
+                let Ok(permit) = inflight.clone().acquire_owned().await else {
+                    return;
+                };
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         let rpc = rpc.clone();
-                        tokio::spawn(serve_one(rpc, stream));
+                        let tip = tip.clone();
+                        tokio::spawn(async move {
+                            serve_one(rpc, tip, stream).await;
+                            drop(permit);
+                        });
                     }
                     // A transient accept error must not kill the server; a
                     // permanent one would spin, so yield between attempts.
                     Err(e) => {
                         eprintln!("[witness] accept failed: {e}");
+                        drop(permit);
                         tokio::time::sleep(Duration::from_millis(200)).await;
                     }
                 }
@@ -277,6 +450,12 @@ impl WitnessServer {
 
     pub fn is_running(&self) -> bool {
         !self.task.is_finished()
+    }
+}
+
+impl Drop for WitnessServer {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -313,6 +492,189 @@ mod tests {
                 other => panic!("a witness must never call {other}"),
             }
         }
+    }
+
+    /// A node that counts what it is asked and how much of it happens at once.
+    struct CountingNode {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        live: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+        delay: Duration,
+    }
+
+    impl CountingNode {
+        fn new(delay: Duration) -> Self {
+            Self {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                delay,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Rpc for CountingNode {
+        async fn call(&self, method: &str, _params: Value) -> AppResult<Value> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.calls.fetch_add(1, SeqCst);
+            let now = self.live.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.live.fetch_sub(1, SeqCst);
+            match method {
+                "getblockchaininfo" => Ok(json!({
+                    "blocks": 211_500,
+                    "headers": 211_500,
+                    "verificationprogress": 1.0,
+                    "initialblockdownload": false,
+                })),
+                "getblockhash" => Ok(json!(format!("{:064x}", 7))),
+                other => panic!("a witness must never call {other}"),
+            }
+        }
+    }
+
+    async fn ask(addr: SocketAddr, request: &str) -> String {
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(request.as_bytes()).await.unwrap();
+        let mut got = String::new();
+        c.read_to_string(&mut got).await.unwrap();
+        got
+    }
+
+    /// The finding this fixes: an unbounded accept loop lets anyone who can
+    /// reach the port drive btxd past `rpcworkqueue`, whereupon the app's own
+    /// poll starts failing and, twenty failures later, reaps the node. A
+    /// witness must never be the reason its node dies.
+    #[tokio::test]
+    async fn a_burst_is_answered_in_full_but_never_hits_the_node_all_at_once() {
+        let node = Arc::new(CountingNode::new(Duration::from_millis(30)));
+        let peak = node.peak.clone();
+        let server = WitnessServer::start(node, "127.0.0.1:0").await.unwrap();
+        let addr = server.addr;
+
+        let mut asks = Vec::new();
+        for _ in 0..40 {
+            asks.push(tokio::spawn(async move {
+                ask(addr, "GET /block-height/7 HTTP/1.1\r\n\r\n").await
+            }));
+        }
+        let mut answered = 0;
+        for a in asks {
+            let got = a.await.unwrap();
+            assert!(got.starts_with("HTTP/1.1 200"), "burst answer was: {got:?}");
+            answered += 1;
+        }
+        assert_eq!(answered, 40, "every request must still be answered");
+        let seen = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            seen <= MAX_INFLIGHT,
+            "{seen} concurrent RPCs reached the node, bound is {MAX_INFLIGHT}"
+        );
+        server.stop();
+    }
+
+    /// The finding this fixes: with the timeout inside the read loop, one byte
+    /// every nine seconds renewed it forever. The deadline is for the whole
+    /// read, so a trickle is cut off.
+    #[tokio::test]
+    async fn a_trickling_client_is_cut_off_by_the_whole_connection_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            // Never a newline, and never idle long enough to trip a per-read
+            // timeout: exactly the shape that used to hold a socket for hours.
+            for _ in 0..40 {
+                if c.write_all(b"G").await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
+        let started = tokio::time::Instant::now();
+        assert_eq!(read_request_line(&mut stream, deadline).await, Err(400));
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "the deadline did not hold: {:?}",
+            started.elapsed()
+        );
+        client.abort();
+    }
+
+    /// The finding this fixes: replying and closing while header bytes sit
+    /// unread sends RST, and an RST can destroy the response the client was
+    /// already sent. Every request here carries a head bigger than one read.
+    #[tokio::test]
+    async fn a_request_with_a_long_head_still_gets_its_whole_response() {
+        let node = Arc::new(StubNode { height: 211_500 });
+        let server = WitnessServer::start(node, "127.0.0.1:0").await.unwrap();
+        let padding = "X-Pad: ".to_string() + &"p".repeat(4000) + "\r\n";
+        let request = format!(
+            "GET /blocks/tip/height HTTP/1.1\r\nHost: x\r\n{padding}Cookie: {}\r\n\r\n",
+            "c".repeat(2000)
+        );
+        for _ in 0..5 {
+            let got = ask(server.addr, &request).await;
+            assert!(got.starts_with("HTTP/1.1 200"), "answer was: {got:?}");
+            assert!(got.ends_with("211500"), "body was lost: {got:?}");
+        }
+        server.stop();
+    }
+
+    /// The tip height is the polled route, so it is answered from a one-second
+    /// memory rather than from the node every time.
+    #[tokio::test]
+    async fn the_tip_height_is_reused_for_a_second_instead_of_asked_again() {
+        let node = Arc::new(CountingNode::new(Duration::ZERO));
+        let calls = node.calls.clone();
+        let server = WitnessServer::start(node, "127.0.0.1:0").await.unwrap();
+        for _ in 0..20 {
+            let got = ask(server.addr, "GET /blocks/tip/height HTTP/1.1\r\n\r\n").await;
+            assert!(got.ends_with("211500"), "answer was: {got:?}");
+        }
+        let n = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            n < 20,
+            "20 tip requests made {n} calls; the cache did nothing"
+        );
+        // Block hashes are never cached: a reorg changes them.
+        let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..3 {
+            ask(server.addr, "GET /block-height/7 HTTP/1.1\r\n\r\n").await;
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) - before,
+            3,
+            "block hashes must be asked for every time"
+        );
+        server.stop();
+    }
+
+    /// The finding this fixes: `WitnessServer`'s doc said dropping it stops it,
+    /// and dropping a JoinHandle detaches rather than cancels. A server left in
+    /// a slot that is overwritten used to keep the port open with no handle
+    /// left to close it.
+    #[tokio::test]
+    async fn dropping_the_server_really_does_free_the_port() {
+        let node = Arc::new(StubNode { height: 1 });
+        let server = WitnessServer::start(node.clone(), "127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = server.addr;
+        drop(server);
+        // The abort has to be observed by the runtime before the port is free.
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if let Ok(again) = WitnessServer::start(node.clone(), &addr.to_string()).await {
+                again.stop();
+                return;
+            }
+        }
+        panic!("{addr} was still held after the server was dropped");
     }
 
     #[test]
@@ -501,6 +863,63 @@ mod tests {
         assert!(r.contains("200 OK"), "the server must survive junk: {r}");
 
         server.stop();
+    }
+
+    #[test]
+    fn a_bind_address_is_an_address_and_a_usable_port() {
+        for good in [
+            "127.0.0.1:3081",
+            "0.0.0.0:3081",
+            "[::1]:3081",
+            "  127.0.0.1:3081  ",
+        ] {
+            assert!(validate_bind(good).is_ok(), "{good} should be accepted");
+        }
+        assert_eq!(
+            validate_bind("  127.0.0.1:3081  ").unwrap(),
+            "127.0.0.1:3081"
+        );
+        for bad in [
+            "",
+            "127.0.0.1", // no port
+            "127.0.0.1:0",
+            "127.0.0.1:99999",
+            "127.0.0.1:http",
+            // A name would be resolved at start and could silently bind
+            // somewhere else later.
+            "esplora-1.easybtx.com:3081",
+            "example.com:3081",
+            "127.0.0.1:3081/x",
+            "127.0.0.1 :3081",
+        ] {
+            assert!(validate_bind(bad).is_err(), "{bad:?} should be refused");
+        }
+        // Privileged ports: this app is not running as root and should say so
+        // rather than failing at bind time with EACCES.
+        let e = validate_bind("0.0.0.0:443").unwrap_err();
+        assert!(e.contains("above 1023"), "{e}");
+    }
+
+    /// `localhost` is a name, and a name is resolved at bind time. Accepting it
+    /// let a resolver decide where this server listened while `is_public_bind`
+    /// went on judging the eight letters it was given — a public bind the UI
+    /// would call private.
+    #[test]
+    fn a_name_is_refused_even_when_the_name_is_localhost() {
+        for name in ["localhost:8080", "localhost:3081", "[localhost]:3081"] {
+            let err = validate_bind(name).unwrap_err();
+            assert!(err.contains("not a name"), "{name} said: {err}");
+        }
+    }
+
+    #[test]
+    fn a_public_bind_is_recognised_as_public() {
+        for local in ["127.0.0.1:3081", "[::1]:3081"] {
+            assert!(!is_public_bind(local), "{local} is loopback");
+        }
+        for public in ["0.0.0.0:3081", "192.168.1.50:3081", "[::]:3081"] {
+            assert!(is_public_bind(public), "{public} accepts from outside");
+        }
     }
 
     #[tokio::test]

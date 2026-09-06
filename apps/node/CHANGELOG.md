@@ -8,10 +8,17 @@ root).
 
 ## [Unreleased]
 
-**Your node can settle a fork for a wallet, whatever its size.** The BTX wallet
-checks whether it is on the right chain by asking an independent source for the
-block hash at a height they both hold. It has had exactly one source for that,
-and it has been stuck since before 4 September, so the check has not run at all.
+## [0.6.20] - 2026-09-06 · linux
+
+**Your node can settle a fork for a wallet, whatever its size.** There is a
+switch for it in Settings: "Help wallets check the chain". It is off until you
+turn it on, it installs nothing, and it works on every node this app can run,
+including a keeper on 10 GB.
+
+**Why it matters.** The BTX wallet checks whether it is on the right chain by
+asking an independent source for the block hash at a height they both hold.
+It has had exactly one source for that, and it has been stuck since before
+4 September, so the check has not run at all.
 Replacing it looked like it needed a full archival node: the whole 124 GB chain,
 a search index on top and a graphics card to build it.
 
@@ -25,6 +32,25 @@ about whether its balances are right, and the source this replaces was wrong
 about balances in exactly that way. Proven on a pruned node on 6 September,
 including block hashes from heights it has not stored a byte of for months.
 `deploy/esplora/install-systemd.sh` installs it, and it is now the default.
+
+The switch answers only from this machine until you change "Who can ask" to
+`0.0.0.0`, and the row says which of those it is doing rather than leaving you
+to work it out. Two honest limits, both on screen: a wallet asks a witness only
+when its address is in the wallet's own built-in list, so turning this on does
+not by itself put your node to work; and it answers block hashes and refuses
+every other question.
+
+**What has not changed: the engine, and how much of the fleet validates for
+itself.** The engine stays v0.34.6 at commit `9eb4e005`, as in 0.6.18 and
+0.6.19. Two device classes validate the MatMul fork independently: NVIDIA
+`sm_120` and Apple M4-class. Every other machine starts, follows, and stalls
+below the fork rather than validating it. That is a property of the engine
+rather than of this release, and it is worth saying beside a witness feature:
+a node that follows reports the chain it was handed, so several witnesses
+following one source are one source wearing several hats. Comparing block
+hashes tells a wallet that two sources agree. It never tells it either is
+right, which is why the wallet asks more than one and why this answers the
+question it can answer instead of the ones it cannot.
 
 **Esplora mode: serve wallets from your own node.** A "Serve wallets
 (Esplora API)" switch in Settings runs electrs and a Caddy front beside btxd,
