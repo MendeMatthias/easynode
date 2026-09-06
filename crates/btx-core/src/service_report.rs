@@ -10,7 +10,7 @@
 //! Written atomically (tmp + rename) so a reader never sees a torn file.
 
 use crate::error::{AppError, AppResult};
-use crate::node_api::ArchivePeerSummary;
+use crate::node_api::{ArchivePeerSummary, TxRelayHealth};
 use crate::watchdog::StallVerdict;
 use serde::Serialize;
 use std::path::Path;
@@ -19,8 +19,8 @@ pub const SERVICE_REPORT_FILE: &str = "service-report.json";
 
 /// Bump when the shape changes so readers can dispatch.
 ///
-/// 2 adds `nickname`.
-pub const SERVICE_REPORT_SCHEMA: u32 = 2;
+/// 2 adds `nickname`. 3 adds `tx_relay`.
+pub const SERVICE_REPORT_SCHEMA: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ServiceReport {
@@ -36,6 +36,15 @@ pub struct ServiceReport {
     pub bytes_sent: Option<u64>,
     /// The trusted-mirror archive-peer summary, when measured.
     pub archive_peers: Option<ArchivePeerSummary>,
+    /// Whether this node is actually exchanging TRANSACTIONS with its peers.
+    ///
+    /// Every other number here can look perfect while this one is `isolated`:
+    /// synced, well connected, serving blocks, and never once receiving a
+    /// transaction. Measured across two independent public BTX nodes on
+    /// 2026-09-06, that was the real state, and nothing anywhere reported it
+    /// because nothing was measuring it. `None` means the peer census did not
+    /// run this tick; `unknown` means it ran and could not yet tell.
+    pub tx_relay: Option<TxRelayHealth>,
     /// The stall discriminator's current verdict, if any.
     pub stall: Option<StallVerdict>,
     /// Whether this node runs as a trusted mirror.
@@ -64,6 +73,7 @@ impl ServiceReport {
             peers: 0,
             bytes_sent: None,
             archive_peers: None,
+            tx_relay: None,
             stall: None,
             trusted_mirror: false,
             serving_attestations: false,
