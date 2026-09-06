@@ -220,6 +220,35 @@ fn prune_value_in_conf(conf: &Path) -> Option<String> {
     found
 }
 
+/// Has this datadir already deleted blocks?
+///
+/// The conf says what the app INTENDED. This says what the folder IS, and on
+/// any datadir that pruned before this app managed it the two disagree.
+///
+/// btxd prunes oldest-first, so a datadir that still holds `blocks/blk00000.dat`
+/// has never pruned — which makes the common case a single stat. Only when that
+/// file is absent do we look for higher-numbered ones, which is what separates
+/// "pruned" from "has not started yet".
+///
+/// Measured on this project's validator 2026-09-06: conf `prune=0`,
+/// `btx_rw.conf` `prune=4096`, `getblockchaininfo` reporting
+/// `pruned: true, pruneheight: 184942`, and `blocks/` holding blk00001,
+/// blk01003 and blk01004 with no blk00000.
+pub fn datadir_has_pruned(datadir: &Path) -> bool {
+    let blocks = datadir.join("blocks");
+    if blocks.join("blk00000.dat").exists() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(&blocks) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with("blk") && name.ends_with(".dat")
+    })
+}
+
 pub fn build_node_command(
     btxd: &Path,
     datadir: &Path,
@@ -297,8 +326,45 @@ pub fn build_node_command(
     // Re-asserting the CONF's OWN value rather than a hardcoded 0 is what keeps
     // the keeper profile working: the conf is the app's intent, and the command
     // line is how the intent survives contact with an old datadir.
-    if let Some(prune) = prune_value_in_conf(conf) {
-        args.push(format!("-prune={prune}"));
+    //
+    // ONE EXCEPTION, added 2026-09-06, and it is the difference between a node
+    // that runs and a node that does not. `prune=0` is not a posture a datadir
+    // can be TALKED into. btxd records that block files were pruned and refuses
+    // to start unpruned against them, with the very string this file already
+    // names PRUNED_DATADIR_REFUSED_MARKER, and it exits during init before RPC
+    // binds. Asserting `prune=0` over a datadir that HAS pruned therefore does
+    // not un-prune it; it stops the node starting, and `launch_failure_hint`
+    // answers that failure with "Remove node data" — a wipe.
+    //
+    // Reproduced against the SHIPPED 0.6.20 engine on a read-only copy of this
+    // project's validator: with `-prune=0` it exits 1 on the refusal; with the
+    // datadir's own target it reaches "init message: Done loading".
+    //
+    // The reachable population is not exotic. `installer.rs` documents that the
+    // legacy python faststart preset used `prune=4096` while this app writes
+    // `prune=0`, so every datadir that pruned under the old preset and then met
+    // the new conf is in exactly this state — and a fleet update is the event
+    // that restarts them all at once.
+    //
+    // A pruned datadir is not a broken one, which is the whole argument of this
+    // release: it holds every block HASH and can settle a fork as well as an
+    // archive can. So start it as what it is and say so on screen
+    // (`datadir_pruned` in the status) rather than refusing it.
+    //
+    // Only `prune=0` is affected. btxd accepts a change from one non-zero
+    // target to another, so the keeper profile goes on asserting its own.
+    match prune_value_in_conf(conf) {
+        Some(prune) if prune == "0" && datadir_has_pruned(datadir) => {
+            // Keep the posture the folder actually has, stated explicitly. Its
+            // own btx_rw.conf is what btxd would fall back to anyway; passing
+            // it keeps the "the command line states the intent" rule intact and
+            // puts the real value in the log instead of a silent fallback.
+            if let Some(kept) = prune_value_in_conf(&datadir.join("btx_rw.conf")) {
+                args.push(format!("-prune={kept}"));
+            }
+        }
+        Some(prune) => args.push(format!("-prune={prune}")),
+        None => {}
     }
     // btxd v0.31.0+ ships its OWN signed source-based auto-updater that, on
     // mainnet, defaults to ON: it polls btx.dev and tries to build + swap itself.
@@ -923,10 +989,12 @@ pub const PRUNED_DATADIR_REFUSED_MARKER: &str = "Block files have previously bee
 pub fn launch_failure_hint(text: &str) -> Option<&'static str> {
     if text.contains(PRUNED_DATADIR_REFUSED_MARKER) {
         return Some(
-            "this node folder still holds blocks from an earlier run that deleted old \
-             blocks to save space, and the node is now set to keep them all, so it \
-             refuses to start. Use Remove node data, then set the node up again from a \
-             snapshot.",
+            "this node folder deleted old blocks in an earlier run, and something asked \
+             it to keep them all, so it refused to start. Since 0.6.20 this app does not \
+             ask that of a folder like this, so check what else did: a prune=0 in the \
+             folder's own btx_rw.conf outranks the app's. Getting every block back means \
+             downloading the whole chain again either way — Remove node data and set up \
+             again from a snapshot is the faster half of that, not a different outcome.",
         );
     }
     if text.contains(MATMUL_CONSENSUS_REFUSED_MARKER) {
@@ -3006,6 +3074,137 @@ consensus-validator service.";
         assert!(!args.iter().any(|a| a.starts_with("-prune=")));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a datadir whose `blocks/` holds exactly these blk indices.
+    fn datadir_with_blk_files(tag: &str, indices: &[u32]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("easynode-prune-{tag}-{}", std::process::id()));
+        let blocks = dir.join("blocks");
+        std::fs::create_dir_all(&blocks).unwrap();
+        for i in indices {
+            std::fs::write(blocks.join(format!("blk{i:05}.dat")), b"x").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn a_datadir_that_has_pruned_is_recognised_without_asking_the_node() {
+        // No datadir at all, and a datadir with no blocks folder: a folder that
+        // has not started has not pruned.
+        assert!(!datadir_has_pruned(Path::new("/definitely/not/here")));
+        let empty = datadir_with_blk_files("empty", &[]);
+        assert!(!datadir_has_pruned(&empty), "no block files is not pruned");
+
+        // The ordinary syncing case: the first file is still there.
+        let fresh = datadir_with_blk_files("fresh", &[0, 1, 2]);
+        assert!(
+            !datadir_has_pruned(&fresh),
+            "blk00000 present is not pruned"
+        );
+
+        // The shape measured on this project's validator on 2026-09-06.
+        let pruned = datadir_with_blk_files("pruned", &[1, 1003, 1004]);
+        assert!(
+            datadir_has_pruned(&pruned),
+            "no blk00000 but higher files is pruned"
+        );
+
+        for d in [empty, fresh, pruned] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// The bug this guards: `-prune=0` over a pruned datadir does not un-prune
+    /// it, it stops btxd starting before RPC binds, and the app then tells the
+    /// user to delete their chain. A fleet update is what restarts every
+    /// affected node at once, so this must hold before one is pushed.
+    #[test]
+    fn prune_zero_is_never_asserted_over_a_datadir_that_has_pruned() {
+        let dd = datadir_with_blk_files("guard", &[1, 1003]);
+        std::fs::write(dd.join("btx_rw.conf"), "prune=4096\n").unwrap();
+        let conf = dd.join("faststart.conf");
+        std::fs::write(&conf, "# prune=0 keeps ALL blocks\nprune=0\n").unwrap();
+
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.6/lin/btxd"),
+            &dd,
+            &conf,
+            Backend::Cuda,
+        );
+        assert!(
+            !args.iter().any(|a| a == "-prune=0"),
+            "asking a pruned folder to keep everything is how it stops starting: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "-prune=4096"),
+            "state the posture the folder actually has, rather than falling back \
+             silently to it: {args:?}"
+        );
+        let _ = std::fs::remove_dir_all(dd);
+    }
+
+    #[test]
+    fn a_pruned_datadir_with_nothing_remembered_is_left_to_the_engine() {
+        // No btx_rw.conf to read a target from. Saying nothing lets btxd use
+        // its own recorded posture, which starts; saying `-prune=0` does not.
+        let dd = datadir_with_blk_files("noremember", &[7]);
+        let conf = dd.join("c.conf");
+        std::fs::write(&conf, "prune=0\n").unwrap();
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.6/lin/btxd"),
+            &dd,
+            &conf,
+            Backend::Cuda,
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("-prune=")),
+            "no target to state means state nothing, never zero: {args:?}"
+        );
+        let _ = std::fs::remove_dir_all(dd);
+    }
+
+    #[test]
+    fn the_keeper_target_is_still_asserted_on_a_pruned_datadir() {
+        // Only prune=0 is refused. Moving one non-zero target to another is
+        // something btxd accepts, and the keeper profile depends on it.
+        let dd = datadir_with_blk_files("keeper", &[1, 1003]);
+        std::fs::write(dd.join("btx_rw.conf"), "prune=4096\n").unwrap();
+        let conf = dd.join("keeper.conf");
+        std::fs::write(&conf, "prune=10000\n").unwrap();
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.6/lin/btxd"),
+            &dd,
+            &conf,
+            Backend::Cuda,
+        );
+        assert!(
+            args.iter().any(|a| a == "-prune=10000"),
+            "the keeper profile still states its own target: {args:?}"
+        );
+        let _ = std::fs::remove_dir_all(dd);
+    }
+
+    /// The 0.6.18 fix must survive this one. On a datadir that has NOT pruned,
+    /// `prune=0` still goes on the command line, because that is what stops a
+    /// remembered `btx_rw.conf` target silently pruning a node whose app says
+    /// it keeps everything.
+    #[test]
+    fn an_unpruned_datadir_still_gets_the_confs_prune_zero() {
+        let dd = datadir_with_blk_files("unpruned", &[0, 1]);
+        std::fs::write(dd.join("btx_rw.conf"), "prune=4096\n").unwrap();
+        let conf = dd.join("faststart.conf");
+        std::fs::write(&conf, "prune=0\n").unwrap();
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.6/lin/btxd"),
+            &dd,
+            &conf,
+            Backend::Cuda,
+        );
+        assert!(
+            args.iter().any(|a| a == "-prune=0"),
+            "a folder that never pruned must still be held to the conf: {args:?}"
+        );
+        let _ = std::fs::remove_dir_all(dd);
     }
 
     #[test]

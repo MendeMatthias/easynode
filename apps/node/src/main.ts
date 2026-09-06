@@ -131,6 +131,8 @@ export interface NodeStatusInfo {
   stall: { class: string; summary: string } | null;
   /** The user's node profile CHOICE ("full" | "keeper"). */
   node_profile: string;
+  /** The folder already deleted blocks, whatever the profile says. */
+  datadir_pruned: boolean;
   /** Whether the bundled engine can honour the keeper profile yet. */
   keeper_engine_ready: boolean;
   /** Esplora mode: serve the Esplora REST API to wallets from this node. */
@@ -1193,6 +1195,14 @@ function reflectKeeperRow(status: NodeStatusInfo) {
   } else if (status.node_profile === "keeper") {
     desc.textContent =
       "Small node (~10 GB) serving signed confirmations. Applies fully at the next node start";
+  } else if (status.datadir_pruned) {
+    // The switch is off, so the row would otherwise offer a small node as if
+    // this were a full one. It is not: the folder deleted old blocks in an
+    // earlier run and cannot be talked out of it — asking it to keep them all
+    // is what used to stop the node starting. Say what it is, and say that the
+    // thing this release is about still works, because it does.
+    desc.textContent =
+      "This folder already deleted old blocks in an earlier run, so it stays small whatever this switch says. Getting every block back means downloading the chain again. It can still help wallets check the chain: that needs the list of blocks, not the blocks";
   } else {
     desc.textContent =
       "Small node (~10 GB) that serves signed confirmations — the network's scarcest service";
