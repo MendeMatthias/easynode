@@ -48,6 +48,11 @@ jobs:
         with:
           workspaces: crates/btx-core
 
+      - name: every workflow run block parses as shell
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 scripts/check-workflow-shell.py
+
       - name: cargo fmt (btx-core)
         working-directory: crates/btx-core
         run: cargo fmt --all --check
