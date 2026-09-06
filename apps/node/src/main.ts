@@ -150,6 +150,9 @@ export interface NodeStatusInfo {
    *  particular prune posture: the server is compiled into this app. */
   witness_enabled: boolean;
   witness_listen: string;
+  /** The address the running server is BOUND to, which is not always the
+   *  saved one: the setting applies at the next node start. */
+  witness_serving_on: string | null;
   witness_running: boolean;
   /** True when the bind address accepts connections from other machines. */
   witness_public: boolean;
@@ -917,6 +920,15 @@ async function refreshEsploraPreflight(): Promise<void> {
 const WITNESS_STATIC_COPY =
   "Answer one question for wallets: which block is at a given height. It is how a wallet checks it is on the right chain, it costs almost nothing, and your node can already do it";
 
+// The two limits the release note promises are on screen. They are properties
+// of the feature, not of the bind address, so they belong in every state the
+// switch is on in — including the loopback default, which is where a user
+// actually lands. The first is the one that stops somebody believing they are
+// now helping the network; the second is the promise this must never quietly
+// grow out of.
+const WITNESS_LIMITS =
+  "A wallet uses a witness only when its address is in the wallet's own built-in list. This answers block hashes and refuses every other question.";
+
 $<HTMLInputElement>("witness-toggle").addEventListener("change", async (e) => {
   const box = e.target as HTMLInputElement;
   const on = box.checked;
@@ -970,9 +982,17 @@ function reflectWitnessRow(status: NodeStatusInfo): void {
   if (!status.witness_enabled) {
     desc.textContent = WITNESS_STATIC_COPY;
   } else if (status.witness_running) {
+    // The address it is BOUND to, never the saved one. Saying "answering on
+    // 127.0.0.1" because that is what was typed, while the live server is on
+    // 0.0.0.0, tells somebody they closed a port they did not close.
+    const on = status.witness_serving_on ?? status.witness_listen;
+    const pending =
+      status.witness_serving_on && status.witness_serving_on !== status.witness_listen
+        ? ` ${status.witness_listen} applies at the next node start`
+        : "";
     desc.textContent = status.witness_public
-      ? `Answering on ${status.witness_listen}. Other machines can ask. A wallet uses a witness only when its address is in the wallet's own built-in list`
-      : `Answering on ${status.witness_listen}, this machine only. Set the address to 0.0.0.0 to let other machines ask`;
+      ? `Answering on ${on}. Other machines can ask.${pending} ${WITNESS_LIMITS}`
+      : `Answering on ${on}, this machine only. Set the address to 0.0.0.0 to let other machines ask.${pending} ${WITNESS_LIMITS}`;
   } else if (status.witness_message) {
     desc.textContent = status.witness_message;
     desc.classList.add("needs-attention");

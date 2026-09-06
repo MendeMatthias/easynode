@@ -1621,6 +1621,19 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                         // btxd so a fresh spawn doesn't lose the datadir-lock
                         // race. Leaving rpc set here made Start a permanent
                         // no-op with the UI stuck on this very error.
+                        // Everything that serves FROM this node has to go
+                        // with it. Without this the witness kept answering
+                        // from an RpcClient holding the dead node's cookie —
+                        // and `answer()` maps an RPC error on /block-height to
+                        // 404, so a wallet read a dead witness as "behind"
+                        // rather than as gone, and its fork check stopped
+                        // silently. The orphan also held the port, so the
+                        // "Press Start" this phase suggests could not rebind.
+                        {
+                            let state = app.state::<AppState>();
+                            stop_witness(&state).await;
+                            stop_esplora(&state).await;
+                        }
                         *rpc_slot.lock().await = None;
                         *node_slot.lock().await = None;
                         let p = NodePhase::Error {
@@ -1923,7 +1936,13 @@ pub struct NodeStatusInfo {
     /// mode this needs no second binary and no particular prune posture, so
     /// `witness_running` is simply whether it is on and the node is up.
     pub witness_enabled: bool,
+    /// The saved setting, which the text input round-trips.
     pub witness_listen: String,
+    /// The address the running server is actually BOUND to, when one is
+    /// running. It can differ from the setting for a whole session, and the
+    /// difference is the one that matters: narrowing the setting back to
+    /// loopback does not close a port that is already open.
+    pub witness_serving_on: Option<String>,
     pub witness_running: bool,
     /// True when the bind address accepts connections from outside this
     /// machine, so the UI can say what the setting actually does.
@@ -2111,7 +2130,20 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         state.esplora_error.lock().await.clone()
     };
 
-    let witness_running = state.witness.lock().await.is_some();
+    // Read the slot once for both facts. `witness_public` is computed from the
+    // BOUND address whenever there is one: reporting it from the saved setting
+    // made the exposure warning switch off the moment somebody saved
+    // 127.0.0.1, while the live server went on answering 0.0.0.0 for the rest
+    // of the session. The Esplora row above already gets this right.
+    let (witness_running, witness_serving_on) = match &*state.witness.lock().await {
+        Some(s) => (true, Some(s.addr.to_string())),
+        None => (false, None),
+    };
+    let witness_public = btx_core::witness::is_public_bind(
+        witness_serving_on
+            .as_deref()
+            .unwrap_or(&settings.witness_listen),
+    );
 
     Ok(NodeStatusInfo {
         running,
@@ -2181,8 +2213,9 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         esplora_serving_on,
         witness_enabled: settings.witness_enabled,
         witness_listen: settings.witness_listen.clone(),
+        witness_serving_on,
         witness_running,
-        witness_public: btx_core::witness::is_public_bind(&settings.witness_listen),
+        witness_public,
         witness_message: if witness_running {
             None
         } else {
@@ -2869,6 +2902,13 @@ fn spawn_esplora_guardian(state: &AppState, datadir: PathBuf) {
 /// this fails are a bind that is refused and a node that is not up.
 async fn start_witness(state: &AppState, datadir: &Path) -> Result<(), String> {
     let listen = NodeAppSettings::load(datadir).witness_listen;
+    // A server already in the slot is stopped before we bind, never
+    // overwritten. Overwriting leaked a listener that still held its port —
+    // so the bind below would fail with "address already in use" while the
+    // abandoned server went on answering the network from a stale RPC client.
+    if let Some(old) = state.witness.lock().await.take() {
+        old.stop();
+    }
     let Some(rpc) = state.rpc.lock().await.clone() else {
         let msg = "the node is not running yet".to_string();
         *state.witness_error.lock().await = Some(msg.clone());
@@ -2924,15 +2964,29 @@ pub async fn set_witness(state: State<'_, AppState>, on: bool) -> Result<String,
     }
     start_witness(&state, &datadir).await?;
     let listen = NodeAppSettings::load(&datadir).witness_listen;
-    Ok(if btx_core::witness::is_public_bind(&listen) {
+    Ok(witness_started_message(&listen))
+}
+
+/// What the user reads the moment they turn on this release's headline switch.
+///
+/// A function, not two literals inline, because it is the one string in the
+/// feature nothing else would ever look at: the first version of it shipped
+/// with fourteen-space runs mid-sentence, from source lines wrapped without
+/// continuations. It reads as a broken build, and the loopback branch is the
+/// default, so it would have been the common case.
+fn witness_started_message(listen: &str) -> String {
+    if btx_core::witness::is_public_bind(listen) {
         format!(
-            "Serving block hashes on {listen}. Other machines can reach it.              A wallet only uses a witness whose address is in its own built-in              list, so this helps once that name points here."
+            "Serving block hashes on {listen}. Other machines can reach it. \
+             A wallet only uses a witness whose address is in its own built-in \
+             list, so this helps once that name points here."
         )
     } else {
         format!(
-            "Serving block hashes on {listen}, this machine only. Change the              address to 0.0.0.0 to let other machines ask."
+            "Serving block hashes on {listen}, this machine only. Change the \
+             address to 0.0.0.0 to let other machines ask."
         )
-    })
+    }
 }
 
 /// Settings: where the witness binds. Applies at the next start.
@@ -3187,6 +3241,25 @@ pub async fn node_footprint(state: State<'_, AppState>) -> Result<NodeFootprint,
 
 #[cfg(test)]
 mod tests {
+    use super::witness_started_message;
+
+    /// Wrapping a Rust string literal across source lines WITHOUT a trailing
+    /// `\\` keeps every space of the indentation. That is how this message
+    /// first shipped, and no test, type or lint sees it — only a user does.
+    #[test]
+    fn the_witness_message_reads_as_one_sentence_not_as_a_broken_build() {
+        for listen in ["127.0.0.1:3081", "0.0.0.0:3081"] {
+            let m = witness_started_message(listen);
+            assert!(!m.contains("  "), "a run of spaces in: {m:?}");
+            assert!(!m.contains('\n'), "a newline in: {m:?}");
+            assert!(m.contains(listen), "the address is missing from: {m:?}");
+        }
+        // The public one has to say the limit that stops somebody believing
+        // turning this on is by itself enough to help.
+        assert!(witness_started_message("0.0.0.0:3081").contains("built-in list"));
+        // The loopback one has to say how to change it, since it is the default.
+        assert!(witness_started_message("127.0.0.1:3081").contains("0.0.0.0"));
+    }
     use super::{pre_launch_plan, PreLaunchPlan, NODE_RELEASE_TAG};
     use btx_core::node::DatadirHolder;
 

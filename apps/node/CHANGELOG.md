@@ -16,8 +16,9 @@ turn it on, it installs nothing, and it works on every node this app can run,
 including a keeper on 10 GB.
 
 **Why it matters.** The BTX wallet checks whether it is on the right chain by
-asking an independent source for the block hash at a height they both hold. It has had exactly one source for that,
-and it has been stuck since before 4 September, so the check has not run at all.
+asking an independent source for the block hash at a height they both hold.
+It has had exactly one source for that, and it has been stuck since before
+4 September, so the check has not run at all.
 Replacing it looked like it needed a full archival node: the whole 124 GB chain,
 a search index on top and a graphics card to build it.
 
@@ -37,8 +38,7 @@ The switch answers only from this machine until you change "Who can ask" to
 to work it out. Two honest limits, both on screen: a wallet asks a witness only
 when its address is in the wallet's own built-in list, so turning this on does
 not by itself put your node to work; and it answers block hashes and refuses
-every other question, because a node offering to settle forks has said nothing
-about whether its balances are right.
+every other question.
 
 **Esplora mode: serve wallets from your own node.** A "Serve wallets
 (Esplora API)" switch in Settings runs electrs and a Caddy front beside btxd,
