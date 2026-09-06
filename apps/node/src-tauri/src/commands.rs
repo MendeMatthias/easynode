@@ -1904,6 +1904,11 @@ pub struct NodeStatusInfo {
     pub esplora_enabled: bool,
     pub esplora_listen: String,
     pub esplora_running: bool,
+    /// Both sidecars are alive but the endpoint is not answering yet, which on
+    /// a first run means electrs is building its index. That takes hours on a
+    /// full chain, and it is not an error — the alternative is telling an
+    /// operator their working node "did not answer" for an afternoon.
+    pub esplora_indexing: bool,
     pub esplora_freshness: Option<String>,
     pub esplora_message: Option<String>,
 }
@@ -2066,7 +2071,22 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         .map(|s| s.health().all_up())
         .unwrap_or(false);
     let esplora_verdict = state.esplora_verdict.lock().await.clone();
-    let esplora_message = if esplora_running {
+    // electrs binds its HTTP port only once the initial index is built, so
+    // "running, and no tip yet" is the signature of a first index rather than
+    // of a fault. Only the app can tell those apart: it spawned the processes
+    // and knows they are alive.
+    let esplora_indexing = esplora_running
+        && esplora_verdict
+            .as_ref()
+            .is_some_and(|v| v.served_tip.is_none());
+    let esplora_message = if esplora_indexing {
+        Some(
+            "electrs is building its index. On a full chain the first run takes hours; \
+             the node keeps working throughout, and the log is in the esplora folder \
+             inside your data folder."
+                .to_string(),
+        )
+    } else if esplora_running {
         esplora_verdict.as_ref().map(|v| v.reason.clone())
     } else {
         state.esplora_error.lock().await.clone()
@@ -2138,6 +2158,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         esplora_enabled: settings.esplora_enabled,
         esplora_listen: settings.esplora_listen.clone(),
         esplora_running,
+        esplora_indexing,
         esplora_freshness: esplora_verdict.map(|v| v.freshness.as_str().to_string()),
         esplora_message,
     })

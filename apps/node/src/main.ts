@@ -137,6 +137,8 @@ export interface NodeStatusInfo {
   esplora_enabled: boolean;
   esplora_listen: string;
   esplora_running: boolean;
+  /** Both sidecars alive, no tip yet: a first index, which takes hours. */
+  esplora_indexing: boolean;
   /** fresh | stale | unverified from the census guardian; null until judged. */
   esplora_freshness: string | null;
   /** The guardian's reason while running, else why the front is not. */
@@ -899,6 +901,10 @@ function reflectEsploraRow(status: NodeStatusInfo): void {
   desc.classList.remove("needs-attention");
   if (!status.esplora_enabled) {
     desc.textContent = ESPLORA_STATIC_COPY;
+  } else if (status.esplora_indexing) {
+    // Work in progress, NOT a problem: no amber. A first index on a full chain
+    // runs for hours and the node serves the network the whole time.
+    desc.textContent = status.esplora_message ?? "electrs is building its index.";
   } else if (status.esplora_running) {
     const fresh = status.esplora_freshness ?? "not judged yet";
     desc.textContent =
