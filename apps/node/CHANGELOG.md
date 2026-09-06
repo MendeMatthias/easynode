@@ -61,7 +61,45 @@ app's. Both now run against local stubs in CI, and the acceptance gate refuses
 to compare an endpoint with itself, which had produced a pass that meant
 nothing.
 
-## [0.6.19] - 2026-09-06 · linux
+## [0.6.19] - 2026-09-06 · linux, mac
+
+**The Mac build ships, from the same tree and the same engine commit.**
+Linux 0.6.19 went live on 5 September at 22:49Z and Macs were offered nothing
+after it, on an engine that parks a deep reorganisation. The Mac build is that
+same release: BTX 0.34.6 at commit `9eb4e005`, built from a pristine worktree
+on an Apple M5 (`BUILD_GIT_DIRTY 0`, source fingerprint
+`a7bf4bd74375b2690eda5a3b13c800e52e2f853ec53983c8f27ac06b2094236b`, the value
+the Linux engine was built from), passing upstream's own
+`scripts/release/verify_release_btxd.py` and carrying no Homebrew load
+commands. It replaces the v0.34.5 engine that 0.6.17 shipped.
+
+Two things were measured on that Mac rather than assumed, and both correct
+notes this repository carried. An Apple M5 is **not** refused by the 0.34.6
+engine in consensus mode: the startup canary reports
+`admission=self_qualification`, `cpu_fallbacks=0` and `ready=1`, the node
+advertises `MATMUL_CONSENSUS`, and `getmatmultrustedstatus` reads
+`matmul_validation_mode consensus`, `trusted_mirror false`. So the app passes
+no `-matmulvalidation` and no `-allowsinglekeytrustedmirror=1` on a Mac, the
+sticky `.matmul-consensus-refused` marker is never written, and the
+trusted-mirror path this changelog once said an M5 would take is not the path
+an M5 takes on a 0.34.5-or-newer engine. And `scripts/node-observer.sh` runs
+on macOS: its only Linux assumption is the default `BTX_CLI` path, and the one
+`ss` call sits in a branch that only runs when btxd is already gone. Set
+`BTX_CLI` and the release gate works on a Mac like anywhere else.
+
+The fresh-install path and the upgrade path were both walked on that Mac.
+A genuinely empty datadir completed setup in seven seconds (snapshot
+downloaded and SHA verified, engine provisioned, RPC up), which is the trap
+the release recipe names. The real 0.6.17 datadir, untouched since
+2 September, took the upgrade: the app provisioned v0.34.6 and launched it
+with `-parkdeepreorg=0` and both live-chain seeds on the command line, and the
+node's header chain then contained luckypool.io's own published block hashes
+for heights 211,410 and 211,421, with every headers-only branch in
+`getchaintips` forking at exactly its active tip. That is the shape of a node
+that is behind rather than forked, which is why the fork card stayed dark:
+`btx_core::fork` treats a branch that extends our own tip as lag, not a fork.
+It was 4,853 blocks behind at 00:15Z on 6 September, catching up at roughly
+two blocks a minute, and it was not at the tip when this shipped.
 
 **The node follows the chain with the most work again.** Since 0.6.7 the
 shipped conf parked any reorganisation deeper than six blocks

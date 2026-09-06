@@ -474,6 +474,131 @@ Also expect:
 - `-matmulvalidation=relay` is new: ADDR-only discovery, no attestation serving.
   A candidate Keeper profile for Macs that cannot validate.
 
+## Building the Mac engine on a Mac with no Homebrew
+
+Added 2026-09-06, cutting the Mac half of 0.6.19 on an Apple M5 that has never
+had Homebrew. The tree builds, but three of its macOS-only branches assume a
+Homebrew prefix and are **fatal**, not advisory, so a clean Mac fails
+configure three times in a row with three different messages. All three are
+satisfied from OUTSIDE the source tree, which matters: the worktree must stay
+pristine or `BUILD_GIT_DIRTY` flips to 1 and the source fingerprint the
+production canary prints stops matching the tree the goldens came from.
+
+Work in a detached worktree at the pin, never in a checkout you edit:
+
+```bash
+git -C <btx-clone> worktree add --detach ~/btx-ship <NODE_RELEASE_COMMIT>
+```
+
+**1. libevent, sqlite and zeromq.** Build them from the tree's own `depends/`
+rather than looking for kegs:
+
+```bash
+ln -s "$(xcrun --show-sdk-path)" \
+  ~/btx-ship/depends/SDKs/Xcode-15.0-15A240d-extracted-SDK-with-libcxx-headers
+make -C ~/btx-ship/depends -j10 HOST=arm64-apple-darwin NO_QT=1 NO_BDB=1 NO_UPNP=1 NO_USDT=1
+```
+
+`depends/SDKs/` and `depends/{built,work,sources,arm64-apple-darwin}` are all
+in `depends/.gitignore`, so this leaves the tree clean. The SDK symlink is
+needed because `hosts/darwin.mk` hardcodes an extracted-SDK path; pointing it
+at Xcode's own SDK works.
+
+That is not enough on its own, because `cmake/module/FindZeroMQ.cmake` and
+`cmake/module/FindLibevent.cmake` only ever LOOK in `/opt/homebrew` and
+`/usr/local` on macOS, and both `message(FATAL_ERROR)` otherwise. Feed them the
+depends archives through two files kept outside the tree: a
+`-DCMAKE_PROJECT_INCLUDE` script that imports `depends/.../libzmq.a` as the
+`zeromq` target (guard it with `if(TARGET zeromq) return() endif()` — the
+project-include runs again for every sub-`project()`, secp256k1 and
+libbitcoinpqc included), and a `FindLibevent.cmake` override reached by
+`list(PREPEND CMAKE_MODULE_PATH ...)`. Keep the same target names, the same
+static linkage and the same `LIBEVENT_LINKAGE`/`ZMQ_LINKAGE` markers: the top
+level `CMakeLists.txt` fails the build if either resolves shared.
+
+**2. The OpenMP runtime, which needs a different compiler.**
+`src/CMakeLists.txt` takes a hard AppleClang branch that reads `libomp.a`
+from a Homebrew path and cannot be redirected: `BTX_APPLE_LIBOMP_LIBRARY` is
+plainly `set()` and then filled from two absolute paths, so `-D` does not
+survive, and `/opt` is root owned. Any OTHER Clang falls through to
+`find_package(OpenMP)` instead, which IS steerable. So build with the official
+LLVM macOS release and a static libomp from the SAME LLVM source:
+
+```bash
+# libomp.a from llvm-project-<ver>.src.tar.xz, openmp/ subdirectory:
+cmake -S <src>/openmp -B build-omp -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DLIBOMP_ENABLE_SHARED=OFF -DOPENMP_STANDALONE_BUILD=ON \
+  -DOPENMP_ENABLE_LIBOMPTARGET=OFF -DLIBOMP_OMPT_SUPPORT=OFF \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+  -DCMAKE_INSTALL_PREFIX=<prefix>
+```
+
+then configure the engine with
+`-DOpenMP_CXX_FLAGS=-fopenmp -DOpenMP_CXX_LIB_NAMES=omp -DOpenMP_omp_LIBRARY=<prefix>/lib/libomp.a`
+(and the C pair). Static, so nothing reaches for a keg at runtime.
+
+🔴 **3. The trap that only appears at LINK time.** A newer LLVM ships newer
+libc++ HEADERS, and the runtime is always the system `/usr/lib/libc++.1.dylib`.
+LLVM 22's `<atomic>` inlines calls to `std::__atomic_monitor_global`,
+`__atomic_wait_global_table` and `__atomic_notify_one_global_table`, which the
+macOS 26 runtime does not export, and `coins.cpp.o` then fails to link with
+exactly three undefined symbols after a full compile. Compile against the SDK's
+own libc++ headers instead:
+
+```
+-nostdinc++ -isystem "$(xcrun --show-sdk-path)/usr/include/c++/v1"
+```
+
+in both `CMAKE_CXX_FLAGS` and `CMAKE_OBJCXX_FLAGS`. This is the same trick the
+depends toolchain already uses for its own packages
+(`-nostdlibinc -iwithsysroot/usr/include/c++/v1`). A one-file probe that calls
+`std::atomic_flag::notify_one()` reproduces the failure in a second and is
+worth running before a 10-minute build.
+
+**Then the usual flags**, with `BTX_MATMUL_METAL_PRECOMPILE_KERNELS=OFF` and
+`WITH_ZMQ=ON`, and check three things before staging:
+
+```bash
+grep BUILD_GIT_ build/src/bitcoin-build-info.h   # DIRTY 0, and the fingerprint
+git -C ~/btx-ship status --short                 # must print nothing
+python3 scripts/release/verify_release_btxd.py build/bin/btxd build/bin/btx-cli
+```
+
+The fingerprint must equal the one the Linux engine was built from; it is the
+same tree, so it will, and if it does not, something edited the worktree.
+`verify_release_btxd.py` is upstream's own gate and it checks what `otool -L`
+alone cannot: that ZMQ is really compiled in, that libzmq is static, that no
+`/opt/homebrew` load command survived, and that the binary actually launches.
+
+## The observer runs on macOS
+
+The same day, and it corrects a note that said otherwise. `scripts/node-observer.sh`
+was read as Linux-only because it calls `ss` and `pgrep -x`. `pgrep -x` is BSD
+too, and the single `ss` call is inside the branch that only runs once btxd is
+already missing from the process table, where its empty output means "nothing
+is listening", which is the safe reading. The one real Linux assumption is the
+default `BTX_CLI` path. So on a Mac:
+
+```bash
+BTX_CLI=$HOME/.local/btx/<tag>/macos-arm64/bin/btx-cli \
+  BTX_INTERVAL=60 bash scripts/node-observer.sh
+```
+
+and `scripts/observer-ok.sh` gates the release there exactly as it does on the
+Linux box. Prefer that over `OBSERVER_OVERRIDE=1`, which should stay what it
+says it is: for the day the observer is what is broken.
+
+⚠ One difference worth knowing before you trust a green row. The observer's
+FORK rule and the app's `btx_core::fork` do NOT agree on a node that is merely
+behind. The observer writes `FORK` after `BTX_FORK_ROWS` samples with
+`headers - blocks` over `BTX_FORK_BEHIND`, whatever the gap is doing;
+`btx_core::fork` does not, because it discards any headers-only branch whose
+fork point is at or past the active tip (that branch extends our own chain, so
+it is lag) and it requires the gap to have stopped closing. A Mac catching up
+after days offline will therefore trip the observer and leave the app's fork
+card dark, and the app is the one that is right. Read the row, do not just take
+its colour.
+
 ## The box's own node must be on the chain it claims
 
 Added 2026-09-05, the day 0.6.18 was cut from a validator that had been
