@@ -67,6 +67,55 @@ use tokio::net::{TcpListener, TcpStream};
 /// of it owns TLS, CORS and rate limiting, exactly as it does for electrs.
 pub const WITNESS_ADDR: &str = "127.0.0.1:3081";
 
+/// Whether a bind address accepts connections from outside this machine.
+/// The UI needs this to say what a setting actually does, rather than leaving
+/// an operator to work out what 0.0.0.0 means.
+pub fn is_public_bind(addr: &str) -> bool {
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    !(host == "127.0.0.1" || host == "localhost" || host == "::1")
+}
+
+/// A bind address the witness server will accept: `host:port`, where host is
+/// an IPv4 literal, a bracketed IPv6 literal, or `localhost`.
+///
+/// Deliberately NOT a hostname: this is a local bind, and a name here would be
+/// resolved at start and silently bind somewhere else if DNS changed. Returns
+/// the trimmed value.
+pub fn validate_bind(s: &str) -> Result<String, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err("the address is empty".into());
+    }
+    if t.chars()
+        .any(|c| c.is_whitespace() || c == '/' || c == '\\')
+    {
+        return Err("an address is host:port, with no path".into());
+    }
+    let (host, port) = t
+        .rsplit_once(':')
+        .ok_or_else(|| "an address needs a port, like 127.0.0.1:3081".to_string())?;
+    match port.parse::<u16>() {
+        Ok(0) | Err(_) => return Err(format!("'{port}' is not a port")),
+        Ok(p) if p < 1024 => {
+            return Err(format!(
+                "port {p} needs privileges this app does not have; pick one above 1023"
+            ))
+        }
+        Ok(_) => {}
+    }
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let ok = bare == "localhost"
+        || bare.parse::<std::net::Ipv4Addr>().is_ok()
+        || bare.parse::<std::net::Ipv6Addr>().is_ok();
+    if !ok {
+        return Err(format!(
+            "'{bare}' must be an address like 127.0.0.1 or 0.0.0.0, not a name"
+        ));
+    }
+    Ok(t.to_string())
+}
+
 /// The largest request head this will read. A witness request is about sixty
 /// bytes; anything approaching this is not one, and reading unboundedly from a
 /// socket is how a trivial server becomes a memory bug.
@@ -501,6 +550,52 @@ mod tests {
         assert!(r.contains("200 OK"), "the server must survive junk: {r}");
 
         server.stop();
+    }
+
+    #[test]
+    fn a_bind_address_is_an_address_and_a_usable_port() {
+        for good in [
+            "127.0.0.1:3081",
+            "0.0.0.0:3081",
+            "localhost:8080",
+            "[::1]:3081",
+            "  127.0.0.1:3081  ",
+        ] {
+            assert!(validate_bind(good).is_ok(), "{good} should be accepted");
+        }
+        assert_eq!(
+            validate_bind("  127.0.0.1:3081  ").unwrap(),
+            "127.0.0.1:3081"
+        );
+        for bad in [
+            "",
+            "127.0.0.1", // no port
+            "127.0.0.1:0",
+            "127.0.0.1:99999",
+            "127.0.0.1:http",
+            // A name would be resolved at start and could silently bind
+            // somewhere else later.
+            "esplora-1.easybtx.com:3081",
+            "example.com:3081",
+            "127.0.0.1:3081/x",
+            "127.0.0.1 :3081",
+        ] {
+            assert!(validate_bind(bad).is_err(), "{bad:?} should be refused");
+        }
+        // Privileged ports: this app is not running as root and should say so
+        // rather than failing at bind time with EACCES.
+        let e = validate_bind("0.0.0.0:443").unwrap_err();
+        assert!(e.contains("above 1023"), "{e}");
+    }
+
+    #[test]
+    fn a_public_bind_is_recognised_as_public() {
+        for local in ["127.0.0.1:3081", "localhost:3081", "[::1]:3081"] {
+            assert!(!is_public_bind(local), "{local} is loopback");
+        }
+        for public in ["0.0.0.0:3081", "192.168.1.50:3081", "[::]:3081"] {
+            assert!(is_public_bind(public), "{public} accepts from outside");
+        }
     }
 
     #[tokio::test]

@@ -47,6 +47,8 @@ pub fn run() {
             commands::esplora_preflight,
             commands::set_esplora,
             commands::set_esplora_listen,
+            commands::set_witness,
+            commands::set_witness_listen,
             ask::ask_chain_progress,
             ask::ask_supply,
             ask::ask_next_halving,

@@ -146,6 +146,14 @@ export interface NodeStatusInfo {
   esplora_freshness: string | null;
   /** The guardian's reason while running, else why the front is not. */
   esplora_message: string | null;
+  /** Answer block-hash questions for wallets. Needs no second binary and no
+   *  particular prune posture: the server is compiled into this app. */
+  witness_enabled: boolean;
+  witness_listen: string;
+  witness_running: boolean;
+  /** True when the bind address accepts connections from other machines. */
+  witness_public: boolean;
+  witness_message: string | null;
 }
 
 /**
@@ -506,6 +514,7 @@ function renderStatus(status: NodeStatusInfo) {
   reflectPeerNames(status);
   reflectFork(status);
   reflectEsploraRow(status);
+  reflectWitnessRow(status);
 
   const mode = visualMode(p, status.rc_stalled);
   orb.className = `status-orb is-${mode}`;
@@ -762,6 +771,7 @@ $("settings-btn").addEventListener("click", async () => {
     reflectOnClose(lastStatus.on_close);
     reflectKeeperRow(lastStatus);
     reflectEsploraRow(lastStatus);
+    reflectWitnessRow(lastStatus);
   }
   // The preflight is a question about the machine, so it is asked when the
   // panel opens rather than on the status poll: it reads the conf, the node
@@ -898,6 +908,83 @@ async function refreshEsploraPreflight(): Promise<void> {
   for (const w of p.warnings) lines.push(w);
   el.textContent = lines.join(" ");
   el.hidden = lines.length === 0;
+}
+
+// Answering block-hash questions is cheap and needs nothing installed, so the
+// copy here is about what it does for the network rather than about disk. It
+// also has to be honest that switching it on does not by itself make wallets
+// use this node: a wallet only asks addresses in its own built-in list.
+const WITNESS_STATIC_COPY =
+  "Answer one question for wallets: which block is at a given height. It is how a wallet checks it is on the right chain, it costs almost nothing, and your node can already do it";
+
+$<HTMLInputElement>("witness-toggle").addEventListener("change", async (e) => {
+  const box = e.target as HTMLInputElement;
+  const on = box.checked;
+  const result = $("witness-result");
+  box.disabled = true;
+  try {
+    const msg = await invoke<string>("set_witness", { on });
+    result.classList.remove("is-error");
+    result.textContent = msg;
+  } catch (err) {
+    box.checked = !on;
+    result.classList.add("is-error");
+    result.textContent = String(err);
+  }
+  result.hidden = false;
+  box.disabled = false;
+});
+
+async function saveWitnessListen(): Promise<void> {
+  const input = $<HTMLInputElement>("witness-listen");
+  const result = $("witness-result");
+  try {
+    const msg = await invoke<string>("set_witness_listen", { listen: input.value });
+    result.classList.remove("is-error");
+    result.textContent = msg;
+  } catch (err) {
+    result.classList.add("is-error");
+    result.textContent = String(err);
+  }
+  result.hidden = false;
+}
+$("witness-listen-save").addEventListener("click", () => void saveWitnessListen());
+$("witness-listen").addEventListener("keydown", (e) => {
+  if ((e as KeyboardEvent).key === "Enter") void saveWitnessListen();
+});
+
+/**
+ * The witness row. Three things it must not do: claim to be helping when it is
+ * only reachable from this machine, claim wallets are using it (they only ask
+ * addresses in their own built-in list), and colour a stopped node as a
+ * problem.
+ */
+function reflectWitnessRow(status: NodeStatusInfo): void {
+  const t = $<HTMLInputElement>("witness-toggle");
+  if (document.activeElement !== t) t.checked = status.witness_enabled;
+  const input = $<HTMLInputElement>("witness-listen");
+  if (document.activeElement !== input) input.value = status.witness_listen;
+
+  const desc = $("witness-desc");
+  desc.classList.remove("needs-attention");
+  if (!status.witness_enabled) {
+    desc.textContent = WITNESS_STATIC_COPY;
+  } else if (status.witness_running) {
+    desc.textContent = status.witness_public
+      ? `Answering on ${status.witness_listen}. Other machines can ask. A wallet uses a witness only when its address is in the wallet's own built-in list`
+      : `Answering on ${status.witness_listen}, this machine only. Set the address to 0.0.0.0 to let other machines ask`;
+  } else if (status.witness_message) {
+    desc.textContent = status.witness_message;
+    desc.classList.add("needs-attention");
+  } else {
+    desc.textContent = "Saved — it starts with the node";
+  }
+
+  const listenDesc = $("witness-listen-desc");
+  listenDesc.classList.toggle("needs-attention", status.witness_enabled && status.witness_public);
+  listenDesc.textContent = status.witness_public
+    ? "Any machine that can reach this address can ask. Nothing about your wallet or your coins is exposed: it answers block hashes and refuses everything else"
+    : "This machine only, unless you change it. Use 0.0.0.0 to let other machines ask. Applies at the next node start";
 }
 
 const ESPLORA_STATIC_COPY =

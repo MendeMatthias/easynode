@@ -978,6 +978,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     // Re-gated against the LIVE node, and any refusal is recorded for the
     // Settings row rather than logged away.
     maybe_start_esplora(state, &datadir).await;
+    maybe_start_witness(state, &datadir).await;
     Ok(())
 }
 
@@ -1641,6 +1642,7 @@ pub async fn stop_node_inner(state: &AppState) {
     // Kill the refresher first so it can't overwrite the Stopped phase.
     state.refresher_gen.fetch_add(1, Ordering::SeqCst);
     stop_esplora(state).await;
+    stop_witness(state).await;
     let launch = state.launch.lock().await.clone();
     {
         let mut guard = state.node.lock().await;
@@ -1917,6 +1919,17 @@ pub struct NodeStatusInfo {
     pub esplora_indexing: bool,
     pub esplora_freshness: Option<String>,
     pub esplora_message: Option<String>,
+    /// Serve the two routes a wallet needs to settle a fork. Unlike Esplora
+    /// mode this needs no second binary and no particular prune posture, so
+    /// `witness_running` is simply whether it is on and the node is up.
+    pub witness_enabled: bool,
+    pub witness_listen: String,
+    pub witness_running: bool,
+    /// True when the bind address accepts connections from outside this
+    /// machine, so the UI can say what the setting actually does.
+    pub witness_public: bool,
+    /// Why it is not running when it is on. `None` otherwise.
+    pub witness_message: Option<String>,
 }
 
 #[tauri::command]
@@ -2098,6 +2111,8 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         state.esplora_error.lock().await.clone()
     };
 
+    let witness_running = state.witness.lock().await.is_some();
+
     Ok(NodeStatusInfo {
         running,
         phase,
@@ -2164,6 +2179,15 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         esplora_enabled: settings.esplora_enabled,
         esplora_listen: settings.esplora_listen.clone(),
         esplora_serving_on,
+        witness_enabled: settings.witness_enabled,
+        witness_listen: settings.witness_listen.clone(),
+        witness_running,
+        witness_public: btx_core::witness::is_public_bind(&settings.witness_listen),
+        witness_message: if witness_running {
+            None
+        } else {
+            state.witness_error.lock().await.clone()
+        },
         esplora_running,
         esplora_indexing,
         esplora_freshness: esplora_verdict.map(|v| v.freshness.as_str().to_string()),
@@ -2827,6 +2851,105 @@ fn spawn_esplora_guardian(state: &AppState, datadir: PathBuf) {
             .await;
         }
     });
+}
+
+// ── The fork witness ─────────────────────────────────────────────────────────
+//
+// A wallet settles a fork by comparing the block hash at a height two sources
+// both hold, which is two read-only routes. Esplora mode answers them too and
+// needs electrs, a prune=0 datadir and the whole 124 GiB chain — all of which
+// exist for the ADDRESS index, which a witness is never asked about.
+//
+// Pruning discards block DATA, not the block INDEX, so this runs on any node.
+// The server is compiled into this app (btx_core::witness), so turning it on
+// installs nothing and downloads nothing: a keeper on 10 GB can settle forks
+// as well as an archive can.
+
+/// Start the witness for a running node. Any node qualifies, so the only ways
+/// this fails are a bind that is refused and a node that is not up.
+async fn start_witness(state: &AppState, datadir: &Path) -> Result<(), String> {
+    let listen = NodeAppSettings::load(datadir).witness_listen;
+    let Some(rpc) = state.rpc.lock().await.clone() else {
+        let msg = "the node is not running yet".to_string();
+        *state.witness_error.lock().await = Some(msg.clone());
+        return Err(msg);
+    };
+    match btx_core::witness::WitnessServer::start(Arc::new(rpc), &listen).await {
+        Ok(server) => {
+            eprintln!("[witness] serving block hashes on {}", server.addr);
+            *state.witness_error.lock().await = None;
+            *state.witness.lock().await = Some(server);
+            Ok(())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            *state.witness_error.lock().await = Some(msg.clone());
+            Err(msg)
+        }
+    }
+}
+
+async fn maybe_start_witness(state: &AppState, datadir: &Path) {
+    if !NodeAppSettings::load(datadir).witness_enabled {
+        return;
+    }
+    if let Err(e) = start_witness(state, datadir).await {
+        eprintln!("[witness] not starting: {e}");
+    }
+}
+
+async fn stop_witness(state: &AppState) {
+    // Taken out of the slot before stopping, so the status poll — which locks
+    // this same slot every tick — is never blocked by a stop.
+    let server = { state.witness.lock().await.take() };
+    if let Some(s) = server {
+        s.stop();
+        eprintln!("[witness] stopped");
+    }
+}
+
+/// Settings: serve as a fork witness.
+#[tauri::command]
+pub async fn set_witness(state: State<'_, AppState>, on: bool) -> Result<String, String> {
+    let datadir = node_datadir();
+    if !on {
+        NodeAppSettings::update(&datadir, |s| s.witness_enabled = false);
+        stop_witness(&state).await;
+        *state.witness_error.lock().await = None;
+        return Ok("Off. This node no longer answers block-hash questions.".to_string());
+    }
+    NodeAppSettings::update(&datadir, |s| s.witness_enabled = true);
+    if state.rpc.lock().await.is_none() {
+        return Ok("Saved. It starts with the node.".to_string());
+    }
+    start_witness(&state, &datadir).await?;
+    let listen = NodeAppSettings::load(&datadir).witness_listen;
+    Ok(if btx_core::witness::is_public_bind(&listen) {
+        format!(
+            "Serving block hashes on {listen}. Other machines can reach it.              A wallet only uses a witness whose address is in its own built-in              list, so this helps once that name points here."
+        )
+    } else {
+        format!(
+            "Serving block hashes on {listen}, this machine only. Change the              address to 0.0.0.0 to let other machines ask."
+        )
+    })
+}
+
+/// Settings: where the witness binds. Applies at the next start.
+#[tauri::command]
+pub async fn set_witness_listen(
+    state: State<'_, AppState>,
+    listen: String,
+) -> Result<String, String> {
+    let listen = btx_core::witness::validate_bind(&listen)?;
+    NodeAppSettings::update(&node_datadir(), |s| s.witness_listen = listen.clone());
+    let running = state.witness.lock().await.is_some();
+    let public = btx_core::witness::is_public_bind(&listen);
+    Ok(match (running, public) {
+        (true, _) => format!("Saved. It moves to {listen} the next time the node starts."),
+        (false, true) => format!("Saved: {listen}, which other machines can reach."),
+        (false, false) => format!("Saved: {listen}, this machine only."),
+    })
 }
 
 #[tauri::command]

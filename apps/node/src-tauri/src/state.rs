@@ -128,6 +128,18 @@ pub struct NodeAppSettings {
     /// gives it a hostname, which gets automatic HTTPS.
     #[serde(default = "default_esplora_listen")]
     pub esplora_listen: String,
+    /// Serve the two routes a wallet needs to settle a fork
+    /// (`btx_core::witness`). Off by default, and unlike Esplora mode it needs
+    /// no second binary and no particular prune posture: the server is
+    /// compiled into this app and reads block hashes from the node's index,
+    /// which every node has.
+    #[serde(default)]
+    pub witness_enabled: bool,
+    /// Where the witness binds. Loopback by default: accepting connections
+    /// from outside is a deliberate choice, not something a toggle does behind
+    /// somebody's back.
+    #[serde(default = "default_witness_listen")]
+    pub witness_listen: String,
 }
 
 fn default_on_close() -> String {
@@ -144,6 +156,10 @@ fn default_true() -> bool {
 
 fn default_esplora_listen() -> String {
     btx_core::esplora_sidecar::DEFAULT_LISTEN.to_string()
+}
+
+fn default_witness_listen() -> String {
+    btx_core::witness::WITNESS_ADDR.to_string()
 }
 
 impl Default for NodeAppSettings {
@@ -166,6 +182,8 @@ impl Default for NodeAppSettings {
             node_nickname: String::new(),
             esplora_enabled: false,
             esplora_listen: default_esplora_listen(),
+            witness_enabled: false,
+            witness_listen: default_witness_listen(),
         }
     }
 }
@@ -370,6 +388,11 @@ pub struct AppState {
     /// Generation counter for the guardian loop, bumped on every sidecar
     /// start; a loop whose generation is superseded exits.
     pub esplora_gen: Arc<AtomicU64>,
+    /// The fork-witness server, while it is on and the node runs.
+    pub witness: Arc<Mutex<Option<btx_core::witness::WitnessServer>>>,
+    /// Why the witness is not running although the setting is on. Shown beside
+    /// the switch; `None` when it is running or off.
+    pub witness_error: Arc<Mutex<Option<String>>>,
 }
 
 /// Whose node did we attach to? Derived from the `DatadirHolder` seen at the
@@ -421,6 +444,8 @@ impl AppState {
             esplora_verdict: Arc::new(Mutex::new(None)),
             esplora_error: Arc::new(Mutex::new(None)),
             esplora_gen: Arc::new(AtomicU64::new(0)),
+            witness: Arc::new(Mutex::new(None)),
+            witness_error: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -441,6 +466,16 @@ mod tests {
         assert!(s.wallet_name.is_none());
         assert_eq!(s.on_close, "ask", "the red X asks until the user decides");
         assert!(!s.esplora_enabled, "Esplora mode is opt-in, never default");
+        assert!(!s.witness_enabled, "witnessing is opt-in, never default");
+        assert_eq!(
+            s.witness_listen,
+            btx_core::witness::WITNESS_ADDR,
+            "the witness binds loopback until somebody chooses otherwise"
+        );
+        assert!(
+            !btx_core::witness::is_public_bind(&s.witness_listen),
+            "the default must not accept connections from outside"
+        );
         assert_eq!(
             s.esplora_listen,
             btx_core::esplora_sidecar::DEFAULT_LISTEN,
