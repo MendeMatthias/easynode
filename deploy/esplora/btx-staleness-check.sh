@@ -49,11 +49,27 @@
 # mines races. A first version of these rules called a correct endpoint "on
 # another chain" for not holding a one-block orphan; these do not.
 #
+# SETTLED PAIRS ARE THE GOOD ANSWER. Everything above is inference from
+# heights and from a tip hash that is regularly an orphan. Since EasyBTX#468
+# the feed publishes, per chain, up to ten (height, hash-prefix) pairs at least
+# six blocks below that chain's tip and above its fork. Asking this node for
+# one of those heights places it on a chain POSITIVELY, which is the difference
+# between "nothing looks wrong" and "this node is on the chain the network is
+# on". The NEWEST askable pair decides: below a fork every chain agrees, so a
+# match deeper down says nothing about which side we are on.
+#
 # THE RULES, in this order. crates/btx-core/src/esplora_freshness.rs implements
 # them identically for the easyNode app; change one and change the other.
 #   local tip unknown                                   -> unverified
 #   no census, older than 30 min, or no heaviest chain
 #     with a usable tip                                 -> unverified
+#   a settled block of the heaviest chain MATCHES       -> fresh, or stale when
+#                                                          more than TOLERANCE
+#                                                          below its tip
+#   a settled block of the heaviest chain DIFFERS       -> unverified (a real
+#                                                          divergence; the chain
+#                                                          we are on is named
+#                                                          when the feed allows)
 #   holds a DEEP competing chain's tip (forked more
 #     than RACE_DEPTH below the heaviest tip)           -> unverified (another chain)
 #   local tip >= census tip, our block there IS it      -> fresh
@@ -61,11 +77,11 @@
 #   more than TOLERANCE below the census tip            -> stale
 #   within TOLERANCE, not comparable                    -> unverified
 #
-# The deep-branch test runs FIRST, before any height comparison: an overstated
-# balance from the wrong chain reaching a signing wallet is worse than a stale
-# one. What would sharpen all of this is `recentHashes` per chain in the public
-# feed, a few blocks below each tip where a race has settled; then an endpoint
-# could be placed on a chain positively rather than by elimination.
+# The settled test runs first because it is the only one that can prove
+# anything; the deep-branch test runs before any height comparison because an
+# overstated balance from the wrong chain reaching a signing wallet is worse
+# than a stale one. A feed with no settled pairs (published before #468) falls
+# through to the older rules rather than failing.
 set -u
 
 RUN_DIR="${BTX_ESPLORA_RUN:-/run}"
@@ -112,9 +128,31 @@ def hash_at(h):
     v = v.lower() if v else None
     return v if v and len(v) == 64 and all(c in "0123456789abcdef" for c in v) else None
 
-def prefix_of(chain):
-    p = str(chain.get("tipHash") or "").strip().lower()
+def hexprefix(v):
+    p = str(v or "").strip().lower()
     return p if len(p) >= 8 and all(c in "0123456789abcdef" for c in p) else None
+
+def prefix_of(chain):
+    return hexprefix(chain.get("tipHash"))
+
+def askable(chain):
+    """Settled pairs this node can be asked about, newest first."""
+    out = []
+    for b in (chain.get("settled") or []):
+        h, pre = b.get("height"), hexprefix(b.get("hash"))
+        if isinstance(h, int) and pre and h <= local:
+            out.append((h, pre))
+    out.sort(reverse=True)
+    return out
+
+def holds_settled(chain):
+    """(on_this_chain, height) from the NEWEST askable pair, or None when
+    nothing could be compared."""
+    for h, pre in askable(chain):
+        ours = hash_at(h)
+        if ours is not None:
+            return (ours.startswith(pre), h)
+    return None
 
 def holds_tip(chain):
     """True/False when comparable, None when the served hash could not be read."""
@@ -148,8 +186,32 @@ if not heaviest or heaviest.get("tipHeight") is None or not prefix_of(heaviest):
     out("unverified", why="no-heaviest-chain", local=local)
 hh = int(heaviest["tipHeight"])
 
-# FIRST: are we positively on a chain that left the heaviest one deeply? That
-# is the 2026-09-05 failure, and it is what the census witnesses well.
+# FIRST, and best: place this node on a chain POSITIVELY, using a settled block
+# below the racing window. Everything after this is inference.
+if heaviest.get("settled"):
+    got = holds_settled(heaviest)
+    if got is not None:
+        on, at = got
+        if on:
+            lag = hh - local
+            if lag > tol:
+                out("stale", why="behind-on-heaviest-chain", proven_at=at, local=local, census=hh, lag=lag)
+            out("fresh", why="settled-block-matches", proven_at=at, local=local, census=hh,
+                chain=heaviest.get("id"))
+        which = "none"
+        for other in chains:
+            if other is heaviest:
+                continue
+            got2 = holds_settled(other)
+            if got2 is not None and got2[0]:
+                which = other.get("id")
+                break
+        out("unverified", why="off-heaviest-at-settled-height", at=at, serves_chain=which,
+            local=local, census=hh)
+
+# Otherwise: are we positively on a chain that left the heaviest one deeply?
+# That is the 2026-09-05 failure, and the census witnesses it well even without
+# settled pairs.
 for other in chains:
     if other is heaviest or other.get("tipHeight") is None:
         continue

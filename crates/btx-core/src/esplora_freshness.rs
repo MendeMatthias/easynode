@@ -177,6 +177,30 @@ pub struct CensusChain {
     pub competing: bool,
     #[serde(default)]
     pub partial: bool,
+    /// Settled `(height, hash-prefix)` pairs for this chain, oldest first,
+    /// every one at least six blocks below the chain's tip and above its fork.
+    /// Empty on a feed published before EasyBTX#468, which is why every rule
+    /// that uses these has a fallback that does not.
+    #[serde(default)]
+    pub settled: Vec<SettledBlock>,
+}
+
+/// One settled block: a height an endpoint can be asked about, and the prefix
+/// its answer must start with.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+pub struct SettledBlock {
+    #[serde(default)]
+    pub height: u64,
+    #[serde(default)]
+    pub hash: String,
+}
+
+impl SettledBlock {
+    /// The comparable prefix: lowercase hex, at least [`MIN_PREFIX_LEN`].
+    pub fn prefix(&self) -> Option<String> {
+        let p = self.hash.trim().to_ascii_lowercase();
+        (p.len() >= MIN_PREFIX_LEN && p.bytes().all(|b| b.is_ascii_hexdigit())).then_some(p)
+    }
 }
 
 impl Census {
@@ -209,6 +233,43 @@ impl CensusChain {
     pub fn prefix(&self) -> Option<String> {
         let p = self.tip_hash.as_deref()?.trim().to_ascii_lowercase();
         (p.len() >= MIN_PREFIX_LEN && p.bytes().all(|b| b.is_ascii_hexdigit())).then_some(p)
+    }
+
+    /// The settled heights this endpoint could actually answer for, newest
+    /// first: a height above the served tip is not a question it can be asked.
+    pub fn askable(&self, served_tip: u64) -> Vec<&SettledBlock> {
+        let mut v: Vec<&SettledBlock> = self
+            .settled
+            .iter()
+            .filter(|b| b.height <= served_tip && b.prefix().is_some())
+            .collect();
+        v.sort_by(|a, b| b.height.cmp(&a.height));
+        v
+    }
+
+    /// Is the endpoint ON this chain? `Some(true)` when a settled block it can
+    /// answer for matches, `Some(false)` when one demonstrably does not, and
+    /// `None` when nothing could be compared - no settled pairs, none below
+    /// the served tip, or no answer from the endpoint.
+    ///
+    /// The NEWEST askable pair decides. Deeper pairs are shared history: below
+    /// a fork every chain agrees, so a match there says nothing about which
+    /// side the endpoint is on.
+    pub fn holds_settled(
+        &self,
+        served_tip: u64,
+        hash_at: &dyn Fn(u64) -> Option<String>,
+    ) -> Option<(bool, u64)> {
+        for b in self.askable(served_tip) {
+            let prefix = b.prefix()?;
+            if let Some(ours) = hash_at(b.height) {
+                return Some((
+                    ours.trim().to_ascii_lowercase().starts_with(&prefix),
+                    b.height,
+                ));
+            }
+        }
+        None
     }
 
     /// Has this chain diverged deeply enough from `heaviest_tip` that holding
@@ -305,9 +366,66 @@ pub fn judge(
         );
     };
 
-    // FIRST, and whatever the heights say: is this endpoint positively on a
-    // chain that diverged deeply from the heaviest one? That is the 2026-09-05
-    // failure, and it is the thing the census witnesses well.
+    // FIRST, and best: can the endpoint be placed on a chain POSITIVELY, by a
+    // settled block below the racing window? Everything after this point is
+    // inference from heights and from the one hash the feed used to publish,
+    // which is a tip and is regularly a one-block orphan.
+    if !heaviest.settled.is_empty() {
+        match heaviest.holds_settled(tip, hash_at) {
+            Some((true, at)) => {
+                // On the heaviest chain, proven. Freshness is now only a
+                // question of how far behind its tip this endpoint is.
+                let lag = census_tip.saturating_sub(tip);
+                return if lag > STALE_TOLERANCE {
+                    verdict(
+                        Freshness::Stale,
+                        format!(
+                            "on the heaviest measured chain (its settled block at {at} matches), but {lag} behind its tip {census_tip}"
+                        ),
+                        Some(census_tip),
+                    )
+                } else {
+                    verdict(
+                        Freshness::Fresh,
+                        format!(
+                            "on the heaviest measured chain, proven at its settled block {at}; local tip {tip}, census tip {census_tip}"
+                        ),
+                        Some(census_tip),
+                    )
+                };
+            }
+            Some((false, at)) => {
+                // Demonstrably NOT on the heaviest chain, at a height where a
+                // race cannot explain it. Name the chain it is on if the feed
+                // lets us, but the verdict does not depend on finding one.
+                let which = census
+                    .chains()
+                    .iter()
+                    .filter(|c| !c.heaviest)
+                    .find(|c| matches!(c.holds_settled(tip, hash_at), Some((true, _))))
+                    .map(|c| {
+                        let forked = c
+                            .fork_height
+                            .map(|f| format!(", which left the heaviest chain at height {f}"))
+                            .unwrap_or_default();
+                        format!(" It serves chain {}{forked}.", c.id)
+                    })
+                    .unwrap_or_default();
+                return verdict(
+                    Freshness::Unverified,
+                    format!(
+                        "the block served at the settled height {at} is not the heaviest chain's, and that height is below the racing window, so this is a real divergence rather than a race.{which}"
+                    ),
+                    Some(census_tip),
+                );
+            }
+            None => {} // nothing comparable; fall through to the older rules
+        }
+    }
+
+    // Otherwise: is this endpoint positively on a chain that diverged deeply
+    // from the heaviest one? That is the 2026-09-05 failure, and it is the
+    // thing the census witnesses well even without settled pairs.
     for other in census.chains().iter().filter(|c| !c.heaviest) {
         if other.is_deep_branch(census_tip)
             && other.tip_height.is_some_and(|h| h <= tip)
@@ -456,6 +574,20 @@ pub async fn tick(
     // reached; fetch exactly those.
     let mut hashes: HashMap<u64, String> = HashMap::new();
     if let (Some(tip), Some(c)) = (served, census.as_ref()) {
+        // The settled heights first, and only the NEWEST askable one per
+        // chain: that is the height `holds_settled` decides on, and fetching
+        // the rest would be requests whose answers nothing reads.
+        for chain in c.chains() {
+            if let Some(b) = chain.askable(tip).into_iter().next() {
+                if !hashes.contains_key(&b.height) {
+                    if let Some(x) = served_hash_at(client, electrs_base, b.height).await {
+                        hashes.insert(b.height, x);
+                    }
+                }
+            }
+        }
+        // Then the tips, for the older rules that run when a feed carries no
+        // settled pairs.
         for chain in c.chains() {
             if let Some(h) = chain.tip_height {
                 if h <= tip && !hashes.contains_key(&h) {
@@ -680,6 +812,162 @@ mod tests {
             Freshness::Unverified
         );
         assert!(Census::parse("not json").is_none());
+    }
+
+    // ── settled pairs: placing an endpoint POSITIVELY ────────────────────
+    // The feed used to publish one hash per chain, its tip, and on this
+    // network a tip is regularly a one-block orphan. EasyBTX#468 publishes
+    // settled pairs below the racing window. These tests are the reason that
+    // change was worth making: the exact shape measured on 2026-09-06 00:00Z
+    // now reads `fresh` instead of `unverified`.
+
+    /// The 00:00Z shape, with settled pairs added: the census's heaviest chain
+    /// has tip 211404, which our validator held as a one-block side tip while
+    /// its active chain ran to 211416.
+    const SAMPLE_SETTLED: &str = r#"{"schema":2,"checkedAt":1788649839,"chains":{"split":true,"tipHeight":211404,"chains":[
+      {"id":"A","tipHeight":211404,"tipHash":"d5cdc194a5bbc8a7","forkHeight":null,"nodes":6,"competing":true,"heaviest":true,"partial":false,
+       "settled":[{"height":211396,"hash":"1111111111111111"},{"height":211397,"hash":"2222222222222222"},{"height":211398,"hash":"3333333333333333"}]},
+      {"id":"C","tipHeight":210885,"tipHash":"457516cceb7b076a","forkHeight":210496,"nodes":1,"competing":true,"heaviest":false,"partial":false,
+       "settled":[{"height":210870,"hash":"cccccccccccccccc"},{"height":210879,"hash":"dddddddddddddddd"}]}]}}"#;
+
+    fn settled_census() -> Census {
+        Census::parse(SAMPLE_SETTLED).expect("the settled feed shape parses")
+    }
+
+    fn full(prefix: &str) -> String {
+        // A 64-hex hash beginning with the published prefix.
+        format!("{prefix}{}", "0".repeat(64 - prefix.len()))
+    }
+
+    #[test]
+    fn the_settled_shape_parses_and_only_askable_heights_count() {
+        let c = settled_census();
+        let a = c.heaviest().expect("A is heaviest");
+        assert_eq!(a.settled.len(), 3);
+        assert_eq!(a.settled[0].prefix().as_deref(), Some("1111111111111111"));
+        // Newest first, and nothing above the served tip is a question this
+        // endpoint can be asked.
+        let askable: Vec<u64> = a.askable(211397).iter().map(|b| b.height).collect();
+        assert_eq!(askable, vec![211397, 211396]);
+        assert!(a.askable(211000).is_empty());
+        // A prefix too short to be evidence is not askable either.
+        let mut short = a.clone();
+        short.settled = vec![SettledBlock {
+            height: 1,
+            hash: "abc".into(),
+        }];
+        assert!(short.askable(100).is_empty());
+    }
+
+    #[test]
+    fn a_settled_match_is_fresh_even_when_the_census_tip_is_an_orphan() {
+        // THE CASE THIS EXISTS FOR. The endpoint is twelve blocks past the
+        // census tip and does NOT hold it, because that tip was a one-block
+        // orphan. Under the old rules that read `unverified` for a correct
+        // endpoint. A settled block below the racing window proves it is on
+        // the chain, so it reads `fresh`.
+        let c = settled_census();
+        let v = judge(
+            Some(211416),
+            &lookup(&[
+                (211398, &full("3333333333333333")),
+                (
+                    211404,
+                    "a433ed21d83356c1f13e49e6969e27e33cf4de78a71f809a268c13483b020676",
+                ),
+            ]),
+            Some(&c),
+            NOW,
+        );
+        assert_eq!(v.freshness, Freshness::Fresh, "{v:?}");
+        assert!(
+            v.reason.contains("211398"),
+            "name the block that proved it: {}",
+            v.reason
+        );
+    }
+
+    #[test]
+    fn a_settled_mismatch_is_a_divergence_and_names_the_chain() {
+        // Serving chain C's settled block, and not A's. Below the racing
+        // window, so a race cannot explain it.
+        let c = settled_census();
+        let v = judge(
+            Some(211416),
+            &lookup(&[
+                (211398, &full("ffffffffffffffff")),
+                (210879, &full("dddddddddddddddd")),
+            ]),
+            Some(&c),
+            NOW,
+        );
+        assert_eq!(v.freshness, Freshness::Unverified, "{v:?}");
+        assert!(v.reason.contains("real divergence"), "{}", v.reason);
+        assert!(
+            v.reason.contains("chain C"),
+            "name the chain it is on: {}",
+            v.reason
+        );
+        assert!(v.reason.contains("210496"), "name the fork: {}", v.reason);
+    }
+
+    #[test]
+    fn a_settled_mismatch_stands_even_when_no_other_chain_matches() {
+        // The verdict must not depend on identifying the other side. An
+        // endpoint on a chain the census has never seen is still not on the
+        // heaviest one.
+        let c = settled_census();
+        let v = judge(
+            Some(211416),
+            &lookup(&[(211398, &full("ffffffffffffffff"))]),
+            Some(&c),
+            NOW,
+        );
+        assert_eq!(v.freshness, Freshness::Unverified, "{v:?}");
+        assert!(v.reason.contains("real divergence"), "{}", v.reason);
+        assert!(!v.reason.contains("It serves chain"), "{}", v.reason);
+    }
+
+    #[test]
+    fn on_the_right_chain_but_far_behind_is_stale_not_fresh() {
+        let c = settled_census();
+        let v = judge(
+            Some(211398),
+            &lookup(&[(211398, &full("3333333333333333"))]),
+            Some(&c),
+            NOW,
+        );
+        assert_eq!(v.freshness, Freshness::Stale, "{v:?}");
+        assert!(
+            v.reason.contains("on the heaviest measured chain"),
+            "{}",
+            v.reason
+        );
+        // Within tolerance it is fresh again.
+        let v = judge(
+            Some(211402),
+            &lookup(&[(211398, &full("3333333333333333"))]),
+            Some(&c),
+            NOW,
+        );
+        assert_eq!(v.freshness, Freshness::Fresh, "{v:?}");
+    }
+
+    #[test]
+    fn an_endpoint_that_cannot_answer_the_settled_height_falls_back_rather_than_guessing() {
+        // No answer at any askable settled height: the newer rule declines and
+        // the older ones decide, which is what keeps this working against a
+        // feed published before settled pairs existed.
+        let c = settled_census();
+        let v = judge(Some(211416), &lookup(&[]), Some(&c), NOW);
+        assert_eq!(v.freshness, Freshness::Unverified, "{v:?}");
+        assert!(!v.reason.contains("real divergence"), "{}", v.reason);
+        // And a feed with no settled pairs at all still behaves as before.
+        let old = census();
+        assert_eq!(
+            judge(Some(211391), &lookup(&[(211381, B_TIP)]), Some(&old), NOW).freshness,
+            Freshness::Fresh
+        );
     }
 
     #[test]
