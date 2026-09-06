@@ -1225,7 +1225,6 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
     let gen = state.refresher_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let gen_counter = state.refresher_gen.clone();
     let rpc_slot = state.rpc.clone();
-    let node_slot = state.node.clone();
     let phase_slot = state.phase.clone();
     let stall_slot = state.stall_verdict.clone();
     let rc_cache_slot = state.rc_status_cache.clone();
@@ -1242,6 +1241,10 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
         // clock to within milliseconds).
         let run_started = std::time::Instant::now();
         let mut consecutive_failures: u32 = 0;
+        // The last peer count actually measured this run, so a lost getpeerinfo
+        // holds the number instead of claiming zero. Starts at 0, which is the
+        // truth before the first successful read.
+        let mut last_peers: i64 = 0;
         let mut snapshot_swept = false;
         // Trusted-mirror stall watchdog state (Paper 3 §3, progress rule
         // refined — see btx_core::watchdog): while a connectable gap exists,
@@ -1302,7 +1305,24 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                     );
                     let chainstates = chainstates.unwrap_or_default();
                     let peer_infos = peer_infos.ok();
-                    let peers = peer_infos.as_ref().map(|p| p.len() as i64).unwrap_or(0);
+                    // A FAILED MEASUREMENT IS NOT ZERO PEERS. `peers` is an i64
+                    // on the phase, so it cannot carry "unknown" the way
+                    // bytes_sent, inbound_peers and archive_peers do — and this
+                    // file's own rule for those is "no measurement, no claim".
+                    // Collapsing a failed getpeerinfo to 0 broke that: one lost
+                    // RPC on a healthy long-running node showed PEERS 0 and
+                    // replaced the "Helping the network" card with "Looking for
+                    // peers — this usually takes a minute or two on a new
+                    // install". Hold the last number we actually measured
+                    // instead; it is the honest answer to "how many peers did
+                    // we last see", and it self-corrects on the next tick.
+                    let peers = match peer_infos.as_ref() {
+                        Some(p) => {
+                            last_peers = p.len() as i64;
+                            last_peers
+                        }
+                        None => last_peers,
+                    };
                     let archive_summary = peer_infos
                         .as_ref()
                         .map(|ps| btx_core::node_api::summarize_archive_peers(ps));
@@ -1446,7 +1466,27 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                             Some(v) => {
                                 let first =
                                     *fork_first_seen.get_or_insert_with(std::time::Instant::now);
-                                Some(v.with_since(first.elapsed().as_secs()))
+                                // Only LongerBranch needs a clock from us: it is
+                                // built with `since_secs: 0` because a branch in
+                                // `getchaintips` carries no age. HeadersAhead
+                                // already knows how long its gap has been open —
+                                // the detector measured it, and cannot even fire
+                                // before 10 minutes.
+                                //
+                                // Overwriting BOTH made the one sentence the fork
+                                // detector exists to produce contradict itself at
+                                // the exact moment the user is asked to act on it:
+                                // `fork_first_seen` is None until the verdict first
+                                // appears, so on that tick `first.elapsed()` is ~0
+                                // and the card read "...beyond its own blocks for 0
+                                // minutes and the gap is not closing", on a
+                                // condition that by definition had held for ten.
+                                match v {
+                                    btx_core::fork::ForkAlarm::HeadersAhead { .. } => Some(v),
+                                    btx_core::fork::ForkAlarm::LongerBranch { .. } => {
+                                        Some(v.with_since(first.elapsed().as_secs()))
+                                    }
+                                }
                             }
                             None => {
                                 fork_first_seen = None;
@@ -1613,35 +1653,54 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                 Err(_) => {
                     consecutive_failures += 1;
                     // ~1 min of continuous silence → tell the user instead of
-                    // freezing on a stale number. No destructive action.
+                    // freezing on a stale number, and stop the node the way
+                    // Stop does rather than dropping it onto a SIGKILL.
                     if consecutive_failures >= 20 {
-                        // Unwedge so Start actually works: clear the RPC slot
-                        // (start_node's already-running guard keys on it) and
-                        // drop the controller — kill_on_drop reaps the wedged
-                        // btxd so a fresh spawn doesn't lose the datadir-lock
-                        // race. Leaving rpc set here made Start a permanent
-                        // no-op with the UI stuck on this very error.
-                        // Everything that serves FROM this node has to go
-                        // with it. Without this the witness kept answering
-                        // from an RpcClient holding the dead node's cookie —
-                        // and `answer()` maps an RPC error on /block-height to
-                        // 404, so a wallet read a dead witness as "behind"
-                        // rather than as gone, and its fork check stopped
-                        // silently. The orphan also held the port, so the
-                        // "Press Start" this phase suggests could not rebind.
-                        {
-                            let state = app.state::<AppState>();
-                            stop_witness(&state).await;
-                            stop_esplora(&state).await;
-                        }
-                        *rpc_slot.lock().await = None;
-                        *node_slot.lock().await = None;
+                        // Say it on screen first: the stop below can take the
+                        // full flush grace, and the user should not watch a
+                        // stale number for 90 s before being told.
                         let p = NodePhase::Error {
                             message: "The node stopped responding. Press Start to relaunch it."
                                 .into(),
                         };
                         *phase_slot.lock().await = p.clone();
                         crate::tray::reflect_phase(&app, &p);
+
+                        // THEN STOP IT THE WAY `Stop` DOES — btx-cli stop, wait
+                        // out the flush, SIGKILL only if it never exits.
+                        //
+                        // This block used to do `*node_slot = None` and nothing
+                        // else, under a comment that said "No destructive
+                        // action". It was the most destructive line in the file:
+                        // the controller is built with `kill_on_drop(true)`
+                        // (btx_core::node), so dropping it SIGKILLs btxd on the
+                        // spot, with no `btx-cli stop` and no grace, after ~60 s
+                        // of RPC silence.
+                        //
+                        // RPC silence is not death. btxd holds cs_main through
+                        // the background `loadtxoutset` this same start path
+                        // kicks off, through a heavy ConnectBlock and through a
+                        // large reorg, and answers nothing meanwhile. So the
+                        // node most likely to be killed here was a HEALTHY one
+                        // in the middle of the longest operation it ever does.
+                        // node.rs sizes the grace for exactly that: 90 s,
+                        // because "a too-small grace turns a graceful stop of a
+                        // HEALTHY node into a SIGKILL mid-flush, and the next
+                        // start into a long Verifying blocks rebuild" — and on
+                        // a pruned keeper that rebuild cannot read the blocks it
+                        // needs at all.
+                        //
+                        // `stop_node_inner` is that path, and it also clears the
+                        // state this arm used to leave standing: the macOS
+                        // keep-awake assertion (held forever with no node
+                        // running, so the Mac never idle-slept again), the
+                        // uptime clock, and the stall, fork and archive-service
+                        // verdicts, which otherwise kept rendering as CURRENT
+                        // facts about a node that was gone. One canonical stop,
+                        // so "the refresher gave up" and "the user pressed
+                        // Stop" leave the app in the same state.
+                        let state = app.state::<AppState>();
+                        stop_node_inner(&state).await;
                         return;
                     }
                 }
@@ -2214,7 +2273,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         // returning_launch_paths walk (2 full install-dir traversals) is only
         // worth paying while setup hasn't happened yet.
         installed: settings.setup_complete || returning_launch_paths(&datadir, &tag).is_some(),
-        node_tag: tag,
+        node_tag: tag.clone(),
         setup_complete: settings.setup_complete,
         keep_awake: settings.keep_awake,
         keep_awake_supported: btx_core::power::sleep_assertion_supported(),
@@ -2257,7 +2316,15 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         stall: state.stall_verdict.lock().await.clone(),
         node_profile: settings.node_profile.clone(),
         datadir_pruned: btx_core::node::datadir_has_pruned(&datadir),
-        keeper_engine_ready: btx_core::installer::engine_supports_keeper_profile(NODE_RELEASE_TAG),
+        // `&tag`, not NODE_RELEASE_TAG — the same choice `start_node_inner`
+        // makes and for the same reason: the binaries in play come from the
+        // PERSISTED tag, which only advances to the compiled pin once a start's
+        // provisioning succeeded. They disagree on two ordinary paths: a failed
+        // provision (swallowed as "keep launching the old, known-good tag") and
+        // attach mode. Judging the pin there told a keeper "Applies fully at the
+        // next node start" forever, suppressing the "switches on with the next
+        // node engine update" wording written for exactly that case.
+        keeper_engine_ready: btx_core::installer::engine_supports_keeper_profile(&tag),
         esplora_enabled: settings.esplora_enabled,
         esplora_listen: settings.esplora_listen.clone(),
         esplora_serving_on,
@@ -2757,6 +2824,18 @@ pub async fn set_esplora(state: State<'_, AppState>, on: bool) -> Result<String,
     }
     let electrs = find_binary(ELECTRS_BIN).ok_or_else(|| missing_binary_message(ELECTRS_BIN))?;
     let caddy = find_binary(CADDY_BIN).ok_or_else(|| missing_binary_message(CADDY_BIN))?;
+    // NAMED caddy is not the same as CAN READ THIS CONFIG. find_binary returns
+    // the first executable called caddy on PATH, /usr/local/bin, /usr/bin,
+    // /opt/homebrew/bin, ~/.local/bin, ~/.cargo/bin or ~/go/bin, and a stock
+    // Caddy in any of those refuses this Caddyfile on its first directive
+    // (`unrecognized directive: rate_limit`). Reported as success before this
+    // check: the row showed the listen address while Caddy had already exited,
+    // and 30-60s later the guardian killed electrs too and said only "the Caddy
+    // front exited". deploy/esplora/test-front.sh has gated on this since it
+    // was written; the app had not.
+    if !btx_core::esplora_sidecar::caddy_has_required_module(&caddy) {
+        return Err(btx_core::esplora_sidecar::wrong_caddy_message(&caddy));
+    }
     NodeAppSettings::update(&datadir, |s| s.esplora_enabled = true);
     let running = state.rpc.lock().await.is_some();
     if !running {

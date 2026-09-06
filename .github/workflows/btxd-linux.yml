@@ -116,7 +116,7 @@ jobs:
             echo "building $ref (app pins $pinned, an UNTAGGED pin = commit $pinned_ref)"
           else
             echo "building $ref (app pins $pinned)"
-          fi"
+          fi
 
       - name: Checkout btxchain/btx
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

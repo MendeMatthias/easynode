@@ -2,7 +2,9 @@
 //!
 //! WHY THIS EXISTS. Several files in a datadir are read-modify-rewritten in
 //! place: `faststart.conf` (three writers in [`crate::setup`], one in
-//! [`crate::disk`]) and the node app's settings file. A plain `std::fs::write`
+//! [`crate::disk`], and two in [`crate::installer`] — the provisioning paths,
+//! which are the only ones that replace the WHOLE file rather than editing it)
+//! and the node app's settings file. A plain `std::fs::write`
 //! is open + O_TRUNC + write, so the truncation is committed before the bytes
 //! are, and the caller sees one call that either worked or did not.
 //!
