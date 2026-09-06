@@ -1058,7 +1058,10 @@ mod tests {
         assert_eq!(s.peers, 4);
         assert_eq!(s.tx_bytes_in, 0, "not one peer delivered a transaction");
         assert_eq!(s.sending_us_tx, 0);
-        assert_eq!(s.tx_bytes_out, 7874, "we sent ours out; the silence is one-directional");
+        assert_eq!(
+            s.tx_bytes_out, 7874,
+            "we sent ours out; the silence is one-directional"
+        );
         assert_eq!(s.taking_our_tx, 1);
         assert_eq!(s.want_tx_from_us, 3);
         assert_eq!(s.priced_out, 2, "0.0917 BTX/kvB is 9,171 sat per byte");
@@ -1070,7 +1073,12 @@ mod tests {
         let now = 1_788_657_000;
         let v = judge_tx_relay(&summarize_tx_relay(&measured_mainnet_peers(now), now));
         match v {
-            TxRelayHealth::Isolated { peers, hours_connected, peers_wanting_tx, priced_out } => {
+            TxRelayHealth::Isolated {
+                peers,
+                hours_connected,
+                peers_wanting_tx,
+                priced_out,
+            } => {
                 assert_eq!(peers, 4);
                 assert_eq!(hours_connected, 6);
                 assert_eq!(peers_wanting_tx, 3);
@@ -1088,7 +1096,10 @@ mod tests {
         let v = judge_tx_relay(&summarize_tx_relay(&peers, now));
         assert_eq!(
             v,
-            TxRelayHealth::Receiving { peers_sending: 1, tx_bytes_in: 3916 },
+            TxRelayHealth::Receiving {
+                peers_sending: 1,
+                tx_bytes_in: 3916
+            },
             "one real transaction is proof relay works; it does not need to be many"
         );
     }
