@@ -1241,6 +1241,10 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
         // clock to within milliseconds).
         let run_started = std::time::Instant::now();
         let mut consecutive_failures: u32 = 0;
+        // The last peer count actually measured this run, so a lost getpeerinfo
+        // holds the number instead of claiming zero. Starts at 0, which is the
+        // truth before the first successful read.
+        let mut last_peers: i64 = 0;
         let mut snapshot_swept = false;
         // Trusted-mirror stall watchdog state (Paper 3 §3, progress rule
         // refined — see btx_core::watchdog): while a connectable gap exists,
@@ -1301,7 +1305,24 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                     );
                     let chainstates = chainstates.unwrap_or_default();
                     let peer_infos = peer_infos.ok();
-                    let peers = peer_infos.as_ref().map(|p| p.len() as i64).unwrap_or(0);
+                    // A FAILED MEASUREMENT IS NOT ZERO PEERS. `peers` is an i64
+                    // on the phase, so it cannot carry "unknown" the way
+                    // bytes_sent, inbound_peers and archive_peers do — and this
+                    // file's own rule for those is "no measurement, no claim".
+                    // Collapsing a failed getpeerinfo to 0 broke that: one lost
+                    // RPC on a healthy long-running node showed PEERS 0 and
+                    // replaced the "Helping the network" card with "Looking for
+                    // peers — this usually takes a minute or two on a new
+                    // install". Hold the last number we actually measured
+                    // instead; it is the honest answer to "how many peers did
+                    // we last see", and it self-corrects on the next tick.
+                    let peers = match peer_infos.as_ref() {
+                        Some(p) => {
+                            last_peers = p.len() as i64;
+                            last_peers
+                        }
+                        None => last_peers,
+                    };
                     let archive_summary = peer_infos
                         .as_ref()
                         .map(|ps| btx_core::node_api::summarize_archive_peers(ps));
@@ -1445,7 +1466,27 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                             Some(v) => {
                                 let first =
                                     *fork_first_seen.get_or_insert_with(std::time::Instant::now);
-                                Some(v.with_since(first.elapsed().as_secs()))
+                                // Only LongerBranch needs a clock from us: it is
+                                // built with `since_secs: 0` because a branch in
+                                // `getchaintips` carries no age. HeadersAhead
+                                // already knows how long its gap has been open —
+                                // the detector measured it, and cannot even fire
+                                // before 10 minutes.
+                                //
+                                // Overwriting BOTH made the one sentence the fork
+                                // detector exists to produce contradict itself at
+                                // the exact moment the user is asked to act on it:
+                                // `fork_first_seen` is None until the verdict first
+                                // appears, so on that tick `first.elapsed()` is ~0
+                                // and the card read "...beyond its own blocks for 0
+                                // minutes and the gap is not closing", on a
+                                // condition that by definition had held for ten.
+                                match v {
+                                    btx_core::fork::ForkAlarm::HeadersAhead { .. } => Some(v),
+                                    btx_core::fork::ForkAlarm::LongerBranch { .. } => {
+                                        Some(v.with_since(first.elapsed().as_secs()))
+                                    }
+                                }
                             }
                             None => {
                                 fork_first_seen = None;
@@ -2232,7 +2273,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         // returning_launch_paths walk (2 full install-dir traversals) is only
         // worth paying while setup hasn't happened yet.
         installed: settings.setup_complete || returning_launch_paths(&datadir, &tag).is_some(),
-        node_tag: tag,
+        node_tag: tag.clone(),
         setup_complete: settings.setup_complete,
         keep_awake: settings.keep_awake,
         keep_awake_supported: btx_core::power::sleep_assertion_supported(),
@@ -2275,7 +2316,15 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         stall: state.stall_verdict.lock().await.clone(),
         node_profile: settings.node_profile.clone(),
         datadir_pruned: btx_core::node::datadir_has_pruned(&datadir),
-        keeper_engine_ready: btx_core::installer::engine_supports_keeper_profile(NODE_RELEASE_TAG),
+        // `&tag`, not NODE_RELEASE_TAG — the same choice `start_node_inner`
+        // makes and for the same reason: the binaries in play come from the
+        // PERSISTED tag, which only advances to the compiled pin once a start's
+        // provisioning succeeded. They disagree on two ordinary paths: a failed
+        // provision (swallowed as "keep launching the old, known-good tag") and
+        // attach mode. Judging the pin there told a keeper "Applies fully at the
+        // next node start" forever, suppressing the "switches on with the next
+        // node engine update" wording written for exactly that case.
+        keeper_engine_ready: btx_core::installer::engine_supports_keeper_profile(&tag),
         esplora_enabled: settings.esplora_enabled,
         esplora_listen: settings.esplora_listen.clone(),
         esplora_serving_on,
