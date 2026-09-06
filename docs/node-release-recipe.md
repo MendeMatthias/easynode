@@ -588,16 +588,33 @@ and `scripts/observer-ok.sh` gates the release there exactly as it does on the
 Linux box. Prefer that over `OBSERVER_OVERRIDE=1`, which should stay what it
 says it is: for the day the observer is what is broken.
 
-⚠ One difference worth knowing before you trust a green row. The observer's
-FORK rule and the app's `btx_core::fork` do NOT agree on a node that is merely
-behind. The observer writes `FORK` after `BTX_FORK_ROWS` samples with
-`headers - blocks` over `BTX_FORK_BEHIND`, whatever the gap is doing;
-`btx_core::fork` does not, because it discards any headers-only branch whose
-fork point is at or past the active tip (that branch extends our own chain, so
-it is lag) and it requires the gap to have stopped closing. A Mac catching up
-after days offline will therefore trip the observer and leave the app's fork
-card dark, and the app is the one that is right. Read the row, do not just take
-its colour.
+⚠ Two claims that were in this section earlier on 2026-09-06 were wrong, and
+both are now fixed in the script itself rather than merely described here. Kept
+short, because the wrong version was published.
+
+**"The observer's `fork_lead` does not exclude a branch whose fork point is at
+or past the active tip." It does**, and always has. That exclusion is the same
+one `btx_core::fork::longer_branch` applies, and the script's own function was
+measured returning `0` on a node 4,873 blocks behind. The claim came from a
+hand-written re-implementation of the rule that dropped the line, not from the
+script. Run `node-observer.sh --self-test` rather than retyping its arithmetic.
+
+**The real divergence was the other clause, and it is closed.** The observer
+wrote `FORK` after `BTX_FORK_ROWS` samples with `headers - blocks` over
+`BTX_FORK_BEHIND` whatever the gap was doing, while
+`btx_core::fork::headers_ahead` also requires the gap to have stopped closing.
+A node catching up after days offline therefore tripped the observer while the
+app's card stayed dark. `fork_condition_holds` now applies the same closing
+test and is covered by the self-test.
+
+Two more things the same review found in this script, both fixed: `pgrep -x
+btxd` could not match the released engine's `btxd.real`, so every sample
+against an upstream-tarball engine wrote an empty row and the FORK rule never
+ran at all; and the `ss`-based "nothing is listening" guard failed OPEN
+wherever `ss` does not exist, which is every Mac, so it would move a live
+node's pidfiles aside. Both are why this paragraph now says: **set `BTX_CLI`
+and otherwise trust the script**, and read `--self-test` if you want to know
+what the rule is.
 
 ## The box's own node must be on the chain it claims
 
