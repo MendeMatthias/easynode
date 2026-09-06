@@ -45,7 +45,10 @@
 #          (the same rule crates/btx-core/src/fork.rs applies in the app), or
 #        - headers are more than FORK_BEHIND (20) ahead of blocks for
 #          FORK_ROWS (5) consecutive samples, ten minutes at the default
-#          interval.
+#          interval, AND the gap is not closing. The closing test is the same
+#          one fork.rs applies in `headers_ahead`, and it is what keeps a node
+#          catching up after days offline from being called a fork on the
+#          fifth sample.
 #      Nothing is recovered: which chain is right is not this script's call.
 #      scripts/observer-ok.sh reads the state column, and the release scripts
 #      refuse to run on anything but a fresh `ok`.
@@ -87,9 +90,15 @@ LOG="${BTX_OBSERVER_LOG:-$HOME/node-observer.log}"
 A=(-datadir="$DD")
 
 command -v python3 >/dev/null || { echo "node-observer: python3 is required" >&2; exit 1; }
-[ -x "$CLI" ] || { echo "node-observer: no btx-cli at $CLI (set BTX_CLI)" >&2; exit 1; }
+# --self-test exercises the pure FORK rule and touches no node, so it must not
+# require a btx-cli. Same shape as scripts/observer-ok.sh --self-test.
+if [ "${1:-}" != "--self-test" ]; then
+  [ -x "$CLI" ] || { echo "node-observer: no btx-cli at $CLI (set BTX_CLI)" >&2; exit 1; }
+fi
 
-[ -f "$TSV" ] || printf 'utc\tblocks\theaders\tbehind\tpeers\tarchival_at_tip\tstored_attestations\tstate\n' > "$TSV"
+if [ "${1:-}" != "--self-test" ]; then
+  [ -f "$TSV" ] || printf 'utc\tblocks\theaders\tbehind\tpeers\tarchival_at_tip\tstored_attestations\tstate\n' > "$TSV"
+fi
 say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$LOG"; }
 
 # Count peers that both advertise NETWORK and are at or above our own tip.
@@ -150,31 +159,141 @@ except Exception:
     print("")
 ' "$1" 2>/dev/null; }
 
-last_blocks=""; stuck=0; behind_rows=0; fork_said=0
+# Does the FORK condition hold? Pure: every input is an argument, so the rule
+# is testable without a node (`node-observer.sh --self-test`).
+#
+#   $1 lead              fork_lead(): how far a headers-only branch this node
+#                        cannot obtain leads the active chain since the split
+#   $2 behind_rows       consecutive samples with headers - blocks over FORK_BEHIND
+#   $3 behind            headers - blocks now
+#   $4 behind_at_start   what it was when that run of samples began ("" = no run)
+#
+# Exit 0 = FORK. Mirrors crates/btx-core/src/fork.rs: `longer_branch` on the
+# first clause, `headers_ahead` on the second, INCLUDING its requirement that
+# the gap has stopped closing.
+fork_condition_holds() {
+  lead="${1:-0}"; rows="${2:-0}"; behind_now="${3:-0}"; behind_start="${4:-}"
+  [ "$lead" -gt "$FORK_LEAD" ] && return 0
+  [ "$rows" -ge "$FORK_ROWS" ] || return 1
+  # Closing gap is lag, not a fork. Strictly less, so a gap that is merely not
+  # growing still alarms.
+  if [ -n "$behind_start" ] && [ "$behind_now" -lt "$behind_start" ]; then return 1; fi
+  return 0
+}
+
+# Is btxd in the process table?
+#
+# `pgrep -x btxd` alone is not the question. Since upstream 0.34.1 the released
+# macOS and Linux packages ship `bin/btxd` as a `#!/bin/sh` wrapper that execs
+# `../libexec/btxd.real`, so the RUNNING process is named `btxd.real` and the
+# table never shows `btxd` at all. This script's own default BTX_CLI points at
+# exactly such an install. With only the bare check, every sample against a
+# released engine took the btxd_down branch and wrote an empty row, so blocks,
+# headers, behind and the FORK rule were never evaluated - the fork detector
+# this script exists for was dead, and observer-ok.sh then refused every
+# release for a reason that had nothing to do with the chain.
+#
+# Same two exact names the Rust side matches (crates/btx-core/src/node.rs,
+# `comm_looks_like_btxd`), and no pattern: `pgrep -x` stays exact so a
+# `btxd-wrapper` or a `stop-btxd.sh` still does not count.
+btxd_in_process_table() {
+  pgrep -x btxd >/dev/null 2>&1 || pgrep -x btxd.real >/dev/null 2>&1
+}
+
+# Is anything listening on the RPC port? Prints exactly one of:
+#   listening   proven bound
+#   free        proven not bound
+#   unknown     no probe available - the caller must treat this as hands-off
+#
+# Three probes because no single one is portable: `ss` is Linux-only (iproute2),
+# `lsof` is the macOS answer, `netstat` is the fallback on both. A probe that
+# runs but finds nothing is `free`; only the absence of every probe is
+# `unknown`.
+RPC_PORT="${BTX_RPC_PORT:-19334}"
+rpc_port_listener_state() {
+  if command -v ss >/dev/null 2>&1; then
+    if ss -tln 2>/dev/null | grep -qE "[:.]${RPC_PORT}([^0-9]|\$)"; then echo listening; else echo free; fi
+    return
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    if lsof -nP -iTCP:"$RPC_PORT" -sTCP:LISTEN >/dev/null 2>&1; then echo listening; else echo free; fi
+    return
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    if netstat -an 2>/dev/null | grep -qE "[:.]${RPC_PORT}([^0-9]|\$).*LISTEN"; then echo listening; else echo free; fi
+    return
+  fi
+  echo unknown
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+  fails=0
+  expect() {  # <want: fork|calm> <label> <lead> <rows> <behind> <behind_at_start>
+    want="$1"; label="$2"; shift 2
+    if fork_condition_holds "$@"; then got=fork; else got=calm; fi
+    if [ "$got" != "$want" ]; then echo "self-test: $label should be $want, got $got"; fails=1; fi
+  }
+  # A real longer branch we cannot obtain: the 2026-09-05 shape. Always a fork,
+  # whatever the gap is doing.
+  expect fork "a branch leading by 671"            671 0 0 ""
+  expect calm "a branch leading by exactly 6"      6   0 0 ""
+  # THE REGRESSION. A mac catching up after days offline: far behind, over the
+  # sample threshold, and closing. Called FORK before 2026-09-06, which made
+  # observer-ok.sh refuse a release from a node provably on the live chain.
+  expect calm "4853 behind and closing"            0 9 4853 4860
+  expect calm "closing by a single block"          0 9 4859 4860
+  # Not closing is still an alarm: stuck, or losing ground.
+  expect fork "stuck at the same gap"              0 9 4860 4860
+  expect fork "gap growing"                        0 9 4870 4860
+  # Below the sample threshold nothing alarms yet.
+  expect calm "over the gap but only 4 samples"    0 4 4860 4860
+  # No window recorded: fall back to the sample count alone.
+  expect fork "rows met with no window recorded"   0 9 100 ""
+  if [ "$fails" -eq 0 ]; then echo "self-test: every case behaved"; exit 0; fi
+  exit 1
+fi
+
+last_blocks=""; stuck=0; behind_rows=0; fork_said=0; behind_at_start=""
 while true; do
   now="$(date -u +%FT%TZ)"; state=ok
 
-  if ! pgrep -x btxd >/dev/null 2>&1; then
+  if ! btxd_in_process_table; then
     state=btxd_down
     # Only touch pid files when nothing is listening either. A btxd that is
     # alive but momentarily missing from a pgrep race must never be "recovered".
-    if ! ss -tln 2>/dev/null | grep -q ':19334'; then
-      for f in btxd.pid easybtx-node.pid; do
-        if [ -f "$DD/$f" ]; then
-          mv "$DD/$f" "$DD/$f.stale-$(date -u +%Y%m%d%H%M%S)"
-          say "cleared stale $f (no btxd in the process table, nothing on 19334)"
+    #
+    # UNKNOWN IS NOT "NOTHING IS LISTENING". This test used to be a bare
+    # `! ss -tln | grep -q :19334`, and `ss` is Linux-only. On a host without
+    # it the command printed nothing, its "command not found" went to the
+    # suppressed stderr, grep failed, and the negation PASSED - so the guard
+    # read "nothing is listening" on every macOS host whatever was actually
+    # bound, and went on to move a LIVE node's pidfiles aside and start a
+    # second node against a locked datadir. That is the outage this script
+    # exists to notice, caused by this script. docs/node-release-recipe.md
+    # tells a release cutter to run this on a Mac, so it was a live trap.
+    case "$(rpc_port_listener_state)" in
+      listening)
+        say "btxd absent from the process table but $RPC_PORT is listening; leaving it alone"
+        ;;
+      unknown)
+        say "btxd absent from the process table and no usable listener probe (ss, lsof, netstat) - refusing to touch pidfiles"
+        ;;
+      free)
+        for f in btxd.pid easybtx-node.pid; do
+          if [ -f "$DD/$f" ]; then
+            mv "$DD/$f" "$DD/$f.stale-$(date -u +%Y%m%d%H%M%S)"
+            say "cleared stale $f (no btxd in the process table, nothing on $RPC_PORT)"
+          fi
+        done
+        if [ -n "$START_CMD" ]; then
+          say "btxd down -> $START_CMD"
+          bash -c "$START_CMD" >> "$LOG" 2>&1
+          state=restarted
+        else
+          say "btxd down and BTX_START_CMD is unset -> reporting only"
         fi
-      done
-      if [ -n "$START_CMD" ]; then
-        say "btxd down -> $START_CMD"
-        bash -c "$START_CMD" >> "$LOG" 2>&1
-        state=restarted
-      else
-        say "btxd down and BTX_START_CMD is unset -> reporting only"
-      fi
-    else
-      say "btxd absent from the process table but 19334 is listening; leaving it alone"
-    fi
+        ;;
+    esac
     printf '%s\t\t\t\t\t\t\t%s\n' "$now" "$state" >> "$TSV"
     sleep "$INTERVAL"; continue
   fi
@@ -200,7 +319,25 @@ while true; do
   att="$("$CLI" "${A[@]}" getmatmultrustedstatus 2>/dev/null | json_int stored_attestations)"
 
   if [ "$blocks" = "$last_blocks" ]; then stuck=$((stuck+1)); else stuck=0; fi
-  if [ "$behind" -gt "$FORK_BEHIND" ]; then behind_rows=$((behind_rows+1)); else behind_rows=0; fi
+  # The headers-ahead window, with the SAME closing test crates/btx-core/src/
+  # fork.rs applies in `headers_ahead`: remember how far behind we were when
+  # the window opened, so a gap that is shrinking never alarms.
+  #
+  # Without it this counted samples only, and a node catching up after days
+  # offline was called FORK on the fifth one. That is precisely the population
+  # 0.6.19 exists for, and it made observer-ok.sh refuse a release from a box
+  # whose node was provably on the live chain and merely behind. Measured
+  # 2026-09-06 on the mac cutting the 0.6.19 release: header tip hash identical
+  # to luckypool.io's at the same height, every headers-only branch forking at
+  # the active tip, `fork_lead` correctly 0, and this rule shouting FORK.
+  if [ "$behind" -gt "$FORK_BEHIND" ]; then
+    behind_rows=$((behind_rows+1))
+    [ -z "$behind_at_start" ] && behind_at_start="$behind"
+  else
+    behind_rows=0; behind_at_start=""
+  fi
+  # Closing? Then it is lag, whatever the sample count says. Strictly less, so
+  # a gap that is merely not growing still alarms.
   last_blocks="$blocks"
 
   # Ten samples with no new block AND measurably behind. At the default
@@ -226,7 +363,7 @@ while true; do
   # on stderr when it starts and every 15 samples (30 minutes) while it holds,
   # so a long one is not a single line lost in scrollback.
   lead="$(fork_lead)"
-  if [ "${lead:-0}" -gt "$FORK_LEAD" ] || [ "$behind_rows" -ge "$FORK_ROWS" ]; then
+  if fork_condition_holds "${lead:-0}" "$behind_rows" "$behind" "$behind_at_start"; then
     state=FORK
     if [ $((fork_said % 15)) -eq 0 ]; then
       msg="FORK: blocks $blocks, headers $headers, behind $behind for $behind_rows sample(s); longest branch this node cannot obtain leads ours by $lead"
