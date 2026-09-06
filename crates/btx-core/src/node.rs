@@ -3498,10 +3498,10 @@ matmul: metal runtime_probe_ok, selecting metal\n\
             "/Users/me/.easybtx/install/btx-0.30.1/bin/btxd"
         ));
         assert!(comm_looks_like_btxd("  btxd  ")); // surrounding whitespace tolerated
-        // The upstream 0.34.1+ wrapper layout: `bin/btxd` is a sh wrapper and
-        // the process that actually runs is `libexec/btxd.real`. Verbatim from
-        // the process table on 2026-09-06 while the 0.6.17 -> 0.6.19 mac
-        // upgrade was failing.
+                                                   // The upstream 0.34.1+ wrapper layout: `bin/btxd` is a sh wrapper and
+                                                   // the process that actually runs is `libexec/btxd.real`. Verbatim from
+                                                   // the process table on 2026-09-06 while the 0.6.17 -> 0.6.19 mac
+                                                   // upgrade was failing.
         assert!(comm_looks_like_btxd("btxd.real"));
         assert!(comm_looks_like_btxd(
             "/Users/bonuz/.local/btx/v0.34.5/macos-arm64/bin/../libexec/btxd.real"
