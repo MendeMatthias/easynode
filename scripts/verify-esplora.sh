@@ -76,6 +76,34 @@ code() { curl -sS --max-time "$TIMEOUT" -o /dev/null -w '%{http_code}' "$1" 2>/d
 
 echo "candidate : $CAND"
 echo "reference : $REF"
+
+# ── the candidate must not BE the reference ─────────────────────────────────
+# The UTXO set comparison is the check this whole script exists for, and it is
+# a comparison. Point it at one host twice and it agrees with itself perfectly,
+# every time, and the script prints "may be advertised to a wallet". That is a
+# silent vacuous pass on the one check that catches a Byron-Bay-class index.
+#
+# It is not hypothetical: the first run of this gate in this repository was
+# exactly that, because there was no second endpoint to compare against yet.
+# SELF_COMPARE=1 allows it for exercising the script, and says so in the
+# verdict so nobody quotes that run as an acceptance.
+selfcmp=0
+if [ "$CAND" = "$REF" ]; then
+  if [ "${SELF_COMPARE:-}" = "1" ]; then
+    selfcmp=1
+    echo
+    echo "⚠ SELF_COMPARE=1: candidate and reference are the SAME host. The set"
+    echo "  comparison below compares this endpoint with itself and cannot fail."
+    echo "  This run exercises the script. It accepts nothing."
+  else
+    echo
+    echo "ABORT: the candidate and the reference are the same host ($CAND)." >&2
+    echo "       The UTXO set comparison would compare it with itself, agree, and" >&2
+    echo "       report a pass that means nothing. Give REF_API a DIFFERENT known-good" >&2
+    echo "       endpoint, or set SELF_COMPARE=1 if you are only exercising this script." >&2
+    exit 2
+  fi
+fi
 echo
 
 # ── 0. the reference must actually be alive, or nothing below means anything ──
@@ -367,7 +395,13 @@ printf '  passed %d, failed %d' "$pass" "$fail"
 [ "$futurefail" -gt 0 ] && printf ', %d future-capability note(s)' "$futurefail"
 printf '\n'
 if [ "$fail" -eq 0 ]; then
-  echo "  This endpoint may be advertised to a wallet."
+  if [ "$selfcmp" -eq 1 ]; then
+    echo "  NOT AN ACCEPTANCE: the candidate was compared with itself"
+    echo "  (SELF_COMPARE=1), so the UTXO set check could not fail. Re-run"
+    echo "  against a different known-good reference before advertising this."
+  else
+    echo "  This endpoint may be advertised to a wallet."
+  fi
   if [ "$futurefail" -gt 0 ]; then
     echo "  Some capability notes above are not failures; read them."
   fi

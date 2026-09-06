@@ -16,6 +16,9 @@ is worth doing at all.
 | `test-vectors/` | real blocks rust-btx's tests decode byte-exactly (vendored) |
 | `build-electrs.sh` | builds `electrs` from the tree above and installs it |
 | `build-caddy.sh` | builds a Caddy WITH the rate-limit plugin this front needs |
+| `install-systemd.sh` | installs the units for the server path, refusing a pruned node first |
+| `test-front.sh` | starts the real Caddyfile against stubs and checks every claim in it |
+| `test-guardian.sh` | runs the freshness guardian against stubs and pins that it agrees with the Rust |
 | `Caddyfile.template` | the TLS + CORS + freshness front. Reads `BTX_ESPLORA_HOST` and `BTX_ESPLORA_RUN` |
 | `electrs.service.template` | the indexer as a systemd unit. Replace `USER` and the two data paths |
 | `btxd.service.template` | btxd as a unit, for a server that does not run the easyNode app |
@@ -42,21 +45,39 @@ Everything lives under `<datadir>/esplora/`: `run/` (the markers),
 **Without the app, on a server.** The units and the timer, the way
 api.btxscan.io runs:
 
-1. **Check you can.** `prune=0` is not advice, it is a precondition: electrs
-   indexes from btxd's block files and refuses a pruned node outright. A
-   pruned datadir needs a resync; there is no shortcut.
-2. `build-electrs.sh`, then `electrs.service.template` →
-   `/etc/systemd/system/electrs.service` with the paths filled in.
-3. `build-caddy.sh`. Stock Caddy refuses this Caddyfile (`rate_limit`).
-4. Install `btx-staleness-check.sh` to `/usr/local/bin/`, enable the timer.
-   Confirm it writes exactly one of `/run/btx-{fresh,stale,unverified}` and
-   says why on stdout (`journalctl -u btx-staleness`).
-5. `BTX_ESPLORA_HOST=… caddy run --config Caddyfile.template --adapter caddyfile`,
-   or the same through a unit of your own.
-6. **Run the gate before telling anyone the endpoint exists:**
+```bash
+deploy/esplora/build-electrs.sh
+deploy/esplora/build-caddy.sh          # stock Caddy refuses this Caddyfile
+deploy/esplora/install-systemd.sh --host esplora-1.example.com          # prints the plan
+deploy/esplora/install-systemd.sh --host esplora-1.example.com --yes    # does it
+```
+
+`install-systemd.sh` changes nothing without `--yes`, and before it changes
+anything it asks **btxd itself** whether the datadir is pruned. It does not
+read the conf for that: a datadir's own `btx_rw.conf` outranks the conf file,
+and a node on this project ran pruned for weeks against a conf that said
+`prune=0`. It also refuses when either binary is missing, or when the caddy on
+PATH has no `rate_limit` module.
+
+Then, in order:
+
+1. `journalctl -fu electrs` — the first index takes hours on a full chain.
+2. `curl -sI https://your-host/blocks/tip/height | grep -i x-btx-freshness`.
+   It says `unverified` until the guardian has judged it against the census,
+   which is the honest state on the way up.
+3. **Run the gate before telling anyone the endpoint exists**, against a
+   reference that is *not* this host — the gate refuses a self-comparison,
+   because comparing an endpoint with itself agrees every time:
    ```bash
    scripts/verify-esplora.sh https://your-host <mainnet-address-with-spend-history> …
    ```
+
+Both moving parts have their own tests, which need no node and no network:
+
+```bash
+deploy/esplora/test-front.sh      # the Caddyfile, started, against stubs
+deploy/esplora/test-guardian.sh   # the freshness rules, executed
+```
 
 ## Four things that will bite
 
