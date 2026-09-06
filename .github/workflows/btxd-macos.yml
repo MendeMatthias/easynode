@@ -54,6 +54,23 @@ name: Build macOS btxd (Metal source build, smoked on the runner)
 # does. Runtime compilation needs a FOREGROUND btxd — the app never passes
 # `-daemon`, and `stage-node-pkg-mac-source.sh` says so at length.
 #
+# ── PROVEN, 2026-09-06 ──────────────────────────────────────────────────────
+# Run 34063738825 is green end to end on macos-15, and it produced an engine
+# provably identical in source to the one that shipped:
+#
+#     reports v0.34.6 from 9eb4e0050e08ea3ef768bac276dac9cbd2e84542
+#     source fingerprint a7bf4bd74375b2690eda5a3b13c800e52e2f853ec53983c8f27ac06b2094236b
+#
+# That fingerprint is byte for byte the one the hand-built 0.6.19 mac engine
+# carries, and the one the Linux engine was built from. So Mac and Linux are not
+# merely "the same app": they are the same tree, and now both provable by a job
+# rather than by one laptop. BUILD_GIT_DIRTY 0, upstream's release gate PASS on
+# both binaries, Metal.framework linked, and the regtest smoke mined a block.
+#
+# Six runs to get there, and every failure was a fact about building this tree
+# on macOS that was written down nowhere before. They are recorded above rather
+# than deleted, because the next person will otherwise rediscover them.
+#
 # ── THE GATE THAT MATTERS HERE ──────────────────────────────────────────────
 # On Linux the shipping risk is a btxd with no GPU kernels. On macOS it is a
 # btxd that cannot LAUNCH on a machine without Homebrew: the tree's finders
