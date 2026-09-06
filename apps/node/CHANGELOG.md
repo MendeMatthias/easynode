@@ -8,6 +8,19 @@ root).
 
 ## [Unreleased]
 
+**"Check now" stops blaming your connection for a release that has no build for
+your platform.** Single-platform releases are the normal cadence here, and a
+copy on a platform the release skips is meant to stay exactly where it is. The
+updater does not report that as "no update" though — it reports an error,
+because it looks for your platform's download before it compares versions — and
+one catch answered every check failure with "Couldn't check right now, are you
+online?". On 6 September 0.6.20 went out for Linux alone and every Mac and
+Windows copy that pressed the button was told to check its network. It now says
+what is actually true: this release has no build for your platform, this copy
+stays where it is, and downloads for every platform are on the site. A real
+network failure still reads as one. (The automatic six-hourly check stays
+silent either way; there is nothing to act on.)
+
 ## [0.6.20] - 2026-09-06 · linux
 
 **Your node can settle a fork for a wallet, whatever its size.** There is a
