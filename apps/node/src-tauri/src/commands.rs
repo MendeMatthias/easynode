@@ -1908,6 +1908,12 @@ pub struct NodeStatusInfo {
     pub stall: Option<btx_core::watchdog::StallVerdict>,
     /// The user's node profile CHOICE ("full" | "keeper").
     pub node_profile: String,
+    /// Whether this datadir has already deleted blocks, read from the folder
+    /// rather than from the conf the app itself wrote. The two disagree on any
+    /// datadir that pruned before this app managed it, and the folder wins:
+    /// a pruned datadir cannot be talked into keeping everything, so a profile
+    /// that says "keep it all" is a claim the app cannot make good on.
+    pub datadir_pruned: bool,
     /// Whether the bundled engine can honour the keeper profile. When the
     /// choice is "keeper" and this is false, the UI says the profile arrives
     /// with the next engine update — the choice is stored, not lost.
@@ -2207,6 +2213,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         archive_peers,
         stall: state.stall_verdict.lock().await.clone(),
         node_profile: settings.node_profile.clone(),
+        datadir_pruned: btx_core::node::datadir_has_pruned(&datadir),
         keeper_engine_ready: btx_core::installer::engine_supports_keeper_profile(NODE_RELEASE_TAG),
         esplora_enabled: settings.esplora_enabled,
         esplora_listen: settings.esplora_listen.clone(),

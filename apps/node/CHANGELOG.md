@@ -40,6 +40,28 @@ when its address is in the wallet's own built-in list, so turning this on does
 not by itself put your node to work; and it answers block hashes and refuses
 every other question.
 
+**A node folder that had already saved space could refuse to start, and the
+app said to delete it.** Since 0.6.18 the app has stated the disk posture on
+the command line, so that a folder which remembered a different one could not
+silently override the app. That was a real fix. It had a worse edge: a folder
+that has already deleted old blocks cannot be told to keep them all. The engine
+refuses to start against it — "you need to rebuild the database using
+-reindex" — and it exits before the app can reach it, so the node simply never
+came up, and the only advice on screen was to remove the node data and start
+again from a snapshot. The reachable case is not unusual: any folder set up by
+the older installer, which saved space by default, and then carried into this
+one. An app update is what restarts them all at once, which is what made this
+worth finding before this release went out rather than after.
+
+The app now reads what the folder IS rather than what the app once wrote about
+it, and never asks a folder that has already saved space to keep everything. It
+starts as what it is. The "Keep less on disk" row says so plainly instead of
+offering a choice that was already made, and it says the part that matters for
+this release: a node that saved space can still help wallets check the chain,
+because that needs the list of blocks rather than the blocks. Nothing changes
+for a folder that has kept everything — it is still held to keeping everything,
+which is what 0.6.18 was for.
+
 **What has not changed: the engine, and how much of the fleet validates for
 itself.** The engine stays v0.34.6 at commit `9eb4e005`, as in 0.6.18 and
 0.6.19. Two device classes validate the MatMul fork independently: NVIDIA
