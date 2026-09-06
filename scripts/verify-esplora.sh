@@ -51,7 +51,23 @@ TIMEOUT="${TIMEOUT:-25}"
 
 # Heights that must match the reference. 187661 and 187662 are the reorg window
 # above; the rest are ordinary spot checks either side of it.
+#
+# ⚠ EVERY ONE OF THESE IS ANCIENT, AND THAT WAS A HOLE. The highest fixed
+# height here is 205000. The 2026-09-05 split forked at 210496 and a mirror sat
+# on the losing side of it for a day. Two endpoints on opposite sides of that
+# split agree at every height in this list, because all of them are below the
+# fork — so this section would have printed eight PASSes for an endpoint on a
+# dead branch. Below a fork point every chain is byte-identical; that is the
+# whole reason the census publishes settled hashes above one.
+#
+# So a RECENT height is added at run time, from the census, and the fixed list
+# stays for the old reorg window it documents. The census check below is the
+# one that places the endpoint on a chain; this makes the height list stop
+# implying a coverage it never had.
 WITNESS_HEIGHTS="${WITNESS_HEIGHTS:-150000 180000 187660 187661 187662 190000 199297 205000}"
+# Filled from the census once it is read, so the loop also asks about a height
+# ABOVE the most recent fork the network has seen.
+RECENT_WITNESS=""
 
 pass=0; fail=0; futurefail=0
 ok()   { printf '  \033[32mPASS\033[0m  %s\n' "$*"; pass=$((pass+1)); }
@@ -76,6 +92,34 @@ code() { curl -sS --max-time "$TIMEOUT" -o /dev/null -w '%{http_code}' "$1" 2>/d
 
 echo "candidate : $CAND"
 echo "reference : $REF"
+
+# ── the candidate must not BE the reference ─────────────────────────────────
+# The UTXO set comparison is the check this whole script exists for, and it is
+# a comparison. Point it at one host twice and it agrees with itself perfectly,
+# every time, and the script prints "may be advertised to a wallet". That is a
+# silent vacuous pass on the one check that catches a Byron-Bay-class index.
+#
+# It is not hypothetical: the first run of this gate in this repository was
+# exactly that, because there was no second endpoint to compare against yet.
+# SELF_COMPARE=1 allows it for exercising the script, and says so in the
+# verdict so nobody quotes that run as an acceptance.
+selfcmp=0
+if [ "$CAND" = "$REF" ]; then
+  if [ "${SELF_COMPARE:-}" = "1" ]; then
+    selfcmp=1
+    echo
+    echo "⚠ SELF_COMPARE=1: candidate and reference are the SAME host. The set"
+    echo "  comparison below compares this endpoint with itself and cannot fail."
+    echo "  This run exercises the script. It accepts nothing."
+  else
+    echo
+    echo "ABORT: the candidate and the reference are the same host ($CAND)." >&2
+    echo "       The UTXO set comparison would compare it with itself, agree, and" >&2
+    echo "       report a pass that means nothing. Give REF_API a DIFFERENT known-good" >&2
+    echo "       endpoint, or set SELF_COMPARE=1 if you are only exercising this script." >&2
+    exit 2
+  fi
+fi
 echo
 
 # ── 0. the reference must actually be alive, or nothing below means anything ──
@@ -130,6 +174,21 @@ for c in chains:
 ' "$RACE_DEPTH" 2>/dev/null)"
   read -r census_tip census_prefix census_chain <<<"$(printf '%s' "$census_read" | head -1)"
   census_deep="$(printf '%s' "$census_read" | tail -n +2)"
+  # A settled height from the heaviest chain: recent, above every fork the
+  # census knows, and therefore the only height in the whole comparison that
+  # can tell two sides of a current split apart.
+  RECENT_WITNESS="$(printf '%s' "$census_json" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for c in ((d.get("chains") or {}).get("chains") or []):
+    if c.get("heaviest"):
+        for b in reversed(c.get("settled") or []):
+            if isinstance(b.get("height"), int):
+                print(b["height"]); sys.exit(0)
+' 2>/dev/null)"
 fi
 
 # Does the endpoint at $1 positively serve a DEEP competing chain's tip? Echoes
@@ -233,12 +292,31 @@ if [ -n "$census_tip" ]; then
     case "$a" in
       "$census_prefix"*) ok "/block-height/$census_tip is the heaviest measured chain's tip (${census_prefix}…)" ;;
       '') future "/block-height/$census_tip not served: this endpoint cannot be placed on a chain positively (it is on no deep branch)" ;;
-      *)  ok "on no deep branch: not on any chain the census says forked more than $RACE_DEPTH blocks down"
-          info "it serves ${a:0:16}… at $census_tip where the census has ${census_prefix}…, which is a mining race, not a divergence" ;;
+      *)  # Not a match and not empty. It might be a mining race, or it might
+          # be an error body: electrs answers a height it does not have with a
+          # 404 whose body is text, and `curl` without -f prints that body, so
+          # "not the expected prefix" covered both. Only something that LOOKS
+          # like a block hash is evidence of a race.
+          case "$a" in
+            [0-9a-f]*)
+              if [ "${#a}" -eq 64 ]; then
+                ok "on no deep branch: not on any chain the census says forked more than $RACE_DEPTH blocks down"
+                info "it serves ${a:0:16}… at $census_tip where the census has ${census_prefix}…, which is a mining race, not a divergence"
+              else
+                bad "/block-height/$census_tip returned ${#a} hex characters, not a 64-character block hash: '${a:0:60}'"
+              fi ;;
+            *)  bad "/block-height/$census_tip did not return a block hash: '${a:0:60}'" ;;
+          esac ;;
     esac
   fi
 fi
 wfail=0
+if [ -n "$RECENT_WITNESS" ]; then
+  info "adding height $RECENT_WITNESS from the census: every fixed height above is below the 2026-09-05 fork at 210496"
+  WITNESS_HEIGHTS="$WITNESS_HEIGHTS $RECENT_WITNESS"
+else
+  info "no recent height available from the census; the fixed heights below are ALL under the 2026-09-05 fork at 210496 and cannot tell two sides of a current split apart"
+fi
 for h in $WITNESS_HEIGHTS; do
   a="$(get "$CAND/block-height/$h" | tr -d '\r\n')"
   b="$(get "$REF/block-height/$h"  | tr -d '\r\n')"
@@ -313,17 +391,42 @@ PY
              info "a wallet will build transactions spending them and every broadcast will fail" ;;
     esac
 
-    # Independent of the reference: prove each claimed-unspent output is unspent.
+    # Prove each claimed-unspent output really is unspent — ASKING THE
+    # REFERENCE, not the candidate.
+    #
+    # This queried $CAND until 2026-09-06, under a comment that said
+    # "independent of the reference". It was not independent of anything: it
+    # asked the same host, backed by the same index, to corroborate the list
+    # that index had just produced.
+    #
+    # For the exact defect this gate exists to catch, the two routes cannot
+    # disagree. In the vendored electrs, `utxo_delta` drops an outpoint on the
+    # Spending history row and `lookup_spend` reads the TxEdgeRow, and
+    # `index_transaction` writes both in the same batch from the same loop. A
+    # spending transaction that was never indexed leaves NEITHER, so /utxo
+    # lists the output as unspent and /outspend answers from
+    # `impl Default for SpendingValue` — `spent: false`, HTTP 200. Byron Bay's
+    # index did precisely that on 116 outputs. The loop therefore reached
+    # bad_spend=0 every time and printed PASS, sometimes on the very line after
+    # the set comparison had printed FAIL for the same address.
     outspend="$(python3 - "$ca" <<'PY'
 import json, sys
 try: print(" ".join("%s:%d" % (o["txid"], o["vout"]) for o in json.loads(sys.argv[1])[:25]))
 except Exception: pass
 PY
 )"
+    # An address whose UTXO set is EMPTY on both sides agrees trivially and
+    # then skips this loop entirely, so it scored two passes while proving
+    # nothing. The gate asks for addresses WITH SPEND HISTORY for a reason; say
+    # so rather than banking the pass.
+    if [ -z "$outspend" ]; then
+      bad "$addr: no unspent outputs to prove. Pass an address that HOLDS coins and has spend history; an empty set agrees with anything."
+      continue
+    fi
     bad_spend=0; checked=0
     for op in $outspend; do
       t="${op%%:*}"; v="${op##*:}"
-      sp="$(get "$CAND/tx/$t/outspend/$v")"
+      sp="$(get "$REF/tx/$t/outspend/$v")"
       checked=$((checked+1))
       case "$sp" in
         *'"spent":true'*)  bad_spend=$((bad_spend+1)) ;;
@@ -333,8 +436,8 @@ PY
     done
     if [ "$checked" -gt 0 ]; then
       [ "$bad_spend" -eq 0 ] \
-        && ok "$addr: all $checked sampled outputs prove genuinely unspent" \
-        || bad "$addr: $bad_spend of $checked claimed-unspent outputs are spent or unprovable"
+        && ok "$addr: the reference agrees all $checked sampled outputs are unspent" \
+        || bad "$addr: $bad_spend of $checked outputs the candidate calls unspent are spent, or unprovable, at the reference"
     fi
   done
 fi
@@ -367,7 +470,13 @@ printf '  passed %d, failed %d' "$pass" "$fail"
 [ "$futurefail" -gt 0 ] && printf ', %d future-capability note(s)' "$futurefail"
 printf '\n'
 if [ "$fail" -eq 0 ]; then
-  echo "  This endpoint may be advertised to a wallet."
+  if [ "$selfcmp" -eq 1 ]; then
+    echo "  NOT AN ACCEPTANCE: the candidate was compared with itself"
+    echo "  (SELF_COMPARE=1), so the UTXO set check could not fail. Re-run"
+    echo "  against a different known-good reference before advertising this."
+  else
+    echo "  This endpoint may be advertised to a wallet."
+  fi
   if [ "$futurefail" -gt 0 ]; then
     echo "  Some capability notes above are not failures; read them."
   fi

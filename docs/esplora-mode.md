@@ -337,35 +337,95 @@ exact best block", because BTX mines races and a race flips both the heaviest
 flag and the published tip hash within a block or two. The rules follow that
 distinction now, and the threshold between the two is `RACE_DEPTH`, six blocks.
 
+### Settled blocks made this provable
+
+The paragraph that used to end this section asked for exactly one thing: hashes
+below the racing window, so an endpoint could be placed on a chain positively
+rather than by elimination. [EasyBTX#468](https://github.com/MendeMatthias/EasyBTX/pull/468)
+publishes them. Each chain in the feed now carries up to ten
+`(height, hash-prefix)` pairs, every one at least six blocks below that chain's
+tip and above its fork, drawn from the chain's own witness headers.
+
+Six is `SPLIT_MIN_LEAD` on the site, the number of blocks it already required
+before calling a branch a chain, and `RACE_DEPTH` here. The two were chosen
+independently and agree, which is the right answer for the same reason in both
+places: it is btxd's own emergency park depth.
+
+The **newest askable pair decides**. Below a fork every chain is byte-identical,
+so a match deep down proves nothing about which side an endpoint is on; the
+deepest useful question is the shallowest settled one.
+
 ### The rules
 
 Implemented in `esplora_freshness.rs` and identically in
 `deploy/esplora/btx-staleness-check.sh`; the acceptance gate applies the same
-deep-branch test.
+deep-branch test. Both are executed by tests —
+`deploy/esplora/test-guardian.sh` runs the shell against stubs and pins that
+the two agree.
 
 | in this order | evidence | verdict |
 |---|---|---|
 | 1 | the served tip is unknown | `unverified` |
 | 2 | no census, older than 30 min, or no heaviest chain with a usable tip | `unverified` |
-| 3 | the endpoint holds the tip of a competing chain that forked more than 6 blocks below the heaviest tip | `unverified`, and the chain and its fork height are named |
-| 4 | at or past the census tip, and the block served there IS the census tip | `fresh` |
-| 5 | at or past the census tip, and it is not | `unverified`, said as a probable race, not an accusation |
-| 6 | more than 3 blocks below the census tip | `stale` |
-| 7 | within 3 blocks, not comparable | `unverified` |
+| 3 | a settled block of the heaviest chain **matches** | `fresh`, or `stale` when more than 3 below its tip |
+| 4 | a settled block of the heaviest chain **differs** | `unverified`, a real divergence; the chain it is on is named when the feed allows |
+| 5 | the endpoint holds the tip of a competing chain that forked more than 6 blocks below the heaviest tip | `unverified`, and the chain and its fork height are named |
+| 6 | at or past the census tip, and the block served there IS the census tip | `fresh` |
+| 7 | at or past the census tip, and it is not | `unverified`, said as a probable race, not an accusation |
+| 8 | more than 3 blocks below the census tip | `stale` |
+| 9 | within 3 blocks, not comparable | `unverified` |
 
-Rule 3 runs before any height comparison: an endpoint on a minority branch is
-`unverified` however current it looks, because an overstated balance from the
-wrong chain reaching a signing wallet is worse than a stale one. `fresh` needs
-positive evidence, so on a racing network an honest endpoint will read
-`unverified` some of the time, and the header says which. The Caddy front now
-answers `unverified` when no marker exists at all (`PROVENANCE.md` says why
-that differs from the original).
+Rules 3 and 4 are the only ones that prove anything; everything below them is
+inference from heights and from a tip hash that is regularly an orphan. They
+run first for that reason. Rules 5 to 9 remain because a feed published before
+#468 carries no settled pairs, and a guardian that broke on an older feed would
+be worse than one that is merely less certain.
 
-**What would sharpen this, and it is a small change to the site:**
-`recentHashes` per chain in the public feed, a handful of blocks below each
-tip where a race has settled. Then an endpoint could be placed on a chain
-positively rather than by elimination, and rule 5 would become a real answer
-instead of a shrug.
+Rule 5 still runs before any height comparison: an endpoint on a minority
+branch is `unverified` however current it looks, because an overstated balance
+from the wrong chain reaching a signing wallet is worse than a stale one. The
+Caddy front answers `unverified` when no marker exists at all
+(`PROVENANCE.md` says why that differs from the original).
+
+The measured case, end to end: an endpoint at 211416 that does **not** hold the
+census's heaviest tip 211404, because that tip was a one-block orphan. Before
+settled pairs it read `unverified`. It now reads `fresh`, proven at the settled
+block 211398, and both the Rust and the shell say so with the height that
+proved it.
+
+## The software is proven; the deployment is not
+
+Those are different claims and this document used to have no way to make the
+first one. `deploy/esplora/test-stack.sh` runs the whole stack against a real
+BTX node on a throwaway **regtest** chain: btxd mines it, the vendored electrs
+indexes it and serves the wallet's routes, and the Caddy front sits in front.
+
+That matters because until it ran, the fork of Blockstream's indexer and the
+BTX consensus decode crate beside it had been vendored, compiled and
+unit-tested, and never once asked to index a chain and answer a wallet. Eleven
+checks, all passing, in about thirty seconds:
+
+| | |
+|---|---|
+| btxd on regtest | answers RPC; a P2MR address encodes to something it accepts |
+| mining | 20 blocks — regtest needs no GPU for the MatMul proof |
+| electrs | indexes to the tip |
+| **`/block-height/<h>`** | **equals btxd's own `getblockhash`** |
+| `/blocks`, `/mempool` | 200 |
+| `/address/<a>/utxo` | lists the coinbase outputs: the address index works |
+| the front | same tip end to end, `X-Btx-Freshness: fresh`, CORS exactly once |
+
+The fourth row is the one worth pausing on. It is `rust-btx` decoding real BTX
+blocks — a 182-byte header with a trailing MatMul payload, a shape upstream
+rust-bitcoin cannot read — and arriving at the same hash as the node that made
+them. That is the assumption the whole port rests on, and it had never been
+checked outside the crate's own tests.
+
+**What it does not prove**, said plainly so nobody quotes it as an acceptance:
+nothing about mainnet scale, nothing about a mainnet index, and nothing about
+an endpoint's correctness against another source. Regtest blocks are trivial
+and there are twenty of them. That is `scripts/verify-esplora.sh` against a
+full unpruned node, below.
 
 ## Acceptance status, 2026-09-06
 
@@ -379,7 +439,18 @@ because none exists yet that can pass its precondition:
 - The box has 54 GB free against a 124 GiB chain plus an unmeasured index, so
   a second unpruned datadir cannot live there either.
 
-What was run instead, all on 2026-09-05/06 and all in the pull request:
+What was run instead, all on 2026-09-05/06 and all in the pull requests:
+
+- the whole stack on a regtest chain (above): 11 checks, including electrs
+  agreeing with btxd on a block hash and the address index returning real
+  outputs;
+- the Caddy front against stubs: 17 checks. Its first run found the per-IP rate
+  limit had never been in force, because a bare `rate_limit` beside `handle`
+  blocks is ordered after a directive that terminates routing. A 300-request
+  burst was served in full; it is now 184 served and 116 refused;
+- the freshness guardian against stubs: 10 checks, pinning that the shell
+  agrees with the Rust, which had been asserted since the port and never
+  tested;
 
 - rust-btx's suite in its vendored location: 25 tests, pass.
 - `build-electrs.sh` on this box with no root, which is how it found that the

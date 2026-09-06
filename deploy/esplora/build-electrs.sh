@@ -37,7 +37,16 @@ command -v cargo >/dev/null 2>&1 || {
 
 # libclang: the system one if present, else the pip one, else say what is missing.
 if [ -z "${LIBCLANG_PATH:-}" ]; then
-  if ! ls /usr/lib/llvm-*/lib/libclang*.so* /usr/lib/*/libclang*.so* >/dev/null 2>&1; then
+  # `ls a b` fails when EITHER pattern matches nothing, so this probe reported
+  # "no system libclang" on a machine that had one in /usr/lib/x86_64-linux-gnu
+  # but no /usr/lib/llvm-*/ directory — a normal Debian layout. It then fell
+  # through to the pip library, which has no builtin headers, and the build
+  # died on stdbool.h with a message about bindgen.
+  have_system_libclang=0
+  for pat in /usr/lib/llvm-*/lib/libclang*.so* /usr/lib/*/libclang*.so* /usr/lib64/libclang*.so*; do
+    [ -e "$pat" ] && { have_system_libclang=1; break; }
+  done
+  if [ "$have_system_libclang" -eq 0 ]; then
     pyclang="$(python3 -c 'import clang, os; print(os.path.join(os.path.dirname(clang.__file__), "native"))' 2>/dev/null || true)"
     if [ -n "$pyclang" ] && [ -e "$pyclang/libclang.so" ]; then
       export LIBCLANG_PATH="$pyclang"

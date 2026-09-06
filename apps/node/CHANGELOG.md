@@ -23,6 +23,44 @@ nothing is downloaded: the two binaries are built from the source vendored in
 this repository. The front listens on localhost until you give it a name.
 `docs/esplora-mode.md` has the design and the acceptance gate.
 
+**It says which block proves it.** Freshness used to be able to say only that
+nothing looked wrong. The chain census published one hash per chain, its tip,
+and on this chain a tip is regularly a one-block orphan: on 6 September the
+heaviest chain's published tip was a block this project's own validator held as
+a side tip while its active chain ran twelve blocks past it. So a node could be
+placed on a chain only by elimination. The site now publishes settled block
+hashes, six or more blocks below each chain's tip where a race has resolved,
+and your node is placed on a chain by asking it for one of those blocks. The
+verdict names the height that proved it, so it can be checked rather than
+believed.
+
+**A first index no longer looks like a broken node.** electrs answers nothing
+until its index is built, which on a full chain is hours, and Settings used to
+report that as an endpoint that "did not answer". It now says the index is
+building, that the node keeps working throughout, and where the log is — and
+does not colour it as a problem, because it is not one.
+
+**The preflight is asked before the switch, not after the refusal.** Opening
+Settings now tells you whether this datadir can serve Esplora at all, what the
+disk will cost, and whether `electrs` and `caddy` are installed, naming the
+script that builds a missing one. All of that was computed before and shown to
+nobody.
+
+**For operators running a server without this app:**
+`deploy/esplora/install-systemd.sh` installs the units, and refuses first — it
+asks btxd itself whether the datadir is pruned rather than trusting the config
+file, because a datadir's own settings outrank it. It changes nothing without
+`--yes`.
+
+**Things that were only comments are now tests.** The Caddy front had never
+been started; running it found that the per-IP rate limit had never been in
+force, because the directive was ordered after one that terminates routing. A
+300-request burst used to be served in full. The freshness guardian had never
+been executed either, though its rules were documented as identical to the
+app's. Both now run against local stubs in CI, and the acceptance gate refuses
+to compare an endpoint with itself, which had produced a pass that meant
+nothing.
+
 ## [0.6.19] - 2026-09-06 · linux
 
 **The node follows the chain with the most work again.** Since 0.6.7 the

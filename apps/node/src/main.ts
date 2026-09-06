@@ -136,11 +136,34 @@ export interface NodeStatusInfo {
   /** Esplora mode: serve the Esplora REST API to wallets from this node. */
   esplora_enabled: boolean;
   esplora_listen: string;
+  /** The address the RUNNING front is bound to; null when nothing runs. Not
+   *  the same as the setting, which applies at the next start. */
+  esplora_serving_on: string | null;
   esplora_running: boolean;
+  /** Both sidecars alive, no tip yet: a first index, which takes hours. */
+  esplora_indexing: boolean;
   /** fresh | stale | unverified from the census guardian; null until judged. */
   esplora_freshness: string | null;
   /** The guardian's reason while running, else why the front is not. */
   esplora_message: string | null;
+}
+
+/**
+ * What `esplora_preflight` answers: can this machine serve Esplora, what will
+ * it cost, and are the two binaries even here. Read BEFORE the operator flips
+ * the switch, which is the only moment any of it is useful.
+ */
+interface EsploraPreflight {
+  allowed: boolean;
+  /** The gate's sentence when it refuses: a pruning conf, an already-pruned
+   *  datadir, or the keeper profile. Each needs a different conversation. */
+  blocker: string | null;
+  /** Non-blocking costs, chiefly the disk one. */
+  warnings: string[];
+  /** Where the binaries were found, or null when they are not installed. */
+  electrs_found: string | null;
+  caddy_found: string | null;
+  listen: string;
 }
 
 interface ReclaimReport {
@@ -740,6 +763,10 @@ $("settings-btn").addEventListener("click", async () => {
     reflectKeeperRow(lastStatus);
     reflectEsploraRow(lastStatus);
   }
+  // The preflight is a question about the machine, so it is asked when the
+  // panel opens rather than on the status poll: it reads the conf, the node
+  // and the disk, and none of that changes second to second.
+  void refreshEsploraPreflight();
   try {
     $<HTMLInputElement>("autostart-toggle").checked = await isEnabled();
   } catch {
@@ -787,11 +814,23 @@ $<HTMLInputElement>("keeper-toggle").addEventListener("change", (e) => {
 // and shows its sentence — the switch springs back rather than staying on and
 // inert. A missing electrs or caddy is refused the same way, naming the build
 // script. The address row applies at the next start of the front.
+let esploraToggleBusy = false;
 $<HTMLInputElement>("esplora-toggle").addEventListener("change", async (e) => {
   const box = e.target as HTMLInputElement;
   const on = box.checked;
   const result = $("esplora-result");
-  result.hidden = true;
+  // Turning this on spawns two processes and waits to see they survived, so it
+  // is seconds, not milliseconds. Without a guard a second click issues a
+  // concurrent set_esplora and the two race over the same slot.
+  if (esploraToggleBusy) {
+    box.checked = !on;
+    return;
+  }
+  esploraToggleBusy = true;
+  box.disabled = true;
+  result.classList.remove("is-error");
+  result.textContent = on ? "Starting electrs and the front…" : "Stopping…";
+  result.hidden = false;
   try {
     const msg = await invoke<string>("set_esplora", { on });
     result.classList.remove("is-error");
@@ -802,6 +841,9 @@ $<HTMLInputElement>("esplora-toggle").addEventListener("change", async (e) => {
     result.textContent = String(err); // the Rust side's sentence, not a stack trace
   }
   result.hidden = false;
+  box.disabled = false;
+  esploraToggleBusy = false;
+  void refreshEsploraPreflight();
 });
 
 async function saveEsploraListen(): Promise<void> {
@@ -822,6 +864,42 @@ $("esplora-listen").addEventListener("keydown", (e) => {
   if ((e as KeyboardEvent).key === "Enter") void saveEsploraListen();
 });
 
+/**
+ * Ask whether this machine can serve Esplora, and say so under the switch.
+ *
+ * Everything here was already computed and thrown away: the prune gate's
+ * three-way refusal, the measured disk cost, and whether electrs and caddy are
+ * installed at all. Rendering it before the switch is flipped is the whole
+ * point of a preflight — the alternative is an operator learning the answer
+ * from a refusal.
+ */
+async function refreshEsploraPreflight(): Promise<void> {
+  const el = $("esplora-preflight");
+  let p: EsploraPreflight;
+  try {
+    p = await invoke<EsploraPreflight>("esplora_preflight");
+  } catch {
+    el.hidden = true; // never a scary line for a failure the operator cannot act on
+    return;
+  }
+  const lines: string[] = [];
+  el.classList.toggle("is-error", !p.allowed);
+  if (!p.allowed && p.blocker) {
+    lines.push(p.blocker);
+  } else {
+    // Name what is missing and the script that builds it. Nothing is
+    // downloaded by the app, so this is the operator's next command.
+    const missing: string[] = [];
+    if (!p.electrs_found) missing.push("electrs (deploy/esplora/build-electrs.sh)");
+    if (!p.caddy_found) missing.push("caddy with the rate-limit plugin (deploy/esplora/build-caddy.sh)");
+    if (missing.length) lines.push("Not installed yet: " + missing.join("; ") + ".");
+    else lines.push(`Ready: electrs at ${p.electrs_found}, caddy at ${p.caddy_found}.`);
+  }
+  for (const w of p.warnings) lines.push(w);
+  el.textContent = lines.join(" ");
+  el.hidden = lines.length === 0;
+}
+
 const ESPLORA_STATIC_COPY =
   "Serve the Esplora API to wallets from your own full node. Needs the whole chain on disk (never a pruned node), electrs and Caddy built from deploy/esplora, and disk for the index";
 
@@ -840,15 +918,36 @@ function reflectEsploraRow(status: NodeStatusInfo): void {
   desc.classList.remove("needs-attention");
   if (!status.esplora_enabled) {
     desc.textContent = ESPLORA_STATIC_COPY;
+  } else if (status.esplora_indexing) {
+    // Work in progress, NOT a problem: no amber. A first index on a full chain
+    // runs for hours and the node serves the network the whole time.
+    desc.textContent = status.esplora_message ?? "electrs is building its index.";
   } else if (status.esplora_running) {
+    // The address the front is BOUND to, not the setting. Changing the setting
+    // while the front is up applies at the next start, so naming the setting
+    // here would tell someone to point a wallet at a port nothing is on.
+    const where = status.esplora_serving_on ?? status.esplora_listen;
+    const pending =
+      status.esplora_serving_on && status.esplora_serving_on !== status.esplora_listen
+        ? ` (${status.esplora_listen} applies at the next start)`
+        : "";
     const fresh = status.esplora_freshness ?? "not judged yet";
     desc.textContent =
-      `Serving on ${status.esplora_listen} — freshness: ${fresh}` +
+      `Serving on ${where}${pending} — freshness: ${fresh}` +
       (status.esplora_message ? ` (${status.esplora_message})` : "");
     if (status.esplora_freshness !== "fresh") desc.classList.add("needs-attention");
+  } else if (status.esplora_message) {
+    desc.textContent = status.esplora_message;
+    desc.classList.add("needs-attention");
+  } else if (status.running) {
+    // On, the node is up, and nothing is serving — with no recorded reason.
+    // "starts with the node" was shown here and is simply false: the node has
+    // already started.
+    desc.textContent =
+      "On, but electrs and the front are not running. Stop and start the node to try again; the log is in the esplora folder inside your data folder.";
+    desc.classList.add("needs-attention");
   } else {
-    desc.textContent = status.esplora_message ?? "Saved — electrs and the front start with the node";
-    if (status.esplora_message) desc.classList.add("needs-attention");
+    desc.textContent = "Saved — electrs and the front start with the node";
   }
 }
 
