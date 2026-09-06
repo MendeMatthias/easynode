@@ -30,6 +30,58 @@ with no hash and tracked an unattested fork during the August stall.
 
 That is what this mode is for.
 
+## Two tiers, and the smaller one is what the network is short of
+
+**A fork witness does not need an archival node.** That was the assumption
+holding this up, and it was wrong.
+
+A wallet settles a fork by comparing the block HASH at a height two sources both
+hold. That is two routes: `GET /blocks/tip/height` and `GET /block-height/<h>`.
+Esplora mode answers them too, and needs electrs, a `prune=0` datadir, the full
+124 GiB chain and a GPU to build it — every one of those costs exists for the
+**address index**, which a witness is never asked about and must never be
+trusted for.
+
+Pruning discards block **data**, not the block **index**. Every node knows every
+block hash. Measured on this project's validator on 2026-09-06, `pruneheight`
+184942:
+
+| height | served | |
+|---:|---|---|
+| 1 | `99911b8fb5433f68…` | 184,941 blocks below the prune height |
+| 50000 | `c50527a161292906…` | below |
+| 150000 | `85db9f65d6f58cd1…` | below |
+| 211475 | `d3f2320640266f23…` | above |
+
+So the tier the network actually lacks — an independent, current fork witness —
+runs on any node anybody already has.
+
+| | witness | esplora |
+|---|---|---|
+| serves | the two block routes | the whole Esplora API |
+| needs | any node, pruned or not | `prune=0`, ~124 GiB, an index, a GPU to build it |
+| binary | `btx-witness` (in this repository) | electrs (vendored, built from source) |
+| proves | which chain a wallet is on | that, plus balances and history |
+| acceptance | its answers match a node's own `getblockhash` | `scripts/verify-esplora.sh`, a UTXO set comparison |
+
+`crates/btx-core/src/witness.rs` is the server and
+`crates/btx-core/src/bin/btx-witness.rs` the binary.
+`deploy/esplora/install-systemd.sh --mode witness` is the default, and
+`deploy/esplora/test-witness.sh` proves a given node can do it.
+
+**A witness serves the two routes and 404s everything else**, including every
+`/address` and `/tx` route. That is not a gap to be filled in later. A node
+serving witness data has made no promise about an address index, and the defect
+that retired the last independent witness was an address index answering every
+route confidently while not recording spends. The wallet enforces the same
+split from its side (`WITNESS_ONLY_ORIGINS`), so an origin added for witnessing
+cannot be asked for money data even if it would answer.
+
+Measured end to end on 2026-09-06, on the pruned validator: 21 checks, the
+front carrying CORS exactly once, the money routes 404 through it, and the real
+freshness guardian against the real census returning
+`state=fresh why=settled-block-matches proven_at=211747`.
+
 ## The route contract
 
 Read from the wallet's own egress validator,
@@ -476,6 +528,11 @@ index, then run the gate with two or three addresses that have spend history.
 Only a PASS is a reason to give the endpoint a name.
 
 ## Hostnames and DNS: the runbook
+
+**Start with a witness.** It needs no acceptance run, no full chain and no GPU,
+and it closes the gap that actually hurts: the wallet's only witness has been
+frozen since before 2026-09-04, so its fork check has not run for days. An
+Esplora endpoint can follow whenever a machine exists for it.
 
 Option (a) from the decision above. Nothing here has been done yet; it is the
 owner's to do, in this order, after an acceptance PASS:

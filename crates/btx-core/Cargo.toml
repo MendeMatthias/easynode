@@ -17,7 +17,10 @@ description = "Shared BTX node engine: launch/supervise btxd, JSON-RPC, assumeut
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "fs", "io-util"] }
+# "net" is for the witness server (crates/btx-core/src/witness.rs): two
+# read-only GET routes on loopback, hand-written over tokio rather than pulling
+# a web framework into a crate that ships beside a signing wallet.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "fs", "io-util", "net"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 thiserror = "1"
 async-trait = "0.1"
