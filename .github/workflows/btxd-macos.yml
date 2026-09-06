@@ -14,10 +14,16 @@ name: Build macOS btxd (Metal source build, smoked on the runner)
 # The app is ONE codebase. The only thing that was ever platform-specific is
 # which machine compiles the engine. This makes that a machine anyone can run.
 #
-# ⚠ macos-14 ON PURPOSE, and pinned rather than macos-latest. This produces an
+# ⚠ macos-15 ON PURPOSE, and pinned rather than macos-latest. This produces an
 # arm64 binary for Apple Silicon, which is the only Mac target the app ships
 # (`BTX-Node_<v>_aarch64`). `macos-latest` moves between runner images, and the
 # deployment target a binary picks up decides which macOS versions can run it.
+#
+# It is 15 rather than 14 because 14 CANNOT BUILD THIS TREE. Measured, run
+# 34061771287: Apple clang 15.0.0 from Xcode 15.4 rejects
+# `matmul_v4_rc_stage3_recursive_fixedpoint.h:278` with "no matching constructor
+# for initialization of 'ar::PermLayout'", which is C++20 parenthesized
+# aggregate initialisation (P0960) it does not implement.
 #
 # ⚠ NEVER patch BTX's source to make a version string look nicer. btxd embeds
 # whether its tree was dirty and then fails its OWN production canary with
@@ -26,14 +32,14 @@ name: Build macOS btxd (Metal source build, smoked on the runner)
 # below exists to make that impossible to do by accident. Same rule, same
 # wording, as the Linux workflow.
 #
-# ⚠ HOMEBREW'S LLVM, NOT THE RUNNER'S APPLE CLANG. Measured on macos-14
-# (run 34061771287): Apple clang 15.0.0 from Xcode 15.4 cannot compile this
-# tree at all — `matmul_v4_rc_stage3_recursive_fixedpoint.h:278` uses C++20
-# parenthesized aggregate initialisation (P0960) and it fails with "no matching
-# constructor for initialization of 'ar::PermLayout'". The shipped 0.6.19 mac
-# engine was built with LLVM 22, so that is the family known to work. Pinning
-# the compiler rather than the Xcode version also stops a runner-image bump
-# silently changing what compiles the release.
+# ⚠ THE RUNNER'S OWN APPLE CLANG, deliberately, and this took three runs to
+# settle. Homebrew's LLVM does compile the P0960 the tree needs, but pairing a
+# very new clang with an older Xcode SDK then fails INSIDE Apple's own headers:
+# `CFAvailability.h`'s `CF_ENUM` macro produced 20 errors from CoreGraphics via
+# Accelerate on run 34062046058, after 355 of 726 objects. Compiler and SDK have
+# to move together, so the answer is a newer image rather than a newer compiler
+# bolted onto an old one — which also keeps the tree's own AppleClang branches
+# (notably its hardcoded Homebrew libomp path) working exactly as written.
 #
 # ⚠ PRECOMPILE_KERNELS=OFF, deliberately, matching what ships. Compiling the
 # Metal shaders at build time needs full Xcode's `xcrun metal`; with it off btxd
@@ -68,8 +74,8 @@ permissions:
 
 jobs:
   build-btxd:
-    name: btxd + btx-cli (macos-14, arm64, Metal)
-    runs-on: macos-14
+    name: btxd + btx-cli (macos-15, arm64, Metal)
+    runs-on: macos-15
     timeout-minutes: 180
     steps:
       - name: Checkout easynode (for the engine pin)
@@ -137,12 +143,10 @@ jobs:
           # sodium would re-introduce an /opt/homebrew load command.
           # libomp likewise: src/CMakeLists.txt refuses to configure under
           # AppleClang without a static libomp.a plus omp.h.
-          # llvm is not optional. See the compiler note on the configure step:
-          # the runner's Apple clang cannot compile this tree.
-          brew install --quiet cmake ninja pkgconf boost libevent sqlite zeromq libsodium libomp llvm
+          brew install --quiet cmake ninja pkgconf boost libevent sqlite zeromq libsodium libomp
           cmake --version | head -1
-          /opt/homebrew/opt/llvm/bin/clang++ --version | head -1
-          echo "(Apple clang, NOT used for this build: $(clang++ --version | head -1))"
+          clang++ --version | head -1
+          xcodebuild -version
           # NOT `xcodebuild -version | head -1`. head closes the pipe after the
           # first line, xcodebuild takes SIGPIPE, and being an Objective-C app it
           # turns that into an uncaught NSFileHandleOperationException and aborts
@@ -160,36 +164,16 @@ jobs:
           # its header. Wallet ON and sqlite ON or the app's wallet is dead;
           # ZMQ ON because 0.34 packaging refuses a btxd that fails upstream's
           # verifier, which requires the ENABLE_ZMQ help text and a real link.
-          LLVM=/opt/homebrew/opt/llvm/bin
-          SDK="$(xcrun --show-sdk-path)"
-          # ⚠ THE SYSTEM libc++ HEADERS, WITH A NEWER CLANG. Homebrew's LLVM
-          # ships newer libc++ HEADERS while the runtime is always the system
-          # /usr/lib/libc++.1.dylib. Recent <atomic> inlines
-          # std::__atomic_{monitor,wait,notify_one}_global*, which macOS does not
-          # export, and coins.cpp.o then fails to link with exactly three
-          # undefined symbols AFTER a full compile. Measured on an M5 while
-          # building the shipped 0.6.19 mac engine.
-          STDLIB="-nostdinc++ -isystem $SDK/usr/include/c++/v1"
           # Same options as docs/node-release-recipe.md and the header of
           # stage-node-pkg-mac-source.sh. Wallet ON and sqlite ON or the app's
           # wallet is dead; ZMQ ON because 0.34 packaging refuses a btxd that
           # fails upstream's verifier.
           #
-          # OpenMP is steered explicitly because src/CMakeLists.txt only takes
-          # its hardcoded Homebrew libomp path when the compiler ID is
-          # AppleClang. Any other Clang falls through to find_package(OpenMP),
-          # which IS steerable — which is the whole reason that fall-through is
-          # usable here.
+          # No compiler override and no OpenMP steering: on this image Apple
+          # clang builds the tree, so src/CMakeLists.txt takes its own AppleClang
+          # branch and finds Homebrew's static libomp where it expects it. That
+          # is the configuration the tree is written for.
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER="$LLVM/clang" \
-            -DCMAKE_CXX_COMPILER="$LLVM/clang++" \
-            -DCMAKE_OBJC_COMPILER="$LLVM/clang" \
-            -DCMAKE_OBJCXX_COMPILER="$LLVM/clang++" \
-            -DCMAKE_CXX_FLAGS="$STDLIB" \
-            -DCMAKE_OBJCXX_FLAGS="$STDLIB" \
-            -DOpenMP_C_FLAGS=-fopenmp -DOpenMP_C_LIB_NAMES=omp \
-            -DOpenMP_CXX_FLAGS=-fopenmp -DOpenMP_CXX_LIB_NAMES=omp \
-            -DOpenMP_omp_LIBRARY=/opt/homebrew/opt/libomp/lib/libomp.a \
             -DBUILD_DAEMON=ON -DBUILD_CLI=ON \
             -DBUILD_UTIL=OFF -DBUILD_TX=OFF -DBUILD_WALLET_TOOL=OFF \
             -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_TESTS=OFF \
