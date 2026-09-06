@@ -1,8 +1,9 @@
 # 2026-09-06: a header tower nobody serves bodies for, and the 0.6.20 hold
 
-0.6.20 is built, gated and **not signed**. This records why, so the next person
-does not rebuild it or, worse, override the gate to get past a condition they
-have not read.
+0.6.20 was built and gated, then held unsigned for 47 minutes while this
+played out. It cleared on its own and the release went ahead; see the
+Resolution at the end. This records the shape, because every number a release
+script reads said "chain split" and it was not one.
 
 ## What happened
 
@@ -75,17 +76,51 @@ packaged app carries the witness routes, `check-engine-tag.sh` and
 recipe's ship blocker — PASS for both binaries. The engine in these bundles is
 **byte-for-byte identical to the shipped 0.6.19**, all 21 files.
 
-Not done, and not to be done until the gate clears: signing, the feed, the
-GitHub release, the site pin.
+Then the gate cleared on its own and the rest ran: signed at 15:12:54Z,
+verified against the app key two independent ways, a Linux-only feed, and
+**draft** `node-v0.6.20` on `MendeMatthias/EasyBTX-releases` with all four
+assets re-downloaded from GitHub and byte-compared against the gate run.
+
+Not done, and each an explicit decision: flipping the draft live, the site feed
+and pins, and syncing this changelog into the monorepo.
 
 ## To resume
 
 1. `scripts/observer-ok.sh` must exit 0 on its own. Do not set
    `OBSERVER_OVERRIDE=1` to get past this; that is an owner decision and it is
-   the exact shortcut the 2026-09-05 release took.
+   the exact shortcut the 2026-09-05 release took. On this occasion waiting was
+   the whole fix: 47 minutes, and nothing touched.
 2. Re-read chain truth from the node: `getchaintips` and `getblockchaininfo`
    within ten minutes of signing, plus the census, never an explorer alone and
    never btxscan.
 3. Then `tools/release-helpers/sign_feed_0620.sh`, then
    `publish_draft_0620.sh`. The artifacts are already gated and named in
-   `~/release-0.6.20`; do not rebuild them.
+   `~/release-0.6.20`; do not rebuild them. `finish_0620.sh` runs both behind
+   the chain gate and stops at the draft.
+
+## Resolution, 15:10:37Z
+
+It cleared on its own, 45 minutes after it started, with nothing done to the
+node. The bodies arrived and btxd connected them in one step: **211,960 →
+211,990**, and the headers/blocks gap went to 0. `observer-ok.sh` returned `ok`
+at 15:10:08Z.
+
+Read at 15:12Z, after the jump:
+
+- `getchaintips` active 211,993. The only branch ahead leads by **1**, an
+  ordinary one-block race, far inside the 6 that separates a race from a
+  branch.
+- The branch this node had been on, `639483535dd86ca1` at 211,960, is now a
+  `valid-fork` 33 behind. It was a two-block losing branch, exactly as the
+  shape suggested and not what the settled comparison made it look like.
+- The census reports **`split: false`**, one chain, 8 nodes, and this node
+  matches **all ten** of its settled hashes (211,974–211,983).
+
+So the whole episode was one stall in body delivery, not a chain split, and
+the numbers a release script reads said "split" throughout it. The point of
+this note stands: `debug.log` and the `getchaintips` status were the only
+sources that distinguished them at the time, and they said so from the first
+minute.
+
+0.6.20 was signed at 15:12:54Z once the gate cleared on its own, and nothing
+was overridden to get there.
