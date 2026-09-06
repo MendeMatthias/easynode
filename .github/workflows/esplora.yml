@@ -46,6 +46,10 @@ jobs:
       # and change the other" is not a mechanism. Stubs only: no node, no
       # chain, no network.
       - run: deploy/esplora/test-guardian.sh
+      # Skips cleanly on a runner, which has no BTX node. It is here so the
+      # script is exercised for syntax and its skip path, and so a change that
+      # breaks it fails somewhere rather than nowhere.
+      - run: deploy/esplora/test-witness.sh
 
   # The Caddy front, actually started and asked what it does. Until this job
   # existed the configuration had never been run: the three freshness states,

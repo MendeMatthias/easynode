@@ -16,7 +16,9 @@ is worth doing at all.
 | `test-vectors/` | real blocks rust-btx's tests decode byte-exactly (vendored) |
 | `build-electrs.sh` | builds `electrs` from the tree above and installs it |
 | `build-caddy.sh` | builds a Caddy WITH the rate-limit plugin this front needs |
-| `install-systemd.sh` | installs the units for the server path, refusing a pruned node first |
+| `install-systemd.sh` | installs the units, `--mode witness` (default) or `--mode esplora` |
+| `btx-witness.service.template` | the witness server as a unit; runs on any node, pruned or not |
+| `test-witness.sh` | proves the node here can serve as a fork witness |
 | `test-front.sh` | starts the real Caddyfile against stubs and checks every claim in it |
 | `test-guardian.sh` | runs the freshness guardian against stubs and pins that it agrees with the Rust |
 | `test-stack.sh` | the whole stack against a REAL btxd on a throwaway regtest chain |
@@ -43,14 +45,27 @@ guardian here); and shows the verdict beside the switch. The front listens on
 Everything lives under `<datadir>/esplora/`: `run/` (the markers),
 `electrs-db/`, `Caddyfile`, and the two logs.
 
-**Without the app, on a server.** The units and the timer, the way
-api.btxscan.io runs:
+**Without the app, on a server.** Two tiers, and most operators want the
+smaller one.
+
+A **witness** serves the two routes a wallet needs to settle a fork. It runs on
+any node, including a pruned one, because pruning discards block data and not
+the block index. It is the tier the network is short of:
 
 ```bash
-deploy/esplora/build-electrs.sh
+(cd crates/btx-core && cargo build --release --bin btx-witness)
+sudo install -m755 crates/btx-core/target/release/btx-witness /usr/local/bin/
 deploy/esplora/build-caddy.sh          # stock Caddy refuses this Caddyfile
 deploy/esplora/install-systemd.sh --host esplora-1.example.com          # prints the plan
 deploy/esplora/install-systemd.sh --host esplora-1.example.com --yes    # does it
+```
+
+**Esplora** serves the whole API, balances included, and needs `prune=0`, the
+full ~124 GiB chain and an index on top:
+
+```bash
+deploy/esplora/build-electrs.sh
+deploy/esplora/install-systemd.sh --mode esplora --host esplora-2.example.com --yes
 ```
 
 `install-systemd.sh` changes nothing without `--yes`, and before it changes
@@ -78,6 +93,14 @@ Both moving parts have their own tests, which need no node and no network:
 ```bash
 deploy/esplora/test-front.sh      # the Caddyfile, started, against stubs
 deploy/esplora/test-guardian.sh   # the freshness rules, executed
+```
+
+And one that needs only the node you already have, no chain rebuild and no
+network — it runs the witness server against it and checks every answer against
+that node's own `getblockhash`, including at heights below its prune height:
+
+```bash
+deploy/esplora/test-witness.sh
 ```
 
 And one that needs a btxd binary but no chain, no GPU and no network — it mines

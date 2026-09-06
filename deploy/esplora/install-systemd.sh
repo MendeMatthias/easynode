@@ -17,9 +17,21 @@
 # the node had been pruning at 4096 for weeks). electrs would otherwise
 # discover this hours into an index it was never going to finish.
 #
+# TWO TIERS, and most operators want the smaller one.
+#
+#   --mode witness   (default) btxd + btx-witness + the front. Serves the two
+#                    routes a wallet needs to settle a fork. Works on ANY node,
+#                    including a pruned one: pruning discards block DATA, not
+#                    the block INDEX. This is the tier the network is short of.
+#
+#   --mode esplora   btxd + electrs + the front. Serves the whole Esplora API,
+#                    including balances and history. Needs prune=0, the full
+#                    ~124 GiB chain, and an index on top of it.
+#
 #   deploy/esplora/install-systemd.sh --host esplora-1.example.com [options]
 #
 # Options:
+#   --mode <tier>        witness (default) or esplora
 #   --host <name>        the public hostname Caddy serves and gets a certificate for
 #   --user <name>        the service user (default: the invoking user)
 #   --datadir <path>     btxd's datadir, holding blocks/ and .cookie (default /var/lib/btx)
@@ -32,6 +44,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 HOST=""
+MODE=witness
 SVC_USER="${SUDO_USER:-$(id -un)}"
 DATADIR=/var/lib/btx
 DB_DIR=/var/lib/electrs-db
@@ -40,6 +53,7 @@ APPLY=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --mode)    MODE="${2:?--mode needs a value}"; shift 2 ;;
     --host)    HOST="${2:?--host needs a value}"; shift 2 ;;
     --user)    SVC_USER="${2:?--user needs a value}"; shift 2 ;;
     --datadir) DATADIR="${2:?--datadir needs a value}"; shift 2 ;;
@@ -51,6 +65,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+case "$MODE" in
+  witness|esplora) : ;;
+  *) echo "--mode must be witness or esplora, not '$MODE'" >&2; exit 2 ;;
+esac
 [ -n "$HOST" ] || { echo "--host is required (the name Caddy serves and gets a certificate for)" >&2; exit 2; }
 case "$HOST" in
   *[!a-zA-Z0-9.-]*) echo "--host must be a hostname, not a URL or an expression: $HOST" >&2; exit 2 ;;
@@ -84,25 +102,46 @@ if [ -z "$info" ]; then
 fi
 pruned="$(printf '%s' "$info" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("yes" if d.get("pruned") else "no", d.get("pruneheight") or 0, d.get("blocks") or 0)')"
 set -- $pruned
-if [ "$1" = "yes" ]; then
+if [ "$MODE" = esplora ] && [ "$1" = "yes" ]; then
   echo "ABORT: this datadir is pruned (history below block $2 is gone)." >&2
   echo "       electrs indexes from the block files on disk and the ones it needs" >&2
   echo "       are not there. Setting prune=0 now is not enough, because nothing" >&2
   echo "       re-downloads history that was discarded: serving Esplora from this" >&2
   echo "       datadir requires a full resync with prune=0 from the start." >&2
+  echo "" >&2
+  echo "       This node CAN serve as a fork witness, which is the tier the network" >&2
+  echo "       is actually short of. Re-run with --mode witness." >&2
   exit 3
 fi
-say "btxd is unpruned and at block $3. electrs can index it."
+if [ "$MODE" = witness ]; then
+  # Pruning discards block DATA, not the block INDEX, so a witness works on any
+  # node. Verified against this project's own validator (pruneheight 184942) on
+  # 2026-09-06: it answered heights 1, 50000 and 150000 correctly.
+  if [ "$1" = "yes" ]; then
+    say "btxd is pruned below block $2 and at block $3 — fine for a witness, which"
+    say "reads block hashes from the index, not block data from disk."
+  else
+    say "btxd is unpruned and at block $3."
+  fi
+else
+  say "btxd is unpruned and at block $3. electrs can index it."
+fi
 
 echo
 echo "── the binaries ──"
 missing=0
-for b in electrs caddy; do
+NEED_BINS="caddy"
+[ "$MODE" = esplora ] && NEED_BINS="electrs caddy"
+[ "$MODE" = witness ] && NEED_BINS="btx-witness caddy"
+for b in $NEED_BINS; do
   path="$(command -v "$b" || true)"
   [ -z "$path" ] && [ -x "/usr/local/bin/$b" ] && path="/usr/local/bin/$b"
   [ -z "$path" ] && [ -x "$HOME/.local/bin/$b" ] && path="$HOME/.local/bin/$b"
   if [ -z "$path" ]; then
-    say "$b: NOT FOUND — build it with deploy/esplora/build-$b.sh"
+    case "$b" in
+      btx-witness) say "$b: NOT FOUND — build it with: (cd crates/btx-core && cargo build --release --bin btx-witness)" ;;
+      *)           say "$b: NOT FOUND — build it with deploy/esplora/build-$b.sh" ;;
+    esac
     missing=1
   else
     say "$b: $path"
@@ -122,11 +161,22 @@ say "caddy carries the rate-limit module"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-sed -e "s|^User=USER$|User=$SVC_USER|" \
-    -e "s|--daemon-dir /var/lib/btx|--daemon-dir $DATADIR|" \
-    -e "s|--daemon-rpc-addr 127.0.0.1:19334|--daemon-rpc-addr $RPC|" \
-    -e "s|--db-dir /var/lib/electrs-db|--db-dir $DB_DIR|" \
-    "$HERE/electrs.service.template" > "$WORK/electrs.service"
+if [ "$MODE" = esplora ]; then
+  UPSTREAM=127.0.0.1:3000
+  BACKEND_UNIT=electrs.service
+  sed -e "s|^User=USER$|User=$SVC_USER|" \
+      -e "s|--daemon-dir /var/lib/btx|--daemon-dir $DATADIR|" \
+      -e "s|--daemon-rpc-addr 127.0.0.1:19334|--daemon-rpc-addr $RPC|" \
+      -e "s|--db-dir /var/lib/electrs-db|--db-dir $DB_DIR|" \
+      "$HERE/electrs.service.template" > "$WORK/$BACKEND_UNIT"
+else
+  UPSTREAM=127.0.0.1:3081
+  BACKEND_UNIT=btx-witness.service
+  sed -e "s|^User=USER$|User=$SVC_USER|" \
+      -e "s|--datadir /var/lib/btx|--datadir $DATADIR|" \
+      -e "s|--rpc 127.0.0.1:19334|--rpc $RPC|" \
+      "$HERE/btx-witness.service.template" > "$WORK/$BACKEND_UNIT"
+fi
 
 # The front runs as its own unit reading this directory's Caddyfile, with the
 # two placeholders supplied as environment. The Caddyfile is NOT copied: it is
@@ -134,7 +184,7 @@ sed -e "s|^User=USER$|User=$SVC_USER|" \
 cat > "$WORK/btx-esplora-front.service" <<UNIT
 [Unit]
 Description=easyNode Esplora front (Caddy: TLS, CORS, freshness headers)
-After=network-online.target electrs.service
+After=network-online.target $BACKEND_UNIT
 Wants=network-online.target
 
 [Service]
@@ -142,7 +192,7 @@ User=$SVC_USER
 Type=simple
 Environment=BTX_ESPLORA_HOST=$HOST
 Environment=BTX_ESPLORA_RUN=/run
-Environment=BTX_ESPLORA_ELECTRS=127.0.0.1:3000
+Environment=BTX_ESPLORA_ELECTRS=$UPSTREAM
 Environment=BTX_ESPLORA_BTXD_RPC=$RPC
 # Ports 80 and 443 must reach this machine or Caddy cannot get a certificate.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -156,8 +206,12 @@ WantedBy=multi-user.target
 UNIT
 
 echo
-echo "── what will be installed ──"
-say "electrs.service              user $SVC_USER, datadir $DATADIR, index $DB_DIR"
+echo "── what will be installed ($MODE) ──"
+if [ "$MODE" = esplora ]; then
+  say "electrs.service              user $SVC_USER, datadir $DATADIR, index $DB_DIR"
+else
+  say "btx-witness.service          user $SVC_USER, datadir $DATADIR, two read-only routes"
+fi
 say "btx-esplora-front.service    host $HOST, config $HERE/Caddyfile.template"
 say "btx-staleness.service/.timer the freshness guardian, every 30s"
 say "/usr/local/bin/btx-staleness-check.sh"
@@ -166,17 +220,17 @@ say "markers in /run (tmpfs; the guardian recreates them)"
 echo
 echo "── install ──"
 run install -m 0755 "$HERE/btx-staleness-check.sh" /usr/local/bin/btx-staleness-check.sh
-run install -m 0644 "$WORK/electrs.service" /etc/systemd/system/electrs.service
+run install -m 0644 "$WORK/$BACKEND_UNIT" "/etc/systemd/system/$BACKEND_UNIT"
 run install -m 0644 "$WORK/btx-esplora-front.service" /etc/systemd/system/btx-esplora-front.service
 run install -m 0644 "$HERE/btx-staleness.service" /etc/systemd/system/btx-staleness.service
 run install -m 0644 "$HERE/btx-staleness.timer" /etc/systemd/system/btx-staleness.timer
-run install -d -o "$SVC_USER" -g "$SVC_USER" "$DB_DIR"
+[ "$MODE" = esplora ] && run install -d -o "$SVC_USER" -g "$SVC_USER" "$DB_DIR"
 run systemctl daemon-reload
 # The guardian starts FIRST and on its own: until it has written a marker the
 # front answers `unverified`, which is the honest state and the one this
 # deployment wants on the way up rather than on the way to a wrong claim.
 run systemctl enable --now btx-staleness.timer
-run systemctl enable --now electrs.service
+run systemctl enable --now "$BACKEND_UNIT"
 run systemctl enable --now btx-esplora-front.service
 
 echo
@@ -184,6 +238,7 @@ if [ "$APPLY" -ne 1 ]; then
   echo "Nothing was changed. Re-run with --yes to apply."
   exit 0
 fi
+if [ "$MODE" = esplora ]; then
 cat <<NEXT
 Installed. Then, in this order:
 
@@ -194,3 +249,20 @@ Installed. Then, in this order:
      Do not advertise this endpoint to anyone until that passes, against a
      reference that is NOT this host.
 NEXT
+else
+cat <<NEXT
+Installed. Then:
+
+  1. journalctl -fu btx-witness    — it serves immediately; there is no index
+  2. curl -s https://$HOST/blocks/tip/height
+     curl -s https://$HOST/block-height/\$(( \$(curl -s https://$HOST/blocks/tip/height) - 6 ))
+     and check that hash against your own node's getblockhash.
+  3. curl -sI https://$HOST/blocks/tip/height | grep -i x-btx-freshness
+     'unverified' until the guardian has judged it against the census.
+  4. deploy/esplora/test-witness.sh proves the same things locally.
+
+  This host serves NO address or transaction data, which is the point: a
+  witness makes no claim about an index. It becomes useful to wallets when its
+  origin is added to WITNESS_ONLY_ORIGINS in pq-wallet and released.
+NEXT
+fi

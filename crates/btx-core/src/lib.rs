@@ -41,3 +41,4 @@ pub mod snapshot;
 pub mod supply;
 pub mod wallet_format;
 pub mod watchdog;
+pub mod witness;

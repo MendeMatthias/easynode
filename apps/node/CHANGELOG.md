@@ -8,6 +8,24 @@ root).
 
 ## [Unreleased]
 
+**Your node can settle a fork for a wallet, whatever its size.** The BTX wallet
+checks whether it is on the right chain by asking an independent source for the
+block hash at a height they both hold. It has had exactly one source for that,
+and it has been stuck since before 4 September, so the check has not run at all.
+Replacing it looked like it needed a full archival node: the whole 124 GB chain,
+a search index on top and a graphics card to build it.
+
+It does not. Those costs are for balances and history. Comparing block hashes
+needs only the list of blocks, which every node keeps even when it stores none
+of them — so a keeper on 10 GB can do this as well as an archive can.
+
+`btx-witness` is that server. It answers two read-only routes and refuses
+everything else, on purpose: a node offering to settle forks has said nothing
+about whether its balances are right, and the source this replaces was wrong
+about balances in exactly that way. Proven on a pruned node on 6 September,
+including block hashes from heights it has not stored a byte of for months.
+`deploy/esplora/install-systemd.sh` installs it, and it is now the default.
+
 **Esplora mode: serve wallets from your own node.** A "Serve wallets
 (Esplora API)" switch in Settings runs electrs and a Caddy front beside btxd,
 so the BTX wallet can read balances from a full node you run instead of from
