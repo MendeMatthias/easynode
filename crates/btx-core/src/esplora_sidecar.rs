@@ -196,6 +196,39 @@ pub fn caddy_env(listen: &str, run_dir: &Path) -> Vec<(String, String)> {
     ]
 }
 
+/// A marker directory the Caddyfile can actually express.
+///
+/// Caddy substitutes `{$VAR}` as a raw byte replacement over the whole file
+/// BEFORE the Caddyfile is lexed, so this value becomes part of the config's
+/// token stream rather than being passed as one argument. The template quotes
+/// the placeholder — `root "{$BTX_ESPLORA_RUN:/run}"` — which is what makes a
+/// path containing SPACES safe, and spaces are the realistic case: relocating
+/// the datadir to an external drive is a supported, documented flow and
+/// `/Volumes/My Passport/…` is what those drives are called.
+///
+/// Quoting cannot save a path containing a quote, a backslash, a brace or a
+/// newline: those end the token, escape it, or open a placeholder. There is no
+/// escaping that helps, so refuse with a sentence that names the real cause.
+/// Without this the failure is silent and misleading — `set_esplora` returns
+/// "Serving the Esplora API on …" while Caddy has already exited, and 30–60 s
+/// later the guardian kills electrs too and reports only "the Caddy front
+/// exited".
+pub fn validate_run_dir(run_dir: &Path) -> Result<(), String> {
+    let s = run_dir.to_string_lossy();
+    if let Some(bad) = s
+        .chars()
+        .find(|c| matches!(c, '"' | '\\' | '{' | '}' | '\n' | '\r'))
+    {
+        return Err(format!(
+            "the data folder path contains {bad:?}, which the Esplora front's configuration \
+             cannot express ({}). Move the data folder somewhere without quotes, backslashes \
+             or braces in its name, then turn this on again.",
+            run_dir.display()
+        ));
+    }
+    Ok(())
+}
+
 /// A site address Caddy will accept and that cannot smuggle anything into the
 /// configuration: `http://host[:port]`, `https://host[:port]`, or a bare
 /// hostname (which gets automatic HTTPS). Returns the trimmed value.
@@ -275,6 +308,7 @@ impl EsploraSidecars {
         listen: &str,
     ) -> AppResult<Self> {
         let listen = validate_listen(listen).map_err(AppError::Config)?;
+        validate_run_dir(&run_dir(datadir)).map_err(AppError::Config)?;
         for d in [esplora_dir(datadir), run_dir(datadir), db_dir(datadir)] {
             std::fs::create_dir_all(&d)
                 .map_err(|e| AppError::Config(format!("cannot create {}: {e}", d.display())))?;
@@ -572,6 +606,31 @@ mod tests {
             "x.y:port",
         ] {
             assert!(validate_listen(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
+
+    /// A path with SPACES must be accepted: relocating the datadir to an
+    /// external drive is a supported flow, and the template quotes the
+    /// placeholder so Caddy reads it as one token.
+    #[test]
+    fn a_run_dir_with_spaces_is_fine_and_one_with_quotes_is_not() {
+        assert!(validate_run_dir(Path::new("/Volumes/My Passport/easybtx/esplora/run")).is_ok());
+        assert!(validate_run_dir(Path::new("/Users/someone/.easybtx/esplora/run")).is_ok());
+        // Quoting cannot survive these: they end the token, escape it, or open
+        // a Caddy placeholder.
+        for bad in [
+            "/tmp/we\"ird/run",
+            "/tmp/back\\slash/run",
+            "/tmp/{brace}/run",
+            "/tmp/new\nline/run",
+        ] {
+            let e = validate_run_dir(Path::new(bad));
+            assert!(e.is_err(), "{bad:?} should be refused");
+            // The message must name the cause, not just fail.
+            assert!(
+                e.unwrap_err().contains("data folder"),
+                "the refusal must tell the user which folder to move"
+            );
         }
     }
 }
