@@ -144,6 +144,51 @@ pub fn missing_binary_message(name: &str) -> String {
     }
 }
 
+/// The Caddy module this front's configuration requires. Stock Caddy does not
+/// carry it; `deploy/esplora/build-caddy.sh` builds one that does.
+pub const CADDY_REQUIRED_MODULE: &str = "http.handlers.rate_limit";
+
+/// Does this caddy binary carry the rate-limit plugin the Caddyfile needs?
+///
+/// `find_binary` returns the first executable NAMED caddy on PATH,
+/// /usr/local/bin, /usr/bin, /opt/homebrew/bin, ~/.local/bin, ~/.cargo/bin or
+/// ~/go/bin, and the name is all it ever checked. A stock Caddy is extremely
+/// likely to be sitting in one of those directories, and it refuses this whole
+/// configuration on its first directive: `unrecognized directive: rate_limit`.
+///
+/// What that looked like without this check: Settings reported success and the
+/// listen address, Caddy had already exited, and 30–60 s later the guardian
+/// killed electrs too and said "the Caddy front exited; the log is in the
+/// esplora folder" — naming no cause, on a machine where the operator had done
+/// nothing wrong except have Caddy installed.
+///
+/// `deploy/esplora/test-front.sh` has gated itself on exactly this since it was
+/// written. The app did not.
+pub fn caddy_has_required_module(caddy: &Path) -> bool {
+    let Ok(out) = std::process::Command::new(caddy)
+        .arg("list-modules")
+        .output()
+    else {
+        // Cannot ask: do not refuse on that alone. A binary that will not run
+        // fails loudly at spawn a moment later, with its own error.
+        return true;
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|l| l.trim() == CADDY_REQUIRED_MODULE)
+}
+
+/// What to tell an operator whose caddy is the wrong build.
+pub fn wrong_caddy_message(caddy: &Path) -> String {
+    format!(
+        "the caddy at {} has no {CADDY_REQUIRED_MODULE} module, so it cannot read this front's \
+         configuration (it stops at `unrecognized directive: rate_limit`). Stock Caddy builds \
+         lack it. Build the right one with deploy/esplora/build-caddy.sh and put it earlier on \
+         PATH, or in /usr/local/bin.",
+        caddy.display()
+    )
+}
+
 /// The electrs command line, mirroring `deploy/esplora/electrs.service.template`
 /// so the app and the unit start the same indexer.
 ///
@@ -276,6 +321,86 @@ pub fn validate_listen(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
+/// Where each sidecar records its pid, so an orphan left by a force-quit can be
+/// found and cleared on the next start.
+pub fn sidecar_pidfile(datadir: &Path, name: &str) -> PathBuf {
+    esplora_dir(datadir).join(format!("{name}.pid"))
+}
+
+/// Stop a sidecar left running by a previous app instance.
+///
+/// WHY THIS EXISTS. Both children are spawned with `kill_on_drop`, which needs
+/// the app's own `Drop` to run. A force-quit, a crash or an OS kill skips it and
+/// reparents them, exactly as happens to btxd. The difference was what came
+/// next: btxd has a whole recovery apparatus (pidfile reconciliation,
+/// `DatadirHolder`, `stop_unmanaged_node`, `force_kill_foreign_btxd`), while
+/// electrs and caddy had none at all.
+///
+/// So Esplora mode was dead from that point on, and the operator was never told
+/// why: every node start said "electrs exited; the log is in the esplora
+/// folder", the log said the database was locked or the address was in use, and
+/// nothing mentioned an orphan or offered to clear it — while the orphaned Caddy
+/// carried on serving the public hostname from an index nobody was updating.
+///
+/// Same discipline as the btxd path: a pid is only signalled once its process
+/// name confirms what it is, so a reused pid is never touched.
+pub async fn reap_orphan(datadir: &Path, name: &str) {
+    let pidfile = sidecar_pidfile(datadir, name);
+    let Ok(txt) = std::fs::read_to_string(&pidfile) else {
+        return;
+    };
+    let Ok(pid) = txt.trim().parse::<u32>() else {
+        let _ = std::fs::remove_file(&pidfile);
+        return;
+    };
+    if !crate::platform::process_is_alive(pid) {
+        let _ = std::fs::remove_file(&pidfile);
+        return;
+    }
+    // Confirm identity before signalling anything.
+    let is_ours = crate::platform::process_name(pid)
+        .await
+        .map(|c| {
+            c.trim()
+                .rsplit('/')
+                .next()
+                .map(|b| b == name)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if !is_ours {
+        eprintln!(
+            "[esplora] {name}.pid names live pid {pid} but that process is not {name}; \
+             ignoring the stale file and leaving it alone"
+        );
+        let _ = std::fs::remove_file(&pidfile);
+        return;
+    }
+    eprintln!("[esplora] a {name} from a previous run (pid {pid}) is still going; stopping it");
+    // force_kill is the only signal the platform layer offers, and it is the
+    // right one here. Unlike btxd, neither sidecar holds anything a flush would
+    // save: electrs replays its own write-ahead log on the next start, and the
+    // front is stateless. The alternative to killing it is what shipped —
+    // Esplora mode permanently dead behind a locked index.
+    crate::platform::force_kill(pid);
+    // Wait for the index lock and the listen address to come free before the
+    // caller spawns replacements, or the new pair loses the same race.
+    for _ in 0..40 {
+        if !crate::platform::process_is_alive(pid) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let _ = std::fs::remove_file(&pidfile);
+}
+
+fn record_pid(datadir: &Path, name: &str, child: &Child) {
+    if let Some(pid) = child.id() {
+        let _ =
+            crate::fsx::atomic_write(&sidecar_pidfile(datadir, name), pid.to_string().as_bytes());
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct SidecarHealth {
     pub electrs: bool,
@@ -313,6 +438,11 @@ impl EsploraSidecars {
             std::fs::create_dir_all(&d)
                 .map_err(|e| AppError::Config(format!("cannot create {}: {e}", d.display())))?;
         }
+        // Clear our own leftovers FIRST. Without this a force-quit left both
+        // children running, and every later start died on a locked index or a
+        // held address with no explanation.
+        reap_orphan(datadir, ELECTRS_BIN).await;
+        reap_orphan(datadir, CADDY_BIN).await;
         // The front answers `unverified` until the guardian says otherwise.
         // Written BEFORE the front exists so there is never a window with no
         // marker at all.
@@ -331,15 +461,20 @@ impl EsploraSidecars {
             &[],
             &electrs_log(datadir),
         )?;
+        record_pid(datadir, ELECTRS_BIN, &electrs);
         let caddy = match spawn(
             caddy_bin,
             &caddy_args(&caddyfile),
             &caddy_env(&listen, &run_dir(datadir)),
             &caddy_log(datadir),
         ) {
-            Ok(c) => c,
+            Ok(c) => {
+                record_pid(datadir, CADDY_BIN, &c);
+                c
+            }
             Err(e) => {
                 let _ = electrs.start_kill();
+                let _ = std::fs::remove_file(sidecar_pidfile(datadir, ELECTRS_BIN));
                 return Err(e);
             }
         };
@@ -456,6 +591,49 @@ fn spawn(bin: &Path, args: &[String], envs: &[(String, String)], log: &Path) -> 
 
 #[cfg(test)]
 mod tests {
+
+    /// A pidfile naming a process that is NOT the sidecar must never be
+    /// signalled — the same rule the btxd path applies, for the same reason: a
+    /// pid the OS has reused belongs to somebody else.
+    #[tokio::test]
+    async fn reap_orphan_ignores_a_pid_that_is_not_ours_and_clears_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(esplora_dir(dir.path())).unwrap();
+        // Our own pid, which is certainly alive and certainly not named electrs.
+        let pidfile = sidecar_pidfile(dir.path(), ELECTRS_BIN);
+        std::fs::write(&pidfile, std::process::id().to_string()).unwrap();
+        reap_orphan(dir.path(), ELECTRS_BIN).await;
+        assert!(!pidfile.exists(), "the stale pidfile should be cleared");
+        // And we are still here, which is the point.
+        assert!(crate::platform::process_is_alive(std::process::id()));
+    }
+
+    #[tokio::test]
+    async fn reap_orphan_tolerates_a_missing_or_junk_pidfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(esplora_dir(dir.path())).unwrap();
+        // Missing: nothing to do, no panic.
+        reap_orphan(dir.path(), CADDY_BIN).await;
+        // Junk: cleared rather than parsed into a signal.
+        let pidfile = sidecar_pidfile(dir.path(), CADDY_BIN);
+        std::fs::write(&pidfile, "not-a-pid").unwrap();
+        reap_orphan(dir.path(), CADDY_BIN).await;
+        assert!(!pidfile.exists());
+    }
+
+    #[test]
+    fn the_wrong_caddy_message_names_the_binary_and_the_builder() {
+        let m = wrong_caddy_message(Path::new("/usr/local/bin/caddy"));
+        assert!(
+            m.contains("/usr/local/bin/caddy"),
+            "must name which caddy: {m}"
+        );
+        assert!(m.contains(CADDY_REQUIRED_MODULE));
+        assert!(
+            m.contains("build-caddy.sh"),
+            "must say how to get the right one: {m}"
+        );
+    }
     use super::*;
 
     #[test]
