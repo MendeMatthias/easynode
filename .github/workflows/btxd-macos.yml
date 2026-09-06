@@ -1,0 +1,250 @@
+name: Build macOS btxd (Metal source build, smoked on the runner)
+
+# Builds btxd + btx-cli for macOS arm64 from a btxchain/btx ref, WITH the Metal
+# backend, and proves the binary is shippable before uploading.
+#
+# ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+# Linux has btxd-linux.yml and node-linux-installer.yml. Windows has
+# btxd-windows.yml and node-win-installer.yml. macOS had NOTHING, so every Mac
+# release was built by hand on one laptop while every Linux release was a CI
+# job. That asymmetry is why the two platforms drift: 0.6.18 and 0.6.19 shipped
+# Linux-first and Macs waited, and on 2026-09-06 Linux went to 0.6.20 while Mac
+# stayed on 0.6.19 with the feed carrying no darwin key at all.
+#
+# The app is ONE codebase. The only thing that was ever platform-specific is
+# which machine compiles the engine. This makes that a machine anyone can run.
+#
+# ⚠ macos-14 ON PURPOSE, and pinned rather than macos-latest. This produces an
+# arm64 binary for Apple Silicon, which is the only Mac target the app ships
+# (`BTX-Node_<v>_aarch64`). `macos-latest` moves between runner images, and the
+# deployment target a binary picks up decides which macOS versions can run it.
+#
+# ⚠ NEVER patch BTX's source to make a version string look nicer. btxd embeds
+# whether its tree was dirty and then fails its OWN production canary with
+# build_provenance_mismatch, leaving a node that runs, syncs and holds peers
+# while silently refusing to validate. The "prove the tree is pristine" step
+# below exists to make that impossible to do by accident. Same rule, same
+# wording, as the Linux workflow.
+#
+# ⚠ PRECOMPILE_KERNELS=OFF, deliberately, matching what ships. Compiling the
+# Metal shaders at build time needs full Xcode's `xcrun metal`; with it off btxd
+# compiles them at runtime, which is what upstream's own release effectively
+# does. Runtime compilation needs a FOREGROUND btxd — the app never passes
+# `-daemon`, and `stage-node-pkg-mac-source.sh` says so at length.
+#
+# ── THE GATE THAT MATTERS HERE ──────────────────────────────────────────────
+# On Linux the shipping risk is a btxd with no GPU kernels. On macOS it is a
+# btxd that cannot LAUNCH on a machine without Homebrew: the tree's finders
+# deliberately link the STATIC archives (libevent_core.a, libzmq.a, libomp.a)
+# so no /opt/homebrew load command ends up in the image. Upstream ships a
+# script that checks exactly that, and 0.34 packaging refuses a btxd that fails
+# it, so this workflow runs it rather than reimplementing it.
+#
+# Security: workflow_dispatch only, `permissions: contents: read`, no secrets.
+# The one input reaches a shell through `env:` and is dereferenced as an
+# ordinary variable, never expanded by the ${{ }} templater into script text —
+# the same discipline btxd-linux.yml, btxd-windows.yml and
+# node-win-installer.yml use.
+
+on:
+  workflow_dispatch:
+    inputs:
+      btxchain_ref:
+        description: "btxchain/btx ref to build (blank = the ref the app pins)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build-btxd:
+    name: btxd + btx-cli (macos-14, arm64, Metal)
+    runs-on: macos-14
+    timeout-minutes: 180
+    steps:
+      - name: Checkout easynode (for the engine pin)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: easynode
+
+      # ONE source of truth for which engine we build, read from the app itself,
+      # exactly as btxd-linux.yml does it. A workflow with its own hardcoded
+      # default drifts from NODE_RELEASE_TAG silently, which is how a release
+      # ships an engine the app then refuses to install.
+      - name: Resolve the engine ref from the app itself
+        id: pin
+        env:
+          BTXCHAIN_REF: ${{ inputs.btxchain_ref }}
+        run: |
+          set -euo pipefail
+          cd easynode
+          # shellcheck source=/dev/null
+          . apps/node/scripts/lib/engine-pin.sh
+          pinned="$(engine_pin_tag apps/node)"
+          pinned_ref="$(engine_pin_ref apps/node)"
+          ref="$BTXCHAIN_REF"
+          [ -n "$ref" ] || ref="$pinned_ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+          # Artifact names cannot contain "/", and a branch name like
+          # release/0.34.6 fails the upload AFTER a full build.
+          echo "slug=$(printf '%s' "$ref" | tr '/' '-')" >> "$GITHUB_OUTPUT"
+          if [ "$pinned_ref" != "$pinned" ]; then
+            echo "building $ref (app pins $pinned, an UNTAGGED pin = commit $pinned_ref)"
+          else
+            echo "building $ref (app pins $pinned)"
+          fi
+
+      - name: Checkout btxchain/btx
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: btxchain/btx
+          ref: ${{ steps.pin.outputs.ref }}
+          path: btx
+          fetch-depth: 0
+
+      - name: Prove the tree is PRISTINE before building
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          # Exactly the set cmake/script/GenerateBuildInfo.cmake watches to
+          # decide BUILD_GIT_DIRTY. If anything shows here, the resulting btxd
+          # fails its own production canary and must never ship.
+          dirty=$(git status --porcelain -uall -- CMakeLists.txt cmake src contrib/matmul-v4)
+          if [ -n "$dirty" ]; then
+            echo "::error::source tree is not pristine — btxd would fail its own"
+            echo "::error::production canary with build_provenance_mismatch"
+            echo "$dirty"
+            exit 1
+          fi
+          echo "tree pristine at $(git rev-parse HEAD)"
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          # libsodium is not optional: cmake/module/FindZeroMQ.cmake requires a
+          # static libsodium.a beside the static libzmq.a, because a dylib
+          # sodium would re-introduce an /opt/homebrew load command.
+          # libomp likewise: src/CMakeLists.txt refuses to configure under
+          # AppleClang without a static libomp.a plus omp.h.
+          brew install --quiet cmake ninja pkgconf boost libevent sqlite zeromq libsodium libomp
+          cmake --version | head -1
+          clang++ --version | head -1
+          xcodebuild -version | head -1
+
+      - name: Configure + build
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          # The same options docs/node-release-recipe.md gives for the mac
+          # engine, and the same ones stage-node-pkg-mac-source.sh documents in
+          # its header. Wallet ON and sqlite ON or the app's wallet is dead;
+          # ZMQ ON because 0.34 packaging refuses a btxd that fails upstream's
+          # verifier, which requires the ENABLE_ZMQ help text and a real link.
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_DAEMON=ON -DBUILD_CLI=ON \
+            -DBUILD_UTIL=OFF -DBUILD_TX=OFF -DBUILD_WALLET_TOOL=OFF \
+            -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_TESTS=OFF \
+            -DBUILD_FUZZ_BINARY=OFF \
+            -DENABLE_WALLET=ON -DWITH_SQLITE=ON -DWITH_ZMQ=ON \
+            -DBTX_ENABLE_METAL=ON -DBTX_MATMUL_METAL_PRECOMPILE_KERNELS=OFF
+          ninja -C build
+
+      - name: Confirm the build info the canary reads
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          info=$(find build -name 'bitcoin-build-info.h' | head -1)
+          [ -n "$info" ] || { echo "::error::no build info header produced"; exit 1; }
+          cat "$info"
+          if ! grep -q '#define BUILD_GIT_DIRTY 0' "$info"; then
+            echo "::error::BUILD_GIT_DIRTY is not 0 — this binary would fail its canary"
+            exit 1
+          fi
+
+      # THE GATE THAT MATTERS ON THIS PLATFORM. Everything above can succeed and
+      # still produce a btxd that will not start on a Mac without Homebrew, or
+      # one that advertises -zmqpub* and publishes nothing. Upstream ships the
+      # check and 0.34 packaging refuses a btxd that fails it, so run theirs.
+      - name: Upstream's release gate (static ZMQ, no Homebrew load commands, it launches)
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          gate=scripts/release/verify_release_btxd.py
+          if [ ! -f "$gate" ]; then
+            echo "::error::$gate is missing from this ref. It is a ship blocker,"
+            echo "::error::not an optional check — refusing to upload unverified binaries."
+            exit 1
+          fi
+          python3 "$gate" build/bin/btxd build/bin/btx-cli
+
+      - name: Prove the Metal backend is actually in the binary
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          # The macOS analogue of the Linux CUDA check. A btxd with no Metal
+          # backend cannot validate the MatMul fork on Apple silicon, and looks
+          # perfectly healthy while failing to.
+          if ! otool -L build/bin/btxd | grep -q 'Metal.framework'; then
+            echo "::error::btxd does not link Metal.framework. A node built from"
+            echo "::error::this cannot validate on Apple silicon."
+            exit 1
+          fi
+          echo "Metal.framework linked"
+          otool -L build/bin/btxd | sed 's/^/  /'
+
+      - name: Regtest smoke (boot, wallet, mine one block)
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          # Proves the daemon BOOTS, its wallet works and it can mine a regtest
+          # block. It does not prove the Metal path executes on mainnet-scale
+          # work; that is measured on real hardware.
+          d=$(mktemp -d)
+          ./build/bin/btxd --version | head -1
+          ./build/bin/btxd -regtest -datadir="$d" -fallbackfee=0.0001 -daemonwait
+          trap './build/bin/btx-cli -regtest -datadir="'"$d"'" stop || true' EXIT
+          ./build/bin/btx-cli -regtest -datadir="$d" createwallet smoke >/dev/null
+          addr=$(./build/bin/btx-cli -regtest -datadir="$d" -rpcwallet=smoke getnewaddress)
+          [ -n "$addr" ] || { echo "::error::getnewaddress returned nothing"; exit 1; }
+          ./build/bin/btx-cli -regtest -datadir="$d" -rpcwallet=smoke \
+            generatetoaddress 1 "$addr" >/dev/null
+          count=$(./build/bin/btx-cli -regtest -datadir="$d" getblockcount)
+          [ "$count" = "1" ] || { echo "::error::unexpected block count: $count"; exit 1; }
+          echo "SMOKE PASSED: daemon boots, wallet works, mined 1 regtest block"
+
+      - name: Collect binaries + provenance + sha256
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/btxd-dist"
+          mkdir -p "$out"
+          cp build/bin/btxd build/bin/btx-cli "$out/"
+          # NO strip, matching the Linux path and the release packaging.
+          file "$out/btxd"
+          # What the binary REPORTS and which commit it came from, so a
+          # downstream job verifies both without trusting a filename. The
+          # reported version can legitimately lag the tag: a branch that never
+          # bumped CLIENT_VERSION_BUILD reports the older number, which is why
+          # the package declares what it carries in .btxd-version instead.
+          "$out/btxd" --version | head -1 | grep -oE 'v[0-9]+(\.[0-9]+)+' > "$out/BTXD_VERSION"
+          git rev-parse HEAD > "$out/BTXD_COMMIT"
+          # The source fingerprint the goldens are bound to. Two builds of the
+          # same ref must agree here; a difference means the trees differed.
+          info=$(find build -name 'bitcoin-build-info.h' | head -1)
+          grep -oE '"[0-9a-f]{64}"' "$info" | tr -d '"' | head -1 > "$out/BTXD_SOURCE_FINGERPRINT" || true
+          echo "reports $(cat "$out/BTXD_VERSION") from $(cat "$out/BTXD_COMMIT")"
+          echo "source fingerprint: $(cat "$out/BTXD_SOURCE_FINGERPRINT" 2>/dev/null || echo '(none)')"
+          # Any non-system load command a user's Mac may not have. The gate
+          # above already fails on Homebrew paths; listing them makes a surprise
+          # dependency visible in the build log instead of at runtime.
+          otool -L "$out/btxd" | sed 's/^/  /'
+          (cd "$out" && shasum -a 256 btxd btx-cli | tee SHA256SUMS.txt)
+
+      - name: Upload btxd artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: btxd-macos-${{ steps.pin.outputs.slug }}
+          path: btxd-dist/*
+          if-no-files-found: error
