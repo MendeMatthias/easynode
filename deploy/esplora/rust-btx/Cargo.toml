@@ -1,0 +1,25 @@
+[package]
+name = "rust-btx"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.63"
+description = "BTX consensus decode/encode primitives for an electrs fork. Diverges from rust-bitcoin the way rust-elements does: re-exports the byte-identical Bitcoin primitives and natively defines the BTX-diverged types (182-byte header, trailing matmul block payloads, shielded-bundle transaction + BTX txid rule)."
+license = "MIT"
+
+[dependencies]
+# We mirror rust-bitcoin 0.32.4 exactly and re-export its unchanged primitives.
+# Pinned with '=' so the re-exported types are ABI/trait-identical to the ones
+# electrs itself links (electrs pins bitcoin 0.32.4), which lets Cargo unify to a
+# single crate instance and makes `impl bitcoin::consensus::Decodable for Block`
+# usable through bitcoin's own generic `deserialize::<Block>()`.
+bitcoin = { version = "=0.32.4", features = ["serde"] }
+# The exact bech32 release that bitcoin 0.32.4 already pins, taken as a direct dep so we
+# can reach `bech32::segwit` (bitcoin does not re-export it). Cargo unifies this to the
+# same crate instance bitcoin links, so `Fe32`/`Hrp` are the identical types.
+bech32 = "=0.11.1"
+serde = { version = "1.0", features = ["derive"] }
+hex = "0.4"
+thiserror = "1.0"
+
+[dev-dependencies]
+hex = "0.4"

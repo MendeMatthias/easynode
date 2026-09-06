@@ -15,6 +15,10 @@
 - **[esplora-mode.md](esplora-mode.md)**: the opt-in Esplora API front, the
   route contract a wallet actually requires, and the gate that decides whether an
   endpoint may be advertised.
+- **[esplora-api-contract.md](esplora-api-contract.md)**: the API the vendored
+  electrs fork serves (`deploy/esplora/`), verbatim from the deployment behind
+  api.btxscan.io, with the BTX-specific fields and the places it diverges from
+  stock Esplora.
 - **[appimage-size.md](appimage-size.md)**: what the ~466 MB (445 MiB) Linux download is
   made of, and why the per-architecture split that was planned does not pay.
 - **[gpu-qualification-rtx3060.md](gpu-qualification-rtx3060.md)**: a full

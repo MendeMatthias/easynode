@@ -133,6 +133,14 @@ export interface NodeStatusInfo {
   node_profile: string;
   /** Whether the bundled engine can honour the keeper profile yet. */
   keeper_engine_ready: boolean;
+  /** Esplora mode: serve the Esplora REST API to wallets from this node. */
+  esplora_enabled: boolean;
+  esplora_listen: string;
+  esplora_running: boolean;
+  /** fresh | stale | unverified from the census guardian; null until judged. */
+  esplora_freshness: string | null;
+  /** The guardian's reason while running, else why the front is not. */
+  esplora_message: string | null;
 }
 
 interface ReclaimReport {
@@ -474,6 +482,7 @@ function renderStatus(status: NodeStatusInfo) {
 
   reflectPeerNames(status);
   reflectFork(status);
+  reflectEsploraRow(status);
 
   const mode = visualMode(p, status.rc_stalled);
   orb.className = `status-orb is-${mode}`;
@@ -729,6 +738,7 @@ $("settings-btn").addEventListener("click", async () => {
     $<HTMLInputElement>("wallet-toggle").checked = lastStatus.wallet_enabled;
     reflectOnClose(lastStatus.on_close);
     reflectKeeperRow(lastStatus);
+    reflectEsploraRow(lastStatus);
   }
   try {
     $<HTMLInputElement>("autostart-toggle").checked = await isEnabled();
@@ -772,6 +782,75 @@ $<HTMLInputElement>("keeper-toggle").addEventListener("change", (e) => {
   );
   // The conf applies at the next start; keeperReflect explains the engine gate.
 });
+
+// Esplora mode: serve wallets from this node. ON runs the prune gate in Rust
+// and shows its sentence — the switch springs back rather than staying on and
+// inert. A missing electrs or caddy is refused the same way, naming the build
+// script. The address row applies at the next start of the front.
+$<HTMLInputElement>("esplora-toggle").addEventListener("change", async (e) => {
+  const box = e.target as HTMLInputElement;
+  const on = box.checked;
+  const result = $("esplora-result");
+  result.hidden = true;
+  try {
+    const msg = await invoke<string>("set_esplora", { on });
+    result.classList.remove("is-error");
+    result.textContent = msg;
+  } catch (err) {
+    box.checked = !on;
+    result.classList.add("is-error");
+    result.textContent = String(err); // the Rust side's sentence, not a stack trace
+  }
+  result.hidden = false;
+});
+
+async function saveEsploraListen(): Promise<void> {
+  const input = $<HTMLInputElement>("esplora-listen");
+  const result = $("esplora-result");
+  try {
+    const msg = await invoke<string>("set_esplora_listen", { listen: input.value });
+    result.classList.remove("is-error");
+    result.textContent = msg;
+  } catch (err) {
+    result.classList.add("is-error");
+    result.textContent = String(err);
+  }
+  result.hidden = false;
+}
+$("esplora-listen-save").addEventListener("click", () => void saveEsploraListen());
+$("esplora-listen").addEventListener("keydown", (e) => {
+  if ((e as KeyboardEvent).key === "Enter") void saveEsploraListen();
+});
+
+const ESPLORA_STATIC_COPY =
+  "Serve the Esplora API to wallets from your own full node. Needs the whole chain on disk (never a pruned node), electrs and Caddy built from deploy/esplora, and disk for the index";
+
+/**
+ * The Esplora row says what is true: off, saved-but-waiting for the node,
+ * refused (the gate's sentence, in amber), or serving with the guardian's
+ * freshness verdict — amber for anything but `fresh`, because `unverified`
+ * and `stale` are exactly the states a wallet operator should read.
+ */
+function reflectEsploraRow(status: NodeStatusInfo): void {
+  const t = $<HTMLInputElement>("esplora-toggle");
+  if (document.activeElement !== t) t.checked = status.esplora_enabled;
+  const input = $<HTMLInputElement>("esplora-listen");
+  if (document.activeElement !== input) input.value = status.esplora_listen;
+  const desc = $("esplora-desc");
+  desc.classList.remove("needs-attention");
+  if (!status.esplora_enabled) {
+    desc.textContent = ESPLORA_STATIC_COPY;
+  } else if (status.esplora_running) {
+    const fresh = status.esplora_freshness ?? "not judged yet";
+    desc.textContent =
+      `Serving on ${status.esplora_listen} — freshness: ${fresh}` +
+      (status.esplora_message ? ` (${status.esplora_message})` : "");
+    if (status.esplora_freshness !== "fresh") desc.classList.add("needs-attention");
+  } else {
+    desc.textContent = status.esplora_message ?? "Saved — electrs and the front start with the node";
+    if (status.esplora_message) desc.classList.add("needs-attention");
+  }
+}
 
 /**
  * Reflect the profile choice + engine gate in Settings. The choice is stored

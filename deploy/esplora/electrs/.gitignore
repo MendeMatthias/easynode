@@ -1,0 +1,8 @@
+target
+*db/
+*.log
+*.sublime*
+*~
+*.pyc
+result
+.direnv

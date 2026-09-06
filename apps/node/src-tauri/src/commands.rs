@@ -10,6 +10,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use btx_core::backend::Backend;
 use btx_core::error::AppError;
+use btx_core::esplora_sidecar::{find_binary, missing_binary_message, CADDY_BIN, ELECTRS_BIN};
 use btx_core::installer::{
     install_dir, resolve_bundled_node_pkg, returning_launch_paths, FaststartResult,
 };
@@ -973,6 +974,10 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
 
     set_phase(app, state, NodePhase::LoadingSnapshot).await;
     spawn_status_refresher(app.clone(), state);
+    // Esplora mode, if chosen: electrs and the front start beside the node.
+    // Re-gated against the LIVE node, and any refusal is recorded for the
+    // Settings row rather than logged away.
+    maybe_start_esplora(state, &datadir).await;
     Ok(())
 }
 
@@ -1635,6 +1640,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
 pub async fn stop_node_inner(state: &AppState) {
     // Kill the refresher first so it can't overwrite the Stopped phase.
     state.refresher_gen.fetch_add(1, Ordering::SeqCst);
+    stop_esplora(state).await;
     let launch = state.launch.lock().await.clone();
     {
         let mut guard = state.node.lock().await;
@@ -1891,6 +1897,15 @@ pub struct NodeStatusInfo {
     /// choice is "keeper" and this is false, the UI says the profile arrives
     /// with the next engine update — the choice is stored, not lost.
     pub keeper_engine_ready: bool,
+    /// Esplora mode: serve wallets from this node. The choice, the address,
+    /// whether both sidecars are up, the guardian's freshness verdict
+    /// (`fresh` | `stale` | `unverified`), and the sentence to show beside the
+    /// switch: the verdict's reason while running, else why it is not.
+    pub esplora_enabled: bool,
+    pub esplora_listen: String,
+    pub esplora_running: bool,
+    pub esplora_freshness: Option<String>,
+    pub esplora_message: Option<String>,
 }
 
 #[tauri::command]
@@ -2041,6 +2056,22 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         None
     };
 
+    // Esplora: both sidecars alive, and what the guardian last said. A dead
+    // child is reported as not running even while the setting is on.
+    let esplora_running = state
+        .esplora
+        .lock()
+        .await
+        .as_mut()
+        .map(|s| s.health().all_up())
+        .unwrap_or(false);
+    let esplora_verdict = state.esplora_verdict.lock().await.clone();
+    let esplora_message = if esplora_running {
+        esplora_verdict.as_ref().map(|v| v.reason.clone())
+    } else {
+        state.esplora_error.lock().await.clone()
+    };
+
     Ok(NodeStatusInfo {
         running,
         phase,
@@ -2104,6 +2135,11 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         stall: state.stall_verdict.lock().await.clone(),
         node_profile: settings.node_profile.clone(),
         keeper_engine_ready: btx_core::installer::engine_supports_keeper_profile(NODE_RELEASE_TAG),
+        esplora_enabled: settings.esplora_enabled,
+        esplora_listen: settings.esplora_listen.clone(),
+        esplora_running,
+        esplora_freshness: esplora_verdict.map(|v| v.freshness.as_str().to_string()),
+        esplora_message,
     })
 }
 
@@ -2500,6 +2536,263 @@ pub async fn set_node_profile(profile: String) -> Result<(), String> {
     // The conf takes effect at the next provisioning/start; the caller's UI
     // explains that (and the engine gate) — no silent node surgery here.
     Ok(())
+}
+
+// ── Esplora mode: serve wallets from this node ───────────────────────────────
+//
+// docs/esplora-mode.md is the design. In one paragraph: the wallet reads all
+// chain data over the Esplora REST API and has one working source left, so
+// full nodes serving it are the fix, but a WRONG endpoint is worse than a
+// missing one, so this is gated (btx_core::esplora, the prune posture),
+// judged (btx_core::esplora_freshness, against the chain census, every
+// TICK_SECS) and labelled (the Caddy front's X-Btx-Freshness) rather than
+// merely switched on.
+
+/// Everything the prune gate wants to know, measured rather than assumed: the
+/// conf's own `prune=`, the running node's `pruned`/`pruneheight` when there
+/// is one (a datadir's btx_rw.conf outranks the conf, so the node is the
+/// authority whenever it answers), the profile, and the free disk.
+async fn esplora_facts(state: &AppState, datadir: &Path) -> btx_core::esplora::EsploraFacts {
+    let settings = NodeAppSettings::load(datadir);
+    let conf = datadir.join("faststart").join("faststart.conf");
+    let rpc = state.rpc.lock().await.clone();
+    let (node_pruned, prune_height) = match rpc {
+        Some(rpc) => btx_core::esplora::node_prune_posture(&rpc).await,
+        None => (None, None),
+    };
+    btx_core::esplora::EsploraFacts {
+        conf_prune: btx_core::esplora::conf_prune(&conf),
+        node_pruned,
+        prune_height,
+        profile: Some(settings.node_profile.clone()),
+        free_disk_mb: free_disk_bytes(datadir).map(|b| b / (1024 * 1024)),
+    }
+}
+
+/// What the Settings row can show BEFORE an operator commits: the gate's
+/// verdict with its sentence, the disk warning, whether the two binaries
+/// exist and where, and the address the front would listen on.
+#[derive(Debug, Clone, Serialize)]
+pub struct EsploraPreflight {
+    pub allowed: bool,
+    pub blocker: Option<String>,
+    pub warnings: Vec<String>,
+    pub electrs_found: Option<String>,
+    pub caddy_found: Option<String>,
+    pub listen: String,
+}
+
+#[tauri::command]
+pub async fn esplora_preflight(state: State<'_, AppState>) -> Result<EsploraPreflight, String> {
+    let datadir = node_datadir();
+    let facts = esplora_facts(&state, &datadir).await;
+    let verdict = btx_core::esplora::check(&facts);
+    Ok(EsploraPreflight {
+        allowed: verdict.is_allowed(),
+        blocker: verdict.blocker.as_ref().map(btx_core::esplora::explain),
+        warnings: verdict
+            .warnings
+            .iter()
+            .map(btx_core::esplora::explain_warning)
+            .collect(),
+        electrs_found: find_binary(ELECTRS_BIN).map(|p| p.display().to_string()),
+        caddy_found: find_binary(CADDY_BIN).map(|p| p.display().to_string()),
+        listen: NodeAppSettings::load(&datadir).esplora_listen,
+    })
+}
+
+/// Settings: serve wallets. ON runs the prune gate and refuses with its
+/// sentence, then checks both binaries exist and names the build script for a
+/// missing one; the setting is persisted only when nothing refused, so the
+/// switch is never on and inert. With a node running the sidecars start now;
+/// otherwise they start with the node. OFF stops them and persists.
+#[tauri::command]
+pub async fn set_esplora(state: State<'_, AppState>, on: bool) -> Result<String, String> {
+    let datadir = node_datadir();
+    if !on {
+        NodeAppSettings::update(&datadir, |s| s.esplora_enabled = false);
+        stop_esplora(&state).await;
+        *state.esplora_error.lock().await = None;
+        return Ok("Esplora off. Wallets pointed at this node stop getting answers.".to_string());
+    }
+    let facts = esplora_facts(&state, &datadir).await;
+    let verdict = btx_core::esplora::check(&facts);
+    if let Some(b) = verdict.blocker.as_ref() {
+        return Err(btx_core::esplora::explain(b));
+    }
+    let electrs = find_binary(ELECTRS_BIN).ok_or_else(|| missing_binary_message(ELECTRS_BIN))?;
+    let caddy = find_binary(CADDY_BIN).ok_or_else(|| missing_binary_message(CADDY_BIN))?;
+    NodeAppSettings::update(&datadir, |s| s.esplora_enabled = true);
+    let running = state.rpc.lock().await.is_some();
+    if !running {
+        return Ok("Saved. electrs and the front start with the node.".to_string());
+    }
+    start_esplora(&state, &datadir, &electrs, &caddy).await?;
+    Ok(format!(
+        "Serving the Esplora API on {}. Run scripts/verify-esplora.sh against it before \
+         telling a wallet; the front says X-Btx-Freshness: unverified until the guardian \
+         has judged it against the chain census.",
+        NodeAppSettings::load(&datadir).esplora_listen
+    ))
+}
+
+/// Settings: where the front listens. Validated the way the sidecar validates
+/// it (a host, never a path or anything a Caddyfile could read as config);
+/// applies the next time the front starts.
+#[tauri::command]
+pub async fn set_esplora_listen(
+    state: State<'_, AppState>,
+    listen: String,
+) -> Result<String, String> {
+    let listen = btx_core::esplora_sidecar::validate_listen(&listen)?;
+    NodeAppSettings::update(&node_datadir(), |s| s.esplora_listen = listen.clone());
+    let running = state.esplora.lock().await.is_some();
+    Ok(if running {
+        format!(
+            "Saved. The front moves to {listen} the next time it starts (stop and start the node)."
+        )
+    } else {
+        format!("Saved: the front will listen on {listen}.")
+    })
+}
+
+/// Start the sidecars for a running node. The gate runs AGAIN, against the
+/// live node: the datadir may have been pruned since the choice was made
+/// (btx_rw.conf outranks the conf), and electrs would only find out hours in.
+async fn start_esplora(
+    state: &AppState,
+    datadir: &Path,
+    electrs: &Path,
+    caddy: &Path,
+) -> Result<(), String> {
+    let facts = esplora_facts(state, datadir).await;
+    let verdict = btx_core::esplora::check(&facts);
+    if let Some(b) = verdict.blocker.as_ref() {
+        let msg = btx_core::esplora::explain(b);
+        *state.esplora_error.lock().await = Some(msg.clone());
+        return Err(msg);
+    }
+    let listen = NodeAppSettings::load(datadir).esplora_listen;
+    let sidecars =
+        btx_core::esplora_sidecar::EsploraSidecars::start(datadir, electrs, caddy, &listen)
+            .await
+            .map_err(|e| e.to_string());
+    let sidecars = match sidecars {
+        Ok(s) => s,
+        Err(e) => {
+            *state.esplora_error.lock().await = Some(e.clone());
+            return Err(e);
+        }
+    };
+    eprintln!(
+        "[esplora] electrs and the front started beside the node; listening on {}",
+        sidecars.listen
+    );
+    *state.esplora_error.lock().await = None;
+    *state.esplora_verdict.lock().await = None;
+    *state.esplora.lock().await = Some(sidecars);
+    spawn_esplora_guardian(state, datadir.to_path_buf());
+    Ok(())
+}
+
+/// Every node start: honour the persisted choice, and record rather than
+/// hide why it could not be honoured.
+async fn maybe_start_esplora(state: &AppState, datadir: &Path) {
+    if !NodeAppSettings::load(datadir).esplora_enabled {
+        return;
+    }
+    let (electrs, caddy) = match (find_binary(ELECTRS_BIN), find_binary(CADDY_BIN)) {
+        (Some(e), Some(c)) => (e, c),
+        (None, _) => {
+            let msg = missing_binary_message(ELECTRS_BIN);
+            eprintln!("[esplora] not starting: {msg}");
+            *state.esplora_error.lock().await = Some(msg);
+            return;
+        }
+        (_, None) => {
+            let msg = missing_binary_message(CADDY_BIN);
+            eprintln!("[esplora] not starting: {msg}");
+            *state.esplora_error.lock().await = Some(msg);
+            return;
+        }
+    };
+    if let Err(e) = start_esplora(state, datadir, &electrs, &caddy).await {
+        eprintln!("[esplora] not starting: {e}");
+    }
+}
+
+async fn stop_esplora(state: &AppState) {
+    state.esplora_gen.fetch_add(1, Ordering::SeqCst);
+    if let Some(mut s) = state.esplora.lock().await.take() {
+        s.stop().await;
+        eprintln!("[esplora] electrs and the front stopped");
+    }
+    *state.esplora_verdict.lock().await = None;
+}
+
+/// The freshness guardian: every `TICK_SECS`, judge the served tip against the
+/// chain census and write the marker the front matches on. Ends with the
+/// sidecars, and ends them if one of the two dies: half an endpoint is worse
+/// than none, because the survivor keeps answering.
+fn spawn_esplora_guardian(state: &AppState, datadir: PathBuf) {
+    let gen = state.esplora_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let gen_counter = state.esplora_gen.clone();
+    let esplora = state.esplora.clone();
+    let verdict_slot = state.esplora_verdict.clone();
+    let error_slot = state.esplora_error.clone();
+    tauri::async_runtime::spawn(async move {
+        let client = btx_core::esplora_freshness::client();
+        let run = btx_core::esplora_sidecar::run_dir(&datadir);
+        loop {
+            if gen_counter.load(Ordering::SeqCst) != gen {
+                return; // superseded by a later start, or stopped
+            }
+            {
+                let mut guard = esplora.lock().await;
+                let Some(s) = guard.as_mut() else {
+                    return;
+                };
+                let h = s.health();
+                if !h.all_up() {
+                    let which = if !h.electrs {
+                        "electrs"
+                    } else {
+                        "the Caddy front"
+                    };
+                    *error_slot.lock().await = Some(format!(
+                        "{which} exited; the log is in the esplora folder inside your data folder"
+                    ));
+                    s.stop().await;
+                    *guard = None;
+                    let _ = btx_core::esplora_freshness::write_marker(
+                        &run,
+                        btx_core::esplora_freshness::Freshness::Unverified,
+                    );
+                    *verdict_slot.lock().await = None;
+                    return;
+                }
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let v = btx_core::esplora_freshness::tick(
+                &client,
+                btx_core::esplora_sidecar::ELECTRS_HTTP_BASE,
+                btx_core::esplora_freshness::CENSUS_URL,
+                &run,
+                now,
+            )
+            .await;
+            if gen_counter.load(Ordering::SeqCst) == gen {
+                *verdict_slot.lock().await = Some(v);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(
+                btx_core::esplora_freshness::TICK_SECS,
+            ))
+            .await;
+        }
+    });
 }
 
 #[tauri::command]

@@ -1,16 +1,29 @@
 # easyNode Esplora front — Caddy configuration template.
 #
-# Ported from the deployment that serves api.btxscan.io today. The comments are
-# the valuable part: each one records an incident, and they are kept verbatim
-# where the reasoning still applies. What was NOT ported is listed at the bottom.
+# Ported from the deployment that serves api.btxscan.io today, and verified
+# against it on 2026-09-06 (PROVENANCE.md). The comments are the valuable part:
+# each one records an incident, and they are kept verbatim where the reasoning
+# still applies. What was NOT ported is listed at the bottom.
 #
-# Set the hostname when you run it:
-#     BTX_ESPLORA_HOST=esplora-1.example.com caddy run --config Caddyfile
+# ⚠ This needs a Caddy built with the rate-limit plugin
+#   (github.com/mholt/caddy-ratelimit). Stock Caddy refuses this file with
+#   "unrecognized directive: rate_limit". build-caddy.sh builds the right one.
+#
+# Environment, read when the Caddyfile is adapted:
+#     BTX_ESPLORA_HOST   the site address. A hostname gets automatic HTTPS
+#                        (esplora-1.example.com); http://127.0.0.1:3080 serves
+#                        plain HTTP on localhost, which is what the easyNode
+#                        app starts with until an operator puts a name on it.
+#     BTX_ESPLORA_RUN    where the freshness guardian writes its markers.
+#                        Default /run (the systemd deployment); the app uses
+#                        <datadir>/esplora/run because it does not run as root.
+#
+#     BTX_ESPLORA_HOST=esplora-1.example.com caddy run --config Caddyfile.template --adapter caddyfile
 #
 # Assumes:
 #     electrs  on 127.0.0.1:3000   (see electrs.service.template)
 #     btxd RPC on 127.0.0.1:19334
-#     the staleness guardian writing /run/btx-{fresh,stale,unverified}
+#     the staleness guardian writing $BTX_ESPLORA_RUN/btx-{fresh,stale,unverified}
 #
 # ⚠ Do not enable this on a pruned node. electrs indexes from block files on
 #   disk and a pruned datadir deletes them; easyNode refuses the mode outright
@@ -91,8 +104,8 @@
 	}
 
 	# ── Freshness-gated, never chain-swapped ─────────────────────────────────
-	# The guardian writes exactly one of /run/btx-{fresh,stale,unverified} and
-	# Caddy matches on its presence.
+	# The guardian writes exactly one of $BTX_ESPLORA_RUN/btx-{fresh,stale,
+	# unverified} and Caddy matches on its presence.
 	#
 	# This exists because a node once stopped following the chain at block
 	# 184,999 and kept answering 200 with stale data. Error-driven failover
@@ -119,8 +132,15 @@
 	# X-Btx-Freshness: fresh | stale | unverified
 	#   unverified = no witness was reachable, we do not know, and we refuse to
 	#   claim we are current.
+	#
+	# ONE DELIBERATE CHANGE FROM THE ORIGINAL (2026-09-06): with NO marker
+	# present this front answers `unverified`, not `fresh`. The original could
+	# default to `fresh` because its guardian always writes a marker; here the
+	# front is also started by the easyNode app, and a front that says `fresh`
+	# before anything has checked is the exact confident wrong answer the
+	# guardian exists to prevent. `fresh` now needs its marker like the others.
 	@stale file {
-		root /run
+		root {$BTX_ESPLORA_RUN:/run}
 		try_files btx-stale
 	}
 	handle @stale {
@@ -136,13 +156,13 @@
 			}
 		}
 	}
-	@unverified file {
-		root /run
-		try_files btx-unverified
+	@fresh file {
+		root {$BTX_ESPLORA_RUN:/run}
+		try_files btx-fresh
 	}
-	handle @unverified {
+	handle @fresh {
 		header X-Btx-Upstream "local"
-		header X-Btx-Freshness "unverified"
+		header X-Btx-Freshness "fresh"
 		reverse_proxy 127.0.0.1:3000 {
 			header_down -Access-Control-Allow-Origin
 			header_down -Access-Control-Allow-Methods
@@ -155,7 +175,7 @@
 	}
 	handle {
 		header X-Btx-Upstream "local"
-		header X-Btx-Freshness "fresh"
+		header X-Btx-Freshness "unverified"
 		reverse_proxy 127.0.0.1:3000 {
 			header_down -Access-Control-Allow-Origin
 			header_down -Access-Control-Allow-Methods

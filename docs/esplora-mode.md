@@ -44,70 +44,81 @@ GET  /address/<addr>/txs/chain/<txid>
 GET  /tx/<txid>
 GET  /mempool
 GET  /blocks/tip/height       -> a bare decimal integer, nothing else
+GET  /blocks                  -> the recent block listing (chain age)
+GET  /block-height/<height>   -> the block hash there, bare 64 hex
 POST /tx
 ```
 
-**Eight routes. Serve them at the root of the origin, with no `/api` prefix.**
+**Ten routes. Serve them at the root of the origin, with no `/api` prefix.**
 Verified against the live reference: `api.btxscan.io/blocks/tip/height` answers
 200 and `api.btxscan.io/api/blocks/tip/height` answers 404. The wallet agrees —
 `AZURE_ESPLORA` is commented "our own node — Esplora at ROOT, no /api". Only
 minebtx ever served under `/api`, which is why the wallet keeps the path in its
 UI list and pins only scheme+host in the Rust gate.
 
-### ⚠ The witness route is not in that list, and that is the finding
+### ⚠ The witness half is BUILT, and this section used to say it was not
 
-An earlier version of this document, following the brief it came from, listed
-ten routes including `GET /blocks` and `GET /block-height/<height>`, and called
-the latter "THE WITNESS ROUTE — do not skip it".
+**Corrected 2026-09-06 against `MendeMatthias/pq-wallet@169b413`.** Every
+paragraph that used to stand here was written from the wallet as it was on
+2026-09-04 and is now wrong. It said the wallet denied `/blocks` and
+`/block-height`, with tests pinning the denial; that the divergence check
+compared heights across `OFFICIAL_EXPLORERS`; that a one-element list made it
+inert; and that the witness half therefore had to be planned and built. Anyone
+following that would plan work that already exists.
 
-**The wallet does not permit either one.** They are not omitted, they are
-actively denied, and there are tests pinning the denial:
+What the wallet actually does today, read from its source:
 
-```rust
-assert!(validate_esplora_route("GET", "/blocks", None).is_err());          // block listing
-assert!(validate_esplora_route("GET", "/blocks/tip/hash", None).is_err()); // not needed
-```
+- `validate_esplora_route` **permits** `GET /blocks` and
+  `GET /block-height/<h>`. The height gate, `is_height_segment`, is stricter
+  than anything this document asked for: ASCII digits only, one to nine of
+  them, no leading zero so a padded encoding cannot smuggle extra capacity,
+  and exactly three path segments. Its comment sizes the residual at about 30
+  bits.
+- Divergence does **not** run over `OFFICIAL_EXPLORERS`. There is a separate
+  `CHAIN_WITNESSES` list, and the separation is the design: a witness answers
+  one question, whether an independent source holds the same block hash at a
+  height both hold, and is never asked about balances, UTXOs, fees or history.
+  That is why Byron Bay is still useful there while it is banned from the money
+  path — wrong about money, sound about blocks.
+- The comparison is two requests, `/blocks/tip/height` then
+  `/block-height/<h>`, at the **highest shared height**. That is a correction
+  to this document's own instinct: comparing low returns "agree" on a genuinely
+  forked chain, because every block below a fork point is byte-identical on
+  both sides.
+- `judgeDivergence` returns `agree | differ | unknown`, and its comment says
+  what matters most: "a check that did not run is not a check that passed".
 
-`/block-height` appears nowhere in the wallet at all — not in the validator, not
-in the UI, not in a test.
-
-So the claim that Byron's `/blocks` 404 "silently broke the wallet's divergence
-check" cannot be right in that form: the wallet never calls `/blocks`, and its
-own gate would refuse the attempt. What the divergence check actually does, in
-`ui/main.js::checkTipFreshness`, is fetch `/blocks/tip/height` from every entry
-in `OFFICIAL_EXPLORERS` and compare the **heights**.
-
-Which is worse than described, for a different reason. `OFFICIAL_EXPLORERS`
-currently has **one entry**. Byron and minebtx were removed from it on
-2026-08-19, with a comment saying not to restore either without re-running the
-UTXO set comparison. A one-element list compared against itself is not a weak
-divergence check, it is an inert one — and no server-side change fixes that.
+So the sentence at the top of this document, that when Byron goes nothing can
+settle a fork for the wallet, is right about the **network** and wrong about
+the **code**. The machinery exists and has exactly one witness, which is
+retiring.
 
 ### What this means for the work
 
-Serving Esplora from the fleet takes **two halves, and neither alone is enough**:
+The two halves are still two halves, but only one of them is unbuilt:
 
-| half | where | what it needs |
+| half | where | state |
 |---|---|---|
-| data | easyNode | serve the eight routes above; this is the part an operator can do today |
-| witness | the wallet | permit `/block-height/<h>`, and carry more than one endpoint |
+| data | easyNode | built here: `deploy/esplora/`, the app switch, the gate |
+| witness machinery | the wallet | **already built** (`ui/tipwatch.js`, the three block routes) |
+| witnesses to point it at | the wallet's lists | **the actual gap**: `CHAIN_WITNESSES` has one entry, Byron Bay, which is retiring |
 
-A height alone proves nothing — on 2026-08-24 two mirrors agreed on 199,296 and
-both were wrong — so the witness half has to compare **hashes**, and the wallet
-cannot ask for a hash today. Building only the server side yields more copies of
-the same data and no fork-settling ability whatsoever.
+The remaining wallet change is therefore not an arm in a validator and not an
+architecture change. It is one or two entries in `CHAIN_WITNESSES` (and, for a
+node fit to serve money routes too, in `OFFICIAL_EXPLORERS` plus
+`PRODUCTION_EXPLORER_ORIGINS`, which the endpoints test keeps in lockstep). It
+is blocked on the same two things as everything else here: a DNS name, and an
+acceptance PASS behind it. Adding a name that does not resolve buys nothing and
+risks a user selecting a dead endpoint, so it waits.
 
-The good news is that the second half is small: one arm in `validate_esplora_route`,
-its test, and more than one entry in the curated list. It is a wallet change, not
-an architecture change. But it must be *planned*, because the server work alone
-buys none of the capability this was started for.
-
-`scripts/verify-esplora.sh` therefore separates the two sets. Routes the wallet
-requires **today** are PASS/FAIL and decide the verdict; the witness routes
-(`/blocks`, `/block-height/<h>`) are labelled **FUTURE**, counted separately, and
-cannot refuse an endpoint. Getting that wrong withheld wallet-fit endpoints for
-failing a capability no wallet can use yet, on a network whose whole problem is
-that there is one source left.
+`scripts/verify-esplora.sh` treats all three block routes as **required**, and
+did not before. It labelled them FUTURE, on the finding above, and counted them
+separately so they could not refuse an endpoint. That was right while the
+wallet denied them and is wrong now: an endpoint that 404s `/blocks` breaks the
+chain-age reading, and one that cannot answer `/block-height/<h>` cannot
+witness at all, which is the single capability this whole mode exists to
+restore. Byron Bay would now fail the gate on that route, which is correct: it
+is a witness the wallet already cannot rely on.
 
 Be exact about coverage: the gate probes `/blocks/tip/height`, `/mempool`,
 `/address/<a>/utxo`, `/tx/<t>/outspend/<v>` and `POST /tx` out of the eight, plus
@@ -182,18 +193,20 @@ comparison into a pass.
 
 **Proof the gate works.** Run against Byron Bay it refuses the endpoint, on the
 routes the wallet actually calls: no CORS headers, no freshness headers, and a
-UTXO set it will not bless without a comparison. Its `/blocks` 404 and its two
-diverging heights are reported as FUTURE notes and do not contribute to that
-refusal — before the split they did, which is how a wallet-fit endpoint could be
-turned away for a capability no wallet can use.
+UTXO set it will not bless without a comparison. Since 2026-09-06 its `/blocks`
+404 and its diverging heights count too, because the wallet now calls those
+routes. That is the second time this line has moved, in both directions, and
+the rule behind it is the stable part: the gate requires exactly what the
+wallet actually calls, and reads the wallet's own validator to find out.
 
 Re-run it rather than quoting a count from here; the numbers moved once the two
 sets were separated, and they will move again.
 
-Note that Byron's `/blocks` 404 is reported by the gate as a **future** problem,
-not a current one: the wallet cannot call `/blocks` today. It is worth serving
-anyway, because the witness half needs it and because an endpoint that already
-answers it is one less thing to coordinate when the wallet changes.
+Byron's `/blocks` 404 is reported by the gate as a **current** failure since
+2026-09-06, and used to be reported as a future one. The wallet calls that
+route today (the correction above), so an endpoint that does not answer it
+cannot serve this wallet, and saying otherwise would hand a wallet an endpoint
+that half-works.
 
 The reorg check is worth stating exactly, because the boundary was described
 wrongly before. Measured across three sources:
@@ -244,21 +257,174 @@ bottleneck is that there is **one** source, and (a) fixes that this month.
 
 ## What is built here, and what is not
 
+*Updated 2026-09-06. The earlier version of this section said the electrs
+fork, the decode crate, the Caddy configuration, the units and the guardian
+were "not present on this machine" and "not built here". They are now.*
+
 **Built and tested in this repository:**
 
-- [`deploy/esplora/`](../deploy/esplora/) — the Caddy front, the electrs unit,
-  and the freshness guardian with its timer, ported from the deployment behind
-  api.btxscan.io. Its README lists what was deliberately left behind.
-- `crates/btx-core/src/esplora.rs` — the precondition gate, with the three-way
-  distinction above and 8 tests.
-- `scripts/verify-esplora.sh` — the acceptance gate, exercised against both a
-  known-bad endpoint and a known-good one.
-- This document, including the route contract and the hostname recommendation.
+- [`deploy/esplora/`](../deploy/esplora/): the whole serving stack, ported from
+  the deployment behind api.btxscan.io at commit `c77fa40` of the private
+  `btx-esplora` repository. electrs and rust-btx are vendored verbatim
+  (`PROVENANCE.md` there records the commit, the exclusions and every
+  hand-made difference), the Caddy front was verified against the original by
+  a comment-stripped diff, and the build scripts, units, guardian, health
+  check and decoder scan were ported by hand. rust-btx's suite passes in its
+  new home; `.github/workflows/esplora.yml` runs it and checks electrs
+  whenever the trees change.
+- `crates/btx-core/src/esplora.rs`: the precondition gate, with the three-way
+  distinction above and its tests, plus the two measurements it needs
+  (`conf_prune`, `node_prune_posture`).
+- `crates/btx-core/src/esplora_freshness.rs`: the freshness guardian, judged
+  against the chain census rather than any explorer (next section), pure and
+  tested against the feed as read on 2026-09-05.
+- `crates/btx-core/src/esplora_sidecar.rs`: electrs and the Caddy front as
+  children of the app, beside btxd.
+- The app: a "Serve wallets (Esplora API)" switch in Settings that runs the
+  gate and shows its sentence, refuses on a pruned datadir or a missing
+  binary rather than staying on and inert, starts the two sidecars with the
+  node, runs the guardian every 30 s, and shows the verdict beside the switch.
+- `scripts/verify-esplora.sh`: the acceptance gate, now checking the reference
+  and the candidate against the census's heaviest chain before it compares
+  anything.
+- [`esplora-api-contract.md`](esplora-api-contract.md): the API the electrs
+  fork serves, verbatim from the source repository.
 
-**Not built here, and deliberately not invented:** electrs itself, the BTX
-consensus decode crate, the Caddy configuration, the systemd units and the
-freshness guardian that writes `/run/btx-{fresh,stale,unverified}`. A working
-implementation of all of that already exists in the `btx-esplora` repository —
-the thing serving `api.btxscan.io` today — and it is not present on this machine.
-Porting it is the next step, and it should be a port rather than a rewrite: the
-`Caddyfile` in particular encodes decisions that were paid for with incidents.
+**Not built, and said plainly:**
+
+- An acceptance run against a real endpoint (below).
+- Bundling electrs and Caddy in the AppImage. Both are built, not downloaded;
+  `deploy/esplora/build-electrs.sh` and `build-caddy.sh` are the route, and the
+  app names the missing one. Shipping them in the release is a packaging
+  change for another day, and it should wait for the acceptance run.
+- `recentHashes` in the public census feed, which would remove the one-block
+  orphan caveat in the guardian.
+
+## Freshness comes from the census, not from an explorer
+
+The guardian ported from api.btxscan.io compared the local tip height with one
+explorer's. That failed three separate ways: explorer.minebtx.com died and its
+absence was read as health (2026-08-13); esplora.btxbyronbay.com followed the
+unattested branch, so its height meant nothing (2026-08-14); and on 2026-09-05
+api.btxscan.io itself sat on a minority branch for a day, which as a witness
+would have called a live-chain node "stale" and a dead-branch node "fresh".
+
+Since 2026-09-05 the site's `/api/nodes` publishes `chains`: every chain any
+reachable node follows, measured from the nodes' own headers, with the one
+carrying the most work marked `heaviest`, its tip height, a 16-character prefix
+of its tip hash, and the height at which it left the others. That is a
+measurement of the network, and it is the witness now.
+
+### What the census can and cannot witness, measured
+
+The first version of these rules compared the served block at the census's
+heaviest tip and called a mismatch "another chain". Running it found that
+wrong, twice in half an hour:
+
+| read | census says heaviest | this box's validator, same minute |
+|---|---|---|
+| 2026-09-05 23:27Z | chain B, tip 211381 (`2218b55a…`) | `2218b55a…` is a one-block `valid-headers` side tip; active chain at 211391 |
+| 2026-09-06 00:00Z | chain A, tip 211404 (`d5cdc194…`) | `d5cdc194…` is a one-block `valid-headers` side tip; active chain at 211416, and its block at 211404 is `a433ed21…` |
+
+At 00:00Z `api.btxscan.io` served `a433ed21…` at 211404 too, agreeing with this
+node at every settled height. The first rules would have called it "on another
+chain", and the acceptance gate did exactly that: it aborted.
+
+So the census is a **strong** witness for "this endpoint is on a deep minority
+branch", which is the 2026-09-05 shape (chain C, forked 389 blocks down, and
+still there a day later). It is a **weak** witness for "this endpoint holds the
+exact best block", because BTX mines races and a race flips both the heaviest
+flag and the published tip hash within a block or two. The rules follow that
+distinction now, and the threshold between the two is `RACE_DEPTH`, six blocks.
+
+### The rules
+
+Implemented in `esplora_freshness.rs` and identically in
+`deploy/esplora/btx-staleness-check.sh`; the acceptance gate applies the same
+deep-branch test.
+
+| in this order | evidence | verdict |
+|---|---|---|
+| 1 | the served tip is unknown | `unverified` |
+| 2 | no census, older than 30 min, or no heaviest chain with a usable tip | `unverified` |
+| 3 | the endpoint holds the tip of a competing chain that forked more than 6 blocks below the heaviest tip | `unverified`, and the chain and its fork height are named |
+| 4 | at or past the census tip, and the block served there IS the census tip | `fresh` |
+| 5 | at or past the census tip, and it is not | `unverified`, said as a probable race, not an accusation |
+| 6 | more than 3 blocks below the census tip | `stale` |
+| 7 | within 3 blocks, not comparable | `unverified` |
+
+Rule 3 runs before any height comparison: an endpoint on a minority branch is
+`unverified` however current it looks, because an overstated balance from the
+wrong chain reaching a signing wallet is worse than a stale one. `fresh` needs
+positive evidence, so on a racing network an honest endpoint will read
+`unverified` some of the time, and the header says which. The Caddy front now
+answers `unverified` when no marker exists at all (`PROVENANCE.md` says why
+that differs from the original).
+
+**What would sharpen this, and it is a small change to the site:**
+`recentHashes` per chain in the public feed, a handful of blocks below each
+tip where a race has settled. Then an endpoint could be placed on a chain
+positively rather than by elimination, and rule 5 would become a real answer
+instead of a shrug.
+
+## Acceptance status, 2026-09-06
+
+`scripts/verify-esplora.sh` was **not** run against an easyNode endpoint,
+because none exists yet that can pass its precondition:
+
+- The release box's validator is the project's signer and its datadir is
+  pruned (`getblockchaininfo` read at 23:25:42Z on 2026-09-05: `pruned: true`,
+  `pruneheight: 184942`). It cannot serve Esplora without a resync and it will
+  not be resynced.
+- The box has 54 GB free against a 124 GiB chain plus an unmeasured index, so
+  a second unpruned datadir cannot live there either.
+
+What was run instead, all on 2026-09-05/06 and all in the pull request:
+
+- rust-btx's suite in its vendored location: 25 tests, pass.
+- `build-electrs.sh` on this box with no root, which is how it found that the
+  pip `libclang` ships no builtin headers and needs gcc's include directory;
+  the script now handles that. The binary runs.
+- That binary against this box's validator: it read the cookie, connected, and
+  refused with `pruned node is not supported (use '-prune=0' bitcoind flag)`,
+  which is the precondition `crates/btx-core/src/esplora.rs` exists to catch
+  before an operator spends hours on it.
+- btx-core (339 tests) and the app (40) with clippy's correctness and
+  suspicious lints; the web layer's typecheck, 55 tests and bundle.
+- The gate against `api.btxscan.io`, twice: once to find the false abort
+  described above, and once after the fix, where it passes 19 checks including
+  a UTXO set comparison and a `POST /tx` round-trip. Note what that run is and
+  is not: with no second endpoint to compare against, candidate and reference
+  were the same host, so the set comparison compared it with itself. It
+  exercises the gate; it accepts nothing.
+
+The acceptance run needs a machine with the whole chain: sync one with
+`prune=0` (140 GiB free, a qualified GPU for blocks past 185,000), build
+electrs and Caddy with the two scripts, switch the setting on, let electrs
+index, then run the gate with two or three addresses that have spend history.
+Only a PASS is a reason to give the endpoint a name.
+
+## Hostnames and DNS: the runbook
+
+Option (a) from the decision above. Nothing here has been done yet; it is the
+owner's to do, in this order, after an acceptance PASS:
+
+1. Pick the operator behind `esplora-1.easybtx.com`. Their app's "Esplora
+   address" setting becomes that hostname; Caddy obtains the certificate, so
+   ports 80 and 443 must reach the machine.
+2. Create the DNS `A`/`AAAA` record for `esplora-1.easybtx.com` at the
+   provider that serves `easybtx.com`.
+3. Re-run the gate against `https://esplora-1.easybtx.com`. PASS, or stop.
+4. Repeat for `esplora-2` with a different operator, so the wallet has two
+   sources to compare hashes between.
+5. Only then: the wallet change, a wallet release, and the link from the site.
+   The change is two list entries, not machinery — the machinery is already
+   there (the correction above). A node that has passed the gate goes in
+   `CHAIN_WITNESSES`; one that should also serve balances goes in
+   `OFFICIAL_EXPLORERS` **and** `PRODUCTION_EXPLORER_ORIGINS`, which
+   `ui/endpoints.test.js` keeps in lockstep. Witnessing is the scarcer job:
+   `CHAIN_WITNESSES` has one entry today and it is Byron Bay, which is
+   retiring.
+
+Repointing a name at another operator later is a DNS change, not an app
+release. That is the whole reason for (a).

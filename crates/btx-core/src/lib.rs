@@ -22,6 +22,8 @@ pub mod datadir;
 pub mod disk;
 pub mod error;
 pub mod esplora;
+pub mod esplora_freshness;
+pub mod esplora_sidecar;
 pub mod fork;
 pub mod frontier;
 pub mod fsx;

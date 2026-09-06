@@ -8,6 +8,21 @@ root).
 
 ## [Unreleased]
 
+**Esplora mode: serve wallets from your own node.** A "Serve wallets
+(Esplora API)" switch in Settings runs electrs and a Caddy front beside btxd,
+so the BTX wallet can read balances from a full node you run instead of from
+the one explorer left. It is a gate before it is a switch: a pruned datadir is
+refused with the reason (a conf that asks for pruning, a datadir that has
+already pruned, or a keeper, which is pruned on purpose) and a missing
+`electrs` or `caddy` is refused naming the script that builds it
+(`deploy/esplora/`). Freshness is judged every 30 seconds against the chain
+census on easybtx.com, never against an explorer, and the front labels every
+answer `fresh`, `stale` or `unverified`; a node that is not on the heaviest
+measured chain is `unverified` whatever its age. Nothing is bundled and
+nothing is downloaded: the two binaries are built from the source vendored in
+this repository. The front listens on localhost until you give it a name.
+`docs/esplora-mode.md` has the design and the acceptance gate.
+
 ## [0.6.19] - 2026-09-06 · linux
 
 **The node follows the chain with the most work again.** Since 0.6.7 the

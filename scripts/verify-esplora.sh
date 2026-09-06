@@ -58,12 +58,17 @@ ok()   { printf '  \033[32mPASS\033[0m  %s\n' "$*"; pass=$((pass+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; fail=$((fail+1)); }
 info() { printf '        %s\n' "$*"; }
 
-# A route the WITNESS capability will need once the wallet permits it, but that
-# the wallet cannot call today. docs/esplora-mode.md is explicit that these are
-# reported as future problems, not current ones: the wallet's own egress
-# validator permits eight routes and DENIES /blocks and /block-height, with
-# tests pinning the denial. Failing an otherwise wallet-fit endpoint on them
-# withheld exactly the capacity this network has one of.
+# A capability the wallet does not have yet. Kept because this line has moved in
+# both directions and will move again: the rule is that the gate requires
+# exactly what the wallet actually calls, read from its own egress validator,
+# and reports anything else separately so it cannot refuse a wallet-fit
+# endpoint for a capability nobody can use.
+#
+# ⚠ /blocks and /block-height were reported here until 2026-09-06, because
+# validate_esplora_route DENIED them. It does not any more (pq-wallet@169b413:
+# both are permitted, is_height_segment gates the height, and the chain-health
+# feature calls /blocks/tip/height then /block-height/<h> against a witness).
+# They are required checks below.
 future() { printf '  \033[33mFUTURE\033[0m  %s\n' "$*"; futurefail=$((futurefail+1)); }
 
 get()  { curl -sS --max-time "$TIMEOUT" "$1" 2>/dev/null; }
@@ -83,6 +88,94 @@ esac
 echo "reference tip: $ref_tip"
 echo
 
+# ── 0b. the reference must be on the chain the network is on ────────────────
+# An explorer is one server. On 2026-09-05 api.btxscan.io sat on a minority
+# branch for a day; a UTXO comparison against it would have blessed a wrong
+# candidate and refused a right one. So before anything is compared, ask the
+# chain census (easybtx.com/api/nodes: which chain carries the most work,
+# measured from every reachable node's headers) for the heaviest chain's tip
+# and check that the reference holds it. No census: a warning, and the tip
+# checks fall back to the reference alone, said out loud. A reference on
+# another chain: ABORT, unless REF_ALLOW_OFFCHAIN=1 says you know.
+CENSUS_URL="${CENSUS_URL:-https://easybtx.com/api/nodes}"
+# How far below the heaviest tip a competing chain must fork before holding its
+# tip means a different chain rather than the losing side of a race. Same
+# figure as crates/btx-core/src/esplora_freshness.rs::RACE_DEPTH.
+RACE_DEPTH="${RACE_DEPTH:-6}"
+census_tip=""; census_prefix=""; census_chain=""; census_deep=""
+census_json="$(curl -sS --max-time "$TIMEOUT" -A "verify-esplora" "$CENSUS_URL" 2>/dev/null)"
+if [ -n "$census_json" ]; then
+  census_read="$(printf '%s' "$census_json" | python3 -c '
+import json, sys, time
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if time.time() - int(d.get("checkedAt") or 0) > 1800:
+    sys.exit(0)
+chains = (d.get("chains") or {}).get("chains") or []
+heavy = next((c for c in chains if c.get("heaviest") and c.get("tipHeight") is not None and c.get("tipHash")), None)
+if not heavy:
+    sys.exit(0)
+depth = int(sys.argv[1])
+print(heavy["tipHeight"], str(heavy["tipHash"]).lower(), heavy.get("id") or "?")
+# Every OTHER chain that forked more than RACE_DEPTH below the heaviest tip:
+# holding one of these tips is being on another chain, not losing a race.
+for c in chains:
+    if c is heavy or c.get("tipHeight") is None or not c.get("tipHash"):
+        continue
+    f = c.get("forkHeight")
+    if f is not None and int(heavy["tipHeight"]) - int(f) > depth:
+        print(c["tipHeight"], str(c["tipHash"]).lower(), c.get("id") or "?", f)
+' "$RACE_DEPTH" 2>/dev/null)"
+  read -r census_tip census_prefix census_chain <<<"$(printf '%s' "$census_read" | head -1)"
+  census_deep="$(printf '%s' "$census_read" | tail -n +2)"
+fi
+
+# Does the endpoint at $1 positively serve a DEEP competing chain's tip? Echoes
+# a description when it does, nothing when it does not.
+on_deep_branch() {
+  local base="$1" h prefix id fork got
+  [ -n "$census_deep" ] || return 0
+  while read -r h prefix id fork; do
+    [ -n "$h" ] || continue
+    got="$(get "$base/block-height/$h" | tr -d '\r\n' | tr 'A-F' 'a-f')"
+    case "$got" in
+      "$prefix"*) echo "chain $id, which left the heaviest chain at height $fork (its tip $h is ${prefix}…)"; return 0 ;;
+    esac
+  done <<<"$census_deep"
+}
+if [ -n "$census_tip" ]; then
+  echo "census    : heaviest chain $census_chain, tip $census_tip (${census_prefix}…)"
+  [ -n "$census_deep" ] && echo "          : $(printf '%s\n' "$census_deep" | grep -c .) competing chain(s) forked more than $RACE_DEPTH blocks down"
+  # The decisive question is the deep one. A mismatch at the heaviest tip is
+  # NOT: measured 2026-09-06 00:00Z, the census's heaviest tip was a one-block
+  # orphan that this project's own validator held as a side tip while its
+  # active chain ran twelve blocks past it, and api.btxscan.io served the same
+  # block there as the validator. An earlier version of this check aborted on
+  # exactly that, which would have refused a correct reference.
+  ref_deep="$(on_deep_branch "$REF")"
+  if [ -n "$ref_deep" ]; then
+    echo "ABORT: reference $REF serves $ref_deep" >&2
+    echo "       Its UTXO sets would bless the wrong chain." >&2
+    if [ "${REF_ALLOW_OFFCHAIN:-}" = "1" ]; then
+      echo "       REF_ALLOW_OFFCHAIN=1: continuing against an off-chain reference, as instructed." >&2
+    else
+      exit 3
+    fi
+  else
+    ref_at="$(get "$REF/block-height/$census_tip" | tr -d '\r\n' | tr 'A-F' 'a-f')"
+    case "$ref_at" in
+      "$census_prefix"*) echo "reference holds the heaviest measured chain's tip" ;;
+      '') echo "note: reference does not answer /block-height/$census_tip; it is on no deep branch, which is what matters here" ;;
+      *)  echo "note: reference serves ${ref_at:0:16}… at $census_tip, the census ${census_prefix}… — a mining race the census caught mid-flight, not a branch (no deep divergence found)" ;;
+    esac
+  fi
+else
+  echo "WARN: the chain census could not be read; tip checks fall back to the reference alone, which is one explorer"
+fi
+echo
+
 echo "── routes answer at the ORIGIN ROOT, with no /api prefix ──"
 # The wallet's chain() builds URLs against the origin root. A node that serves
 # these under /api answers nothing the wallet will ever ask for.
@@ -90,24 +183,33 @@ cand_tip="$(get "$CAND/blocks/tip/height")"
 case "$cand_tip" in
   ''|*[!0-9]*) bad "/blocks/tip/height must be a bare decimal integer (got: ${cand_tip:0:60})" ;;
   *)           ok  "/blocks/tip/height -> $cand_tip"
-               d=$(( ref_tip > cand_tip ? ref_tip - cand_tip : cand_tip - ref_tip ))
-               # A few blocks is normal: the attested tip legitimately trails the
-               # mined tip. Tens of blocks is not.
-               if [ "$d" -le 6 ]; then info "within $d of the reference"
-               else bad "$d blocks from the reference tip ($ref_tip)"; fi ;;
+               if [ -n "$census_tip" ]; then
+                 # The census is a snapshot a few minutes old, so a live node
+                 # is normally AT or AHEAD of it; behind by more than a few
+                 # blocks is the problem. Chain identity is checked below.
+                 if [ "$cand_tip" -ge "$census_tip" ]; then info "at or ahead of the census tip ($census_tip)"
+                 elif [ $(( census_tip - cand_tip )) -le 6 ]; then info "within $(( census_tip - cand_tip )) of the census tip"
+                 else bad "$(( census_tip - cand_tip )) blocks behind the heaviest measured chain's tip ($census_tip)"; fi
+               else
+                 d=$(( ref_tip > cand_tip ? ref_tip - cand_tip : cand_tip - ref_tip ))
+                 # A few blocks is normal: the attested tip legitimately trails the
+                 # mined tip. Tens of blocks is not.
+                 if [ "$d" -le 6 ]; then info "within $d of the reference"
+                 else bad "$d blocks from the reference tip ($ref_tip)"; fi
+               fi ;;
 esac
 
-# /blocks is a WITNESS route, not a wallet route. The wallet's egress validator
-# denies it outright (docs/esplora-mode.md), so a 404 here does not break
-# anything a wallet does today - it means this endpoint cannot yet serve the
-# hash-comparison the witness capability needs. Reported, not fatal.
+# /blocks is a REQUIRED route since 2026-09-06. The wallet reads the recent
+# block listing to judge how old the chain's newest block is, which is the
+# signal that caught a source answering 200 from a chain that had stopped 29.5
+# hours earlier. An endpoint that 404s it (Byron Bay does) breaks that reading.
 blocks_code="$(code "$CAND/blocks")"
 if [ "$blocks_code" = "200" ]; then
   n=$(get "$CAND/blocks" | grep -o '"height"' | wc -l)
-  ok "/blocks -> 200 with $n entries"
-  [ "$n" -ge 1 ] || future "/blocks returned 200 but no blocks"
+  if [ "$n" -ge 1 ]; then ok "/blocks -> 200 with $n entries"
+  else bad "/blocks returned 200 but no blocks: the wallet cannot read the chain's age from it"; fi
 else
-  future "/blocks -> $blocks_code: no witness hash comparison from this endpoint yet (the wallet cannot call it either way)"
+  bad "/blocks -> $blocks_code: the wallet reads this route for the chain's age (esplora.btxbyronbay.com 404s it, which is why it fails here)"
 fi
 
 for r in "/mempool"; do
@@ -117,19 +219,36 @@ done
 
 echo
 echo "── the witness route: /block-height/<h> ──"
-# This is what lets the fleet replace Byron Bay as a fork witness. A height alone
-# proves nothing: on 2026-08-24 two mirrors agreed on 199,296 and both were wrong.
+# This is what lets the fleet replace Byron Bay as a fork witness, and the wallet
+# calls it today. A height alone proves nothing: on 2026-08-24 two mirrors agreed
+# on 199,296 and both were wrong.
+if [ -n "$census_tip" ]; then
+  cand_deep="$(on_deep_branch "$CAND")"
+  if [ -n "$cand_deep" ]; then
+    bad "this endpoint serves $cand_deep"
+    info "every balance it serves is a balance on that chain, and a wallet cannot tell."
+    info "This is the 2026-09-05 shape: a mirror that stayed on a branch for a day."
+  else
+    a="$(get "$CAND/block-height/$census_tip" | tr -d '\r\n' | tr 'A-F' 'a-f')"
+    case "$a" in
+      "$census_prefix"*) ok "/block-height/$census_tip is the heaviest measured chain's tip (${census_prefix}…)" ;;
+      '') future "/block-height/$census_tip not served: this endpoint cannot be placed on a chain positively (it is on no deep branch)" ;;
+      *)  ok "on no deep branch: not on any chain the census says forked more than $RACE_DEPTH blocks down"
+          info "it serves ${a:0:16}… at $census_tip where the census has ${census_prefix}…, which is a mining race, not a divergence" ;;
+    esac
+  fi
+fi
 wfail=0
 for h in $WITNESS_HEIGHTS; do
   a="$(get "$CAND/block-height/$h" | tr -d '\r\n')"
   b="$(get "$REF/block-height/$h"  | tr -d '\r\n')"
   case "$a" in
     [0-9a-f]*) : ;;
-    *) future "/block-height/$h did not return a bare 64-hex hash (got: ${a:0:60})"; wfail=1; continue ;;
+    *) bad "/block-height/$h did not return a bare 64-hex hash (got: ${a:0:60})"; wfail=1; continue ;;
   esac
-  if [ "${#a}" -ne 64 ]; then future "/block-height/$h returned ${#a} chars, expected 64"; wfail=1; continue; fi
+  if [ "${#a}" -ne 64 ]; then bad "/block-height/$h returned ${#a} chars, expected 64"; wfail=1; continue; fi
   if [ "$a" = "$b" ]; then ok "/block-height/$h matches reference (${a:0:16}…)"
-  else future "/block-height/$h DIVERGES: candidate ${a:0:16}… reference ${b:0:16}…"
+  else bad "/block-height/$h DIVERGES: candidate ${a:0:16}… reference ${b:0:16}…"
        info "this is the Byron Bay defect: an index that never rolled back after a reorg"
        wfail=1; fi
 done
@@ -250,11 +369,12 @@ printf '\n'
 if [ "$fail" -eq 0 ]; then
   echo "  This endpoint may be advertised to a wallet."
   if [ "$futurefail" -gt 0 ]; then
-    echo "  It cannot yet serve the WITNESS capability (/blocks, /block-height)."
-    echo "  That needs BOTH halves: these routes here, and a wallet change to"
-    echo "  permit them - its egress validator denies them today, with tests"
-    echo "  pinning the denial. Server work alone buys none of the capability."
+    echo "  Some capability notes above are not failures; read them."
   fi
+  echo "  Advertising it is a second step: the wallet reaches an endpoint only"
+  echo "  through its curated lists, so the origin must also be added there"
+  echo "  (pq-wallet CHAIN_WITNESSES, or OFFICIAL_EXPLORERS +"
+  echo "  PRODUCTION_EXPLORER_ORIGINS for the money routes) and released."
   exit 0
 fi
 echo "  DO NOT advertise this endpoint to a wallet."
