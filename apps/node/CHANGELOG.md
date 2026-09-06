@@ -62,17 +62,25 @@ because that needs the list of blocks rather than the blocks. Nothing changes
 for a folder that has kept everything — it is still held to keeping everything,
 which is what 0.6.18 was for.
 
-**What has not changed: the engine, and how much of the fleet validates for
-itself.** The engine stays v0.34.6 at commit `9eb4e005`, as in 0.6.18 and
-0.6.19. Two device classes validate the MatMul fork independently: NVIDIA
-`sm_120` and Apple M4-class. Every other machine starts, follows, and stalls
-below the fork rather than validating it. That is a property of the engine
-rather than of this release, and it is worth saying beside a witness feature:
-a node that follows reports the chain it was handed, so several witnesses
-following one source are one source wearing several hats. Comparing block
-hashes tells a wallet that two sources agree. It never tells it either is
-right, which is why the wallet asks more than one and why this answers the
-question it can answer instead of the ones it cannot.
+**What has not changed: the engine.** It stays v0.34.6 at commit `9eb4e005`,
+as in 0.6.18 and 0.6.19 — byte for byte the same twenty-one files, checked by
+extracting both published AppImages and comparing every one.
+
+Two device classes are rows in the engine's sealed golden manifest, NVIDIA
+`sm_120` and Apple M4-class. Those are the classes reproduced independently,
+not the only ones that work: on this engine a capable NVIDIA card qualifies
+itself by measurement at startup instead, and this project's own RTX 3060 has
+run as a full consensus validator at the tip since 4 September
+(`docs/gpu-qualification-rtx3060.md` is the transcript, taken while it was
+signing and serving attestations). A machine with no capable card still starts
+and follows headers, but a processor cannot keep up with this network's block
+validation, so it will not hold at the tip.
+
+Worth saying beside a witness feature: a node that follows reports the chain it
+was handed, so several witnesses following one source are one source wearing
+several hats. Comparing block hashes tells a wallet that two sources agree. It
+never tells it either is right, which is why the wallet asks more than one and
+why this answers the question it can answer instead of the ones it cannot.
 
 **Esplora mode: serve wallets from your own node.** A "Serve wallets
 (Esplora API)" switch in Settings runs electrs and a Caddy front beside btxd,
@@ -127,7 +135,7 @@ app's. Both now run against local stubs in CI, and the acceptance gate refuses
 to compare an endpoint with itself, which had produced a pass that meant
 nothing.
 
-## [0.6.19] - 2026-09-06 · linux
+## [0.6.19] - 2026-09-06 · mac + linux
 
 **The node follows the chain with the most work again.** Since 0.6.7 the
 shipped conf parked any reorganisation deeper than six blocks
