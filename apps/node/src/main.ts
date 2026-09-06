@@ -136,6 +136,9 @@ export interface NodeStatusInfo {
   /** Esplora mode: serve the Esplora REST API to wallets from this node. */
   esplora_enabled: boolean;
   esplora_listen: string;
+  /** The address the RUNNING front is bound to; null when nothing runs. Not
+   *  the same as the setting, which applies at the next start. */
+  esplora_serving_on: string | null;
   esplora_running: boolean;
   /** Both sidecars alive, no tip yet: a first index, which takes hours. */
   esplora_indexing: boolean;
@@ -811,11 +814,23 @@ $<HTMLInputElement>("keeper-toggle").addEventListener("change", (e) => {
 // and shows its sentence — the switch springs back rather than staying on and
 // inert. A missing electrs or caddy is refused the same way, naming the build
 // script. The address row applies at the next start of the front.
+let esploraToggleBusy = false;
 $<HTMLInputElement>("esplora-toggle").addEventListener("change", async (e) => {
   const box = e.target as HTMLInputElement;
   const on = box.checked;
   const result = $("esplora-result");
-  result.hidden = true;
+  // Turning this on spawns two processes and waits to see they survived, so it
+  // is seconds, not milliseconds. Without a guard a second click issues a
+  // concurrent set_esplora and the two race over the same slot.
+  if (esploraToggleBusy) {
+    box.checked = !on;
+    return;
+  }
+  esploraToggleBusy = true;
+  box.disabled = true;
+  result.classList.remove("is-error");
+  result.textContent = on ? "Starting electrs and the front…" : "Stopping…";
+  result.hidden = false;
   try {
     const msg = await invoke<string>("set_esplora", { on });
     result.classList.remove("is-error");
@@ -826,6 +841,8 @@ $<HTMLInputElement>("esplora-toggle").addEventListener("change", async (e) => {
     result.textContent = String(err); // the Rust side's sentence, not a stack trace
   }
   result.hidden = false;
+  box.disabled = false;
+  esploraToggleBusy = false;
   void refreshEsploraPreflight();
 });
 
@@ -906,14 +923,31 @@ function reflectEsploraRow(status: NodeStatusInfo): void {
     // runs for hours and the node serves the network the whole time.
     desc.textContent = status.esplora_message ?? "electrs is building its index.";
   } else if (status.esplora_running) {
+    // The address the front is BOUND to, not the setting. Changing the setting
+    // while the front is up applies at the next start, so naming the setting
+    // here would tell someone to point a wallet at a port nothing is on.
+    const where = status.esplora_serving_on ?? status.esplora_listen;
+    const pending =
+      status.esplora_serving_on && status.esplora_serving_on !== status.esplora_listen
+        ? ` (${status.esplora_listen} applies at the next start)`
+        : "";
     const fresh = status.esplora_freshness ?? "not judged yet";
     desc.textContent =
-      `Serving on ${status.esplora_listen} — freshness: ${fresh}` +
+      `Serving on ${where}${pending} — freshness: ${fresh}` +
       (status.esplora_message ? ` (${status.esplora_message})` : "");
     if (status.esplora_freshness !== "fresh") desc.classList.add("needs-attention");
+  } else if (status.esplora_message) {
+    desc.textContent = status.esplora_message;
+    desc.classList.add("needs-attention");
+  } else if (status.running) {
+    // On, the node is up, and nothing is serving — with no recorded reason.
+    // "starts with the node" was shown here and is simply false: the node has
+    // already started.
+    desc.textContent =
+      "On, but electrs and the front are not running. Stop and start the node to try again; the log is in the esplora folder inside your data folder.";
+    desc.classList.add("needs-attention");
   } else {
-    desc.textContent = status.esplora_message ?? "Saved — electrs and the front start with the node";
-    if (status.esplora_message) desc.classList.add("needs-attention");
+    desc.textContent = "Saved — electrs and the front start with the node";
   }
 }
 

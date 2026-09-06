@@ -446,6 +446,22 @@ pub fn judge(
         }
     }
 
+    // A chain whose headers were capped before its tip carries a tipHeight
+    // that is a FLOOR, not the tip. Being "at or past" a floor proves nothing,
+    // so the height-only rules below must not grant `fresh` on one. The
+    // settled pairs above are unaffected: those are real blocks at real
+    // heights whether or not the walk reached the top.
+    if heaviest.partial {
+        return verdict(
+            Freshness::Unverified,
+            format!(
+                "the census could not read chain {} to its tip (partial), so {census_tip} is a floor rather than the tip and no height comparison against it means anything",
+                heaviest.id
+            ),
+            Some(census_tip),
+        );
+    }
+
     if tip >= census_tip {
         return match heaviest.holds_tip(hash_at) {
             Some(true) => verdict(
@@ -968,6 +984,29 @@ mod tests {
             judge(Some(211391), &lookup(&[(211381, B_TIP)]), Some(&old), NOW).freshness,
             Freshness::Fresh
         );
+    }
+
+    #[test]
+    fn a_partial_chain_is_a_floor_and_never_grants_fresh() {
+        // `partial` means the census's header walk was capped before the
+        // chain's tip, so tipHeight is a lower bound. It was decoded and never
+        // read, so an endpoint "at or past" a floor was called fresh.
+        let mut c = census();
+        c.chains.as_mut().unwrap().chains[1].partial = true;
+        let v = judge(Some(211391), &lookup(&[(211381, B_TIP)]), Some(&c), NOW);
+        assert_eq!(v.freshness, Freshness::Unverified, "{v:?}");
+        assert!(v.reason.contains("floor"), "{}", v.reason);
+        // But a settled block still proves placement, because those are real
+        // blocks at real heights whatever the walk reached.
+        let mut c2 = settled_census();
+        c2.chains.as_mut().unwrap().chains[0].partial = true;
+        let v = judge(
+            Some(211416),
+            &lookup(&[(211398, &full("3333333333333333"))]),
+            Some(&c2),
+            NOW,
+        );
+        assert_eq!(v.freshness, Freshness::Fresh, "{v:?}");
     }
 
     #[test]

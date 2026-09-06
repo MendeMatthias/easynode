@@ -1903,6 +1903,12 @@ pub struct NodeStatusInfo {
     /// switch: the verdict's reason while running, else why it is not.
     pub esplora_enabled: bool,
     pub esplora_listen: String,
+    /// The address the RUNNING front is actually bound to, which is not the
+    /// same thing as the setting: the setting can be changed while the front
+    /// is up, and it applies at the next start. `None` when nothing is
+    /// running. The row must name this one, or it tells an operator to point a
+    /// wallet at a port nothing is listening on.
+    pub esplora_serving_on: Option<String>,
     pub esplora_running: bool,
     /// Both sidecars are alive but the endpoint is not answering yet, which on
     /// a first run means electrs is building its index. That takes hours on a
@@ -2063,13 +2069,13 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
 
     // Esplora: both sidecars alive, and what the guardian last said. A dead
     // child is reported as not running even while the setting is on.
-    let esplora_running = state
-        .esplora
-        .lock()
-        .await
-        .as_mut()
-        .map(|s| s.health().all_up())
-        .unwrap_or(false);
+    let (esplora_running, esplora_serving_on) = {
+        let mut guard = state.esplora.lock().await;
+        match guard.as_mut() {
+            Some(s) => (s.health().all_up(), Some(s.listen.clone())),
+            None => (false, None),
+        }
+    };
     let esplora_verdict = state.esplora_verdict.lock().await.clone();
     // electrs binds its HTTP port only once the initial index is built, so
     // "running, and no tip yet" is the signature of a first index rather than
@@ -2157,6 +2163,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         keeper_engine_ready: btx_core::installer::engine_supports_keeper_profile(NODE_RELEASE_TAG),
         esplora_enabled: settings.esplora_enabled,
         esplora_listen: settings.esplora_listen.clone(),
+        esplora_serving_on,
         esplora_running,
         esplora_indexing,
         esplora_freshness: esplora_verdict.map(|v| v.freshness.as_str().to_string()),
@@ -2744,7 +2751,13 @@ async fn maybe_start_esplora(state: &AppState, datadir: &Path) {
 
 async fn stop_esplora(state: &AppState) {
     state.esplora_gen.fetch_add(1, Ordering::SeqCst);
-    if let Some(mut s) = state.esplora.lock().await.take() {
+    // Take the sidecars OUT of the slot before stopping them. In an
+    // `if let Some(x) = m.lock().await.take()` the guard is a temporary that
+    // lives to the end of the block, so the whole status poll — which locks
+    // this same slot every tick to report health — blocked for the entire stop
+    // grace. A stop is exactly when a UI must stay answering.
+    let sidecars = { state.esplora.lock().await.take() };
+    if let Some(mut s) = sidecars {
         s.stop().await;
         eprintln!("[esplora] electrs and the front stopped");
     }
