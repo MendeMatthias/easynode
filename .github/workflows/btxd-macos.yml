@@ -207,9 +207,22 @@ jobs:
           # Homebrew-only find modules see the depends archives instead.
           # apps/node/scripts/mac-engine/README.md explains both.
           SHIMS="$GITHUB_WORKSPACE/easynode/apps/node/scripts/mac-engine"
+          # ⚠ THE ONE THING THE DEPENDS TOOLCHAIN BREAKS. It sets
+          # CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY, so src/CMakeLists.txt's
+          # `find_path(BTX_APPLE_LIBOMP_INCLUDE_DIR omp.h HINTS /opt/homebrew...)`
+          # cannot see outside the depends prefix and comes back empty — while
+          # the library beside it IS found, because that check is `if(EXISTS
+          # <absolute path>)`, which the root path does not constrain. The
+          # result is the tree's libomp FATAL_ERROR on a machine where libomp is
+          # installed. Measured, run 34063351388.
+          #
+          # find_path skips entirely when its cache variable is already set, so
+          # passing it is the whole fix. Verified against the guard at
+          # src/CMakeLists.txt:1004, which only tests that both are non-empty.
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_TOOLCHAIN_FILE=depends/arm64-apple-darwin/toolchain.cmake \
             -DCMAKE_PROJECT_INCLUDE="$SHIMS/zmq-depends.cmake" \
+            -DBTX_APPLE_LIBOMP_INCLUDE_DIR=/opt/homebrew/opt/libomp/include \
             -DBUILD_DAEMON=ON -DBUILD_CLI=ON \
             -DBUILD_UTIL=OFF -DBUILD_TX=OFF -DBUILD_WALLET_TOOL=OFF \
             -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_TESTS=OFF \
