@@ -41,6 +41,15 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: for f in deploy/esplora/*.sh scripts/verify-esplora.sh; do bash -n "$f"; done
       - run: shellcheck -S error deploy/esplora/*.sh scripts/verify-esplora.sh
+      # The freshness guardian, actually run. Its rules are documented as
+      # identical to crates/btx-core/src/esplora_freshness.rs, and "change one
+      # and change the other" is not a mechanism. Stubs only: no node, no
+      # chain, no network.
+      - run: deploy/esplora/test-guardian.sh
+      # Skips cleanly on a runner, which has no BTX node. It is here so the
+      # script is exercised for syntax and its skip path, and so a change that
+      # breaks it fails somewhere rather than nowhere.
+      - run: deploy/esplora/test-witness.sh
 
   # The Caddy front, actually started and asked what it does. Until this job
   # existed the configuration had never been run: the three freshness states,
@@ -69,12 +78,6 @@ jobs:
           "$HOME/.local/bin/caddy" list-modules | grep -qx 'http.handlers.rate_limit'
       - name: Run the front against stubs
         run: deploy/esplora/test-front.sh
-        env:
-          # Free ports: the runner has nothing on these, and the defaults would
-          # collide with a real deployment if this ever ran on one.
-          FRONT_PORT: '13080'
-          ELECTRS_PORT: '13000'
-          BTXD_PORT: '13334'
 
   rust-btx:
     name: rust-btx (test)

@@ -39,6 +39,17 @@
 #   (crates/btx-core/src/esplora.rs) and this config would only fail later and
 #   more confusingly. See docs/esplora-mode.md.
 {
+	# No admin endpoint. Caddy otherwise opens an UNAUTHENTICATED control API
+	# on 127.0.0.1:2019 that can rewrite its whole configuration, which is a
+	# fourth listening port this file never declared and nothing here uses. It
+	# is also a startup failure waiting to happen: Caddy REFUSES TO START when
+	# 2019 is taken, and something else holding it is not hypothetical — on the
+	# machine this was developed on, a Windows process had it and WSL2 shares
+	# localhost.
+	#
+	# Set BTX_ESPLORA_ADMIN to an address if you want it back.
+	admin {$BTX_ESPLORA_ADMIN:off}
+
 	# BEFORE `handle`, and this is load-bearing. The original read
 	# `order rate_limit before reverse_proxy`, which worked there because its
 	# rate_limit sat inside a `route` block. This port dropped that wrapper
@@ -164,7 +175,7 @@
 	# before anything has checked is the exact confident wrong answer the
 	# guardian exists to prevent. `fresh` now needs its marker like the others.
 	@stale file {
-		root {$BTX_ESPLORA_RUN:/run}
+		root "{$BTX_ESPLORA_RUN:/run}"
 		try_files btx-stale
 	}
 	handle @stale {
@@ -181,7 +192,12 @@
 		}
 	}
 	@fresh file {
-		root {$BTX_ESPLORA_RUN:/run}
+		# QUOTED: the app puts this directory under the datadir, and a datadir
+		# path containing a space is ordinary on macOS and Windows. Unquoted,
+		# Caddy reads the second word as another argument and refuses the whole
+		# configuration — the front would not start, for a reason nowhere near
+		# the freshness markers it is about.
+		root "{$BTX_ESPLORA_RUN:/run}"
 		try_files btx-fresh
 	}
 	handle @fresh {

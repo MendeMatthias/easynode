@@ -43,7 +43,18 @@ pub const ELECTRS_BIN: &str = "electrs";
 pub const CADDY_BIN: &str = "caddy";
 /// How long a graceful stop may take before the children are killed. electrs
 /// flushes rocksdb on SIGTERM; Caddy finishes in-flight requests.
-pub const STOP_GRACE: Duration = Duration::from_secs(20);
+///
+/// TEN, not twenty. This runs inside the app's quit path, which budgets about
+/// 95 s for btxd's shielded-state flush — and that flush is the long pole:
+/// cutting it short leaves an in-flight mutation marker and costs a multi-minute
+/// rebuild on the next start. electrs flushing rocksdb is worth waiting for,
+/// but not out of btxd's budget.
+pub const STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// How long to watch a freshly spawned child before believing it started.
+/// Long enough for a bind failure or a config rejection, short enough that
+/// nobody notices it in a Settings toggle.
+pub const STARTUP_WATCH: Duration = Duration::from_millis(1200);
 
 pub fn esplora_dir(datadir: &Path) -> PathBuf {
     datadir.join("esplora")
@@ -298,12 +309,38 @@ impl EsploraSidecars {
                 return Err(e);
             }
         };
-        Ok(Self {
+        let mut me = Self {
             electrs,
             caddy,
             listen,
             datadir: datadir.to_path_buf(),
-        })
+        };
+        // A spawn that succeeds says the process STARTED, not that it lived.
+        // Both of these die immediately on the ordinary mistakes: a port
+        // already bound, a Caddyfile the binary will not adapt, an electrs
+        // that refuses a pruned datadir. Without this the caller reported
+        // success for a front that was already gone, and the operator learned
+        // it from a Settings row minutes later.
+        tokio::time::sleep(STARTUP_WATCH).await;
+        let health = me.health();
+        if !health.all_up() {
+            let which = if !health.electrs {
+                "electrs"
+            } else {
+                "the Caddy front"
+            };
+            let log = if !health.electrs {
+                electrs_log(datadir)
+            } else {
+                caddy_log(datadir)
+            };
+            me.stop().await;
+            return Err(AppError::Process(format!(
+                "{which} exited immediately after starting. Its log is {}",
+                log.display()
+            )));
+        }
+        Ok(me)
     }
 
     /// Which of the two is still running. `try_wait` reaps a dead child.
