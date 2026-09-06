@@ -1650,6 +1650,22 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
     });
 }
 
+/// May the attached-mode stop path actually stop the node it is attached to?
+///
+/// `None` is "we spawned it" (nothing was ever attached), which is ours.
+/// `OurOrphan` is our own previous instance, adopted after a self-update
+/// relaunch, which is the case the attached stop path was written for.
+/// `Unknown` is a node we cannot vouch for but that no live app claims — we
+/// keep stopping it, because refusing would leave the datadir held by
+/// something nobody will ever stop.
+///
+/// `AnotherApp` is the one answer that means hands off, and it is exactly the
+/// answer `AttachedTo` documents as "Never ours to stop, and never ours to
+/// delete under".
+fn attached_node_is_ours_to_stop(attached: Option<AttachedTo>) -> bool {
+    !matches!(attached, Some(AttachedTo::AnotherApp))
+}
+
 /// Graceful stop shared by the command, the tray, and app exit.
 pub async fn stop_node_inner(state: &AppState) {
     // Kill the refresher first so it can't overwrite the Stopped phase.
@@ -1657,6 +1673,7 @@ pub async fn stop_node_inner(state: &AppState) {
     stop_esplora(state).await;
     stop_witness(state).await;
     let launch = state.launch.lock().await.clone();
+    let attached = *state.attached_to.lock().await;
     {
         let mut guard = state.node.lock().await;
         if let Some(controller) = guard.as_mut() {
@@ -1665,14 +1682,40 @@ pub async fn stop_node_inner(state: &AppState) {
             }
             *guard = None;
         } else if let Some((btx_cli, datadir)) = launch.as_ref() {
-            // Attached mode (we never spawned it): ask it to stop gracefully
-            // and wait out the SAME flush budget a node of our own gets. This
-            // is the common case, not the exotic one — after a self-update
-            // relaunch the app has adopted the previous instance's orphan, so
-            // the very next quit takes this branch. The old 10 s wait here
-            // (inherited from stop_foreign_node) force-killed btxd mid-flush
-            // and cost a multi-minute shielded-state rebuild on the next start.
-            btx_core::node::stop_unmanaged_node(datadir, btx_cli, ATTACHED_STOP_GRACE).await;
+            if attached_node_is_ours_to_stop(attached) {
+                // Attached mode (we never spawned it): ask it to stop gracefully
+                // and wait out the SAME flush budget a node of our own gets. This
+                // is the common case, not the exotic one — after a self-update
+                // relaunch the app has adopted the previous instance's orphan, so
+                // the very next quit takes this branch. The old 10 s wait here
+                // (inherited from stop_foreign_node) force-killed btxd mid-flush
+                // and cost a multi-minute shielded-state rebuild on the next start.
+                btx_core::node::stop_unmanaged_node(datadir, btx_cli, ATTACHED_STOP_GRACE).await;
+            } else {
+                // ATTACHED TO SOMEONE ELSE'S NODE. Detach, do not stop.
+                //
+                // `state.launch` is armed at the top of `start_node_inner`,
+                // BEFORE the holder is classified, so it is armed on the Attach
+                // path too — including when the holder is another live app's
+                // node. This branch used to act on `launch` alone and never read
+                // `attached_to`, so Stop, the tray's Stop and Quit all ran
+                // `stop_unmanaged_node` against the MINER's btxd on the shared
+                // `~/.easybtx` datadir: `btx-cli stop`, then a force-kill once
+                // the 90 s grace expired. `AttachedTo::AnotherApp` says what the
+                // rule is in one line — "Never ours to stop, and never ours to
+                // delete under" — and `node_ownership`/`destructive_allowed`
+                // already enforce it for `reclaim_disk_now` and
+                // `remove_node_data_now`. The ordinary stop path was the hole.
+                //
+                // A force-kill there is not a theoretical cost: node.rs measures
+                // the shielded-state flush at 90–120 s on an M2 Pro, which is
+                // longer than the grace, so the miner's node could be killed
+                // mid-flush and pay a multi-minute rebuild on its next start.
+                eprintln!(
+                    "[node-app] the node serving this datadir belongs to another live app \
+                     (the miner, or another window) — detaching without stopping it"
+                );
+            }
         }
     }
     *state.rpc.lock().await = None;
@@ -3248,7 +3291,10 @@ pub async fn node_footprint(state: State<'_, AppState>) -> Result<NodeFootprint,
 
 #[cfg(test)]
 mod tests {
-    use super::witness_started_message;
+    use super::{
+        attached_node_is_ours_to_stop, pre_launch_plan, witness_started_message, AttachedTo,
+        PreLaunchPlan, NODE_RELEASE_TAG,
+    };
 
     /// Wrapping a Rust string literal across source lines WITHOUT a trailing
     /// `\\` keeps every space of the indentation. That is how this message
@@ -3267,7 +3313,25 @@ mod tests {
         // The loopback one has to say how to change it, since it is the default.
         assert!(witness_started_message("127.0.0.1:3081").contains("0.0.0.0"));
     }
-    use super::{pre_launch_plan, PreLaunchPlan, NODE_RELEASE_TAG};
+
+    /// THE MINER'S NODE IS NOT OURS TO STOP.
+    ///
+    /// `state.launch` is armed before the holder is classified, so the
+    /// attached-mode stop path is reachable while attached to another live
+    /// app's btxd. Stopping there ran `btx-cli stop` against the miner's node
+    /// on the shared datadir and force-killed it after the 90 s grace.
+    #[test]
+    fn only_another_live_apps_node_is_off_limits_to_the_stop_path() {
+        assert!(!attached_node_is_ours_to_stop(Some(AttachedTo::AnotherApp)));
+        // Our own previous instance, adopted after a self-update relaunch:
+        // this is the case the attached stop path exists for.
+        assert!(attached_node_is_ours_to_stop(Some(AttachedTo::OurOrphan)));
+        // Unvouched, but claimed by no live app. Refusing here would strand
+        // the datadir under something nobody will ever stop.
+        assert!(attached_node_is_ours_to_stop(Some(AttachedTo::Unknown)));
+        // Never attached at all: we spawned it, so it is ours.
+        assert!(attached_node_is_ours_to_stop(None));
+    }
     use btx_core::node::DatadirHolder;
 
     // The four things `<datadir>/btxd.pid` can turn out to mean, named so the
