@@ -303,9 +303,44 @@ done
 # miner's updater for every user.
 echo
 echo "==> flipping the draft live, make_latest=\"false\""
-RELEASE_ID="$(gh api "repos/$REPO/releases/tags/$TAG" --jq '.id')"
+# ⚠ NOT `gh api repos/.../releases/tags/$TAG`. That is "Get a release by tag
+# name", and a DRAFT has no git tag yet — GitHub creates the tag when the
+# release is published — so the lookup 404s on the very release this script
+# just created. Under `set -euo pipefail` the assignment then killed the
+# script here, after the ~450 MB upload and every verification had passed,
+# leaving the release a permanent draft with `gh: Not Found (HTTP 404)` as the
+# only explanation. Measured 2026-09-06 against a throwaway draft on the real
+# releases repo:
+#
+#     gh release view <tag> --json databaseId   ->  383444166   (draft=true)
+#     gh api repos/<repo>/releases/tags/<tag>   ->  404 Not Found
+#
+# `gh release view` sees drafts, which is why the existence check further up
+# uses it, and the two lookups disagreeing about what exists is the whole bug.
+# `databaseId` is the numeric REST id the PATCH needs; `id` is the GraphQL
+# node id (`RE_kwD…`) and does not address this endpoint.
+RELEASE_ID="$(gh release view "$TAG" --repo "$REPO" --json databaseId --jq '.databaseId')"
+[[ "$RELEASE_ID" =~ ^[0-9]+$ ]] || {
+  echo "error: could not read a numeric release id for $TAG (got ${RELEASE_ID:-<empty>})." >&2
+  echo "       The release is still a DRAFT with its assets attached. Publish it by hand:" >&2
+  echo "         gh api -X PATCH repos/$REPO/releases/<id> -f draft=false -f make_latest=false" >&2
+  exit 1
+}
 gh api -X PATCH "repos/$REPO/releases/$RELEASE_ID" \
   -f draft=false -f make_latest=false >/dev/null
+
+# The PATCH is not the proof. Read the release back and require it to be live:
+# `-f draft=false` sends the STRING "false", and a post-condition that only
+# checks the Latest pointer passes trivially while the release is still a
+# draft — which would then let step 8 of the recipe deploy a feed whose URLs
+# all 404, silently, because the automatic update check surfaces nothing.
+STILL_DRAFT="$(gh api "repos/$REPO/releases/$RELEASE_ID" --jq '.draft')"
+if [[ "$STILL_DRAFT" != "false" ]]; then
+  echo >&2
+  echo "error: $TAG is STILL A DRAFT after the publish PATCH (draft=$STILL_DRAFT)." >&2
+  echo "       Its assets are not publicly downloadable, so do NOT deploy the feed." >&2
+  exit 1
+fi
 
 NOW_LATEST="$(gh api "repos/$REPO/releases/latest" --jq '.tag_name' 2>/dev/null || echo "<none>")"
 echo "==> repo-global Latest is now: $NOW_LATEST"
