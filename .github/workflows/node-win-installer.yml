@@ -59,10 +59,19 @@ env:
   # wait for it to go green, confirm its smoke job passed, then set these from
   # that run. All of them move TOGETHER — the artifact name is minted from the
   # ref, so bumping only the run id downloads nothing and fails late.
-  PROVEN_BTXD_RUN_ID: ""
-  PROVEN_BTXD_ARTIFACT: ""
-  PROVEN_BTXD_VERSION: ""
-  PROVEN_BTXD_TAG: ""
+  # BOOTSTRAPPED 2026-09-08, in this repository, from this repository's own
+  # green run — which is the whole point of the "empty on purpose" note above.
+  # Run 33997938941 (btxd-windows.yml on main, 2026-09-05): both jobs green,
+  # including "regtest smoke on real Windows", and its artifact is minted from
+  # the ref, so the name carries the commit. That commit is 9eb4e005, which is
+  # NODE_RELEASE_COMMIT — the engine this app already installs and the one
+  # scripts/check-engine-tag.sh clears. VERSION is what the binary reports and
+  # TAG is the app's install key; they are equal here only because upstream's
+  # tag and its CLIENT_VERSION agree at v0.34.6. Do not collapse them.
+  PROVEN_BTXD_RUN_ID: "33997938941"
+  PROVEN_BTXD_ARTIFACT: "btxd-windows-9eb4e0050e08ea3ef768bac276dac9cbd2e84542"
+  PROVEN_BTXD_VERSION: "v0.34.6"
+  PROVEN_BTXD_TAG: "v0.34.6"
 
 permissions:
   contents: read
