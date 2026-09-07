@@ -198,6 +198,54 @@ pub fn snapshot_marker_path(datadir: &Path) -> PathBuf {
     datadir.join("faststart").join(".snapshot-loaded")
 }
 
+/// btxd's fatal when it cannot rewind a block, verbatim from
+/// `validation.cpp:10673`.
+///
+/// It is a `FatalError`, so the node aborts. On an assumeutxo node it used to
+/// be reachable at the snapshot base itself, where the undo data does not exist
+/// by construction; v0.34.6 fixed that specific case
+/// (`ParkAndRefuseSnapshotBaseDisconnect`, `validation.cpp:10665`) and the
+/// fatal now means what it says — a local failure. Either way it is the one log
+/// line that must stop this app from deleting the only copy of the snapshot the
+/// node was started from.
+pub const SNAPSHOT_DISCONNECT_FATAL_MARKER: &str = "Failed to disconnect block.";
+
+/// Blocks the node must have connected PAST the snapshot base before the
+/// source file is deleted.
+///
+/// `loadtxoutset` returning success means the UTXO set was accepted, not that
+/// the node can build on it: the background validation of everything below the
+/// base still has to run, and a node that aborts before it has made real
+/// progress is a node that may need the snapshot again. A thousand blocks is
+/// roughly a day of chain at 90-second spacing — long enough that a load which
+/// was going to fail has failed, short enough that the ~450 MB is reclaimed in
+/// the session the user notices.
+pub const SNAPSHOT_SWEEP_MIN_PROGRESS: u64 = 1_000;
+
+/// Whether the downloaded `snapshot.dat` has earned deletion.
+///
+/// Pure, so the rule is tested rather than trusted. Two conditions, both
+/// necessary, on top of the two the caller already checks (its own
+/// `snapshot_loaded` flag and the shared cross-process marker):
+///
+///   1. **The node has actually built on the snapshot.** `blocks` must be at
+///      least [`SNAPSHOT_SWEEP_MIN_PROGRESS`] past `anchor_height`. Deleting
+///      on the strength of "loadtxoutset returned ok" throws away the only
+///      local copy of a 450 MB file before anything has proved the node can
+///      use it, and the re-download is the whole faststart proposition.
+///   2. **btxd has not just died failing to rewind a block.** A
+///      [`SNAPSHOT_DISCONNECT_FATAL_MARKER`] in the recent log is the shape of
+///      a node that is not going to make that progress on its own.
+///
+/// A node BELOW the base (`blocks < anchor_height`) can happen — a datadir that
+/// never loaded the snapshot, or one reindexing — and is simply not progress.
+pub fn snapshot_sweep_allowed(blocks: u64, anchor_height: u64, log_tail: &str) -> bool {
+    if log_tail.contains(SNAPSHOT_DISCONNECT_FATAL_MARKER) {
+        return false;
+    }
+    blocks.saturating_sub(anchor_height) >= SNAPSHOT_SWEEP_MIN_PROGRESS
+}
+
 /// True if the shared cross-process "loaded" marker is present.
 pub fn snapshot_marker_present(datadir: &Path) -> bool {
     snapshot_marker_path(datadir).exists()
@@ -618,6 +666,39 @@ pub fn ensure_snapshot_loaded(
 
 #[cfg(test)]
 mod tests {
+    /// The snapshot is the only local copy of a 450 MB download, so "the load
+    /// returned ok" does not earn its deletion — real progress on top of it
+    /// does.
+    #[test]
+    fn the_snapshot_survives_until_the_node_has_built_on_it() {
+        let base = v0_34_5_spec().anchor_height;
+        assert!(
+            !snapshot_sweep_allowed(base, base, ""),
+            "no progress at all"
+        );
+        assert!(
+            !snapshot_sweep_allowed(base + SNAPSHOT_SWEEP_MIN_PROGRESS - 1, base, ""),
+            "one block short is still short"
+        );
+        assert!(snapshot_sweep_allowed(
+            base + SNAPSHOT_SWEEP_MIN_PROGRESS,
+            base,
+            ""
+        ));
+        // A node BELOW the base has not loaded it (or is reindexing): not
+        // progress, and saturating arithmetic must not read it as a huge lead.
+        assert!(!snapshot_sweep_allowed(base - 5_000, base, ""));
+    }
+
+    /// A node that just died failing to rewind a block may need the snapshot
+    /// again, whatever its height says.
+    #[test]
+    fn a_disconnect_fatal_keeps_the_snapshot_however_far_the_node_got() {
+        let base = v0_34_5_spec().anchor_height;
+        let log = "2026-09-07T10:00:00Z Error: Failed to disconnect block.";
+        assert!(!snapshot_sweep_allowed(base + 50_000, base, log));
+    }
+
     use super::*;
     use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicBool, Ordering};

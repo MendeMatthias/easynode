@@ -39,8 +39,19 @@ pub trait Rpc: Send + Sync {
 pub struct RpcClient {
     client: reqwest::Client,
     url: String,
-    user: String,
-    pass: String,
+    /// Shared so a refresh reaches every clone — `for_wallet` hands out a second
+    /// handle to the SAME node, and a cookie that rotated rotated for both.
+    creds: std::sync::Arc<std::sync::RwLock<(String, String)>>,
+    /// Where the credentials came from, when they came from a `.cookie`.
+    ///
+    /// btxd regenerates `.cookie` on every start, so credentials read once at
+    /// construction are only valid for the btxd that was running then. A client
+    /// that outlives a node restart — every long-lived one in this app does —
+    /// then authenticates with a dead password and gets HTTP 401 forever, which
+    /// `call` reports as a generic HTTP error indistinguishable from a node
+    /// that is down. Keeping the PATH is what lets a 401 be answered by
+    /// re-reading the file instead of by giving up.
+    cookie_path: Option<std::path::PathBuf>,
 }
 
 impl RpcClient {
@@ -59,8 +70,8 @@ impl RpcClient {
         Self {
             client,
             url: base_url.into(),
-            user: user.into(),
-            pass: pass.into(),
+            creds: std::sync::Arc::new(std::sync::RwLock::new((user.into(), pass.into()))),
+            cookie_path: None,
         }
     }
 
@@ -76,8 +87,8 @@ impl RpcClient {
             // `/wallet/`). pct_encode keeps the same unreserved set RFC 3986
             // defines (`A-Z a-z 0-9 - . _ ~`) and percent-encodes the rest.
             url: format!("{}/wallet/{}", base, pct_encode(name)),
-            user: self.user.clone(),
-            pass: self.pass.clone(),
+            creds: self.creds.clone(),
+            cookie_path: self.cookie_path.clone(),
         }
     }
 
@@ -92,7 +103,52 @@ impl RpcClient {
             .trim()
             .split_once(':')
             .ok_or_else(|| AppError::Config("malformed .cookie (expected user:pass)".into()))?;
-        Ok(Self::new(base_url, user.to_string(), pass.to_string()))
+        let mut client = Self::new(base_url, user.to_string(), pass.to_string());
+        client.cookie_path = Some(cookie_path.to_path_buf());
+        Ok(client)
+    }
+
+    /// The credentials to sign the next request with.
+    ///
+    /// Cloned out under the lock rather than held across the `await`: a
+    /// `std::sync::RwLock` guard is not `Send`, and holding one over a network
+    /// round trip would serialise every concurrent RPC behind the slowest.
+    fn creds(&self) -> (String, String) {
+        let guard = self.creds.read().unwrap_or_else(|e| e.into_inner());
+        guard.clone()
+    }
+
+    /// Re-read the `.cookie` and adopt it. `true` when the credentials actually
+    /// CHANGED, which is the only case worth replaying a request for — an
+    /// unchanged cookie means the 401 was not staleness and a replay would be a
+    /// second identical failure.
+    fn refresh_cookie(&self) -> bool {
+        let Some(path) = self.cookie_path.as_ref() else {
+            return false;
+        };
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        let Some((user, pass)) = raw.trim().split_once(':') else {
+            return false;
+        };
+        let mut guard = self.creds.write().unwrap_or_else(|e| e.into_inner());
+        if guard.0 == user && guard.1 == pass {
+            return false;
+        }
+        *guard = (user.to_string(), pass.to_string());
+        true
+    }
+
+    async fn send(&self, body: &Value) -> AppResult<reqwest::Response> {
+        let (user, pass) = self.creds();
+        self.client
+            .post(&self.url)
+            .basic_auth(&user, Some(&pass))
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| AppError::Http(e.to_string()))
     }
 }
 
@@ -106,14 +162,18 @@ impl Rpc for RpcClient {
             "params": params,
         });
 
-        let response = self
-            .client
-            .post(&self.url)
-            .basic_auth(&self.user, Some(&self.pass))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AppError::Http(e.to_string()))?;
+        let mut response = self.send(&body).await?;
+
+        // A 401 from btxd means one thing in practice: it restarted and wrote a
+        // new `.cookie` under us. Re-read it and replay ONCE — once, because a
+        // second 401 on freshly-read credentials is a real authentication
+        // failure and retrying it would spin. `refresh_cookie` returns false
+        // when the file is unchanged or absent, so a client built from an
+        // explicit user/pass never replays at all.
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && self.refresh_cookie() {
+            eprintln!("[rpc] 401 from node: .cookie rotated, re-reading and retrying once");
+            response = self.send(&body).await?;
+        }
 
         if !response.status().is_success() {
             let status = response.status();

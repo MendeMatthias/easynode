@@ -38,6 +38,23 @@ use tokio::process::{Child, Command};
 /// fresh node fetch the branch at all; history up to the split is the same on
 /// both chains and still comes from the archives.
 pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
+    // ORDER IS THE POINT, not a preference. `-addnode` peers are dialled in
+    // list order and the engine grants only MAX_ADDNODE_CONNECTIONS (8)
+    // manual slots at a time (net.h:112, `semAddnode`), so whatever sits at
+    // the top of this list is what a fresh or reconnecting node reaches
+    // FIRST. A live-chain body source below the eighth entry is a body source
+    // the node may not dial for minutes. Live chain first, archives after.
+    //
+    // LuckyPool's node, reported 2026-09-07 as a live body source carrying the
+    // majority chain (16 bodies in flight, MATMUL_CONSENSUS +
+    // MATMUL_ATTESTATION_ARCHIVE). Verified from this project's Mac the same
+    // day only as far as an outside check can go: TCP 213.224.31.105:33706
+    // accepts a connection. The service bits and the body delivery are the
+    // operator's report, not our own measurement, which is why it is a
+    // bootstrap seed and NOT an archive: it is pruned, so it cannot answer a
+    // deep body request, and the `noban` grant in BTX_ARCHIVE_WHITELIST_IPS
+    // belongs only to peers that can. Non-standard port on purpose.
+    "213.224.31.105:33706",
     // The one node found on the live chain 2026-09-05 19:49Z: /BTX:0.34.5/,
     // MATMUL_CONSENSUS, at 211197 while every other reachable node was at or
     // below 210872, and it answered `getdata` for the live branch's first
@@ -137,6 +154,60 @@ pub const BTX_ARCHIVE_PEERS: &[&str] = &[
     "node.btx.tools:19335",
 ];
 
+/// How many `-addnode` peers the engine will actually work through.
+///
+/// `MAX_ADDNODE_CONNECTIONS = 8` (`src/net.h:112`), and it is not a soft
+/// preference: `CConnman::Start` builds `semAddnode` with exactly that many
+/// grants, and `ThreadOpenAddedConnections` walks the added-node list in
+/// order taking one grant per peer it has to dial. A peer past the eighth
+/// unconnected entry is skipped (`if (!grant) continue;`) until a grant frees.
+///
+/// Two engine facts make this a correctness constant rather than trivia, both
+/// read from the shipped v0.34.6 tree:
+///
+///   * **There is no dedupe.** `init.cpp:3468` does
+///     `connOptions.m_added_nodes = args.GetArgs("-addnode")` and `net.h:1323`
+///     `push_back`s each one, so a peer named twice becomes two entries. The
+///     comment this replaced claimed "btxd dedupes addnode entries"; it does
+///     not. Only the `addnode` RPC dedupes, and that is a different path.
+///   * **Every source is merged.** `GetSettingsList` (`common/settings.cpp`)
+///     appends config-file values AFTER command-line ones for list args, so
+///     the same peer in the conf and on the CLI really is two entries.
+///
+/// Together those made the manual set on 2026-09-05 the union of the CLI's
+/// eleven distinct peers and the conf's copy of the same list. Eleven distinct
+/// peers cannot fit in eight slots, so three of them were never dialled at
+/// all, and during the cold-start window — before any connection is
+/// established, when every entry still reads `fConnected = false` — the
+/// duplicates consumed grants too. That is the shape of "the live-chain peer
+/// was never dialled for 13 minutes".
+pub const MAX_MANUAL_PEERS: usize = 8;
+
+/// The manual (`-addnode`) peer set for one start: deduplicated, capped at
+/// [`MAX_MANUAL_PEERS`], live chain first.
+///
+/// Order is inherited from the two lists, which is the whole design:
+/// [`BTX_BOOTSTRAP_PEERS`] leads with the peers measured on the live chain, and
+/// [`BTX_ARCHIVE_PEERS`] follows with the deep-history archives. A node that
+/// can only dial eight peers should spend those eight on the chain it must
+/// follow before the history it can fetch later.
+///
+/// Truncation is silent to btxd but not to us: anything past the cap is
+/// dropped here rather than handed to an engine that would ignore it, so the
+/// set this returns is the set the node actually dials.
+pub fn manual_peers() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::with_capacity(MAX_MANUAL_PEERS);
+    for peer in BTX_BOOTSTRAP_PEERS.iter().chain(BTX_ARCHIVE_PEERS.iter()) {
+        if out.len() >= MAX_MANUAL_PEERS {
+            break;
+        }
+        if !out.contains(peer) {
+            out.push(peer);
+        }
+    }
+    out
+}
+
 /// `whitelist=in,out,noban@<ip>` targets asserted into the conf at start.
 ///
 /// The `in,out` direction flags are REQUIRED: bare `-whitelist` is
@@ -158,8 +229,45 @@ pub const BTX_ARCHIVE_WHITELIST_IPS: &[&str] = &[
     "164.90.246.229",
 ];
 
-/// The archive noban-whitelist targets for THIS start: the pinned IPs above
-/// plus a fresh DNS resolution of every hostname in [`BTX_ARCHIVE_PEERS`].
+/// Live-chain BODY SOURCES that get the same `noban` grant as the archives.
+///
+/// WHY THESE ARE HERE AND NOT IN [`BTX_ARCHIVE_WHITELIST_IPS`]. That list is
+/// the deep-history archives, and its doc comment is explicit that the grant
+/// belongs to peers that can answer a deep body request. These three cannot,
+/// or are not known to: they are the peers measured serving the LIVE chain's
+/// recent bodies. Two different jobs, so two lists, and the comment above each
+/// stays true.
+///
+/// WHY THEY GET THE GRANT AT ALL. `noban` and `addnode` are the two halves of
+/// the same authority gate, and the engine skips a peer that has never served
+/// it a body unless the peer is manual or noban (`net_processing.cpp`,
+/// `no_body_availability`). These peers are already manual — they are at the
+/// head of [`BTX_BOOTSTRAP_PEERS`] — so the grant is belt-and-braces rather
+/// than the primary fix, and it is worth having for two reasons. It survives
+/// the manual list being trimmed at [`MAX_MANUAL_PEERS`], and it is what stops
+/// the engine's own `getmmattest` ban from taking out a live body source: on
+/// 2026-09-05 the validator banned 89.85.40.184 for exactly that
+/// (btxchain/btx#142, `docs/incident-2026-09-05-fork.md`) and then could not
+/// fetch the live branch from the one peer that had it.
+///
+/// The managed block is rewritten on every start, so an address that leaves
+/// this list loses its grant at the next launch, same as an archive.
+pub const BTX_LIVE_BODY_SOURCE_IPS: &[&str] = &[
+    // Reported by LuckyPool 2026-09-07 as a live body source; TCP-reachable
+    // from this project's Mac the same day. See BTX_BOOTSTRAP_PEERS.
+    "213.224.31.105",
+    // The one node found on the live chain 2026-09-05 19:49Z that answered
+    // getdata for the live branch's first block with the body.
+    "13.140.141.180",
+    // Served the validator's whole 383-block reorganisation on 2026-09-05
+    // after it was dialled as a manual peer, having been banned by this side's
+    // own getmmattest hammer earlier the same day.
+    "89.85.40.184",
+];
+
+/// Every noban-whitelist target for THIS start: the pinned archive IPs, the
+/// live-chain body sources, and a fresh DNS resolution of every hostname in
+/// [`BTX_ARCHIVE_PEERS`].
 ///
 /// The pinned constants keep the mirror working when DNS is down; the live
 /// resolution keeps the whitelist tracking a ROTATED host instead of blessing
@@ -168,12 +276,20 @@ pub const BTX_ARCHIVE_WHITELIST_IPS: &[&str] = &[
 /// neither set — that pair is what makes the noban grant revocable.
 ///
 /// Blocking (getaddrinfo): call it off the async executor.
-pub fn resolve_archive_whitelist_ips() -> Vec<String> {
+pub fn resolve_managed_whitelist_ips() -> Vec<String> {
     use std::net::ToSocketAddrs;
-    let mut ips: Vec<String> = BTX_ARCHIVE_WHITELIST_IPS
+    let mut ips: Vec<String> = Vec::new();
+    for ip in BTX_ARCHIVE_WHITELIST_IPS
         .iter()
-        .map(|s| s.to_string())
-        .collect();
+        .chain(BTX_LIVE_BODY_SOURCE_IPS.iter())
+    {
+        // A peer that is both an archive and a live body source is one grant,
+        // not two: btxd reads a repeated whitelist line as a repeated grant and
+        // the block would grow a duplicate on every start.
+        if !ips.iter().any(|had| had == ip) {
+            ips.push(ip.to_string());
+        }
+    }
     for peer in BTX_ARCHIVE_PEERS {
         // Literal-IP peers are already pinned above; only hostnames resolve.
         let host = peer.rsplit_once(':').map(|(h, _)| h).unwrap_or(peer);
@@ -267,20 +383,17 @@ pub fn build_node_command(
         format!("-conf={}", conf.display()),
         "-server=1".to_string(),
     ];
-    for peer in BTX_BOOTSTRAP_PEERS {
+    // The manual peer set: ONE entry per peer, at most MAX_MANUAL_PEERS, live
+    // chain first. See `manual_peers` for why each of those three properties
+    // is load-bearing and what the engine does without them.
+    //
+    // Archive peers are in that set because addnode == manual == one half of
+    // the trusted-mirror authority gate (the other half, noban, is asserted
+    // into the conf by `setup::set_managed_whitelist_block` on every start).
+    // Passing them on the CLI as well as in the conf means even a node started
+    // against a foreign conf still dials them.
+    for peer in manual_peers() {
         args.push(format!("-addnode={peer}"));
-    }
-    // Archive peers ride along as -addnode too: addnode == manual == one half
-    // of the trusted-mirror authority gate (the other half, noban, is asserted
-    // into the conf by ensure_whitelist_in_conf at provisioning time). Passing
-    // them on the CLI as well means even a node started against a foreign conf
-    // still dials the archives. Duplicates with BTX_BOOTSTRAP_PEERS are fine —
-    // btxd dedupes addnode entries.
-    for peer in BTX_ARCHIVE_PEERS {
-        let arg = format!("-addnode={peer}");
-        if !args.contains(&arg) {
-            args.push(arg);
-        }
     }
     // BIP324 v2 transport, explicitly ON. Confirmed upstream 2026-08-31: every
     // archive peer on the network now prefers v2, and a v1 dial to one opens
@@ -824,7 +937,42 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
         // `stalled = mode == "strict-device" && ready == Some(false)`, so while
         // we passed auto-fallback `rc_stalled` could never fire and a parked
         // node rendered as LIVE. strict-device makes the refusal clean and
-        // legible, and follows the chain via the trusted quorum below instead.
+        // legible.
+        //
+        // ⚠ CORRECTED 2026-09-07. This used to end "...and follows the chain
+        // via the trusted quorum below instead", and on a 0.34.5-or-newer
+        // engine that is no longer true for these hosts. The degraded-start
+        // block in `build_node_command` sets `consensus_replaces_mirror_here`
+        // to `!Metal && node_allows_degraded_matmul_start`, which passes
+        // `-matmulvalidation=consensus` and SKIPS the trusted quorum entirely.
+        // So a GPU-less Linux or Windows node on the shipped engine gets
+        // strict-device AND consensus AND no pins: it starts, syncs, serves
+        // history, and then stalls below the Epoch-A height with nothing to
+        // cross it. `node_rc_status` reports that stall rather than hiding it,
+        // which is why strict-device is still the right flag — the node is
+        // honest about being parked instead of burning a core producing
+        // nothing — but the fallback this comment promised is not configured.
+        //
+        // Closing it is a product decision, not a cleanup, and it has three
+        // ends, none free:
+        //
+        //   1. Land a golden manifest row for the host class so it validates in
+        //      consensus mode for real. The only one that ends with an
+        //      independent node; needs upstream.
+        //   2. Configure the trusted quorum for these hosts again — which on
+        //      0.34 also needs `-allowsinglekeytrustedmirror=1` at M=1, and
+        //      makes the app's three pinned keys this node's proof-of-work
+        //      authority. That is a trust choice the app would be imposing.
+        //   3. Accept the stall and say so plainly on screen, which is today.
+        //
+        // `-matmulvalidation=relay` READS like a fourth option and is not one.
+        // Verified against the shipped v0.34.6 binary and its source: relay
+        // returns InitError unless `-disablewallet=1` (this app has a wallet),
+        // clears NODE_NETWORK and NODE_NETWORK_LIMITED so the node serves no
+        // blocks at all, forces `-blocksonly=1`, and warns that it "must not be
+        // used as getbestblockhash / getblocktemplate" — which is every status
+        // read this app makes. It is the 0.34 public DNS/introducer role, not
+        // an honest follower (init.cpp:1165, 1600, 1814, 2643).
         Backend::Cpu | Backend::Cuda => Some("strict-device"),
     }
 }
@@ -1881,6 +2029,9 @@ pub struct NodeController {
     child: Option<Child>,
     /// Last-used launch parameters, populated by `start` and reused by `restart`.
     config: Option<LaunchConfig>,
+    /// Consecutive [`NodeController::restart`] calls, reset by a `start` that
+    /// the caller drove itself. The crash-loop guard counts on this.
+    restarts: u32,
 }
 
 impl NodeController {
@@ -1888,6 +2039,7 @@ impl NodeController {
         Self {
             child: None,
             config: None,
+            restarts: 0,
         }
     }
 
@@ -1961,6 +2113,29 @@ impl NodeController {
         backend: Backend,
         btx_cli: &Path,
     ) -> AppResult<()> {
+        // Free space is checked HERE, before anything is stopped or spawned,
+        // because this is the last point at which refusing is free. See
+        // `setup::NODE_START_DISK_FLOOR` for why a node is not started onto a
+        // volume this short, and why the floor is the app's existing red line
+        // rather than a new one.
+        //
+        // An UNMEASURABLE volume never blocks, which is the same rule the
+        // profile-change preflight in `apps/node` already follows: a disk we
+        // cannot read is not evidence of a disk that is full.
+        if let Some(free) = crate::setup::free_disk_bytes(datadir) {
+            if free < crate::setup::NODE_START_DISK_FLOOR {
+                const GIB: u64 = 1024 * 1024 * 1024;
+                return Err(AppError::Disk(format!(
+                    "not starting the node: {} has {:.1} GiB free and btxd needs at least {} GiB \
+                     to write blocks and chainstate without corrupting them. Free some \
+                     space and start it again — the chain on disk is fine.",
+                    datadir.display(),
+                    free as f64 / GIB as f64,
+                    crate::setup::NODE_START_DISK_FLOOR / GIB,
+                )));
+            }
+        }
+
         // Detect + clear any orphaned daemon from a previous run.
         Self::stop_stale(datadir, btx_cli).await;
 
@@ -2032,6 +2207,11 @@ impl NodeController {
         }
 
         self.child = Some(child);
+        // A start the CALLER asked for clears the crash-loop counter: the
+        // operator (or a fresh launch) has intervened, so the next fault gets
+        // the full budget again. `restart` puts its own running total back
+        // afterwards, which is what keeps the loop bounded.
+        self.restarts = 0;
         // Remember the parameters so `restart` can re-spawn without the caller
         // having to thread the paths through again (used by mining recovery).
         self.config = Some(LaunchConfig {
@@ -2072,29 +2252,108 @@ impl NodeController {
         }
     }
 
+    /// How many times [`NodeController::restart`] will re-spawn before it stops
+    /// and says so. A node that dies three times in a row is not a node a
+    /// fourth spawn fixes; it is a fault whose cause is still there, and the
+    /// spawn loop only hides it.
+    pub const RESTART_MAX_ATTEMPTS: u32 = 3;
+
+    /// Seconds to wait before the Nth re-spawn (N-1 × this, so 0s, 15s, 30s).
+    /// btxd needs the previous process's datadir lock released and its port
+    /// free; a re-spawn that races the old one's shutdown fails on the lock and
+    /// looks like a second crash.
+    pub const RESTART_BACKOFF_SECS: u64 = 15;
+
     /// Re-spawn btxd using the stored launch config (set by the last `start`).
     ///
-    /// Used by the mining supervisor's recovery path: after repeated RPC
-    /// failures the node is presumed wedged, so we kill the old child and
-    /// launch a fresh one. Errors if `start` was never called.
+    /// # This never kills a node that is alive
+    ///
+    /// It used to. The old body called `child.kill()` — SIGKILL, no grace —
+    /// and then re-spawned, with no limit and no check on whether anything was
+    /// actually wrong. Three separate things in this repository say why that is
+    /// the wrong shape:
+    ///
+    ///   * [`NodeController::stop`] exists precisely because SIGKILLing btxd
+    ///     during a shielded flush leaves an in-flight mutation marker and the
+    ///     next start spends 8 minutes rebuilding shielded state.
+    ///   * `watchdog.rs` never restarts anything, deliberately, and its stall
+    ///     taxonomy is built around the fact that a node replaying blocks looks
+    ///     wedged for ten minutes and must be left alone.
+    ///   * A node that is slow to answer RPC is the single most common healthy
+    ///     state this app sees (warmup, `RPC_IN_WARMUP` for minutes).
+    ///
+    /// So a restart now REQUIRES the child to have exited: `child_has_exited()`
+    /// must be `Some(true)`. A live child is refused, and the caller is told to
+    /// use `stop` — the graceful path — if it really wants the node down. An
+    /// RPC timeout alone is never enough.
+    ///
+    /// Errors if `start` was never called, if the child is still alive, or if
+    /// [`Self::RESTART_MAX_ATTEMPTS`] consecutive restarts have already been
+    /// made.
     pub async fn restart(&mut self) -> AppResult<()> {
         let cfg = self
             .config
             .clone()
             .ok_or_else(|| AppError::Process("cannot restart: node was never started".into()))?;
-        // Kill the existing child (best-effort) before re-spawning so we never
-        // leave two daemons fighting over the same wallet/datadir lock.
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill().await;
+
+        // A positive fault signal, or nothing happens. `Some(false)` is a live
+        // child; `None` is a controller that never spawned one and therefore
+        // has nothing to replace.
+        match self.child_has_exited() {
+            Some(true) => {}
+            Some(false) => {
+                return Err(AppError::Process(
+                    "not restarting: btxd is still running. A node that is slow to answer RPC \
+                     is usually warming up or replaying blocks, and killing it there costs \
+                     an 8-minute shielded rebuild. Stop it with `stop` if it really must \
+                     go down."
+                        .into(),
+                ))
+            }
+            None => {
+                return Err(AppError::Process(
+                    "cannot restart: this controller never started a node".into(),
+                ))
+            }
         }
-        self.start(
-            &cfg.btxd,
-            &cfg.datadir,
-            &cfg.conf,
-            cfg.backend,
-            &cfg.btx_cli,
-        )
-        .await
+
+        if self.restarts >= Self::RESTART_MAX_ATTEMPTS {
+            return Err(AppError::Process(format!(
+                "not restarting: btxd has already been re-spawned {} times in a row and \
+                 keeps exiting. The cause is still there; see the node log in the datadir.",
+                self.restarts
+            )));
+        }
+
+        // Back off before the second and later attempts: the exited child's
+        // datadir lock and RPC port are not necessarily free the instant it
+        // dies, and a re-spawn that races that looks like one more crash.
+        if self.restarts > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                Self::RESTART_BACKOFF_SECS * self.restarts as u64,
+            ))
+            .await;
+        }
+
+        // The child has exited and has already been reaped by `try_wait`
+        // inside `child_has_exited`; dropping the handle is all that is left.
+        self.child = None;
+        self.restarts += 1;
+
+        let attempts = self.restarts;
+        let result = self
+            .start(
+                &cfg.btxd,
+                &cfg.datadir,
+                &cfg.conf,
+                cfg.backend,
+                &cfg.btx_cli,
+            )
+            .await;
+        // `start` resets the counter (it is the caller-driven path); this is a
+        // restart, so put the running total back.
+        self.restarts = attempts;
+        result
     }
 
     /// The launch parameters captured by the last `start`, if any. Lets the
@@ -2586,6 +2845,87 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// A NODE THAT IS ALIVE IS NEVER KILLED BY `restart`.
+    ///
+    /// The old body SIGKILLed unconditionally. `stop` exists because killing
+    /// btxd mid-flush costs an 8-minute shielded rebuild, and `watchdog.rs`
+    /// never restarts anything precisely because a node replaying blocks looks
+    /// wedged for ten minutes and must be left alone. A slow RPC is not a
+    /// fault, so it must not be answered with a kill.
+    #[tokio::test]
+    async fn restart_refuses_a_node_that_is_still_running() {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = start_shim(d.path(), "sleep 30").await;
+
+        let err = c.restart().await.expect_err("a live child must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("still running"), "{msg}");
+        // ...and it is still running: the refusal did not kill it on the way
+        // out, which is the entire point.
+        assert_eq!(c.child_has_exited(), Some(false));
+    }
+
+    /// A controller that never started anything has nothing to re-spawn, and
+    /// says so rather than spawning a node the caller never asked for.
+    #[tokio::test]
+    async fn restart_without_a_previous_start_is_an_error() {
+        let mut c = NodeController::new();
+        let err = c.restart().await.expect_err("nothing to restart");
+        assert!(err.to_string().contains("never started"), "{err}");
+    }
+
+    /// An EXITED child is the positive fault signal, so the re-spawn happens.
+    #[tokio::test]
+    async fn a_dead_node_is_respawned() {
+        let d = tempfile::tempdir().unwrap();
+        // Exits immediately: the child is a confirmed fault by the time we ask.
+        let mut c = start_shim(d.path(), "exit 1").await;
+        while c.child_has_exited() != Some(true) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        c.restart().await.expect("a dead node is re-spawned");
+        assert_eq!(c.restarts, 1, "the attempt must be counted");
+    }
+
+    /// ...but not forever. The budget is asserted without serving the real
+    /// backoff: the counter is what bounds the loop, and a unit test should not
+    /// spend 45 seconds proving that `sleep` sleeps.
+    #[tokio::test]
+    async fn a_node_that_keeps_dying_stops_being_respawned() {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = start_shim(d.path(), "exit 1").await;
+        while c.child_has_exited() != Some(true) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        c.restarts = NodeController::RESTART_MAX_ATTEMPTS;
+
+        let err = c
+            .restart()
+            .await
+            .expect_err("past the budget the loop must stop");
+        assert!(err.to_string().contains("keeps exiting"), "{err}");
+    }
+
+    /// A start the caller drove clears the budget: the operator has
+    /// intervened, so the next fault gets the full allowance again.
+    #[tokio::test]
+    async fn a_caller_driven_start_clears_the_restart_budget() {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = start_shim(d.path(), "exit 1").await;
+        c.restarts = NodeController::RESTART_MAX_ATTEMPTS;
+        let cfg = c.config.clone().unwrap();
+        c.start(
+            &cfg.btxd,
+            &cfg.datadir,
+            &cfg.conf,
+            cfg.backend,
+            &cfg.btx_cli,
+        )
+        .await
+        .expect("a caller-driven start always runs");
+        assert_eq!(c.restarts, 0);
+    }
+
     #[tokio::test]
     async fn launch_watch_passes_a_child_that_stays_up() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3452,31 +3792,79 @@ consensus-validator service.";
         );
     }
 
+    /// The manual peer set on the command line is exactly `manual_peers()`:
+    /// each peer once, at most MAX_MANUAL_PEERS of them, live chain first.
+    ///
+    /// This replaces an assertion that every entry of BTX_BOOTSTRAP_PEERS
+    /// reached the command line, which stopped being the contract when the cap
+    /// arrived. The engine grants eight manual slots (net.h:112) and works
+    /// through the list in order, so "all of them" was never something the
+    /// command line could deliver — it just meant the tail was dropped by btxd
+    /// instead of by us, silently, at the point where the live chain was what
+    /// got dropped.
     #[test]
-    fn command_includes_all_bootstrap_addnode_args() {
+    fn the_command_line_carries_one_capped_live_first_manual_set() {
         let (_, args, _) = build_node_command(
             &PathBuf::from("/data/bin/btxd"),
             &PathBuf::from("/data"),
             &PathBuf::from("/data/btx.conf"),
             Backend::Cuda,
         );
-        for peer in BTX_BOOTSTRAP_PEERS {
-            let expected = format!("-addnode={peer}");
+        let addnodes: Vec<&String> = args.iter().filter(|a| a.starts_with("-addnode=")).collect();
+
+        assert!(
+            addnodes.len() <= MAX_MANUAL_PEERS,
+            "more manual peers than the engine will dial: {addnodes:?}"
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        for arg in &addnodes {
             assert!(
-                args.contains(&expected),
-                "expected {expected} in args; got: {args:?}"
+                seen.insert((*arg).clone()),
+                "{arg} passed twice — the engine does not dedupe added nodes \
+                 (init.cpp:3468 + net.h:1323), so a repeat is a wasted slot"
             );
         }
-        // A tripwire, not a fact about the network: the count is pinned so that
-        // adding or dropping a seed cannot pass unnoticed. Every entry is
-        // something a fresh install dials on first start, so a change here
-        // deserves the moment it takes to update this number deliberately.
-        // 2026-09-05: 9 became 7 — one live-chain node in, three parked or
-        // dead-branch nodes out (see the list's comments and the incident file).
+
+        let expected: Vec<String> = manual_peers()
+            .iter()
+            .map(|p| format!("-addnode={p}"))
+            .collect();
+        let got: Vec<String> = addnodes.into_iter().cloned().collect();
+        assert_eq!(got, expected, "order is the fix; it must be preserved");
+
+        // The live-chain body sources lead, because the eight slots are spent
+        // in order and a body source below the eighth entry may not be dialled.
+        assert_eq!(
+            got.first().map(String::as_str),
+            Some("-addnode=213.224.31.105:33706"),
+            "the live-chain seed must be dialled first"
+        );
+    }
+
+    /// `manual_peers` is where the cap and the dedupe live, so it is asserted
+    /// directly and not only through the command it feeds.
+    #[test]
+    fn manual_peers_is_deduplicated_and_capped() {
+        let peers = manual_peers();
+        assert!(peers.len() <= MAX_MANUAL_PEERS, "{peers:?}");
+        let unique: std::collections::HashSet<_> = peers.iter().collect();
+        assert_eq!(unique.len(), peers.len(), "duplicate in {peers:?}");
+        // Every entry comes from a list we ship; nothing is invented here.
+        for p in &peers {
+            assert!(
+                BTX_BOOTSTRAP_PEERS.contains(p) || BTX_ARCHIVE_PEERS.contains(p),
+                "{p} is in neither shipped list"
+            );
+        }
+        // A tripwire, not a fact about the network: pinned so that adding or
+        // dropping a seed cannot pass unnoticed. 2026-09-05: 9 became 7 — one
+        // live-chain node in, three parked or dead-branch nodes out.
+        // 2026-09-07: 7 became 8 with LuckyPool's live body source at the head.
         assert_eq!(
             BTX_BOOTSTRAP_PEERS.len(),
-            7,
-            "BTX_BOOTSTRAP_PEERS should have 7 entries"
+            8,
+            "BTX_BOOTSTRAP_PEERS should have 8 entries"
         );
     }
 
@@ -3499,7 +3887,7 @@ consensus-validator service.";
     /// union never duplicates an address.
     #[test]
     fn archive_whitelist_resolution_keeps_the_pins_and_dedupes() {
-        let ips = resolve_archive_whitelist_ips();
+        let ips = resolve_managed_whitelist_ips();
         for pin in BTX_ARCHIVE_WHITELIST_IPS {
             assert!(ips.iter().any(|i| i == pin), "pinned {pin} must survive");
         }

@@ -689,6 +689,20 @@ pub async fn wallet_create(state: State<'_, AppState>) -> Result<Ask<CreateResul
         return Ok(degrade(e));
     }
 
+    // The bundle carries spending key material and btxd wrote it with its own
+    // umask, which on a default install is 0644 — world-readable, on the
+    // Desktop, of a machine that may have more than one account. Nothing else
+    // in this app leaves key material at that mode. Best-effort: an export the
+    // user has in hand is worth more than a failed chmod, and the reveal below
+    // still happens either way.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(e) = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)) {
+            eprintln!("[node-app] could not tighten permissions on the wallet bundle: {e}");
+        }
+    }
+
     NodeAppSettings::update(&datadir, |s| {
         s.wallet_name = Some(WALLET_NAME.into());
         s.wallet_address = Some(address.clone());

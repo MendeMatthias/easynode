@@ -122,6 +122,11 @@ pub fn strip_unused_index_conf_str(conf: &str) -> String {
 /// Rewrite faststart.conf in place to drop the unused-index lines. Returns true if
 /// the file changed (caller may need to (re)start btxd for it to take effect).
 fn strip_unused_index_conf(conf_path: &Path) -> bool {
+    // Hold the conf lock across the WHOLE read-modify-write: reading before
+    // another writer's rename and writing after it is how an edit gets lost.
+    // See `fsx::ConfLock` for what that costs on this file and what the lock
+    // does and does not bind.
+    let _guard = crate::fsx::ConfLock::acquire(conf_path);
     let Ok(original) = std::fs::read_to_string(conf_path) else {
         return false;
     };
@@ -169,7 +174,16 @@ pub fn reclaim_disk(datadir: &Path, conf_path: &Path, snapshot_loaded: bool) -> 
     }
 
     // 2) Delete the post-load assumeutxo bootstrap snapshot (C3-gated).
-    if let Some(bytes) = sweep_loaded_snapshot(datadir, snapshot_loaded) {
+    //
+    // btxd is stopped on this path, so there is no height to compare against
+    // the snapshot base and the stronger `snapshot_sweep_allowed` rule cannot
+    // be applied here. The half that IS available from disk is applied: a node
+    // whose log ends in the "Failed to disconnect block." fatal keeps its
+    // snapshot, because that is the state in which it may need to be loaded
+    // again and the file is the only local copy.
+    let no_disconnect_fatal = !crate::node::node_log_tail(datadir, 64 * 1024)
+        .contains(crate::snapshot::SNAPSHOT_DISCONNECT_FATAL_MARKER);
+    if let Some(bytes) = sweep_loaded_snapshot(datadir, snapshot_loaded, no_disconnect_fatal) {
         freed_bytes += bytes;
         report
             .items
@@ -201,8 +215,18 @@ pub fn reclaim_disk(datadir: &Path, conf_path: &Path, snapshot_loaded: bool) -> 
 /// btxd RUNNING: the daemon reads snapshot.dat once during `loadtxoutset` and
 /// never holds it after, so a live app can sweep the ~450 MB the moment the
 /// load is confirmed instead of leaving it until the next manual reclaim.
-pub fn sweep_loaded_snapshot(datadir: &Path, caller_loaded_flag: bool) -> Option<u64> {
-    if !(caller_loaded_flag && crate::snapshot::snapshot_marker_present(datadir)) {
+/// `sweep_allowed` is the caller's evidence that the node has actually BUILT on
+/// the snapshot rather than merely accepted it — normally
+/// [`crate::snapshot::snapshot_sweep_allowed`], which needs a height the caller
+/// has and this function does not. It is a parameter and not an inference
+/// because "loadtxoutset returned ok" is not the same claim as "the node can
+/// use it", and this function deletes the only local copy of a 450 MB download.
+pub fn sweep_loaded_snapshot(
+    datadir: &Path,
+    caller_loaded_flag: bool,
+    sweep_allowed: bool,
+) -> Option<u64> {
+    if !(caller_loaded_flag && sweep_allowed && crate::snapshot::snapshot_marker_present(datadir)) {
         return None;
     }
     let snap = datadir.join("faststart").join("snapshot.dat");
@@ -571,17 +595,17 @@ mod tests {
         let snap = fs_dir.join("snapshot.dat");
         std::fs::write(&snap, vec![0u8; 2048]).unwrap();
         // Caller flag alone: no delete (the OTHER app may still be loading).
-        assert_eq!(sweep_loaded_snapshot(&dd, true), None);
+        assert_eq!(sweep_loaded_snapshot(&dd, true, true), None);
         assert!(snap.exists());
         // Marker alone: no delete (this caller hasn't confirmed its own load).
         crate::snapshot::mark_snapshot_marker(&dd);
-        assert_eq!(sweep_loaded_snapshot(&dd, false), None);
+        assert_eq!(sweep_loaded_snapshot(&dd, false, true), None);
         assert!(snap.exists());
         // Both agree → swept, bytes reported.
-        assert_eq!(sweep_loaded_snapshot(&dd, true), Some(2048));
+        assert_eq!(sweep_loaded_snapshot(&dd, true, true), Some(2048));
         assert!(!snap.exists());
         // Idempotent once gone.
-        assert_eq!(sweep_loaded_snapshot(&dd, true), None);
+        assert_eq!(sweep_loaded_snapshot(&dd, true, true), None);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

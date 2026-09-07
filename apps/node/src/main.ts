@@ -86,7 +86,10 @@ export interface NodeStatusInfo {
   archive_service_message: string | null;
   archive_service_needs_attention: boolean;
   /** A longer chain this node cannot obtain blocks for; null when healthy or
-   *  not yet measured. `kind` is longer_branch | headers_ahead. The sentence
+   *  not yet measured. `kind` is longer_branch | waiting_for_bodies |
+   *  headers_ahead — waiting_for_bodies is the same branch shape as
+   *  longer_branch with btxd itself saying no peer is serving the bodies, i.e.
+   *  a propagation race rather than a split. The sentence
    *  is rendered in Rust (fork_message), like archive_service_message. */
   fork: { kind: string; since_secs?: number } | null;
   fork_message: string | null;
