@@ -2844,7 +2844,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     /// A NODE THAT IS ALIVE IS NEVER KILLED BY `restart`.
     ///
     /// The old body SIGKILLed unconditionally. `stop` exists because killing
@@ -2852,6 +2851,7 @@ mod tests {
     /// never restarts anything precisely because a node replaying blocks looks
     /// wedged for ten minutes and must be left alone. A slow RPC is not a
     /// fault, so it must not be answered with a kill.
+    #[cfg(unix)]
     #[tokio::test]
     async fn restart_refuses_a_node_that_is_still_running() {
         let d = tempfile::tempdir().unwrap();
@@ -2875,6 +2875,7 @@ mod tests {
     }
 
     /// An EXITED child is the positive fault signal, so the re-spawn happens.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_dead_node_is_respawned() {
         let d = tempfile::tempdir().unwrap();
@@ -2890,6 +2891,7 @@ mod tests {
     /// ...but not forever. The budget is asserted without serving the real
     /// backoff: the counter is what bounds the loop, and a unit test should not
     /// spend 45 seconds proving that `sleep` sleeps.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_node_that_keeps_dying_stops_being_respawned() {
         let d = tempfile::tempdir().unwrap();
@@ -2908,6 +2910,7 @@ mod tests {
 
     /// A start the caller drove clears the budget: the operator has
     /// intervened, so the next fault gets the full allowance again.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_caller_driven_start_clears_the_restart_budget() {
         let d = tempfile::tempdir().unwrap();
@@ -2926,6 +2929,7 @@ mod tests {
         assert_eq!(c.restarts, 0);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn launch_watch_passes_a_child_that_stays_up() {
         let tmp = tempfile::tempdir().unwrap();

@@ -202,7 +202,12 @@ impl ConfLock {
                 .open(&path)
             {
                 Ok(file) => return Some(Self { file: Some(file) }),
-                Err(_) if waited < WAIT_MS => {
+                // A sharing violation — someone else holds the lock — is the
+                // one error worth waiting on. Anything else (no such
+                // directory, read-only volume) will not become true by
+                // waiting, and retrying it for five seconds would stall every
+                // conf write behind a lock that is never coming.
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied && waited < WAIT_MS => {
                     std::thread::sleep(std::time::Duration::from_millis(STEP_MS));
                     waited += STEP_MS;
                 }
@@ -221,7 +226,11 @@ impl Drop for ConfLock {
             // first keeps the release explicit and independent of close order.
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
         }
-        self.file = None;
+        // Closing the handle is what releases the lock on Windows, and the
+        // second half of releasing it on Unix. `take` rather than `= None` so
+        // the field is READ on every platform — on Windows the flock block
+        // above is compiled out, and a write-only field is a dead_code warning.
+        drop(self.file.take());
     }
 }
 
