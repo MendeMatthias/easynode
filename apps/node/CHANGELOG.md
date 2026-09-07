@@ -8,6 +8,71 @@ root).
 
 ## [Unreleased]
 
+## [0.6.21] - 2026-09-08 · prepared, not yet signed or published
+
+**Your node dials the peers it was given.** The app shipped eleven bootstrap
+and archive peers, and named each of them twice — once on the command line and
+once in the generated config. btxd grants exactly eight manual peer slots
+(`MAX_ADDNODE_CONNECTIONS`), works through the list in order, and does not
+remove duplicates from it: the code comment saying it did was simply wrong.
+Three peers were therefore never dialled at all, and while a node was still
+connecting — the moment a fresh start or a reconnect matters most — the repeats
+consumed slots of their own. On 5 September that is why a node could sit for
+thirteen minutes without ever calling the one peer that had the live chain. The
+list is now built once, each peer appears once, it is capped at eight, and the
+peers measured serving the live chain come first. If a peer this build ships
+does not fit, the log says which, rather than letting the engine drop it
+quietly. LuckyPool's node joins the list at the top as a live body source.
+
+**The fork warning stops calling an ordinary traffic jam a fork.** On 6
+September the app reported a competing chain when what was actually happening
+is that no peer had yet sent the next block's contents — it cleared itself in
+47 minutes. The two look identical in the numbers, and the earlier check read
+only the numbers. btxd knows the difference and says so in its log, so the app
+now reads btxd's own line: when the engine reports that no connected peer is
+serving the block it is waiting for, the card says the node is waiting on the
+network, not that the chain has split. A genuine split is still named a split,
+in the same words as before.
+
+**Two parts of the app can no longer overwrite each other's settings.** The
+node's config file is edited by several places at once — the start sequence,
+the Settings screen, and the miner, which shares the same folder. Each of them
+read the file, changed their copy and wrote it back, so when two overlapped one
+of the edits vanished. Nothing was ever corrupted; something was simply
+missing, and what went missing could be the peer list that reaches the live
+chain, or the setting that keeps every block. The whole read-and-write cycle is
+now held under a lock.
+
+**The node will not start onto a disk that has no room left.** Below 2 GB free
+— the point the app already paints red — starting btxd risks it running out of
+space mid-write and leaving the chain database needing hours of repair. It now
+declines to start and says to free some space, instead of starting and
+corrupting. A disk it cannot measure never blocks anything.
+
+**The app reconnects after btxd restarts instead of going quiet.** btxd writes
+a new authentication cookie every time it starts, and the app read it once and
+kept the old one, so a connection that outlived a node restart failed from then
+on and looked exactly like a node that was down. It now re-reads the cookie and
+retries once.
+
+**The bootstrap snapshot is kept until the node has actually used it.** The
+450 MB download was deleted as soon as btxd accepted it, which is earlier than
+knowing the node can build on it. It now stays until the node has connected a
+thousand blocks past the snapshot's height, and is kept regardless if btxd has
+failed to rewind a block.
+
+**A recovery restart can no longer kill a node that is working.** The restart
+path stopped btxd outright and tried again, with no limit and no check that
+anything was wrong — and a node replaying blocks after an unclean shutdown
+looks unresponsive for ten minutes while being perfectly healthy. It now
+restarts only a node that has actually exited, waits longer between attempts,
+and stops after three rather than looping.
+
+**The wallet file you export is no longer readable by other accounts on the
+machine.** It is written to the Desktop with your key material in it and
+inherited whatever permissions btxd's defaults gave it; it is now readable only
+by you.
+
 **"Check now" stops blaming your connection for a release that has no build for
 your platform.** Single-platform releases are the normal cadence here, and a
 copy on a platform the release skips is meant to stay exactly where it is. The
@@ -20,6 +85,20 @@ what is actually true: this release has no build for your platform, this copy
 stays where it is, and downloads for every platform are on the site. A real
 network failure still reads as one. (The automatic six-hourly check stays
 silent either way; there is nothing to act on.)
+
+**What has not changed: the engine, and which machines validate for
+themselves.** It stays v0.34.6 at commit `9eb4e005`, as in 0.6.18 through
+0.6.20. Two device classes are rows in its sealed golden manifest, NVIDIA
+`sm_120` and Apple M4-class; on this engine a capable NVIDIA card also
+qualifies itself by measurement at startup. A machine with no capable card
+still starts, follows headers and serves history, but a processor cannot keep
+up with this network's block validation, so it will not hold at the tip. None
+of the fixes above change that, and the peering fix in particular does not:
+dialling the right peers is what lets a node obtain the chain, never what lets
+it validate the fork.
+
+Internal: `withGlobalTauri` is off — the interface never used it.
+
 
 ## [0.6.20] - 2026-09-06 · linux
 
