@@ -690,13 +690,21 @@ mod tests {
 
     #[test]
     fn electrs_args_mirror_the_unit() {
-        let args = electrs_args(Path::new("/home/u/.easybtx"));
+        let datadir = Path::new("/home/u/.easybtx");
+        let args = electrs_args(datadir);
         let joined = args.join(" ");
+        // Built with `join`, not spelled out: `db_dir` builds a PathBuf, and a
+        // PathBuf renders its separators for the platform it is on. The
+        // hardcoded POSIX form failed on Windows against
+        // `/home/u/.easybtx\esplora\electrs-db`, which is the correct answer
+        // there — a test-portability bug, not a product one. Caught the first
+        // time this suite ran on Windows.
+        let db = format!("--db-dir {}", db_dir(datadir).display());
         for needed in [
             "--network mainnet",
             "--daemon-dir /home/u/.easybtx",
             "--daemon-rpc-addr 127.0.0.1:19334",
-            "--db-dir /home/u/.easybtx/esplora/electrs-db",
+            db.as_str(),
             "--http-addr 127.0.0.1:3000",
             "--electrum-rpc-addr 127.0.0.1:50001",
             "--cors *",
