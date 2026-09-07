@@ -14,7 +14,7 @@ use btx_core::esplora_sidecar::{find_binary, missing_binary_message, CADDY_BIN, 
 use btx_core::installer::{
     install_dir, resolve_bundled_node_pkg, returning_launch_paths, FaststartResult,
 };
-use btx_core::node::{DatadirHolder, NodeController, BTX_BOOTSTRAP_PEERS};
+use btx_core::node::{DatadirHolder, NodeController};
 use btx_core::node_api::{get_blockchain_info, get_chainstates};
 use btx_core::rpc::RpcClient;
 use btx_core::setup::{
@@ -585,26 +585,54 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
         }
     }
 
-    // Bootstrap peers belong in the conf on every start (idempotent) so even a
-    // hand-started btxd against this datadir reaches the sparse BTX network.
-    let _ = ensure_addnodes_in_conf(&paths.faststart_conf, BTX_BOOTSTRAP_PEERS);
+    // The manual peer set belongs in the conf on every start (idempotent) so
+    // even a hand-started btxd against this datadir reaches the sparse BTX
+    // network. It is the SAME set `build_node_command` passes on the CLI —
+    // `btx_core::node::manual_peers()` — deduplicated, capped at
+    // MAX_MANUAL_PEERS and live-chain first, because the engine merges the
+    // conf and the command line into one list and grants only eight manual
+    // slots. Writing a different (or longer) set here is how the conf and the
+    // CLI between them produced eleven distinct peers for eight slots.
+    let manual = btx_core::node::manual_peers();
+    let _ = ensure_addnodes_in_conf(&paths.faststart_conf, &manual);
 
-    // Archive peers + their noban whitelist: on a trusted mirror these ARE the
-    // sync path — `IsTrustedMirrorAuthorityPeer()` only asks manual/noban
-    // archive peers for attestations, and `fPreferredDownload` (block download)
-    // runs the same check. Without these lines a post-#331 trusted mirror can
-    // sit at a frozen height with healthy-looking peers (the api.btxscan.io
-    // incident class, 2026-08-14..17). Idempotent, asserted on every start.
+    // NO SILENT CAP. The engine dials eight manual peers and no more, so a
+    // shipped seat past the eighth is not dialled — that was already true, it
+    // was just btxd dropping the tail instead of us. Say which ones out loud,
+    // because the list order is now a decision and a decision nobody can see is
+    // one nobody revisits.
+    let dropped: Vec<&str> = btx_core::node::BTX_BOOTSTRAP_PEERS
+        .iter()
+        .chain(btx_core::node::BTX_ARCHIVE_PEERS.iter())
+        .copied()
+        .filter(|p| !manual.contains(p))
+        .collect();
+    if !dropped.is_empty() {
+        eprintln!(
+            "[node-app] {} shipped peer(s) past the {}-slot manual cap, not dialled: {}",
+            dropped.len(),
+            btx_core::node::MAX_MANUAL_PEERS,
+            dropped.join(" ")
+        );
+    }
+
+    // The archives keep their authority even when the cap costs them an
+    // `addnode` seat: on a trusted mirror `IsTrustedMirrorAuthorityPeer()`
+    // accepts `noban` OR `manual` (net_processing.cpp — `archive && (m_noban ||
+    // m_manual)`), and `fPreferredDownload` runs the same check. Without one of
+    // the two a post-#331 trusted mirror can sit at a frozen height with
+    // healthy-looking peers (the api.btxscan.io incident class,
+    // 2026-08-14..17). So the whitelist below is what carries an archive that
+    // did not make the manual cut — it is asserted on every start.
     //
     // The whitelist is a MANAGED BLOCK, not an append: noban is a security
     // grant and must stay revocable — the block is rewritten each start to
     // the pinned IPs plus a live DNS resolution of the hostname archives, so
     // an address that leaves the census loses its grant on the next start
     // (see set_managed_whitelist_block). DNS runs off the executor.
-    let _ = ensure_addnodes_in_conf(&paths.faststart_conf, btx_core::node::BTX_ARCHIVE_PEERS);
 
-    // ...and then PRUNE, which is the half that was missing. The two ensure
-    // calls above only ever append, so until now the peer set btxd dialled was
+    // ...and then PRUNE, which is the half that was missing. The ensure call
+    // above only ever appends, so until now the peer set btxd dialled was
     // the union of every census we have ever shipped: adding a seed reached
     // existing installs, retiring one never did. Measured on a real install on
     // 0.6.17, the release whose whole point was the corrected census, the conf
@@ -614,12 +642,12 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     // "an address that leaves the census loses its grant on the next start".
     // The addnode list now behaves the same way, so a seat we give up is
     // actually given up.
-    let retired: Vec<&str> = BTX_BOOTSTRAP_PEERS
-        .iter()
-        .chain(btx_core::node::BTX_ARCHIVE_PEERS.iter())
-        .copied()
-        .collect();
-    let pruned = btx_core::setup::prune_retired_addnodes_in_conf(&paths.faststart_conf, &retired);
+    //
+    // `keep` is the manual set above and nothing else. It used to be the union
+    // of both peer constants, which let the conf carry every peer this build
+    // ships even when that was more than the eight the engine will dial. The
+    // conf now converges on exactly the set that gets dialled.
+    let pruned = btx_core::setup::prune_retired_addnodes_in_conf(&paths.faststart_conf, &manual);
     if pruned > 0 {
         eprintln!(
             "[node-app] conf: dropped {pruned} retired addnode line(s) left by an earlier version"
@@ -627,11 +655,13 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     }
 
     let whitelist_ips =
-        tauri::async_runtime::spawn_blocking(btx_core::node::resolve_archive_whitelist_ips)
+        tauri::async_runtime::spawn_blocking(btx_core::node::resolve_managed_whitelist_ips)
             .await
             .unwrap_or_else(|_| {
+                // DNS failed: keep the pinned half of the grant, both lists.
                 btx_core::node::BTX_ARCHIVE_WHITELIST_IPS
                     .iter()
+                    .chain(btx_core::node::BTX_LIVE_BODY_SOURCE_IPS.iter())
                     .map(|s| s.to_string())
                     .collect()
             });
@@ -1266,6 +1296,8 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
         let mut gap_since: Option<(std::time::Instant, u64)> = None;
         let mut fork_first_seen: Option<std::time::Instant> = None;
         let mut fork_tips: Vec<btx_core::fork::ChainTip> = Vec::new();
+        // Refreshed with the tips, on the same tick, from the node's own log.
+        let mut at_served_body_tip = false;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             if gen_counter.load(Ordering::SeqCst) != gen {
@@ -1284,13 +1316,31 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                     if !snapshot_swept {
                         let dd = node_datadir();
                         let loaded = NodeAppSettings::load(&dd).snapshot_loaded;
-                        if let Some(bytes) = btx_core::disk::sweep_loaded_snapshot(&dd, loaded) {
+                        // "loadtxoutset returned ok" is not "the node can build
+                        // on it". The file is the only local copy of a 450 MB
+                        // download, so it goes only once this node has actually
+                        // connected blocks past the snapshot base and has not
+                        // died failing to rewind one — see
+                        // `snapshot::snapshot_sweep_allowed`.
+                        let allowed = btx_core::snapshot::snapshot_sweep_allowed(
+                            chain.blocks,
+                            snapshot_spec().anchor_height,
+                            &btx_core::node::node_log_tail(&dd, 64 * 1024),
+                        );
+                        let swept = btx_core::disk::sweep_loaded_snapshot(&dd, loaded, allowed);
+                        if let Some(bytes) = swept {
                             eprintln!(
                                 "[node-app] swept loaded snapshot.dat ({} MB)",
                                 bytes / (1024 * 1024)
                             );
                         }
-                        snapshot_swept = loaded; // stop probing once confirmed
+                        // Stop probing when the work is DONE, not when the flag
+                        // says the load happened. Those were the same thing
+                        // while the flag was the only gate; now that the sweep
+                        // can legitimately defer, `snapshot_swept = loaded`
+                        // would turn "not yet" into "never this session".
+                        snapshot_swept =
+                            swept.is_some() || !dd.join("faststart").join("snapshot.dat").exists();
                     }
                     // Independent reads — one round-trip instead of two.
                     // getpeerinfo replaces getconnectioncount (its length IS
@@ -1452,6 +1502,22 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                             if let Ok(tips) = btx_core::node_api::get_chain_tips(&rpc).await {
                                 fork_tips = tips;
                             }
+                            // btxd's own answer to the question `getchaintips`
+                            // cannot answer: is anyone actually serving us the
+                            // next body? Both the 09-05 split and the 09-06
+                            // propagation race show up as `headers-only`
+                            // branches; only the engine knows which it is, and
+                            // it says so in the log. Read on the same tick as
+                            // the tips so the two facts describe one moment.
+                            //
+                            // 64 KiB of a log this chatty is the last few
+                            // minutes, which is the window that should count:
+                            // a note from an hour ago is not evidence about
+                            // now, and a bounded tail is what keeps it from
+                            // becoming one.
+                            at_served_body_tip = btx_core::fork::at_served_body_tip(
+                                &btx_core::node::node_log_tail(&node_datadir(), 64 * 1024),
+                            );
                         }
                         let gap = gap_since.map(|(t, b)| btx_core::fork::GapWindow {
                             since_secs: t.elapsed().as_secs(),
@@ -1460,7 +1526,13 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                         let verdict = if chain.initial_block_download {
                             None
                         } else {
-                            btx_core::fork::fork_alarm(&fork_tips, chain.blocks, chain.headers, gap)
+                            btx_core::fork::fork_alarm(
+                                &fork_tips,
+                                chain.blocks,
+                                chain.headers,
+                                gap,
+                                at_served_body_tip,
+                            )
                         };
                         let verdict = match verdict {
                             Some(v) => {
@@ -1483,7 +1555,8 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                                 // condition that by definition had held for ten.
                                 match v {
                                     btx_core::fork::ForkAlarm::HeadersAhead { .. } => Some(v),
-                                    btx_core::fork::ForkAlarm::LongerBranch { .. } => {
+                                    btx_core::fork::ForkAlarm::LongerBranch { .. }
+                                    | btx_core::fork::ForkAlarm::WaitingForBodies { .. } => {
                                         Some(v.with_since(first.elapsed().as_secs()))
                                     }
                                 }

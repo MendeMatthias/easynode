@@ -50,6 +50,31 @@ pub const MEASURED_CHAIN_PAYLOAD_GIB: u64 = 124;
 ///
 /// A RESUME only needs operating headroom.
 pub const DISK_REQUIRED_FRESH: u64 = 140 * 1024 * 1024 * 1024; // measured chain (124 GiB) + working room
+/// The free space below which this app refuses to SPAWN btxd at all.
+///
+/// Distinct from every other threshold in this file, and from `disk.rs`'s
+/// `NODE_DISK_*_MB`, because those answer a different question. They decide
+/// what the UI SAYS and whether a prune posture may change; this one decides
+/// whether a process is started. Nothing used to: `NodeController::start`
+/// spawned btxd whatever the volume had left, and the amber/red banners were
+/// compared only for display.
+///
+/// It matters because of what ENOSPC does to this particular process. btxd
+/// writes its block and chainstate files with no room to back out: a write that
+/// fails mid-flush leaves the LevelDB chainstate inconsistent, and the node
+/// comes back needing `-reindex-chainstate` — hours — or, on a shielded wallet,
+/// the 8-minute rebuild `node.rs` already documents. Refusing to start costs
+/// the user a sentence; starting into ENOSPC costs them the chain.
+///
+/// The value is deliberately the app's OWN existing red line rather than a new
+/// judgement: `DISK_REQUIRED_RESUME` (what a resume is already said to need)
+/// and `disk::NODE_DISK_CRITICAL_MB` (what the UI already calls critical) are
+/// both 2 GiB. So this gate refuses exactly the machines the app already tells
+/// the user are in trouble, and no others. Raising it is a real decision with
+/// real fallout — it would refuse to start nodes that run today — and belongs
+/// with a measurement, not here.
+pub const NODE_START_DISK_FLOOR: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
 pub const DISK_REQUIRED_RESUME: u64 = 2 * 1024 * 1024 * 1024; // ~2 GiB
 
 /// What a fresh KEEPER install needs. A keeper runs `prune=10000`, so it keeps
@@ -140,6 +165,11 @@ pub fn free_disk_bytes(path: &Path) -> Option<u64> {
 /// installer-started (non-NodeController) nodes also reach the network when DNS
 /// seeds return no results.
 pub fn ensure_addnodes_in_conf(conf_path: &Path, peers: &[&str]) -> AppResult<()> {
+    // Hold the conf lock across the WHOLE read-modify-write: reading before
+    // another writer's rename and writing after it is how an edit gets lost.
+    // See `fsx::ConfLock` for what that costs on this file and what the lock
+    // does and does not bind.
+    let _guard = crate::fsx::ConfLock::acquire(conf_path);
     // Read existing content (empty string if file doesn't exist yet).
     let existing = match std::fs::read_to_string(conf_path) {
         Ok(s) => s,
@@ -241,6 +271,11 @@ pub fn prune_retired_addnodes_str(conf: &str, keep: &[&str]) -> String {
 /// write is not fatal: a stale seed is a degraded peer set, not a broken node,
 /// and refusing to start over it would be worse than the problem.
 pub fn prune_retired_addnodes_in_conf(conf_path: &Path, keep: &[&str]) -> usize {
+    // Hold the conf lock across the WHOLE read-modify-write: reading before
+    // another writer's rename and writing after it is how an edit gets lost.
+    // See `fsx::ConfLock` for what that costs on this file and what the lock
+    // does and does not bind.
+    let _guard = crate::fsx::ConfLock::acquire(conf_path);
     let Ok(original) = std::fs::read_to_string(conf_path) else {
         return 0;
     };
@@ -289,6 +324,11 @@ pub const WHITELIST_BLOCK_END: &str = "# END easybtx-managed archive whitelist";
 /// operator's and survives untouched. An unterminated block (BEGIN without
 /// END — a truncated write) is treated as ours to the end of file.
 pub fn set_managed_whitelist_block(conf_path: &Path, ips: &[String]) -> AppResult<()> {
+    // Hold the conf lock across the WHOLE read-modify-write: reading before
+    // another writer's rename and writing after it is how an edit gets lost.
+    // See `fsx::ConfLock` for what that costs on this file and what the lock
+    // does and does not bind.
+    let _guard = crate::fsx::ConfLock::acquire(conf_path);
     let existing = match std::fs::read_to_string(conf_path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -392,6 +432,14 @@ pub const BASE_CONF_SAFETY_KEYS: [&str; 5] = [
 ///      the fleet.
 ///
 /// A key absent from `canonical` too is not invented.
+/// This one deliberately does NOT take [`crate::fsx::ConfLock`] itself. It is a
+/// composite: every write it performs goes through [`set_conf_kv`], which takes
+/// the lock per key, and `flock` is held per open file description — a second
+/// `acquire` from this same thread would wait forever on a lock this thread
+/// already holds. Its own reads (`conf_kv`) are therefore unlocked, and the
+/// worst a race can do is have it re-assert a key another writer just wrote,
+/// with the same canonical value. That is idempotent, which is why the
+/// composite is the right place to give the lock up.
 pub fn ensure_base_conf_keys(conf_path: &Path, canonical: &str) -> AppResult<Vec<String>> {
     let mut added = Vec::new();
     for key in BASE_CONF_SAFETY_KEYS {
@@ -427,6 +475,11 @@ pub fn conf_kv(conf_path: &Path, key: &str) -> Option<String> {
 /// all `key=…` lines. Unlike `ensure_addnodes_in_conf` (append-only), this
 /// rewrites the file — removal needs it. Explorer mode uses it for `txindex=1`.
 pub fn set_conf_kv(conf_path: &Path, key: &str, value: Option<&str>) -> AppResult<()> {
+    // Hold the conf lock across the WHOLE read-modify-write: reading before
+    // another writer's rename and writing after it is how an edit gets lost.
+    // See `fsx::ConfLock` for what that costs on this file and what the lock
+    // does and does not bind.
+    let _guard = crate::fsx::ConfLock::acquire(conf_path);
     let existing = match std::fs::read_to_string(conf_path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

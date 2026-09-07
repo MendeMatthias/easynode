@@ -25,8 +25,10 @@
 //!     the one that stops btxd. What it does NOT do is serialise the
 //!     read-modify-write: both writers read before either writes, so the
 //!     loser's edit is lost. That is a lost update, not a corrupt file, and
-//!     closing it needs a lock around the whole read-modify-write, which is a
-//!     separate decision.
+//!     closing it needs a lock around the whole read-modify-write. That lock
+//!     is [`ConfLock`], taken by every read-modify-write writer of the conf in
+//!     [`crate::setup`] and [`crate::disk`]; its doc comment states exactly
+//!     which writers it binds and which it cannot.
 //!
 //! A truncated `faststart.conf` is not a cosmetic loss. `prune=0` disappearing
 //! means the datadir's own `btx_rw.conf` decides the prune posture instead, and
@@ -95,6 +97,132 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     written
+}
+
+/// The lock file that serialises read-modify-write cycles on a conf.
+///
+/// A sibling of the conf rather than a name in the datadir root: every writer
+/// of one conf derives the same path from the conf it is editing, which is what
+/// makes them exclude each other without threading a datadir through five
+/// signatures.
+fn conf_lock_path(conf_path: &Path) -> std::path::PathBuf {
+    conf_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".easybtx.conf.lock")
+}
+
+/// An exclusive advisory lock held for the whole read → modify → write of a
+/// conf file.
+///
+/// WHY THIS EXISTS. [`atomic_write`] closes the *torn file* hole and says so in
+/// this module's header: two writers get two temp files, so neither can publish
+/// a byte-mixed hybrid. What it explicitly does NOT close is the **lost
+/// update** — both writers read the old text, each edits its own copy, and the
+/// second rename silently discards the first's edit. Every conf writer in this
+/// crate is a read-modify-write, and several of them run concurrently by
+/// design: the start sequence in `apps/node` walks the whole conf reconciliation
+/// while the Settings commands rewrite the same file on their own tasks.
+///
+/// What a lost update costs on this particular file, today, in descending order
+/// of harm:
+///
+///   * **The `addnode` set.** The peer list is what decides which chain a node
+///     can obtain bodies for at all — the whole subject of
+///     `docs/incident-2026-09-05-fork.md`. Losing the edit that puts the live
+///     chain's body source in the conf is losing the route to the live chain.
+///   * **`prune=0`.** The datadir's own `btx_rw.conf` then decides the prune
+///     posture, and `disk.rs` documents why this app runs unpruned.
+///   * **The managed noban block**, which is a security grant that is supposed
+///     to be revocable on a schedule this app controls.
+///
+/// SCOPE, stated plainly. This is `flock(2)` on Unix and an exclusive
+/// share-mode open on Windows, and it binds **processes that take it** — this
+/// app's tasks, and a second copy of this app. The miner shares the datadir by
+/// design and is a separate program that does not take this lock, so a race
+/// with the miner is narrowed (the window shrinks to one writer's critical
+/// section) but not eliminated. That is why the callers that assert a key still
+/// assert it every start rather than trusting one successful write.
+///
+/// Failing to take the lock is never fatal: the caller proceeds unlocked, which
+/// is exactly the behaviour that existed before this type. A conf that cannot
+/// be locked is still a conf that must be written.
+pub struct ConfLock {
+    file: Option<std::fs::File>,
+}
+
+impl ConfLock {
+    /// Take the exclusive lock for `conf_path`, blocking until it is ours.
+    ///
+    /// Returns `None` when the lock could not be taken at all (the directory is
+    /// read-only, the filesystem does not support locking, another process held
+    /// it past the Windows timeout). The caller does its read-modify-write
+    /// anyway — see the type's doc comment.
+    #[cfg(unix)]
+    pub fn acquire(conf_path: &Path) -> Option<Self> {
+        use std::os::unix::io::AsRawFd;
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(conf_lock_path(conf_path))
+            .ok()?;
+        // LOCK_EX blocks until the holder releases. EINTR is the one retryable
+        // failure: a signal during the wait is not a lock we cannot have.
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Some(Self { file: Some(file) });
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return None;
+            }
+        }
+    }
+
+    /// Windows has no `flock`. Exclusivity comes from the open itself: a
+    /// share mode of 0 lets exactly one handle exist at a time, and Windows
+    /// closes it (and so releases the lock) even if the process dies, which is
+    /// the property a hand-rolled lockfile would not have. The wait is bounded
+    /// rather than infinite because a share-mode conflict has no blocking form.
+    #[cfg(not(unix))]
+    pub fn acquire(conf_path: &Path) -> Option<Self> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const WAIT_MS: u64 = 5_000;
+        const STEP_MS: u64 = 25;
+        let path = conf_lock_path(conf_path);
+        let mut waited = 0;
+        loop {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .share_mode(0)
+                .open(&path)
+            {
+                Ok(file) => return Some(Self { file: Some(file) }),
+                Err(_) if waited < WAIT_MS => {
+                    std::thread::sleep(std::time::Duration::from_millis(STEP_MS));
+                    waited += STEP_MS;
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
+impl Drop for ConfLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(file) = self.file.as_ref() {
+            use std::os::unix::io::AsRawFd;
+            // Closing the descriptor releases the lock on its own; unlocking
+            // first keeps the release explicit and independent of close order.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
+        self.file = None;
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +304,52 @@ maxreorgdepthpark=6
             .filter(|n| n != "faststart.conf")
             .collect();
         assert!(leftovers.is_empty(), "left {leftovers:?} behind");
+    }
+
+    /// THE LOST UPDATE, WHICH `atomic_write` ALONE DOES NOT PREVENT.
+    ///
+    /// Two writers each read the conf, add their own line, and write it back.
+    /// Unlocked, the second read happens before the first rename and one edit
+    /// disappears — a conf that silently loses `addnode=` or `prune=0`. Under
+    /// `ConfLock` each cycle is serialised and both lines survive every round.
+    #[test]
+    fn the_lock_makes_two_read_modify_writes_both_survive() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("faststart.conf");
+
+        for round in 0..25 {
+            std::fs::write(&p, "prune=0\n").unwrap();
+            let edit = |line: &'static str| {
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    let _guard = ConfLock::acquire(&p);
+                    let mut text = std::fs::read_to_string(&p).unwrap();
+                    // A real writer's think time between the read and the
+                    // write; without the lock this is the whole race.
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    text.push_str(line);
+                    atomic_write(&p, text.as_bytes()).unwrap();
+                })
+            };
+            let a = edit("addnode=13.140.141.180:19335\n");
+            let b = edit("addnode=213.224.31.105:33706\n");
+            a.join().unwrap();
+            b.join().unwrap();
+
+            let got = std::fs::read_to_string(&p).unwrap();
+            assert!(got.contains("13.140.141.180"), "round {round}: {got}");
+            assert!(got.contains("213.224.31.105"), "round {round}: {got}");
+            assert!(got.contains("prune=0"), "round {round}: {got}");
+        }
+    }
+
+    /// A lock that cannot be taken must not stop the write: a conf that has to
+    /// be written is written, locked or not. (An unwritable directory is the
+    /// reachable version of "no lock available".)
+    #[test]
+    fn an_unavailable_lock_is_never_fatal() {
+        let missing = std::path::Path::new("/no-such-dir-here/faststart.conf");
+        assert!(ConfLock::acquire(missing).is_none());
     }
 
     #[test]
