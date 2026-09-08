@@ -22,7 +22,14 @@ thirteen minutes without ever calling the one peer that had the live chain. The
 list is now built once, each peer appears once, it is capped at eight, and the
 peers measured serving the live chain come first. If a peer this build ships
 does not fit, the log says which, rather than letting the engine drop it
-quietly. LuckyPool's node joins the list at the top as a live body source.
+quietly.
+
+The list itself was re-measured for this release by starting a node against it
+and reading what actually connected. Two seeds that had not answered since 5
+September were retired — under a cap a seat that fails is a live peer evicted,
+not just a wasted dial — and LuckyPool's node joins as a live source carrying
+attestations. All eight peers this build ships were measured completing a
+handshake and moving real bytes.
 
 **The fork warning stops calling an ordinary traffic jam a fork.** On 6
 September the app reported a competing chain when what was actually happening
