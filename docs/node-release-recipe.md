@@ -666,7 +666,11 @@ anything is signed, published or flipped live:
    ⚠ Dispatch it with **`btxchain_ref=<btxd commit SHA>`** — the same COMMIT SHA
    rule step 3 states for Linux, and for the same reason: artifact names cannot
    contain `/`, so a branch name fails the upload after a full build. It is
-   currently `1e51f0d1ccc594b8fe215a6af3dcc7c118d7d1ca`.
+   `9eb4e0050e08ea3ef768bac276dac9cbd2e84542` (v0.34.6), which is
+   `NODE_RELEASE_COMMIT` in `commands.rs` — read it from there rather than from
+   this page. This line said `1e51f0d1` until 2026-09-09, three engine versions
+   stale, and following it would have pinned the Windows build to an engine
+   that parks at 184,999 while Mac and Linux shipped 0.34.6.
 
    This step used to read `btxchain_ref=v<node version>`, which is wrong twice
    over: the node's version (0.6.x) and btxd's ref are unrelated namespaces, and
