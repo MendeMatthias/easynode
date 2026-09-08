@@ -165,8 +165,21 @@ jobs:
             cuda-nvcc-${CUDA_VERSION} \
             cuda-cudart-dev-${CUDA_VERSION} \
             libcublas-dev-${CUDA_VERSION} \
-            cuda-nvprune-${CUDA_VERSION}
+            cuda-nvprune-${CUDA_VERSION} \
+            cuda-cuobjdump-${CUDA_VERSION}
           "$CUDA_HOME/bin/nvcc" --version | tail -2
+          # cuda-cuobjdump is NOT part of nvcc, cudart, cublas or nvprune — it
+          # is its own package, and without it the gate below cannot inspect
+          # anything. Prove both tools exist HERE, where the message is about a
+          # missing package, rather than three steps later where it looks like
+          # a binary with no kernels in it.
+          for t in nvcc cuobjdump; do
+            [ -x "$CUDA_HOME/bin/$t" ] || {
+              echo "::error::$t missing from $CUDA_HOME/bin after install"
+              exit 1
+            }
+          done
+          echo "toolchain present: nvcc + cuobjdump"
 
       - name: Configure + build
         working-directory: btx
@@ -230,7 +243,9 @@ jobs:
           [ -n "$archs" ] || archs="$DEFAULT_CUDA_ARCHS"
 
           if [ ! -x "$CUDA_HOME/bin/cuobjdump" ]; then
-            echo "::error::no cuobjdump at $CUDA_HOME/bin — cannot inspect device code"
+            echo "::error::no cuobjdump at $CUDA_HOME/bin — cannot inspect device code."
+            echo "::error::It is packaged separately: add cuda-cuobjdump-\$CUDA_VERSION"
+            echo "::error::to the toolkit install step. nvcc alone does not bring it."
             exit 1
           fi
 
