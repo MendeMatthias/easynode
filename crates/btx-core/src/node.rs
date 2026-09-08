@@ -45,32 +45,56 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // FIRST. A live-chain body source below the eighth entry is a body source
     // the node may not dial for minutes. Live chain first, archives after.
     //
-    // LuckyPool's node, reported 2026-09-07 as a live body source carrying the
-    // majority chain (16 bodies in flight, MATMUL_CONSENSUS +
-    // MATMUL_ATTESTATION_ARCHIVE). Verified from this project's Mac the same
-    // day only as far as an outside check can go: TCP 213.224.31.105:33706
-    // accepts a connection. The service bits and the body delivery are the
-    // operator's report, not our own measurement, which is why it is a
-    // bootstrap seed and NOT an archive: it is pruned, so it cannot answer a
-    // deep body request, and the `noban` grant in BTX_ARCHIVE_WHITELIST_IPS
-    // belongs only to peers that can. Non-standard port on purpose.
-    "213.224.31.105:33706",
     // The one node found on the live chain 2026-09-05 19:49Z: /BTX:0.34.5/,
     // MATMUL_CONSENSUS, at 211197 while every other reachable node was at or
     // below 210872, and it answered `getdata` for the live branch's first
     // block (210497, 2d816071…) with the body. NETWORK_LIMITED — recent
     // blocks only — so it carries the post-split chain, not deep history.
     "13.140.141.180:19335",
-    // Refused every dial from the validator on 2026-09-05 ("Connection
-    // refused", hundreds of debug.log lines) and did not answer the probe.
-    // Kept: it is the only full-history archive the census ever found, and a
-    // retired seed costs one failed dial.
-    "207.56.229.99:19335",
+    // LuckyPool. Reported to us 2026-09-07 as a live body source, and
+    // CONFIRMED here 2026-09-08 by starting a real v0.34.6 node against a
+    // scratch datadir with exactly this manual set and reading `getpeerinfo`:
+    //
+    //     /BTX:0.34.6/  synced_headers 93999  743 KB received
+    //     WITNESS, SHIELDED, NETWORK_LIMITED, CONSENSUS, ATTESTATION_ARCHIVE
+    //
+    // CONSENSUS + ATTESTATION_ARCHIVE is the scarce half: of the nine peers in
+    // that run only three advertised ATTESTATION_ARCHIVE. It is
+    // NETWORK_LIMITED, so it carries recent bodies rather than deep history —
+    // which is why it is a bootstrap seed and NOT in BTX_ARCHIVE_PEERS, whose
+    // noban grant belongs to peers that can answer a deep body request.
+    //
+    // ⚠ READ THE MEASUREMENT LATE, NOT EARLY. Two minutes into that same run
+    // this peer read `version 0, subver "", services [], synced_headers -1,
+    // 194 bytes` — indistinguishable from the dead seeds this list retires for
+    // exactly that signature — and it was struck from this list on the
+    // strength of it. It is the only peer here without P2P_V2, so it falls
+    // back to a v1 handshake and takes longer to come up than the other eight.
+    // Four minutes later it was a fully handshaked attestation archive. A seed
+    // is disqualified by a settled measurement, never by a snapshot taken
+    // while the handshake is still in flight.
+    "213.224.31.105:33706",
+    // ── MEASURED DEAD 2026-09-08, and that is why they are not here ──────────
+    // Probed from this project's Mac: three TCP attempts each, eight-second
+    // timeout, 0/3 answered. Corroborated by the box's own live node, which has
+    // carried all three as manual peers for days and has none of them in
+    // getpeerinfo while it holds seven other manual connections.
+    //
+    // They are commented out rather than deleted because the cap is what makes
+    // this matter. The engine dials eight manual peers; with these in the list
+    // two of those eight went to hosts that do not answer, and the peers pushed
+    // past the cap were node.btx.dev and node.btxchain.org — which that same
+    // getpeerinfo shows CONNECTED and serving at the tip. A dead seat used to
+    // cost one failed dial and then free its slot; under a hard cap it costs
+    // the slot outright. Put one back the day it answers again.
+    //
+    //   "207.56.229.99:19335"   0/3 — "the only full-history archive the census
+    //                           ever found", refusing every dial since
+    //                           2026-09-05 (docs/incident-2026-09-05-fork.md)
+    //   "114.150.94.235:19335"  0/3 — no answer to the 09-05 probe either
     // 2026-09-05 19:49Z: answered at 210872 on the minority branch. Still a
     // NETWORK archive for the shared history.
     "37.230.134.222:19335",
-    // 2026-09-05 19:49Z: no answer to the probe.
-    "114.150.94.235:19335",
     // 2026-09-05 19:49Z: no answer to the probe, and on the validator's
     // banlist. Both were this side's doing: at 20:23Z the same node, dialled
     // as a manual peer, was /BTX:0.34.6/ with NETWORK + MATMUL_CONSENSUS on
@@ -141,12 +165,13 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
 /// numair's fleet archives. Update as the census evolves — the nodes directory
 /// on easybtx.com will carry the live archive flag (service bit 31).
 pub const BTX_ARCHIVE_PEERS: &[&str] = &[
-    "207.56.229.99:19335",
+    // 207.56.229.99, 114.150.94.235 and 195.137.245.82 were measured 0/3 on
+    // 2026-09-08 and are listed with that measurement in BTX_BOOTSTRAP_PEERS
+    // above. An archive that does not answer cannot be a download source, and
+    // under the eight-slot manual cap listing it evicts one that can.
     // 2026-08-31: upstream's maintainer-grade node. Runs the unreleased 0.34.6
     // and advertises MATMUL_ATTESTATION_ARCHIVE (observed live the same day).
     "37.230.134.222:19335",
-    "114.150.94.235:19335",
-    "195.137.245.82:20982",
     // 185.204.25.227 removed 2026-08-31: refused TCP outright in every probe
     // that day and upstream's re-vetted census no longer lists it.
     "node.btx.dev:19335",
@@ -253,8 +278,8 @@ pub const BTX_ARCHIVE_WHITELIST_IPS: &[&str] = &[
 /// The managed block is rewritten on every start, so an address that leaves
 /// this list loses its grant at the next launch, same as an archive.
 pub const BTX_LIVE_BODY_SOURCE_IPS: &[&str] = &[
-    // Reported by LuckyPool 2026-09-07 as a live body source; TCP-reachable
-    // from this project's Mac the same day. See BTX_BOOTSTRAP_PEERS.
+    // LuckyPool, measured 2026-09-08 handshaking with CONSENSUS +
+    // ATTESTATION_ARCHIVE (see BTX_BOOTSTRAP_PEERS for the full reading).
     "213.224.31.105",
     // The one node found on the live chain 2026-09-05 19:49Z that answered
     // getdata for the live branch's first block with the body.
@@ -2844,7 +2869,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     /// A NODE THAT IS ALIVE IS NEVER KILLED BY `restart`.
     ///
     /// The old body SIGKILLed unconditionally. `stop` exists because killing
@@ -2852,6 +2876,7 @@ mod tests {
     /// never restarts anything precisely because a node replaying blocks looks
     /// wedged for ten minutes and must be left alone. A slow RPC is not a
     /// fault, so it must not be answered with a kill.
+    #[cfg(unix)]
     #[tokio::test]
     async fn restart_refuses_a_node_that_is_still_running() {
         let d = tempfile::tempdir().unwrap();
@@ -2875,6 +2900,7 @@ mod tests {
     }
 
     /// An EXITED child is the positive fault signal, so the re-spawn happens.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_dead_node_is_respawned() {
         let d = tempfile::tempdir().unwrap();
@@ -2890,6 +2916,7 @@ mod tests {
     /// ...but not forever. The budget is asserted without serving the real
     /// backoff: the counter is what bounds the loop, and a unit test should not
     /// spend 45 seconds proving that `sleep` sleeps.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_node_that_keeps_dying_stops_being_respawned() {
         let d = tempfile::tempdir().unwrap();
@@ -2908,6 +2935,7 @@ mod tests {
 
     /// A start the caller drove clears the budget: the operator has
     /// intervened, so the next fault gets the full allowance again.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_caller_driven_start_clears_the_restart_budget() {
         let d = tempfile::tempdir().unwrap();
@@ -2926,6 +2954,7 @@ mod tests {
         assert_eq!(c.restarts, 0);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn launch_watch_passes_a_child_that_stays_up() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3835,10 +3864,22 @@ consensus-validator service.";
 
         // The live-chain body sources lead, because the eight slots are spent
         // in order and a body source below the eighth entry may not be dialled.
+        // Pinned to the head of BTX_BOOTSTRAP_PEERS rather than a literal, so
+        // retiring a seed does not silently stop this asserting anything —
+        // 2026-09-08 moved this head twice in one afternoon.
         assert_eq!(
             got.first().map(String::as_str),
-            Some("-addnode=213.224.31.105:33706"),
-            "the live-chain seed must be dialled first"
+            Some(format!("-addnode={}", BTX_BOOTSTRAP_PEERS[0]).as_str()),
+            "the first manual peer must be the first shipped bootstrap seed"
+        );
+        // ...and that seed must be one a live node measured handshaking, which
+        // is a property of the LIST, not of this call: every entry that has
+        // failed that check is commented out above with its measurement.
+        assert!(
+            BTX_BOOTSTRAP_PEERS[0].starts_with("13.140.141.180:"),
+            "head is {} — if a seed was retired, move this with it and say \
+             what measurement justified the new head",
+            BTX_BOOTSTRAP_PEERS[0]
         );
     }
 
@@ -3861,10 +3902,14 @@ consensus-validator service.";
         // dropping a seed cannot pass unnoticed. 2026-09-05: 9 became 7 — one
         // live-chain node in, three parked or dead-branch nodes out.
         // 2026-09-07: 7 became 8 with LuckyPool's live body source at the head.
+        // 2026-09-07: 7 became 8 with LuckyPool's live body source at the head.
+        // 2026-09-08: 8 became 6 — two hosts measured 0/3 over three TCP
+        // attempts, and under the cap a dead seat is an evicted live one.
+        // LuckyPool stays: a settled reading showed it handshaked.
         assert_eq!(
             BTX_BOOTSTRAP_PEERS.len(),
-            8,
-            "BTX_BOOTSTRAP_PEERS should have 8 entries"
+            6,
+            "BTX_BOOTSTRAP_PEERS should have 6 entries"
         );
     }
 

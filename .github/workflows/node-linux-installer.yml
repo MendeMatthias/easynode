@@ -87,9 +87,32 @@ env:
   #      different commits can report the SAME version string, so the version is
   #      not an identity — the mac thread once found a wrong btxd sitting in a
   #      gitignored staging directory and no version gate could have caught it.
-  PROVEN_BTXD_RUN_ID: ""
-  PROVEN_BTXD_ARTIFACT: ""
-  PROVEN_BTXD_COMMIT: ""
+  # BOOTSTRAPPED 2026-09-08, following the four numbered steps above, from this
+  # repository's own first green btxd-linux run.
+  #
+  # Run 34220687218: every step green, including the two the recipe names by
+  # hand. The regtest smoke passed (boot, wallet, mine one block), and the CUDA
+  # proof reported every requested architecture present, in both places it now
+  # looks:
+  #
+  #     sm_100 sm_120 sm_75 sm_86 sm_89   <- build/bin/btxd
+  #     sm_100 sm_120 sm_75 sm_86 sm_89   <- build/lib/libbtx_matmul_backend.a
+  #
+  # It took four attempts to get that line, and none of the failures were the
+  # build: the gate ran under `bash -e` and died before printing, and its own
+  # `cuobjdump` was never installed. See the commits on this branch.
+  #
+  # COMMIT is set, not left blank, because the run reported it and the guard
+  # below can then prove the artifact is the one we meant — two different
+  # commits can report the same version string, so a version is not an identity.
+  # Moved to 34223411886, the rebuild whose artifact CARRIES libcublasLt.so.13
+  # (31 MB -> 375 MB, which is what that library weighs). Same ref, so the
+  # artifact NAME is unchanged and the "both pins move together" warning above
+  # is satisfied trivially — it guards against moving the run id when the ref
+  # changed, which is not what happened here.
+  PROVEN_BTXD_RUN_ID: "34223411886"
+  PROVEN_BTXD_ARTIFACT: "btxd-linux-9eb4e0050e08ea3ef768bac276dac9cbd2e84542"
+  PROVEN_BTXD_COMMIT: "9eb4e0050e08ea3ef768bac276dac9cbd2e84542"
 
 jobs:
   build-node-linux:
@@ -174,6 +197,17 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x btxd-dist/btxd btxd-dist/btx-cli
+          # The artifact carries the libraries this runner does not have (CUDA
+          # lives only on the engine builder). Point the loader at them so the
+          # staging script's version probe can start btxd at all, and so its
+          # own ldd walk resolves them and vendors them into bin/lib with an
+          # $ORIGIN rpath. The script's FINAL verification deliberately runs
+          # under `env -u LD_LIBRARY_PATH`, so self-containment is still proved
+          # without this crutch — it only has to get the walk started.
+          if [ -d btxd-dist/lib ]; then
+            export LD_LIBRARY_PATH="$PWD/btxd-dist/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            echo "loader path for staging: $LD_LIBRARY_PATH"
+          fi
           apps/node/scripts/stage-node-pkg-linux-source.sh btxd-dist
 
       # The guard, rewritten. The OLD one was broken twice over:

@@ -563,6 +563,63 @@ pub async fn wait_for_node_rpc(
 #[cfg(test)]
 mod tests {
 
+    /// THE WHOLE START-SEQUENCE CONF RECONCILIATION, IN ORDER, UNDER THE LOCK.
+    ///
+    /// `apps/node`'s `start_node_inner` calls these seven writers back to back
+    /// on every launch, and since `fsx::ConfLock` landed each one takes an
+    /// exclusive `flock` on the same file. `flock` is held per OPEN FILE
+    /// DESCRIPTION, so a second `acquire` from a thread that already holds one
+    /// waits on itself, forever — and the thread that would deadlock here is
+    /// the one that starts the node. A hang in this order would brick every
+    /// start of every install, silently, with the app sitting on "Starting".
+    ///
+    /// The composite `ensure_base_conf_keys` is the one that could do it: it
+    /// calls `set_conf_kv` per missing key, so it must NOT take the lock
+    /// itself. That is asserted here rather than trusted, because the failure
+    /// mode is a hang and a hang does not show up as a failed assertion — it
+    /// shows up as a test suite that never finishes, which is why this runs on
+    /// its own thread with a deadline.
+    #[test]
+    fn the_start_sequence_conf_writers_do_not_deadlock_on_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("faststart.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = conf.clone();
+        std::thread::spawn(move || {
+            // Exactly the order apps/node uses.
+            let manual = ["13.140.141.180:19335", "37.230.134.222:19335"];
+            ensure_addnodes_in_conf(&path, &manual).unwrap();
+            prune_retired_addnodes_in_conf(&path, &manual);
+            set_managed_whitelist_block(&path, &["1.2.3.4".to_string()]).unwrap();
+            ensure_base_conf_keys(&path, "prune=0\nparkdeepreorg=0\n").unwrap();
+            set_conf_kv(&path, "txindex", Some("1")).unwrap();
+            set_conf_kv(&path, "uacomment", Some("node")).unwrap();
+            set_conf_kv(&path, "matmulattestationserve", Some("1")).unwrap();
+            let _ = tx.send(());
+        });
+
+        rx.recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the start sequence deadlocked on its own conf lock");
+
+        // ...and it produced the conf it was supposed to, not just an exit.
+        let out = std::fs::read_to_string(&conf).unwrap();
+        for want in [
+            "addnode=13.140.141.180:19335",
+            "addnode=37.230.134.222:19335",
+            "whitelist=in,out,noban@1.2.3.4",
+            "prune=0",
+            "parkdeepreorg=0",
+            "txindex=1",
+            "uacomment=node",
+            "matmulattestationserve=1",
+            "server=1",
+        ] {
+            assert!(out.contains(want), "missing {want} in:\n{out}");
+        }
+    }
+
     // ---- retired addnode pruning -------------------------------------------
 
     #[test]

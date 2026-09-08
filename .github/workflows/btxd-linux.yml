@@ -165,8 +165,21 @@ jobs:
             cuda-nvcc-${CUDA_VERSION} \
             cuda-cudart-dev-${CUDA_VERSION} \
             libcublas-dev-${CUDA_VERSION} \
-            cuda-nvprune-${CUDA_VERSION}
+            cuda-nvprune-${CUDA_VERSION} \
+            cuda-cuobjdump-${CUDA_VERSION}
           "$CUDA_HOME/bin/nvcc" --version | tail -2
+          # cuda-cuobjdump is NOT part of nvcc, cudart, cublas or nvprune — it
+          # is its own package, and without it the gate below cannot inspect
+          # anything. Prove both tools exist HERE, where the message is about a
+          # missing package, rather than three steps later where it looks like
+          # a binary with no kernels in it.
+          for t in nvcc cuobjdump; do
+            [ -x "$CUDA_HOME/bin/$t" ] || {
+              echo "::error::$t missing from $CUDA_HOME/bin after install"
+              exit 1
+            }
+          done
+          echo "toolchain present: nvcc + cuobjdump"
 
       - name: Configure + build
         working-directory: btx
@@ -213,14 +226,57 @@ jobs:
         env:
           CUDA_ARCHS_INPUT: ${{ inputs.cuda_architectures }}
         run: |
-          set -euo pipefail
+          # `set +e`, EXPLICITLY, and it has to be explicit. GitHub runs every
+          # `run:` block as `bash -e {0}` — errexit comes from the SHELL
+          # INVOCATION, not from the script — so deleting a `set -e` from the
+          # body changes nothing, and `set -uo pipefail` does not touch `e`.
+          # Both were tried (runs 34213317482 and 34216481832) and both died
+          # the same way: `grep -oE 'sm_[0-9]+'` exits 1 when it matches
+          # nothing, `pipefail` lifts that out of the command substitution, and
+          # the step ended before its first `echo`. ZERO output, twice — no
+          # "architectures present:", none of the ::error:: sentences below.
+          # A gate whose whole job is to explain why a binary is unfit was
+          # structurally incapable of explaining anything.
+          set +e
+          set -uo pipefail
           archs="$CUDA_ARCHS_INPUT"
           [ -n "$archs" ] || archs="$DEFAULT_CUDA_ARCHS"
-          found=$("$CUDA_HOME/bin/cuobjdump" --list-elf build/bin/btxd 2>/dev/null \
-                  | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ')
+
+          if [ ! -x "$CUDA_HOME/bin/cuobjdump" ]; then
+            echo "::error::no cuobjdump at $CUDA_HOME/bin — cannot inspect device code."
+            echo "::error::It is packaged separately: add cuda-cuobjdump-\$CUDA_VERSION"
+            echo "::error::to the toolkit install step. nvcc alone does not bring it."
+            exit 1
+          fi
+
+          # Device code does not have to live in the executable, and in this
+          # tree it does not: the CUDA objects compile into the
+          # `btx_matmul_backend` target (14 of them in that same run, e.g.
+          # src/CMakeFiles/btx_matmul_backend.dir/cuda/matmul_v4_accel.cu.o).
+          # A STATIC archive device-links into btxd and shows up there; a
+          # SHARED one does not, and asking only about bin/btxd then reports
+          # "no device code" about a build that has plenty. Ask every artifact
+          # that could carry it and say which one answered.
+          targets="build/bin/btxd"
+          while IFS= read -r extra; do
+            targets="$targets $extra"
+          done < <(find build \( -name 'libbtx_matmul_backend*' -o -name '*matmul*backend*.so*' \) 2>/dev/null)
+
+          found=""
+          for f in $targets; do
+            if [ ! -f "$f" ]; then
+              echo "  (absent)        $f"
+              continue
+            fi
+            a=$("$CUDA_HOME/bin/cuobjdump" --list-elf "$f" 2>/dev/null | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ' || true)
+            echo "  ${a:-(no device code)}  <- $f"
+            found="$found $a"
+          done
+          found=$(printf '%s' "$found" | tr ' ' '\n' | grep -vE '^$' | sort -u | tr '\n' ' ' || true)
           echo "architectures present: ${found:-(none)}"
           if [ -z "$found" ]; then
-            echo "::error::btxd contains NO device code. A node built from this"
+            echo "::error::btxd contains NO device code, in the executable or in any"
+            echo "::error::matmul backend library beside it. A node built from this"
             echo "::error::cannot advertise NODE_MATMUL_CONSENSUS on any card."
             exit 1
           fi
@@ -284,6 +340,40 @@ jobs:
           # script vendors these with ORIGIN rpaths; listing them here makes a
           # surprise dependency visible in the build log instead of at runtime.
           ldd "$out/btxd" || true
+
+          # ...and SHIP them, which this step did not do and had to.
+          #
+          # btxd links libcublasLt.so.13 out of /usr/local/cuda-13.3, a path
+          # that exists on THIS runner because step 7 installed the toolkit and
+          # on no other runner anywhere. node-linux-installer.yml then ran the
+          # staging script on a CUDA-less machine, where the script's own first
+          # act — `btxd --version`, to check the engine is the pinned one —
+          # died with "libcublasLt.so.13: cannot open shared object file" and
+          # was reported as "btxd is not v0.34.6". The engine was v0.34.6; it
+          # could not start to say so.
+          #
+          # The staging script cannot vendor a library that is not on the disk
+          # it runs on, so the artifact has to carry it. Same classification the
+          # staging script uses: /lib, /lib64, /usr/lib and /usr/lib64 are the
+          # system, everything else travels. That deliberately includes
+          # /usr/local, which is where CUDA lives.
+          mkdir -p "$out/lib"
+          while read -r soname path; do
+            case "$path" in
+              /lib/*|/lib64/*|/usr/lib/*|/usr/lib64/*) continue ;;
+            esac
+            cp -L "$path" "$out/lib/$soname"
+            echo "artifact carries: $soname  <- $path"
+          done < <(
+            { ldd "$out/btxd"; ldd "$out/btx-cli"; } 2>/dev/null \
+              | awk '{ for (i = 1; i <= NF; i++) if ($i == "=>" && $(i+1) ~ /^\//) print $1, $(i+1) }' \
+              | sort -u
+          )
+          if [ -z "$(ls -A "$out/lib" 2>/dev/null)" ]; then
+            rmdir "$out/lib"
+            echo "artifact carries: no non-system libraries"
+          fi
+
           (cd "$out" && sha256sum btxd btx-cli | tee SHA256SUMS.txt)
 
       - name: Upload btxd artifact

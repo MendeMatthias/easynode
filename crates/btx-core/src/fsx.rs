@@ -202,6 +202,17 @@ impl ConfLock {
                 .open(&path)
             {
                 Ok(file) => return Some(Self { file: Some(file) }),
+                // A directory that does not exist will not start existing
+                // because we waited, and retrying it for five seconds would
+                // stall a conf write behind a lock that is never coming.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+                // Everything else is treated as contention and waited out.
+                // Deliberately NOT narrowed to `PermissionDenied`: Windows
+                // reports a sharing violation as ERROR_SHARING_VIOLATION (32),
+                // which Rust does not map to that kind — it arrives
+                // uncategorised. Matching on the kind meant the second writer
+                // gave up instantly and took no lock at all, which the lost
+                // update test caught on the first Windows run.
                 Err(_) if waited < WAIT_MS => {
                     std::thread::sleep(std::time::Duration::from_millis(STEP_MS));
                     waited += STEP_MS;
@@ -221,7 +232,11 @@ impl Drop for ConfLock {
             // first keeps the release explicit and independent of close order.
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
         }
-        self.file = None;
+        // Closing the handle is what releases the lock on Windows, and the
+        // second half of releasing it on Unix. `take` rather than `= None` so
+        // the field is READ on every platform — on Windows the flock block
+        // above is compiled out, and a write-only field is a dead_code warning.
+        drop(self.file.take());
     }
 }
 
