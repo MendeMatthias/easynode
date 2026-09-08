@@ -213,13 +213,18 @@ jobs:
         env:
           CUDA_ARCHS_INPUT: ${{ inputs.cuda_architectures }}
         run: |
-          # NOT `set -e`. This step exists to SAY WHY, and `set -e` with
-          # `pipefail` stopped it doing that: `grep` exits 1 when it matches
-          # nothing, the command substitution below inherited that, and the step
-          # died before its first `echo`. Run 34213317482 failed with ZERO
-          # output — no "architectures present", none of the ::error:: lines
-          # underneath — which reads like a broken runner and is actually the
-          # gate firing correctly and being unable to explain itself.
+          # `set +e`, EXPLICITLY, and it has to be explicit. GitHub runs every
+          # `run:` block as `bash -e {0}` — errexit comes from the SHELL
+          # INVOCATION, not from the script — so deleting a `set -e` from the
+          # body changes nothing, and `set -uo pipefail` does not touch `e`.
+          # Both were tried (runs 34213317482 and 34216481832) and both died
+          # the same way: `grep -oE 'sm_[0-9]+'` exits 1 when it matches
+          # nothing, `pipefail` lifts that out of the command substitution, and
+          # the step ended before its first `echo`. ZERO output, twice — no
+          # "architectures present:", none of the ::error:: sentences below.
+          # A gate whose whole job is to explain why a binary is unfit was
+          # structurally incapable of explaining anything.
+          set +e
           set -uo pipefail
           archs="$CUDA_ARCHS_INPUT"
           [ -n "$archs" ] || archs="$DEFAULT_CUDA_ARCHS"
@@ -248,11 +253,11 @@ jobs:
               echo "  (absent)        $f"
               continue
             fi
-            a=$("$CUDA_HOME/bin/cuobjdump" --list-elf "$f" 2>/dev/null | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ')
+            a=$("$CUDA_HOME/bin/cuobjdump" --list-elf "$f" 2>/dev/null | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ' || true)
             echo "  ${a:-(no device code)}  <- $f"
             found="$found $a"
           done
-          found=$(printf '%s' "$found" | tr ' ' '\n' | grep -vE '^$' | sort -u | tr '\n' ' ')
+          found=$(printf '%s' "$found" | tr ' ' '\n' | grep -vE '^$' | sort -u | tr '\n' ' ' || true)
           echo "architectures present: ${found:-(none)}"
           if [ -z "$found" ]; then
             echo "::error::btxd contains NO device code, in the executable or in any"
