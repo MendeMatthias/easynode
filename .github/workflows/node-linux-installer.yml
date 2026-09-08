@@ -192,6 +192,17 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x btxd-dist/btxd btxd-dist/btx-cli
+          # The artifact carries the libraries this runner does not have (CUDA
+          # lives only on the engine builder). Point the loader at them so the
+          # staging script's version probe can start btxd at all, and so its
+          # own ldd walk resolves them and vendors them into bin/lib with an
+          # $ORIGIN rpath. The script's FINAL verification deliberately runs
+          # under `env -u LD_LIBRARY_PATH`, so self-containment is still proved
+          # without this crutch — it only has to get the walk started.
+          if [ -d btxd-dist/lib ]; then
+            export LD_LIBRARY_PATH="$PWD/btxd-dist/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            echo "loader path for staging: $LD_LIBRARY_PATH"
+          fi
           apps/node/scripts/stage-node-pkg-linux-source.sh btxd-dist
 
       # The guard, rewritten. The OLD one was broken twice over:
