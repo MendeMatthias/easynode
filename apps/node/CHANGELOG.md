@@ -8,7 +8,7 @@ root).
 
 ## [Unreleased]
 
-## [0.6.21] - 2026-09-08 · prepared, not yet signed or published
+## [0.6.21] - 2026-09-09 · mac + linux + windows
 
 **Your node dials the peers it was given.** The app shipped eleven bootstrap
 and archive peers, and named each of them twice — once on the command line and
@@ -29,7 +29,9 @@ and reading what actually connected. Two seeds that had not answered since 5
 September were retired — under a cap a seat that fails is a live peer evicted,
 not just a wasted dial — and LuckyPool's node joins as a live source carrying
 attestations. All eight peers this build ships were measured completing a
-handshake and moving real bytes.
+handshake and moving real bytes: six of them serving blocks, three of those
+also serving attestations, and the remaining two the network's discovery
+relays, which introduce peers rather than carry chain.
 
 **The fork warning stops calling an ordinary traffic jam a fork.** On 6
 September the app reported a competing chain when what was actually happening
@@ -92,6 +94,15 @@ what is actually true: this release has no build for your platform, this copy
 stays where it is, and downloads for every platform are on the site. A real
 network failure still reads as one. (The automatic six-hourly check stays
 silent either way; there is nothing to act on.)
+
+**One release for Mac, Linux and Windows.** That is unusual here — single
+platform releases are the normal cadence — and it means two long gaps close at
+once. Macs were last built at 0.6.19 and sat out 0.6.20 entirely. Windows was
+last built at 0.6.6, whose engine predates the 17 August consensus release and
+parks at block 191,713, or 184,999 on a machine that checks blocks on the
+processor; a Windows copy is offered this one directly. The route we have
+measured against a GPU on Windows is still the Linux build under WSL2, and the
+native build has not been measured that way.
 
 **What has not changed: the engine, and which machines validate for
 themselves.** It stays v0.34.6 at commit `9eb4e005`, as in 0.6.18 through
