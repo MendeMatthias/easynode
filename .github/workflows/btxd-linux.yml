@@ -213,14 +213,50 @@ jobs:
         env:
           CUDA_ARCHS_INPUT: ${{ inputs.cuda_architectures }}
         run: |
-          set -euo pipefail
+          # NOT `set -e`. This step exists to SAY WHY, and `set -e` with
+          # `pipefail` stopped it doing that: `grep` exits 1 when it matches
+          # nothing, the command substitution below inherited that, and the step
+          # died before its first `echo`. Run 34213317482 failed with ZERO
+          # output — no "architectures present", none of the ::error:: lines
+          # underneath — which reads like a broken runner and is actually the
+          # gate firing correctly and being unable to explain itself.
+          set -uo pipefail
           archs="$CUDA_ARCHS_INPUT"
           [ -n "$archs" ] || archs="$DEFAULT_CUDA_ARCHS"
-          found=$("$CUDA_HOME/bin/cuobjdump" --list-elf build/bin/btxd 2>/dev/null \
-                  | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ')
+
+          if [ ! -x "$CUDA_HOME/bin/cuobjdump" ]; then
+            echo "::error::no cuobjdump at $CUDA_HOME/bin — cannot inspect device code"
+            exit 1
+          fi
+
+          # Device code does not have to live in the executable, and in this
+          # tree it does not: the CUDA objects compile into the
+          # `btx_matmul_backend` target (14 of them in that same run, e.g.
+          # src/CMakeFiles/btx_matmul_backend.dir/cuda/matmul_v4_accel.cu.o).
+          # A STATIC archive device-links into btxd and shows up there; a
+          # SHARED one does not, and asking only about bin/btxd then reports
+          # "no device code" about a build that has plenty. Ask every artifact
+          # that could carry it and say which one answered.
+          targets="build/bin/btxd"
+          while IFS= read -r extra; do
+            targets="$targets $extra"
+          done < <(find build \( -name 'libbtx_matmul_backend*' -o -name '*matmul*backend*.so*' \) 2>/dev/null)
+
+          found=""
+          for f in $targets; do
+            if [ ! -f "$f" ]; then
+              echo "  (absent)        $f"
+              continue
+            fi
+            a=$("$CUDA_HOME/bin/cuobjdump" --list-elf "$f" 2>/dev/null | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ')
+            echo "  ${a:-(no device code)}  <- $f"
+            found="$found $a"
+          done
+          found=$(printf '%s' "$found" | tr ' ' '\n' | grep -vE '^$' | sort -u | tr '\n' ' ')
           echo "architectures present: ${found:-(none)}"
           if [ -z "$found" ]; then
-            echo "::error::btxd contains NO device code. A node built from this"
+            echo "::error::btxd contains NO device code, in the executable or in any"
+            echo "::error::matmul backend library beside it. A node built from this"
             echo "::error::cannot advertise NODE_MATMUL_CONSENSUS on any card."
             exit 1
           fi
