@@ -61,16 +61,27 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // block (210497, 2d816071…) with the body. NETWORK_LIMITED — recent
     // blocks only — so it carries the post-split chain, not deep history.
     "13.140.141.180:19335",
-    // Refused every dial from the validator on 2026-09-05 ("Connection
-    // refused", hundreds of debug.log lines) and did not answer the probe.
-    // Kept: it is the only full-history archive the census ever found, and a
-    // retired seed costs one failed dial.
-    "207.56.229.99:19335",
+    // ── MEASURED DEAD 2026-09-08, and that is why they are not here ──────────
+    // Probed from this project's Mac: three TCP attempts each, eight-second
+    // timeout, 0/3 answered. Corroborated by the box's own live node, which has
+    // carried all three as manual peers for days and has none of them in
+    // getpeerinfo while it holds seven other manual connections.
+    //
+    // They are commented out rather than deleted because the cap is what makes
+    // this matter. The engine dials eight manual peers; with these in the list
+    // two of those eight went to hosts that do not answer, and the peers pushed
+    // past the cap were node.btx.dev and node.btxchain.org — which that same
+    // getpeerinfo shows CONNECTED and serving at the tip. A dead seat used to
+    // cost one failed dial and then free its slot; under a hard cap it costs
+    // the slot outright. Put one back the day it answers again.
+    //
+    //   "207.56.229.99:19335"   0/3 — "the only full-history archive the census
+    //                           ever found", refusing every dial since
+    //                           2026-09-05 (docs/incident-2026-09-05-fork.md)
+    //   "114.150.94.235:19335"  0/3 — no answer to the 09-05 probe either
     // 2026-09-05 19:49Z: answered at 210872 on the minority branch. Still a
     // NETWORK archive for the shared history.
     "37.230.134.222:19335",
-    // 2026-09-05 19:49Z: no answer to the probe.
-    "114.150.94.235:19335",
     // 2026-09-05 19:49Z: no answer to the probe, and on the validator's
     // banlist. Both were this side's doing: at 20:23Z the same node, dialled
     // as a manual peer, was /BTX:0.34.6/ with NETWORK + MATMUL_CONSENSUS on
@@ -141,12 +152,13 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
 /// numair's fleet archives. Update as the census evolves — the nodes directory
 /// on easybtx.com will carry the live archive flag (service bit 31).
 pub const BTX_ARCHIVE_PEERS: &[&str] = &[
-    "207.56.229.99:19335",
+    // 207.56.229.99, 114.150.94.235 and 195.137.245.82 were measured 0/3 on
+    // 2026-09-08 and are listed with that measurement in BTX_BOOTSTRAP_PEERS
+    // above. An archive that does not answer cannot be a download source, and
+    // under the eight-slot manual cap listing it evicts one that can.
     // 2026-08-31: upstream's maintainer-grade node. Runs the unreleased 0.34.6
     // and advertises MATMUL_ATTESTATION_ARCHIVE (observed live the same day).
     "37.230.134.222:19335",
-    "114.150.94.235:19335",
-    "195.137.245.82:20982",
     // 185.204.25.227 removed 2026-08-31: refused TCP outright in every probe
     // that day and upstream's re-vetted census no longer lists it.
     "node.btx.dev:19335",
@@ -3865,10 +3877,13 @@ consensus-validator service.";
         // dropping a seed cannot pass unnoticed. 2026-09-05: 9 became 7 — one
         // live-chain node in, three parked or dead-branch nodes out.
         // 2026-09-07: 7 became 8 with LuckyPool's live body source at the head.
+        // 2026-09-07: 7 became 8 with LuckyPool's live body source at the head.
+        // 2026-09-08: 8 became 6 — two hosts measured 0/3 removed, because the
+        // cap turns a dead seat into an evicted live one.
         assert_eq!(
             BTX_BOOTSTRAP_PEERS.len(),
-            8,
-            "BTX_BOOTSTRAP_PEERS should have 8 entries"
+            6,
+            "BTX_BOOTSTRAP_PEERS should have 6 entries"
         );
     }
 
