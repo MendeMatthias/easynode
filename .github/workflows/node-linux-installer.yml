@@ -87,9 +87,27 @@ env:
   #      different commits can report the SAME version string, so the version is
   #      not an identity — the mac thread once found a wrong btxd sitting in a
   #      gitignored staging directory and no version gate could have caught it.
-  PROVEN_BTXD_RUN_ID: ""
-  PROVEN_BTXD_ARTIFACT: ""
-  PROVEN_BTXD_COMMIT: ""
+  # BOOTSTRAPPED 2026-09-08, following the four numbered steps above, from this
+  # repository's own first green btxd-linux run.
+  #
+  # Run 34220687218: every step green, including the two the recipe names by
+  # hand. The regtest smoke passed (boot, wallet, mine one block), and the CUDA
+  # proof reported every requested architecture present, in both places it now
+  # looks:
+  #
+  #     sm_100 sm_120 sm_75 sm_86 sm_89   <- build/bin/btxd
+  #     sm_100 sm_120 sm_75 sm_86 sm_89   <- build/lib/libbtx_matmul_backend.a
+  #
+  # It took four attempts to get that line, and none of the failures were the
+  # build: the gate ran under `bash -e` and died before printing, and its own
+  # `cuobjdump` was never installed. See the commits on this branch.
+  #
+  # COMMIT is set, not left blank, because the run reported it and the guard
+  # below can then prove the artifact is the one we meant — two different
+  # commits can report the same version string, so a version is not an identity.
+  PROVEN_BTXD_RUN_ID: "34220687218"
+  PROVEN_BTXD_ARTIFACT: "btxd-linux-9eb4e0050e08ea3ef768bac276dac9cbd2e84542"
+  PROVEN_BTXD_COMMIT: "9eb4e0050e08ea3ef768bac276dac9cbd2e84542"
 
 jobs:
   build-node-linux:
