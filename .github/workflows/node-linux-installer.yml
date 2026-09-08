@@ -105,7 +105,12 @@ env:
   # COMMIT is set, not left blank, because the run reported it and the guard
   # below can then prove the artifact is the one we meant — two different
   # commits can report the same version string, so a version is not an identity.
-  PROVEN_BTXD_RUN_ID: "34220687218"
+  # Moved to 34223411886, the rebuild whose artifact CARRIES libcublasLt.so.13
+  # (31 MB -> 375 MB, which is what that library weighs). Same ref, so the
+  # artifact NAME is unchanged and the "both pins move together" warning above
+  # is satisfied trivially — it guards against moving the run id when the ref
+  # changed, which is not what happened here.
+  PROVEN_BTXD_RUN_ID: "34223411886"
   PROVEN_BTXD_ARTIFACT: "btxd-linux-9eb4e0050e08ea3ef768bac276dac9cbd2e84542"
   PROVEN_BTXD_COMMIT: "9eb4e0050e08ea3ef768bac276dac9cbd2e84542"
 
