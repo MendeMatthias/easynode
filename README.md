@@ -1,25 +1,21 @@
 # easyNode
 
-> **Status, 2026-09-09.** On 5 September our nodes — the project's validator,
-> the official seeds and the explorer we linked — sat on a **minority fork**
-> from height 210496 for twenty hours, while 0.6.18 shipped that morning saying
-> "follows the live chain". The validator rejoined at 20:32Z after a 383-block
-> reorganisation, and three releases since have gone at the causes: 0.6.19 added
-> the fork detector and made the node follow the most-work chain, 0.6.20 let any
-> node answer which block sits at a given height, and **0.6.21 fixed the peering
-> that made a live-chain node unreachable in the first place** — the app was
-> naming eleven peers for the engine's eight manual slots, so three were never
-> dialled at all.
+> **September 2026.** Our nodes spent twenty hours on a minority fork from
+> height 210496, and 0.6.18 shipped that morning saying "follows the live
+> chain". Both incident write-ups are kept, unedited, with the numbers and the
+> wrong turns left in:
+> [`docs/incident-2026-09-05-fork.md`](docs/incident-2026-09-05-fork.md) and
+> [`docs/incident-2026-09-06-bodyless-tower.md`](docs/incident-2026-09-06-bodyless-tower.md),
+> the day after, when every number said "split" and it was not one. What they
+> cost is in the releases since: 0.6.19 detects a chain it cannot obtain,
+> 0.6.20 lets any node witness a fork for a wallet, and 0.6.21 fixed the peering
+> underneath it — the app was naming eleven peers for the engine's eight manual
+> slots, so three were never dialled at all.
 >
-> What is NOT fixed: the engine's own peer policy first refused a live-chain
-> node as a body source and then banned it for asking about its own chain
-> (btxchain/btx#142). That is upstream's, and it is why
-> [issue #35](https://github.com/MendeMatthias/easynode/issues/35) stays open.
-> The raw facts are in
-> [`docs/incident-2026-09-05-fork.md`](docs/incident-2026-09-05-fork.md), and
-> [`docs/incident-2026-09-06-bodyless-tower.md`](docs/incident-2026-09-06-bodyless-tower.md)
-> records the day after, when every number said "split" and it was not one.
-> This note comes down when #35 closes.
+> One cause is still upstream and not ours to fix: the engine refuses a
+> live-chain node as a body source and then bans it for asking about its own
+> chain (btxchain/btx#142). Tracked in
+> [#38](https://github.com/MendeMatthias/easynode/issues/38).
 
 **Run a real BTX node from home, on the machine you already own.**
 
