@@ -1159,6 +1159,25 @@ pub const PRUNED_DATADIR_REFUSED_MARKER: &str = "Block files have previously bee
 ///
 /// Returns `None` when nothing in the tail is recognised, so the caller can say
 /// it does not know instead of inventing a reason.
+/// btxd could not take the RPC port, which on this app means one thing in
+/// practice: something else is already running a node against this machine.
+///
+/// Found 2026-09-09 by starting 0.6.21 on a machine whose validator was
+/// already up. btxd says exactly what happened —
+///
+/// ```text
+/// Binding RPC on address 127.0.0.1 port 19334 failed (Error: Address already in use (48)).
+/// Unable to bind all endpoints for RPC server
+/// ```
+///
+/// — and the app answered "its log does not say why in a way this app
+/// recognises", with a path to a log file. That is the least useful thing it
+/// could have said about the most legible failure it can have. The datadir is
+/// shared with the miner by design and the app can be opened twice, so this is
+/// not an exotic state; it is the ordinary one for anyone who already has a
+/// node up.
+pub const RPC_BIND_FAILED_MARKER: &str = "Unable to bind all endpoints for RPC server";
+
 pub fn launch_failure_hint(text: &str) -> Option<&'static str> {
     if text.contains(PRUNED_DATADIR_REFUSED_MARKER) {
         return Some(
@@ -1168,6 +1187,16 @@ pub fn launch_failure_hint(text: &str) -> Option<&'static str> {
              folder's own btx_rw.conf outranks the app's. Getting every block back means \
              downloading the whole chain again either way — Remove node data and set up \
              again from a snapshot is the faster half of that, not a different outcome.",
+        );
+    }
+    if text.contains(RPC_BIND_FAILED_MARKER) {
+        return Some(
+            "another node is already running on this computer. btxd could not take the \
+             port it talks to this app on, because something already holds it — most \
+             likely the easyBTX miner's node, a second copy of this app, or a btxd you \
+             started by hand. Only one node can use a machine's node folder at a time. \
+             Stop the other one and press Retry; nothing here is broken and nothing \
+             needs removing.",
         );
     }
     if text.contains(MATMUL_CONSENSUS_REFUSED_MARKER) {
@@ -3243,6 +3272,29 @@ consensus-validator service.";
     /// silent when it recognises nothing. Verbatim lines, captured from a real
     /// v0.34.5 run against ~/.easybtx on 2026-08-31, where the app had been
     /// telling the user the datadir lock never freed while nothing held it.
+    /// THE MESSAGE THE APP SHOWED FOR THE MOST LEGIBLE FAILURE IT HAS.
+    ///
+    /// Verbatim from a 0.6.21 run on 2026-09-09, started while this machine's
+    /// validator was already up. btxd names the cause in two lines; the app
+    /// said "its log does not say why in a way this app recognises" and handed
+    /// the user a path to a log file. A port already taken is not an unknown
+    /// exit, and it is the ordinary state for anyone whose miner is running.
+    #[test]
+    fn a_port_already_taken_is_named_rather_than_called_unrecognised() {
+        let log = "2026-09-09T01:25:44Z Binding RPC on address 127.0.0.1 port 19334 \
+                   failed (Error: Address already in use (48)).\n\
+                   2026-09-09T01:25:44Z Unable to bind all endpoints for RPC server\n\
+                   2026-09-09T01:25:44Z [error] Unable to start HTTP server.";
+        let hint = launch_failure_hint(log).expect("a taken port must be named");
+        assert!(hint.contains("another node is already running"), "{hint}");
+        // ...and it must NOT send the user at the repair path. The chain on
+        // disk is fine; the only thing wrong is that two nodes want one folder.
+        assert!(
+            !hint.to_lowercase().contains("remove node data"),
+            "a port collision must never read as a reason to wipe: {hint}"
+        );
+    }
+
     #[test]
     fn a_pruned_datadir_refusal_is_named_and_an_unknown_exit_is_not_guessed_at() {
         const REAL_PRUNED_REFUSAL: &str = "2026-08-30T21:17:13Z LoadBlockIndexDB: last block \
