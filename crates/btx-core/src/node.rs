@@ -169,11 +169,52 @@ pub const BTX_ARCHIVE_PEERS: &[&str] = &[
     // 2026-09-08 and are listed with that measurement in BTX_BOOTSTRAP_PEERS
     // above. An archive that does not answer cannot be a download source, and
     // under the eight-slot manual cap listing it evicts one that can.
+    //
+    // node.btx.dev, node.btxchain.org and node.btx.tools LEFT this list on
+    // 2026-09-09: measured, they are discovery relays and not archives. They
+    // are in BTX_DISCOVERY_PEERS below, with the reading that moved them.
+    //
     // 2026-08-31: upstream's maintainer-grade node. Runs the unreleased 0.34.6
-    // and advertises MATMUL_ATTESTATION_ARCHIVE (observed live the same day).
+    // and advertises MATMUL_ATTESTATION_ARCHIVE (observed live the same day),
+    // and confirmed again 2026-09-08 from a running node: NETWORK, CONSENSUS
+    // and ATTESTATION_ARCHIVE, 12.1 MB served in six minutes. After the two
+    // removals above this is the ONLY archive this app ships, which is worth
+    // knowing before anyone reasons about how many we have.
     "37.230.134.222:19335",
     // 185.204.25.227 removed 2026-08-31: refused TCP outright in every probe
     // that day and upstream's re-vetted census no longer lists it.
+];
+
+/// DISCOVERY relays: peers that introduce other peers and cannot serve a block.
+///
+/// These three sat in [`BTX_ARCHIVE_PEERS`] until 2026-09-09 and are not
+/// archives. Read from a live v0.34.6 node with the shipped manual set, after
+/// the handshakes settled:
+///
+/// ```text
+/// node.btxchain.org   /BTX:0.34.5/   25 KB   WITNESS, SHIELDED, P2P_V2, DISCOVERY
+/// node.btx.tools      /BTX:0.34.5/   18 KB   WITNESS, SHIELDED, P2P_V2, DISCOVERY
+/// node.btx.dev        /BTX:0.34.5/   18 KB   WITNESS, SHIELDED, P2P_V2, DISCOVERY
+/// ```
+///
+/// `MATMUL_DISCOVERY` and **no `NETWORK`** — the 0.34 pointer-only role
+/// (`-matmulvalidation=relay`, `init.cpp:2643`, which clears NODE_NETWORK and
+/// NODE_NETWORK_LIMITED on purpose). Beside them the real block sources moved
+/// 10 to 17 MB in the same window. They introduce peers; they do not carry
+/// chain.
+///
+/// WHY THEY ARE STILL DIALLED. An introducer is worth a manual slot on a
+/// network whose DNS seeds are unreliable: a fresh node has to reach somebody,
+/// and these answer. They come AFTER the archives in [`manual_peers`] so a peer
+/// that can serve a block always outranks one that cannot.
+///
+/// WHAT THEY LOST. The `noban` grant in [`BTX_ARCHIVE_WHITELIST_IPS`], which is
+/// documented there as belonging to peers that can answer a deep body request.
+/// It never bought them anything anyway — `IsTrustedMirrorAuthorityPeer` needs
+/// `archive && (m_noban || m_manual)` and they do not advertise the archive
+/// bit, so the grant could never fire. Dropping it costs nothing and stops the
+/// config claiming something untrue.
+pub const BTX_DISCOVERY_PEERS: &[&str] = &[
     "node.btx.dev:19335",
     "node.btxchain.org:19335",
     "node.btx.tools:19335",
@@ -208,21 +249,53 @@ pub const BTX_ARCHIVE_PEERS: &[&str] = &[
 /// was never dialled for 13 minutes".
 pub const MAX_MANUAL_PEERS: usize = 8;
 
+/// The peers that can actually SERVE A BLOCK: the live-chain seeds and the
+/// archives, and deliberately not the discovery relays.
+///
+/// Exists for the watchdog's remediation, which is the one automated action
+/// this app takes on a frozen node: redial peers over RPC `addnode` so the
+/// manual exemption gets past the engine's body gate. That loop used to walk
+/// [`BTX_ARCHIVE_PEERS`], and until 2026-09-09 three of the four entries in
+/// that list were `MATMUL_DISCOVERY` relays which advertise no `NETWORK` and
+/// cannot answer a `getdata` at all. So the recovery with a production receipt
+/// behind it — an archive handshake unsticking a node in 21 seconds — was
+/// spending three of its four dials on peers structurally incapable of
+/// providing it.
+///
+/// Not capped at [`MAX_MANUAL_PEERS`]: this is an RPC redial of hosts the node
+/// mostly already has, not the start-up `-addnode` set, and a frozen node is
+/// exactly when it is worth asking everyone who might answer.
+pub fn block_source_peers() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for peer in BTX_BOOTSTRAP_PEERS.iter().chain(BTX_ARCHIVE_PEERS.iter()) {
+        if !out.contains(peer) {
+            out.push(peer);
+        }
+    }
+    out
+}
+
 /// The manual (`-addnode`) peer set for one start: deduplicated, capped at
 /// [`MAX_MANUAL_PEERS`], live chain first.
 ///
-/// Order is inherited from the two lists, which is the whole design:
-/// [`BTX_BOOTSTRAP_PEERS`] leads with the peers measured on the live chain, and
-/// [`BTX_ARCHIVE_PEERS`] follows with the deep-history archives. A node that
-/// can only dial eight peers should spend those eight on the chain it must
-/// follow before the history it can fetch later.
+/// Order is inherited from the three lists, which is the whole design:
+/// [`BTX_BOOTSTRAP_PEERS`] leads with the peers measured on the live chain,
+/// [`BTX_ARCHIVE_PEERS`] follows with the deep-history archives, and
+/// [`BTX_DISCOVERY_PEERS`] comes last because an introducer cannot serve a
+/// block. A node that can only dial eight peers should spend those eight on the
+/// chain it must follow, then the history it can fetch later, then the peers
+/// that merely point at other peers.
 ///
 /// Truncation is silent to btxd but not to us: anything past the cap is
 /// dropped here rather than handed to an engine that would ignore it, so the
 /// set this returns is the set the node actually dials.
 pub fn manual_peers() -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::with_capacity(MAX_MANUAL_PEERS);
-    for peer in BTX_BOOTSTRAP_PEERS.iter().chain(BTX_ARCHIVE_PEERS.iter()) {
+    for peer in BTX_BOOTSTRAP_PEERS
+        .iter()
+        .chain(BTX_ARCHIVE_PEERS.iter())
+        .chain(BTX_DISCOVERY_PEERS.iter())
+    {
         if out.len() >= MAX_MANUAL_PEERS {
             break;
         }
@@ -249,9 +322,12 @@ pub const BTX_ARCHIVE_WHITELIST_IPS: &[&str] = &[
     "37.230.134.222",
     "114.150.94.235",
     "195.137.245.82",
-    "146.190.179.86",
-    "206.189.253.106",
-    "164.90.246.229",
+    // 146.190.179.86, 206.189.253.106 and 164.90.246.229 left on 2026-09-09.
+    // They are node.btx.dev, node.btxchain.org and node.btx.tools, which are
+    // discovery relays rather than archives (see BTX_DISCOVERY_PEERS), and this
+    // list's grant is documented above as belonging to peers that can answer a
+    // deep body request. They still reach us as manual peers, which is the
+    // exemption that actually mattered.
 ];
 
 /// Live-chain BODY SOURCES that get the same `noban` grant as the archives.
@@ -3935,6 +4011,34 @@ consensus-validator service.";
         );
     }
 
+    /// THE WATCHDOG'S ONE AUTOMATED RECOVERY MUST DIAL PEERS THAT CAN ANSWER.
+    ///
+    /// It redials this set over RPC when a node freezes. Until 2026-09-09 it
+    /// walked BTX_ARCHIVE_PEERS, three of whose four entries were
+    /// MATMUL_DISCOVERY relays: no NETWORK bit, no `getdata` answer, no way to
+    /// unstick anything. A recovery action that spends its dials on peers
+    /// structurally incapable of helping is worse than none, because it looks
+    /// like it tried.
+    #[test]
+    fn the_frozen_node_remediation_dials_only_peers_that_serve_blocks() {
+        let sources = block_source_peers();
+        assert!(!sources.is_empty());
+        for p in &sources {
+            assert!(
+                !BTX_DISCOVERY_PEERS.contains(p),
+                "{p} introduces peers and cannot serve a block; redialling it \
+                 cannot unfreeze a node"
+            );
+        }
+        // Every live-chain seed and every archive is in it: a frozen node is
+        // when to ask everyone who might answer, so this is NOT capped.
+        for p in BTX_BOOTSTRAP_PEERS.iter().chain(BTX_ARCHIVE_PEERS.iter()) {
+            assert!(sources.contains(p), "{p} missing from the redial set");
+        }
+        let unique: std::collections::HashSet<_> = sources.iter().collect();
+        assert_eq!(unique.len(), sources.len(), "duplicate dial in {sources:?}");
+    }
+
     /// `manual_peers` is where the cap and the dedupe live, so it is asserted
     /// directly and not only through the command it feeds.
     #[test]
@@ -3946,10 +4050,34 @@ consensus-validator service.";
         // Every entry comes from a list we ship; nothing is invented here.
         for p in &peers {
             assert!(
-                BTX_BOOTSTRAP_PEERS.contains(p) || BTX_ARCHIVE_PEERS.contains(p),
-                "{p} is in neither shipped list"
+                BTX_BOOTSTRAP_PEERS.contains(p)
+                    || BTX_ARCHIVE_PEERS.contains(p)
+                    || BTX_DISCOVERY_PEERS.contains(p),
+                "{p} is in none of the three shipped lists"
             );
         }
+        // A peer that can serve a block outranks one that cannot. Discovery
+        // relays introduce peers and carry no chain, so if the cap ever has to
+        // choose, it must drop an introducer before an archive.
+        let first_relay = peers.iter().position(|p| BTX_DISCOVERY_PEERS.contains(p));
+        let last_server = peers
+            .iter()
+            .rposition(|p| BTX_BOOTSTRAP_PEERS.contains(p) || BTX_ARCHIVE_PEERS.contains(p));
+        if let (Some(relay), Some(server)) = (first_relay, last_server) {
+            assert!(
+                server < relay,
+                "a discovery relay is dialled before a block source: {peers:?}"
+            );
+        }
+        // The archive list means what it says: everything in it must advertise
+        // the archive role. Asserted as a COUNT because the measurement that
+        // emptied it out is in the comments and a silent re-add should trip.
+        assert_eq!(
+            BTX_ARCHIVE_PEERS.len(),
+            1,
+            "only 37.230.134.222 measured as a real archive; adding one needs a \
+             reading, not a hostname"
+        );
         // A tripwire, not a fact about the network: pinned so that adding or
         // dropping a seed cannot pass unnoticed. 2026-09-05: 9 became 7 — one
         // live-chain node in, three parked or dead-branch nodes out.
