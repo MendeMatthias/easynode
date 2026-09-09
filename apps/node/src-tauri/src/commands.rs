@@ -604,6 +604,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     let dropped: Vec<&str> = btx_core::node::BTX_BOOTSTRAP_PEERS
         .iter()
         .chain(btx_core::node::BTX_ARCHIVE_PEERS.iter())
+        .chain(btx_core::node::BTX_DISCOVERY_PEERS.iter())
         .copied()
         .filter(|p| !manual.contains(p))
         .collect();
@@ -1663,7 +1664,15 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                                 if due {
                                     wd_last_dial = Some(std::time::Instant::now());
                                     let mut dialled = 0usize;
-                                    for host in btx_core::node::BTX_ARCHIVE_PEERS {
+                                    // BLOCK SOURCES, not the archive list. Until
+                                    // 2026-09-09 that list held three
+                                    // MATMUL_DISCOVERY relays — no NETWORK bit,
+                                    // cannot answer a getdata — so this
+                                    // remediation spent three of its four dials
+                                    // on peers that could not possibly unstick
+                                    // the node it was trying to rescue.
+                                    let sources = btx_core::node::block_source_peers();
+                                    for host in &sources {
                                         match btx_core::node_api::add_node(&rpc, host).await {
                                             Ok(()) => dialled += 1,
                                             Err(e) => eprintln!(
@@ -1673,12 +1682,12 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                                     }
                                     wd_last_dial_ok = dialled > 0;
                                     eprintln!(
-                                        "[node-app] watchdog: {:?} after {}s frozen at {:?} — redialled {}/{} archive peers",
+                                        "[node-app] watchdog: {:?} after {}s frozen at {:?} — redialled {}/{} block sources",
                                         v.class,
                                         frozen_secs,
                                         heights,
                                         dialled,
-                                        btx_core::node::BTX_ARCHIVE_PEERS.len()
+                                        sources.len()
                                     );
                                 }
                             }
