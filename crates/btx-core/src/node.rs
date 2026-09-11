@@ -50,7 +50,21 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // below 210872, and it answered `getdata` for the live branch's first
     // block (210497, 2d816071…) with the body. NETWORK_LIMITED — recent
     // blocks only — so it carries the post-split chain, not deep history.
-    "13.140.141.180:19335",
+    //
+    // ── MEASURED DEAD 2026-09-11, so it leaves the first seat ────────────────
+    // Probed from this project's Mac at 15:5xZ: three TCP attempts, twelve
+    // seconds apart, ConnectionRefused on all three. Refused, not slow, so this
+    // is not the in-flight-handshake trap the pool peer below is documented
+    // for. Corroborated twice, the way the 09-08 retirements were: btxscan's
+    // live node no longer has it in getpeerinfo, and the easybtx.com census
+    // dropped it from livePeers, the consenting seeds it measured on the
+    // heaviest chain, which that day listed 89.85.40.184 alone.
+    //
+    // It held the FIRST manual slot. Under the eight-slot cap a dead first
+    // entry is a slot every fresh or reconnecting node burns before it reaches
+    // a live one. Put it back the day it answers again, with the measurement.
+    //
+    //   "13.140.141.180:19335"  0/3 — ConnectionRefused, 2026-09-11
     // LuckyPool. Reported to us 2026-09-07 as a live body source, and
     // CONFIRMED here 2026-09-08 by starting a real v0.34.6 node against a
     // scratch datadir with exactly this manual set and reading `getpeerinfo`:
