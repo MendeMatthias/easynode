@@ -4017,8 +4017,14 @@ consensus-validator service.";
         // ...and that seed must be one a live node measured handshaking, which
         // is a property of the LIST, not of this call: every entry that has
         // failed that check is commented out above with its measurement.
+        // 2026-09-11: the head moved from 13.140.141.180 to LuckyPool's node.
+        // What justifies it: the settled 09-08 reading above, a full v0.34.6
+        // handshake as CONSENSUS + ATTESTATION_ARCHIVE with 743 KB received.
+        // What does NOT count against it: a 30 s probe from the Mac the same
+        // afternoon saw no version message, which is exactly the in-flight
+        // snapshot the list's own note says never disqualifies this peer.
         assert!(
-            BTX_BOOTSTRAP_PEERS[0].starts_with("13.140.141.180:"),
+            BTX_BOOTSTRAP_PEERS[0].starts_with("213.224.31.105:"),
             "head is {} — if a seed was retired, move this with it and say \
              what measurement justified the new head",
             BTX_BOOTSTRAP_PEERS[0]
@@ -4100,10 +4106,13 @@ consensus-validator service.";
         // 2026-09-08: 8 became 6 — two hosts measured 0/3 over three TCP
         // attempts, and under the cap a dead seat is an evicted live one.
         // LuckyPool stays: a settled reading showed it handshaked.
+        // 2026-09-11: 6 became 5 — the head, 13.140.141.180, refused three
+        // spaced TCP dials outright, and under the cap a dead FIRST seat is
+        // the one every fresh node pays for before it reaches a live peer.
         assert_eq!(
             BTX_BOOTSTRAP_PEERS.len(),
-            6,
-            "BTX_BOOTSTRAP_PEERS should have 6 entries"
+            5,
+            "BTX_BOOTSTRAP_PEERS should have 5 entries"
         );
     }
 
