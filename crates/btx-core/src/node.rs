@@ -87,7 +87,19 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // Four minutes later it was a fully handshaked attestation archive. A seed
     // is disqualified by a settled measurement, never by a snapshot taken
     // while the handshake is still in flight.
-    "213.224.31.105:33706",
+    //
+    // ── MEASURED DEAD 2026-09-12, by the standard the paragraph above sets ──
+    // Not a snapshot this time. btxscan's live v0.34.5 node was asked to
+    // `addnode 213.224.31.105:33706 onetry` and left for 300 seconds, past the
+    // four minutes the 09-08 handshake needed: no peer appeared at all, not
+    // even the half-handshaked `version 0` shape. The same onetry to
+    // 89.85.40.184 produced a full /BTX:0.34.6/ peer in 20 seconds. From the
+    // project Mac, TCP opened but no version message came back inside 30 s on
+    // 09-11 and inside 200 s on 09-12. Two clients, two days, one real node
+    // waiting longer than the documented worst case. Put it back the day a
+    // real node handshakes it again, with that reading.
+    //
+    //   "213.224.31.105:33706"  onetry 300 s, no peer — 2026-09-12
     // ── MEASURED DEAD 2026-09-08, and that is why they are not here ──────────
     // Probed from this project's Mac: three TCP attempts each, eight-second
     // timeout, 0/3 answered. Corroborated by the box's own live node, which has
@@ -4023,8 +4035,14 @@ consensus-validator service.";
         // What does NOT count against it: a 30 s probe from the Mac the same
         // afternoon saw no version message, which is exactly the in-flight
         // snapshot the list's own note says never disqualifies this peer.
+        // 2026-09-12: the head moved again, to 37.230.134.222. LuckyPool's
+        // node was dialled by btxscan's real node with `onetry` for 300 s and
+        // produced no peer, past the four minutes its own note allows. What
+        // justifies the new head: btxscan carries 37.230.134.222 as a manual
+        // peer every day, /BTX:0.34.6/, synced at the tip on 09-11 and 09-12,
+        // and it is one of the peers actually delivering attestations there.
         assert!(
-            BTX_BOOTSTRAP_PEERS[0].starts_with("213.224.31.105:"),
+            BTX_BOOTSTRAP_PEERS[0].starts_with("37.230.134.222:"),
             "head is {} — if a seed was retired, move this with it and say \
              what measurement justified the new head",
             BTX_BOOTSTRAP_PEERS[0]
@@ -4109,10 +4127,13 @@ consensus-validator service.";
         // 2026-09-11: 6 became 5 — the head, 13.140.141.180, refused three
         // spaced TCP dials outright, and under the cap a dead FIRST seat is
         // the one every fresh node pays for before it reaches a live peer.
+        // 2026-09-12: 5 became 4 — LuckyPool's node produced no peer for a
+        // real btxd `onetry` held 300 s, past the four minutes its own note
+        // allows, and the comparison dial to 89.85.40.184 took 20 s.
         assert_eq!(
             BTX_BOOTSTRAP_PEERS.len(),
-            5,
-            "BTX_BOOTSTRAP_PEERS should have 5 entries"
+            4,
+            "BTX_BOOTSTRAP_PEERS should have 4 entries"
         );
     }
 
