@@ -115,7 +115,7 @@ hash electrs serves at a height is the hash btxd reports there, which is
 `rust-btx` decoding real 182-byte headers with their trailing MatMul payloads
 and agreeing with the node that made them.
 
-## Four things that will bite
+## Five things that will bite
 
 **Freshness is declared, never faked.** Exactly one marker exists at a time
 and the proxy matches on its presence; with none at all it answers
@@ -139,6 +139,32 @@ chains share.
 **CORS exactly once.** electrs emits its own headers and Caddy strips them
 downstream before emitting one set. Duplicate `Access-Control-Allow-Origin`
 is rejected by browsers outright and broke the web wallet once already.
+
+**The front matches on `Host`, so a tunnel must rewrite it.** `BTX_ESPLORA_HOST`
+is a Caddy *site address*: Caddy serves only requests whose `Host` equals it.
+Put a tunnel in front that forwards the public name unchanged and nothing
+matches, and Caddy answers `200` with an empty body and none of its own
+headers — which reads exactly like the request never arrived. Measured
+2026-09-14 bringing up `witness-1.easybtx.com`: an hour went into Cloudflare
+Workers and page rules before the cause turned out to be local. cloudflared
+only logs individual requests at debug level, so an empty connector log is not
+evidence either. One command settles it, and it is the first one to run:
+
+```bash
+curl -i -H "Host: <the public name>" http://127.0.0.1:3080/blocks/tip/height
+```
+
+Full headers plus a body means Caddy is fine and the tunnel is mis-addressed;
+an empty `200` means the `Host` does not match the site address. For a
+Cloudflare tunnel the fix belongs in its ingress, not in this Caddyfile:
+
+```yaml
+ingress:
+  - hostname: <the public name>
+    service: http://127.0.0.1:3080
+    originRequest:
+      httpHostHeader: "127.0.0.1:3080"
+```
 
 ## Changes made during the port
 
