@@ -352,6 +352,34 @@ pub struct ArchivePeerSummary {
     pub blocks_in_flight: usize,
 }
 
+/// What `getmatmultrustedstatus` says about this node's own MatMul role.
+///
+/// The app has never asked this question, and it is the one that decides
+/// whether the archive bit means what it appears to mean. See
+/// [`crate::frontier::archive_service`].
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct MatmulTrustedStatus {
+    /// This node holds an attestation signing key.
+    #[serde(default)]
+    pub local_signer: bool,
+    /// `-matmulattestationserve` is on.
+    #[serde(default)]
+    pub serves_attestations: bool,
+    /// `consensus` | `trusted` | other.
+    #[serde(default)]
+    pub matmul_validation_mode: String,
+    #[serde(default)]
+    pub trusted_mirror: bool,
+}
+
+/// Read this node's own MatMul role. Cheap, and answered by every engine that
+/// supports attestations; an older one that does not know the method returns an
+/// error, which callers treat as "unknown" rather than as "no".
+pub async fn get_matmul_trusted_status(rpc: &dyn Rpc) -> AppResult<MatmulTrustedStatus> {
+    let v = rpc.call("getmatmultrustedstatus", json!([])).await?;
+    serde_json::from_value(v).map_err(|e| crate::error::AppError::Decode(e.to_string()))
+}
+
 /// NODE_MATMUL_ATTESTATION_ARCHIVE — service bit 31.
 pub const NODE_MATMUL_ATTESTATION_ARCHIVE_BIT: u64 = 1 << 31;
 
