@@ -49,10 +49,15 @@
 #     the release notes must say so.
 #   * It says nothing about the fork constant (that is check-engine-tag.sh), the
 #     withdrawn assumeutxo bases, or whether a machine is fast enough.
-#   * Being IN the manifest is necessary, not sufficient. BTX's cuBLASLt request
-#     gets no IMMA kernel on any pre-Hopper NVIDIA card, so 30 and 40 series
-#     owners are excluded even before the manifest is consulted. See
-#     docs/2026-08-29-ampere-imma-layout.md.
+#   * Being IN the manifest is necessary, not sufficient: the host must also
+#     reproduce the row's golden digest. An earlier version of this note said no
+#     pre-Hopper NVIDIA card could, so 30 and 40 series owners were excluded
+#     before the manifest was consulted. That was wrong, and it must not become
+#     recruitment copy: the mainnet signer since September 2026 is an RTX 3060
+#     (cuda/sm_86), and the cohort check accepts a cuda row of any sm_*
+#     architecture (matmul_v4_rc_production_canary.cpp,
+#     GoldenArchitectureMatchesFamily). What binds is the digest and the
+#     fingerprint, not the GPU generation.
 #
 # USAGE
 #   scripts/check-engine-fleet-ready.sh              check the pin in commands.rs
