@@ -806,6 +806,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     state.peer_nicknames_cache.lock().await.clear();
     *state.archive_service.lock().await = None;
     *state.fork.lock().await = None;
+    *state.tip_median_time.lock().await = None;
 
     set_phase(app, state, NodePhase::Starting).await;
 
@@ -1263,6 +1264,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
     let nickname_slot = state.peer_nicknames_cache.clone();
     let archive_service_slot = state.archive_service.clone();
     let fork_slot = state.fork.clone();
+    let tip_time_slot = state.tip_median_time.clone();
     let anchor = snapshot_spec().anchor_height;
 
     tauri::async_runtime::spawn(async move {
@@ -1310,6 +1312,10 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
             match get_blockchain_info(&rpc).await {
                 Ok(chain) => {
                     consecutive_failures = 0;
+                    // The one chain signal here that does not come from our
+                    // peers. Recorded on every successful poll, judged at
+                    // render time against the clock then.
+                    *tip_time_slot.lock().await = Some(chain.median_time);
                     // Housekeeping: free the ~450 MB bootstrap snapshot the
                     // moment its load is confirmed (C3-gated; safe while btxd
                     // runs — it never holds the file after loadtxoutset).
@@ -1869,6 +1875,7 @@ pub async fn stop_node_inner(state: &AppState) {
     state.peer_nicknames_cache.lock().await.clear();
     *state.archive_service.lock().await = None;
     *state.fork.lock().await = None;
+    *state.tip_median_time.lock().await = None;
     // Release the keep-awake assertion — the Mac may sleep again.
     *state.sleep_guard.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
@@ -2012,6 +2019,19 @@ pub struct NodeStatusInfo {
     /// people, for the same reason `archive_service` ships both.
     pub fork: Option<btx_core::fork::ForkAlarm>,
     pub fork_message: Option<String>,
+    /// The tip's own age, measured against the wall clock rather than against
+    /// what our peers believe. `true` once the newest block is older than
+    /// `btx_core::node_api::TIP_STALE_AFTER_SECS` (2 h).
+    ///
+    /// A node whose peers are stuck with it reports `blocks == headers`, no
+    /// `fork`, and looks healthy. This is the field that does not.
+    pub tip_stale: bool,
+    /// Seconds since the tip's median time, or `None` when the node is stopped
+    /// or has not answered. Shipped next to the flag for the same reason
+    /// `fork` ships next to `fork_message`: the number for machines, the
+    /// sentence for people.
+    pub tip_age_secs: Option<u64>,
+    pub tip_stale_message: Option<String>,
     /// The nickname the user has chosen (empty = none). This is what WILL be
     /// broadcast; `subversion` below is what IS.
     pub node_nickname: String,
@@ -2272,6 +2292,30 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
     // could ship two different ticks in one status.
     let archive_service = state.archive_service.lock().await.clone();
     let fork = state.fork.lock().await.clone();
+    let tip_median_time = *state.tip_median_time.lock().await;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let tip_stale = tip_median_time
+        .map(|mt| btx_core::node_api::tip_is_stale(mt, now_unix))
+        .unwrap_or(false);
+    let tip_age_secs = tip_median_time
+        .filter(|mt| *mt > 0)
+        .map(|mt| now_unix.saturating_sub(mt).max(0) as u64);
+    let tip_stale_message = if tip_stale {
+        tip_age_secs.map(|secs| {
+            let hours = secs / 3600;
+            format!(
+                "The newest block this node has is {} hours old. That is measured against \
+                 the clock, not against what its peers report, so it holds even when every \
+                 peer agrees with it. The node is not following the chain.",
+                hours
+            )
+        })
+    } else {
+        None
+    };
 
     // Archive-peer census for the trusted-mirror health card: served from the
     // refresher's per-tick cache (≤3 s old) instead of running a second full
@@ -2369,6 +2413,9 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         archive_service: archive_service.clone(),
         archive_service_message: archive_service.as_ref().map(|a| a.message()),
         fork_message: fork.as_ref().map(|f| f.message()),
+        tip_stale,
+        tip_age_secs,
+        tip_stale_message,
         fork,
         node_nickname: settings.node_nickname.clone(),
         broadcast_nickname: subversion

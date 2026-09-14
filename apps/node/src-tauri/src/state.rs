@@ -365,6 +365,27 @@ pub struct AppState {
     /// headers/blocks gap. Cleared on every stop/start like the others, so a
     /// dead run's fork never renders as current. See `btx_core::fork`.
     pub fork: Arc<Mutex<Option<btx_core::fork::ForkAlarm>>>,
+    /// `getblockchaininfo.mediantime` from the last successful poll, or `None`
+    /// when the node is stopped or has not answered yet.
+    ///
+    /// WHY THIS IS SEPARATE FROM `fork`. Every other chain signal this app
+    /// shows is derived from the node's peers: `blocks`, `headers`,
+    /// `getchaintips`, and therefore `fork` too. When a node and all of its
+    /// peers are stuck together, every one of those agrees that nothing is
+    /// wrong — which is exactly what happened to the explorer on 2026-09-13,
+    /// where its own health check printed GREEN for twenty-one hours.
+    ///
+    /// A block timestamp cannot be fooled that way: it comes from the chain,
+    /// not from agreement among the peers we happen to be talking to. So this
+    /// is the one staleness signal in the app that is not self-referential,
+    /// and `node_api::tip_is_stale` has always been the right check for it —
+    /// it was simply only ever wired into the wallet panel. See
+    /// `node_api.rs:36`: "it can be hours dead without `is_stale` if it
+    /// believes its own tip."
+    ///
+    /// Stored raw rather than pre-judged so the verdict is computed against
+    /// the clock at render time, never against the clock at poll time.
+    pub tip_median_time: Arc<Mutex<Option<i64>>>,
     /// The archive-peer census, computed ONCE per refresher tick from a single
     /// getpeerinfo and shared by the status snapshot, the watchdog and the
     /// service report. The UI poll used to run its own full getpeerinfo every
@@ -438,6 +459,7 @@ impl AppState {
             stall_verdict: Arc::new(Mutex::new(None)),
             archive_service: Arc::new(Mutex::new(None)),
             fork: Arc::new(Mutex::new(None)),
+            tip_median_time: Arc::new(Mutex::new(None)),
             archive_peers_cache: Arc::new(Mutex::new(None)),
             peer_nicknames_cache: Arc::new(Mutex::new(Vec::new())),
             esplora: Arc::new(Mutex::new(None)),
