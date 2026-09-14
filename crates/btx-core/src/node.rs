@@ -498,8 +498,9 @@ pub fn build_node_command(
         // function against today's behaviour, and it is not a choice we get to
         // make differently, because the alternative is a node that does not run.
         // The way out is a manifest row for the user's device class, not a
-        // weaker quorum. See docs/2026-08-29-ampere-imma-layout.md for why no
-        // pre-Hopper NVIDIA card can get one today.
+        // weaker quorum. (An earlier note here said no pre-Hopper NVIDIA card
+        // could get one. The mainnet signer since September 2026 is an RTX 3060,
+        // sm_86, so that was wrong; the cohort accepts any sm_* cuda row.)
         //
         // scripts/check-engine-fleet-ready.sh fails if this gate is missing on an
         // engine that needs it.
