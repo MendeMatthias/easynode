@@ -1483,8 +1483,22 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                         } else {
                             None
                         };
+                        // Whether we hold a signing key decides what the
+                        // archive bit actually delivers, so it is read here
+                        // rather than assumed. An engine that does not know the
+                        // method leaves this false, which is the pre-existing
+                        // behaviour and only ever over-reports capability the
+                        // same way it always did.
+                        let has_local_signer = btx_core::node_api::get_matmul_trusted_status(&rpc)
+                            .await
+                            .map(|s| s.local_signer)
+                            .unwrap_or(false);
                         *archive_service_slot.lock().await =
-                            Some(btx_core::frontier::archive_service(serving, blocks_behind));
+                            Some(btx_core::frontier::archive_service(
+                                serving,
+                                blocks_behind,
+                                has_local_signer,
+                            ));
                     }
 
                     // ── Is there a longer chain this node cannot obtain? ────
