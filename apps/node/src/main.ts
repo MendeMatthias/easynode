@@ -93,6 +93,15 @@ export interface NodeStatusInfo {
    *  is rendered in Rust (fork_message), like archive_service_message. */
   fork: { kind: string; since_secs?: number } | null;
   fork_message: string | null;
+  /** The tip's own age against the wall clock, not against what our peers
+   *  believe. Every other chain signal here — blocks, headers, getchaintips,
+   *  and so `fork` too — is derived from the peers we happen to have, so a
+   *  node stuck together with its peers looks healthy in all of them. A block
+   *  timestamp cannot agree with a stuck peer set. The sentence is rendered in
+   *  Rust, like fork_message. */
+  tip_stale: boolean;
+  tip_age_secs: number | null;
+  tip_stale_message: string | null;
   node_nickname: string;
   broadcast_nickname: string | null;
   subversion: string | null;
@@ -1181,12 +1190,17 @@ function reflectArchiveService(status: NodeStatusInfo): void {
 function reflectFork(status: NodeStatusInfo): void {
   const card = $("fork-card");
   const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
-  if (!running || !status.fork_message) {
+  // A stale tip outranks a fork verdict. A fork says "there is a better chain
+  // we cannot reach"; a stale tip says "the newest block we have is hours old
+  // however healthy everything else reads", which is the condition every
+  // peer-derived signal in this app is blind to by construction.
+  const message = status.tip_stale_message ?? status.fork_message;
+  if (!running || !message) {
     card.hidden = true;
     return;
   }
   card.hidden = false;
-  $("fork-msg").textContent = status.fork_message;
+  $("fork-msg").textContent = message;
 }
 
 function reflectKeeperRow(status: NodeStatusInfo) {
