@@ -8,7 +8,7 @@ root).
 
 ## [Unreleased]
 
-## [0.6.22] - 2026-09-14 · mac + linux + windows
+## [0.6.22] - 2026-09-15 · linux + windows (mac follows when built)
 
 **Your node will tell you when its own view of the chain has gone stale.**
 Every chain signal on the status card was derived from the peers this node
