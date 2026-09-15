@@ -73,6 +73,70 @@ provisioning verifies the binary against the declaration, exactly as the
 `v0.33.3-pr105b` key did in 0.6.1. The chain in `~/.easybtx` is untouched by
 the swap.
 
+**A PC with no graphics card now follows the chain instead of stopping at it,
+and can serve the explorer's history.** Since 0.6.15 every Windows and Linux
+node has started in consensus mode. On a machine with a capable NVIDIA card
+that is right: the engine measures the card at startup and the node validates
+every block itself, as this project's RTX 3060 has since 1 September. On a
+machine with no card it was a node that helped nobody. The engine starts it
+degraded, it follows headers, it stops below block 185,000 where the new proof
+of work begins, and it can never advertise the archive service, because the
+engine (`init.cpp:2662-2673`, identical at our pinned commit `9eb4e005`, at
+the `v0.34.6` tag and on the unreleased 0.34.7 branch) grants that service only
+to a trusted mirror or to a signer whose card is ready. Its owner believed it
+was helping.
+
+The role the network is short of needs neither a card nor a key. A node with
+NO signing key serves attestation history with no window limit at all, where a
+signer is clamped to the last sixteen blocks (0.6.22 said this about our own
+signer). On 13 September the explorer sat frozen for twenty-one hours for want
+of one historical signature that no peer it asked would serve. A keyless mirror
+would have answered.
+
+So the app now looks for the NVIDIA driver before it starts the node. A machine
+that has it (`nvcuda.dll` on Windows, `libcuda.so.1` on Linux, both measured on
+this project's 3060 box) is launched in consensus mode exactly as before. A
+machine that does not is launched as a trusted mirror: the same three pinned
+signer keys the Mac fallback already uses, threshold one, the
+`-allowsinglekeytrustedmirror=1` the 0.34 engine requires, and the mode stated
+on the command line rather than left to the engine's default, for the reason
+0.6.16 learned in five seconds. It follows the signed chain, and when "Serve
+signed confirmations" is on, which the engine turns on by default in this
+mode, it advertises the archive service and serves history at any height. The
+status card calls it "Mirror" and says what is being trusted.
+
+The trade, in the words of the decision record
+(`docs/decisions/2026-09-15-keyless-cpu-hosts-are-trusted-mirrors.md`): at
+threshold 1 every pinned key is a full authority alone, so one stolen signing
+key could make these nodes accept MatMul-invalid blocks; btxd itself warns
+about this at init. Mirrors also freeze when signers go quiet (2026-09-05/06
+incidents) rather than validating on their own. A node that stalled for certain
+and served nobody becomes one that follows on signatures, can serve, and
+freezes if the signers do. The 31 August reasoning that put every PC in
+consensus mode rested on an attestation supply that had measured dead in
+mid-August; this project's validator has signed since 1 September and
+LuckyPool's node carries attestations too, so that premise no longer holds.
+
+What this does not fix, said so nobody expects it to: a PC whose NVIDIA card
+has the driver but fails the engine's startup check (an older or weaker card)
+still reads as a CUDA machine, still starts in consensus mode, and still stops
+below block 185,000, with the card reading "Stopped" as before. The engine's
+own verdict after start is the signal that would route such a machine to the
+mirror, and using it is the next step, not this one. `EASYBTX_NODE_TRUSTED_MIRROR=1`
+in the environment puts it on the mirror by hand meanwhile, and `=0` on a
+machine with no card is the one-flag return to the 0.6.15 through 0.6.22
+posture.
+
+Verified offline on this box against the shipped 0.34.6 engine, with exactly
+the flags a card-less PC receives and no peers: the engine reaches "Done
+loading" in two seconds, `getmatmultrustedstatus` reads `trusted_mirror true`,
+`local_signer false`, `serves_attestations true`, three signers at threshold
+one, and the node advertises the trusted-mirror and attestation-archive
+service bits with the consensus bit clear; switching serving off drops the
+archive bit and nothing else. Macs are untouched: an Apple Silicon Mac still
+passes no mode flag and validates for itself, and the M5 fallback path is
+unchanged. A PC with a capable card is untouched.
+
 ## [0.6.22] - 2026-09-15 · linux + windows (mac follows when built)
 
 **Your node will tell you when its own view of the chain has gone stale.**
@@ -112,7 +176,6 @@ payload, so the whole chain holds roughly 43 MB of transaction data and the
 index that sits on top of it is under a gigabyte, not a fraction of 124 GiB.
 That makes keeping block files on a slow disk a correct design rather than a
 compromise.
-
 
 ## [0.6.21] - 2026-09-09 · mac + linux + windows
 
@@ -222,7 +285,6 @@ dialling the right peers is what lets a node obtain the chain, never what lets
 it validate the fork.
 
 Internal: `withGlobalTauri` is off — the interface never used it.
-
 
 ## [0.6.20] - 2026-09-06 · linux
 

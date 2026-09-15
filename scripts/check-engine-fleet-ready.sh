@@ -21,21 +21,26 @@
 #   DEGRADED start instead, logging "MatMul RC DEGRADED START" and withholding
 #   NODE_MATMUL_CONSENSUS. Measured on the same 3060 against PR #128: it starts.
 #
-#   btxd from 0.34 onward also refuses a 1-of-1 TRUSTED MIRROR on mainnet.
-#   crates/btx-core/src/node.rs sends every non-Metal host down exactly that
-#   path with -matmultrustedthreshold=1.
+#   btxd from 0.34 onward also refuses a 1-of-1 TRUSTED MIRROR on mainnet,
+#   unless -allowsinglekeytrustedmirror=1 is passed (0.34.5 added the flag as
+#   a transition override). crates/btx-core/src/node.rs hands that mirror, at
+#   -matmultrustedthreshold=1, to a refused Mac and, since 2026-09-15, to every
+#   PC with no NVIDIA driver; a PC with the driver stays in consensus mode
+#   (docs/decisions/2026-09-15-keyless-cpu-hosts-are-trusted-mirrors.md).
 #
 # So the matrix, all four cells measured from the tags themselves:
 #
 #   engine        consensus start        1-of-1 mirror     our app works?
 #   < 0.34        refused off-manifest   ALLOWED           yes, via the mirror
 #   0.34 .. .4    refused off-manifest   refused           NO. no startable mode
-#   0.34.5+       ALLOWED (degraded)     refused           yes, but only if the
-#                                                          app stops using the
-#                                                          mirror on that engine
+#   0.34.5+       ALLOWED (degraded)     refused without   yes: driver hosts via
+#                                        the override      consensus, the rest
+#                                                          via the mirror plus
+#                                                          the override
 #
 # A bump into the middle row is a fleet-wide outage. A bump into the bottom row
-# without the matching app change is the same outage. This guard catches both.
+# without the degraded-start gate, or with the gate but without the override on
+# the mirror arm, is the same outage. This guard catches all three.
 #
 # FAIL CLOSED. A file it cannot fetch, a marker it cannot find, a manifest it
 # cannot parse: all failures. This repo has twice shipped breakage behind a
@@ -94,9 +99,14 @@ pin_commit() {
 DEGRADED_START_MARKER="MatMul RC DEGRADED START"
 # Added in 0.34. Absent on every v0.33.x tag.
 SINGLE_KEY_REFUSAL="Mainnet trusted MatMul mirrors require at least 2"
-# The app-side marker that says node.rs knows to stay in consensus mode on an
-# engine that allows a degraded start, instead of taking the refused mirror.
+# The app-side marker that says node.rs knows which engines allow a degraded
+# start: on those a driver host takes consensus mode and a driver-less host
+# takes the mirror WITH the override below, instead of the refused bare mirror.
 APP_DEGRADED_GATE="node_allows_degraded_matmul_start"
+# The override that makes a 1-of-1 mainnet mirror start on 0.34.5+. If node.rs
+# pins a single key on such an engine and this literal is gone, every PC with
+# no NVIDIA driver fails at init. Since 2026-09-15 that is the mirror arm.
+APP_SINGLE_KEY_OVERRIDE="-allowsinglekeytrustedmirror=1"
 
 annotate() {
   if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::$1::$2"; fi
@@ -143,6 +153,9 @@ if [ "${1:-}" = "--self-test" ]; then
   grep -q "$SINGLE_KEY_REFUSAL"    "$t/mirror.cpp"   || { echo "self-test: mirror check MISSED the refusal"; fails=1; }
   grep -q "$APP_DEGRADED_GATE"     "$t/node_ungated.rs" && { echo "self-test: app-gate check matched an ungated node.rs"; fails=1; }
   grep -q "$APP_DEGRADED_GATE"     "$t/node_gated.rs"   || { echo "self-test: app-gate check MISSED the gate"; fails=1; }
+  printf 'args.push("%s".to_string());\n' "$APP_SINGLE_KEY_OVERRIDE" > "$t/node_override.rs"
+  grep -q -- "$APP_SINGLE_KEY_OVERRIDE" "$t/node_ungated.rs"  && { echo "self-test: override check matched a node.rs without the override"; fails=1; }
+  grep -q -- "$APP_SINGLE_KEY_OVERRIDE" "$t/node_override.rs" || { echo "self-test: override check MISSED the override"; fails=1; }
 
   printf 'BTX_RC_PRODUCTION_GOLDEN_V1\n' > "$t/m0.data"
   printf 'BTX_RC_PRODUCTION_GOLDEN_V1\nid|cuda|sm_120|1|d|1|doc/x|r|f|h\n' > "$t/m1.data"
@@ -224,6 +237,8 @@ APP_PINS_SINGLE_KEY=0
 if grep -q -- "-matmultrustedthreshold=1" "$NODE_RS"; then APP_PINS_SINGLE_KEY=1; fi
 APP_HAS_DEGRADED_GATE=0
 if grep -q "$APP_DEGRADED_GATE" "$NODE_RS"; then APP_HAS_DEGRADED_GATE=1; fi
+APP_PASSES_SINGLE_KEY_OVERRIDE=0
+if grep -q -- "$APP_SINGLE_KEY_OVERRIDE" "$NODE_RS"; then APP_PASSES_SINGLE_KEY_OVERRIDE=1; fi
 
 if [ "$APP_PINS_SINGLE_KEY" -eq 1 ]; then
   echo "app off-manifest path .. trusted mirror, threshold 1"
@@ -234,6 +249,11 @@ if [ "$APP_HAS_DEGRADED_GATE" -eq 1 ]; then
   echo "app degraded-start gate  present ($APP_DEGRADED_GATE)"
 else
   echo "app degraded-start gate  ABSENT"
+fi
+if [ "$APP_PASSES_SINGLE_KEY_OVERRIDE" -eq 1 ]; then
+  echo "app single-key override  present ($APP_SINGLE_KEY_OVERRIDE)"
+else
+  echo "app single-key override  ABSENT"
 fi
 echo
 
@@ -258,12 +278,16 @@ if [ "$CONSENSUS_STARTS" -eq 0 ] && [ "$MIRROR_STARTS" -eq 0 ]; then
   note "no startable mode exists on this tag for a host outside the golden manifest: consensus exits at init and a 1-of-1 trusted mirror is refused"
 elif [ "$CONSENSUS_STARTS" -eq 1 ] && [ "$MIRROR_STARTS" -eq 0 ] \
      && [ "$APP_PINS_SINGLE_KEY" -eq 1 ] && [ "$APP_HAS_DEGRADED_GATE" -eq 0 ]; then
-  note "this tag allows a degraded consensus start but refuses the 1-of-1 mirror the app still selects; crates/btx-core/src/node.rs needs a $APP_DEGRADED_GATE gate so off-manifest hosts stay in consensus mode instead"
+  note "this tag allows a degraded consensus start but refuses the 1-of-1 mirror the app still selects; crates/btx-core/src/node.rs needs a $APP_DEGRADED_GATE gate so driver hosts take consensus mode and driver-less hosts take the mirror with $APP_SINGLE_KEY_OVERRIDE"
+elif [ "$CONSENSUS_STARTS" -eq 1 ] && [ "$MIRROR_STARTS" -eq 0 ] \
+     && [ "$APP_PINS_SINGLE_KEY" -eq 1 ] && [ "$APP_HAS_DEGRADED_GATE" -eq 1 ] \
+     && [ "$APP_PASSES_SINGLE_KEY_OVERRIDE" -eq 0 ]; then
+  note "this tag refuses the 1-of-1 mirror the app hands a PC with no NVIDIA driver unless $APP_SINGLE_KEY_OVERRIDE is passed, and crates/btx-core/src/node.rs no longer passes it"
 fi
 
 if [ -z "$PROBLEMS" ]; then
   if [ "$CONSENSUS_STARTS" -eq 1 ]; then
-    echo "OK: $TAG is fleet-startable, off-manifest hosts via a degraded consensus start."
+    echo "OK: $TAG is fleet-startable: off-manifest hosts with an NVIDIA driver via a degraded consensus start, hosts without one via the 1-of-1 mirror behind the override."
   else
     echo "OK: $TAG is fleet-startable, off-manifest hosts via the trusted mirror."
   fi

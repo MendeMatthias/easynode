@@ -275,29 +275,24 @@ pub fn snapshot_spec() -> SnapshotSpec {
     btx_core::snapshot::v0_34_5_spec()
 }
 
-/// The matmul backend env for btxd. The node app never mines, but block
-/// VALIDATION evaluates MatMul proofs too — on Apple Silicon the Metal backend
-/// does that on the GPU. Everywhere else: CPU.
+/// The backend btxd is launched with, and since 2026-09-15 the input to the
+/// launch-mode split in `node::build_node_command`: Metal on Apple Silicon,
+/// Cuda where the NVIDIA driver library is present, Cpu where it is not. The
+/// node app never mines, so the env this becomes steers nothing; the MODE it
+/// selects is what matters, and `btx_core::backend::node_host_backend` says
+/// what each answer means and does not mean.
 ///
 /// ⚠ "btxd falls back to CPU safely if Metal is unavailable" USED to be true and
 /// is not true after the MatMul v4.7 fork (mainnet block 185,000). Under the
 /// default `strict-device` RC execution policy a CPU fallback is exactly what
 /// btxd refuses: the GEMM backend is zeroed and the node stalls instead of
-/// validating. Since #331, `node::rc_execution_mode` hands every non-Metal
-/// host `strict-device` PLUS trusted-mirror mode (`-matmulvalidation=trusted`
-/// + the two signer pubkeys) — NOT `auto-fallback`, which a 16-hour field run
-/// showed pegging a core, deadlocking `btx-cli stop`, and bricking a datadir
-/// on the forced kill. The UI reports btxd's OWN policy rather than assuming
-/// this function's choice succeeded.
+/// validating. `node::rc_execution_mode` hands every non-Metal host
+/// `strict-device` — NOT `auto-fallback`, which a 16-hour field run showed
+/// pegging a core, deadlocking `btx-cli stop`, and bricking a datadir on the
+/// forced kill. The UI reports btxd's OWN policy rather than assuming this
+/// function's choice succeeded.
 fn node_backend() -> Backend {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        Backend::Metal
-    }
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    {
-        Backend::Cpu
-    }
+    btx_core::backend::node_host_backend()
 }
 
 /// Wait budget for a freshly-spawned node's RPC: 360 × 500 ms = 3 min covers a

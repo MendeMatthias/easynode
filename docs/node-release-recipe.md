@@ -142,15 +142,21 @@ on.
 
 Two 0.34.5 specifics a release cutter needs:
 
-* On 0.34.5 and newer, non-Metal hosts run CONSENSUS mode, not the trusted
-  mirror: the engine admits a capable card by measurement at startup
-  (verified on an RTX 3060: self-qualifies, advertises MATMUL_CONSENSUS),
-  and the 1-of-1 mirror both requires an alarming override and depends on an
-  attestation supply that measured dead. `crates/btx-core/src/node.rs`
-  encodes this; do not hand a 0.34.5 host mirror flags.
-* A host with no capable card starts degraded, follows headers, and stalls
-  below the Epoch-A height. The release notes must say which machines
-  validate and which only follow. Do not imply everyone is a validator.
+* On 0.34.5 and newer a non-Metal host is split on its backend
+  (`docs/decisions/2026-09-15-keyless-cpu-hosts-are-trusted-mirrors.md`).
+  With the NVIDIA driver present it runs CONSENSUS mode: the engine admits a
+  capable card by measurement at startup (verified on an RTX 3060:
+  self-qualifies, advertises MATMUL_CONSENSUS). With no driver it runs the
+  1-of-1 trusted mirror WITH `-allowsinglekeytrustedmirror=1`, because a
+  card-less host in consensus mode stalls and can never carry the archive
+  bit, and the attestation supply the 08-31 rule measured dead has been live
+  since 2026-09-01. `crates/btx-core/src/node.rs` encodes both arms, and the
+  mode is explicit on the command line either way.
+* A host WITH the driver but without a capable card (Pascal, Turing, a weak
+  Ampere) still starts degraded, follows headers, and stalls below the
+  Epoch-A height. The release notes must say which machines validate, which
+  follow on signatures, and which only follow headers. Do not imply everyone
+  is a validator.
 
 ### 2026-09-05: the pin moved PAST the newest tag, and why that was allowed
 

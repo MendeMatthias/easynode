@@ -811,8 +811,95 @@ pub fn build_node_command(
         // anyway. Metal keeps its mirror routing untouched: the marker path
         // exists for engines that refuse a not-yet-goldened Mac at init, and
         // slow manifest-admitted Apple hosts are a mac lane decision.
-        let consensus_replaces_mirror_here =
-            !matches!(backend, Backend::Metal) && node_allows_degraded_matmul_start(btxd);
+        // ⚠ SPLIT 2026-09-15, and the 08-31 supersession above stays because
+        // it is right about a host WITH a capable card. It rested on two
+        // premises. The first holds: an RTX 3060 self-qualifies in consensus
+        // mode and validates for itself. Re-read from this box's live signer
+        // on 2026-09-15, a btxd this app launched with BTX_MATMUL_BACKEND=cpu
+        // in its environment, so the env never decided the device: its
+        // debug.log reads `provider=cuda_rc_exact_fused_extract ready=1
+        // cpu_fallbacks=0`. The second premise was "an attestation supply
+        // that measured dead", and that changed: this project's Linux
+        // validator has signed since 2026-09-01 (docs/gpu-qualification-
+        // rtx3060.md is its transcript) and LuckyPool's node carries
+        // attestations too (0.6.21 changelog, measured 2026-09-09).
+        //
+        // With a live supply, what a host WITHOUT a capable card gets from
+        // consensus mode is nothing at all. Upstream init.cpp:2662-2673
+        // (verified identical 2026-09-15 at our pin 9eb4e005, at tag v0.34.6
+        // = 3013c2c2, and on the unreleased 0.34.7 branch) grants
+        // NODE_MATMUL_ATTESTATION_ARCHIVE (bit 31) only to a node that serves
+        // attestations AND is either a trusted mirror or a local signer whose
+        // strict-device provider is ready. A GPU-less host in consensus mode
+        // is neither: it starts degraded, follows headers, stalls below the
+        // Epoch-A height, and can never advertise the archive bit, while its
+        // operator believes it helps. Meanwhile the role btxscan asked for
+        // (issue #90, closed 2026-09-14 without recording a decision) needs
+        // no GPU and no key: matmul_trusted_attestations.h:317 lets a KEYLESS
+        // node serve GETMMATTEST history with no window limit, where a signer
+        // is clamped to 16 blocks (0.6.22). On 2026-09-13 the explorer sat
+        // frozen for 21 hours for want of one historical signature that no
+        // peer it asked would serve. A keyless mirror would have answered.
+        //
+        // So a non-Metal host is split on what its backend says:
+        //
+        //   Cuda  the NVIDIA driver's CUDA library is present
+        //         (backend::node_host_backend: nvcuda.dll on Windows,
+        //         libcuda.so.1 on Linux). Stays in EXPLICIT consensus mode,
+        //         exactly as since 08-31. A capable card validates.
+        //   Cpu   no driver, so no GPU btxd could ever qualify. Launches as
+        //         the trusted mirror this block already builds for Metal's
+        //         marker path, WITH the single-key override on 0.34.5+, so it
+        //         follows the signed chain instead of stalling and is
+        //         eligible for the keyless archive role the moment serving is
+        //         on. btxd defaults -matmulattestationserve to 1 in trusted
+        //         mode; the app's switch writes the conf either way.
+        //
+        // Measured offline on 2026-09-15 against the shipped 0.34.6 engine
+        // with exactly the flags the Cpu arm produces (scratch datadir, no
+        // peers): "init message: Done loading" in 2 s; getmatmultrustedstatus
+        // matmul_validation_mode=trusted trusted_mirror=true local_signer=false
+        // serves_attestations=true threshold=1 trusted_signers=3
+        // pin_quorum_reachable=true; localservices 0x82000d09, which is bits
+        // 25 (TRUSTED_MIRROR) and 31 (ATTESTATION_ARCHIVE) set and bit 27
+        // (CONSENSUS) clear; with -matmulattestationserve=0 the same run reads
+        // 0x02000d09, bit 31 gone. So the archive bit is a switch the operator
+        // holds, on a node that can now hold it.
+        //
+        // Mode stays EXPLICIT for every non-Metal host, never the absence of
+        // a flag: the 09-01 paragraph below is why, and it applies to both
+        // arms. Metal is untouched.
+        //
+        // The cost, stated rather than buried, in the words the changelog and
+        // docs/decisions/2026-09-15-keyless-cpu-hosts-are-trusted-mirrors.md
+        // use: at threshold 1 every pinned key is a full authority alone, so
+        // one stolen signing key could make these nodes accept MatMul-invalid
+        // blocks; btxd itself warns about this at init. Mirrors also freeze
+        // when signers go quiet (2026-09-05/06 incidents) rather than
+        // validating on their own. The operator trades a node that stalls
+        // for certain and serves nobody for one that follows on signatures
+        // and can serve history, and freezes if the signers do.
+        //
+        // The gap this does not close: a host whose card carries the driver
+        // but fails the canary (Pascal, Turing, a weak Ampere) reads as Cuda,
+        // takes the consensus arm, and stalls exactly as today. The signal
+        // that would route it lands only after start: node_rc_status reads
+        // btxd's own `strict-device ... ready=0
+        // reason=no_rc_self_qualified_device_backend`. Turning that into a
+        // sticky marker and a restart as a mirror, the way
+        // record_matmul_consensus_refused does for a refused Mac, is the
+        // refinement, not this change. EASYBTX_NODE_TRUSTED_MIRROR=1 is the
+        // hand-operated version meanwhile, and =0 is the rollback: a Cpu host
+        // with it set gets explicit consensus, the 0.6.15 through 0.6.22
+        // posture.
+        let degraded_start = node_allows_degraded_matmul_start(btxd);
+        // The operator's explicit word outranks the backend split in both
+        // directions: =1 puts a Cuda host on the mirror, =0 keeps a Cpu host
+        // in consensus. Unset, the backend decides.
+        let cuda_validates_here = degraded_start
+            && matches!(backend, Backend::Cuda)
+            && trusted_mirror_override() != Some(true);
+        let mirror_here = trusted_mirror_required(backend, datadir) && !cuda_validates_here;
         // Consensus mode must be EXPLICIT, not the absence of a flag. Measured
         // 2026-09-01 on this box's real 0.6.5-era install: btxd persists its
         // runtime settings in the datadir's btx_rw.conf (the fork's read-write
@@ -826,16 +913,21 @@ pub fn build_node_command(
         // the leftover pin degrades to telemetry a stolen key cannot abuse.
         // Every fleet install that ran the mirror era carries this leftover,
         // so this line is what makes the upgrade land for them.
-        if consensus_replaces_mirror_here {
+        //
+        // Both arms of the split state their mode. Metal alone may stay
+        // silent, and only while its marker is clear: an M5 on this engine
+        // passes no -matmulvalidation at all and self-qualifies (0.6.19).
+        let consensus_here = !matches!(backend, Backend::Metal) && degraded_start && !mirror_here;
+        if consensus_here {
             args.push("-matmulvalidation=consensus".to_string());
         }
-        if trusted_mirror_required(backend, datadir) && !consensus_replaces_mirror_here {
+        if mirror_here {
             args.push("-matmulvalidation=trusted".to_string());
             for pubkey in BTX_TRUSTED_ATTESTATION_PUBKEYS {
                 args.push(format!("-matmultrustedpubkey={pubkey}"));
             }
             args.push("-matmultrustedthreshold=1".to_string());
-            if node_allows_degraded_matmul_start(btxd) {
+            if degraded_start {
                 // 0.34.5 and newer refuse a mainnet mirror at M<2 without this.
                 args.push("-allowsinglekeytrustedmirror=1".to_string());
             }
@@ -1030,11 +1122,15 @@ fn node_allows_degraded_matmul_start(btxd: &Path) -> bool {
 ///   the point: the refusal is instant, costs nothing, and is legible to
 ///   `node_rc_status()`. Such a host follows the chain via the trusted quorum
 ///   (`trusted_mirror_enabled`), not by grinding the proof on the processor.
-/// * **Cuda** → `strict-device`. Only `sm_120` (Blackwell) is in the manifest.
-///   An sm_120 owner qualifies and gets full independent validation; anyone
-///   else gets the same clean refusal as Cpu. (The node app never selects Cuda
-///   today — `node_backend()` is Metal on macOS/aarch64 and Cpu everywhere
-///   else — but the shared command builder must still answer honestly.)
+/// * **Cuda** → `strict-device`. Only `sm_120` (Blackwell) is in the manifest,
+///   but on 0.34.5+ the engine also admits a card by runtime measurement (an
+///   RTX 3060, sm_86, is the mainnet signer). A card that qualifies gets full
+///   independent validation; one that does not gets the same clean refusal as
+///   Cpu. (Until 2026-09-15 the node app never selected Cuda: `node_backend()`
+///   was Metal on macOS/aarch64 and Cpu everywhere else. It now returns Cuda
+///   when the NVIDIA driver's CUDA library is present, see
+///   `backend::node_host_backend`, because the mode split in
+///   `build_node_command` needs the difference.)
 ///
 /// Override with `EASYBTX_NODE_RC_EXECUTION=strict-device|auto-fallback|
 /// cpu-diagnostic|default`. Unrecognised values are IGNORED rather than passed
@@ -1092,6 +1188,14 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
         //      makes the app's three pinned keys this node's proof-of-work
         //      authority. That is a trust choice the app would be imposing.
         //   3. Accept the stall and say so plainly on screen, which is today.
+        //
+        // ⚠ CLOSED for Cpu hosts 2026-09-15, by taking end 2. A host with no
+        // CUDA driver gets the quorum again, with the override 0.34 needs,
+        // because the "today" of end 3 was a node that helps nobody while a
+        // keyless mirror can serve the explorer's history. A Cuda host whose
+        // card fails the canary stays on end 3 for now; the SPLIT paragraph
+        // in `build_node_command` and docs/decisions/2026-09-15-keyless-cpu-
+        // hosts-are-trusted-mirrors.md carry the measurements and the cost.
         //
         // `-matmulvalidation=relay` READS like a fourth option and is not one.
         // Verified against the shipped v0.34.6 binary and its source: relay
@@ -1171,16 +1275,39 @@ pub const BTX_TRUSTED_ATTESTATION_PUBKEYS: [&str; 3] = [
 /// silently downgraded to a mirror.
 ///
 /// Opt out with `EASYBTX_NODE_TRUSTED_MIRROR=0` to keep strict consensus and
-/// accept parking at 184,999.
+/// accept parking at 184,999. On a degraded-start engine (0.34.5+) that opt-out
+/// is stated as an explicit `-matmulvalidation=consensus`, the 0.6.15 through
+/// 0.6.22 posture for every non-Metal host, and `=1` puts a Cuda host on the
+/// mirror; `build_node_command` reads the override for both.
 pub fn trusted_mirror_enabled(backend: Backend) -> bool {
-    if let Ok(raw) = std::env::var("EASYBTX_NODE_TRUSTED_MIRROR") {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "0" | "false" | "off" | "no" => return false,
-            "1" | "true" | "on" | "yes" => return true,
-            _ => {}
-        }
+    if let Some(forced) = trusted_mirror_override() {
+        return forced;
     }
     !matches!(backend, Backend::Metal)
+}
+
+/// The operator's explicit answer to "run this node as a trusted mirror?",
+/// read from `EASYBTX_NODE_TRUSTED_MIRROR`; `None` when unset or unrecognised.
+///
+/// Since 2026-09-15 `build_node_command` reads this as well as
+/// `trusted_mirror_enabled`, because it has to outrank the backend split in
+/// both directions: `=1` puts a Cuda host whose card fails the canary on the
+/// mirror by hand, `=0` keeps a Cpu host in explicit consensus mode, which is
+/// the one-flag rollback of that decision.
+pub fn trusted_mirror_override() -> Option<bool> {
+    let raw = std::env::var("EASYBTX_NODE_TRUSTED_MIRROR").ok()?;
+    parse_trusted_mirror_override(&raw)
+}
+
+/// Pure half of `trusted_mirror_override`. Unrecognised values are ignored
+/// rather than guessed at, for the reason `rc_execution_mode` ignores them: a
+/// typo in an env var must not decide a node's consensus posture.
+pub fn parse_trusted_mirror_override(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => Some(false),
+        "1" | "true" | "on" | "yes" => Some(true),
+        _ => None,
+    }
 }
 
 /// Verbatim from btxd's init refusal, measured on an Apple M5 against the
@@ -3776,51 +3903,208 @@ consensus-validator service.";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Every `-matmulvalidation=` value on the command line, in order. A
+    /// non-Metal host on a degraded-start engine must state its mode exactly
+    /// once: never zero times (the 09-01 lesson, an absent flag lets the
+    /// datadir's btx_rw.conf decide) and never twice.
+    fn validation_modes(args: &[String]) -> Vec<&str> {
+        args.iter()
+            .filter_map(|a| a.strip_prefix("-matmulvalidation="))
+            .collect()
+    }
+
+    /// All three pinned signers and threshold 1: the quorum as this file
+    /// builds it for Metal's marker path, and since 2026-09-15 for keyless
+    /// CPU hosts too.
+    fn carries_trusted_quorum(args: &[String]) -> bool {
+        BTX_TRUSTED_ATTESTATION_PUBKEYS.iter().all(|k| {
+            args.iter()
+                .any(|a| a == &format!("-matmultrustedpubkey={k}"))
+        }) && args.iter().any(|a| a == "-matmultrustedthreshold=1")
+    }
+
+    fn carries_single_key_override(args: &[String]) -> bool {
+        args.iter().any(|a| a == "-allowsinglekeytrustedmirror=1")
+    }
+
     #[test]
-    fn on_0_34_5_a_non_metal_host_leaves_the_mirror_for_consensus() {
-        // This assertion has now flipped twice, so the dates matter more than
-        // the prose. Until 2026-08-30 it demanded no mirror, because a bare
-        // 1-of-1 is refused at init. Then it demanded mirror plus override,
-        // upstream's transition escape hatch. Both predate the fact that
-        // decides it: the final v0.34.5 tag admits a capable card by runtime
-        // MEASUREMENT, not by manifest row. Measured 2026-08-31 on an RTX 3060
-        // with the exact shipped Linux package: consensus mode self-qualifies
+    fn on_a_degraded_start_engine_a_cuda_host_validates_in_explicit_consensus_mode() {
+        // This assertion has flipped three times for non-Metal hosts, so the
+        // dates matter more than the prose. Until 2026-08-30 it demanded no
+        // mirror, because a bare 1-of-1 is refused at init. Then it demanded
+        // mirror plus override, upstream's transition escape hatch. From
+        // 2026-08-31 it demanded consensus for EVERY non-Metal host, on a
+        // measurement that still stands for this one: an RTX 3060 with the
+        // exact shipped Linux package self-qualifies in consensus mode
         // (ready=1, cpu_fallbacks=0) and advertises NODE_MATMUL_CONSENSUS,
-        // while the mirror pin left the same GPU idle against an attestation
-        // supply that measured dead in mid August. A host with no capable card
-        // loses nothing here: under strict-device it refuses cleanly and
-        // stalls where rc_stalled can see it, which is also everything the
-        // dead quorum had to offer.
-        for backend in [Backend::Cpu, Backend::Cuda] {
+        // while the mirror pin left the same GPU idle behind a single key.
+        // Since 2026-09-15 that is asked of the CUDA host alone; the host with
+        // no driver has its own test below, and the matrix after that.
+        for engine in ["v0.34.5", "v0.34.6", "v0.35.0"] {
             let (_, args, _) = build_node_command(
-                Path::new("/x/btx/v0.34.5/lin/btxd"),
+                Path::new(&format!("/x/btx/{engine}/lin/btxd")),
+                Path::new("/dd"),
+                Path::new("/dd/btx.conf"),
+                Backend::Cuda,
+            );
+            assert_eq!(
+                validation_modes(&args),
+                vec!["consensus"],
+                "consensus must be EXPLICIT and stated once on {engine}: btxd \
+                 persists mirror settings in the datadir's btx_rw.conf across \
+                 engine upgrades, and only a command line value outranks them \
+                 (measured on a real 0.6.5 era install, 2026-09-01), got {args:?}"
+            );
+            assert!(
+                !args.iter().any(|a| a.starts_with("-matmultrustedpubkey=")),
+                "no signer pins in consensus mode on {engine}, got {args:?}"
+            );
+            assert!(
+                !args.iter().any(|a| a == "-matmultrustedthreshold=1"),
+                "no threshold in consensus mode on {engine}, got {args:?}"
+            );
+            assert!(
+                !carries_single_key_override(&args),
+                "the stolen-key override has no place beside consensus on {engine}, got {args:?}"
+            );
+            // strict-device stays: a card that qualifies validates, and one
+            // that does not refuses cleanly where rc_stalled can see it.
+            assert!(args.iter().any(|a| a == "-matmulrcexecution=strict-device"));
+        }
+    }
+
+    #[test]
+    fn on_a_degraded_start_engine_a_keyless_cpu_host_is_a_trusted_mirror() {
+        // The 08-31 rule sent this host into consensus mode too, where it
+        // starts degraded, follows headers, stalls below the Epoch-A height
+        // and can never advertise the archive bit: init.cpp:2662-2673 grants
+        // it only to a trusted mirror or to a signer whose device is ready.
+        // That rule's premise was "an attestation supply that measured dead",
+        // and the supply is live again (this project's validator has signed
+        // since 2026-09-01). So a host with no CUDA driver takes the mirror
+        // this file already builds for a refused Mac, override included, and
+        // follows the signed chain. Measured offline on 2026-09-15 against
+        // the shipped 0.34.6 engine with exactly these flags: "init message:
+        // Done loading" in 2 s, getmatmultrustedstatus trusted_mirror=true
+        // local_signer=false serves_attestations=true, localservices
+        // 0x82000d09 (bits 25 and 31 set, bit 27 clear).
+        for engine in ["v0.34.5", "v0.34.6", "v0.35.0"] {
+            let (_, args, _) = build_node_command(
+                Path::new(&format!("/x/btx/{engine}/lin/btxd")),
+                Path::new("/dd"),
+                Path::new("/dd/btx.conf"),
+                Backend::Cpu,
+            );
+            assert_eq!(
+                validation_modes(&args),
+                vec!["trusted"],
+                "a keyless CPU host states trusted mode once on {engine}, got {args:?}"
+            );
+            assert!(
+                carries_trusted_quorum(&args),
+                "all three pinned signers at threshold 1 on {engine}, got {args:?}"
+            );
+            assert!(
+                carries_single_key_override(&args),
+                "every 0.34 tag refuses a 1-of-1 mainnet mirror without the \
+                 override; without this line the node does not start on \
+                 {engine}, got {args:?}"
+            );
+            assert!(args.iter().any(|a| a == "-matmulrcexecution=strict-device"));
+        }
+    }
+
+    /// The whole matrix in one table, so the next flip has to rewrite a row
+    /// rather than one assertion, and a change to one host class shows up as
+    /// a diff against the others.
+    #[test]
+    fn the_launch_mode_matrix_is_metal_silent_cuda_consensus_cpu_mirror() {
+        // (backend, btxd path, stated modes, quorum pinned, override passed)
+        let cases: [(Backend, &str, &[&str], bool, bool); 9] = [
+            // Metal says nothing without its marker: btxd's default is
+            // consensus and Apple Silicon self-qualifies (an M5 on 0.34.6,
+            // 0.6.19). The marker path has its own tests above.
+            (
+                Backend::Metal,
+                "/x/btx/v0.33.4.1/mac/btxd",
+                &[],
+                false,
+                false,
+            ),
+            (Backend::Metal, "/x/btx/v0.34.6/mac/btxd", &[], false, false),
+            // Engines before the degraded start exit at init in consensus
+            // mode on an off-manifest host, so both PC classes keep the mirror
+            // there, and without the override, which is a 0.34 flag.
+            (
+                Backend::Cuda,
+                "/x/btx/v0.33.4.1/lin/btxd",
+                &["trusted"],
+                true,
+                false,
+            ),
+            (
+                Backend::Cpu,
+                "/x/btx/v0.33.4.1/lin/btxd",
+                &["trusted"],
+                true,
+                false,
+            ),
+            // The split, 2026-09-15.
+            (
+                Backend::Cuda,
+                "/x/btx/v0.34.6/lin/btxd",
+                &["consensus"],
+                false,
+                false,
+            ),
+            (
+                Backend::Cpu,
+                "/x/btx/v0.34.6/lin/btxd",
+                &["trusted"],
+                true,
+                true,
+            ),
+            // A tag-less path fails safe: no MatMul flags at all.
+            (Backend::Metal, "/data/bin/btxd", &[], false, false),
+            (Backend::Cuda, "/data/bin/btxd", &[], false, false),
+            (Backend::Cpu, "/data/bin/btxd", &[], false, false),
+        ];
+        for (backend, btxd, modes, quorum, override_) in cases {
+            let (_, args, _) = build_node_command(
+                Path::new(btxd),
                 Path::new("/dd"),
                 Path::new("/dd/btx.conf"),
                 backend,
             );
-            assert!(
-                args.iter().any(|a| a == "-matmulvalidation=consensus"),
-                "consensus must be EXPLICIT: btxd persists mirror settings in \
-                 the datadir's btx_rw.conf across engine upgrades, and only an \
-                 explicit command line value outranks them (measured on a real \
-                 0.6.5 era install, 2026-09-01), got {args:?}"
+            assert_eq!(
+                validation_modes(&args),
+                modes,
+                "{backend:?} on {btxd}: {args:?}"
             );
-            assert!(
-                !args.iter().any(|a| a == "-matmulvalidation=trusted"),
-                "never downgrade a 0.34.5 host to a mirror, got {args:?}"
+            assert_eq!(
+                carries_trusted_quorum(&args),
+                quorum,
+                "{backend:?} on {btxd}: {args:?}"
             );
-            assert!(
-                !args.iter().any(|a| a.starts_with("-matmultrustedpubkey=")),
-                "no signer pins in consensus mode, got {args:?}"
+            assert_eq!(
+                carries_single_key_override(&args),
+                override_,
+                "{backend:?} on {btxd}: {args:?}"
             );
-            assert!(
-                !args.iter().any(|a| a == "-allowsinglekeytrustedmirror=1"),
-                "the single stolen key override must leave the fleet, got {args:?}"
-            );
-            // strict-device stays: a card that qualifies validates, and a host
-            // with none refuses cleanly where rc_stalled can see it.
-            assert!(args.iter().any(|a| a == "-matmulrcexecution=strict-device"));
         }
+    }
+
+    #[test]
+    fn the_mirror_override_reads_yes_and_no_and_ignores_noise() {
+        assert_eq!(parse_trusted_mirror_override("1"), Some(true));
+        assert_eq!(parse_trusted_mirror_override(" ON "), Some(true));
+        assert_eq!(parse_trusted_mirror_override("yes"), Some(true));
+        assert_eq!(parse_trusted_mirror_override("0"), Some(false));
+        assert_eq!(parse_trusted_mirror_override("no"), Some(false));
+        assert_eq!(parse_trusted_mirror_override("Off"), Some(false));
+        // A typo must not decide a consensus posture.
+        assert_eq!(parse_trusted_mirror_override("maybe"), None);
+        assert_eq!(parse_trusted_mirror_override(""), None);
     }
 
     #[test]
@@ -3857,14 +4141,23 @@ consensus-validator service.";
         // exit at init in consensus mode on an off-manifest host.
         let dd = std::env::temp_dir().join("btx-core-mirror-gate-test");
         let _ = std::fs::create_dir_all(&dd);
-        let (_, args, _) = build_node_command(
-            Path::new("/x/btx/v0.33.4.1/lin/btxd"),
-            &dd,
-            &dd.join("btx.conf"),
-            Backend::Cpu,
-        );
-        assert!(args.iter().any(|a| a == "-matmulvalidation=trusted"));
-        assert!(args.iter().any(|a| a == "-matmultrustedthreshold=1"));
+        for backend in [Backend::Cpu, Backend::Cuda] {
+            let (_, args, _) = build_node_command(
+                Path::new("/x/btx/v0.33.4.1/lin/btxd"),
+                &dd,
+                &dd.join("btx.conf"),
+                backend,
+            );
+            assert_eq!(
+                validation_modes(&args),
+                vec!["trusted"],
+                "{backend:?}: {args:?}"
+            );
+            assert!(carries_trusted_quorum(&args), "{backend:?}: {args:?}");
+            // The override is a 0.34 flag, only passed where 0.34.5+ needs
+            // it; an older engine would reject an unknown argument fatally.
+            assert!(!carries_single_key_override(&args), "{backend:?}: {args:?}");
+        }
     }
 
     #[test]
@@ -3914,15 +4207,28 @@ consensus-validator service.";
         assert!(node_supports_matmul_rc_flags(btxd));
         assert!(node_allows_degraded_matmul_start(btxd));
         // And the launch command that follows from those gates is the 0.34.5+
-        // one: consensus mode, never the refused 1-of-1 mirror.
-        let (_, args, _) = build_node_command(
+        // one on both PC arms. A host with an NVIDIA driver validates in
+        // explicit consensus mode; a host without one is the keyless trusted
+        // mirror behind the single-key override (2026-09-15 decision). Neither
+        // is the bare 1-of-1 mirror that 0.34.5+ refuses at init.
+        let (_, cuda, _) = build_node_command(
+            btxd,
+            Path::new("/dd"),
+            Path::new("/dd/btx.conf"),
+            Backend::Cuda,
+        );
+        assert!(cuda.iter().any(|a| a == "-matmulrcexecution=strict-device"));
+        assert!(cuda.iter().any(|a| a == "-matmulvalidation=consensus"));
+        assert!(!cuda.iter().any(|a| a == "-matmultrustedthreshold=1"));
+        let (_, cpu, _) = build_node_command(
             btxd,
             Path::new("/dd"),
             Path::new("/dd/btx.conf"),
             Backend::Cpu,
         );
-        assert!(args.iter().any(|a| a == "-matmulrcexecution=strict-device"));
-        assert!(!args.iter().any(|a| a == "-matmultrustedthreshold=1"));
+        assert!(cpu.iter().any(|a| a == "-matmulrcexecution=strict-device"));
+        assert!(cpu.iter().any(|a| a == "-matmulvalidation=trusted"));
+        assert!(cpu.iter().any(|a| a == "-allowsinglekeytrustedmirror=1"));
         // A qualifier whose digits could be mistaken for a fourth segment is
         // still a qualifier: `-3013c2c2` is not `.3013`.
         assert_eq!(parse_tag_version("v0.34.6-3013c2c2").unwrap().len(), 3);
