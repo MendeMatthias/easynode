@@ -24,7 +24,7 @@ contents, and tests pin the 401-then-200, 401-then-401 and unchanged-cookie
 sequences. The systemd template restarts the witness always, after five
 seconds.
 
-## [0.6.23] - 2026-09-15 · linux + windows (mac follows when built)
+## [0.6.23] - 2026-09-15 · mac + linux + windows
 
 **Your node says which role it actually fills, and whether that helps.** The
 status card could say a node was running, at the frontier, and advertising the
