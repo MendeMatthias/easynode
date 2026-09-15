@@ -110,9 +110,21 @@ env:
   # artifact NAME is unchanged and the "both pins move together" warning above
   # is satisfied trivially — it guards against moving the run id when the ref
   # changed, which is not what happened here.
-  PROVEN_BTXD_RUN_ID: "34223411886"
-  PROVEN_BTXD_ARTIFACT: "btxd-linux-9eb4e0050e08ea3ef768bac276dac9cbd2e84542"
-  PROVEN_BTXD_COMMIT: "9eb4e0050e08ea3ef768bac276dac9cbd2e84542"
+  #
+  # MOVED 2026-09-15 to the upstream TAG v0.34.6 = 3013c2c2, one commit past
+  # 9eb4e005 (no consensus change; commands.rs has the diff). All three pins
+  # move together this time because the ref DID change. Run 34914768284,
+  # dispatched from main with btxchain_ref=3013c2c2…: completed success, log
+  # proved `tree pristine at 3013c2c2…`, BUILD_GIT_DIRTY 0, architectures
+  # present sm_100 sm_120 sm_75 sm_86 sm_89 in both btxd and
+  # libbtx_matmul_backend.a, `BTX daemon version v0.34.6`, SMOKE PASSED.
+  # Artifact 393720371 bytes. The app's install key is now `v0.34.6-3013c2c2`
+  # while the binary still reports v0.34.6; the guard below reads
+  # `.btxd-version` for the version and BTXD_COMMIT for identity, so neither
+  # side of that needs the other to be spelled the same.
+  PROVEN_BTXD_RUN_ID: "34914768284"
+  PROVEN_BTXD_ARTIFACT: "btxd-linux-3013c2c22a9a453e778d6cc426734567d819fa59"
+  PROVEN_BTXD_COMMIT: "3013c2c22a9a453e778d6cc426734567d819fa59"
 
 jobs:
   build-node-linux:

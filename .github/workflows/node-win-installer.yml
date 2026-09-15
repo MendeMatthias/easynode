@@ -68,10 +68,23 @@ env:
   # scripts/check-engine-tag.sh clears. VERSION is what the binary reports and
   # TAG is the app's install key; they are equal here only because upstream's
   # tag and its CLIENT_VERSION agree at v0.34.6. Do not collapse them.
-  PROVEN_BTXD_RUN_ID: "33997938941"
-  PROVEN_BTXD_ARTIFACT: "btxd-windows-9eb4e0050e08ea3ef768bac276dac9cbd2e84542"
+  #
+  # MOVED 2026-09-15 to upstream's TAG v0.34.6 = 3013c2c2, one commit past
+  # 9eb4e005 (no consensus change; commands.rs has the diff). Run 34914770368,
+  # dispatched from main with btxchain_ref=3013c2c2…: both jobs green, the
+  # mingw cross-compile and "regtest smoke on real Windows", artifact
+  # btxd-windows-3013c2c2… (19079508 bytes). All four pins move together, and
+  # this time VERSION and TAG DIVERGE, which is the case the note above was
+  # written for: the binary still reports v0.34.6 (upstream did not bump
+  # CLIENT_VERSION for the tag commit, it only tagged it), while the app's
+  # install key is v0.34.6-3013c2c2 so that every install already holding the
+  # 9eb4e005 build under the bare `v0.34.6` key re-provisions onto this one.
+  # The staging script asserts VERSION against btxd.exe --version and writes
+  # it to .btxd-version; the guard below asserts TAG against NODE_RELEASE_TAG.
+  PROVEN_BTXD_RUN_ID: "34914770368"
+  PROVEN_BTXD_ARTIFACT: "btxd-windows-3013c2c22a9a453e778d6cc426734567d819fa59"
   PROVEN_BTXD_VERSION: "v0.34.6"
-  PROVEN_BTXD_TAG: "v0.34.6"
+  PROVEN_BTXD_TAG: "v0.34.6-3013c2c2"
 
 permissions:
   contents: read

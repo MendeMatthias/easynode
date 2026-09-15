@@ -113,7 +113,7 @@ jobs:
           # pr/0.33.3-network-stability fails the upload AFTER a full build.
           echo "slug=$(printf '%s' "$ref" | tr '/' '-')" >> "$GITHUB_OUTPUT"
           if [ "$pinned_ref" != "$pinned" ]; then
-            echo "building $ref (app pins $pinned, an UNTAGGED pin = commit $pinned_ref)"
+            echo "building $ref (app install key $pinned, NODE_RELEASE_COMMIT $pinned_ref)"
           else
             echo "building $ref (app pins $pinned)"
           fi

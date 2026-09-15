@@ -68,8 +68,10 @@ DEST="$APP_DIR/src-tauri/resources/node-pkg"
 # shellcheck source=lib/engine-pin.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/engine-pin.sh"
 if [[ -z "$EXPECT" ]]; then
-  EXPECT="$(engine_pin_tag "$APP_DIR")"
-  echo "==> no version given; using the engine pin $EXPECT"
+  # The VERSION part of the key, not the key: btxd prints `v0.34.6`, never our
+  # `-3013c2c2` qualifier, and the banner check below must match what it prints.
+  EXPECT="$(engine_pin_version "$APP_DIR")"
+  echo "==> no version given; using the engine pin $(engine_pin_tag "$APP_DIR") (btxd reports $EXPECT)"
 else
   assert_matches_engine_pin "$APP_DIR" "${EXPECT#v}"
 fi
