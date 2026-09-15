@@ -13,8 +13,10 @@
 //! private-append helper, and the LAST outcome in the settings file, which
 //! `get_node_status` carries so the pane shows it without waiting for the
 //! next check and after a relaunch. The front end calls `record_update_check`
-//! at every exit of its `updateCheck()`, fire-and-forget: nothing written
-//! here may change what the updater does.
+//! at every exit of its `updateCheck()` (the launch check and the button),
+//! fire-and-forget, and the six-hourly timer in `update_timer` calls `record`
+//! directly at every exit of its own check: nothing written here may change
+//! what the updater does, on either side.
 
 use std::io::Write;
 use std::path::Path;
@@ -124,10 +126,21 @@ fn newest_lines_within(contents: &str, max_bytes: usize) -> &str {
     }
 }
 
+/// Seconds since the Unix epoch, now; 0 on a clock set before 1970, which the
+/// timestamp then renders as such rather than refusing the record.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// One line, printable, at most [`DETAIL_MAX_CHARS`] characters: an error
 /// message from the updater can carry newlines, and a newline in a
-/// line-per-record log is a forged record.
-fn one_line(detail: &str) -> String {
+/// line-per-record log is a forged record. `record` applies it; `update_timer`
+/// applies it once more, up front, so the event it emits carries exactly the
+/// text the log line got.
+pub fn one_line(detail: &str) -> String {
     let flat: String = detail
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })

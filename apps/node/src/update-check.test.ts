@@ -9,12 +9,20 @@
 // machine could say whether they ran, failed, or found nothing. These pin the
 // outcome vocabulary closed on both sides of the app, and read main.ts to make
 // sure no exit of updateCheck() is silent again.
+//
+// The last part is about WHERE the six-hourly check runs. The hypothesis for
+// those eight hours is a webview timer that never fired in a hidden window, so
+// the recheck moved to a tokio timer in src-tauri/src/update_timer.rs. These
+// read main.ts and that file to pin that there is one periodic path, that it
+// speaks the same five words, and that its results are painted by the same
+// functions the JavaScript check paints with.
 import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
 import {
   classifyCheckFailure,
   checkFailureMessage,
   describeWhen,
+  installErrorFromDetail,
   lastCheckLine,
   plainOutcome,
   updateCheckRecord,
@@ -327,5 +335,115 @@ describe("the Last check line", () => {
     expect(lastCheckLine({ at: "not a date", outcome: "no-update", detail: "" }, now, "e")).toBe(
       "Last check: at an unknown time — you're on the latest version",
     );
+  });
+});
+
+// ── The six-hourly recheck lives in Rust ─────────────────────────────────────
+// Source introspection again, on both files: main.ts must have exactly the two
+// JavaScript triggers left (launch and the button) plus a listener, and
+// update_timer.rs must speak the vocabulary this file already pins.
+
+describe("the six-hourly recheck lives in Rust", () => {
+  const main = read("./main.ts");
+  const timer = read("../src-tauri/src/update_timer.rs");
+  const fnBody = (name: string, src: string) => {
+    const s = src.indexOf(`function ${name}(`);
+    expect(s, `function ${name} in source`).toBeGreaterThan(-1);
+    return src.slice(s, src.indexOf("\n}\n", s));
+  };
+
+  it("no longer wraps updateCheck() in a setInterval", () => {
+    expect(main).not.toMatch(/setInterval\([^\n]*updateCheck/);
+    // The launch check and the button stay in JavaScript, through updateCheck.
+    expect(main).toMatch(/^\s*void updateCheck\(\);/m);
+    expect(main).toContain("await updateCheck(true)");
+    // And the Rust side has a first delay and a period, not a fire-at-once.
+    expect(timer).toMatch(/pub const FIRST_CHECK_DELAY: Duration = Duration::from_secs\(2 \* 60\)/);
+    expect(timer).toMatch(/pub const CHECK_PERIOD: Duration = Duration::from_secs\(6 \* 60 \* 60\)/);
+    expect(timer).toContain("interval_at(");
+  });
+
+  it("listens for the timer's event under the name the Rust side emits", () => {
+    const m = /UPDATE_CHECK_EVENT: &str = "([^"]+)"/.exec(timer);
+    expect(m, "UPDATE_CHECK_EVENT in update_timer.rs").not.toBeNull();
+    expect(main).toContain(`listen<UpdateCheckEvent>("${m![1]}"`);
+    expect(main).toContain("onUpdateCheckEvent(e.payload)");
+    // The payload's fields are the ones the TypeScript interface names.
+    for (const field of ["outcome", "version", "detail", "at"]) {
+      expect(timer, field).toMatch(new RegExp(`^\\s*pub ${field}: `, "m"));
+    }
+  });
+
+  it("paints the event through the functions updateCheck() paints with", () => {
+    const handler = fnBody("onUpdateCheckEvent", main);
+    expect(handler).toContain("paintUpdateProgress(");
+    expect(handler).toContain("paintLastUpdateCheck(");
+    expect(handler).toContain("installErrorFromDetail(ev.detail)");
+    const check = fnBody("updateCheck", main);
+    for (const o of ["found", "install-failed", "installed"]) {
+      expect(check, o).toContain(`paintUpdateProgress("${o}"`);
+    }
+    // The status tick's line goes through the same painter, and nothing else
+    // writes that element.
+    expect(fnBody("reflectLastUpdateCheck", main)).toContain("paintLastUpdateCheck(");
+    expect(main.match(/\$\("update-last-check"\)/g)).toHaveLength(1);
+    // The painter covers exactly the outcomes that show something.
+    const paint = fnBody("paintUpdateProgress", main);
+    for (const o of ["found", "install-failed", "installed"]) {
+      expect(paint, o).toContain(`case "${o}":`);
+    }
+    expect(paint).not.toContain('case "no-update"');
+    expect(paint).not.toContain('case "check-failed"');
+  });
+
+  it("speaks the same five words, always as automatic, on the Rust side", () => {
+    const used = [...timer.matchAll(/settle\(app, &datadir, "([a-z-]+)"/g)].map((x) => x[1]);
+    expect([...new Set(used)].sort()).toEqual([...UPDATE_CHECK_OUTCOMES].sort());
+    // The details are the shapes updateCheckRecord produces for "automatic".
+    expect(timer).toContain('"automatic: no build for this platform"');
+    expect(timer).toContain('"automatic: v{current} is current"');
+    expect(timer).toContain('"automatic: v{version} offered, downloading"');
+    expect(timer).toContain('"automatic: v{version}: {}"');
+    expect(timer).toContain('"automatic: v{version}, restarting"');
+    expect(timer).not.toMatch(/"manual:/);
+    // The record is written before the event, and a failed record is logged,
+    // never propagated.
+    const settle = timer.slice(timer.indexOf("fn settle("), timer.indexOf("\n}\n", timer.indexOf("fn settle(")));
+    expect(settle.indexOf("update_log::record(")).toBeLessThan(settle.indexOf(".emit("));
+    expect(settle).toContain("eprintln!");
+    expect(settle).not.toMatch(/\?;|unwrap\(\)|expect\(/);
+  });
+
+  it("states the hypothesis as a hypothesis, with the measurement", () => {
+    expect(timer).toMatch(/hypothesis/i);
+    expect(timer).toContain("2026-09-15");
+    expect(timer).toContain("eight hours");
+    expect(timer).toMatch(/not a finding/);
+    expect(timer).toMatch(/confirms or refutes/);
+  });
+});
+
+describe("installErrorFromDetail", () => {
+  it("returns the error alone out of an install-failed detail", () => {
+    const rec = updateCheckRecord(
+      { branch: "install-failed", version: "0.6.23", error: new Error("Failed to install .deb package") },
+      "automatic",
+    );
+    expect(installErrorFromDetail(rec.detail)).toBe("Error: Failed to install .deb package");
+    expect(installErrorFromDetail("manual: v0.6.23: deb: not supported")).toBe("deb: not supported");
+  });
+
+  it("hands every other detail back whole", () => {
+    for (const d of [
+      "automatic: v0.6.23 offered, downloading",
+      "automatic: v0.6.23, restarting",
+      "automatic: v0.6.23, restart failed: spawn failed",
+      "automatic: v0.6.22 is current",
+      "automatic: no build for this platform",
+      "automatic",
+      "",
+    ]) {
+      expect(installErrorFromDetail(d)).toBe(d);
+    }
   });
 });

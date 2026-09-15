@@ -2983,15 +2983,17 @@ pub async fn set_service_report(on: bool) -> Result<(), String> {
 ///
 /// `outcome` must be one of `update_log::UPDATE_CHECK_OUTCOMES`; anything else
 /// is refused and nothing is written. The front end calls this fire-and-forget
-/// at every exit of its `updateCheck()`, so an `Err` here reaches the console
-/// and never the update flow.
+/// at every exit of its `updateCheck()` (the launch check and the button), so
+/// an `Err` here reaches the console and never the update flow. The six-hourly
+/// recheck runs in `update_timer` and records without this command.
 #[tauri::command]
 pub async fn record_update_check(outcome: String, detail: String) -> Result<(), String> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    crate::update_log::record(&node_datadir(), now, &outcome, &detail)
+    crate::update_log::record(
+        &node_datadir(),
+        crate::update_log::now_secs(),
+        &outcome,
+        &detail,
+    )
 }
 
 #[tauri::command]

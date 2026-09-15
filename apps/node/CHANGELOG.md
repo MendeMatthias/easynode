@@ -167,6 +167,19 @@ does: a failure to record is a console warning, and the one place the app is
 about to end its own process, the restart after an install, waits at most two
 seconds for the line to land first.
 
+The six-hourly check itself has also moved, out of the window and into the
+app's Rust side. Until now the recheck was a JavaScript timer inside the
+webview, and the hypothesis behind those eight silent hours, held as a
+hypothesis because the only measurement is the two checks that fell due and
+left no trace while the launch-time check on the same box did work right
+after a relaunch, is that WebKitGTK slows or suspends the timers of a hidden
+window, and this app spends its life hidden in the menu bar. The recheck now
+runs on a timer nothing throttles, two minutes after launch and every six
+hours after, through the same updater and into the same log with the same
+five words; the check at launch and the "Check now" button are unchanged. The
+log is what settles the question on the next release: six-hourly lines from a
+node left in the tray confirm it, and their absence points elsewhere.
+
 ## [0.6.22] - 2026-09-15 · linux + windows (mac follows when built)
 
 **Your node will tell you when its own view of the chain has gone stale.**

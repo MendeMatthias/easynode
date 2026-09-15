@@ -177,6 +177,33 @@ export interface LastUpdateCheck {
   detail: string;
 }
 
+/**
+ * One settled check as the Rust timer emits it (`UpdateCheckEvent` in
+ * src-tauri/src/update_timer.rs): the same `outcome` and `detail` the record
+ * got, the version offered where there was one (empty otherwise), and the
+ * record's own timestamp, so the pane can paint its "Last check" line from the
+ * event exactly as it paints it from the settings file on the next tick.
+ */
+export interface UpdateCheckEvent {
+  outcome: string;
+  version: string;
+  detail: string;
+  at: string;
+}
+
+const INSTALL_FAILED_DETAIL = /^(?:manual|automatic): v\S+: (.*)$/;
+
+/**
+ * The error text out of an `install-failed` detail, which updateCheckRecord
+ * (and the Rust timer, in the same shape) writes as `<trigger>: v<version>:
+ * <error>`. The event carries the detail and not the error separately, and the
+ * sentence beside the button shows the error alone, the way it does when the
+ * install ran here. Any other shape comes back whole.
+ */
+export function installErrorFromDetail(detail: string): string {
+  return INSTALL_FAILED_DETAIL.exec(detail)?.[1] ?? detail;
+}
+
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 function hhmm(d: Date): string {

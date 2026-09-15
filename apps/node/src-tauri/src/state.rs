@@ -144,9 +144,9 @@ pub struct NodeAppSettings {
     /// (one of `update_log::UPDATE_CHECK_OUTCOMES`), and the short detail the
     /// front end recorded with it. `None`/empty until the first check has
     /// finished. Written by `record_update_check` at every exit of the front
-    /// end's `updateCheck()`, so the Settings pane can say what the automatic
-    /// path did, and can still say it after the relaunch that an install
-    /// causes. The per-check history is `<datadir>/update-check.log`; this is
+    /// end's `updateCheck()` and by the six-hourly timer in `update_timer`, so
+    /// the Settings pane can say what the automatic path did, and can still
+    /// say it after the relaunch that an install causes. The per-check history is `<datadir>/update-check.log`; this is
     /// only the last line of it, kept where the pane can read it without
     /// parsing a file. See `update_log` for the eight silent hours behind it.
     #[serde(default)]
