@@ -278,6 +278,17 @@ pub struct ConnectionCounts {
     /// what WILL be broadcast and this is what IS.
     #[serde(default)]
     pub subversion: String,
+    /// Our own service bits as the hex string `getnetworkinfo` reports (e.g.
+    /// "0000000088000c09"), riding on the same call for the same reason as
+    /// `subversion`: it is what the network SEES this node offer, where the
+    /// settings only say what it was asked to offer. Bit 27 is consensus, bit
+    /// 31 the attestation archive; [`crate::role`] decides from these bits,
+    /// and from `localservicesnames` only when this is absent, because a btxd
+    /// that predates a bit's name renders it `UNKNOWN[2^31]`.
+    #[serde(default)]
+    pub localservices: String,
+    #[serde(default)]
+    pub localservicesnames: Vec<String>,
 }
 
 /// The per-peer subset a trusted mirror's health depends on (`getpeerinfo`).
@@ -382,6 +393,14 @@ pub async fn get_matmul_trusted_status(rpc: &dyn Rpc) -> AppResult<MatmulTrusted
 
 /// NODE_MATMUL_ATTESTATION_ARCHIVE — service bit 31.
 pub const NODE_MATMUL_ATTESTATION_ARCHIVE_BIT: u64 = 1 << 31;
+
+/// NODE_MATMUL_CONSENSUS — service bit 27: this node validates MatMul
+/// transcripts itself. A node in `consensus` mode WITHOUT this bit is the
+/// degraded start (no qualifying accelerator), which follows headers and
+/// stalls below the Epoch A height. Both numbers are from upstream
+/// `src/protocol.h` at 3013c2c; the check-in and [`crate::role`] read the
+/// same constant so they cannot disagree about which bit that is.
+pub const NODE_MATMUL_CONSENSUS_BIT: u64 = 1 << 27;
 
 /// Does this peer advertise the attestation-archive service? Decided from the
 /// service BITS (bit 31), not from the display names: a name-substring match

@@ -163,7 +163,7 @@ pub fn normalize_services(raw: &str) -> Option<String> {
 /// our word for this.
 pub fn claims_matmul_consensus(services_hex: &str) -> bool {
     u64::from_str_radix(services_hex.trim_start_matches("0x"), 16)
-        .map(|v| v & (1u64 << 27) != 0)
+        .map(|v| v & crate::node_api::NODE_MATMUL_CONSENSUS_BIT != 0)
         .unwrap_or(false)
 }
 

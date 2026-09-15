@@ -360,6 +360,15 @@ pub struct AppState {
     /// answer. Cleared on every stop/start alongside the stall verdict, so a
     /// previous run's answer never renders as current. See `btx_core::frontier`.
     pub archive_service: Arc<Mutex<Option<btx_core::frontier::ArchiveService>>>,
+    /// The engine's own answer to `getmatmultrustedstatus`, from the refresher
+    /// tick that already makes the call. Until now only `local_signer` was
+    /// kept, and only long enough to feed the frontier verdict; the validation
+    /// mode and the mirror flag were thrown away, which is why no screen
+    /// could tell an operator that a key pinned on a trusted mirror signs
+    /// nothing (2026-09-03, eleven days). `None` when the engine does not
+    /// know the method, and absence is reported as unknown, never as "no".
+    /// Cleared on every stop/start like the others. See `btx_core::role`.
+    pub matmul_trusted: Arc<Mutex<Option<btx_core::node_api::MatmulTrustedStatus>>>,
     /// The fork detector's verdict — a longer chain this node cannot obtain
     /// blocks for — computed by the refresher from `getchaintips` and the
     /// headers/blocks gap. Cleared on every stop/start like the others, so a
@@ -458,6 +467,7 @@ impl AppState {
             rc_status_cache: Arc::new(Mutex::new(None)),
             stall_verdict: Arc::new(Mutex::new(None)),
             archive_service: Arc::new(Mutex::new(None)),
+            matmul_trusted: Arc::new(Mutex::new(None)),
             fork: Arc::new(Mutex::new(None)),
             tip_median_time: Arc::new(Mutex::new(None)),
             archive_peers_cache: Arc::new(Mutex::new(None)),

@@ -538,6 +538,41 @@ body {
 .fork-card { border-color: rgba(251, 191, 36, 0.5); font-size: 13px; }
 .fork-card p { color: var(--color-amber); margin: 0; line-height: 1.45; }
 
+/* Your node's role: one fact per line, each ending in a sentence on whether it
+   helps. The mark is the only judgement on the card and it is deliberately
+   quiet — filled green = helps other nodes, hollow = does not, dashed = the
+   engine did not say. No amber: none of these lines is an alarm, they are
+   answers to "is this machine useful, and how", and a node filling a modest
+   role honestly must not look like one that is failing. */
+.role-card { display: flex; flex-direction: column; gap: var(--space-s); font-size: 13px; }
+.role-head {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-muted);
+}
+.role-lines { list-style: none; display: flex; flex-direction: column; gap: 10px; }
+.role-row { display: flex; align-items: center; gap: 8px; }
+.role-mark {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-muted);
+  flex: none;
+}
+.role-line.is-helps .role-mark { background: var(--color-green); border-color: var(--color-green); }
+.role-line.is-unknown .role-mark { border-style: dashed; }
+.role-label { color: var(--color-muted); white-space: nowrap; }
+.role-value { margin-left: auto; text-align: right; font-weight: 700; }
+.role-note {
+  margin: 2px 0 0 16px;
+  font-size: 12px;
+  color: var(--color-muted);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 /* ── Settings overlay ─────────────────────────────────────────────────────── */
 .overlay {
   position: fixed;
