@@ -805,6 +805,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     *state.archive_peers_cache.lock().await = None;
     state.peer_nicknames_cache.lock().await.clear();
     *state.archive_service.lock().await = None;
+    *state.matmul_trusted.lock().await = None;
     *state.fork.lock().await = None;
     *state.tip_median_time.lock().await = None;
 
@@ -1263,6 +1264,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
     let archive_slot = state.archive_peers_cache.clone();
     let nickname_slot = state.peer_nicknames_cache.clone();
     let archive_service_slot = state.archive_service.clone();
+    let matmul_trusted_slot = state.matmul_trusted.clone();
     let fork_slot = state.fork.clone();
     let tip_time_slot = state.tip_median_time.clone();
     let anchor = snapshot_spec().anchor_height;
@@ -1489,10 +1491,27 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                         // method leaves this false, which is the pre-existing
                         // behaviour and only ever over-reports capability the
                         // same way it always did.
-                        let has_local_signer = btx_core::node_api::get_matmul_trusted_status(&rpc)
+                        //
+                        // The WHOLE answer is kept now, not just the key flag.
+                        // This call was already being made every tick and its
+                        // validation mode was being dropped on the floor — the
+                        // one field that says whether a key on this node can
+                        // sign anything at all. A mirror consumes attestations
+                        // rather than producing them, so a key pinned on one
+                        // signs nothing; on 2026-09-03 exactly that happened and
+                        // went unnoticed for eleven days because no surface
+                        // showed the role. `btx_core::role` renders it from
+                        // this slot. Only a successful answer overwrites: a
+                        // transient failure keeps the last known role rather
+                        // than flickering to "unknown" for one tick.
+                        let trusted_status = btx_core::node_api::get_matmul_trusted_status(&rpc)
                             .await
-                            .map(|s| s.local_signer)
-                            .unwrap_or(false);
+                            .ok();
+                        let has_local_signer =
+                            trusted_status.as_ref().is_some_and(|s| s.local_signer);
+                        if trusted_status.is_some() {
+                            *matmul_trusted_slot.lock().await = trusted_status;
+                        }
                         *archive_service_slot.lock().await =
                             Some(btx_core::frontier::archive_service(
                                 serving,
@@ -1888,6 +1907,7 @@ pub async fn stop_node_inner(state: &AppState) {
     *state.archive_peers_cache.lock().await = None;
     state.peer_nicknames_cache.lock().await.clear();
     *state.archive_service.lock().await = None;
+    *state.matmul_trusted.lock().await = None;
     *state.fork.lock().await = None;
     *state.tip_median_time.lock().await = None;
     // Release the keep-awake assertion — the Mac may sleep again.
@@ -2026,6 +2046,26 @@ pub struct NodeStatusInfo {
     /// copy in TypeScript that drifts from the first.
     pub archive_service_message: Option<String>,
     pub archive_service_needs_attention: bool,
+    /// Which role this node actually fills on the network (`btx_core::role`):
+    /// how it validates, whether the key it holds produces anything, what it
+    /// serves, whether anyone can reach it, where it stands on the chain.
+    /// Decided from the engine's own answers — `getmatmultrustedstatus` kept
+    /// whole from the refresher tick, and `localservices` / `connections_in`
+    /// from the `getnetworkinfo` this poll already makes — never from a
+    /// setting, which is what WILL be true at the next start.
+    ///
+    /// `None` when the node is stopped or `getnetworkinfo` did not answer: no
+    /// measurement, no claim, the same discipline as `inbound_peers`. Inside a
+    /// `Some`, an unanswered `getmatmultrustedstatus` is reported as unknown
+    /// on the lines that depend on it, never as "no key" — absence of an
+    /// answer was exactly how a key pinned on a mirror on 2026-09-03 signed
+    /// nothing for eleven days without anybody being told.
+    pub role: Option<btx_core::role::NodeRole>,
+    /// The same role as one line per fact, with the sentence about whether it
+    /// helps rendered in Rust. Empty when `role` is `None`. Shipped beside the
+    /// struct for the reason `archive_service_message` is: the copy lives in
+    /// one place, with tests, instead of growing a TypeScript twin that drifts.
+    pub role_lines: Vec<btx_core::role::RoleLine>,
     /// A longer chain this node cannot obtain blocks for (`btx_core::fork`),
     /// or `None` when healthy or not yet measured. The 2026-09-05 lesson: a
     /// node on a minority branch must not look like a healthy node on a quiet
@@ -2299,12 +2339,50 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         None => None,
     };
     let inbound_peers = net.as_ref().map(|c| c.inbound);
-    let subversion = net.map(|c| c.subversion).filter(|s| !s.is_empty());
 
     // Read the frontier verdict ONCE: the payload carries the tagged value for
     // machines and the rendered sentence for people, and taking the lock twice
     // could ship two different ticks in one status.
     let archive_service = state.archive_service.lock().await.clone();
+
+    // ── Which role does this node fill? ─────────────────────────────────────
+    // Decided by btx_core::role from three things this poll and the refresher
+    // already hold: the engine's own getmatmultrustedstatus (kept whole in its
+    // slot by the tick), the service bits and inbound count riding on the
+    // getnetworkinfo above, and the frontier verdict just read. No new RPC.
+    //
+    // Gated on `net`, not only on `running`: a running node whose
+    // getnetworkinfo failed has no service bits to judge, and an empty hex
+    // string would read as "advertises nothing", which is the degraded-start
+    // sentence aimed at a healthy node over one lost call. No measurement, no
+    // claim — the same rule inbound_peers follows a few lines up.
+    let matmul_trusted = if running {
+        state.matmul_trusted.lock().await.clone()
+    } else {
+        None
+    };
+    // Headers beyond blocks, from the phase the refresher already computed.
+    let blocks_behind_headers = match &phase {
+        NodePhase::Ready { blocks_behind, .. } => Some(*blocks_behind),
+        NodePhase::Syncing {
+            height, headers, ..
+        } => Some(headers.saturating_sub(*height)),
+        _ => None,
+    };
+    let role = net.as_ref().filter(|_| running).map(|n| {
+        btx_core::role::node_role(
+            matmul_trusted.as_ref(),
+            &n.localservices,
+            &n.localservicesnames,
+            n.inbound,
+            uptime_secs,
+            blocks_behind_headers,
+            archive_service.as_ref(),
+        )
+    });
+    let role_lines = role.as_ref().map(|r| r.lines()).unwrap_or_default();
+
+    let subversion = net.map(|c| c.subversion).filter(|s| !s.is_empty());
     let fork = state.fork.lock().await.clone();
     let tip_median_time = *state.tip_median_time.lock().await;
     let now_unix = std::time::SystemTime::now()
@@ -2426,6 +2504,8 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         attestation_serve_enabled: settings.attestation_serve_enabled,
         archive_service: archive_service.clone(),
         archive_service_message: archive_service.as_ref().map(|a| a.message()),
+        role,
+        role_lines,
         fork_message: fork.as_ref().map(|f| f.message()),
         tip_stale,
         tip_age_secs,

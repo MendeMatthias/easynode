@@ -8,6 +8,36 @@ root).
 
 ## [Unreleased]
 
+**Your node says which role it actually fills, and whether that helps.** The
+status card could say a node was running, at the frontier, and advertising the
+archive service. It never said what the machine was actually doing for the
+network: checking blocks itself or following other people's signatures,
+whether a key it holds produces anything, whether any other node can reach it.
+Three things went wrong in that silence. On 3 September an operator offered a
+signing key; it was pinned and produced zero signatures for eleven days,
+because his node runs as a trusted mirror and a mirror consumes attestations
+rather than producing them. Nothing was broken, nothing was logged, and no
+screen could have said "this key signs nothing here". This project's own
+signer advertises the archive service while holding a key, which the engine
+clamps to the last sixteen blocks; on 13 September the explorer needed one
+signature from about 800 blocks back, every peer it asked refused, and it sat
+frozen for twenty-one hours. And a machine without a graphics card the engine
+accepts is launched in consensus mode, starts degraded, follows headers,
+advertises neither the consensus nor the archive service, and stalls below the
+Epoch A height while its operator believes it is helping.
+
+A small card now reads the engine's own answers (`getmatmultrustedstatus` and
+`getnetworkinfo`, both calls the app was already making) and says, one line
+each: how this node validates, whether it holds a signing key and whether that
+key can sign anything here, what history it serves, whether anyone has
+connected to it, and where it stands on the chain, each with one plain
+sentence on whether that helps other nodes. An engine that does not answer is
+reported as unknown, never as "no": absence of an answer is exactly how the
+pinned key went unnoticed. A node that has been up under half an hour with no
+inbound connection is not yet told it is unreachable, the same grace the
+"Helping the network" card already gives. The lines are decided and tested in
+Rust; the screen only lays them out.
+
 ## [0.6.22] - 2026-09-15 · linux + windows (mac follows when built)
 
 **Your node will tell you when its own view of the chain has gone stale.**

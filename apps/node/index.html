@@ -173,6 +173,17 @@
           <p id="fork-msg"></p>
         </div>
 
+        <!-- Which role this node actually fills, one fact per line, each with
+             a sentence on whether it helps (btx_core::role). Exists because no
+             screen said it: a key pinned on a trusted mirror signed nothing
+             for eleven days (2026-09-03), and a degraded consensus start looks
+             like a full node to the person running it. Facts from the engine,
+             sentences from Rust; the script only lays them out. -->
+        <div class="card role-card" id="role-card" hidden>
+          <div class="role-head">Your node's role</div>
+          <ul class="role-lines" id="role-lines"></ul>
+        </div>
+
         <p class="peer-names" id="peer-names" hidden></p>
 
         <button id="global-stats-link" class="link-row" type="button">

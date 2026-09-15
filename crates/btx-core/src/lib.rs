@@ -34,6 +34,7 @@ pub mod node;
 pub mod node_api;
 pub mod platform;
 pub mod power;
+pub mod role;
 pub mod rpc;
 pub mod service_report;
 pub mod setup;

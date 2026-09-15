@@ -85,6 +85,29 @@ export interface NodeStatusInfo {
   // place. Null until the refresher has completed a tick.
   archive_service_message: string | null;
   archive_service_needs_attention: boolean;
+  /**
+   * Which role this node fills on the network, decided in Rust
+   * (btx_core::role) from the engine's own answers, never from a setting.
+   * Null when the node is stopped or getnetworkinfo did not answer.
+   * `validation_mode` is consensus | trusted | relay | unknown;
+   * `holds_signing_key` is null when the engine did not answer, which is not
+   * evidence of no key.
+   */
+  role: {
+    validation_mode: string;
+    holds_signing_key: boolean | null;
+    advertises_consensus: boolean;
+    advertises_archive: boolean;
+    reachable_inbound: boolean;
+    inbound: number;
+    uptime_secs: number;
+    blocks_behind: number | null;
+  } | null;
+  /** One line per fact with its sentence pre-rendered in Rust, like
+   *  archive_service_message: the copy lives in one place, with tests. Empty
+   *  when `role` is null. `helps` is true | false | null — null when the
+   *  engine did not say, or when the fact is simply neutral. */
+  role_lines: { label: string; value: string; helps: boolean | null; note: string }[];
   /** A longer chain this node cannot obtain blocks for; null when healthy or
    *  not yet measured. `kind` is longer_branch | waiting_for_bodies |
    *  headers_ahead — waiting_for_bodies is the same branch shape as
@@ -531,6 +554,7 @@ function renderStatus(status: NodeStatusInfo) {
 
   reflectPeerNames(status);
   reflectFork(status);
+  renderRole(status);
   reflectEsploraRow(status);
   reflectWitnessRow(status);
 
@@ -1201,6 +1225,60 @@ function reflectFork(status: NodeStatusInfo): void {
   }
   card.hidden = false;
   $("fork-msg").textContent = message;
+}
+
+/**
+ * "Your node's role": one line per fact about what this machine is actually
+ * doing for the network, each with a sentence on whether that helps. The facts
+ * and the sentences are btx_core::role's — this only lays them out. Hidden on
+ * any phase that is not running, like the fork card: a stopped node fills no
+ * role, and the last live answer must not stay up as if it did.
+ */
+function renderRole(status: NodeStatusInfo): void {
+  const card = $("role-card");
+  const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
+  if (!running || !status.role || status.role_lines.length === 0) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  const list = $("role-lines");
+  // Elements and textContent, never innerHTML: the strings are ours today, and
+  // the habit is what keeps that safe on the day one of them is not.
+  list.textContent = "";
+  for (const line of status.role_lines) {
+    const li = document.createElement("li");
+    const verdict =
+      line.helps === true ? "is-helps" : line.helps === false ? "is-not" : "is-unknown";
+    li.className = `role-line ${verdict}`;
+    const row = document.createElement("div");
+    row.className = "role-row";
+    const mark = document.createElement("span");
+    mark.className = "role-mark";
+    // The mark is the only place the verdict is not spelled out in words, so
+    // give a screen reader the words.
+    mark.setAttribute("role", "img");
+    mark.setAttribute(
+      "aria-label",
+      line.helps === true
+        ? "helps the network"
+        : line.helps === false
+          ? "does not help the network"
+          : "not known",
+    );
+    const label = document.createElement("span");
+    label.className = "role-label";
+    label.textContent = line.label;
+    const value = document.createElement("span");
+    value.className = "role-value";
+    value.textContent = line.value;
+    row.append(mark, label, value);
+    const note = document.createElement("p");
+    note.className = "role-note";
+    note.textContent = line.note;
+    li.append(row, note);
+    list.append(li);
+  }
 }
 
 function reflectKeeperRow(status: NodeStatusInfo) {
