@@ -8,6 +8,22 @@ root).
 
 ## [Unreleased]
 
+**A btxd restart no longer locks the witness out of its own node.** btxd
+writes a new RPC cookie on every start, and a witness that read it once kept
+authenticating with the dead one. Measured 2026-09-15 on
+`witness-1.easybtx.com`: btxd restarted at 11:45:44Z for the 0.6.23 engine,
+from 11:46:06Z every witness request logged `HTTP 401 Unauthorized`, and the
+public endpoint, which the wallet's fork check and btxscan's health check
+now depend on, answered `the node did not answer` with `x-btx-freshness:
+unverified` until the unit was restarted at 11:47:37Z. The binary there
+predated the 8 September reload; the reload itself now compares the cookie
+on disk with the credentials each request actually sent rather than with
+the shared state, so eight requests refused together all recover instead of
+one, it logs one line per reload with the file's mtime and never its
+contents, and tests pin the 401-then-200, 401-then-401 and unchanged-cookie
+sequences. The systemd template restarts the witness always, after five
+seconds.
+
 ## [0.6.23] - 2026-09-15 · linux + windows (mac follows when built)
 
 **Your node says which role it actually fills, and whether that helps.** The

@@ -60,6 +60,15 @@ deploy/esplora/install-systemd.sh --host esplora-1.example.com          # prints
 deploy/esplora/install-systemd.sh --host esplora-1.example.com --yes    # does it
 ```
 
+The witness re-reads the node's `.cookie` when a request comes back `401`
+and replays it once, so it survives the btxd restart that every app update
+and engine bump causes. Measured 2026-09-15 on `witness-1.easybtx.com`, whose
+binary predated that reload: btxd restarted at 11:45:44Z for the 0.6.23
+engine and rewrote the cookie, and from 11:46:06Z every request logged
+`HTTP 401 Unauthorized` while the public endpoint answered `the node did not
+answer` with `x-btx-freshness: unverified`, until `systemctl --user restart
+btx-witness` at 11:47:37Z.
+
 **Esplora** serves the whole API, balances included, and needs `prune=0`, the
 full ~124 GiB chain and an index on top:
 

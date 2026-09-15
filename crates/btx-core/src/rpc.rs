@@ -30,6 +30,29 @@ fn pct_encode(s: &str) -> String {
     out
 }
 
+/// One `.cookie` line, `user:password`, as btxd writes it
+/// (`__cookie__:<random>`). Shared by construction and by the reload after a
+/// 401, so the two can never disagree about what the file says.
+fn parse_cookie(raw: &str) -> Option<(String, String)> {
+    let (user, pass) = raw.trim().split_once(':')?;
+    Some((user.to_string(), pass.to_string()))
+}
+
+/// The cookie file's mtime for the reload log line: when btxd wrote it, as
+/// unix seconds, and how long ago. The contents are never logged — the file
+/// is the node's RPC secret.
+fn cookie_mtime(path: &std::path::Path) -> String {
+    let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+        return "mtime unknown".to_string();
+    };
+    let unix = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let ago = modified.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    format!("mtime {unix} (written {ago}s ago)")
+}
+
 #[async_trait]
 pub trait Rpc: Send + Sync {
     async fn call(&self, method: &str, params: Value) -> AppResult<Value>;
@@ -99,11 +122,9 @@ impl RpcClient {
     ) -> AppResult<Self> {
         let raw = std::fs::read_to_string(cookie_path)
             .map_err(|_| AppError::Config("cannot read .cookie file".into()))?;
-        let (user, pass) = raw
-            .trim()
-            .split_once(':')
+        let (user, pass) = parse_cookie(&raw)
             .ok_or_else(|| AppError::Config("malformed .cookie (expected user:pass)".into()))?;
-        let mut client = Self::new(base_url, user.to_string(), pass.to_string());
+        let mut client = Self::new(base_url, user, pass);
         client.cookie_path = Some(cookie_path.to_path_buf());
         Ok(client)
     }
@@ -118,33 +139,44 @@ impl RpcClient {
         guard.clone()
     }
 
-    /// Re-read the `.cookie` and adopt it. `true` when the credentials actually
-    /// CHANGED, which is the only case worth replaying a request for — an
-    /// unchanged cookie means the 401 was not staleness and a replay would be a
-    /// second identical failure.
-    fn refresh_cookie(&self) -> bool {
-        let Some(path) = self.cookie_path.as_ref() else {
-            return false;
-        };
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            return false;
-        };
-        let Some((user, pass)) = raw.trim().split_once(':') else {
-            return false;
-        };
-        let mut guard = self.creds.write().unwrap_or_else(|e| e.into_inner());
-        if guard.0 == user && guard.1 == pass {
-            return false;
+    /// Re-read the `.cookie` after a 401 answered to `sent`.
+    ///
+    /// Returns the credentials now on disk when they differ from what was
+    /// sent, which is the one case a replay can succeed, and adopts them for
+    /// every clone. `None` when the file is gone, malformed, or still says
+    /// exactly what was sent: then the 401 is a real refusal and a replay
+    /// would be a second identical failure. A client built from an explicit
+    /// user/pass has no path and never replays.
+    ///
+    /// Compared against what THIS request sent, not against the shared
+    /// credentials. Eight witness requests can be in flight when btxd comes
+    /// back, all refused with the dead cookie; the first one here adopts the
+    /// new file, and comparing the other seven against the shared state would
+    /// call the file "unchanged" and fail them, though a replay with the fresh
+    /// cookie is exactly what they need. The file is the truth, and each
+    /// request asks whether it was behind it.
+    fn reload_cookie_after_401(&self, sent: &(String, String)) -> Option<(String, String)> {
+        let path = self.cookie_path.as_ref()?;
+        let fresh = parse_cookie(&std::fs::read_to_string(path).ok()?)?;
+        if fresh == *sent {
+            return None;
         }
-        *guard = (user.to_string(), pass.to_string());
-        true
+        let mtime = cookie_mtime(path);
+        let mut guard = self.creds.write().unwrap_or_else(|e| e.into_inner());
+        if *guard != fresh {
+            *guard = fresh.clone();
+            // One line per adoption, not per replay, and never the cookie.
+            eprintln!(
+                "[rpc] node RPC cookie reloaded after 401 (btxd restarted?); .cookie {mtime}"
+            );
+        }
+        Some(fresh)
     }
 
-    async fn send(&self, body: &Value) -> AppResult<reqwest::Response> {
-        let (user, pass) = self.creds();
+    async fn send(&self, creds: &(String, String), body: &Value) -> AppResult<reqwest::Response> {
         self.client
             .post(&self.url)
-            .basic_auth(&user, Some(&pass))
+            .basic_auth(&creds.0, Some(&creds.1))
             .json(body)
             .send()
             .await
@@ -162,17 +194,19 @@ impl Rpc for RpcClient {
             "params": params,
         });
 
-        let mut response = self.send(&body).await?;
+        let sent = self.creds();
+        let mut response = self.send(&sent, &body).await?;
 
         // A 401 from btxd means one thing in practice: it restarted and wrote a
         // new `.cookie` under us. Re-read it and replay ONCE — once, because a
         // second 401 on freshly-read credentials is a real authentication
-        // failure and retrying it would spin. `refresh_cookie` returns false
+        // failure and retrying it would spin. The reload hands back nothing
         // when the file is unchanged or absent, so a client built from an
         // explicit user/pass never replays at all.
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED && self.refresh_cookie() {
-            eprintln!("[rpc] 401 from node: .cookie rotated, re-reading and retrying once");
-            response = self.send(&body).await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let Some(fresh) = self.reload_cookie_after_401(&sent) {
+                response = self.send(&fresh, &body).await?;
+            }
         }
 
         if !response.status().is_success() {
@@ -425,5 +459,182 @@ mod tests {
 
         assert_eq!(result["ok"], true);
         mock.assert_async().await;
+    }
+
+    /// The outage on witness-1.easybtx.com, 2026-09-15: btxd restarted at
+    /// 11:45:44Z for the 0.6.23 engine and wrote a new `.cookie`; the witness
+    /// running there was built before any reload existed, so from 11:46:06Z
+    /// every request was `HTTP 401 Unauthorized` and the public endpoint said
+    /// `the node did not answer` until the unit was restarted at 11:47:37Z.
+    /// This is that sequence against the client: one call, the file changes,
+    /// one more call, and the second recovers by itself, replaying exactly once.
+    #[tokio::test]
+    async fn a_cookie_that_changes_between_two_calls_is_reloaded_after_the_401() {
+        let mut server = Server::new_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cookie_path = dir.path().join(".cookie");
+        std::fs::write(&cookie_path, "__cookie__:first\n").unwrap();
+        let client = RpcClient::from_cookie(server.url(), &cookie_path).unwrap();
+
+        // Before the restart: the first cookie is what the node accepts.
+        let before = server
+            .mock("POST", "/")
+            .match_header(
+                "authorization",
+                Matcher::Exact("Basic X19jb29raWVfXzpmaXJzdA==".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"result":{"blocks":1},"error":null,"id":"easybtx"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let first = client.call("getblockchaininfo", json!([])).await.unwrap();
+        assert_eq!(first["blocks"], 1);
+        before.assert_async().await;
+        before.remove_async().await;
+
+        // btxd restarts: a new cookie on disk, and the old one is refused.
+        std::fs::write(&cookie_path, "__cookie__:second\n").unwrap();
+        let refused = server
+            .mock("POST", "/")
+            .match_header(
+                "authorization",
+                Matcher::Exact("Basic X19jb29raWVfXzpmaXJzdA==".to_string()),
+            )
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+        let accepted = server
+            .mock("POST", "/")
+            .match_header(
+                "authorization",
+                Matcher::Exact("Basic X19jb29raWVfXzpzZWNvbmQ=".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"result":{"blocks":2},"error":null,"id":"easybtx"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let second = client.call("getblockchaininfo", json!([])).await.unwrap();
+        assert_eq!(
+            second["blocks"], 2,
+            "the replay must carry the reloaded cookie"
+        );
+        // Exactly one refusal and exactly one replay: the reload ran once.
+        refused.assert_async().await;
+        accepted.assert_async().await;
+        // And the client now holds the file's cookie for every later call.
+        assert_eq!(
+            client.creds(),
+            ("__cookie__".to_string(), "second".to_string())
+        );
+    }
+
+    /// A 401 with the cookie on disk unchanged is a real refusal, not
+    /// staleness: no replay, because it would be a second identical failure.
+    #[tokio::test]
+    async fn a_401_with_an_unchanged_cookie_is_reported_and_not_replayed() {
+        let mut server = Server::new_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cookie_path = dir.path().join(".cookie");
+        std::fs::write(&cookie_path, "__cookie__:first").unwrap();
+        let client = RpcClient::from_cookie(server.url(), &cookie_path).unwrap();
+        let refused = server
+            .mock("POST", "/")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+
+        match client.call("getblockchaininfo", json!([])).await {
+            Err(AppError::Http(msg)) => assert!(msg.contains("401"), "{msg}"),
+            other => panic!("expected AppError::Http, got {other:?}"),
+        }
+        refused.assert_async().await;
+        assert_eq!(
+            client.creds().1,
+            "first",
+            "an unchanged file changes nothing"
+        );
+    }
+
+    /// The cookie changed and the node refuses the new one too: replay once,
+    /// then report. Never a loop — a client that replayed every 401 would spin
+    /// against a node it is not allowed to talk to.
+    #[tokio::test]
+    async fn a_second_401_on_the_fresh_cookie_is_the_error_and_ends_the_retry() {
+        let mut server = Server::new_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cookie_path = dir.path().join(".cookie");
+        std::fs::write(&cookie_path, "__cookie__:first").unwrap();
+        let client = RpcClient::from_cookie(server.url(), &cookie_path).unwrap();
+        std::fs::write(&cookie_path, "__cookie__:second").unwrap();
+        let refused = server
+            .mock("POST", "/")
+            .with_status(401)
+            .expect(2)
+            .create_async()
+            .await;
+
+        match client.call("getblockchaininfo", json!([])).await {
+            Err(AppError::Http(msg)) => assert!(msg.contains("401"), "{msg}"),
+            other => panic!("expected AppError::Http, got {other:?}"),
+        }
+        // One original, one replay with the reloaded cookie, and no third.
+        refused.assert_async().await;
+        // The reload still took effect: the next call sends the file's cookie.
+        assert_eq!(client.creds().1, "second");
+    }
+
+    /// Eight requests can be in flight when btxd comes back, all refused with
+    /// the dead cookie. The first to reload adopts the new file; the other
+    /// seven must still replay, because what THEY sent is stale even though
+    /// the shared credentials are already fresh. Comparing against the shared
+    /// state, which is what this did before, failed all seven with a 401 that
+    /// a replay would have cleared.
+    #[tokio::test]
+    async fn a_request_that_sent_the_dead_cookie_replays_even_after_another_reloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookie_path = dir.path().join(".cookie");
+        std::fs::write(&cookie_path, "__cookie__:first").unwrap();
+        let client = RpcClient::from_cookie("http://127.0.0.1:1", &cookie_path).unwrap();
+        let wallet = client.for_wallet("miner");
+        let dead = ("__cookie__".to_string(), "first".to_string());
+        let fresh = ("__cookie__".to_string(), "second".to_string());
+        std::fs::write(&cookie_path, "__cookie__:second").unwrap();
+
+        // The first 401 adopts the file, for every clone of the client.
+        assert_eq!(client.reload_cookie_after_401(&dead), Some(fresh.clone()));
+        assert_eq!(wallet.creds(), fresh);
+        // A second request that had sent the dead cookie still gets to replay.
+        assert_eq!(client.reload_cookie_after_401(&dead), Some(fresh.clone()));
+        assert_eq!(wallet.reload_cookie_after_401(&dead), Some(fresh.clone()));
+        // A request that sent the fresh cookie and was still refused: real.
+        assert_eq!(client.reload_cookie_after_401(&fresh), None);
+        // A cookie file that vanished (btxd shutting down) is not a reload.
+        std::fs::remove_file(&cookie_path).unwrap();
+        assert_eq!(client.reload_cookie_after_401(&dead), None);
+        // And a client built from an explicit user/pass has nothing to reload.
+        let explicit = RpcClient::new("http://127.0.0.1:1", "u", "p");
+        assert_eq!(explicit.reload_cookie_after_401(&dead), None);
+    }
+
+    #[test]
+    fn a_cookie_line_is_user_colon_password_and_nothing_else_parses() {
+        assert_eq!(
+            parse_cookie("__cookie__:abc123\n"),
+            Some(("__cookie__".to_string(), "abc123".to_string()))
+        );
+        // The first colon splits; a password may carry one.
+        assert_eq!(
+            parse_cookie("  u:p:q  "),
+            Some(("u".to_string(), "p:q".to_string()))
+        );
+        assert_eq!(parse_cookie(""), None);
+        assert_eq!(parse_cookie("nocolon"), None);
     }
 }
