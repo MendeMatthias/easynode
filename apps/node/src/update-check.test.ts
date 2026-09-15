@@ -31,7 +31,12 @@ import {
   type UpdateCheckOutcome,
 } from "./update-check";
 
-const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf8");
+// Normalise line endings: a Windows checkout with autocrlf hands these files
+// over as CRLF, and every slice below looks for "\n}\n". Measured on the
+// node-win-installer run of 2026-09-15: two of these tests failed there and
+// nowhere else, for exactly that reason.
+const read = (rel: string) =>
+  readFileSync(new URL(rel, import.meta.url), "utf8").replace(/\r\n/g, "\n");
 
 // Verbatim from tauri-plugin-updater 2.11.0 src/error.rs.
 const TARGET_NOT_FOUND =
