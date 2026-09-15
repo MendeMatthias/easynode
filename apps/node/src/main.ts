@@ -11,7 +11,16 @@ import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { AmbientLine } from "./ambient";
 import { validationView } from "./validation";
-import { classifyCheckFailure, checkFailureMessage } from "./update-check";
+import {
+  classifyCheckFailure,
+  checkFailureMessage,
+  installErrorFromDetail,
+  lastCheckLine,
+  updateCheckRecord,
+  type LastUpdateCheck,
+  type UpdateCheckBranch,
+  type UpdateCheckEvent,
+} from "./update-check";
 import { contributionView } from "./contribution";
 import { mountPowerCore } from "./power-core";
 import { initAsk } from "./ask";
@@ -195,6 +204,14 @@ export interface NodeStatusInfo {
   /** True when the bind address accepts connections from other machines. */
   witness_public: boolean;
   witness_message: string | null;
+  /** The last self-update check as the backend persisted it: when it finished
+   *  (RFC 3339, UTC), one of the five words in UPDATE_CHECK_OUTCOMES, and the
+   *  short detail recorded with it. Null/empty until the first check finishes.
+   *  The "Last check" line under the Check-now button is rendered from these
+   *  on every tick, so the automatic path is no longer silent. */
+  last_update_check_at: string | null;
+  last_update_check_outcome: string | null;
+  last_update_check_detail: string;
 }
 
 /**
@@ -699,6 +716,10 @@ async function tick() {
     // changes — or vanishes when the node stops — is reflected while it is
     // being looked at, not only on the next open.
     reflectArchiveService(status);
+    // Same reason, same place: the "Last check" line is in Settings and is
+    // rendered from what the backend persisted, so it is right at launch and
+    // right within a tick of a check finishing, whoever started the check.
+    reflectLastUpdateCheck(status);
     reflectWalletEnabled(status.wallet_enabled);
     if (status.setup_complete) setupDone = true;
 
@@ -1596,6 +1617,15 @@ function showToast(msg: string) {
 // banner appears under the header the moment an update is found (ported from
 // the miner's "UPDATE AVAILABLE" cue), and Settings has a "Check now" button
 // so nobody has to wait for the 6-hour timer or a relaunch.
+//
+// Two of the three triggers run here: the check at launch (boot, below) and
+// the button, both through updateCheck(). The six-hourly recheck does NOT: it
+// is a tokio timer in src-tauri/src/update_timer.rs, which runs the same
+// plugin check, records through the same update_log, and emits an
+// "update-check" event that onUpdateCheckEvent paints through the same
+// functions updateCheck() paints with. Why it moved, stated as the hypothesis
+// it is, is in that file's comment; in one line: a setInterval in a hidden
+// WebKitGTK window may never fire, and this app lives hidden.
 let appVersion = "";
 
 /** Show the banner as "<strong>{head}</strong> {tail}". DOM-built, never
@@ -1625,6 +1655,90 @@ function setUpdateResult(text: string): void {
 // failed and will fail again.
 const MANUAL_DOWNLOAD = "easybtx.com/node";
 
+// The permanent "Last check" line under the Check-now button, rendered from
+// what the backend persisted (see recordUpdateCheck) on every status tick.
+// Until 2026-09-15 the automatic check painted nothing at all: this project's
+// own signer box ran 0.6.21 for eight hours after the feed served 0.6.22, two
+// six-hourly checks fell due in that window, and nothing on the machine could
+// say whether they ran, failed, or found nothing. Rendering from the persisted
+// value rather than from this session's memory is what makes the line true at
+// launch, before any check has run, and after the relaunch an install causes.
+function reflectLastUpdateCheck(status: NodeStatusInfo): void {
+  paintLastUpdateCheck({
+    at: status.last_update_check_at,
+    outcome: status.last_update_check_outcome,
+    detail: status.last_update_check_detail,
+  });
+}
+
+/** The one place the "Last check" line is written, whether the record came
+ *  from the status tick (persisted) or from the Rust timer's event (just
+ *  recorded), so the two cannot render the same record differently. */
+function paintLastUpdateCheck(last: LastUpdateCheck): void {
+  const el = $("update-last-check");
+  el.textContent = lastCheckLine(last, new Date(), MANUAL_DOWNLOAD);
+  // The recorded detail (automatic or pressed, the error text) on hover; the
+  // line itself stays in plain words.
+  el.title = last.detail;
+}
+
+/**
+ * What the screen shows while a check that found something runs its course:
+ * the banner under the header and the sentence beside the button. Shared by
+ * updateCheck() and by onUpdateCheckEvent, so a check the Rust timer ran looks
+ * exactly like one that ran here. The two quiet outcomes, no-update and
+ * check-failed, paint nothing on the automatic path on either side (a manual
+ * press paints its own sentence in updateCheck); the "Last check" line is
+ * where they show. `error` is the install error's text, used only by
+ * install-failed.
+ */
+function paintUpdateProgress(outcome: string, version: string, error: string): void {
+  switch (outcome) {
+    case "found":
+      showUpdateBanner(`Update available: v${version}`, "— downloading…");
+      setUpdateResult(`Update available: v${version} — downloading…`);
+      break;
+    case "install-failed":
+      // Always visible, manual or not, and never worded as a network problem:
+      // the common cause is a package format this updater cannot replace.
+      showUpdateBanner(`Update v${version} couldn't install`, `— download it from ${MANUAL_DOWNLOAD}`);
+      setUpdateResult(
+        `Automatic update failed — get v${version} from ${MANUAL_DOWNLOAD} (${error.slice(0, 80)})`
+      );
+      break;
+    case "installed":
+      showUpdateBanner(`v${version} ready`, "— restarting…");
+      break;
+    default:
+      break;
+  }
+}
+
+// A check the Rust timer ran has settled (src-tauri/src/update_timer.rs). The
+// backend has already written the record; this paints what updateCheck()
+// would have painted had the check run here, through the same two functions,
+// and the "Last check" line from the record itself rather than waiting for
+// the next status tick to read it back.
+function onUpdateCheckEvent(ev: UpdateCheckEvent): void {
+  paintUpdateProgress(ev.outcome, ev.version, installErrorFromDetail(ev.detail));
+  paintLastUpdateCheck({ at: ev.at, outcome: ev.outcome, detail: ev.detail });
+}
+
+// Write down how this check ended: one line in <datadir>/update-check.log and
+// the last outcome in the settings file, through the backend. Called at EVERY
+// exit of updateCheck below, and update-check.test.ts reads this file to make
+// sure that stays true. Fire-and-forget by contract: a failure to record is a
+// console warning and changes nothing about the update itself. The settled
+// promise is returned for the one caller that is about to end the process and
+// wants the line on disk first.
+function recordUpdateCheck(branch: UpdateCheckBranch, manual: boolean): Promise<void> {
+  const rec = updateCheckRecord(branch, manual ? "manual" : "automatic");
+  return invoke("record_update_check", { outcome: rec.outcome, detail: rec.detail }).then(
+    () => undefined,
+    (e) => console.warn("update-check: could not record the outcome", e),
+  );
+}
+
 async function updateCheck(manual = false): Promise<void> {
   let update: Awaited<ReturnType<typeof checkForUpdate>>;
   try {
@@ -1636,11 +1750,13 @@ async function updateCheck(manual = false): Promise<void> {
     // saying it was sent Mac owners hunting a fault that did not exist on the
     // day 0.6.20 shipped Linux-only. classifyCheckFailure tells the two apart
     // by the plugin's own wording; update-check.test.ts pins both strings.
+    // Quiet on screen is no longer quiet everywhere: the outcome is recorded
+    // either way, with the classified reason.
+    const failure = classifyCheckFailure(e);
     if (manual) {
-      setUpdateResult(
-        checkFailureMessage(classifyCheckFailure(e), appVersion, MANUAL_DOWNLOAD),
-      );
+      setUpdateResult(checkFailureMessage(failure, appVersion, MANUAL_DOWNLOAD));
     }
+    void recordUpdateCheck({ branch: "check-failed", failure }, manual);
     return;
   }
 
@@ -1650,33 +1766,39 @@ async function updateCheck(manual = false): Promise<void> {
         appVersion ? `You're on the latest version (v${appVersion}).` : "You're on the latest version."
       );
     }
+    void recordUpdateCheck({ branch: "no-update", currentVersion: appVersion }, manual);
     return;
   }
 
-  showUpdateBanner(`Update available: v${update.version}`, "— downloading…");
-  setUpdateResult(`Update available: v${update.version} — downloading…`);
+  paintUpdateProgress("found", update.version, "");
+  // Recorded before the download, so a check that found something and then
+  // died mid-download still left the finding behind.
+  void recordUpdateCheck({ branch: "found", version: update.version }, manual);
 
   try {
     await update.downloadAndInstall();
   } catch (e) {
-    // Always visible, manual or not, and never worded as a network problem:
-    // the common cause is a package format this updater cannot replace.
-    showUpdateBanner(
-      `Update v${update.version} couldn't install`,
-      `— download it from ${MANUAL_DOWNLOAD}`
-    );
-    setUpdateResult(
-      `Automatic update failed — get v${update.version} from ${MANUAL_DOWNLOAD} (${String(e).slice(0, 80)})`
-    );
+    paintUpdateProgress("install-failed", update.version, String(e));
+    void recordUpdateCheck({ branch: "install-failed", version: update.version, error: e }, manual);
     return;
   }
 
-  showUpdateBanner(`v${update.version} ready`, "— restarting…");
+  paintUpdateProgress("installed", update.version, "");
+  // Awaited, with a bound, unlike the others: relaunch() ends this process,
+  // and a record still in the IPC queue when it does is a record that was
+  // never written. Two seconds is a bound on a local file append that takes
+  // microseconds; it exists so a wedged backend cannot hold the restart
+  // hostage. The promise never rejects, so the flow cannot change here.
+  await Promise.race([
+    recordUpdateCheck({ branch: "installed", version: update.version }, manual),
+    new Promise<void>((resolve) => setTimeout(resolve, 2000)),
+  ]);
   try {
     await relaunch();
   } catch (e) {
     showUpdateBanner(`v${update.version} is installed`, "— restart the app to finish");
     setUpdateResult(`Installed. Restart to finish. (${String(e).slice(0, 80)})`);
+    void recordUpdateCheck({ branch: "relaunch-failed", version: update.version, error: e }, manual);
   }
 }
 
@@ -1755,5 +1877,12 @@ void (async () => {
   await tick();
   setInterval(() => void tick(), 1500);
   void updateCheck();
-  setInterval(() => void updateCheck(), 6 * 60 * 60 * 1000);
+  // The six-hourly recheck used to be a setInterval here. It is now the Rust
+  // timer in src-tauri/src/update_timer.rs, so there is ONE periodic path and
+  // it is not a JavaScript timer in a window that spends its life hidden;
+  // this is how its results reach the screen. Registered after the launch
+  // check is started, which is fine: the timer's first tick is two minutes
+  // out, and an event that arrives before a listener exists is dropped by
+  // Tauri, never queued to be painted twice.
+  void listen<UpdateCheckEvent>("update-check", (e) => onUpdateCheckEvent(e.payload));
 })();

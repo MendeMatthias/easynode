@@ -11,6 +11,8 @@ mod ask;
 mod commands;
 mod state;
 mod tray;
+mod update_log;
+mod update_timer;
 mod wallet;
 
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
@@ -49,6 +51,7 @@ pub fn run() {
             commands::set_esplora_listen,
             commands::set_witness,
             commands::set_witness_listen,
+            commands::record_update_check,
             ask::ask_chain_progress,
             ask::ask_supply,
             ask::ask_next_halving,
@@ -69,6 +72,12 @@ pub fn run() {
         ])
         .setup(|app| {
             tray::build_tray(app.handle())?;
+
+            // The six-hourly self-update check, on a tokio timer rather than
+            // the webview's setInterval, which the hypothesis in update_timer
+            // says WebKitGTK throttles for a hidden window. The front end
+            // still checks at launch and on the button; this is the recheck.
+            update_timer::spawn(app.handle().clone());
 
             // E2E/QA seam: EASYBTX_NODE_E2E_AUTOSETUP=1 runs the full setup
             // pipeline at launch without a wizard click. HARD-GATED on

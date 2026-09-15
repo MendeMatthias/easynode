@@ -65,3 +65,202 @@ export function checkFailureMessage(
   }
   return `Couldn't check right now — are you online? (${failure.detail.slice(0, 80)})`;
 }
+
+// ── What a check ended as, written down ─────────────────────────────────────
+//
+// updateCheck() in main.ts painted its result into the Settings pane and
+// nowhere else, and on the automatic path a failed check returned in silence.
+// Measured 2026-09-15: this project's own signer box ran 0.6.21 for eight
+// hours after the feed served 0.6.22, with two six-hourly checks due in that
+// window, and nothing anywhere said whether they ran, failed, or found
+// nothing. Every exit of updateCheck() now records one of the words below
+// through the `record_update_check` command (src-tauri/src/update_log.rs),
+// which appends a line to <datadir>/update-check.log and keeps the last
+// outcome in the settings file for the pane's "Last check" line.
+
+/**
+ * The closed set of things a check can end as. `UPDATE_CHECK_OUTCOMES` in
+ * src-tauri/src/update_log.rs is the same five words and the Rust side refuses
+ * anything else unwritten; update-check.test.ts reads that file and keeps the
+ * two lists equal.
+ */
+export const UPDATE_CHECK_OUTCOMES = [
+  "no-update",
+  "check-failed",
+  "found",
+  "install-failed",
+  "installed",
+] as const;
+export type UpdateCheckOutcome = (typeof UPDATE_CHECK_OUTCOMES)[number];
+
+/** Who started the check. A manual press that fails is on screen already; an
+ *  automatic one that fails was, until now, nowhere. */
+export type UpdateCheckTrigger = "manual" | "automatic";
+
+/**
+ * The six ways out of updateCheck(). "installed" and "relaunch-failed" are the
+ * same outcome with a different detail: the update IS installed either way,
+ * and whether the restart worked is the detail.
+ */
+export type UpdateCheckBranch =
+  | { branch: "check-failed"; failure: CheckFailure }
+  | { branch: "no-update"; currentVersion: string }
+  | { branch: "found"; version: string }
+  | { branch: "install-failed"; version: string; error: unknown }
+  | { branch: "installed"; version: string }
+  | { branch: "relaunch-failed"; version: string; error: unknown };
+
+export interface UpdateCheckRecord {
+  outcome: UpdateCheckOutcome;
+  detail: string;
+}
+
+/** An updater error can run to a stack of URLs; the log keeps this much. */
+const DETAIL_ERROR_CHARS = 200;
+
+function errorText(e: unknown): string {
+  return String(e).replace(/\s+/g, " ").trim().slice(0, DETAIL_ERROR_CHARS);
+}
+
+/**
+ * The word and the short detail for one exit of updateCheck(). Pure, so the
+ * mapping from branch to outcome is a test rather than a reading of main.ts.
+ */
+export function updateCheckRecord(
+  branch: UpdateCheckBranch,
+  trigger: UpdateCheckTrigger,
+): UpdateCheckRecord {
+  switch (branch.branch) {
+    case "check-failed":
+      return {
+        outcome: "check-failed",
+        detail:
+          branch.failure.kind === "no-build-for-this-platform"
+            ? `${trigger}: no build for this platform`
+            : `${trigger}: ${errorText(branch.failure.detail)}`,
+      };
+    case "no-update":
+      return {
+        outcome: "no-update",
+        detail: branch.currentVersion
+          ? `${trigger}: v${branch.currentVersion} is current`
+          : trigger,
+      };
+    case "found":
+      return {
+        outcome: "found",
+        detail: `${trigger}: v${branch.version} offered, downloading`,
+      };
+    case "install-failed":
+      return {
+        outcome: "install-failed",
+        detail: `${trigger}: v${branch.version}: ${errorText(branch.error)}`,
+      };
+    case "installed":
+      return {
+        outcome: "installed",
+        detail: `${trigger}: v${branch.version}, restarting`,
+      };
+    case "relaunch-failed":
+      return {
+        outcome: "installed",
+        detail: `${trigger}: v${branch.version}, restart failed: ${errorText(branch.error)}`,
+      };
+  }
+}
+
+/** The last recorded check as `get_node_status` carries it: null/empty until
+ *  the first check has finished. */
+export interface LastUpdateCheck {
+  at: string | null;
+  outcome: string | null;
+  detail: string;
+}
+
+/**
+ * One settled check as the Rust timer emits it (`UpdateCheckEvent` in
+ * src-tauri/src/update_timer.rs): the same `outcome` and `detail` the record
+ * got, the version offered where there was one (empty otherwise), and the
+ * record's own timestamp, so the pane can paint its "Last check" line from the
+ * event exactly as it paints it from the settings file on the next tick.
+ */
+export interface UpdateCheckEvent {
+  outcome: string;
+  version: string;
+  detail: string;
+  at: string;
+}
+
+const INSTALL_FAILED_DETAIL = /^(?:manual|automatic): v\S+: (.*)$/;
+
+/**
+ * The error text out of an `install-failed` detail, which updateCheckRecord
+ * (and the Rust timer, in the same shape) writes as `<trigger>: v<version>:
+ * <error>`. The event carries the detail and not the error separately, and the
+ * sentence beside the button shows the error alone, the way it does when the
+ * install ran here. Any other shape comes back whole.
+ */
+export function installErrorFromDetail(detail: string): string {
+  return INSTALL_FAILED_DETAIL.exec(detail)?.[1] ?? detail;
+}
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+function hhmm(d: Date): string {
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+function sameDay(a: Date, b: Date): boolean {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
+/** "today 14:03", "yesterday 09:12", "12 Sep 14:03", "3 Jan 2025 08:00". Local
+ *  time, because the person reading it is sitting at the machine. */
+export function describeWhen(at: Date, now: Date): string {
+  if (Number.isNaN(at.getTime())) return "at an unknown time";
+  if (sameDay(at, now)) return `today ${hhmm(at)}`;
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  if (sameDay(at, yesterday)) return `yesterday ${hhmm(at)}`;
+  const year = at.getFullYear() === now.getFullYear() ? "" : ` ${at.getFullYear()}`;
+  return `${at.getDate()} ${MONTHS[at.getMonth()]}${year} ${hhmm(at)}`;
+}
+
+const VERSION_IN_DETAIL = /\bv\d+\.\d+\.\d+\b/;
+
+/** The outcome in plain words. `detail` only lends the version number. An
+ *  outcome this build does not know (a file written by a newer one) is shown
+ *  as its word rather than hidden. */
+export function plainOutcome(outcome: string, detail: string, downloadsAt: string): string {
+  const v = VERSION_IN_DETAIL.exec(detail)?.[0];
+  switch (outcome) {
+    case "no-update":
+      return "you're on the latest version";
+    case "check-failed":
+      return /no build for this platform/.test(detail)
+        ? "no build for this platform yet"
+        : "couldn't check";
+    case "found":
+      return v ? `found ${v}` : "found an update";
+    case "install-failed":
+      return `${v ?? "an update"} couldn't install — get it from ${downloadsAt}`;
+    case "installed":
+      return `${v ?? "an update"} installed`;
+    default:
+      return outcome;
+  }
+}
+
+/**
+ * The permanent line under "Check now". Rendered from the persisted values on
+ * every status tick, so the automatic path shows what it did without anybody
+ * pressing anything, and it reads the same after a relaunch.
+ */
+export function lastCheckLine(last: LastUpdateCheck, now: Date, downloadsAt: string): string {
+  if (!last.at || !last.outcome) return "Last check: none yet";
+  const when = describeWhen(new Date(last.at), now);
+  return `Last check: ${when} — ${plainOutcome(last.outcome, last.detail, downloadsAt)}`;
+}
