@@ -74,11 +74,14 @@ MANIFEST="src/matmul/matmul_v4_rc_production_golden_manifest.data"
 BTX_CLONE="${BTX_CLONE:-/Users/bonuz/repos/btx}"
 RAW_BASE="https://raw.githubusercontent.com/btxchain/btx"
 
-# An UNTAGGED pin. When commands.rs also declares NODE_RELEASE_COMMIT, the tag
-# string may not exist upstream yet (0.34.6 shipped from release/0.34.6 before
-# upstream tagged it). The guard then fetches source at that SHA instead, so an
-# untagged pin gets exactly the check a tagged one gets. It never substitutes a
-# branch name: a branch moves, a SHA does not. Empty when the tag is real.
+# A pin that names its COMMIT. When commands.rs also declares
+# NODE_RELEASE_COMMIT, the key in NODE_RELEASE_TAG may not be an upstream ref at
+# all: 0.34.6 shipped from release/0.34.6 before upstream tagged it, and since
+# 2026-09-15 the key carries a `-<short sha>` qualifier (`v0.34.6-3013c2c2`) so
+# the app re-provisions onto the tag build. The guard then fetches source at
+# that SHA instead, so such a pin gets exactly the check a bare tag gets. It
+# never substitutes a branch name: a branch moves, a SHA does not. Empty when
+# the key is itself a real upstream tag.
 pin_commit() {
   sed -n 's/^pub const NODE_RELEASE_COMMIT: &str = "\([0-9a-f]\{40\}\)";.*$/\1/p' "$1" | head -1
 }
@@ -171,11 +174,17 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 INIT_FILE="$WORK/init.cpp"
+# An explicit argument that spells the install KEY (suffixed or not) is routed
+# to NODE_RELEASE_COMMIT like the bare run is, because the key may not be an
+# upstream ref. Any other argument is taken literally as an upstream tag, so
+# `check-engine-fleet-ready.sh v0.34.6` checks upstream's tag object, which is
+# not necessarily the commit the app pins; read the "verifying ... at commit"
+# line to know which one you got.
 REF="$TAG"
 PIN_COMMIT="$(pin_commit "$COMMANDS_RS")"
 if [ -n "$PIN_COMMIT" ] && [ "$TAG" = "$(sed -n 's/^pub const NODE_RELEASE_TAG: &str = "\([^"]*\)";.*$/\1/p' "$COMMANDS_RS" | head -1)" ]; then
   REF="$PIN_COMMIT"
-  echo "untagged pin: verifying $TAG at commit $REF"
+  echo "pin names its commit: verifying $TAG at commit $REF (NODE_RELEASE_COMMIT)"
 fi
 SRC_INIT="$(fetch_at_tag "$REF" "$INIT_CPP" "$INIT_FILE")" || die \
   "could not read $INIT_CPP for $TAG (ref $REF)" \

@@ -38,6 +38,41 @@ inbound connection is not yet told it is unreachable, the same grace the
 "Helping the network" card already gives. The lines are decided and tested in
 Rust; the screen only lays them out.
 
+**The engine moves to upstream's tagged v0.34.6.** Upstream tagged 0.34.6 on
+13 September at commit `3013c2c2`, exactly one commit past the `9eb4e005`
+branch build that 0.6.18 through 0.6.22 have shipped. That restores the rule
+this project set for itself when it shipped an untagged engine: ship no engine
+bump until a tag exists that upstream itself calls clean AND both guards pass
+on the box cutting the release. Both do, on the literal commit: the fork guard
+finds the withdrawn stall-recovery height disabled on all five networks, and
+the fleet guard finds a degraded consensus start allowed, the 1-of-1 mirror
+refused, and the same two device classes in the sealed golden manifest as
+before (NVIDIA `sm_120`, Apple M4-class).
+
+What the one commit changes, read from the diff rather than from the release
+notes: a peer that has only ever sent headers no longer counts as a source to
+fetch a competing chain's block bodies from, the mining guard's deferred-reorg
+window is kept armed while a reorg is pending, and SHA-256 becomes the only new
+HTLC lock the wallet creates. No consensus rule moves; `chainparams.cpp` is
+byte-identical to the previous pin, so the 203,000 bootstrap base and the
+golden manifest are unchanged, and the manifest's seal re-verifies. CI built
+the tag commit from a pristine tree on both platforms: Linux with
+`BUILD_GIT_DIRTY 0` and kernels for `sm_75/86/89/100/120`, Windows through the
+mingw cross-compile and its regtest smoke on a real Windows runner. Both report
+`BTX daemon version v0.34.6`.
+
+The app installs it under the key `v0.34.6-3013c2c2` rather than `v0.34.6`, and
+that is the part a returning user actually receives. The install directory is
+named after the key, and the app re-provisions an existing install only when
+the key changes; every install since 0.6.18 already sits in a directory called
+`v0.34.6` holding the old build, so keeping the name would have shipped the
+tag to fresh installs only, silently. The suffix is the commit's short hash, so
+the directory says which engine is inside without running it. The binary still
+reports `v0.34.6`, the staged package declares that in `.btxd-version`, and
+provisioning verifies the binary against the declaration, exactly as the
+`v0.33.3-pr105b` key did in 0.6.1. The chain in `~/.easybtx` is untouched by
+the swap.
+
 ## [0.6.22] - 2026-09-15 · linux + windows (mac follows when built)
 
 **Your node will tell you when its own view of the chain has gone stale.**

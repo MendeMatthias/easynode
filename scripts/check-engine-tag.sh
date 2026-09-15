@@ -34,14 +34,15 @@
 #
 # WHAT THIS DOES **NOT** COVER, so nobody mistakes its green for full coverage.
 #
-#   * ONLY the mac engine pin. It reads NODE_RELEASE_TAG, which is the release
-#     TAG the mac node app bundles. Windows and Linux node builds do not use a
-#     tag at all: node-win-installer.yml and node-linux-installer.yml build btxd
-#     from commit pin 1e51f0d1, which is v0.33.3 era and therefore predates the
-#     constant entirely (v0.33.3 has no nMatMulStallRecoveryHeight assignment).
-#     Those two platforms are out of scope because they are not exposed, not
-#     because they were checked. If either ever moves to a tag or to a commit at
-#     or after v0.33.4, bring it into this guard rather than assuming.
+#   * ONLY the pin in commands.rs. It reads NODE_RELEASE_TAG (and, when set,
+#     NODE_RELEASE_COMMIT, the exact upstream commit that key names). Since
+#     2026-09-08 all three platforms build from that one pin: btxd-linux.yml
+#     and btxd-macos.yml read it through engine-pin.sh, and the Windows and
+#     Linux installer workflows pin an artifact whose commit must equal it. So
+#     the pin this guard judges is the engine every platform ships; a workflow
+#     that grows its own hardcoded ref is outside this guard until it is made
+#     to read the pin. (This bullet used to say Windows and Linux built from
+#     1e51f0d1 and were out of scope. That stopped being true on 2026-09-08.)
 #   * ONLY this one constant. It says nothing about the withdrawn assumeutxo
 #     bases 199299 (f12a27d0) and 199300 (ff80e629), which v0.34.2, v0.34.3 and
 #     v0.34.4 all still compile, and nothing about the trusted-mirror M>=2
@@ -91,11 +92,14 @@ CHAINPARAMS="src/kernel/chainparams.cpp"
 BTX_CLONE="${BTX_CLONE:-/Users/bonuz/repos/btx}"
 RAW_BASE="https://raw.githubusercontent.com/btxchain/btx"
 
-# An UNTAGGED pin. When commands.rs also declares NODE_RELEASE_COMMIT, the tag
-# string may not exist upstream yet (0.34.6 shipped from release/0.34.6 before
-# upstream tagged it). The guard then fetches source at that SHA instead, so an
-# untagged pin gets exactly the check a tagged one gets. It never substitutes a
-# branch name: a branch moves, a SHA does not. Empty when the tag is real.
+# A pin that names its COMMIT. When commands.rs also declares
+# NODE_RELEASE_COMMIT, the key in NODE_RELEASE_TAG may not be an upstream ref at
+# all: 0.34.6 shipped from release/0.34.6 before upstream tagged it, and since
+# 2026-09-15 the key carries a `-<short sha>` qualifier (`v0.34.6-3013c2c2`) so
+# the app re-provisions onto the tag build. The guard then fetches source at
+# that SHA instead, so such a pin gets exactly the check a bare tag gets. It
+# never substitutes a branch name: a branch moves, a SHA does not. Empty when
+# the key is itself a real upstream tag.
 pin_commit() {
   sed -n 's/^pub const NODE_RELEASE_COMMIT: &str = "\([0-9a-f]\{40\}\)";.*$/\1/p' "$1" | head -1
 }
@@ -147,16 +151,17 @@ trap 'rm -rf "$WORK"' EXIT
 FILE="$WORK/chainparams.cpp"
 SOURCE=""
 
-# The ref we fetch. Normally the tag itself; for an untagged pin (see
-# pin_commit above) the commit the tag name stands for. An explicit override
+# The ref we fetch. Normally the tag itself; for a pin that names its commit
+# (see pin_commit above) the commit the key stands for. An explicit override
 # argument is always taken literally, so `check-engine-tag.sh v0.34.7` still
-# means "that upstream tag" and nothing else.
+# means "that upstream tag" and nothing else; a suffixed install key passed as
+# the argument is not an upstream ref and fails the fetch, which is correct.
 REF="$TAG"
 if [ -z "$OVERRIDE_TAG" ]; then
   PIN_COMMIT="$(pin_commit "$COMMANDS_RS")"
   if [ -n "$PIN_COMMIT" ]; then
     REF="$PIN_COMMIT"
-    echo "untagged pin: verifying $TAG at commit $REF"
+    echo "pin names its commit: verifying $TAG at commit $REF (NODE_RELEASE_COMMIT)"
   fi
 fi
 

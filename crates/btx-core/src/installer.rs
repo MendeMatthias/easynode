@@ -1201,6 +1201,15 @@ mod tests {
             release_tag_from_install_root(Path::new("/h/.local/btx/v0.33.2/mac")).as_deref(),
             Some("v0.33.2")
         );
+        // A suffixed install key comes back whole. Provisioning only ever
+        // compares it against the binary when the package has no
+        // `.btxd-version` marker, and every staging script writes one, so the
+        // key's qualifier never reaches `btxd --version`.
+        assert_eq!(
+            release_tag_from_install_root(Path::new("/h/.local/btx/v0.34.6-3013c2c2/linux-x86_64"))
+                .as_deref(),
+            Some("v0.34.6-3013c2c2")
+        );
         // No `btx/<tag>` layout → None, so provisioning skips the assert rather
         // than inventing an expectation it cannot justify.
         assert_eq!(release_tag_from_install_root(Path::new("/opt/node")), None);

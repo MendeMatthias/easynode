@@ -32,16 +32,30 @@ name: Build Windows btxd (mingw cross, smoked on Windows)
 # PROVEN_BTXD_TAG is checked against the install tag rather than the artifact.
 # A default that silently produces an unshippable artifact is the wrong default.
 #
-# 1e51f0d1 is btxchain's pr/0.33.3-network-stability. NEVER move this past it
-# without re-reading node-win-installer.yml's pin block: f3098105 makes a
-# GPU-less node refuse to start at init.
+# The default is the commit NODE_RELEASE_COMMIT names in
+# apps/node/src-tauri/src/commands.rs, spelled out here because this workflow
+# checks out btxchain/btx, not easynode, and so cannot read engine-pin.sh the
+# way btxd-linux.yml and btxd-macos.yml do. It MOVES WITH THAT CONSTANT and
+# nothing checks that it did, so read commands.rs before dispatching blank.
+#
+# It sat on 1e51f0d1 (pr/0.33.3-network-stability) from 2026-08-12 until
+# 2026-09-15, three engines behind what the app installed, so a blank dispatch
+# would have produced an artifact that parks at 184,999. The warning that stood
+# here ("f3098105 makes a GPU-less node refuse to start at init") described the
+# 0.34 .. 0.34.4 engines; 0.34.5 and later allow a degraded start, which
+# scripts/check-engine-fleet-ready.sh verifies per pin.
+#
+# 3013c2c2 is upstream's tag v0.34.6 (tagged 2026-09-13), one commit past the
+# 9eb4e005 build 0.6.18 through 0.6.22 shipped, and both engine guards pass on
+# it. A SHA rather than the tag name so the artifact is named for the commit,
+# which is what node-win-installer.yml's identity check needs.
 on:
   workflow_dispatch:
     inputs:
       btxchain_ref:
-        description: "btxchain/btx ref to build"
+        description: "btxchain/btx ref to build (default = NODE_RELEASE_COMMIT)"
         required: false
-        default: "1e51f0d1ccc594b8fe215a6af3dcc7c118d7d1ca"
+        default: "3013c2c22a9a453e778d6cc426734567d819fa59"
   # Self-service trigger. This workflow is dispatch-only, which means a 50 minute
   # build that everything else pins against can only start from a browser, and a
   # release stalls whenever nobody is at a keyboard. Scoped to a throwaway branch
@@ -57,7 +71,7 @@ permissions:
 # fallback there. That is how a build ends up producing an artifact nobody can
 # ship. Every consumer below reads BTXCHAIN_REF instead.
 env:
-  BTXCHAIN_REF: ${{ inputs.btxchain_ref || '1e51f0d1ccc594b8fe215a6af3dcc7c118d7d1ca' }}
+  BTXCHAIN_REF: ${{ inputs.btxchain_ref || '3013c2c22a9a453e778d6cc426734567d819fa59' }}
 
 jobs:
   build-btxd:

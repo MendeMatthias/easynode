@@ -3890,6 +3890,44 @@ consensus-validator service.";
         )));
     }
 
+    /// The install key since 2026-09-15 is `v0.34.6-3013c2c2`: upstream tagged
+    /// v0.34.6 one commit past the build every install held under the bare
+    /// `v0.34.6` key, and the app re-provisions only when the key changes, so
+    /// the key carries the commit. The qualifier starts with DIGITS, which is a
+    /// shape `-pr105b` never exercised: every gate derived from the install
+    /// directory must still read 0.34.6 from it, or the fleet update that
+    /// ships it would launch btxd without the RC flags and the degraded-start
+    /// posture, on every machine at once.
+    #[test]
+    fn the_shipped_install_key_parses_to_the_version_its_btxd_reports() {
+        assert_eq!(
+            parse_tag_version("v0.34.6-3013c2c2"),
+            Some(vec![0, 34, 6]),
+            "a hex qualifier must not leak into the version"
+        );
+        let btxd = Path::new("/x/btx/v0.34.6-3013c2c2/lin/btxd");
+        assert_eq!(
+            release_tag_from_btxd_path(btxd).as_deref(),
+            Some("v0.34.6-3013c2c2")
+        );
+        assert!(node_supports_autoupdate_flag(btxd));
+        assert!(node_supports_matmul_rc_flags(btxd));
+        assert!(node_allows_degraded_matmul_start(btxd));
+        // And the launch command that follows from those gates is the 0.34.5+
+        // one: consensus mode, never the refused 1-of-1 mirror.
+        let (_, args, _) = build_node_command(
+            btxd,
+            Path::new("/dd"),
+            Path::new("/dd/btx.conf"),
+            Backend::Cpu,
+        );
+        assert!(args.iter().any(|a| a == "-matmulrcexecution=strict-device"));
+        assert!(!args.iter().any(|a| a == "-matmultrustedthreshold=1"));
+        // A qualifier whose digits could be mistaken for a fourth segment is
+        // still a qualifier: `-3013c2c2` is not `.3013`.
+        assert_eq!(parse_tag_version("v0.34.6-3013c2c2").unwrap().len(), 3);
+    }
+
     #[test]
     fn build_node_command_adds_rc_flag_only_where_it_belongs() {
         let dd = PathBuf::from("/dd");

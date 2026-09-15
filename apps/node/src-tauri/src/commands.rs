@@ -212,12 +212,58 @@ use crate::state::{
 // snapshot_spec() is unchanged on purpose: the 203000 assumeutxo base is
 // compiled into this commit (chainparams.cpp, "main assumeutxo snapshot at
 // height 203'000 (0.34.5 release …)"), verified in the tree at this SHA.
-pub const NODE_RELEASE_TAG: &str = "v0.34.6";
+//
+// ── 2026-09-15: UPSTREAM TAGGED v0.34.6, ONE COMMIT PAST OUR PIN ────────────
+//
+// Tag `v0.34.6` = `3013c2c22a9a453e778d6cc426734567d819fa59`, tagged 2026-09-13.
+// `git log 9eb4e005..3013c2c2` is exactly one commit, "Make SHA-256 the only
+// new HTLC lock and stop treating header-only peers as replacement body
+// sources": net_processing.cpp (a peer that only sent headers no longer counts
+// as a replacement body source; `PeerCountsAsAlternativeBodyDownloadSource`
+// requires `has_served_block`), validation.cpp/.h (`RefreshDeferredReorgHeartbeat`
+// keeps the mining-guard deferred-reorg window armed), policy.cpp (SHA-256 HTLC
+// leaves standard), script/pqm.*, descriptor.cpp, sign.cpp, wallet code, tests,
+// and a COMMENT in consensus/params.h. No consensus rule moves. chainparams.cpp
+// is byte-identical to 9eb4e005, so the 203000 assumeutxo base and the
+// assumeutxo table (clean of 199299/199300) are unchanged and snapshot_spec()
+// stays where it is. The golden manifest and contrib/matmul-v4 are
+// byte-identical to the pin; two-step seal check: field 8 `855f220b`, field 9
+// `b9c6e4852ab1dc1cc7f998c7199a16f4b9fbd37af16fe00872f1fad2491adbc3`, and the
+// recomputed seal of 855f220b matches. Both guards pass on the literal SHA
+// (check-engine-tag.sh 5/5 sentinel; check-engine-fleet-ready.sh: degraded
+// consensus start, 1-of-1 mirror refused, manifest rows cuda/sm_120 and
+// metal/m4_class). CI built it: btxd-linux.yml run 34914768284, tree pristine,
+// BUILD_GIT_DIRTY 0, sm_75/86/89/100/120 present, `BTX daemon version v0.34.6`,
+// SMOKE PASSED. Upstream's release notes say "CLIENT_VERSION is 0.34.6"; its
+// official binaries need glibc 2.38, so we keep building from source.
+//
+// WHY THE INSTALL KEY IS `v0.34.6-3013c2c2` AND NOT `v0.34.6`. This constant is
+// the install-directory key (`~/.local/btx/<key>/<platform>`), and
+// `start_node_inner` re-provisions an existing install ONLY when it changes.
+// Every 0.6.18 through 0.6.22 install already sits in a directory named
+// `v0.34.6` holding the 9eb4e005 build. Moving the commit while keeping the
+// name would ship the tag build to fresh installs only and leave every
+// returning user on 9eb4e005 forever, with nothing on screen saying so. The
+// `-pr105b` precedent above is the same shape: a suffixed key while the binary
+// reports the unsuffixed version, and the staged package declaring what its
+// btxd really reports in `.btxd-version` (installer.rs, BTXD_VERSION_MARKER),
+// which is what provisioning verifies against. The suffix is the commit's short
+// SHA rather than a counter so the directory name says which engine is inside
+// without running it, and so it can never collide with an upstream tag
+// (upstream tags are vX.Y.Z[.W]). Convention, and the staging scripts hold you
+// to it: the key is `<version btxd reports>[-<qualifier>]`; a qualifier never
+// changes the version part, and `engine_pin_version` in
+// apps/node/scripts/lib/engine-pin.sh strips it. node.rs `parse_tag_version`
+// stops at the first non-digit, so every version gate reads 0.34.6 from it.
+pub const NODE_RELEASE_TAG: &str = "v0.34.6-3013c2c2";
 
-/// The exact upstream commit NODE_RELEASE_TAG names. Set only while the tag
-/// does not exist upstream; the guards read it and fetch source by SHA. Clear
-/// it (or make it match the tag object) once upstream tags the release.
-pub const NODE_RELEASE_COMMIT: &str = "9eb4e0050e08ea3ef768bac276dac9cbd2e84542";
+/// The exact upstream commit NODE_RELEASE_TAG names. Since 2026-09-15 this is
+/// the commit upstream's tag object `v0.34.6` points at, kept set rather than
+/// cleared: the install key carries a suffix and is not itself an upstream
+/// ref, so the guards, `engine_pin_ref` and the engine build workflows fetch
+/// and check out THIS, never the key. If upstream ever re-tags, this does not
+/// move by itself; re-run both guards on the new commit and choose a new key.
+pub const NODE_RELEASE_COMMIT: &str = "3013c2c22a9a453e778d6cc426734567d819fa59";
 
 /// The pinned assumeutxo snapshot this app bootstraps from: the v0.33.2
 /// release's own asset (height 179000), pinned from its snapshot.manifest.json.
@@ -3595,7 +3641,7 @@ pub async fn node_footprint(state: State<'_, AppState>) -> Result<NodeFootprint,
 mod tests {
     use super::{
         attached_node_is_ours_to_stop, pre_launch_plan, witness_started_message, AttachedTo,
-        PreLaunchPlan, NODE_RELEASE_TAG,
+        PreLaunchPlan, NODE_RELEASE_COMMIT, NODE_RELEASE_TAG,
     };
 
     /// Wrapping a Rust string literal across source lines WITHOUT a trailing
@@ -3895,6 +3941,38 @@ mod tests {
         assert_eq!(conf_nickname("rig/01"), None);
         assert_eq!(conf_nickname("a(b)"), None);
         assert_eq!(conf_nickname("a\nrpcallowip=0.0.0.0/0"), None);
+    }
+
+    /// The install key `v0.34.6-3013c2c2` promises that the directory it names
+    /// holds the engine at NODE_RELEASE_COMMIT. Nothing in Rust reads that
+    /// constant (the guards and engine-pin.sh read the source text), so the two
+    /// could drift with no compiler and no test noticing. When the key carries a
+    /// qualifier AND a commit is pinned, the qualifier must be that commit's
+    /// prefix; a bare key with no commit (a plain upstream tag) and a qualifier
+    /// with no commit (the `-pr105b` shape) are both left alone.
+    #[test]
+    fn the_install_key_names_the_commit_it_installs() {
+        assert!(
+            NODE_RELEASE_COMMIT.is_empty()
+                || (NODE_RELEASE_COMMIT.len() == 40
+                    && NODE_RELEASE_COMMIT.chars().all(|c| c.is_ascii_hexdigit())),
+            "NODE_RELEASE_COMMIT must be empty or a full 40-hex SHA"
+        );
+        if let Some((version, qualifier)) = NODE_RELEASE_TAG.split_once('-') {
+            assert!(
+                version
+                    .strip_prefix('v')
+                    .is_some_and(|rest| rest.split('.').all(|s| s.parse::<u64>().is_ok())),
+                "the version part of {NODE_RELEASE_TAG} must be vMAJOR.MINOR.PATCH[.X]"
+            );
+            if !NODE_RELEASE_COMMIT.is_empty() {
+                assert!(
+                    qualifier.len() >= 7 && NODE_RELEASE_COMMIT.starts_with(qualifier),
+                    "the key {NODE_RELEASE_TAG} says it holds {qualifier}, but \
+                     NODE_RELEASE_COMMIT is {NODE_RELEASE_COMMIT}; move them together"
+                );
+            }
+        }
     }
 
     #[test]

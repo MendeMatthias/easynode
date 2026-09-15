@@ -188,6 +188,78 @@ What that changed mechanically, so the next cutter is not surprised:
   Windows btxd and will fail until a Windows btxd exists at this commit. That
   is the guard doing its job; Windows stays on 0.6.6 meanwhile.
 
+### 2026-09-15: upstream tagged 0.34.6, one commit past our pin
+
+The tag exists: **`v0.34.6` = `3013c2c22a9a453e778d6cc426734567d819fa59`**,
+tagged 2026-09-13. `git log 9eb4e005..3013c2c2` is exactly one commit, "Make
+SHA-256 the only new HTLC lock and stop treating header-only peers as
+replacement body sources": `net_processing.cpp` (a peer that only ever sent
+headers no longer counts as a replacement body source;
+`PeerCountsAsAlternativeBodyDownloadSource` requires `has_served_block`),
+`validation.cpp/.h` (`RefreshDeferredReorgHeartbeat` keeps the mining guard's
+deferred-reorg window armed), `policy.cpp` (SHA-256 HTLC leaves standard),
+`script/pqm.*`, `descriptor.cpp`, `sign.cpp`, wallet code, tests, and a COMMENT
+in `consensus/params.h`. No consensus rule moves. `chainparams.cpp` is
+byte-identical to 9eb4e005, so the 203000 assumeutxo base stays and the table
+is clean of 199299/199300; `snapshot_spec()` does not move. The golden manifest
+and `contrib/matmul-v4` are byte-identical to the pin (two-step seal check:
+field 8 `855f220b`, field 9 `b9c6e4852ab1dc1cc7f998c7199a16f4b9fbd37af16fe00872f1fad2491adbc3`,
+recomputed seal of 855f220b matches). Both guards pass on the literal SHA:
+`check-engine-tag.sh` 5/5 sentinel, `check-engine-fleet-ready.sh` degraded
+consensus start, 1-of-1 mirror refused, manifest rows cuda/sm_120 and
+metal/m4_class. Upstream's release notes say "CLIENT_VERSION is 0.34.6"; its
+official binaries need glibc 2.38, so we keep building from source.
+
+So the first half of the rule above holds again, and the pin moved, for 0.6.23.
+What changed mechanically, so the next cutter is not surprised:
+
+* **`NODE_RELEASE_TAG` is `v0.34.6-3013c2c2`, not `v0.34.6`.** The app
+  re-provisions a returning user ONLY when this key changes
+  (`start_node_inner`, `if tag != NODE_RELEASE_TAG`), and every install since
+  0.6.18 already holds the 9eb4e005 build in a directory named `v0.34.6`.
+  Keeping the name and moving the commit would have shipped the tag build to
+  fresh installs only, with nothing on screen saying so. This is the
+  `v0.33.3-pr105b` shape from 0.6.1: a suffixed install key while the binary
+  reports the unsuffixed version, the staged package declaring what it really
+  carries in `.btxd-version`, and provisioning verifying against that. The
+  suffix is the commit's short SHA so the directory says which engine is
+  inside and can never collide with an upstream tag. The convention, held by
+  the scripts: the key is `<version btxd reports>[-<qualifier>]`, and
+  `engine_pin_version` in `engine-pin.sh` strips the qualifier.
+* **`NODE_RELEASE_COMMIT` is `3013c2c2…` and stays SET** although the tag
+  exists, because the key is not an upstream ref and nothing can fetch it by
+  name. The guards, `engine_pin_ref` and both engine build workflows fetch and
+  check out that SHA; their output now says "pin names its commit: verifying
+  … at commit …" instead of "untagged pin".
+* The `-source` staging scripts compare the version part of the key against
+  `btxd --version`, so `stage-node-pkg-linux-source.sh ~/btx-ship/build v0.34.6`
+  is still the call, and with no second argument they derive `v0.34.6` from
+  the pin themselves. The download-based scripts still sit on 0.34.5 and refuse,
+  which remains correct: upstream's 0.34.6 binaries do not run on 22.04.
+* `check-engine-fleet-ready.sh v0.34.6` (the tag as an ARGUMENT) now checks
+  upstream's tag object. Before this change that argument equalled
+  `NODE_RELEASE_TAG` and was silently routed to the pinned commit instead; the
+  two are the same commit today, so the answer is the same, but read the
+  "verifying … at commit" line rather than assuming which one you got.
+* **Linux engine, built in CI at the tag commit:** `btxd-linux.yml` run
+  34914768284, dispatched from main with `btxchain_ref=3013c2c2…`, completed
+  success. Its log proved `tree pristine at 3013c2c2…`, `BUILD_GIT_DIRTY 0`,
+  architectures present `sm_100 sm_120 sm_75 sm_86 sm_89` in both btxd and
+  `libbtx_matmul_backend.a`, `BTX daemon version v0.34.6`, `SMOKE PASSED`.
+  `node-linux-installer.yml` pins that run, its artifact
+  `btxd-linux-3013c2c2…` (393720371 bytes) and the commit.
+* **Windows engine, built in CI at the tag commit:** `btxd-windows.yml` run
+  34914770368, dispatched from main with `btxchain_ref=3013c2c2…`, both jobs
+  green including "regtest smoke on real Windows", artifact
+  `btxd-windows-3013c2c2…` (19079508 bytes). `node-win-installer.yml` moves all
+  four pins together: run id, artifact, `PROVEN_BTXD_VERSION: v0.34.6` (what
+  the binary reports) and `PROVEN_BTXD_TAG: v0.34.6-3013c2c2` (the install
+  key, compared against `NODE_RELEASE_TAG`). This is the first time since 0.6.1
+  that VERSION and TAG differ there, which is what that guard was rewritten for.
+* `btxd-windows.yml`'s `btxchain_ref` default now spells this commit. It sat on
+  `1e51f0d1` (three engines stale) from 2026-08-12, so a blank dispatch built
+  an engine that parks at 184,999.
+
 ### The fork check: necessary, never sufficient
 
 `consensus.nMatMulStallRecoveryHeight = 199'299` is an ASERT re-anchor at a
@@ -666,11 +738,12 @@ anything is signed, published or flipped live:
    ⚠ Dispatch it with **`btxchain_ref=<btxd commit SHA>`** — the same COMMIT SHA
    rule step 3 states for Linux, and for the same reason: artifact names cannot
    contain `/`, so a branch name fails the upload after a full build. It is
-   `9eb4e0050e08ea3ef768bac276dac9cbd2e84542` (v0.34.6), which is
-   `NODE_RELEASE_COMMIT` in `commands.rs` — read it from there rather than from
-   this page. This line said `1e51f0d1` until 2026-09-09, three engine versions
-   stale, and following it would have pinned the Windows build to an engine
-   that parks at 184,999 while Mac and Linux shipped 0.34.6.
+   `3013c2c22a9a453e778d6cc426734567d819fa59` (upstream's tag v0.34.6, since
+   2026-09-15; `9eb4e005` before that), which is `NODE_RELEASE_COMMIT` in
+   `commands.rs` — read it from there rather than from this page. This line
+   said `1e51f0d1` until 2026-09-09, three engine versions stale, and
+   following it would have pinned the Windows build to an engine that parks at
+   184,999 while Mac and Linux shipped 0.34.6.
 
    This step used to read `btxchain_ref=v<node version>`, which is wrong twice
    over: the node's version (0.6.x) and btxd's ref are unrelated namespaces, and
@@ -930,12 +1003,14 @@ glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
 
 1. Engine, from a PRISTINE worktree at the pinned ref (the provenance canary
    fails on any dirty file and the node then runs while silently not
-   validating). The ref is the tag, or for an untagged pin the
-   `NODE_RELEASE_COMMIT` SHA; `engine_pin_ref apps/node` prints it:
+   validating). The ref is the `NODE_RELEASE_COMMIT` SHA when there is one
+   (there is: the install key is not an upstream ref), else the tag;
+   `engine_pin_ref apps/node` prints it:
 
    ```
    git -C <btx-clone> worktree add --detach ~/btx-ship "$(. apps/node/scripts/lib/engine-pin.sh; engine_pin_ref apps/node)"
    # 0.6.18: 9eb4e0050e08ea3ef768bac276dac9cbd2e84542
+   # 0.6.23: 3013c2c22a9a453e778d6cc426734567d819fa59 (upstream tag v0.34.6)
    cd ~/btx-ship
    cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
      -DBUILD_DAEMON=ON -DBUILD_CLI=ON \
@@ -967,16 +1042,18 @@ glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
 
 2. Stage into the app: `apps/node/scripts/stage-node-pkg-linux-source.sh
    ~/btx-ship/build v0.34.6`; the second argument is the version btxd REPORTS,
-   i.e. the tag name, not the commit. It vendors the whole non system library
-   closure (including the ~490 MB cuBLASLt) with ORIGIN rpaths and refuses
-   anything unresolved.
+   i.e. the install key without its `-suffix`, not the key and not the commit
+   (omit it and the script derives the same value from the pin). It vendors
+   the whole non system library closure (including the ~490 MB cuBLASLt) with
+   ORIGIN rpaths and refuses anything unresolved.
 
 3. App: in a NATIVE ext4 checkout (never /mnt/c, never shared node_modules),
    `npm ci`, the three test suites, then `NO_STRIP=true cargo tauri build`.
    NO_STRIP keeps the GPU kernels intact through AppImage packaging.
 
 4. Gates, always on the EXTRACTED bundles, never the staging tree:
-   `.btxd-version` reads the pinned tag name, the bundled btxd and btx-cli execute under
+   `.btxd-version` reads the version part of the pinned key (`v0.34.6`, never
+   the `-suffix`), the bundled btxd and btx-cli execute under
    `env -u LD_LIBRARY_PATH PATH=/usr/bin:/bin`, ldd resolves inside the
    tree, cuobjdump lists every pinned architecture (sm_75/86/89/120, plus
    upstream's own sm_100; the vendored cuBLASLt contributes more, nine in all
