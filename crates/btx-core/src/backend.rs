@@ -200,6 +200,150 @@ pub fn resolve_with_override(detected: BackendStatus, force_metal: bool) -> Back
     }
 }
 
+/// Where the NVIDIA driver installs its CUDA library on Linux. The DRIVER's
+/// library (`libcuda.so.1`), not the toolkit's `libcudart`: the runtime can be
+/// installed on a box with no GPU at all, while the driver library only arrives
+/// with a driver, and a driver is only installed against a card. WSL2 mounts it
+/// from the Windows host under `/usr/lib/wsl/lib` (measured on this project's
+/// RTX 3060 box, 2026-09-15). A distro this list does not know is caught by
+/// `ldconfig -p` in `cuda_driver_library`.
+#[cfg(target_os = "linux")]
+const LINUX_CUDA_DRIVER_LIBRARY_PATHS: &[&str] = &[
+    "/usr/lib/wsl/lib/libcuda.so.1",
+    "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+    "/usr/lib64/libcuda.so.1",
+    "/usr/lib/libcuda.so.1",
+    "/usr/local/nvidia/lib64/libcuda.so.1",
+    "/run/opengl-driver/lib/libcuda.so.1",
+];
+
+/// The path `ldconfig -p` lists for the CUDA driver library, if any. Pure.
+///
+/// A real line, from a WSL2 host with an RTX 3060 (2026-09-15):
+///
+/// ```text
+///     libcuda.so.1 (libc6,x86-64) => /usr/lib/wsl/lib/libcuda.so.1
+/// ```
+///
+/// Only the soname `libcuda.so.1` counts. `libcudart.so.13` is the toolkit
+/// runtime and says nothing about a GPU; `libcudadebugger.so.1` is a tool.
+pub fn libcuda_from_ldconfig(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        if line.split_whitespace().next()? != "libcuda.so.1" {
+            return None;
+        }
+        let (_, path) = line.split_once("=>")?;
+        Some(path.trim().to_string())
+    })
+}
+
+/// The NVIDIA driver's CUDA library on this host, if the driver is installed.
+///
+/// `None` is the node app's launch-time reading of "no GPU btxd could ever
+/// validate on"; see `node_host_backend` for what that answer decides and what
+/// it deliberately does not claim.
+pub fn cuda_driver_library() -> Option<std::path::PathBuf> {
+    cuda_driver_library_impl()
+}
+
+#[cfg(target_os = "windows")]
+fn cuda_driver_library_impl() -> Option<std::path::PathBuf> {
+    // The display driver installs the CUDA driver API here on every NVIDIA
+    // machine, and the CUDA runtime itself loads it from this path. Present on
+    // this project's RTX 3060 Windows host (4,714,728 bytes, 2026-09-15).
+    let root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    let dll = root.join("System32").join("nvcuda.dll");
+    dll.is_file().then_some(dll)
+}
+
+#[cfg(target_os = "linux")]
+fn cuda_driver_library_impl() -> Option<std::path::PathBuf> {
+    if let Some(found) = LINUX_CUDA_DRIVER_LIBRARY_PATHS
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.is_file())
+    {
+        return Some(found);
+    }
+    // A distro the list does not know: ask the loader cache. ldconfig lives in
+    // /sbin, which a desktop session's PATH may not carry, so the absolute
+    // paths come first; the first ldconfig that RUNS gives the answer.
+    for bin in ["/sbin/ldconfig", "/usr/sbin/ldconfig", "ldconfig"] {
+        if let Ok(out) = std::process::Command::new(bin).arg("-p").output() {
+            return libcuda_from_ldconfig(&String::from_utf8_lossy(&out.stdout))
+                .map(std::path::PathBuf::from);
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn cuda_driver_library_impl() -> Option<std::path::PathBuf> {
+    // macOS has had no CUDA driver since 10.13, and the node app runs Metal
+    // there. Nothing to look for.
+    None
+}
+
+/// The backend the NODE app launches btxd with on this host.
+///
+/// * macOS/aarch64 → `Metal`, at compile time: Apple Silicon self-qualifies.
+/// * everywhere else → `Cuda` when the NVIDIA driver's CUDA library is
+///   present, `Cpu` when it is not.
+///
+/// What the answer decides, and what it does NOT claim. Since 2026-09-15
+/// `node::build_node_command` splits non-Metal hosts on it: `Cuda` stays in
+/// explicit consensus mode and `Cpu` launches as a keyless trusted mirror
+/// (docs/decisions/2026-09-15-keyless-cpu-hosts-are-trusted-mirrors.md). So
+/// `Cuda` here means "a GPU exists that btxd COULD qualify", not "the card
+/// qualifies": a Pascal or Turing card carries the same driver and fails the
+/// startup canary, and such a host still takes the consensus path and stalls
+/// below the Epoch-A height. Only btxd's own verdict after start
+/// (`node::node_rc_status`) knows the difference, and routing on that is the
+/// refinement the decision names.
+///
+/// Why not the miner's probe. `detect_backend` asks `btx-matmul-backend-info`,
+/// which applies the matmul library's own device floor and would read a Pascal
+/// card as Cpu. The node packages do not ship that tool: `BUNDLED_NODE_BINARIES`
+/// lists it as best-effort and `apps/node/scripts/stage-node-pkg-linux-source.sh`
+/// copies `btxd` and `btx-cli` only. The driver library is the signal every
+/// install already has, with no new binary and no new dependency.
+///
+/// The `BTX_MATMUL_BACKEND` env this becomes steers MINING, which the node app
+/// never does; btxd chooses its RC validation provider by itself. Measured
+/// 2026-09-15 on this project's mainnet signer, a btxd this app launched with
+/// `BTX_MATMUL_BACKEND=cpu` in its environment: its debug.log reads
+/// `provider=cuda_rc_exact_fused_extract ready=1`. The backend matters here for
+/// the MODE, never for the device.
+///
+/// Says which it chose, and why, on stderr: a wrong classification is a wrong
+/// consensus posture, and the log is where a maintainer looks first.
+pub fn node_host_backend() -> Backend {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Backend::Metal
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        match cuda_driver_library() {
+            Some(lib) => {
+                eprintln!(
+                    "[node] host backend: cuda ({} present), consensus mode on a degraded-start engine",
+                    lib.display()
+                );
+                Backend::Cuda
+            }
+            None => {
+                eprintln!(
+                    "[node] host backend: cpu (no NVIDIA driver library found), trusted mirror on a degraded-start engine"
+                );
+                Backend::Cpu
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,5 +559,64 @@ mod tests {
         assert_eq!(s.selected, Backend::Metal);
         assert!(s.gpu_available);
         assert_eq!(s.reason, "metal_device_present");
+    }
+}
+
+#[cfg(test)]
+mod host_backend_tests {
+    use super::*;
+
+    /// Verbatim `ldconfig -p` lines from this project's RTX 3060 box (WSL2,
+    /// 2026-09-15). Only the driver's soname counts: the toolkit runtime and
+    /// the debugger library are present on machines with no GPU at all.
+    const LDCONFIG_WITH_DRIVER: &str = "\
+\tlibnvidia-ml.so.1 (libc6,x86-64) => /usr/lib/wsl/lib/libnvidia-ml.so.1
+\tlibcudart.so.13 (libc6,x86-64) => /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.13
+\tlibcudadebugger.so.1 (libc6,x86-64) => /usr/lib/wsl/lib/libcudadebugger.so.1
+\tlibcuda.so.1 (libc6,x86-64) => /usr/lib/wsl/lib/libcuda.so.1
+";
+
+    #[test]
+    fn the_driver_library_is_read_from_the_loader_cache() {
+        assert_eq!(
+            libcuda_from_ldconfig(LDCONFIG_WITH_DRIVER).as_deref(),
+            Some("/usr/lib/wsl/lib/libcuda.so.1")
+        );
+    }
+
+    #[test]
+    fn the_toolkit_runtime_alone_is_not_a_driver() {
+        // A box with CUDA installed for development and no NVIDIA card has
+        // libcudart and no libcuda. Counting the runtime would put such a host
+        // in consensus mode, where it stalls; that is the wrong direction for
+        // this signal to be wrong in.
+        let runtime_only = "\
+\tlibcudart.so.13 (libc6,x86-64) => /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.13
+\tlibcudadebugger.so.1 (libc6,x86-64) => /usr/lib/wsl/lib/libcudadebugger.so.1
+";
+        assert_eq!(libcuda_from_ldconfig(runtime_only), None);
+        assert_eq!(libcuda_from_ldconfig(""), None);
+        // The soname is the first token, not a substring anywhere on the line.
+        assert_eq!(
+            libcuda_from_ldconfig("\tlibfoo.so.1 (libc6,x86-64) => /opt/libcuda.so.1/x\n"),
+            None
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn apple_silicon_is_metal_without_asking() {
+        assert_eq!(node_host_backend(), Backend::Metal);
+    }
+
+    /// On a PC the answer is whatever the driver check says, and never Metal.
+    /// Impure by nature (it reads this machine), so it asserts consistency
+    /// between the two public functions rather than a fixed value.
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[test]
+    fn a_pc_is_never_metal_and_follows_its_driver() {
+        let backend = node_host_backend();
+        assert_ne!(backend, Backend::Metal);
+        assert_eq!(backend == Backend::Cuda, cuda_driver_library().is_some());
     }
 }
