@@ -11,7 +11,13 @@ import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { AmbientLine } from "./ambient";
 import { validationView } from "./validation";
-import { classifyCheckFailure, checkFailureMessage } from "./update-check";
+import {
+  classifyCheckFailure,
+  checkFailureMessage,
+  lastCheckLine,
+  updateCheckRecord,
+  type UpdateCheckBranch,
+} from "./update-check";
 import { contributionView } from "./contribution";
 import { mountPowerCore } from "./power-core";
 import { initAsk } from "./ask";
@@ -195,6 +201,14 @@ export interface NodeStatusInfo {
   /** True when the bind address accepts connections from other machines. */
   witness_public: boolean;
   witness_message: string | null;
+  /** The last self-update check as the backend persisted it: when it finished
+   *  (RFC 3339, UTC), one of the five words in UPDATE_CHECK_OUTCOMES, and the
+   *  short detail recorded with it. Null/empty until the first check finishes.
+   *  The "Last check" line under the Check-now button is rendered from these
+   *  on every tick, so the automatic path is no longer silent. */
+  last_update_check_at: string | null;
+  last_update_check_outcome: string | null;
+  last_update_check_detail: string;
 }
 
 /**
@@ -699,6 +713,10 @@ async function tick() {
     // changes — or vanishes when the node stops — is reflected while it is
     // being looked at, not only on the next open.
     reflectArchiveService(status);
+    // Same reason, same place: the "Last check" line is in Settings and is
+    // rendered from what the backend persisted, so it is right at launch and
+    // right within a tick of a check finishing, whoever started the check.
+    reflectLastUpdateCheck(status);
     reflectWalletEnabled(status.wallet_enabled);
     if (status.setup_complete) setupDone = true;
 
@@ -1625,6 +1643,45 @@ function setUpdateResult(text: string): void {
 // failed and will fail again.
 const MANUAL_DOWNLOAD = "easybtx.com/node";
 
+// The permanent "Last check" line under the Check-now button, rendered from
+// what the backend persisted (see recordUpdateCheck) on every status tick.
+// Until 2026-09-15 the automatic check painted nothing at all: this project's
+// own signer box ran 0.6.21 for eight hours after the feed served 0.6.22, two
+// six-hourly checks fell due in that window, and nothing on the machine could
+// say whether they ran, failed, or found nothing. Rendering from the persisted
+// value rather than from this session's memory is what makes the line true at
+// launch, before any check has run, and after the relaunch an install causes.
+function reflectLastUpdateCheck(status: NodeStatusInfo): void {
+  const el = $("update-last-check");
+  el.textContent = lastCheckLine(
+    {
+      at: status.last_update_check_at,
+      outcome: status.last_update_check_outcome,
+      detail: status.last_update_check_detail,
+    },
+    new Date(),
+    MANUAL_DOWNLOAD,
+  );
+  // The recorded detail (automatic or pressed, the error text) on hover; the
+  // line itself stays in plain words.
+  el.title = status.last_update_check_detail;
+}
+
+// Write down how this check ended: one line in <datadir>/update-check.log and
+// the last outcome in the settings file, through the backend. Called at EVERY
+// exit of updateCheck below, and update-check.test.ts reads this file to make
+// sure that stays true. Fire-and-forget by contract: a failure to record is a
+// console warning and changes nothing about the update itself. The settled
+// promise is returned for the one caller that is about to end the process and
+// wants the line on disk first.
+function recordUpdateCheck(branch: UpdateCheckBranch, manual: boolean): Promise<void> {
+  const rec = updateCheckRecord(branch, manual ? "manual" : "automatic");
+  return invoke("record_update_check", { outcome: rec.outcome, detail: rec.detail }).then(
+    () => undefined,
+    (e) => console.warn("update-check: could not record the outcome", e),
+  );
+}
+
 async function updateCheck(manual = false): Promise<void> {
   let update: Awaited<ReturnType<typeof checkForUpdate>>;
   try {
@@ -1636,11 +1693,13 @@ async function updateCheck(manual = false): Promise<void> {
     // saying it was sent Mac owners hunting a fault that did not exist on the
     // day 0.6.20 shipped Linux-only. classifyCheckFailure tells the two apart
     // by the plugin's own wording; update-check.test.ts pins both strings.
+    // Quiet on screen is no longer quiet everywhere: the outcome is recorded
+    // either way, with the classified reason.
+    const failure = classifyCheckFailure(e);
     if (manual) {
-      setUpdateResult(
-        checkFailureMessage(classifyCheckFailure(e), appVersion, MANUAL_DOWNLOAD),
-      );
+      setUpdateResult(checkFailureMessage(failure, appVersion, MANUAL_DOWNLOAD));
     }
+    void recordUpdateCheck({ branch: "check-failed", failure }, manual);
     return;
   }
 
@@ -1650,11 +1709,15 @@ async function updateCheck(manual = false): Promise<void> {
         appVersion ? `You're on the latest version (v${appVersion}).` : "You're on the latest version."
       );
     }
+    void recordUpdateCheck({ branch: "no-update", currentVersion: appVersion }, manual);
     return;
   }
 
   showUpdateBanner(`Update available: v${update.version}`, "— downloading…");
   setUpdateResult(`Update available: v${update.version} — downloading…`);
+  // Recorded before the download, so a check that found something and then
+  // died mid-download still left the finding behind.
+  void recordUpdateCheck({ branch: "found", version: update.version }, manual);
 
   try {
     await update.downloadAndInstall();
@@ -1668,15 +1731,26 @@ async function updateCheck(manual = false): Promise<void> {
     setUpdateResult(
       `Automatic update failed — get v${update.version} from ${MANUAL_DOWNLOAD} (${String(e).slice(0, 80)})`
     );
+    void recordUpdateCheck({ branch: "install-failed", version: update.version, error: e }, manual);
     return;
   }
 
   showUpdateBanner(`v${update.version} ready`, "— restarting…");
+  // Awaited, with a bound, unlike the others: relaunch() ends this process,
+  // and a record still in the IPC queue when it does is a record that was
+  // never written. Two seconds is a bound on a local file append that takes
+  // microseconds; it exists so a wedged backend cannot hold the restart
+  // hostage. The promise never rejects, so the flow cannot change here.
+  await Promise.race([
+    recordUpdateCheck({ branch: "installed", version: update.version }, manual),
+    new Promise<void>((resolve) => setTimeout(resolve, 2000)),
+  ]);
   try {
     await relaunch();
   } catch (e) {
     showUpdateBanner(`v${update.version} is installed`, "— restart the app to finish");
     setUpdateResult(`Installed. Restart to finish. (${String(e).slice(0, 80)})`);
+    void recordUpdateCheck({ branch: "relaunch-failed", version: update.version, error: e }, manual);
   }
 }
 

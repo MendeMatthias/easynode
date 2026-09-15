@@ -386,6 +386,10 @@
             <div class="setting-text">
               <span class="setting-name">Updates</span>
               <span class="setting-desc" id="update-check-result">Checks automatically on launch and every 6 hours</span>
+              <!-- Rendered from what the backend persisted, on every tick: the
+                   automatic check is no longer silent about what it did, and
+                   the line survives the relaunch an install causes. -->
+              <span class="setting-desc" id="update-last-check">Last check: none yet</span>
             </div>
             <button id="update-check-btn" class="btn-secondary" type="button">Check now</button>
           </div>

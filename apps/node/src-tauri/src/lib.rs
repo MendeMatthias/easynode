@@ -11,6 +11,7 @@ mod ask;
 mod commands;
 mod state;
 mod tray;
+mod update_log;
 mod wallet;
 
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
@@ -49,6 +50,7 @@ pub fn run() {
             commands::set_esplora_listen,
             commands::set_witness,
             commands::set_witness_listen,
+            commands::record_update_check,
             ask::ask_chain_progress,
             ask::ask_supply,
             ask::ask_next_halving,

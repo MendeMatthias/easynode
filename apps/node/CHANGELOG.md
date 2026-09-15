@@ -137,6 +137,36 @@ archive bit and nothing else. Macs are untouched: an Apple Silicon Mac still
 passes no mode flag and validates for itself, and the M5 fallback path is
 unchanged. A PC with a capable card is untouched.
 
+**Every update check now says what it did, on screen and on disk.** The app
+checks for a new version on launch and every six hours, and until now the
+result of that check went to exactly one place: the sentence beside the "Check
+now" button, and only when somebody had pressed it. An automatic check that
+found nothing said nothing. An automatic check that failed said nothing
+either, by design, because a six-hourly banner about being offline would have
+been noise. Measured 2026-09-15: this project's own signer box ran 0.6.21 for
+eight hours after the feed served 0.6.22, with two six-hourly checks due in
+that window, and nothing on the machine could say whether those checks ran,
+failed, or ran and found nothing. The release recipe has a step called
+"observe a real upgrade", and there was nothing to observe it with.
+
+Two things now hold the answer. Every check writes one line to
+`update-check.log` in the data folder, beside `setup.log` and through the same
+private file helper: when, which of five outcomes (`no-update`,
+`check-failed`, `found`, `install-failed`, `installed`), and a short detail
+that says whether the check was automatic or pressed, the version offered, and
+the error text when there was one. The file is kept under 64 KiB, so a node
+that runs for years does not grow it forever. And the last of those lines is
+kept in the app's settings file, from which Settings renders a permanent line
+under the button: "Last check: today 14:03 — you're on the latest version",
+or "couldn't check", or "v0.6.23 installed". It is rendered from the persisted
+value, so it is there at launch before any check has run this session, and it
+reads the same after the relaunch an install causes. The five words are one
+list on both sides of the app, and a test keeps them equal; the Rust side
+refuses a sixth unwritten. Writing the line can never change what the updater
+does: a failure to record is a console warning, and the one place the app is
+about to end its own process, the restart after an install, waits at most two
+seconds for the line to land first.
+
 ## [0.6.22] - 2026-09-15 · linux + windows (mac follows when built)
 
 **Your node will tell you when its own view of the chain has gone stale.**

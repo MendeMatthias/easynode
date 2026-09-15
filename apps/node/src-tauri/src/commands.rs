@@ -2254,6 +2254,16 @@ pub struct NodeStatusInfo {
     pub witness_public: bool,
     /// Why it is not running when it is on. `None` otherwise.
     pub witness_message: Option<String>,
+    /// The last self-update check: when it finished (RFC 3339, UTC), how it
+    /// ended (one of `update_log::UPDATE_CHECK_OUTCOMES`), and the short
+    /// detail recorded with it. `None`/empty until the first check finishes.
+    /// The pane's "Last check" line is rendered from these on every tick, so
+    /// the automatic check is no longer silent about what it did, and the line
+    /// reads the same after the relaunch an install causes. From the settings
+    /// file, where `record_update_check` keeps them.
+    pub last_update_check_at: Option<String>,
+    pub last_update_check_outcome: Option<String>,
+    pub last_update_check_detail: String,
 }
 
 #[tauri::command]
@@ -2606,6 +2616,9 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         esplora_indexing,
         esplora_freshness: esplora_verdict.map(|v| v.freshness.as_str().to_string()),
         esplora_message,
+        last_update_check_at: settings.last_update_check_at.clone(),
+        last_update_check_outcome: settings.last_update_check_outcome.clone(),
+        last_update_check_detail: settings.last_update_check_detail.clone(),
     })
 }
 
@@ -2960,6 +2973,25 @@ pub async fn set_node_nickname(name: String) -> Result<String, String> {
 pub async fn set_service_report(on: bool) -> Result<(), String> {
     NodeAppSettings::update(&node_datadir(), |s| s.service_report_enabled = on);
     Ok(())
+}
+
+/// Write down how a self-update check ended: one line in
+/// `<datadir>/update-check.log` and the last outcome in the settings file,
+/// which `get_node_status` carries so the pane's "Last check" line can show it
+/// without waiting for the next check. See `update_log` for the eight silent
+/// hours behind this.
+///
+/// `outcome` must be one of `update_log::UPDATE_CHECK_OUTCOMES`; anything else
+/// is refused and nothing is written. The front end calls this fire-and-forget
+/// at every exit of its `updateCheck()`, so an `Err` here reaches the console
+/// and never the update flow.
+#[tauri::command]
+pub async fn record_update_check(outcome: String, detail: String) -> Result<(), String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    crate::update_log::record(&node_datadir(), now, &outcome, &detail)
 }
 
 #[tauri::command]
