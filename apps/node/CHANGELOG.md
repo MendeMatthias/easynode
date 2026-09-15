@@ -8,6 +8,47 @@ root).
 
 ## [Unreleased]
 
+## [0.6.22] - 2026-09-14 · mac + linux + windows
+
+**Your node will tell you when its own view of the chain has gone stale.**
+Every chain signal on the status card was derived from the peers this node
+happens to have: blocks, headers, `getchaintips`, and therefore the fork
+verdict too. When a node and its peers are stuck together, all of them agree
+that nothing is wrong. That is not a thought experiment. On 13 September the
+network's explorer sat 878 blocks behind for twenty-one hours while its own
+health check reported green the entire time, because every threshold it owned
+compared that node against references that were stuck with it.
+
+A block's timestamp cannot agree with a stuck peer set: it comes from the
+chain. The card now says so when the newest block this node holds is more than
+two hours old, and that sentence outranks a fork warning, because a fork says
+there is a better chain we cannot reach while a stale tip says we are not
+following any chain at all. The check itself was already written and tested in
+this repository; it had simply only ever been wired into the wallet panel.
+
+**A node holding a signing key is no longer described as an archive serving
+history.** The engine clamps a node that holds a key to the last sixteen
+blocks and refuses everything older, while a node with NO key answers the full
+range. The app did not know the difference, so the machine least able to serve
+history was reported as "doing its job" — including this project's own signer,
+which is one of the peers the explorer asked on 13 September and was refused
+by. The status now names that state, and says plainly that what the network is
+short of is keyless archives.
+
+**The Esplora front's site address is a `Host` matcher**, which is documented
+now rather than rediscovered: a tunnel that forwards the public hostname
+unchanged matches no site block, and Caddy answers 200 with an empty body that
+reads exactly like a request that never arrived. `deploy/esplora/README.md`
+carries the one-line curl that settles it in seconds.
+
+**The electrs index is no longer an unmeasured cost.** A megabyte-sized BTX
+block carries one transaction of about 200 bytes and the rest is MatMul
+payload, so the whole chain holds roughly 43 MB of transaction data and the
+index that sits on top of it is under a gigabyte, not a fraction of 124 GiB.
+That makes keeping block files on a slow disk a correct design rather than a
+compromise.
+
+
 ## [0.6.21] - 2026-09-09 · mac + linux + windows
 
 **Your node dials the peers it was given.** The app shipped eleven bootstrap
