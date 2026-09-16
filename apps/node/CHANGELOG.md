@@ -8,6 +8,65 @@ root).
 
 ## [Unreleased]
 
+## [0.6.26] - 2026-09-16 · linux + windows (mac follows when built)
+
+**Every node with a capable graphics card now signs confirmations for the
+mirrors, so the explorer no longer depends on one home computer.** The
+explorer at btxscan.io, the wallets behind it and every GPU-less node follow the
+chain through signed confirmations, because they cannot check the proof of work
+themselves. Four keys are pinned there and one of them signed, from an RTX 3060
+in a home. On 16 September at 15:23Z that machine was switched off and the
+explorer stopped at 221,448 while the network went on to 221,464 and past; a
+test transaction sent through the frozen explorer was relayed and mined five
+minutes later, so money moved and nobody could see it there. Seventeen archive
+nodes helped nothing, because they pass signatures on and cannot make them, and
+the engine has said so on every start: "single-key trusted mirror ... configure
+a second independent signer". 0.6.23 gave the archive half to every GPU-less PC.
+This release gives the signer half to every node that checks blocks itself.
+From this release such a node keeps one signing key in its data folder, hands
+it to the engine, and signs a confirmation for every block it checks. The key
+is made on the machine, once, and never leaves it; the engine refuses to start
+without one (measured against the shipped 0.34.6: "Cannot read MatMul
+attestation signing key file"), so the app makes it rather than asking. A node
+that follows signatures instead of checking blocks, which is every machine
+without an NVIDIA driver and every refused Mac, cannot sign, and the setting
+says so there rather than pretending. **On by default for new installs, and
+turned on once for an existing node that was never asked**, the same rule as
+0.6.25, with the welcome panel saying so on the next launch; a switch somebody
+turned off stays off.
+
+**What you are being asked for is trust, not bandwidth, and the app says so.**
+Settings shows your public signing key with a copy button and this sentence
+under it: a mirror that pins this key takes your node's word for the proof of
+work, with no second check, so hand it only to an operator who asked you for
+it. The private key is never shown. To make your node a signer for the
+explorer, send that public key to its operator; they add one line to the
+mirror's configuration and restart it. Your node already dials the explorer's
+mirror when signing is on, so no port needs forwarding: a signature only helps
+a mirror that hears it, signatures travel to connected peers, and a node relays
+only the keys it pins, which is why this project's own signer has kept that
+link by hand since 2 September.
+
+**The role card says whether the key is actually doing anything.** "Signing
+key: Signing, on N of the last 100 blocks", read from the node's own stored
+confirmations, not from the setting. A configured key that is on none of the
+recent blocks reads as exactly that, in amber. This is the surface that was
+missing on 3 September, when a key was pinned in good faith and produced
+nothing for eleven days without anybody being told.
+
+**A signer is only useful while it is up.** Closing the window while the node
+is signing says, in the close dialog, that a mirror trusting only this key
+stops at its last block while the node is off. Keep-awake was already on by
+default. Launch at login is turned on when the welcome panel that announces
+signing is closed; both switches stay in Settings.
+
+**The witness answers one more question, for the census.** `GET
+/signers/recent` on the witness (the same server behind witness-1.easybtx.com)
+says which keys signed the last hundred blocks, as JSON, from a window it keeps
+current at two calls per new block. easybtx.com's node census has no other way
+to count live signers, and on 16 September that count was one. The two block
+routes are unchanged; every address, transaction and mempool route stays a 404.
+
 ## [0.6.25] - 2026-09-16 · mac + linux + windows
 
 **A node you already run starts helping too.** 0.6.24 turned on serving

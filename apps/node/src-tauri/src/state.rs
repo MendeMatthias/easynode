@@ -69,6 +69,16 @@ pub struct NodeAppSettings {
     /// every existing install, which is the entire population this is for.
     #[serde(default)]
     pub contribution_migrated: bool,
+    /// True once the signer migration has run on this install. Same pairing
+    /// as `contribution_migrated` and for the same reason: serde `false` so a
+    /// file from before the field is migrated, struct `true` so a new install
+    /// (which already signs from `Default`) is not migrated on top of it.
+    ///
+    /// A second flag rather than a reuse of the first: every 0.6.25 install
+    /// has `contribution_migrated: true` already, and the whole population
+    /// this is for is exactly those installs.
+    #[serde(default)]
+    pub signer_migrated: bool,
     /// True once the one-time welcome panel has been shown.
     ///
     /// The two defaults differ ON PURPOSE and it is the whole trick. The
@@ -134,6 +144,30 @@ pub struct NodeAppSettings {
     /// starts serving because they updated.
     #[serde(default)]
     pub attestation_serve_enabled: bool,
+    /// Sign confirmations for mirrors (`btx_core::signer`): on a node that
+    /// validates, keep a signing key and hand it to the engine, which then
+    /// signs an attestation for every block it validates. The mirrors that
+    /// pin the key (btxscan.io's explorer, the wallets behind it, every
+    /// GPU-less easyNode) follow those signatures instead of the proof.
+    ///
+    /// ON by default, and the one default here that the 2026-09-16 outage was
+    /// about: the whole network's mirrors were following ONE key on one home
+    /// computer, and when it was switched off at 15:23Z the explorer froze
+    /// while the chain went on. Every node with a card the engine accepts is
+    /// asked to do what that machine does. A node that mirrors (no CUDA
+    /// driver, a refused Mac) cannot sign, and the setting does nothing there;
+    /// the UI says so rather than showing a switch that lies.
+    ///
+    /// The migration (`migrate_signer`) turns it on for existing installs
+    /// that were never asked, the same rule as `contribution_migrated`, and
+    /// the welcome panel says so on the next launch. An explicit `false` is a
+    /// choice and stays.
+    ///
+    /// What is being asked of the operator is trust, not bandwidth: at
+    /// threshold one a pinned key is a full authority, and the Settings copy
+    /// says so next to the public key.
+    #[serde(default)]
+    pub signer_enabled: bool,
     /// Write a local `service-report.json` next to the datadir every few
     /// minutes: uptime, heights, peers, bytes served, archive-peer summary,
     /// stall verdict. LOCAL FILE ONLY — nothing phones home; this is the
@@ -235,6 +269,7 @@ impl Default for NodeAppSettings {
             // A fresh machine gets the services from these defaults, so it
             // needs no migration; it only needs the panel.
             contribution_migrated: true,
+            signer_migrated: true,
             // A fresh machine has not seen it. See the field's docs for why
             // this disagrees with the serde default.
             welcome_shown: false,
@@ -250,6 +285,9 @@ impl Default for NodeAppSettings {
             // docs. All are cheap, none opens a port, and first run shows
             // them so this is opt-out rather than something done quietly.
             attestation_serve_enabled: true,
+            // The signer role, on. See the field: this is the one the
+            // explorer's freeze on 2026-09-16 was about.
+            signer_enabled: true,
             service_report_enabled: true,
             node_profile: default_profile(),
             // No nickname. Anything else would publish an identifier the user
@@ -333,6 +371,50 @@ impl NodeAppSettings {
             }
         });
         changed
+    }
+
+    /// Has this install never been asked about signing? Read from the RAW
+    /// json for the reason `services_never_chosen` gives: the struct cannot
+    /// tell an absent key from a deliberate `false`, and only the absent one
+    /// is ours to fill in. Unreadable means "touch nothing".
+    pub fn signer_never_chosen(raw: &str) -> bool {
+        serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|v| v.as_object().map(|o| !o.contains_key("signer_enabled")))
+            .unwrap_or(false)
+    }
+
+    /// Turn signing on for an install that was never asked, once.
+    ///
+    /// `applies_here` is whether this host will launch as a validator (the
+    /// only place a key signs anything, `btx_core::node::launches_as_mirror`
+    /// negated). The setting is recorded either way, so a machine that later
+    /// gains a card signs without being asked again; the welcome panel is
+    /// armed only where the change means something today, because a panel
+    /// announcing a role the machine cannot fill would be noise on exactly the
+    /// machines that already got the 0.6.25 panel.
+    ///
+    /// Returns true when the setting was turned on AND the panel was armed.
+    pub fn migrate_signer(datadir: &std::path::Path, applies_here: bool) -> bool {
+        let path = datadir.join(SETTINGS_FILE_NAME);
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return false; // no file at all is a new install; Default covers it
+        };
+        if Self::load(datadir).signer_migrated {
+            return false;
+        }
+        let never_chosen = Self::signer_never_chosen(&raw);
+        let announce = never_chosen && applies_here;
+        Self::update(datadir, |s| {
+            if never_chosen {
+                s.signer_enabled = true;
+            }
+            s.signer_migrated = true;
+            if announce {
+                s.welcome_shown = false;
+            }
+        });
+        announce
     }
 
     pub fn save(&self, datadir: &std::path::Path) -> std::io::Result<()> {
@@ -508,6 +590,21 @@ pub struct AppState {
     /// know the method, and absence is reported as unknown, never as "no".
     /// Cleared on every stop/start like the others. See `btx_core::role`.
     pub matmul_trusted: Arc<Mutex<Option<btx_core::node_api::MatmulTrustedStatus>>>,
+    /// Who signed the newest hundred blocks, from the node's own attestation
+    /// store, kept current by the refresher only while the engine reports a
+    /// local signer (`btx_core::signer::RecentSigners`). This is how the role
+    /// card says "your key was on N of the last 100 blocks" instead of
+    /// "a key is configured", which is the sentence that hid the 2026-09-03
+    /// key that signed nothing. Cleared on every stop/start like the others.
+    pub recent_signers: Arc<Mutex<Option<btx_core::signer::RecentSigners>>>,
+    /// The public key of the signing key on disk, read once at start (and
+    /// when the switch is flipped) so the status poll does not derive a curve
+    /// point from a file every second. `None` when there is no readable key.
+    pub signer_pubkey: Arc<Mutex<Option<String>>>,
+    /// Whether the last start decided this host validates (a key can sign)
+    /// or mirrors (it cannot), from `btx_core::node::launches_as_mirror`.
+    /// `None` before the first start of this app run.
+    pub signer_applies_here: Arc<Mutex<Option<bool>>>,
     /// The fork detector's verdict — a longer chain this node cannot obtain
     /// blocks for — computed by the refresher from `getchaintips` and the
     /// headers/blocks gap. Cleared on every stop/start like the others, so a
@@ -607,6 +704,9 @@ impl AppState {
             stall_verdict: Arc::new(Mutex::new(None)),
             archive_service: Arc::new(Mutex::new(None)),
             matmul_trusted: Arc::new(Mutex::new(None)),
+            recent_signers: Arc::new(Mutex::new(None)),
+            signer_pubkey: Arc::new(Mutex::new(None)),
+            signer_applies_here: Arc::new(Mutex::new(None)),
             fork: Arc::new(Mutex::new(None)),
             tip_median_time: Arc::new(Mutex::new(None)),
             archive_peers_cache: Arc::new(Mutex::new(None)),
@@ -770,6 +870,87 @@ mod tests {
             serde_json::from_str(r#"{"setup_complete":true,"contribution_migrated":true}"#)
                 .unwrap();
         assert!(done.contribution_migrated, "and it does not run twice");
+    }
+
+    /// The signer migration: on for everyone who was never asked, a deliberate
+    /// `false` kept, once only, and the panel armed only where a key can sign.
+    #[test]
+    fn the_signer_migration_turns_signing_on_once_and_respects_a_no() {
+        assert!(
+            NodeAppSettings::default().signer_enabled,
+            "a new install signs"
+        );
+        assert!(
+            NodeAppSettings::default().signer_migrated,
+            "and needs no migration on top of that"
+        );
+        let old: NodeAppSettings = serde_json::from_str(r#"{"setup_complete":true}"#).unwrap();
+        assert!(
+            !old.signer_migrated,
+            "a file predating the flag has not run it"
+        );
+        assert!(
+            !old.signer_enabled,
+            "and reads as off until the migration runs"
+        );
+
+        assert!(NodeAppSettings::signer_never_chosen(
+            r#"{"setup_complete":true,"contribution_migrated":true}"#
+        ));
+        assert!(!NodeAppSettings::signer_never_chosen(
+            r#"{"signer_enabled":false}"#
+        ));
+        assert!(!NodeAppSettings::signer_never_chosen(
+            r#"{"signer_enabled":true}"#
+        ));
+        assert!(!NodeAppSettings::signer_never_chosen("{ nope"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join(SETTINGS_FILE_NAME);
+
+        // A 0.6.25 install on a validating host: turned on, told.
+        std::fs::write(
+            &settings_path,
+            r#"{"setup_complete":true,"contribution_migrated":true,"welcome_shown":true}"#,
+        )
+        .unwrap();
+        assert!(NodeAppSettings::migrate_signer(dir.path(), true));
+        let s = NodeAppSettings::load(dir.path());
+        assert!(s.signer_enabled && s.signer_migrated && !s.welcome_shown);
+        // Once: switching it off afterwards is a choice the next launch keeps.
+        NodeAppSettings::update(dir.path(), |s| {
+            s.signer_enabled = false;
+            s.welcome_shown = true;
+        });
+        assert!(!NodeAppSettings::migrate_signer(dir.path(), true));
+        let s = NodeAppSettings::load(dir.path());
+        assert!(!s.signer_enabled && s.welcome_shown);
+
+        // The same install on a host that mirrors: the setting is recorded
+        // for the day it gains a card, but nobody is interrupted about it.
+        std::fs::write(
+            &settings_path,
+            r#"{"setup_complete":true,"contribution_migrated":true,"welcome_shown":true}"#,
+        )
+        .unwrap();
+        assert!(!NodeAppSettings::migrate_signer(dir.path(), false));
+        let s = NodeAppSettings::load(dir.path());
+        assert!(s.signer_enabled && s.signer_migrated && s.welcome_shown);
+
+        // A deliberate no survives.
+        std::fs::write(
+            &settings_path,
+            r#"{"setup_complete":true,"signer_enabled":false,"welcome_shown":true}"#,
+        )
+        .unwrap();
+        assert!(!NodeAppSettings::migrate_signer(dir.path(), true));
+        let s = NodeAppSettings::load(dir.path());
+        assert!(!s.signer_enabled && s.signer_migrated && s.welcome_shown);
+
+        // No settings file: a new install, nothing to migrate.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!NodeAppSettings::migrate_signer(empty.path(), true));
+        assert!(!empty.path().join(SETTINGS_FILE_NAME).exists());
     }
 
     /// The welcome panel shows once, to a new install, and never to somebody

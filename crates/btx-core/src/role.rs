@@ -69,6 +69,12 @@ pub const HEADERS_AHEAD_IS_BEHIND: u64 = 2;
 /// cards flip on the same tick.
 pub const REACHABILITY_GRACE_SECS: u64 = 30 * 60;
 
+/// How many recent blocks the signed-block window must have read before "on
+/// none of them" is a verdict rather than a window that has barely started.
+/// Ten blocks is about fifteen minutes of chain; a node that validated ten
+/// blocks and signed none of them is telling us something.
+pub const SIGNED_WINDOW_MIN_SEEN: u64 = 10;
+
 /// The P2P port a router has to forward for this node to be reachable. Only
 /// ever quoted to a person, never dialled from here.
 const P2P_PORT: u16 = 19335;
@@ -139,6 +145,12 @@ pub struct NodeRole {
     /// and the line says so instead of judging a state that is about to end.
     #[serde(skip)]
     archive_pending_restart: bool,
+    /// How many of the newest blocks carry this node's own signature, read
+    /// from the node's stored attestations (`btx_core::signer`). `None` until
+    /// the window has been read, or when the node holds no key. This is the
+    /// difference between "a key is configured" and "the key is doing
+    /// something", which no surface could show on 2026-09-03.
+    pub signed_recent: Option<crate::signer::SignedRecent>,
 }
 
 /// Parse `getnetworkinfo.localservices` (16 hex chars, `0x` tolerated).
@@ -247,10 +259,29 @@ pub fn node_role(
         blocks_behind,
         archive,
         archive_pending_restart,
+        signed_recent: None,
     }
 }
 
 impl NodeRole {
+    /// Attach what the signed-block window says. Separate from [`node_role`]
+    /// because the window is read on a different cadence from the facts above
+    /// and is simply absent on the many nodes that hold no key.
+    pub fn with_signed_recent(
+        mut self,
+        signed_recent: Option<crate::signer::SignedRecent>,
+    ) -> Self {
+        self.signed_recent = signed_recent;
+        self
+    }
+
+    /// Holds a key AND validates: the only state in which the key produces
+    /// signatures that mirrors can follow. The close dialog and the welcome
+    /// panel ask this.
+    pub fn signs_for_mirrors(&self) -> bool {
+        self.holds_signing_key == Some(true) && self.validates_independently()
+    }
+
     /// The archive verdict this role reports, after reconciliation.
     pub fn archive_service(&self) -> &ArchiveService {
         &self.archive
@@ -332,12 +363,12 @@ impl NodeRole {
     fn key_line(&self) -> RoleLine {
         let (value, helps, note) = match (self.holds_signing_key, self.validation_mode) {
             (None, _) => (
-                "Unknown",
+                "Unknown".to_string(),
                 None,
                 "The engine did not answer. No answer is not evidence of no key.".to_string(),
             ),
             (Some(false), _) => (
-                "None",
+                "None".to_string(),
                 None,
                 "Ordinary. Most nodes hold none, and a node without a key can serve the full \
                  range of history, which is what the network is short of."
@@ -347,34 +378,61 @@ impl NodeRole {
             // never had a chance: a mirror is on the receiving end of
             // signatures by construction.
             (Some(true), ValidationMode::Trusted) => (
-                "Present, signing nothing",
+                "Present, signing nothing".to_string(),
                 Some(false),
                 "This node follows attestations rather than producing them, so the key signs \
                  nothing here. A key only produces signatures on a node that validates blocks \
                  itself."
                     .to_string(),
             ),
-            (Some(true), ValidationMode::Consensus) if self.advertises_consensus => (
-                "Present",
-                Some(true),
-                "Signs attestations for the blocks it validates, which the nodes that cannot \
-                 validate follow."
-                    .to_string(),
-            ),
+            // The signer. What the window says outranks what the config says:
+            // a configured key that is on none of the recent blocks is not
+            // helping anyone yet, and the line must not read "helps" on the
+            // strength of a setting.
+            (Some(true), ValidationMode::Consensus) if self.advertises_consensus => {
+                match self.signed_recent {
+                    Some(w) if w.seen >= SIGNED_WINDOW_MIN_SEEN && w.signed == 0 => (
+                        format!("Present, on none of the last {} blocks", w.seen),
+                        Some(false),
+                        "This node validates and holds a key, but none of the recent blocks \
+                         carries its signature. A key signs only blocks this node fully \
+                         validated itself; if it stays at none, the node is still catching up \
+                         or the engine is not accepting the card."
+                            .to_string(),
+                    ),
+                    Some(w) if w.seen > 0 => (
+                        format!("Signing, on {} of the last {} blocks", w.signed, w.seen),
+                        Some(true),
+                        "Signs a confirmation for every block it validates. Mirrors that pin \
+                         this key follow it instead of checking the proof themselves, so this \
+                         is what keeps them moving. At threshold one a pinned key is a full \
+                         authority: they take this node's word for it."
+                            .to_string(),
+                    ),
+                    _ => (
+                        "Present, signing".to_string(),
+                        Some(true),
+                        "Signs a confirmation for every block it validates, which the mirrors \
+                         that cannot validate follow. How many recent blocks carry it shows \
+                         here once the node has read them."
+                            .to_string(),
+                    ),
+                }
+            }
             (Some(true), ValidationMode::Consensus) => (
-                "Present, signing nothing",
+                "Present, signing nothing".to_string(),
                 Some(false),
                 "A key only signs blocks this node has validated, and in its degraded state it \
                  validates none."
                     .to_string(),
             ),
             (Some(true), ValidationMode::Relay) => (
-                "Present, signing nothing",
+                "Present, signing nothing".to_string(),
                 Some(false),
                 "A relay validates nothing, so the key signs nothing.".to_string(),
             ),
             (Some(true), ValidationMode::Unknown) => (
-                "Present",
+                "Present".to_string(),
                 None,
                 "Whether it produces signatures depends on how this node validates, which the \
                  engine did not say."
@@ -383,7 +441,7 @@ impl NodeRole {
         };
         RoleLine {
             label: "Signing key",
-            value: value.to_string(),
+            value,
             helps,
             note,
         }
@@ -751,6 +809,102 @@ mod tests {
         let k = line(&k_line, "Signing key");
         assert_eq!(k.helps, Some(false));
         assert!(k.value.contains("signing nothing"), "{}", k.value);
+    }
+
+    /// The signer role's own line: what the window says outranks what the
+    /// config says. This is the surface that was missing on 2026-09-03 (a key
+    /// pinned in good faith, zero signatures, eleven days, nobody told) and
+    /// the one the 2026-09-16 outage asks for: "signing: your key was on N of
+    /// the last 100 blocks", so an operator knows they are actually helping.
+    #[test]
+    fn a_validating_signer_says_how_many_recent_blocks_carry_its_key() {
+        use crate::signer::SignedRecent;
+        let signer = || {
+            node_role(
+                Some(&status("consensus", true)),
+                CONSENSUS_BITS,
+                &[],
+                5,
+                86_400,
+                Some(0),
+                Some(&ArchiveService::NotServing),
+            )
+        };
+        assert!(signer().signs_for_mirrors());
+        assert!(!node_role(
+            Some(&status("trusted", true)),
+            ARCHIVE_ONLY_BITS,
+            &[],
+            5,
+            86_400,
+            Some(0),
+            None
+        )
+        .signs_for_mirrors());
+
+        // Window not read yet: the key is present and the line promises the
+        // count rather than inventing one.
+        let k = line(&signer().lines(), "Signing key").clone();
+        assert_eq!(k.value, "Present, signing");
+        assert_eq!(k.helps, Some(true));
+
+        // The good case, with the trust statement in it.
+        let r = signer().with_signed_recent(Some(SignedRecent {
+            signed: 97,
+            seen: 100,
+            window: 100,
+        }));
+        let k = line(&r.lines(), "Signing key").clone();
+        assert_eq!(k.value, "Signing, on 97 of the last 100 blocks");
+        assert_eq!(k.helps, Some(true));
+        assert!(k.note.contains("full authority"), "{}", k.note);
+        assert!(k.note.contains("keeps them moving"), "{}", k.note);
+
+        // Just after a start: a handful of blocks read, none signed yet, is
+        // not a verdict.
+        let r = signer().with_signed_recent(Some(SignedRecent {
+            signed: 0,
+            seen: SIGNED_WINDOW_MIN_SEEN - 1,
+            window: 100,
+        }));
+        let k = line(&r.lines(), "Signing key").clone();
+        assert_eq!(k.helps, Some(true), "{}", k.value);
+        assert!(
+            k.value.starts_with("Signing, on 0 of the last"),
+            "{}",
+            k.value
+        );
+
+        // Enough blocks read and none carry the key: says so, and does not
+        // claim to help on the strength of a setting.
+        let r = signer().with_signed_recent(Some(SignedRecent {
+            signed: 0,
+            seen: 40,
+            window: 100,
+        }));
+        let k = line(&r.lines(), "Signing key").clone();
+        assert_eq!(k.value, "Present, on none of the last 40 blocks");
+        assert_eq!(k.helps, Some(false));
+        assert!(k.note.contains("catching up"), "{}", k.note);
+
+        // The window never changes what a non-validating key reads as.
+        let mirror = node_role(
+            Some(&status("trusted", true)),
+            ARCHIVE_ONLY_BITS,
+            &[],
+            5,
+            86_400,
+            Some(0),
+            None,
+        )
+        .with_signed_recent(Some(SignedRecent {
+            signed: 50,
+            seen: 100,
+            window: 100,
+        }));
+        let k = line(&mirror.lines(), "Signing key").clone();
+        assert_eq!(k.value, "Present, signing nothing");
+        assert_eq!(k.helps, Some(false));
     }
 
     /// (e) Not reachable inbound, after the grace period: the line names the
@@ -1122,7 +1276,8 @@ mod tests {
     /// role: { validation_mode: string; holds_signing_key: boolean | null;
     ///         advertises_consensus: boolean; advertises_archive: boolean;
     ///         reachable_inbound: boolean; inbound: number; uptime_secs: number;
-    ///         blocks_behind: number | null } | null;
+    ///         blocks_behind: number | null;
+    ///         signed_recent: { signed: number; seen: number; window: number } | null } | null;
     /// role_lines: { label: string; value: string; helps: boolean | null; note: string }[];
     /// ```
     ///
@@ -1151,6 +1306,7 @@ mod tests {
                 "inbound": 2,
                 "uptime_secs": 600,
                 "blocks_behind": 1,
+                "signed_recent": null,
             })
         );
         let unknown = node_role(None, "", &[], 0, 0, None, None);
@@ -1158,6 +1314,17 @@ mod tests {
         assert_eq!(v["validation_mode"], "unknown");
         assert!(v["holds_signing_key"].is_null());
         assert!(v["blocks_behind"].is_null());
+        let signing = r
+            .clone()
+            .with_signed_recent(Some(crate::signer::SignedRecent {
+                signed: 97,
+                seen: 100,
+                window: 100,
+            }));
+        assert_eq!(
+            serde_json::to_value(&signing).unwrap()["signed_recent"],
+            serde_json::json!({ "signed": 97, "seen": 100, "window": 100 })
+        );
 
         let lines = r.lines();
         let l = &lines[1];

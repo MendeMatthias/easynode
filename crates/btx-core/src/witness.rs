@@ -48,6 +48,18 @@
 //! looked wrong would disappear at the exact moment a fork made it useful.
 //! Judging is the caller's job.
 //!
+//! ── THE ONE ADDITION SINCE, AND WHY IT IS THE SAME KIND OF THING ────────────
+//! `GET /signers/recent` (2026-09-16): which keys signed the last hundred
+//! blocks, as JSON, read from the node's own stored attestations
+//! (`btx_core::signer::RecentSigners`). It exists because the census on
+//! easybtx.com has no other way to count live signers: the checker on Vercel
+//! speaks P2P to probe nodes and has no RPC anywhere, and the number it needs
+//! to publish, honestly, was ONE on the day btxscan froze for want of that one.
+//! It is a chain fact from the block index and the attestation store, exactly
+//! the class the two hash routes are; it is not an address, a balance, a
+//! transaction or a mempool, and those stay 404. The PQ wallet's egress gate
+//! does not list this route and is unaffected by its existence.
+//!
 //! ── THE SERVER ──────────────────────────────────────────────────────────────
 //! Hand-written HTTP over tokio rather than a web framework. Two read-only GET
 //! routes on loopback do not justify a new dependency tree in a crate that
@@ -162,6 +174,14 @@ const MAX_INFLIGHT: usize = 8;
 /// caller's: it bounds what a flood of tip requests can push onto btxd.
 const TIP_TTL: Duration = Duration::from_secs(1);
 
+/// How long the signer window is reused before the node is asked what changed.
+///
+/// Refreshing is incremental (two RPCs per new block, see
+/// `signer::refresh_recent_signers`), so this bounds the poll rate rather than
+/// the cost; a cold window costs two hundred calls once. Half a block time is
+/// plenty for a census that runs every thirty minutes.
+const SIGNERS_TTL: Duration = Duration::from_secs(30);
+
 /// How long, and how much, is drained off a socket before it is closed.
 const DRAIN_GRACE: Duration = Duration::from_millis(100);
 const MAX_DRAIN: usize = 64 * 1024;
@@ -174,6 +194,10 @@ pub enum WitnessRoute {
     TipHeight,
     /// `GET /block-height/<h>` — the block hash at that height, as bare hex.
     BlockHash(u64),
+    /// `GET /signers/recent` — which keys signed the newest blocks, as JSON
+    /// (`signer::RecentSignersSummary`). Served from a window the server keeps
+    /// current, never computed from scratch per request.
+    RecentSigners,
 }
 
 /// Parse the request line of an HTTP request: `GET /path HTTP/1.1`.
@@ -223,6 +247,7 @@ pub fn route(method: &str, path: &str) -> Option<WitnessRoute> {
     match path.split('/').collect::<Vec<_>>().as_slice() {
         ["", "blocks", "tip", "height"] => Some(WitnessRoute::TipHeight),
         ["", "block-height", h] => parse_height(h).map(WitnessRoute::BlockHash),
+        ["", "signers", "recent"] => Some(WitnessRoute::RecentSigners),
         _ => None,
     }
 }
@@ -235,6 +260,11 @@ pub fn route(method: &str, path: &str) -> Option<WitnessRoute> {
 /// `Access-Control-Allow-Origin`, which browsers reject outright and which
 /// broke the web wallet once already.
 pub fn http_response(status: u16, body: &str) -> Vec<u8> {
+    http_response_typed(status, "text/plain; charset=utf-8", body)
+}
+
+/// The same response with a stated content type; the signer window is JSON.
+pub fn http_response_typed(status: u16, content_type: &str, body: &str) -> Vec<u8> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -244,7 +274,7 @@ pub fn http_response(status: u16, body: &str) -> Vec<u8> {
     };
     format!(
         "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
          X-Content-Type-Options: nosniff\r\n\
          Connection: close\r\n\
@@ -281,6 +311,39 @@ pub async fn answer(rpc: &dyn Rpc, r: WitnessRoute) -> (u16, String) {
                 Err(_) => (404, "no block at that height".to_string()),
             }
         }
+        // Answered from the server's window, not from here: a per-request
+        // computation would be two hundred RPCs per caller, which is the
+        // flood this module's whole bound exists to prevent.
+        WitnessRoute::RecentSigners => {
+            (500, "the signer window is served by the server".to_string())
+        }
+    }
+}
+
+/// The signer window the server keeps: brought up to the tip at most once per
+/// `SIGNERS_TTL`, otherwise reused. Only a successful tip read advances it.
+#[derive(Default)]
+pub struct SignersCache(
+    tokio::sync::Mutex<(Option<tokio::time::Instant>, crate::signer::RecentSigners)>,
+);
+
+impl SignersCache {
+    /// The window's summary, refreshed first if it is older than the TTL.
+    /// Never fails: a node that does not answer leaves the last window in
+    /// place, which is still true about the blocks it holds, and an empty
+    /// window says `seen: 0` rather than inventing a count.
+    pub async fn summary(&self, rpc: &dyn Rpc) -> crate::signer::RecentSignersSummary {
+        let mut guard = self.0.lock().await;
+        let fresh = guard.0.is_some_and(|at| at.elapsed() < SIGNERS_TTL);
+        if !fresh {
+            if let Ok(info) = crate::node_api::get_blockchain_info(rpc).await {
+                // A whole window at once when cold, then two calls per block.
+                let budget = crate::signer::SIGNED_WINDOW_BLOCKS as usize;
+                crate::signer::refresh_recent_signers(rpc, &mut guard.1, info.blocks, budget).await;
+                guard.0 = Some(tokio::time::Instant::now());
+            }
+        }
+        guard.1.summary()
     }
 }
 
@@ -363,8 +426,14 @@ impl TipCache {
     }
 }
 
-async fn serve_one(rpc: Arc<dyn Rpc>, tip: Arc<TipCache>, mut stream: TcpStream) {
+async fn serve_one(
+    rpc: Arc<dyn Rpc>,
+    tip: Arc<TipCache>,
+    signers: Arc<SignersCache>,
+    mut stream: TcpStream,
+) {
     let deadline = tokio::time::Instant::now() + READ_TIMEOUT;
+    let mut content_type = "text/plain; charset=utf-8";
     let (status, body) = match read_request_line(&mut stream, deadline).await {
         Err(code) => (code, String::new()),
         Ok(line) => match parse_request_line(&line).and_then(|(m, p)| route(m, p)) {
@@ -378,11 +447,21 @@ async fn serve_one(rpc: Arc<dyn Rpc>, tip: Arc<TipCache>, mut stream: TcpStream)
                     answered
                 }
             },
+            Some(WitnessRoute::RecentSigners) => {
+                content_type = "application/json";
+                let summary = signers.summary(rpc.as_ref()).await;
+                match serde_json::to_string(&summary) {
+                    Ok(json) => (200, json),
+                    Err(_) => (500, "{}".to_string()),
+                }
+            }
             Some(r) => answer(rpc.as_ref(), r).await,
             None => (404, "not found".to_string()),
         },
     };
-    let _ = stream.write_all(&http_response(status, &body)).await;
+    let _ = stream
+        .write_all(&http_response_typed(status, content_type, &body))
+        .await;
     let _ = stream.flush().await;
     finish(&mut stream).await;
 }
@@ -413,6 +492,7 @@ impl WitnessServer {
         let task = tokio::spawn(async move {
             let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT));
             let tip = Arc::new(TipCache::default());
+            let signers = Arc::new(SignersCache::default());
             loop {
                 // The permit is taken BEFORE accept, deliberately. At the bound
                 // the connections wait in the kernel's backlog and the callers
@@ -426,8 +506,9 @@ impl WitnessServer {
                     Ok((stream, _)) => {
                         let rpc = rpc.clone();
                         let tip = tip.clone();
+                        let signers = signers.clone();
                         tokio::spawn(async move {
-                            serve_one(rpc, tip, stream).await;
+                            serve_one(rpc, tip, signers, stream).await;
                             drop(permit);
                         });
                     }
@@ -489,9 +570,77 @@ mod tests {
                     }
                     Ok(json!(format!("{:064x}", h)))
                 }
+                // Even heights carry one signature from a fixed key, odd
+                // heights none, so a window's counts are predictable.
+                "getmatmulattestations" => {
+                    let hash = params[0].as_str().unwrap_or("");
+                    let h = u64::from_str_radix(hash, 16).unwrap_or(1);
+                    if h.is_multiple_of(2) {
+                        Ok(json!([format!("00ff21{STUB_SIGNER}463044deadbeef")]))
+                    } else {
+                        Ok(json!([]))
+                    }
+                }
                 other => panic!("a witness must never call {other}"),
             }
         }
+    }
+
+    const STUB_SIGNER: &str = "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675";
+
+    /// The signer census route: JSON, from the node's attestations, served
+    /// from a window rather than recomputed, and never a promise about
+    /// anything but who signed.
+    #[tokio::test]
+    async fn recent_signers_is_json_from_a_window_the_server_keeps() {
+        assert_eq!(
+            route("GET", "/signers/recent"),
+            Some(WitnessRoute::RecentSigners)
+        );
+        assert_eq!(route("GET", "/signers/recent?x=1"), None);
+        assert_eq!(route("POST", "/signers/recent"), None);
+        assert_eq!(route("GET", "/signers"), None);
+
+        let node = Arc::new(StubNode { height: 211_500 });
+        let server = WitnessServer::start(node, "127.0.0.1:0").await.unwrap();
+        let got = ask(server.addr, "GET /signers/recent HTTP/1.1\r\n\r\n").await;
+        assert!(got.starts_with("HTTP/1.1 200"), "{got:?}");
+        assert!(
+            got.contains("Content-Type: application/json\r\n"),
+            "{got:?}"
+        );
+        let body = got.split("\r\n\r\n").nth(1).unwrap();
+        let v: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["window"], 100);
+        assert_eq!(v["seen"], 100);
+        assert_eq!(v["tip"], 211_500);
+        assert_eq!(v["blocks_with_signature"], 50);
+        assert_eq!(v["distinct_keys"], 1);
+        assert_eq!(v["keys"][STUB_SIGNER], 50);
+        server.stop();
+    }
+
+    /// A cold window is two hundred calls once; a warm one is reused for the
+    /// TTL and then costs two calls per new block, never two hundred per
+    /// request. This is what lets the route exist under MAX_INFLIGHT.
+    #[tokio::test]
+    async fn the_signer_window_is_reused_not_recomputed_per_request() {
+        let node = Arc::new(CountingNode::new(Duration::ZERO));
+        let calls = node.calls.clone();
+        let server = WitnessServer::start(node, "127.0.0.1:0").await.unwrap();
+        let first = ask(server.addr, "GET /signers/recent HTTP/1.1\r\n\r\n").await;
+        assert!(first.starts_with("HTTP/1.1 200"), "{first:?}");
+        let cold = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!((100..=201).contains(&cold), "cold fill made {cold} calls");
+        for _ in 0..10 {
+            ask(server.addr, "GET /signers/recent HTTP/1.1\r\n\r\n").await;
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            cold,
+            "ten warm requests must cost the node nothing"
+        );
+        server.stop();
     }
 
     /// A node that counts what it is asked and how much of it happens at once.
@@ -530,6 +679,7 @@ mod tests {
                     "initialblockdownload": false,
                 })),
                 "getblockhash" => Ok(json!(format!("{:064x}", 7))),
+                "getmatmulattestations" => Ok(json!([])),
                 other => panic!("a witness must never call {other}"),
             }
         }

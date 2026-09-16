@@ -18,11 +18,12 @@
 //! and it is the single source of CORS, so this emits none.
 //!
 //! It reads nothing but the node's `.cookie` and answers nothing but those two
-//! routes. Every `/address`, `/tx`, `/mempool` and broadcast route is a 404 by
-//! construction: a node serving witness data has made no promise about an
-//! address index, and the defect that retired the last independent witness was
-//! an address index that answered every route confidently while not recording
-//! spends.
+//! routes, plus `GET /signers/recent` since 2026-09-16: which keys signed the
+//! last hundred blocks, for the census (see `btx_core::witness`). Every
+//! `/address`, `/tx`, `/mempool` and broadcast route is a 404 by construction:
+//! a node serving witness data has made no promise about an address index, and
+//! the defect that retired the last independent witness was an address index
+//! that answered every route confidently while not recording spends.
 
 use btx_core::rpc::RpcClient;
 use btx_core::witness::{WitnessServer, WITNESS_ADDR};
@@ -30,7 +31,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 const USAGE: &str = "\
-btx-witness — serve /blocks/tip/height and /block-height/<h> from a BTX node
+btx-witness — serve /blocks/tip/height, /block-height/<h> and /signers/recent from a BTX node
 
 USAGE:
     btx-witness --datadir <path> [--rpc <addr:port>] [--listen <addr:port>]

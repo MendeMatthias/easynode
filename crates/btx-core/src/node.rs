@@ -893,13 +893,11 @@ pub fn build_node_command(
         // with it set gets explicit consensus, the 0.6.15 through 0.6.22
         // posture.
         let degraded_start = node_allows_degraded_matmul_start(btxd);
-        // The operator's explicit word outranks the backend split in both
-        // directions: =1 puts a Cuda host on the mirror, =0 keeps a Cpu host
-        // in consensus. Unset, the backend decides.
-        let cuda_validates_here = degraded_start
-            && matches!(backend, Backend::Cuda)
-            && trusted_mirror_override() != Some(true);
-        let mirror_here = trusted_mirror_required(backend, datadir) && !cuda_validates_here;
+        // Which arm, decided in ONE place: `launches_as_mirror` is the same
+        // rule the app's start path asks before it hands the engine a signing
+        // key, so the two can never disagree about whether this host follows
+        // signatures or makes them.
+        let mirror_here = launches_as_mirror(btxd, datadir, backend);
         // Consensus mode must be EXPLICIT, not the absence of a flag. Measured
         // 2026-09-01 on this box's real 0.6.5-era install: btxd persists its
         // runtime settings in the datadir's btx_rw.conf (the fork's read-write
@@ -930,6 +928,24 @@ pub fn build_node_command(
             if degraded_start {
                 // 0.34.5 and newer refuse a mainnet mirror at M<2 without this.
                 args.push("-allowsinglekeytrustedmirror=1".to_string());
+            }
+        }
+        // The signer role (btx_core::signer). The conf carries the key, put
+        // there by the app's start path only on a host that validates; this
+        // adds the other half, the LINK. A signature only helps a mirror that
+        // hears it, attestations travel to connected peers, and a node relays
+        // only the keys it pins, so a volunteer's signature reaches the
+        // explorer's mirror over a direct connection or not at all. Dialling
+        // the mirror from here means the operator forwards no port and the
+        // mirror's admin adds exactly one line: the pin. This box's validator
+        // has kept the same link by hand (addnode in its btx_rw.conf plus a
+        // shell loop) since 2026-09-02; this is that link, shipped.
+        //
+        // Never on the mirror arm: a mirror consumes attestations, and a key
+        // there signs nothing (role.rs, the 2026-09-03 case).
+        if !mirror_here && signs_here(conf) {
+            for mirror in crate::signer::BTX_MIRRORS_FED_BY_SIGNERS {
+                args.push(format!("-addnode={mirror}"));
             }
         }
     }
@@ -1497,6 +1513,35 @@ pub fn clear_matmul_consensus_refused(datadir: &Path) {
 /// removing the part that was false: that Apple Silicon always qualifies.
 pub fn trusted_mirror_required(backend: Backend, datadir: &Path) -> bool {
     trusted_mirror_enabled(backend) || matmul_consensus_was_refused(datadir)
+}
+
+/// Will this host be launched as a trusted mirror (follows signatures) rather
+/// than a validator (may make them)? The one rule, used by `build_node_command`
+/// for the `-matmulvalidation` arm and by the app's start path to decide
+/// whether a signing key belongs in the conf at all.
+///
+/// The operator's explicit word (`EASYBTX_NODE_TRUSTED_MIRROR`) outranks the
+/// backend split in both directions: `=1` puts a Cuda host on the mirror, `=0`
+/// keeps a Cpu host in consensus. Unset, the backend decides: a Cuda host
+/// validates, a Cpu host mirrors (2026-09-15), a refused Mac mirrors, and
+/// Metal with a clear marker validates. Only on an engine that allows a
+/// degraded start; before 0.34.5 the split does not apply.
+pub fn launches_as_mirror(btxd: &Path, datadir: &Path, backend: Backend) -> bool {
+    let degraded_start = node_allows_degraded_matmul_start(btxd);
+    let cuda_validates_here = degraded_start
+        && matches!(backend, Backend::Cuda)
+        && trusted_mirror_override() != Some(true);
+    trusted_mirror_required(backend, datadir) && !cuda_validates_here
+}
+
+/// Does the conf hand the engine a signing key? The app's start path writes
+/// `matmulattestationsignerkeyfile=` into the conf when the signer role is on
+/// for a host that validates, and removes it otherwise; the launch reads the
+/// conf rather than the setting so a hand-managed conf (this project's own
+/// validator until 0.6.26) gets the same link.
+pub fn signs_here(conf: &Path) -> bool {
+    crate::setup::conf_kv(conf, crate::signer::SIGNER_KEY_CONF_KEY)
+        .is_some_and(|v| !v.trim().is_empty())
 }
 
 /// macOS SIGKILLs a downloaded binary with "Code Signature Invalid" at exec when
@@ -3971,6 +4016,78 @@ consensus-validator service.";
             // that does not refuses cleanly where rc_stalled can see it.
             assert!(args.iter().any(|a| a == "-matmulrcexecution=strict-device"));
         }
+    }
+
+    /// The signer role's link (btx_core::signer). A conf that hands the engine
+    /// a signing key makes the node dial the mirrors this project's signers
+    /// feed, on the validating arm only, and the whole manual set still fits
+    /// the engine's eight slots. Measured need, not a nicety: attestations
+    /// travel only to connected peers and are relayed only by nodes that pin
+    /// the key, so without this line a volunteer's signatures never reach
+    /// api.btxscan.io's mirror unless they forward a port and the mirror's
+    /// admin adds their address by hand.
+    #[test]
+    fn a_conf_with_a_signing_key_dials_the_mirrors_it_feeds_and_stays_in_budget() {
+        let dir = std::env::temp_dir().join(format!("easynode-signer-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let signing = dir.join("signing.conf");
+        std::fs::write(
+            &signing,
+            "server=1\nmatmulattestationsignerkeyfile=attestation-signer.key\n",
+        )
+        .unwrap();
+        let keyless = dir.join("keyless.conf");
+        std::fs::write(&keyless, "server=1\n").unwrap();
+        let blank = dir.join("blank.conf");
+        std::fs::write(&blank, "matmulattestationsignerkeyfile=\n").unwrap();
+
+        assert!(signs_here(&signing));
+        assert!(!signs_here(&keyless));
+        assert!(!signs_here(&blank), "an empty value is no key");
+        assert!(!signs_here(&dir.join("missing.conf")));
+
+        let mirror_addnodes = |args: &[String]| {
+            crate::signer::BTX_MIRRORS_FED_BY_SIGNERS
+                .iter()
+                .filter(|m| args.iter().any(|a| a == &format!("-addnode={m}")))
+                .count()
+        };
+        let btxd = Path::new("/x/btx/v0.34.6/lin/btxd");
+
+        // A validating host with a key dials every mirror, exactly once each.
+        let (_, args, _) = build_node_command(btxd, Path::new("/dd"), &signing, Backend::Cuda);
+        assert_eq!(validation_modes(&args), vec!["consensus"]);
+        assert_eq!(
+            mirror_addnodes(&args),
+            crate::signer::BTX_MIRRORS_FED_BY_SIGNERS.len(),
+            "{args:?}"
+        );
+        let addnodes = args.iter().filter(|a| a.starts_with("-addnode=")).count();
+        assert!(
+            addnodes <= MAX_MANUAL_PEERS,
+            "{addnodes} manual peers for {MAX_MANUAL_PEERS} slots: the mirror link would \
+             evict a block source or never be dialled: {args:?}"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for a in args.iter().filter(|a| a.starts_with("-addnode=")) {
+            assert!(
+                seen.insert(a.clone()),
+                "duplicate manual peer {a}: the engine does not dedupe"
+            );
+        }
+
+        // The same host without a key dials none of them.
+        let (_, args, _) = build_node_command(btxd, Path::new("/dd"), &keyless, Backend::Cuda);
+        assert_eq!(mirror_addnodes(&args), 0, "{args:?}");
+
+        // A mirror host with the line in its conf still dials none: a mirror
+        // consumes attestations, and a key there signs nothing.
+        let (_, args, _) = build_node_command(btxd, Path::new("/dd"), &signing, Backend::Cpu);
+        assert_eq!(validation_modes(&args), vec!["trusted"]);
+        assert_eq!(mirror_addnodes(&args), 0, "{args:?}");
+        assert!(launches_as_mirror(btxd, Path::new("/dd"), Backend::Cpu));
+        assert!(!launches_as_mirror(btxd, Path::new("/dd"), Backend::Cuda));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

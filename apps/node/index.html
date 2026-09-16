@@ -308,6 +308,33 @@
             </label>
           </div>
 
+          <!-- The signer role (btx_core::signer). The switch is the whole
+               ask of the 2026-09-16 outage: btxscan froze because ONE key on
+               one home computer signed, and the app had no way to add a
+               second. The copy under the key says what is being asked for,
+               which is trust rather than bandwidth. -->
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Sign confirmations for mirrors</span>
+              <span class="setting-desc" id="signer-desc">Your node signs each block it checks, so the nodes that cannot check blocks themselves, the explorer's included, can follow yours. Applies on next start</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="signer-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <p class="setting-result" id="signer-result" hidden></p>
+          <div class="setting-row setting-row-stacked" id="signer-key-row" hidden>
+            <div class="setting-text">
+              <span class="setting-name">Your public signing key</span>
+              <span class="setting-desc">This key is public: every confirmation your node signs carries it. The private key stays in your data folder and never leaves this machine. A mirror that pins this key takes your node's word for the proof of work, with no second check, so hand it only to an operator who asked you for it</span>
+            </div>
+            <div class="nickname-row">
+              <code id="signer-pubkey" class="signer-pubkey" aria-label="Public signing key"></code>
+              <button id="signer-copy-btn" class="btn-secondary" type="button">Copy key</button>
+            </div>
+          </div>
+
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Write a local service report</span>
@@ -470,13 +497,31 @@
             <h2 id="welcome-title">Your node is live</h2>
           </div>
 
-          <p class="welcome-lede">
-            It is already doing these three things for BTX. All of them are
+          <p class="welcome-lede" id="welcome-lede">
+            It is already doing these things for BTX. All of them are
             free to give, none of them opens a port on your router, and every
             one can be turned off in Settings.
           </p>
 
           <ul class="role-lines" id="welcome-role-list">
+            <!-- Shown only where the machine can sign (a card the engine
+                 accepts). On a mirror host it is hidden rather than shown
+                 crossed out: that host already got its own panel. -->
+            <li class="role-line is-helps" id="welcome-signer-item" hidden>
+              <div class="role-row">
+                <span class="role-mark" role="img" aria-label="on"></span>
+                <span class="role-label">Signing confirmations for mirrors</span>
+                <span class="role-value">On</span>
+              </div>
+              <p class="role-note">
+                Your graphics card checks every block, and your node now signs
+                each one it checks. The explorer and the wallets behind it
+                follow those signatures, and until now they all followed one
+                key on one home computer. Your public key is in Settings; the
+                private key never leaves this machine. Launch at login turns on
+                with this, so your signature keeps coming; both are in Settings.
+              </p>
+            </li>
             <li class="role-line is-helps">
               <div class="role-row">
                 <span class="role-mark" role="img" aria-label="on"></span>
@@ -725,6 +770,15 @@
               Your node can keep running in the <span data-tray-term>menu bar</span> so it keeps supporting the
               network, or you can stop it and quit. Quitting stops your node until
               you open the app again.
+            </p>
+            <!-- Shown only while the engine reports this node holding a key
+                 AND validating: the state in which quitting freezes somebody
+                 else's mirror. From the wire, not from the setting. -->
+            <p class="ask-intro needs-attention" id="close-signer-warning" hidden>
+              This node is signing confirmations that mirrors depend on. While
+              it is off, a mirror that trusts only this key stops at its last
+              block, the way the explorer did on 16 September, and money that
+              moves meanwhile does not show there until it is back.
             </p>
             <label class="close-remember">
               <input type="checkbox" id="close-remember" />

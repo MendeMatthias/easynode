@@ -38,6 +38,7 @@ pub mod role;
 pub mod rpc;
 pub mod service_report;
 pub mod setup;
+pub mod signer;
 pub mod snapshot;
 pub mod supply;
 pub mod wallet_format;
