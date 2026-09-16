@@ -460,6 +460,81 @@
       </div>
 
       <!-- ── About (info) overlay ────────────────────────────────────── -->
+      <!-- One-time greeting on a brand new install. Not a setting: the
+           services it lists are already on (NodeAppSettings::default), and
+           this is where the user is told so and can name the node. Existing
+           installs never see it, see NodeAppSettings::welcome_shown. -->
+      <div class="overlay" id="welcome-overlay" hidden>
+        <div class="overlay-panel" role="dialog" aria-modal="true" aria-labelledby="welcome-title">
+          <div class="overlay-head">
+            <h2 id="welcome-title">Your node is live</h2>
+          </div>
+
+          <p class="welcome-lede">
+            It is already doing these three things for BTX. All of them are
+            free to give, none of them opens a port on your router, and every
+            one can be turned off in Settings.
+          </p>
+
+          <ul class="role-lines" id="welcome-role-list">
+            <li class="role-line is-helps">
+              <div class="role-row">
+                <span class="role-mark" role="img" aria-label="on"></span>
+                <span class="role-label">Serving confirmations</span>
+                <span class="role-value">On</span>
+              </div>
+              <p class="role-note">
+                Hands other nodes the signatures that prove old blocks. It is
+                the scarcest thing on the network and costs about 208 bytes a
+                block.
+              </p>
+            </li>
+            <li class="role-line is-helps">
+              <div class="role-row">
+                <span class="role-mark" role="img" aria-label="on"></span>
+                <span class="role-label">Answering wallets</span>
+                <span class="role-value">On</span>
+              </div>
+              <p class="role-note">
+                A BTX wallet on this computer can settle a fork against your
+                own node instead of trusting someone else's server. This
+                answers only this machine.
+              </p>
+            </li>
+            <li class="role-line is-helps">
+              <div class="role-row">
+                <span class="role-mark" role="img" aria-label="on"></span>
+                <span class="role-label">Keeping a service report</span>
+                <span class="role-value">On</span>
+              </div>
+              <p class="role-note">
+                Writes what your node has served to a file in your data folder.
+                Local only. Nothing is uploaded.
+              </p>
+            </li>
+          </ul>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Give it a name</span>
+              <span class="setting-desc">
+                Optional, and other nodes see it. Leave it blank to stay unnamed.
+              </span>
+            </div>
+          </div>
+          <div class="nickname-row">
+            <input id="welcome-nickname" class="wallet-input" type="text" maxlength="24"
+                   placeholder="unnamed" autocomplete="off" spellcheck="false"
+                   aria-label="Node nickname" />
+          </div>
+          <p class="setting-result is-error" id="welcome-nickname-error" hidden></p>
+
+          <div class="nickname-row welcome-actions">
+            <button id="welcome-done" class="btn-primary" type="button">Start helping</button>
+          </div>
+        </div>
+      </div>
+
       <div class="overlay" id="info-overlay" hidden>
         <div class="overlay-panel" role="dialog" aria-modal="true" aria-labelledby="info-title">
           <div class="overlay-head">

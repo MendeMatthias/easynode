@@ -46,6 +46,16 @@ pub struct NodeAppSettings {
     /// once). A returning user skips the wizard and auto-starts the node.
     #[serde(default)]
     pub setup_complete: bool,
+    /// True once the one-time welcome panel has been shown.
+    ///
+    /// The two defaults differ ON PURPOSE and it is the whole trick. The
+    /// struct's `Default` is `false`, and `load` reaches it only when there is
+    /// no settings file, so a brand new install sees the panel. The serde
+    /// default is `true`, which fills the field in for a file that predates
+    /// it, so nobody who already runs a node is shown a welcome for a node
+    /// they set up weeks ago.
+    #[serde(default = "default_true")]
+    pub welcome_shown: bool,
     /// True once `loadtxoutset` has SUCCEEDED against this datadir (or the
     /// chain advanced past the snapshot). Gates snapshot.dat reclaim — see
     /// btx_core::snapshot (C3).
@@ -86,8 +96,19 @@ pub struct NodeAppSettings {
     /// (`matmulattestationserve=1`). The single scarcest service on today's
     /// network (census 2026-08-17: one reachable full-history archive
     /// network-wide) and cheap to give: ~208 bytes/block, rate-limited by
-    /// protocol. Opt-in at first per Paper 3 patch 7; a later release can
-    /// flip the default once the fleet's serve path is field-proven.
+    /// protocol.
+    ///
+    /// ON by default since 2026-09-16, which is the flip this comment used to
+    /// promise "once the fleet's serve path is field-proven". It is: 18
+    /// archives have served attestations since 0.6.21 and the signer link
+    /// stopped being a single point because of them. A node that keeps this
+    /// to itself costs the network the one thing it is short of.
+    ///
+    /// The default reaches NEW installs only. `NodeAppSettings::load` falls
+    /// back to `Default` just when no settings file exists, and every field is
+    /// `#[serde(default)]`, so an existing user's saved choice is read back
+    /// unchanged and a field they never had stays `false`. Nobody's node
+    /// starts serving because they updated.
     #[serde(default)]
     pub attestation_serve_enabled: bool,
     /// Write a local `service-report.json` next to the datadir every few
@@ -129,10 +150,17 @@ pub struct NodeAppSettings {
     #[serde(default = "default_esplora_listen")]
     pub esplora_listen: String,
     /// Serve the two routes a wallet needs to settle a fork
-    /// (`btx_core::witness`). Off by default, and unlike Esplora mode it needs
-    /// no second binary and no particular prune posture: the server is
-    /// compiled into this app and reads block hashes from the node's index,
-    /// which every node has.
+    /// (`btx_core::witness`). Unlike Esplora mode it needs no second binary
+    /// and no particular prune posture: the server is compiled into this app
+    /// and reads block hashes from the node's index, which every node has.
+    ///
+    /// ON by default for new installs since 2026-09-16. It binds
+    /// `WITNESS_ADDR`, `127.0.0.1:3081`, so it opens NO port to the network
+    /// and reaches only this machine: a wallet running here can settle a fork
+    /// against a node its owner runs instead of trusting someone's server.
+    /// Serving other machines still means changing the bind to `0.0.0.0`,
+    /// which stays an explicit choice because there is no proxy in front of it
+    /// (see the header of `btx_core::witness`).
     #[serde(default)]
     pub witness_enabled: bool,
     /// Where the witness binds. Loopback by default: accepting connections
@@ -181,6 +209,9 @@ impl Default for NodeAppSettings {
     fn default() -> Self {
         Self {
             setup_complete: false,
+            // A fresh machine has not seen it. See the field's docs for why
+            // this disagrees with the serde default.
+            welcome_shown: false,
             snapshot_loaded: false,
             btx_release_tag: None,
             keep_awake: true,
@@ -189,15 +220,18 @@ impl Default for NodeAppSettings {
             wallet_name: None,
             wallet_address: None,
             on_close: default_on_close(),
-            attestation_serve_enabled: false,
-            service_report_enabled: false,
+            // The three below are ON for a new install. See each field's
+            // docs. All are cheap, none opens a port, and first run shows
+            // them so this is opt-out rather than something done quietly.
+            attestation_serve_enabled: true,
+            service_report_enabled: true,
             node_profile: default_profile(),
             // No nickname. Anything else would publish an identifier the user
             // never chose to publish.
             node_nickname: String::new(),
             esplora_enabled: false,
             esplora_listen: default_esplora_listen(),
-            witness_enabled: false,
+            witness_enabled: true,
             witness_listen: default_witness_listen(),
             // No check has finished yet, and the pane says so in those words.
             last_update_check_at: None,
@@ -517,7 +551,22 @@ mod tests {
         assert!(s.wallet_name.is_none());
         assert_eq!(s.on_close, "ask", "the red X asks until the user decides");
         assert!(!s.esplora_enabled, "Esplora mode is opt-in, never default");
-        assert!(!s.witness_enabled, "witnessing is opt-in, never default");
+        // Changed 2026-09-16, deliberately. A new install now contributes the
+        // three things that are cheap and expose nothing, and first run shows
+        // them so it is opt-out. Esplora stays opt-in: it needs a second
+        // binary, the full chain and an index.
+        assert!(
+            s.attestation_serve_enabled,
+            "a new node serves attestations: the scarcest service on the network, ~208 bytes/block"
+        );
+        assert!(
+            s.service_report_enabled,
+            "the service report is written locally and uploaded nowhere"
+        );
+        assert!(
+            s.witness_enabled,
+            "a new node answers block-hash questions so a wallet here can settle a fork against it"
+        );
         assert_eq!(
             s.witness_listen,
             btx_core::witness::WITNESS_ADDR,
@@ -525,13 +574,80 @@ mod tests {
         );
         assert!(
             !btx_core::witness::is_public_bind(&s.witness_listen),
-            "the default must not accept connections from outside"
+            "ENABLED is not EXPOSED: the witness runs by default but must never \
+             accept connections from outside until someone chooses that"
         );
         assert_eq!(
             s.esplora_listen,
             btx_core::esplora_sidecar::DEFAULT_LISTEN,
             "the front starts on localhost until an operator names it"
         );
+    }
+
+    /// The defaults above reach NEW installs only. This is the half that
+    /// protects everyone who already runs one: updating the app must never
+    /// start a service on somebody's machine because we changed our minds.
+    ///
+    /// `load` uses `Default` only when there is no settings file. Every field
+    /// is `#[serde(default)]`, which fills a MISSING field with the field
+    /// type's default, `false` for a bool, and not with the value in our
+    /// `Default` impl. So an old file, and a file that predates these fields
+    /// entirely, both read back with the services off.
+    #[test]
+    fn an_existing_install_is_never_switched_on_by_an_update() {
+        // A settings file from before these fields existed.
+        let old: NodeAppSettings =
+            serde_json::from_str(r#"{"setup_complete":true,"keep_awake":true}"#).unwrap();
+        assert!(old.setup_complete, "this is an existing user");
+        assert!(
+            !old.attestation_serve_enabled,
+            "an update must not start serving attestations for them"
+        );
+        assert!(
+            !old.witness_enabled,
+            "an update must not start the witness for them"
+        );
+        assert!(
+            !old.service_report_enabled,
+            "an update must not start writing reports"
+        );
+
+        // And a user who said no explicitly still gets no.
+        let refused: NodeAppSettings = serde_json::from_str(
+            r#"{"setup_complete":true,"attestation_serve_enabled":false,"witness_enabled":false}"#,
+        )
+        .unwrap();
+        assert!(
+            !refused.attestation_serve_enabled,
+            "their choice is read back, not overridden"
+        );
+        assert!(
+            !refused.witness_enabled,
+            "their choice is read back, not overridden"
+        );
+
+        // A fresh machine, by contrast, contributes.
+        let fresh = NodeAppSettings::default();
+        assert!(fresh.attestation_serve_enabled && fresh.witness_enabled);
+    }
+
+    /// The welcome panel shows once, to a new install, and never to somebody
+    /// who set their node up before it existed.
+    #[test]
+    fn the_welcome_panel_is_for_new_installs_only() {
+        assert!(
+            !NodeAppSettings::default().welcome_shown,
+            "no settings file means a brand new install: show it"
+        );
+        let existing: NodeAppSettings =
+            serde_json::from_str(r#"{"setup_complete":true,"keep_awake":true}"#).unwrap();
+        assert!(
+            existing.welcome_shown,
+            "a file that predates the field belongs to someone already running a node"
+        );
+        let seen: NodeAppSettings =
+            serde_json::from_str(r#"{"setup_complete":true,"welcome_shown":true}"#).unwrap();
+        assert!(seen.welcome_shown, "and it does not come back");
     }
 
     #[test]

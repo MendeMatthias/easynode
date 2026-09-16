@@ -40,6 +40,7 @@ pub fn run() {
             commands::set_attestation_serve,
             commands::set_node_nickname,
             commands::set_service_report,
+            commands::mark_welcome_shown,
             commands::reclaim_disk_now,
             commands::node_footprint,
             commands::remove_node_data_now,

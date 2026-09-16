@@ -78,6 +78,8 @@ export interface NodeStatusInfo {
   node_tag: string;
   installed: boolean;
   setup_complete: boolean;
+  /** False only on a brand new install that has not seen the welcome panel. */
+  welcome_shown: boolean;
   keep_awake: boolean;
   keep_awake_supported: boolean;
   tray_term: string;
@@ -562,6 +564,58 @@ function renderContribution(status: NodeStatusInfo) {
   $("contribution-detail").textContent = view.detail;
 }
 
+/** The one-time greeting on a brand new install.
+ *
+ *  Shown once, and only when the backend says so. `welcome_shown` is false
+ *  only when there was no settings file at all, so an existing user updating
+ *  the app is never greeted for a node they set up weeks ago
+ *  (NodeAppSettings::welcome_shown carries the serde trick that makes those
+ *  two cases differ).
+ *
+ *  The services it lists are already ON, from the defaults. This panel exists
+ *  so that is said out loud rather than done quietly, and so the node can be
+ *  given a name while somebody is looking at it. */
+let welcomeOpen = false;
+
+function maybeShowWelcome(status: NodeStatusInfo) {
+  if (welcomeOpen || status.welcome_shown || !status.setup_complete) return;
+  welcomeOpen = true;
+  $("welcome-overlay").hidden = false;
+  $<HTMLInputElement>("welcome-nickname").focus();
+}
+
+async function closeWelcome() {
+  const input = $<HTMLInputElement>("welcome-nickname");
+  const err = $("welcome-nickname-error");
+  const btn = $<HTMLButtonElement>("welcome-done");
+  btn.disabled = true;
+  try {
+    // Only touch the nickname when one was typed. An empty box means "stay
+    // unnamed", which is already the stored value, and calling the setter for
+    // it would be a write with nothing to write.
+    if (input.value.trim()) {
+      await invoke<string>("set_node_nickname", { name: input.value });
+    }
+  } catch (e) {
+    // Same rule as the Settings field: the Rust side refuses anything btxd
+    // would reject, so this is a sentence about what to type. Keep the panel
+    // open so the name is not silently lost.
+    err.textContent = String(e);
+    err.hidden = false;
+    btn.disabled = false;
+    return;
+  }
+  // Mark it seen only after the name is settled, so a refusal above cannot
+  // cost the user the panel.
+  try {
+    await invoke("mark_welcome_shown");
+  } catch (e) {
+    console.error("could not mark the welcome as shown", e);
+  }
+  $("welcome-overlay").hidden = true;
+  btn.disabled = false;
+}
+
 /** The gap samples behind the "catching up" wording. Module scope because the
  *  poll loop calls renderStatus repeatedly and the trend needs history; the
  *  arithmetic itself is pure and tested in catchup-trend.test.ts. */
@@ -752,6 +806,7 @@ async function tick() {
     reflectLastUpdateCheck(status);
     reflectWalletEnabled(status.wallet_enabled);
     if (status.setup_complete) setupDone = true;
+    maybeShowWelcome(status);
 
     if (setupDone && !setupInFlight) {
       renderStatus(status);
@@ -1405,6 +1460,7 @@ async function saveNickname(): Promise<void> {
 }
 
 $("nickname-save").addEventListener("click", () => void saveNickname());
+$("welcome-done").addEventListener("click", () => void closeWelcome());
 $("nickname-input").addEventListener("keydown", (e) => {
   if ((e as KeyboardEvent).key === "Enter") void saveNickname();
 });
