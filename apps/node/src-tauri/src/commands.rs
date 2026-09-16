@@ -295,6 +295,14 @@ fn node_backend() -> Backend {
     btx_core::backend::node_host_backend()
 }
 
+/// A btxd path that carries this build's engine tag and nothing else, for the
+/// rules that read only the tag (`btx_core::node::launches_as_mirror` and the
+/// degraded-start gate behind it) before the real install path is resolved.
+/// The same shape node.rs's own tests use.
+pub fn nominal_btxd_path() -> PathBuf {
+    PathBuf::from(format!("/nominal/btx/{NODE_RELEASE_TAG}/bin/btxd"))
+}
+
 /// Wait budget for a freshly-spawned node's RPC: 360 × 500 ms = 3 min covers a
 /// cold start / slow disk; a node that is ALIVE but warming (RPC_IN_WARMUP)
 /// keeps the wait going inside wait_for_node_rpc's poll loop, and a healthy
@@ -696,7 +704,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
         );
     }
 
-    let whitelist_ips =
+    let mut whitelist_ips =
         tauri::async_runtime::spawn_blocking(btx_core::node::resolve_managed_whitelist_ips)
             .await
             .unwrap_or_else(|_| {
@@ -707,6 +715,65 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
                     .map(|s| s.to_string())
                     .collect()
             });
+
+    // ── The signer role (btx_core::signer) ──────────────────────────────────
+    // Decided here, before the conf is finished, from the same rule the
+    // launch uses for the -matmulvalidation arm: a host that will follow
+    // signatures cannot make them, so it gets no key line whatever the
+    // setting says, and the UI is told so. A host that validates gets the
+    // key (generated once, adopted if already there) in the conf, the mirror
+    // it feeds in the whitelist (the mirror asks for attestations in bursts
+    // while catching up, and the engine bans aggressive askers), and its
+    // public key kept where the status poll can show it.
+    let signer_applies_here =
+        !btx_core::node::launches_as_mirror(&paths.btxd, &datadir, node_backend());
+    *state.signer_applies_here.lock().await = Some(signer_applies_here);
+    let signs_here = settings.signer_enabled && signer_applies_here;
+    let mut signer_pubkey = None;
+    if signs_here {
+        match btx_core::signer::ensure_signer_key(&datadir) {
+            Ok(key) => {
+                if key.created {
+                    eprintln!(
+                        "[node-app] generated a signing key; public key {}",
+                        key.pubkey_hex
+                    );
+                }
+                signer_pubkey = Some(key.pubkey_hex);
+                if let Err(e) = btx_core::setup::set_conf_kv(
+                    &paths.faststart_conf,
+                    btx_core::signer::SIGNER_KEY_CONF_KEY,
+                    Some(btx_core::signer::SIGNER_KEY_FILE),
+                ) {
+                    eprintln!("[node-app] could not write the signing key line to the conf: {e}");
+                }
+                for ip in btx_core::signer::BTX_MIRROR_WHITELIST_IPS {
+                    if !whitelist_ips.iter().any(|w| w == ip) {
+                        whitelist_ips.push(ip.to_string());
+                    }
+                }
+            }
+            Err(e) => {
+                // A key that cannot be read or made must not stop the node:
+                // the engine refuses to start on a bad key file, so the line
+                // comes out and the node runs keyless this time. Said in the
+                // log and on the Settings row (signer_pubkey stays None).
+                eprintln!("[node-app] signing is on but the key is unusable, running keyless: {e}");
+                let _ = btx_core::setup::set_conf_kv(
+                    &paths.faststart_conf,
+                    btx_core::signer::SIGNER_KEY_CONF_KEY,
+                    None,
+                );
+            }
+        }
+    } else if let Err(e) = btx_core::setup::set_conf_kv(
+        &paths.faststart_conf,
+        btx_core::signer::SIGNER_KEY_CONF_KEY,
+        None,
+    ) {
+        eprintln!("[node-app] could not remove the signing key line from the conf: {e}");
+    }
+    *state.signer_pubkey.lock().await = signer_pubkey;
     let _ = btx_core::setup::set_managed_whitelist_block(&paths.faststart_conf, &whitelist_ips);
 
     // Re-assert the app-owned conf keys on EVERY start, not just after setup.
@@ -847,6 +914,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     state.peer_nicknames_cache.lock().await.clear();
     *state.archive_service.lock().await = None;
     *state.matmul_trusted.lock().await = None;
+    *state.recent_signers.lock().await = None;
     *state.fork.lock().await = None;
     *state.tip_median_time.lock().await = None;
 
@@ -1306,6 +1374,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
     let nickname_slot = state.peer_nicknames_cache.clone();
     let archive_service_slot = state.archive_service.clone();
     let matmul_trusted_slot = state.matmul_trusted.clone();
+    let recent_signers_slot = state.recent_signers.clone();
     let fork_slot = state.fork.clone();
     let tip_time_slot = state.tip_median_time.clone();
     let anchor = snapshot_spec().anchor_height;
@@ -1559,6 +1628,27 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                                 blocks_behind,
                                 has_local_signer,
                             ));
+
+                        // ── Is the key actually signing? ────────────────────
+                        // Only a node the engine says holds a key pays for
+                        // this, and it pays two RPCs per NEW block once the
+                        // window is full: `heights_to_read` re-reads the tip
+                        // and asks for what it lacks, so a fresh start fills
+                        // the hundred-block window over four ticks at 25 a
+                        // tick (~0.5 s of RPC at 10 ms a call, against a 3 s
+                        // period) and then idles. A node with no key keeps
+                        // no window at all: no claim without a measurement.
+                        {
+                            let mut window = recent_signers_slot.lock().await;
+                            if has_local_signer {
+                                let w =
+                                    window.get_or_insert_with(btx_core::signer::RecentSigners::new);
+                                btx_core::signer::refresh_recent_signers(&rpc, w, chain.blocks, 25)
+                                    .await;
+                            } else {
+                                *window = None;
+                            }
+                        }
                     }
 
                     // ── Is there a longer chain this node cannot obtain? ────
@@ -2075,6 +2165,19 @@ pub struct NodeStatusInfo {
     /// choice, or a hand-set conf flag the start path adopted. A change
     /// applies on the next node (re)start.
     pub attestation_serve_enabled: bool,
+    /// The signer role (`btx_core::signer`): the persisted switch; whether it
+    /// can mean anything on this host, decided at the last start from the
+    /// same rule as the launch (`None` before the first start); the public key
+    /// of the key on disk, for the copy button (`None` when there is none, or
+    /// the switch is off); and whether the engine reports this node holding a
+    /// key AND validating, which is the only state in which it signs. The
+    /// close dialog warns on the last one, not on the setting: a setting is
+    /// what WILL be true, and a mirror freezing because this window closed is
+    /// about what IS.
+    pub signer_enabled: bool,
+    pub signer_applies_here: Option<bool>,
+    pub signer_pubkey: Option<String>,
+    pub signing_live: bool,
     /// What this node is really providing to other nodes right now: at the
     /// signed frontier and serving history, advertising the archive bit while
     /// silently degraded to the live window, or not serving at all. `None`
@@ -2423,6 +2526,14 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         } => Some(headers.saturating_sub(*height)),
         _ => None,
     };
+    // The signed-block window, read only while a key is on the wire; the role
+    // line renders it. The public key is the one the start path derived, so a
+    // switch flipped since then shows what the RUNNING node signs as.
+    let signer_pubkey = state.signer_pubkey.lock().await.clone();
+    let signed_recent = match (&signer_pubkey, state.recent_signers.lock().await.as_ref()) {
+        (Some(pk), Some(window)) if running => Some(window.signed_by(pk)),
+        _ => None,
+    };
     let role = net.as_ref().filter(|_| running).map(|n| {
         btx_core::role::node_role(
             matmul_trusted.as_ref(),
@@ -2433,8 +2544,11 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
             blocks_behind_headers,
             archive_service.as_ref(),
         )
+        .with_signed_recent(signed_recent)
     });
     let role_lines = role.as_ref().map(|r| r.lines()).unwrap_or_default();
+    let signing_live = role.as_ref().is_some_and(|r| r.signs_for_mirrors());
+    let signer_applies_here = *state.signer_applies_here.lock().await;
 
     let subversion = net.map(|c| c.subversion).filter(|s| !s.is_empty());
     let fork = state.fork.lock().await.clone();
@@ -2557,6 +2671,14 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         },
         txindex_enabled: settings.txindex_enabled,
         attestation_serve_enabled: settings.attestation_serve_enabled,
+        signer_enabled: settings.signer_enabled,
+        signer_applies_here,
+        signer_pubkey: if settings.signer_enabled {
+            signer_pubkey
+        } else {
+            None
+        },
+        signing_live,
         archive_service: archive_service.clone(),
         archive_service_message: archive_service.as_ref().map(|a| a.message()),
         role,
@@ -2876,6 +2998,39 @@ pub async fn set_attestation_serve(on: bool) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Settings: sign confirmations for mirrors (`btx_core::signer`). Persists the
+/// choice. Turning it on makes sure a key exists NOW, so the public key is on
+/// screen the moment the switch is flipped rather than after a restart; the
+/// engine picks the key up at the next node start, which the message says.
+/// Turning it off leaves the key file where it is: a key that mirrors pin is
+/// not something a switch deletes, and switching back on adopts it. The conf
+/// line itself is written and removed by the start path, which is the only
+/// place that knows whether this host validates.
+#[tauri::command]
+pub async fn set_signer(state: State<'_, AppState>, on: bool) -> Result<String, String> {
+    let datadir = node_datadir();
+    NodeAppSettings::update(&datadir, |s| s.signer_enabled = on);
+    if !on {
+        return Ok("Off at the next node start. The key stays in your data folder.".to_string());
+    }
+    let applies = *state.signer_applies_here.lock().await;
+    if applies == Some(false) {
+        return Ok(
+            "Saved. This machine follows other nodes' signatures rather than checking blocks \
+             itself, so it cannot sign; the setting will apply if it ever runs with a \
+             graphics card the engine accepts."
+                .to_string(),
+        );
+    }
+    let key = btx_core::signer::ensure_signer_key(&datadir).map_err(|e| e.to_string())?;
+    *state.signer_pubkey.lock().await = Some(key.pubkey_hex.clone());
+    Ok(if key.created {
+        "Key created. Signing starts at the next node start.".to_string()
+    } else {
+        "Signing starts at the next node start.".to_string()
+    })
 }
 
 /// Which conf the engine-upgrade path writes: the selected profile's when the

@@ -884,6 +884,21 @@ body.compact .stars { display: none; }
   opacity: 0.7;
 }
 
+/* The public signing key: 66 hex characters that have to be readable and
+   copyable, next to a button, on a narrow settings panel. */
+.signer-pubkey {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  word-break: break-all;
+  user-select: all;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(127, 127, 127, 0.12);
+}
+
 .ask-cite {
   display: inline-flex;
   align-items: center;

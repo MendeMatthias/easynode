@@ -38,6 +38,7 @@ pub fn run() {
             commands::set_keep_awake,
             commands::set_node_profile,
             commands::set_attestation_serve,
+            commands::set_signer,
             commands::set_node_nickname,
             commands::set_service_report,
             commands::mark_welcome_shown,
@@ -112,6 +113,26 @@ pub fn run() {
                 eprintln!(
                     "[node-app] enabled the services this install was never asked about; \
                      the welcome panel will say which"
+                );
+            }
+            // And the signer role, for the same population and the same
+            // reason, with one more fact in hand: whether this host can sign
+            // at all. The rule is the launch's own (`launches_as_mirror`),
+            // asked of the engine tag this build ships, since the binary's
+            // real path is not known until the start path resolves it and the
+            // rule reads only the tag. On 2026-09-16 every mirror on the
+            // network was following one key on one home computer; this is
+            // what asks every node with a capable card to do the same job.
+            // See `NodeAppSettings::migrate_signer`.
+            let applies_here = !btx_core::node::launches_as_mirror(
+                &commands::nominal_btxd_path(),
+                &node_datadir(),
+                btx_core::backend::node_host_backend(),
+            );
+            if NodeAppSettings::migrate_signer(&node_datadir(), applies_here) {
+                eprintln!(
+                    "[node-app] this install will sign confirmations for mirrors from now on; \
+                     the welcome panel will say so"
                 );
             }
 

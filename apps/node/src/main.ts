@@ -90,6 +90,15 @@ export interface NodeStatusInfo {
    * flag; a change applies on the next node (re)start.
    */
   attestation_serve_enabled: boolean;
+  /** The signer role (btx_core::signer): the switch; whether this host can
+   *  sign at all (null before the first start, false on a mirror host); the
+   *  public key to show and copy (null when off or when there is no key);
+   *  and whether the engine reports this node holding a key AND validating,
+   *  which is the only state in which quitting freezes somebody's mirror. */
+  signer_enabled: boolean;
+  signer_applies_here: boolean | null;
+  signer_pubkey: string | null;
+  signing_live: boolean;
   /** What we are really providing: `state` is serving_history |
    *  degraded_to_live_window | not_serving | unknown. */
   archive_service: { state: string; blocks_behind?: number } | null;
@@ -114,6 +123,10 @@ export interface NodeStatusInfo {
     inbound: number;
     uptime_secs: number;
     blocks_behind: number | null;
+    /** How many of the newest blocks carry this node's own signature, read
+     *  from its stored attestations; null until read or when there is no
+     *  key. `signed` is out of `seen`, not out of `window`. */
+    signed_recent: { signed: number; seen: number; window: number } | null;
   } | null;
   /** One line per fact with its sentence pre-rendered in Rust, like
    *  archive_service_message: the copy lives in one place, with tests. Empty
@@ -577,9 +590,19 @@ function renderContribution(status: NodeStatusInfo) {
  *  given a name while somebody is looking at it. */
 let welcomeOpen = false;
 
+/** Whether the panel's signing item was on screen when it was closed, so the
+ *  "launch at login turns on with this" sentence in it is kept. */
+let welcomeOfferedSigning = false;
+
 function maybeShowWelcome(status: NodeStatusInfo) {
   if (welcomeOpen || status.welcome_shown || !status.setup_complete) return;
   welcomeOpen = true;
+  // The signing item is for a host that can sign. `signer_applies_here` is
+  // null until the first start decides; a panel that waited for it would miss
+  // the moment, so null is taken as "probably" and the item is shown, which
+  // is the honest default on every machine with an NVIDIA driver.
+  welcomeOfferedSigning = status.signer_enabled && status.signer_applies_here !== false;
+  $("welcome-signer-item").hidden = !welcomeOfferedSigning;
   const input = $<HTMLInputElement>("welcome-nickname");
   // An existing install reaching this panel through the contribution
   // migration may already be named. Showing an empty box would read as "your
@@ -610,6 +633,17 @@ async function closeWelcome() {
     btn.disabled = false;
     return;
   }
+  // A signer is only useful while it is up. The panel said launch at login
+  // turns on with signing, and this is where it does, once, best-effort: the
+  // plugin is unavailable in dev and the switch in Settings remains the
+  // operator's. Keep-awake is already on by default for the same reason.
+  if (welcomeOfferedSigning) {
+    try {
+      await enable();
+    } catch (e) {
+      console.warn("could not turn launch-at-login on for the signer", e);
+    }
+  }
   // Mark it seen only after the name is settled, so a refusal above cannot
   // cost the user the panel.
   try {
@@ -620,6 +654,66 @@ async function closeWelcome() {
   $("welcome-overlay").hidden = true;
   btn.disabled = false;
 }
+
+/**
+ * The signer row in Settings. Three things it must say: whether this host can
+ * sign at all (a mirror host cannot, and a switch that pretends otherwise is
+ * worse than none), what the public key is, and that what is being asked for
+ * is trust. The trust sentence is static HTML under the key; this only fills
+ * in the facts.
+ */
+function reflectSignerRow(status: NodeStatusInfo): void {
+  const t = $<HTMLInputElement>("signer-toggle");
+  if (document.activeElement !== t) t.checked = status.signer_enabled;
+  const desc = $("signer-desc");
+  if (status.signer_applies_here === false) {
+    desc.textContent =
+      "This machine follows other nodes' signatures rather than checking blocks itself, so it cannot sign. The setting is kept for a machine with a graphics card the engine accepts";
+  } else if (status.signing_live) {
+    desc.textContent =
+      "Your node signs each block it checks, and the engine confirms it is signing now. The nodes that cannot check blocks themselves, the explorer's included, can follow yours";
+  } else {
+    desc.textContent =
+      "Your node signs each block it checks, so the nodes that cannot check blocks themselves, the explorer's included, can follow yours. Applies on next start";
+  }
+  const row = $("signer-key-row");
+  const key = status.signer_enabled ? status.signer_pubkey : null;
+  row.hidden = !key;
+  if (key) $("signer-pubkey").textContent = key;
+}
+
+$<HTMLInputElement>("signer-toggle").addEventListener("change", async (e) => {
+  const box = e.target as HTMLInputElement;
+  const on = box.checked;
+  const result = $("signer-result");
+  box.disabled = true;
+  try {
+    const msg = await invoke<string>("set_signer", { on });
+    result.classList.remove("is-error");
+    result.textContent = msg;
+  } catch (err) {
+    box.checked = !on;
+    result.classList.add("is-error");
+    result.textContent = String(err);
+  }
+  result.hidden = false;
+  box.disabled = false;
+  // The key row appears the moment the key exists, not at the next poll.
+  void tick();
+});
+
+$("signer-copy-btn").addEventListener("click", async () => {
+  const btn = $<HTMLButtonElement>("signer-copy-btn");
+  const text = ($("signer-pubkey").textContent ?? "").trim();
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    btn.textContent = "Copied";
+  } catch {
+    btn.textContent = "Couldn't copy";
+  }
+  setTimeout(() => (btn.textContent = "Copy key"), 1500);
+});
 
 /** The gap samples behind the "catching up" wording. Module scope because the
  *  poll loop calls renderStatus repeatedly and the trend needs history; the
@@ -637,6 +731,10 @@ function renderStatus(status: NodeStatusInfo) {
   reflectPeerNames(status);
   reflectFork(status);
   renderRole(status);
+  reflectSignerRow(status);
+  // The close dialog's warning follows the wire on every tick, so a dialog
+  // opened an hour into a run says what the node is doing now.
+  $("close-signer-warning").hidden = !status.signing_live;
   reflectEsploraRow(status);
   reflectWitnessRow(status);
 
@@ -919,6 +1017,7 @@ $("settings-btn").addEventListener("click", async () => {
     // bit while silently degraded to the live window looked completely fine.
     reflectArchiveService(lastStatus);
     reflectNickname(lastStatus);
+    reflectSignerRow(lastStatus);
     $<HTMLInputElement>("report-toggle").checked = lastStatus.service_report_enabled;
     $<HTMLInputElement>("wallet-toggle").checked = lastStatus.wallet_enabled;
     reflectOnClose(lastStatus.on_close);
