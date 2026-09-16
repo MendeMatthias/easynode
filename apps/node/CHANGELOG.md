@@ -15,9 +15,12 @@ used to do nothing for the network until somebody found three switches in
 Settings, and almost nobody does. From this release a fresh install serves
 confirmations, answers wallets and keeps a service report, and the app says so
 on first run instead of doing it quietly. Serving confirmations hands other
-nodes the signatures that prove old blocks: it is the scarcest thing on the
-network, one reachable full-history archive existed when the census looked on
-17 August, and it costs about 208 bytes a block. Answering wallets binds
+nodes the signatures that prove old blocks, and it costs about 208 bytes a
+block. It has been the network's scarcest service: the census found a single
+reachable full-history archive on 17 August. Eighteen nodes have served it
+since 0.6.21, which is what stopped the signing link being a single point of
+failure, and is why this is now on from the start rather than waiting to be
+found. Answering wallets binds
 127.0.0.1 only, so no port is opened and only this computer is served, which
 is enough for a wallet here to settle a fork against a node its owner runs
 rather than someone else's server. The service report is a file in your data
@@ -34,7 +37,7 @@ test for that specifically.
 node whose blocks fall behind its headers showed an amber card reading "the gap
 is not closing: no connected peer is serving them". It had no way to know that.
 Measured here on 16 September: 41 blocks behind for 574 minutes with 16 peers
-connected, 7 of them tracked, the best 15 blocks ahead and delivering, while
+connected, 7 of them tracked, the best 35 blocks ahead and delivering, while
 the node's own log showed it already holding blocks it had not connected. The
 card now says that only when btxd itself reports an unserved body, and
 otherwise says the hold-up is on this machine rather than the network. The
