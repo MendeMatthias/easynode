@@ -46,6 +46,29 @@ pub struct NodeAppSettings {
     /// once). A returning user skips the wizard and auto-starts the node.
     #[serde(default)]
     pub setup_complete: bool,
+    /// True once the contribution migration has run on this install.
+    ///
+    /// 0.6.24 turned the three cheap services on for NEW installs only, which
+    /// was the cautious choice and the wrong outcome: the census on
+    /// 2026-09-16 saw 59 nodes and only 21 serving attestations. An update
+    /// that leaves an existing node contributing nothing is most of the fleet.
+    ///
+    /// So this runs once per install and turns on the services whose key is
+    /// ABSENT from the settings file, which is the honest test for "never
+    /// chose". A key that is present and `false` was set by somebody on
+    /// purpose and is left alone: `#[serde(default)]` maps both to `false`, so
+    /// the struct cannot tell them apart and the raw JSON has to be read.
+    ///
+    /// ⚠ The two defaults are the OPPOSITE pairing from `welcome_shown`, and
+    /// getting it backwards silently does nothing: the serde default is
+    /// `false`, so a settings file written before this field existed reads as
+    /// "not yet migrated" and gets the services. The struct default is `true`,
+    /// because a brand new install already has them from `Default` and must
+    /// not be migrated on top. A test pins both directions; the first draft of
+    /// this had `default_true` on the serde side, which would have skipped
+    /// every existing install, which is the entire population this is for.
+    #[serde(default)]
+    pub contribution_migrated: bool,
     /// True once the one-time welcome panel has been shown.
     ///
     /// The two defaults differ ON PURPOSE and it is the whole trick. The
@@ -209,6 +232,9 @@ impl Default for NodeAppSettings {
     fn default() -> Self {
         Self {
             setup_complete: false,
+            // A fresh machine gets the services from these defaults, so it
+            // needs no migration; it only needs the panel.
+            contribution_migrated: true,
             // A fresh machine has not seen it. See the field's docs for why
             // this disagrees with the serde default.
             welcome_shown: false,
@@ -247,6 +273,66 @@ impl NodeAppSettings {
             Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
             Err(_) => Self::default(),
         }
+    }
+
+    /// Which of the three cheap services this install has never been asked
+    /// about, read from the RAW json.
+    ///
+    /// This is the whole reason the migration is safe. `#[serde(default)]`
+    /// turns both a missing key and an explicit `false` into `false`, so the
+    /// struct cannot distinguish "we never offered it" from "they said no".
+    /// The file can: a key that is not there was never chosen.
+    ///
+    /// Returns `(attestations, witness, report)`, true meaning "absent, so
+    /// free to turn on". Anything unreadable returns all false: when in doubt,
+    /// change nothing on somebody's machine.
+    pub fn services_never_chosen(raw: &str) -> (bool, bool, bool) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+            return (false, false, false);
+        };
+        let Some(o) = v.as_object() else {
+            return (false, false, false);
+        };
+        (
+            !o.contains_key("attestation_serve_enabled"),
+            !o.contains_key("witness_enabled"),
+            !o.contains_key("service_report_enabled"),
+        )
+    }
+
+    /// Turn on the services this install was never asked about, once.
+    ///
+    /// Returns true when something was turned on, which is the caller's cue to
+    /// show the panel: the user is told what changed rather than discovering
+    /// it later. A no-op install (already migrated, or every key already set
+    /// by hand) returns false and shows nothing.
+    pub fn migrate_contributions(datadir: &std::path::Path) -> bool {
+        let path = datadir.join(SETTINGS_FILE_NAME);
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return false; // no file at all is a new install; Default covers it
+        };
+        if Self::load(datadir).contribution_migrated {
+            return false;
+        }
+        let (attest, witness, report) = Self::services_never_chosen(&raw);
+        let changed = attest || witness || report;
+        Self::update(datadir, |s| {
+            if attest {
+                s.attestation_serve_enabled = true;
+            }
+            if witness {
+                s.witness_enabled = true;
+            }
+            if report {
+                s.service_report_enabled = true;
+            }
+            s.contribution_migrated = true;
+            // Only interrupt somebody if something actually changed.
+            if changed {
+                s.welcome_shown = false;
+            }
+        });
+        changed
     }
 
     pub fn save(&self, datadir: &std::path::Path) -> std::io::Result<()> {
@@ -629,6 +715,61 @@ mod tests {
         // A fresh machine, by contrast, contributes.
         let fresh = NodeAppSettings::default();
         assert!(fresh.attestation_serve_enabled && fresh.witness_enabled);
+    }
+
+    /// The migration turns on what was never chosen, and nothing else.
+    ///
+    /// This is the half that decides whether the change is trustworthy: an
+    /// explicit `false` in the file is a person saying no, and no update may
+    /// overturn it.
+    #[test]
+    fn the_migration_respects_a_deliberate_no() {
+        // Never asked: all three keys absent.
+        let (a, w, r) =
+            NodeAppSettings::services_never_chosen(r#"{"setup_complete":true,"keep_awake":true}"#);
+        assert!(a && w && r, "absent keys are free to turn on");
+
+        // Said no to serving, never asked about the other two.
+        let (a, w, r) = NodeAppSettings::services_never_chosen(
+            r#"{"setup_complete":true,"attestation_serve_enabled":false}"#,
+        );
+        assert!(
+            !a,
+            "an explicit false is a choice and must survive the update"
+        );
+        assert!(
+            w && r,
+            "the keys they were never asked about are still free"
+        );
+
+        // Already serving: present and true, so not ours to touch either.
+        let (a, _, _) =
+            NodeAppSettings::services_never_chosen(r#"{"attestation_serve_enabled":true}"#);
+        assert!(!a, "present means chosen, whatever the value");
+
+        // Unreadable: change nothing.
+        let (a, w, r) = NodeAppSettings::services_never_chosen("{ not json");
+        assert!(!a && !w && !r, "when in doubt, touch nothing");
+    }
+
+    /// It runs once. A second launch must not re-enable what somebody turned
+    /// off in between, which is the obvious way a migration becomes a bug.
+    #[test]
+    fn the_migration_runs_once_and_then_leaves_people_alone() {
+        let fresh = NodeAppSettings::default();
+        assert!(
+            fresh.contribution_migrated,
+            "a new install gets the services from Default and needs no migration"
+        );
+        let old: NodeAppSettings = serde_json::from_str(r#"{"setup_complete":true}"#).unwrap();
+        assert!(
+            !old.contribution_migrated,
+            "a file predating the flag has not run it"
+        );
+        let done: NodeAppSettings =
+            serde_json::from_str(r#"{"setup_complete":true,"contribution_migrated":true}"#)
+                .unwrap();
+        assert!(done.contribution_migrated, "and it does not run twice");
     }
 
     /// The welcome panel shows once, to a new install, and never to somebody

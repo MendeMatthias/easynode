@@ -580,8 +580,14 @@ let welcomeOpen = false;
 function maybeShowWelcome(status: NodeStatusInfo) {
   if (welcomeOpen || status.welcome_shown || !status.setup_complete) return;
   welcomeOpen = true;
+  const input = $<HTMLInputElement>("welcome-nickname");
+  // An existing install reaching this panel through the contribution
+  // migration may already be named. Showing an empty box would read as "your
+  // node has no name", and leaving it empty on Done would look like it had
+  // been cleared. Prefill so the name is visible and survives untouched.
+  input.value = status.node_nickname ?? "";
   $("welcome-overlay").hidden = false;
-  $<HTMLInputElement>("welcome-nickname").focus();
+  input.focus();
 }
 
 async function closeWelcome() {
@@ -590,12 +596,11 @@ async function closeWelcome() {
   const btn = $<HTMLButtonElement>("welcome-done");
   btn.disabled = true;
   try {
-    // Only touch the nickname when one was typed. An empty box means "stay
-    // unnamed", which is already the stored value, and calling the setter for
-    // it would be a write with nothing to write.
-    if (input.value.trim()) {
-      await invoke<string>("set_node_nickname", { name: input.value });
-    }
+    // The box is PREFILLED with the stored name, so it now reflects the true
+    // current value and an empty box is a deliberate "remove my name" rather
+    // than "nothing typed". Send whatever it holds. Skipping the empty case
+    // was correct only while the box always started blank.
+    await invoke<string>("set_node_nickname", { name: input.value });
   } catch (e) {
     // Same rule as the Settings field: the Rust side refuses anything btxd
     // would reject, so this is a sentence about what to type. Keep the panel
