@@ -1148,3 +1148,14 @@ body.compact .stars { display: none; }
 .link-ext { opacity: 0.6; }
 .link-row-cite { margin-top: 2px; }
 .cite-dot-ext { background: var(--color-amber); box-shadow: 0 0 6px rgba(251, 191, 36, 0.5); }
+
+/* The one-time welcome panel. Deliberately borrows .overlay-panel,
+   .role-lines and .nickname-row so it looks like the rest of the app rather
+   than a separate screen; only the two things with no equivalent are new. */
+.welcome-lede {
+  margin: 0 0 14px;
+  color: var(--color-text-dim);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.welcome-actions { justify-content: flex-end; margin-top: 16px; }

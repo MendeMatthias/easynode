@@ -2049,6 +2049,9 @@ pub struct NodeStatusInfo {
     pub installed: bool,
     /// Whether first-run setup has completed.
     pub setup_complete: bool,
+    /// False only on a brand new install that has not yet seen the welcome
+    /// panel. See `NodeAppSettings::welcome_shown`.
+    pub welcome_shown: bool,
     /// Keep-awake toggle state.
     pub keep_awake: bool,
     /// Whether "keep awake" does anything on this build. The guard is an inert
@@ -2544,6 +2547,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         installed: settings.setup_complete || returning_launch_paths(&datadir, &tag).is_some(),
         node_tag: tag.clone(),
         setup_complete: settings.setup_complete,
+        welcome_shown: settings.welcome_shown,
         keep_awake: settings.keep_awake,
         keep_awake_supported: btx_core::power::sleep_assertion_supported(),
         tray_term: if cfg!(target_os = "macos") {
@@ -2972,6 +2976,14 @@ pub async fn set_node_nickname(name: String) -> Result<String, String> {
 #[tauri::command]
 pub async fn set_service_report(on: bool) -> Result<(), String> {
     NodeAppSettings::update(&node_datadir(), |s| s.service_report_enabled = on);
+    Ok(())
+}
+
+/// Mark the one-time welcome panel as seen. Idempotent, and there is no way
+/// back: the panel is a greeting, not a setting.
+#[tauri::command]
+pub async fn mark_welcome_shown() -> Result<(), String> {
+    NodeAppSettings::update(&node_datadir(), |s| s.welcome_shown = true);
     Ok(())
 }
 
