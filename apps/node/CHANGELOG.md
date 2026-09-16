@@ -8,6 +8,23 @@ root).
 
 ## [Unreleased]
 
+## [0.6.25] - 2026-09-16 · mac + linux + windows
+
+**A node you already run starts helping too.** 0.6.24 turned on serving
+confirmations, answering wallets and the local service report, but only for
+installs made after it. Every node that already existed updated and then
+contributed exactly what it did the day before. The measurement that showed the
+cost: on 16 September the network census saw 59 nodes and 21 of them serving
+confirmations. Thirty-eight were not, including this project's own mining
+machine, which had updated itself that morning. From this release an existing
+node turns on the services **it was never asked about**, once, and the app says
+which on the next launch so nobody finds out later. A setting somebody switched
+off stays off: the file records the difference between a choice and a silence,
+and only silence is filled in. Serving the Esplora API and Keeper mode are
+untouched either way, because one needs the whole 124 GiB chain and two
+programs the app does not install, and the other prunes.
+
+
 ## [0.6.24] - 2026-09-16 · mac + linux + windows
 
 **Your node starts helping BTX the minute it finishes installing.** A new node
