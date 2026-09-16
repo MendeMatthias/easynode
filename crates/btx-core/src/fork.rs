@@ -742,4 +742,3 @@ mod tests {
         assert!(msg.contains("11 minutes"), "{msg}");
     }
 }
-
