@@ -99,6 +99,22 @@ pub fn run() {
                 });
             }
 
+            // A returning install contributes too, once, before the node
+            // starts so the services are on for this run rather than the next.
+            //
+            // 0.6.24 gave the three cheap services to new installs only. The
+            // census on 2026-09-16 then showed what that leaves behind: 59
+            // nodes seen, 21 serving attestations. This turns them on for
+            // everyone who was never asked, leaves a deliberate `false` alone,
+            // and arms the panel so nobody finds out by accident. See
+            // `NodeAppSettings::migrate_contributions`.
+            if NodeAppSettings::migrate_contributions(&node_datadir()) {
+                eprintln!(
+                    "[node-app] enabled the services this install was never asked about; \
+                     the welcome panel will say which"
+                );
+            }
+
             // Returning user: the app's promise is "open it and your node
             // runs" — auto-start without a click. First run shows the wizard
             // (phase stays Welcome until the user begins setup).
