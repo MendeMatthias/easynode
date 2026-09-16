@@ -8,6 +8,55 @@ root).
 
 ## [Unreleased]
 
+## [0.6.24] - 2026-09-16 · mac + linux + windows
+
+**Your node starts helping BTX the minute it finishes installing.** A new node
+used to do nothing for the network until somebody found three switches in
+Settings, and almost nobody does. From this release a fresh install serves
+confirmations, answers wallets and keeps a service report, and the app says so
+on first run instead of doing it quietly. Serving confirmations hands other
+nodes the signatures that prove old blocks, and it costs about 208 bytes a
+block. It has been the network's scarcest service: the census found a single
+reachable full-history archive on 17 August. Eighteen nodes have served it
+since 0.6.21, which is what stopped the signing link being a single point of
+failure, and is why this is now on from the start rather than waiting to be
+found. Answering wallets binds
+127.0.0.1 only, so no port is opened and only this computer is served, which
+is enough for a wallet here to settle a fork against a node its owner runs
+rather than someone else's server. The service report is a file in your data
+folder and is uploaded nowhere. Every one of them is in Settings and can be
+turned off. Serving the Esplora API stays off, because it needs the whole
+124 GiB chain and two programs the app does not install, and Keeper mode stays
+off, because it prunes and a pruned node cannot rebuild after an unclean
+shutdown. **Nothing changes for a node that already exists.** The new defaults
+reach a machine with no settings file, so no update starts a service on
+anybody's computer, and a switch somebody turned off stays off. There is a
+test for that specifically.
+
+**The app stops telling you your peers are the problem when they are not.** A
+node whose blocks fall behind its headers showed an amber card reading "the gap
+is not closing: no connected peer is serving them". It had no way to know that.
+Measured here on 16 September: 41 blocks behind for 574 minutes with 16 peers
+connected, 7 of them tracked, the best 35 blocks ahead and delivering, while
+the node's own log showed it already holding blocks it had not connected. The
+card now says that only when btxd itself reports an unserved body, and
+otherwise says the hold-up is on this machine rather than the network. The
+sentence mattered: it sent two earlier investigations, on 6 and 13 September,
+looking at routers and peer lists for a problem that was neither.
+
+**The status card says whether the gap is actually closing.** "Still catching
+up" is a promise about the future, and a node more than three blocks behind is
+paced by the engine to one block per block interval, which is the one speed at
+which a gap never closes. Measured on 15 September: a Mac held between 84 and
+99 blocks behind for hours while that line said it was catching up. The card
+now reads the trend rather than the number and says "not catching up" when the
+gap is not moving, while a node genuinely grinding through a large deficit
+still reads as catching up. The release gate learned the same lesson:
+`observer-ok.sh` refused only a forked or silent node, and the observer calls a
+node that is behind but closing healthy on purpose, so the gate would have
+passed a release cut from a node 4,827 blocks behind. Its own log holds 8,576
+such readings. It now also refuses on the gap itself.
+
 **A btxd restart no longer locks the witness out of its own node.** btxd
 writes a new RPC cookie on every start, and a witness that read it once kept
 authenticating with the dead one. Measured 2026-09-15 on
