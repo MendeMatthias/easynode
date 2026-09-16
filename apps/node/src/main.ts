@@ -11,6 +11,7 @@ import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { AmbientLine } from "./ambient";
 import { validationView } from "./validation";
+import { type CatchupSample, catchupTrend, pushSample } from "./catchup-trend";
 import {
   classifyCheckFailure,
   checkFailureMessage,
@@ -561,6 +562,11 @@ function renderContribution(status: NodeStatusInfo) {
   $("contribution-detail").textContent = view.detail;
 }
 
+/** The gap samples behind the "catching up" wording. Module scope because the
+ *  poll loop calls renderStatus repeatedly and the trend needs history; the
+ *  arithmetic itself is pure and tested in catchup-trend.test.ts. */
+let catchupSamples: CatchupSample[] = [];
+
 function renderStatus(status: NodeStatusInfo) {
   showScreen("status");
   const p = status.phase;
@@ -588,6 +594,17 @@ function renderStatus(status: NodeStatusInfo) {
   lastActive = mode === "ready" || mode === "syncing";
   core?.setActive(lastActive);
 
+  // Record the gap on every poll while the node claims to be ready, so the
+  // wording below can tell a closing gap from a pinned one. Cheap, bounded,
+  // and the only place the sample is available.
+  if (p.phase === "ready") {
+    catchupSamples = pushSample(catchupSamples, { at: Date.now(), behind: p.blocks_behind }, Date.now());
+  } else if (p.phase !== "syncing") {
+    // A stop, an error or a fresh start invalidates the history: a gap
+    // measured before a restart says nothing about the one after it.
+    catchupSamples = [];
+  }
+
   let height = 0;
   switch (p.phase) {
     case "ready":
@@ -605,8 +622,21 @@ function renderStatus(status: NodeStatusInfo) {
         // fresh install reads LIVE while still thousands of blocks short and
         // grinding. Still LIVE — it is running and connected — but say the gap
         // rather than let "helping the network" stand on its own.
+        //
+        // "Still catching up" is a claim about the FUTURE, and it is not always
+        // true. A node more than three blocks behind is paced to one block per
+        // block interval by the cadence burst hold (btxchain/btx#140), which is
+        // the one speed at which a gap never closes: measured 2026-09-15, a Mac
+        // held between 84 and 99 behind for hours while this line promised it
+        // was catching up. That wording reads as slow internet and sends people
+        // hunting peers, which is what happened on 2026-09-06 and 2026-09-13.
+        // So say which of the two is happening, from the gap's own trend.
         badge.textContent = "LIVE";
-        sub.textContent = `Your node is live, still catching up — ${fmtInt(p.blocks_behind)} blocks behind`;
+        const trend = catchupTrend(catchupSamples, Date.now());
+        sub.textContent =
+          trend === "stalled"
+            ? `Your node is live but not catching up. It is ${fmtInt(p.blocks_behind)} blocks behind and the gap is not closing.`
+            : `Your node is live, still catching up — ${fmtInt(p.blocks_behind)} blocks behind`;
       } else {
         // "LIVE", not "READY": the node is running and serving the network now —
         // "ready" reads like it's waiting to do something.

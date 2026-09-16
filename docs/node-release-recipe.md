@@ -706,8 +706,18 @@ anything is signed, published or flipped live:
    since their common ancestor, or `headers − blocks` > 20 for over 10 minutes,
    blocks the release and blocks any public sentence about chain position.
 2. `scripts/observer-ok.sh` must exit 0: the observer's last row is younger
-   than five minutes and its state is `ok` (`node-observer.sh` writes `FORK`
-   for the two conditions above). `build-node-feed.sh` and
+   than five minutes, its state is `ok` (`node-observer.sh` writes `FORK`
+   for the two conditions above), AND it is no more than
+   `BTX_OBSERVER_MAX_BEHIND` (20, the number in step 1) blocks behind.
+   ⚠ The gap check is separate on purpose, since 2026-09-15. The observer
+   calls a node that is behind but closing `ok` deliberately, so that a Mac
+   catching up after days offline does not page anyone, and that is correct
+   for an alarm and wrong for a release gate. Before this the script would
+   have passed a node 4,827 blocks behind: `~/node-observer.tsv` holds 8,576
+   rows written `ok` at more than 20 behind, 489 of them on 2026-09-15 alone,
+   when a Mac paced by the cadence burst hold (btxchain/btx#140) read
+   `behind=98 state=ok` at the exact minute the gate was run.
+   `build-node-feed.sh` and
    `publish-node-release.sh` run it first and refuse otherwise, in the dry run
    too. A manual flip (`gh_release.py publish …`) is not covered by a script,
    so run `scripts/observer-ok.sh` by hand immediately before it.
