@@ -99,6 +99,10 @@ export interface NodeStatusInfo {
   signer_applies_here: boolean | null;
   signer_pubkey: string | null;
   signing_live: boolean;
+  /** Offer the public key to easybtx.com so mirror operators can pin it, and
+   *  what came of the last attempt this run (null until one has been made). */
+  signer_publish_enabled: boolean;
+  signer_offer: { delivered: boolean; at: string; detail: string } | null;
   /** What we are really providing: `state` is serving_history |
    *  degraded_to_live_window | not_serving | unknown. */
   archive_service: { state: string; blocks_behind?: number } | null;
@@ -680,7 +684,53 @@ function reflectSignerRow(status: NodeStatusInfo): void {
   const key = status.signer_enabled ? status.signer_pubkey : null;
   row.hidden = !key;
   if (key) $("signer-pubkey").textContent = key;
+
+  // The delivery row only exists while there is a key to deliver.
+  const pubRow = $("signer-publish-row");
+  pubRow.hidden = !key;
+  const pubToggle = $<HTMLInputElement>("signer-publish-toggle");
+  if (document.activeElement !== pubToggle) pubToggle.checked = status.signer_publish_enabled;
+  const line = $("signer-publish-status");
+  const offer = status.signer_offer;
+  if (!status.signer_publish_enabled) {
+    line.textContent =
+      "Not being offered. Send the key above to a mirror operator yourself if you want it pinned.";
+    line.hidden = false;
+  } else if (offer) {
+    // The backend's sentence, with the local time appended: a person wants to
+    // know it happened and when, and the backend has no business formatting a
+    // clock for them.
+    const when = new Date(offer.at);
+    const stamp = Number.isNaN(when.getTime()) ? "" : ` (${when.toLocaleTimeString()})`;
+    line.textContent = `${offer.detail}${stamp}`;
+    line.hidden = false;
+  } else if (status.signing_live) {
+    line.textContent = "Your key goes out with the next check-in, within fifteen minutes.";
+    line.hidden = false;
+  } else {
+    line.hidden = true;
+  }
+  line.classList.toggle("needs-attention", !!offer && !offer.delivered);
 }
+
+$<HTMLInputElement>("signer-publish-toggle").addEventListener("change", async (e) => {
+  const box = e.target as HTMLInputElement;
+  const on = box.checked;
+  const result = $("signer-publish-result");
+  box.disabled = true;
+  try {
+    const msg = await invoke<string>("set_signer_publish", { on });
+    result.classList.remove("is-error");
+    result.textContent = msg;
+  } catch (err) {
+    box.checked = !on;
+    result.classList.add("is-error");
+    result.textContent = String(err);
+  }
+  result.hidden = false;
+  box.disabled = false;
+  void tick();
+});
 
 $<HTMLInputElement>("signer-toggle").addEventListener("change", async (e) => {
   const box = e.target as HTMLInputElement;

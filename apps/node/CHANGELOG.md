@@ -35,17 +35,30 @@ turned on once for an existing node that was never asked**, the same rule as
 0.6.25, with the welcome panel saying so on the next launch; a switch somebody
 turned off stays off.
 
+**Your key finds the people who pin it, on its own.** A signing key that
+nobody pins signs into the void, and the only way to change that used to be a
+person copying 66 characters out of a settings panel and pasting them into a
+chat. That works for the handful of people who already know each other and for
+nobody else, which is the opposite of what a network short of signers needs. So
+a node that signs now offers its **public** key to easybtx.com every fifteen
+minutes, and mirror operators read the list and choose from it. Nothing else
+goes with it: the public key, a random local id, the app and engine versions,
+this run's block height and peer count, and the service bits your node already
+broadcasts to every peer. No wallet, no address, no private key, and no node
+that isn't signing ever sends anything at all. Settings shows exactly what was
+sent and when it arrived, and the switch beside it stops the offer while
+leaving your node signing.
+
 **What you are being asked for is trust, not bandwidth, and the app says so.**
 Settings shows your public signing key with a copy button and this sentence
 under it: a mirror that pins this key takes your node's word for the proof of
-work, with no second check, so hand it only to an operator who asked you for
-it. The private key is never shown. To make your node a signer for the
-explorer, send that public key to its operator; they add one line to the
-mirror's configuration and restart it. Your node already dials the explorer's
-mirror when signing is on, so no port needs forwarding: a signature only helps
-a mirror that hears it, signatures travel to connected peers, and a node relays
-only the keys it pins, which is why this project's own signer has kept that
-link by hand since 2 September.
+work, with no second check. Offering is not pinning. Whoever runs a mirror
+decides, on their own machine, and nothing in this app can make that decision
+for them. Your node already dials the explorer's mirror when signing is on, so
+no port needs forwarding: a signature only helps a mirror that hears it,
+signatures travel to connected peers, and a node relays only the keys it pins,
+which is why this project's own signer has kept that link by hand since
+2 September.
 
 **The role card says whether the key is actually doing anything.** "Signing
 key: Signing, on N of the last 100 blocks", read from the node's own stored

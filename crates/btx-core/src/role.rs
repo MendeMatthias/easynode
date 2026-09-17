@@ -75,9 +75,12 @@ pub const REACHABILITY_GRACE_SECS: u64 = 30 * 60;
 /// blocks and signed none of them is telling us something.
 pub const SIGNED_WINDOW_MIN_SEEN: u64 = 10;
 
-/// The P2P port a router has to forward for this node to be reachable. Only
-/// ever quoted to a person, never dialled from here.
-const P2P_PORT: u16 = 19335;
+/// The P2P port a router has to forward for this node to be reachable.
+///
+/// Quoted to a person by the line below, and named to the directory by
+/// [`crate::checkin`] when somebody has actually reached us, so the census can
+/// dial the claim and turn it into a measurement. Never dialled from here.
+pub const P2P_PORT: u16 = 19335;
 
 /// How the engine says it validates MatMul, from
 /// `getmatmultrustedstatus.matmul_validation_mode`.

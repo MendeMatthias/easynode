@@ -168,6 +168,25 @@ pub struct NodeAppSettings {
     /// says so next to the public key.
     #[serde(default)]
     pub signer_enabled: bool,
+    /// Offer this node's PUBLIC signing key to easybtx.com, so a mirror
+    /// operator can pin it (`btx_core::checkin`). Only ever sent by a node
+    /// that is actually signing; a node that does not sign never checks in.
+    ///
+    /// ON unless the operator says otherwise, and `default_true` on the SERDE
+    /// side as well as the struct side, which is the opposite of the
+    /// contribution fields and is right here: this is not a service that runs
+    /// on somebody's machine, it is the delivery half of a service they
+    /// already switched on, and a signing key that reaches nobody signs into
+    /// the void. An existing install that turns signing on through the
+    /// migration therefore offers its key without a second migration, and the
+    /// welcome panel and Settings both say so. An explicit `false` is still a
+    /// choice and is read back unchanged.
+    ///
+    /// What is sent is in `btx_core::checkin`: the public key, a random local
+    /// id, the app and engine versions, this run's counters, and the service
+    /// bits. No wallet, no address, no secret key.
+    #[serde(default = "default_true")]
+    pub signer_publish_enabled: bool,
     /// Write a local `service-report.json` next to the datadir every few
     /// minutes: uptime, heights, peers, bytes served, archive-peer summary,
     /// stall verdict. LOCAL FILE ONLY — nothing phones home; this is the
@@ -288,6 +307,7 @@ impl Default for NodeAppSettings {
             // The signer role, on. See the field: this is the one the
             // explorer's freeze on 2026-09-16 was about.
             signer_enabled: true,
+            signer_publish_enabled: true,
             service_report_enabled: true,
             node_profile: default_profile(),
             // No nickname. Anything else would publish an identifier the user
@@ -515,6 +535,21 @@ impl Default for NodePhase {
     }
 }
 
+/// The last attempt to offer this node's public signing key to the directory.
+///
+/// Kept per run rather than persisted: it describes what just happened on the
+/// wire, and a stale "sent" line from last week would be worse than no line.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SignerOfferStatus {
+    /// True when the directory stored it (204/200) or said it already had a
+    /// recent one (429 — accepted and ignored, which is not a failure).
+    pub delivered: bool,
+    /// RFC 3339 UTC of the attempt this describes.
+    pub at: String,
+    /// One plain sentence for the Settings line. Never a raw error body.
+    pub detail: String,
+}
+
 /// Shared, thread-safe app state managed by Tauri.
 pub struct AppState {
     pub rpc: Arc<Mutex<Option<RpcClient>>>,
@@ -605,6 +640,12 @@ pub struct AppState {
     /// or mirrors (it cannot), from `btx_core::node::launches_as_mirror`.
     /// `None` before the first start of this app run.
     pub signer_applies_here: Arc<Mutex<Option<bool>>>,
+    /// What happened to the last attempt to offer this node's public signing
+    /// key to the directory (`btx_core::checkin`). `None` until one has been
+    /// attempted this run. Shown in Settings, because "my key is on its way to
+    /// the people who pin it" is the one thing a volunteer wants to know and
+    /// the one thing a silent POST cannot tell them.
+    pub signer_offer: Arc<Mutex<Option<SignerOfferStatus>>>,
     /// The fork detector's verdict — a longer chain this node cannot obtain
     /// blocks for — computed by the refresher from `getchaintips` and the
     /// headers/blocks gap. Cleared on every stop/start like the others, so a
@@ -707,6 +748,7 @@ impl AppState {
             recent_signers: Arc::new(Mutex::new(None)),
             signer_pubkey: Arc::new(Mutex::new(None)),
             signer_applies_here: Arc::new(Mutex::new(None)),
+            signer_offer: Arc::new(Mutex::new(None)),
             fork: Arc::new(Mutex::new(None)),
             tip_median_time: Arc::new(Mutex::new(None)),
             archive_peers_cache: Arc::new(Mutex::new(None)),

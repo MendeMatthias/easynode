@@ -6,6 +6,27 @@
 //! This is that feature, and the consent is the point: it is **off unless the
 //! operator turns it on**, and nothing here runs otherwise.
 //!
+//! # What actually turns it on, since 0.6.26
+//!
+//! One thing: **choosing to sign confirmations for mirrors**
+//! ([`crate::signer`]). A node that does not sign never sends a check-in, and
+//! the app has no other caller for this module.
+//!
+//! That is not a coincidence of scheduling, it is the reason the feature
+//! shipped. A signing key that nobody pins signs into the void, so a volunteer
+//! has to get 66 public characters to whoever runs a mirror. Until 0.6.26 that
+//! meant copying them out of a settings panel and pasting them into a chat with
+//! Mende, once per volunteer, forever — which does not scale past the people
+//! who already know him, and the network needs the opposite of that. On
+//! 2026-09-16 every mirror on BTX was following ONE key on ONE home computer;
+//! at 15:23Z it was switched off and the explorer froze at 221,448 while the
+//! chain went on.
+//!
+//! So a signing node offers its public key here, `easybtx.com` collects them,
+//! and `/api/signer-offers` is the list a mirror operator pins from. Offering
+//! is not pinning: the trust decision stays a human one, taken on the mirror's
+//! own machine, and nothing in this file can make it.
+//!
 //! # Why a node needs to be able to say "I am here"
 //!
 //! The node directory finds nodes by dialling them over P2P. That only ever
@@ -33,10 +54,17 @@
 //! The struct below is the whole payload and the whole of it is operational:
 //! counters, a version string, service bits, and a self-generated random id.
 //!
-//! There is **no wallet, no address, no balance, no key, no username, and no
-//! machine fingerprint**. The id is random bytes generated once and kept in the
-//! datadir; it identifies the same node across restarts and nothing else, and
-//! deleting the file gives the node a new identity with no consequence.
+//! There is **no wallet, no address, no balance, no SECRET key, no username,
+//! and no machine fingerprint**. The id is random bytes generated once and kept
+//! in the datadir; it identifies the same node across restarts and nothing
+//! else, and deleting the file gives the node a new identity with no
+//! consequence.
+//!
+//! The one key it carries is `signer_pubkey`, the PUBLIC half of the signing
+//! key, and only when the operator has turned signing on. It is public by
+//! construction: every confirmation this node signs already carries it to every
+//! peer on the network. The private key never leaves the datadir and nothing in
+//! this crate reads it except the engine's own key file loader.
 //!
 //! The server sees the source IP, as it must for any HTTP request. It stores
 //! only a salted hash of it plus a coarse location, the same model the peer map
@@ -47,7 +75,24 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 /// Schema of the payload below. Must match the receiving endpoint.
-pub const CHECKIN_SCHEMA: u32 = 1;
+///
+/// 2 adds `signer_pubkey`. The endpoint accepts exactly this value and refuses
+/// 1, which costs nothing: this client existed from 0.6.17 with no caller, so
+/// no released app ever sent a schema 1 check-in.
+pub const CHECKIN_SCHEMA: u32 = 2;
+
+/// Where a check-in goes. `EASYBTX_CHECKIN_ENDPOINT` overrides it, which is how
+/// the end-to-end test on the release box points a real node at a local
+/// receiver instead of the live site.
+pub const CHECKIN_ENDPOINT: &str = "https://easybtx.com/api/node-checkin";
+
+/// The endpoint this run will use.
+pub fn checkin_endpoint() -> String {
+    match std::env::var("EASYBTX_CHECKIN_ENDPOINT") {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => CHECKIN_ENDPOINT.to_string(),
+    }
+}
 
 /// Where the node's self-generated id lives, inside the datadir.
 pub const NODE_ID_FILE: &str = "node-id";
@@ -85,6 +130,30 @@ pub struct Checkin {
     /// directory where to dial is what lets it verify the claim rather than
     /// take it, so a reachable node should populate it.
     pub listening_port: Option<u16>,
+    /// The PUBLIC signing key this node's confirmations carry, 66 lowercase
+    /// hex, or `None` on a node that does not sign — which is every node until
+    /// its operator turns signing on.
+    ///
+    /// This is the whole reason the app calls this module. See the header, and
+    /// [`crate::signer`] for where the key comes from.
+    pub signer_pubkey: Option<String>,
+}
+
+/// The engine version in the shape the endpoint accepts (`v0.34.6`), from the
+/// release tag the app pins (`v0.34.6-3013c2c2`).
+///
+/// The receiver takes `^v?[0-9][0-9.]{0,15}$` and silently nulls anything else,
+/// so sending the raw tag would quietly publish a fleet with no engine version
+/// at all. Everything from the first `-` is a commit pin, which is ours and not
+/// upstream's version, so it is dropped rather than mangled.
+pub fn engine_version_for_checkin(tag: &str) -> Option<String> {
+    let head = tag.trim().split('-').next()?.trim();
+    let digits = head.strip_prefix('v').unwrap_or(head);
+    let ok = !digits.is_empty()
+        && digits.len() <= 16
+        && digits.starts_with(|c: char| c.is_ascii_digit())
+        && digits.bytes().all(|b| b.is_ascii_digit() || b == b'.');
+    ok.then(|| head.to_string())
 }
 
 /// Format 16 random bytes as the 32-hex id the endpoint requires.
@@ -131,6 +200,16 @@ pub fn load_or_create_node_id(datadir: &Path, random: [u8; 16]) -> AppResult<Str
     std::fs::write(&tmp, &id).map_err(|e| AppError::Process(format!("write node id: {e}")))?;
     std::fs::rename(&tmp, &path).map_err(|e| AppError::Process(format!("rename node id: {e}")))?;
     Ok(id)
+}
+
+/// [`load_or_create_node_id`] with the randomness taken from the operating
+/// system, which is what every caller outside a test wants. Kept separate so
+/// the id logic stays deterministic and testable.
+pub fn load_or_create_node_id_os(datadir: &Path) -> AppResult<String> {
+    use rand_core::RngCore as _;
+    let mut bytes = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    load_or_create_node_id(datadir, bytes)
 }
 
 /// Forget this node's id. The next check-in generates a fresh one, so the
@@ -213,10 +292,71 @@ pub async fn send_checkin(
     })
 }
 
+/// Build a client and POST one check-in.
+///
+/// The whole HTTPS surface of this feature is here rather than in the app,
+/// which has no HTTP dependency at all and should not grow one to send four
+/// hundred bytes every fifteen minutes. The timeout is short on purpose: this
+/// runs inside the status refresher's tick, and a stalled connection must not
+/// hold up the tick that keeps the screen honest.
+pub async fn offer_signing_key(endpoint: &str, checkin: &Checkin) -> AppResult<CheckinOutcome> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| AppError::Process(format!("check-in client: {e}")))?;
+    send_checkin(&client, endpoint, checkin).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Schema 2 carries the key, and a node that does not sign sends it as
+    /// null rather than omitting the field: the site accepts a null as absent,
+    /// and an omitted-or-renamed field is how a contract quietly breaks.
+    #[test]
+    fn schema_two_carries_the_key_and_a_non_signer_sends_null() {
+        let v = serde_json::to_value(sample()).unwrap();
+        assert_eq!(v["schema"], 2);
+        assert_eq!(
+            v["signer_pubkey"],
+            "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675"
+        );
+        let keyless = Checkin {
+            signer_pubkey: None,
+            ..sample()
+        };
+        let v = serde_json::to_value(keyless).unwrap();
+        assert!(v["signer_pubkey"].is_null());
+    }
+
+    #[test]
+    fn the_engine_tag_becomes_a_version_the_endpoint_keeps() {
+        // Our pin carries a commit; the endpoint's regex refuses the hyphen and
+        // would store nothing at all.
+        assert_eq!(
+            engine_version_for_checkin("v0.34.6-3013c2c2").as_deref(),
+            Some("v0.34.6")
+        );
+        assert_eq!(
+            engine_version_for_checkin("v0.34.5").as_deref(),
+            Some("v0.34.5")
+        );
+        assert_eq!(
+            engine_version_for_checkin("0.34.5").as_deref(),
+            Some("0.34.5")
+        );
+        assert_eq!(engine_version_for_checkin(""), None);
+        assert_eq!(engine_version_for_checkin("nightly"), None);
+        assert_eq!(engine_version_for_checkin("-3013c2c2"), None);
+    }
+
+    #[test]
+    fn the_endpoint_is_the_live_site_unless_a_test_says_otherwise() {
+        assert_eq!(CHECKIN_ENDPOINT, "https://easybtx.com/api/node-checkin");
+        assert!(CHECKIN_ENDPOINT.starts_with("https://"));
+    }
 
     #[test]
     fn a_generated_id_is_the_shape_the_endpoint_requires() {
@@ -323,6 +463,11 @@ mod tests {
             trusted_mirror: false,
             serving_attestations: true,
             listening_port: Some(19335),
+            // A real public key: this project's own signer, which every
+            // attestation on the network already carries.
+            signer_pubkey: Some(
+                "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675".into(),
+            ),
         }
     }
 
@@ -395,6 +540,11 @@ mod tests {
                 "schema",
                 "services",
                 "serving_attestations",
+                // Added 2026-09-17 with schema 2, and added to the site's
+                // ALLOWED set in the same change. These two lists are the
+                // contract; a field in one and not the other is a 422 on
+                // every node in the fleet.
+                "signer_pubkey",
                 "trusted_mirror",
                 "uptime_secs",
             ]

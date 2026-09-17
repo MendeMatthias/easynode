@@ -334,6 +334,18 @@
               <button id="signer-copy-btn" class="btn-secondary" type="button">Copy key</button>
             </div>
           </div>
+          <div class="setting-row" id="signer-publish-row" hidden>
+            <div class="setting-text">
+              <span class="setting-name">Offer my key to mirror operators</span>
+              <span class="setting-desc" id="signer-publish-desc">Sends the public key above to easybtx.com every fifteen minutes, with your node's version and block height, so the people who run mirrors can find it and decide whether to trust it. Nothing else is sent: no wallet, no address, no private key. Turning this off keeps your node signing</span>
+              <span class="setting-desc" id="signer-publish-status" hidden></span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="signer-publish-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <p class="setting-result" id="signer-publish-result" hidden></p>
 
           <div class="setting-row">
             <div class="setting-text">
@@ -517,9 +529,12 @@
                 Your graphics card checks every block, and your node now signs
                 each one it checks. The explorer and the wallets behind it
                 follow those signatures, and until now they all followed one
-                key on one home computer. Your public key is in Settings; the
-                private key never leaves this machine. Launch at login turns on
-                with this, so your signature keeps coming; both are in Settings.
+                key on one home computer. Your node offers its public key to
+                easybtx.com so the people who run mirrors can find it and
+                decide whether to trust it; the private key never leaves this
+                machine, and both that and the offer can be switched off in
+                Settings. Launch at login turns on with this, so your
+                signature keeps coming.
               </p>
             </li>
             <li class="role-line is-helps">
