@@ -83,6 +83,39 @@ engine (`v0.34.6-3013c2c2`):
    word for the proof of work. The close dialog says what happens to a mirror
    while a signing node is off.
 
+## Amendment, 2026-09-17: the key delivers itself
+
+Decision 1 above shipped the key and a copy button, which left the delivery to
+a person: copy 66 characters, paste them into a chat with Mende, once per
+volunteer, forever. The owner's answer on reading it was the right one — that
+does not scale, and a network short of signers needs the opposite.
+
+So a signing node now offers its public key over the check-in
+(`crates/btx-core/src/checkin.rs`, schema 2, `signer_pubkey`), and
+`easybtx.com/api/signer-offers` is the list a mirror operator pins from. The
+check-in client had existed since 0.6.17 with no caller; **choosing to sign is
+the only thing that calls it**, so a node that does not sign still sends
+nothing, which keeps this from becoming a fleet-wide phone-home by the back
+door. What goes with the key is in the module doc and in the Settings copy:
+a random local id, the app and engine versions, this run's counters, and the
+service bits the node already broadcasts to every peer. No wallet, no address,
+no secret.
+
+Two things stay exactly as they were, and they are the important ones:
+
+- **Offering is not pinning.** The trust decision is still a human one, taken
+  on the mirror's own machine. Nothing in the app or on the site can make it.
+- **The public feed never carries a key.** It carries the count of volunteers
+  (`selfReported.offersSigningKey`), because a published list of every key the
+  network's mirrors might pin is a target list. The keys go out over the
+  bearer-gated route, to the people who run mirrors.
+
+`EASYBTX_NODE_RPC_URL` landed with it, for a smaller reason that cost real
+time: this box runs the network's signer on 19334, so a throwaway test install
+had its app polling the LIVE node's port, failing cookie auth, and sitting on
+"reconnecting" — a whole feature could be tested without the app ever reaching
+a node. It completes the harness `EASYBTX_NODE_DATADIR` starts.
+
 ## What this does not do
 
 - It does not pin any new key anywhere. A volunteer's key reaches btxscan only

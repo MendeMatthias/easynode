@@ -18,12 +18,13 @@ use btx_core::node::{DatadirHolder, NodeController};
 use btx_core::node_api::{get_blockchain_info, get_chainstates};
 use btx_core::rpc::RpcClient;
 use btx_core::setup::{
-    enough_free_disk, ensure_addnodes_in_conf, free_disk_bytes, wait_for_node_rpc, RPC_URL,
+    enough_free_disk, ensure_addnodes_in_conf, free_disk_bytes, rpc_url, wait_for_node_rpc,
 };
 use btx_core::snapshot::SnapshotSpec;
 
 use crate::state::{
     node_datadir, AppState, AttachedTo, NodeAppSettings, NodeAppSnapshotFlags, NodePhase,
+    SignerOfferStatus,
 };
 
 /// The BTX release this app installs and runs — the network's current version
@@ -295,6 +296,52 @@ fn node_backend() -> Backend {
     btx_core::backend::node_host_backend()
 }
 
+/// The Settings line for one attempt to offer the public signing key.
+///
+/// Every outcome gets a sentence a person can act on, including the ones that
+/// are not failures: 429 means the directory already has a recent offer from
+/// this node, which is exactly what a node checking in every fifteen minutes
+/// should expect after a restart, and reporting it as an error would send
+/// people hunting a problem that does not exist.
+pub(crate) fn offer_status(
+    outcome: &btx_core::checkin::CheckinOutcome,
+    at: &str,
+) -> SignerOfferStatus {
+    use btx_core::checkin::CheckinOutcome as O;
+    let (delivered, detail) = match outcome {
+        O::Accepted => (
+            true,
+            "Your public key is with easybtx.com, where mirror operators pick \
+             up keys to trust. Pinning it is their decision, and it is not \
+             automatic."
+                .to_string(),
+        ),
+        O::TooSoon => (
+            true,
+            "easybtx.com already has a recent copy of your key.".to_string(),
+        ),
+        O::Unavailable => (
+            false,
+            "easybtx.com could not take the key just now. Your node keeps \
+             signing; it will try again."
+                .to_string(),
+        ),
+        O::Rejected { status, .. } => (
+            false,
+            format!(
+                "easybtx.com refused the key ({status}). Your node keeps signing. \
+                 This is a bug in this app rather than something you can fix; \
+                 the log has the detail."
+            ),
+        ),
+    };
+    SignerOfferStatus {
+        delivered,
+        at: at.to_string(),
+        detail,
+    }
+}
+
 /// A btxd path that carries this build's engine tag and nothing else, for the
 /// rules that read only the tag (`btx_core::node::launches_as_mirror` and the
 /// degraded-start gate behind it) before the real install path is resolved.
@@ -364,7 +411,7 @@ async fn set_phase(app: &AppHandle, state: &AppState, phase: NodePhase) {
 /// started by hand, may already be serving — attaching beats churning it.)
 async fn rpc_already_answering(datadir: &Path) -> Option<RpcClient> {
     let cookie = datadir.join(".cookie");
-    let client = RpcClient::from_cookie(RPC_URL, &cookie).ok()?;
+    let client = RpcClient::from_cookie(&rpc_url(), &cookie).ok()?;
     get_blockchain_info(&client).await.ok()?;
     Some(client)
 }
@@ -1243,7 +1290,7 @@ async fn spawn_node_with_lock_retry(
             spawn_warmup_watcher(app.clone(), state, datadir.to_path_buf());
             return wait_for_node_rpc(
                 datadir,
-                RPC_URL,
+                &rpc_url(),
                 RPC_WAIT_POLLS,
                 RPC_WAIT_POLL_MS,
                 RPC_WAIT_WARMUP_POLLS,
@@ -1330,7 +1377,7 @@ fn spawn_warmup_watcher(app: AppHandle, state: &AppState, datadir: PathBuf) {
             if rpc_slot.lock().await.is_some() || node_slot.lock().await.is_none() {
                 return; // started, stopped, or errored — the main path owns the phase now
             }
-            let Ok(client) = btx_core::rpc::RpcClient::from_cookie(RPC_URL, &cookie) else {
+            let Ok(client) = btx_core::rpc::RpcClient::from_cookie(&rpc_url(), &cookie) else {
                 continue; // no cookie yet — still booting
             };
             match get_blockchain_info(&client).await {
@@ -1375,6 +1422,8 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
     let archive_service_slot = state.archive_service.clone();
     let matmul_trusted_slot = state.matmul_trusted.clone();
     let recent_signers_slot = state.recent_signers.clone();
+    let signer_pubkey_slot = state.signer_pubkey.clone();
+    let signer_offer_slot = state.signer_offer.clone();
     let fork_slot = state.fork.clone();
     let tip_time_slot = state.tip_median_time.clone();
     let anchor = snapshot_spec().anchor_height;
@@ -1403,6 +1452,14 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
         let mut wd_last_dial_ok = true;
         // Service report (opt-in, local JSON): write every ~100 ticks (~5 min).
         let mut report_tick: u32 = 0;
+        // Offering the public signing key to the directory
+        // (`btx_core::checkin`), on a SIGNING node only. One POST every
+        // CHECKIN_INTERVAL_SECS, which is 300 ticks at this period; the
+        // counter starts near the top so the first offer goes out about a
+        // minute in, once the node has peers and real service bits, rather
+        // than fifteen minutes after a machine is switched on.
+        const CHECKIN_EVERY: u32 = (btx_core::checkin::CHECKIN_INTERVAL_SECS / 3) as u32;
+        let mut checkin_tick: u32 = CHECKIN_EVERY.saturating_sub(20);
         // Fork detector state (btx_core::fork). getchaintips is read every
         // FORK_CHECK_EVERY ticks; the headers/blocks gap window and the moment
         // the current verdict was first seen persist across ticks.
@@ -1897,6 +1954,109 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                             }
                         }
                     }
+
+                    // ── Offer the public signing key (~ every 15 min) ───────
+                    //
+                    // The whole reason this app has a check-in at all. A
+                    // signing key nobody pins signs into the void, and until
+                    // 0.6.26 getting one to a mirror operator meant a person
+                    // copying 66 characters into a chat. A node that does not
+                    // sign sends NOTHING: the gate below is the engine's own
+                    // answer that a key is loaded, not a setting, so a machine
+                    // that cannot sign cannot phone home either.
+                    checkin_tick += 1;
+                    if checkin_tick >= CHECKIN_EVERY {
+                        checkin_tick = 0;
+                        let dd = node_datadir();
+                        let settings = NodeAppSettings::load(&dd);
+                        let holds_key = matmul_trusted_slot
+                            .lock()
+                            .await
+                            .as_ref()
+                            .is_some_and(|s| s.local_signer);
+                        let pubkey = signer_pubkey_slot.lock().await.clone();
+                        if settings.signer_enabled
+                            && settings.signer_publish_enabled
+                            && holds_key
+                            && pubkey.is_some()
+                        {
+                            let net = btx_core::node_api::get_connection_counts(&rpc).await.ok();
+                            // No service bits, no claim: the endpoint requires
+                            // them and a made-up value would be a lie about
+                            // what this node offers the network.
+                            let services = net.as_ref().and_then(|n| {
+                                btx_core::checkin::normalize_services(&n.localservices)
+                            });
+                            let node_id = btx_core::checkin::load_or_create_node_id_os(&dd)
+                                .map_err(|e| {
+                                    eprintln!("[node-app] no node id, not offering the key: {e}");
+                                })
+                                .ok();
+                            if let (Some(services), Some(node_id)) = (services, node_id) {
+                                let tag = settings
+                                    .btx_release_tag
+                                    .clone()
+                                    .unwrap_or_else(|| NODE_RELEASE_TAG.to_string());
+                                let checkin = btx_core::checkin::Checkin {
+                                    schema: btx_core::checkin::CHECKIN_SCHEMA,
+                                    node_id,
+                                    agent: format!("easynode/{}", env!("CARGO_PKG_VERSION")),
+                                    btxd_version: btx_core::checkin::engine_version_for_checkin(
+                                        &tag,
+                                    ),
+                                    uptime_secs: run_started.elapsed().as_secs(),
+                                    blocks: readiness.height(),
+                                    headers: chain.headers,
+                                    peers,
+                                    bytes_sent: btx_core::node_api::get_net_totals(&rpc)
+                                        .await
+                                        .ok()
+                                        .map(|t| t.total_bytes_sent),
+                                    services,
+                                    trusted_mirror,
+                                    serving_attestations: settings.attestation_serve_enabled,
+                                    // Only when somebody has actually reached
+                                    // us: the port is there for the census to
+                                    // dial and verify, and an unreachable node
+                                    // naming one just wastes a probe.
+                                    listening_port: net
+                                        .as_ref()
+                                        .filter(|n| n.inbound > 0)
+                                        .map(|_| btx_core::role::P2P_PORT),
+                                    signer_pubkey: pubkey,
+                                };
+                                let now_iso = crate::update_log::rfc3339_utc(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0),
+                                );
+                                let status = match btx_core::checkin::offer_signing_key(
+                                    &btx_core::checkin::checkin_endpoint(),
+                                    &checkin,
+                                )
+                                .await
+                                {
+                                    Ok(outcome) => offer_status(&outcome, &now_iso),
+                                    Err(e) => SignerOfferStatus {
+                                        delivered: false,
+                                        at: now_iso.clone(),
+                                        detail: format!(
+                                            "Could not reach easybtx.com to offer your key ({e}). \
+                                             Your node keeps signing; it will try again."
+                                        ),
+                                    },
+                                };
+                                if !status.delivered {
+                                    eprintln!(
+                                        "[node-app] signing key not offered: {}",
+                                        status.detail
+                                    );
+                                }
+                                *signer_offer_slot.lock().await = Some(status);
+                            }
+                        }
+                    }
                 }
                 Err(AppError::Rpc { code: -28, .. }) => {
                     // Warming up (shielded rebuild / verify) — alive, keep calm.
@@ -2178,6 +2338,11 @@ pub struct NodeStatusInfo {
     pub signer_applies_here: Option<bool>,
     pub signer_pubkey: Option<String>,
     pub signing_live: bool,
+    /// Offer the public key to easybtx.com so a mirror operator can pin it
+    /// (`btx_core::checkin`), and what came of the last attempt this run.
+    /// `None` until a signing node has tried once.
+    pub signer_publish_enabled: bool,
+    pub signer_offer: Option<SignerOfferStatus>,
     /// What this node is really providing to other nodes right now: at the
     /// signed frontier and serving history, advertising the archive bit while
     /// silently degraded to the live window, or not serving at all. `None`
@@ -2679,6 +2844,8 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
             None
         },
         signing_live,
+        signer_publish_enabled: settings.signer_publish_enabled,
+        signer_offer: state.signer_offer.lock().await.clone(),
         archive_service: archive_service.clone(),
         archive_service_message: archive_service.as_ref().map(|a| a.message()),
         role,
@@ -3031,6 +3198,31 @@ pub async fn set_signer(state: State<'_, AppState>, on: bool) -> Result<String, 
     } else {
         "Signing starts at the next node start.".to_string()
     })
+}
+
+/// Settings: offer this node's PUBLIC signing key to easybtx.com, where a
+/// mirror operator can pick it up and pin it (`btx_core::checkin`).
+///
+/// Turning it off stops the offer at the next cycle and leaves the node
+/// signing; the key already delivered is not recalled, because a mirror that
+/// pinned it has it in its own config and this app has no reach into that.
+/// Said plainly in the message rather than implied.
+#[tauri::command]
+pub async fn set_signer_publish(state: State<'_, AppState>, on: bool) -> Result<String, String> {
+    NodeAppSettings::update(&node_datadir(), |s| s.signer_publish_enabled = on);
+    if on {
+        return Ok(
+            "Your node will offer its public key the next time it checks in, within fifteen \
+             minutes."
+                .to_string(),
+        );
+    }
+    *state.signer_offer.lock().await = None;
+    Ok(
+        "Your node will stop offering its key. It keeps signing, and any mirror that already \
+         pinned the key keeps following it — that copy lives in their configuration, not here."
+            .to_string(),
+    )
 }
 
 /// Which conf the engine-upgrade path writes: the selected profile's when the

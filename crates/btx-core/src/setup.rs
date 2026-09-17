@@ -13,6 +13,26 @@ use std::path::Path;
 /// datadir lock and the cookie wait timed out.
 pub const RPC_URL: &str = "http://127.0.0.1:19334";
 
+/// The RPC endpoint this run talks to: [`RPC_URL`], or `EASYBTX_NODE_RPC_URL`
+/// when it is set.
+///
+/// The override completes the throwaway-install harness that
+/// `EASYBTX_NODE_DATADIR` starts. Both exist for the same reason and neither is
+/// for users: this project's release box runs the network's signer out of
+/// `~/.easybtx` on port 19334, so a test install with its own datadir still had
+/// its app polling the LIVE node's port, failing cookie auth, and sitting on
+/// "reconnecting" forever — which is how a whole feature can be tested without
+/// the app ever having reached a node (measured here on 2026-09-16).
+///
+/// An unset or blank value is the constant, so nothing changes for anybody who
+/// does not set it.
+pub fn rpc_url() -> String {
+    match std::env::var("EASYBTX_NODE_RPC_URL") {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => RPC_URL.to_string(),
+    }
+}
+
 /// The un-pruned chain's BLOCK PAYLOAD, measured 2026-09-04 and stated in GiB.
 ///
 /// Method, because this number has been wrong in four places at once: BTX block
