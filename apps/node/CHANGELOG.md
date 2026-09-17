@@ -8,7 +8,7 @@ root).
 
 ## [Unreleased]
 
-## [0.6.26] - 2026-09-16 · linux + windows (mac follows when built)
+## [0.6.26] - 2026-09-17 · linux + windows (mac follows when built)
 
 **Every node with a capable graphics card now signs confirmations for the
 mirrors, so the explorer no longer depends on one home computer.** The
