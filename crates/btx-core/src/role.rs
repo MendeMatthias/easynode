@@ -154,6 +154,24 @@ pub struct NodeRole {
     /// difference between "a key is configured" and "the key is doing
     /// something", which no surface could show on 2026-09-03.
     pub signed_recent: Option<crate::signer::SignedRecent>,
+    /// How many DISTINCT keys carried the newest blocks this node accepted.
+    /// `None` until the window has been read.
+    ///
+    /// Only meaningful on a trusted mirror, and there it is the one number
+    /// that says whether this node survives losing a machine. A mirror
+    /// accepts a block only once a key it PINS has signed it, so if every
+    /// recent block was carried by the same key, that one machine being off,
+    /// slow, or merely unlucky on a fork stops this node dead — however many
+    /// keys the config lists, and with every other indicator still green.
+    ///
+    /// This is not hypothetical and it is not rare. btxscan.io pinned four
+    /// keys and was measured on 2026-09-17 with 552 of its last 600 blocks
+    /// carried by exactly one of them and nothing at all from the other
+    /// three. It had stopped twice that way. `RecentSigners::summary` has
+    /// computed this number since 0.6.26 and served it at
+    /// `/signers/recent`, where nothing read it; the point of carrying it
+    /// here is that the operator is told.
+    pub distinct_signers: Option<u64>,
 }
 
 /// Parse `getnetworkinfo.localservices` (16 hex chars, `0x` tolerated).
@@ -263,6 +281,7 @@ pub fn node_role(
         archive,
         archive_pending_restart,
         signed_recent: None,
+        distinct_signers: None,
     }
 }
 
@@ -275,6 +294,14 @@ impl NodeRole {
         signed_recent: Option<crate::signer::SignedRecent>,
     ) -> Self {
         self.signed_recent = signed_recent;
+        self
+    }
+
+    /// Attach how many distinct keys carried the recent blocks. Same window
+    /// and same cadence as [`Self::with_signed_recent`]; kept separate
+    /// because a mirror has no key of its own and still needs this number.
+    pub fn with_distinct_signers(mut self, distinct_signers: Option<u64>) -> Self {
+        self.distinct_signers = distinct_signers;
         self
     }
 
@@ -334,14 +361,49 @@ impl NodeRole {
                  A height. In this state it does not help the network."
                     .to_string(),
             ),
-            ValidationMode::Trusted => (
-                "Following signed attestations",
-                Some(false),
-                "Follows the chain through attestations signed by other nodes instead of \
-                 checking the proof itself, and produces none of its own. It can still pass \
-                 blocks on; the lines below say whether it does."
-                    .to_string(),
-            ),
+            // What the window says outranks what the config lists, the same
+            // rule the key line already follows. A mirror with four pins and
+            // one working signer is a one-machine node, and reading "follows
+            // signed attestations" while that is true is how this stayed
+            // invisible through two outages.
+            ValidationMode::Trusted => match self.distinct_signers {
+                Some(0) => (
+                    "Following signed attestations, none arriving",
+                    Some(false),
+                    "Follows the chain through attestations signed by other nodes, and none of \
+                     the recent blocks carries one this node accepts. Either it is still \
+                     catching up, or nothing it pins is signing, and then it cannot advance at \
+                     all."
+                        .to_string(),
+                ),
+                Some(1) => (
+                    "Following ONE signer",
+                    Some(false),
+                    "Every recent block reached this node on the signature of a single key. \
+                     However many keys the config pins, that one machine being switched off, \
+                     or merely unlucky on a fork, stops this node — and nothing else here will \
+                     look wrong while it does. Pin a second key that is actually signing."
+                        .to_string(),
+                ),
+                Some(n) => (
+                    "Following signed attestations",
+                    Some(false),
+                    format!(
+                        "Follows the chain through attestations signed by other nodes instead \
+                         of checking the proof itself, and produces none of its own. {n} \
+                         different keys carried the recent blocks, so losing one of them does \
+                         not stop this node."
+                    ),
+                ),
+                None => (
+                    "Following signed attestations",
+                    Some(false),
+                    "Follows the chain through attestations signed by other nodes instead of \
+                     checking the proof itself, and produces none of its own. It can still \
+                     pass blocks on; the lines below say whether it does."
+                        .to_string(),
+                ),
+            },
             ValidationMode::Relay => (
                 "Relay only",
                 Some(false),
@@ -681,6 +743,99 @@ mod tests {
         assert_eq!(line(&lines, "Signing key").helps, None);
         assert_eq!(line(&lines, "Signing key").value, "None");
         assert_eq!(line(&lines, "Serving history").helps, Some(true));
+    }
+
+    fn keyless_mirror() -> NodeRole {
+        node_role(
+            Some(&status("trusted", false)),
+            ARCHIVE_ONLY_BITS,
+            &[],
+            1,
+            86_400,
+            Some(0),
+            Some(&ArchiveService::ServingHistory),
+        )
+    }
+
+    /// THE 2026-09-17 CASE, which is the reason the field exists. btxscan
+    /// pinned four keys, 552 of its last 600 blocks were carried by one of
+    /// them and none at all by the other three, and it had already stopped
+    /// twice that way. Every other indicator was green throughout, because
+    /// every other indicator was measuring the right things: the chain moved,
+    /// the signer was healthy, the peers were there. A node on one signature
+    /// must say so on its own face.
+    #[test]
+    fn a_mirror_carried_by_one_key_says_so() {
+        let lines = keyless_mirror().with_distinct_signers(Some(1)).lines();
+        let v = line(&lines, "Validation");
+        assert_eq!(v.value, "Following ONE signer");
+        assert_eq!(v.helps, Some(false));
+        assert!(v.note.contains("single key"), "{}", v.note);
+        // Naming the remedy is the point: the operator can act on this one.
+        assert!(v.note.contains("Pin a second key"), "{}", v.note);
+    }
+
+    /// Redundancy earns the ordinary line back, and says why it is ordinary.
+    #[test]
+    fn a_mirror_carried_by_several_keys_is_not_warned_about() {
+        let lines = keyless_mirror().with_distinct_signers(Some(3)).lines();
+        let v = line(&lines, "Validation");
+        assert_eq!(v.value, "Following signed attestations");
+        assert!(v.note.contains("3 different keys"), "{}", v.note);
+        assert!(
+            v.note.contains("losing one of them does not stop"),
+            "{}",
+            v.note
+        );
+    }
+
+    /// Zero is not one. A mirror hearing nothing it accepts cannot advance at
+    /// all, which is a different sentence from "it depends on one machine",
+    /// and the difference is what an operator would do next.
+    #[test]
+    fn a_mirror_hearing_nothing_is_told_that_and_not_that_it_has_one_signer() {
+        let lines = keyless_mirror().with_distinct_signers(Some(0)).lines();
+        let v = line(&lines, "Validation");
+        assert_eq!(v.value, "Following signed attestations, none arriving");
+        assert!(!v.note.contains("single key"), "{}", v.note);
+        assert!(v.note.contains("cannot advance"), "{}", v.note);
+    }
+
+    /// NOT KNOWING IS NOT A VERDICT. Before the window has been read the line
+    /// must be the plain one: inventing "ONE signer" from an unread window
+    /// would alarm every mirror for the first minute of every run, and an
+    /// alarm that always fires on startup is one nobody reads by week two.
+    #[test]
+    fn an_unread_window_leaves_the_plain_line_alone() {
+        let lines = keyless_mirror().lines();
+        let v = line(&lines, "Validation");
+        assert_eq!(v.value, "Following signed attestations");
+        assert!(
+            v.note.contains("the lines below say whether it does"),
+            "{}",
+            v.note
+        );
+    }
+
+    /// The count is about how a MIRROR is carried. A node that validates for
+    /// itself does not care who else signed, and must not be told it is
+    /// "following ONE signer" when it is following nobody at all.
+    #[test]
+    fn a_validating_node_is_untouched_by_the_signer_count() {
+        let consensus = node_role(
+            Some(&status("consensus", true)),
+            CONSENSUS_BITS,
+            &[],
+            1,
+            86_400,
+            Some(0),
+            None,
+        )
+        .with_distinct_signers(Some(1));
+        let lines = consensus.lines();
+        let v = line(&lines, "Validation");
+        assert_eq!(v.value, "Checking every block itself");
+        assert_eq!(v.helps, Some(true));
     }
 
     /// (c) The signer. Holds a key, validates, advertises the archive bit: the
@@ -1280,7 +1435,8 @@ mod tests {
     ///         advertises_consensus: boolean; advertises_archive: boolean;
     ///         reachable_inbound: boolean; inbound: number; uptime_secs: number;
     ///         blocks_behind: number | null;
-    ///         signed_recent: { signed: number; seen: number; window: number } | null } | null;
+    ///         signed_recent: { signed: number; seen: number; window: number } | null;
+    ///         distinct_signers: number | null } | null;
     /// role_lines: { label: string; value: string; helps: boolean | null; note: string }[];
     /// ```
     ///
@@ -1310,6 +1466,7 @@ mod tests {
                 "uptime_secs": 600,
                 "blocks_behind": 1,
                 "signed_recent": null,
+                "distinct_signers": null,
             })
         );
         let unknown = node_role(None, "", &[], 0, 0, None, None);
@@ -1327,6 +1484,13 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&signing).unwrap()["signed_recent"],
             serde_json::json!({ "signed": 97, "seen": 100, "window": 100 })
+        );
+        // The mirror's own number travels on the same payload, so the UI can
+        // show "carried by one key" without a second round trip.
+        assert_eq!(
+            serde_json::to_value(r.clone().with_distinct_signers(Some(1))).unwrap()
+                ["distinct_signers"],
+            serde_json::json!(1)
         );
 
         let lines = r.lines();
