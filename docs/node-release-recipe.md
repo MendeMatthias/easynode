@@ -416,12 +416,51 @@ node fell behind the tip and began self-forking, and the wallet RPCs then hung o
 `cs_main` so the balance was unreadable anyway. The panel warns about this above
 50 blocks behind, and it advises rather than unloading anything itself.
 
-**Do NOT pass `-cadenceburstmax=0`**, even though an operator who hit the cadence
-hold will tell you to. It disables a real dump-and-run protection, and the hold is
-already disarmed for a catching-up node: `kernel/chainstatemanager_opts.h:331`
-says IBD, a stale tip, and recovery_escape each disarm it so partition catch-up
-runs at body-download speed. They hit it because their tip was live when the
-majority surged past them. Different state, opposite answer.
+**Do NOT pass `-cadenceburstmax=0`** as a blanket setting, even though an operator
+who hit the cadence hold will tell you to. It disables a real dump-and-run
+protection (btxd itself logs a warning when it is 0, pointing at
+`doc/design/0.34-dump-and-run-reorg.md`).
+
+🔴 **The reason this paragraph used to give was wrong, and the conclusion is right
+for a different reason. Re-verified 2026-09-18 against v0.34.5 and v0.34.6.**
+
+It used to cite `kernel/chainstatemanager_opts.h:331` ("IBD, a stale tip, and
+recovery_escape each disarm it"). That constexpr `CadenceHoldShouldHold` has **no
+callers outside its own definition**; production is
+`ChainstateManager::CadenceHoldShouldHold` at `src/validation.cpp:11794`, and it
+has **no tip-age test at all**. `docs/LEARNINGS-mac-mining.md` corrected that on
+2026-08-31, but that correction is itself incomplete: it stops at the wrapper and
+never opens `GetCadenceHoldAllowedHeight`, which the wrapper calls and which
+carries the two disarms that actually matter.
+
+What the engine really does (mainnet `nPowTargetSpacing = 90`, default
+`burst_max = 3`). `GetCadenceHoldAllowedHeight` returns
+`origin_height + burst_max + (now − origin_time)/90`, and:
+
+- `CadenceHoldFollowedCatchUpDisarms(extends_tip, followed_ahead, yield=100)` is
+  `extends_tip && followed_ahead >= 100`. It **folds the anchor**, after which
+  `origin_height` is the live tip, so the ceiling rises as the tip rises. Its own
+  comment names the symptom it fixed: *"live node: 423 headers ahead, tip stalled"*.
+- `CadenceHoldSnapshotCatchUpDisarms(...)` returns INT_MAX outright for snapshot
+  catch-up toward disk-loaded headers.
+
+| gap to best header, same chain | behaviour |
+|---|---|
+| **>= 100** | anchor folded, ceiling tracks the tip, **catches up normally** |
+| **3 to 99** | anchor pinned at a fixed height, ceiling rises 1 per 90 s while the chain also makes ~1 per 90 s, so the gap **never closes** |
+
+So a node that is *far* behind is fine and a node that is *slightly* behind is
+stuck, which is the opposite of the intuition everyone brings to this. Our own
+`~/.easybtx/faststart/faststart.conf` recorded the evidence and nobody read it that
+way: *"85 blocks closed in 12m45s with this at 0, and the gap re-opened to **41**
+within 2 hours of removing it."* 41 is inside the paced band.
+
+**Therefore:** keep the blanket flag off, because the case this paragraph was
+worried about is already handled upstream. If the 3-to-99 band needs addressing,
+use the conditional shape in `docs/2026-09-01-next-train-notes.md` (pass the flag
+only while behind, drop it at tip) or, better, report the band upstream as a
+refinement of btxchain/btx#140. Do not re-simplify this to either "always 0" or
+"the hold is harmless"; both have been believed here and both are wrong.
 
 **Before any restart, check free disk.** Their worst moment was a node that
 crashed on "Disk space is too low", failed its flush on stop, and could not
