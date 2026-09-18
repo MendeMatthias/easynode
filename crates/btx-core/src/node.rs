@@ -120,7 +120,21 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     //   "114.150.94.235:19335"  0/3 — no answer to the 09-05 probe either
     // 2026-09-05 19:49Z: answered at 210872 on the minority branch. Still a
     // NETWORK archive for the shared history.
-    "37.230.134.222:19335",
+    //
+    // ── OFF THE HEAD 2026-09-13, five hours after it was put there ──────────
+    // btxscan's live node, which carries this address as a manual peer, logged
+    // `connect() to 37.230.134.222:19335 failed after wait: Connection refused
+    // (111)` every 17 seconds from 2026-09-12 23:31Z, still refusing at 09-13
+    // 05:00Z; getaddednodeinfo connected=false; a fresh onetry produced no
+    // peer; three spaced probes from the Mac were refused. Refused, not slow.
+    //
+    // It stays in BTX_ARCHIVE_PEERS below, because it is the only archive this
+    // app ships and upstream's maintainer node has come back before; being
+    // there it is still dialled, just after the three seeds that answer. What
+    // it must not be is the FIRST dial every fresh node makes. Put it back here
+    // the day a real node handshakes it again, with that reading.
+    //
+    //   "37.230.134.222:19335"  refused since 2026-09-12 23:31Z
     // 2026-09-05 19:49Z: no answer to the probe, and on the validator's
     // banlist. Both were this side's doing: at 20:23Z the same node, dialled
     // as a manual peer, was /BTX:0.34.6/ with NETWORK + MATMUL_CONSENSUS on
@@ -4503,8 +4517,14 @@ consensus-validator service.";
         // justifies the new head: btxscan carries 37.230.134.222 as a manual
         // peer every day, /BTX:0.34.6/, synced at the tip on 09-11 and 09-12,
         // and it is one of the peers actually delivering attestations there.
+        // 2026-09-13: the head moved to 89.85.40.184. What justifies it: a
+        // full /BTX:0.34.6/ handshake at the tip on 09-11, 09-12 and 09-13
+        // from the Mac, a real btxd `onetry` from btxscan that connected in
+        // 20 s, and it is the one consenting seed the easybtx.com census has
+        // measured on the heaviest chain all week. 37.230.134.222 has refused
+        // every connection since 2026-09-12 23:31Z (btxd's own log).
         assert!(
-            BTX_BOOTSTRAP_PEERS[0].starts_with("37.230.134.222:"),
+            BTX_BOOTSTRAP_PEERS[0].starts_with("89.85.40.184:"),
             "head is {} — if a seed was retired, move this with it and say \
              what measurement justified the new head",
             BTX_BOOTSTRAP_PEERS[0]
@@ -4592,10 +4612,13 @@ consensus-validator service.";
         // 2026-09-12: 5 became 4 — LuckyPool's node produced no peer for a
         // real btxd `onetry` held 300 s, past the four minutes its own note
         // allows, and the comparison dial to 89.85.40.184 took 20 s.
+        // 2026-09-13: 4 became 3 — 37.230.134.222 refused every connection
+        // from btxscan's real node since 09-12 23:31Z; it keeps its seat in
+        // BTX_ARCHIVE_PEERS and leaves the head.
         assert_eq!(
             BTX_BOOTSTRAP_PEERS.len(),
-            4,
-            "BTX_BOOTSTRAP_PEERS should have 4 entries"
+            3,
+            "BTX_BOOTSTRAP_PEERS should have 3 entries"
         );
     }
 
