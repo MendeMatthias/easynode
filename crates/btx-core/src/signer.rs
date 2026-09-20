@@ -85,6 +85,38 @@ pub const BTX_WIF_VERSION: u8 = 0x99;
 /// How many recent blocks the "is it working" line looks at.
 pub const SIGNED_WINDOW_BLOCKS: u64 = 100;
 
+/// How many blocks at the top of the window are re-read on every pass, because
+/// an attestation can arrive long after the block it signs.
+///
+/// Measured on btxscan.io on 2026-09-20, while a signer was deliberately
+/// switched off to see whether the explorer depended on it. At 11:24:47Z the
+/// last four blocks (224,852 to 224,855) carried no signature from that key. By
+/// 11:34:22Z those same four heights, same hashes, same block times, all did:
+/// the attestations had simply not arrived yet. Reading a height once and
+/// keeping the answer would have recorded four blocks as unsigned by a key that
+/// signed all four, and the first report written off that sample said the
+/// signer had stopped three blocks earlier than it had.
+///
+/// Re-reading only the tip cannot catch a lag that spans four blocks.
+///
+/// Six is a deliberate compromise, not full coverage. The correction on
+/// 2026-09-20 landed when that block was already about fifteen deep, so a band
+/// that caught every late signature would have to re-read twenty heights on
+/// every three second tick, forty RPCs, for a number that does not need them:
+/// `distinct_keys` asks only whether a key appears in ONE of a hundred blocks,
+/// and the ninety-odd settled blocks below the band answer that on their own.
+/// What the band protects is the smaller claim, `signed_by`, where a frozen
+/// incomplete entry undercounts a signer's own contribution forever.
+///
+/// So six catches the common case cheaply, twelve RPCs of about 10 ms against
+/// a 3 s tick, and the window's depth covers the rest. If `signed_by` is ever
+/// held to closer than a few percent, this is the number to raise.
+pub const ATTESTATION_SETTLE_BLOCKS: u64 = 6;
+
+/// The smallest window that may be used to claim how many signers carry this
+/// node. See [`RecentSigners::distinct_signers_if_conclusive`].
+pub const DISTINCT_SIGNERS_MIN_SAMPLE: u64 = 20;
+
 /// The trusted mirrors this project's signers feed. A signer dials them as
 /// manual peers so its attestations arrive over a direct connection (see the
 /// module doc for why relay does not carry them). Today: btxscan.io's mirror
@@ -366,23 +398,47 @@ impl RecentSigners {
     /// blocks up to `tip`, oldest first, at most `budget` of them.
     ///
     /// Entries below the window's floor are dropped first, so a node that was
-    /// stopped for a day does not keep yesterday's heights. The newest recorded
-    /// height is included again: the block at the tip is often read before its
-    /// signature is stored, and a reorg can replace it, so it is always worth
-    /// one more look (its cost is two RPCs).
+    /// stopped for a day does not keep yesterday's heights. The newest
+    /// [`ATTESTATION_SETTLE_BLOCKS`] heights are always included again: a block
+    /// is usually read before every signature on it has arrived, and a reorg
+    /// can replace it, so the top of the window is never taken as final. Each
+    /// costs two RPCs.
+    ///
+    /// Unknown heights sort first because the walk runs from the floor upward,
+    /// so a fresh start still spends its whole budget filling the window and
+    /// the settle re-reads only begin once it is full.
     pub fn heights_to_read(&mut self, tip: u64, budget: usize) -> Vec<u64> {
         let floor = tip.saturating_sub(SIGNED_WINDOW_BLOCKS - 1);
         self.entries.retain(|(h, _, _)| *h >= floor && *h <= tip);
+        let settling = tip.saturating_sub(ATTESTATION_SETTLE_BLOCKS - 1);
         let mut out = Vec::new();
         let mut h = floor;
         while h <= tip && out.len() < budget {
             let known = self.entries.iter().any(|(k, _, _)| *k == h);
-            if !known || h == tip || Some(h) == self.highest() {
+            if !known || h >= settling || Some(h) == self.highest() {
                 out.push(h);
             }
             h += 1;
         }
         out
+    }
+
+    /// How many DISTINCT keys carried this window, or `None` when too few
+    /// blocks have been read for that to mean anything.
+    ///
+    /// The guard exists because the answer drives a warning. "Following ONE
+    /// signer" on a node that has read three blocks is not a finding, it is a
+    /// node that started forty seconds ago, and a warning that cries wolf on
+    /// every launch is one nobody reads by the time it is true. Twenty blocks
+    /// is roughly fifteen to thirty minutes of this chain, which the window
+    /// fills in a single tick once the node is up.
+    ///
+    /// The same rule the rest of this codebase follows, pointed the other way:
+    /// a check that cannot yet be evaluated must not read as PASSING, and it
+    /// must not read as FAILING either. It says nothing until it can.
+    pub fn distinct_signers_if_conclusive(&self) -> Option<u64> {
+        let s = self.summary();
+        (s.seen >= DISTINCT_SIGNERS_MIN_SAMPLE).then_some(s.distinct_keys)
     }
 
     pub fn summary(&self) -> RecentSignersSummary {
@@ -634,11 +690,14 @@ mod tests {
         for h in 401..=500 {
             w.record(h, &format!("h{h}"), &[]);
         }
-        // Full and at the tip: only the tip is re-read.
-        assert_eq!(w.heights_to_read(500, 25), vec![500]);
-        // One new block: the old tip (its signature may have landed since) and
-        // the new one.
-        assert_eq!(w.heights_to_read(501, 25), vec![500, 501]);
+        // Full and at the tip: the settle band at the top is re-read, because
+        // an attestation can land minutes after the block. Measured on
+        // btxscan.io 2026-09-20: four consecutive blocks looked unsigned by a
+        // key that had in fact signed all four, and only looked that way for
+        // ten minutes. Reading the tip alone would keep all four wrong.
+        assert_eq!(w.heights_to_read(500, 25), (495..=500).collect::<Vec<_>>());
+        // One new block: the settle band moves up with the tip.
+        assert_eq!(w.heights_to_read(501, 25), (496..=501).collect::<Vec<_>>());
         // The floor moved, so height 401 is gone.
         assert_eq!(w.hash_at(401), None);
         assert_eq!(w.summary().seen, 99);
@@ -646,6 +705,96 @@ mod tests {
         let far = w.heights_to_read(10_000, 25);
         assert_eq!(far, (9901..=9925).collect::<Vec<_>>());
         assert_eq!(w.summary().seen, 0);
+    }
+
+    /// The guard on the warning: a node that has barely started must not be
+    /// told it is standing on one signer, because at that point it is not
+    /// evidence, it is a small sample.
+    #[test]
+    fn one_signer_is_not_claimed_until_the_window_can_support_it() {
+        let a = "02".to_string() + &"e".repeat(64);
+        let b = "03".to_string() + &"f".repeat(64);
+        let mut w = RecentSigners::new();
+        assert_eq!(
+            w.distinct_signers_if_conclusive(),
+            None,
+            "empty says nothing"
+        );
+
+        for h in 1..DISTINCT_SIGNERS_MIN_SAMPLE {
+            w.record(h, &format!("h{h}"), &[att(&a)]);
+        }
+        assert_eq!(
+            w.distinct_signers_if_conclusive(),
+            None,
+            "one short of the minimum is still not evidence"
+        );
+
+        w.record(DISTINCT_SIGNERS_MIN_SAMPLE, "h", &[att(&a)]);
+        assert_eq!(
+            w.distinct_signers_if_conclusive(),
+            Some(1),
+            "at the minimum the single-signer finding is real and is said"
+        );
+
+        w.record(DISTINCT_SIGNERS_MIN_SAMPLE + 1, "h2", &[att(&b)]);
+        assert_eq!(w.distinct_signers_if_conclusive(), Some(2));
+    }
+
+    /// The btxscan 2026-09-20 shape, as a regression: a key signs every block,
+    /// but its attestations arrive late, so the top of the window reads as
+    /// unsigned by it at first and correct a few minutes later. The count must
+    /// follow the correction rather than freeze the first answer.
+    #[test]
+    fn a_late_attestation_is_picked_up_after_the_tip_moves_on() {
+        let a = "02".to_string() + &"c".repeat(64);
+        let late = "03".to_string() + &"d".repeat(64);
+        let mut w = RecentSigners::new();
+        // 495..=500 arrive carrying only `a`; `late` has not been served yet.
+        for h in 401..=500 {
+            let keys = if h >= 495 {
+                vec![att(&a)]
+            } else {
+                vec![att(&a), att(&late)]
+            };
+            w.record(h, &format!("h{h}"), &keys);
+        }
+        assert_eq!(
+            w.signed_by(&late).signed,
+            94,
+            "the top six look unsigned by it"
+        );
+
+        // The settle band still covers them, so they are asked for again and
+        // the late signatures replace the incomplete answer.
+        let again = w.heights_to_read(500, 25);
+        for h in 495..=500 {
+            assert!(
+                again.contains(&h),
+                "height {h} must be re-read, it is still settling"
+            );
+        }
+        for h in 495..=500 {
+            w.record(h, &format!("h{h}"), &[att(&a), att(&late)]);
+        }
+        assert_eq!(w.signed_by(&late).signed, 100, "the correction is taken");
+        assert_eq!(w.summary().distinct_keys, 2);
+
+        // And the limit, stated so it is a decision rather than a surprise:
+        // once the tip has moved past the band those heights are final, which
+        // is why `distinct_keys` leans on the depth of the window and not on
+        // the band. Six blocks of a hundred cannot change the answer to
+        // "did this key sign anything recently".
+        let stale = w.heights_to_read(520, 25);
+        assert!(
+            !stale.contains(&495),
+            "495 is twenty five deep, it is settled now"
+        );
+        assert_eq!(
+            w.summary().distinct_keys,
+            2,
+            "the count survives the band moving on"
+        );
     }
 
     /// The proof that matters: the shipped engine accepts a key this module

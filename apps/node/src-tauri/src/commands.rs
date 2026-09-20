@@ -1676,6 +1676,19 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                             .ok();
                         let has_local_signer =
                             trusted_status.as_ref().is_some_and(|s| s.local_signer);
+                        // Whether to keep the signer window, decided ONLY on a
+                        // tick that actually got an answer. `Some(false)` means
+                        // the engine told us this node does not need one;
+                        // `None` means it did not answer, and a failed RPC must
+                        // not throw away a hundred-block window that takes four
+                        // ticks to refill and drive the role line off for it.
+                        let keep_signer_window = trusted_status.as_ref().map(|s| {
+                            s.local_signer
+                                || matches!(
+                                    btx_core::role::validation_mode(Some(s)),
+                                    btx_core::role::ValidationMode::Trusted
+                                )
+                        });
                         if trusted_status.is_some() {
                             *matmul_trusted_slot.lock().await = trusted_status;
                         }
@@ -1686,18 +1699,40 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
                                 has_local_signer,
                             ));
 
-                        // ── Is the key actually signing? ────────────────────
-                        // Only a node the engine says holds a key pays for
-                        // this, and it pays two RPCs per NEW block once the
-                        // window is full: `heights_to_read` re-reads the tip
-                        // and asks for what it lacks, so a fresh start fills
-                        // the hundred-block window over four ticks at 25 a
-                        // tick (~0.5 s of RPC at 10 ms a call, against a 3 s
-                        // period) and then idles. A node with no key keeps
-                        // no window at all: no claim without a measurement.
-                        {
+                        // ── Is the key actually signing, and how many keys
+                        //    is this node standing on? ─────────────────────
+                        // Two questions off one window. The first only makes
+                        // sense with a key: does MINE sign? The second makes
+                        // sense to every trusted mirror and matters most to
+                        // the ones with no key at all: how many DIFFERENT keys
+                        // carried the recent blocks, which is the same as
+                        // asking how many machines have to stay up for this
+                        // node to keep working.
+                        //
+                        // Until 2026-09-20 the window was kept only when the
+                        // engine reported a local key, so a plain mirror never
+                        // measured, `distinct_signers` was never set, and the
+                        // "Following ONE signer" line that role.rs has carried
+                        // since #113 could not fire on the nodes it was
+                        // written for. btxscan.io was the worked example: four
+                        // pinned keys, 552 of its last 600 blocks carried by
+                        // exactly one of them, nothing at all from the other
+                        // three, and it had stopped twice that way with every
+                        // other indicator green.
+                        //
+                        // A consensus node checks proofs itself and depends on
+                        // no signer, so it still keeps no window unless it
+                        // holds a key.
+                        //
+                        // Cost is two RPCs per NEW block once the window is
+                        // full, plus the settle band at the top that
+                        // `heights_to_read` re-reads because attestations
+                        // arrive late. A fresh start fills the hundred-block
+                        // window over four ticks at 25 a tick (~0.5 s of RPC
+                        // at 10 ms a call, against a 3 s period), then idles.
+                        if let Some(keep) = keep_signer_window {
                             let mut window = recent_signers_slot.lock().await;
-                            if has_local_signer {
+                            if keep {
                                 let w =
                                     window.get_or_insert_with(btx_core::signer::RecentSigners::new);
                                 btx_core::signer::refresh_recent_signers(&rpc, w, chain.blocks, 25)
@@ -2695,9 +2730,29 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
     // line renders it. The public key is the one the start path derived, so a
     // switch flipped since then shows what the RUNNING node signs as.
     let signer_pubkey = state.signer_pubkey.lock().await.clone();
-    let signed_recent = match (&signer_pubkey, state.recent_signers.lock().await.as_ref()) {
-        (Some(pk), Some(window)) if running => Some(window.signed_by(pk)),
-        _ => None,
+    // One lock, both answers. `signed_recent` needs a key of our own;
+    // `distinct_signers` does not and is the one number that says whether this
+    // node survives losing a machine, so a keyless mirror gets it too.
+    //
+    // Only a node that has CAUGHT UP may answer the second one. A node still
+    // syncing is reading a window of old blocks, or of blocks below the height
+    // where attestations begin at all, and would report zero distinct keys;
+    // role.rs renders that as "Following signed attestations, none arriving",
+    // which on a first install is both alarming and wrong. The window keeps
+    // filling while it syncs, so the answer is ready the moment it is allowed
+    // to be given. A check that cannot yet be evaluated says nothing.
+    let caught_up = matches!(phase, NodePhase::Ready { .. });
+    let (signed_recent, distinct_signers) = {
+        let window = state.recent_signers.lock().await;
+        match window.as_ref() {
+            Some(w) if running => (
+                signer_pubkey.as_ref().map(|pk| w.signed_by(pk)),
+                caught_up
+                    .then(|| w.distinct_signers_if_conclusive())
+                    .flatten(),
+            ),
+            _ => (None, None),
+        }
     };
     let role = net.as_ref().filter(|_| running).map(|n| {
         btx_core::role::node_role(
@@ -2710,6 +2765,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
             archive_service.as_ref(),
         )
         .with_signed_recent(signed_recent)
+        .with_distinct_signers(distinct_signers)
     });
     let role_lines = role.as_ref().map(|r| r.lines()).unwrap_or_default();
     let signing_live = role.as_ref().is_some_and(|r| r.signs_for_mirrors());
