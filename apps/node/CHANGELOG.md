@@ -8,6 +8,47 @@ root).
 
 ## [Unreleased]
 
+## [0.6.27] - 2026-09-20
+
+**Your node now tells you when it is standing on a single signer, which until
+this release it could not, however many keys it pinned.** A node that follows
+signed confirmations accepts a block once ONE key it trusts has signed it, so
+what decides whether it keeps working is not how many keys the config lists but
+how many are actually delivering. Those are different numbers and nothing here
+measured the second one. btxscan.io is the worked example: four keys pinned,
+552 of its last 600 blocks carried by exactly one of them, nothing at all from
+the other three, and it had stopped twice that way with every other indicator
+on the machine green.
+
+The line that says so has existed since 0.6.26 and has never been shown to
+anybody, because nothing in the app ever set the number behind it. Underneath
+that was the real gap: the window that counts signers was only kept by a node
+holding a signing key of its own. A plain mirror, which is every machine
+without a capable graphics card and the node most exposed to this, measured
+nothing at all. It now keeps that window whether or not it holds a key. A node
+that checks proofs itself still does not, because it depends on no signer.
+
+Two guards, because a warning that cries wolf is one nobody reads by the time
+it is true. It says nothing until it has read twenty blocks, so a node that
+started forty seconds ago is not told it stands on one signer, and nothing at
+all until the node has caught up, because a syncing node reads a window from
+below the height confirmations begin at and would report none arriving.
+
+**Signature counts no longer freeze while confirmations are still arriving.**
+Measured on 2026-09-20 during a deliberate test, with a signer switched off at
+the wall to see whether the explorer depended on it: four blocks carried no
+signature from a key that, ten minutes later, had signed all four. Same
+heights, same hashes, no reorg. The window re-read only the newest block, so
+every height below it kept whatever had arrived by the time it was first read,
+and a signer's own count stayed permanently short. It now re-reads the newest
+six.
+
+Also in this release: a peer that refused every connection for five hours after
+being put at the head of the list is no longer left there (#86).
+
+Nothing about how the node validates, signs or serves changed. The engine is
+unchanged from 0.6.26.
+
 ## [0.6.26] - 2026-09-17 · linux + windows (mac follows when built)
 
 **Every node with a capable graphics card now signs confirmations for the
