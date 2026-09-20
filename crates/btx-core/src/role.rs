@@ -196,7 +196,13 @@ fn advertises(hex: &str, names: &[String], bit: u64, name: &str) -> bool {
     }
 }
 
-fn validation_mode(status: Option<&MatmulTrustedStatus>) -> ValidationMode {
+/// How this node validates, from `getmatmultrustedstatus`.
+///
+/// Public because callers outside this module have to make the same decision
+/// and must not re-derive it: the app decides whether to keep a signer window
+/// by asking whether this is a trusted mirror, and a second copy of the
+/// "empty string plus the flag" rule below would drift from this one.
+pub fn validation_mode(status: Option<&MatmulTrustedStatus>) -> ValidationMode {
     let Some(s) = status else {
         return ValidationMode::Unknown;
     };
