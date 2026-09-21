@@ -21,6 +21,7 @@ use btx_core::setup::{
     enough_free_disk, ensure_addnodes_in_conf, free_disk_bytes, rpc_url, wait_for_node_rpc,
 };
 use btx_core::snapshot::SnapshotSpec;
+use btx_core::snapshot_serve as snap;
 
 use crate::state::{
     node_datadir, AppState, AttachedTo, NodeAppSettings, NodeAppSnapshotFlags, NodePhase,
@@ -1168,6 +1169,10 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     // Settings row rather than logged away.
     maybe_start_esplora(state, &datadir).await;
     maybe_start_witness(state, &datadir).await;
+    // The snapshot keeper, if chosen: re-offers the recorded pair once this
+    // node is at the tip (the offer never survives a restart), and refreshes
+    // it every 500 blocks. Gated against the LIVE node on every tick.
+    maybe_start_snapshot_serve(state, &datadir).await;
     Ok(())
 }
 
@@ -2178,6 +2183,9 @@ pub async fn stop_node_inner(state: &AppState) {
     state.refresher_gen.fetch_add(1, Ordering::SeqCst);
     stop_esplora(state).await;
     stop_witness(state).await;
+    // The node is going down and takes the offer with it; the keeper is told
+    // to stop rather than asked to withdraw from a node that is stopping.
+    stop_snapshot_serve(state, false).await;
     let launch = state.launch.lock().await.clone();
     let attached = *state.attached_to.lock().await;
     {
@@ -2560,6 +2568,11 @@ pub struct NodeStatusInfo {
     pub witness_public: bool,
     /// Why it is not running when it is on. `None` otherwise.
     pub witness_message: Option<String>,
+    /// Produce and serve an attested snapshot of the chain state
+    /// (`btx_core::snapshot_serve`): the choice, and the keeper's last word,
+    /// which is `None` while the role is off or the node is down.
+    pub snapshot_serve_enabled: bool,
+    pub snapshot_serve: Option<btx_core::snapshot_serve::ServeStatus>,
     /// The last self-update check: when it finished (RFC 3339, UTC), how it
     /// ended (one of `update_log::UPDATE_CHECK_OUTCOMES`), and the short
     /// detail recorded with it. `None`/empty until the first check finishes.
@@ -2961,6 +2974,8 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         } else {
             state.witness_error.lock().await.clone()
         },
+        snapshot_serve_enabled: settings.snapshot_serve_enabled,
+        snapshot_serve: state.snapshot_serve.lock().ok().and_then(|g| g.clone()),
         esplora_running,
         esplora_indexing,
         esplora_freshness: esplora_verdict.map(|v| v.freshness.as_str().to_string()),
@@ -3846,6 +3861,246 @@ pub async fn set_witness_listen(
         (false, true) => format!("Saved: {listen}, which other machines can reach."),
         (false, false) => format!("Saved: {listen}, this machine only."),
     })
+}
+
+// ── Snapshot serving ─────────────────────────────────────────────────────────
+// btx_core::snapshot_serve is the design. In one paragraph: a node that
+// validates and signs exports the UTXO set at the tip, waits ten
+// confirmations because the dump bases on the 0-conf tip and siblings arrive
+// every ~25 blocks, offers the matured pair over P2P, re-makes the links to
+// the mirrors because service bits travel only in the handshake, refreshes
+// every 500 blocks, and re-offers after every node start because the offer
+// lives in the running process only. The keeper below is that loop. Every
+// decision in it is a pure function in the core module with a test; this is
+// orchestration and reporting.
+
+fn set_snapshot_status(
+    slot: &Arc<std::sync::Mutex<Option<snap::ServeStatus>>>,
+    status: Option<snap::ServeStatus>,
+) {
+    if let Ok(mut g) = slot.lock() {
+        *g = status;
+    }
+}
+
+async fn snapshot_serve_facts(state: &AppState, datadir: &Path) -> snap::SnapshotFacts {
+    let free = Some(btx_core::disk::free_disk_mb(datadir));
+    match state.rpc.lock().await.clone() {
+        Some(rpc) => snap::read_facts(&rpc, free).await,
+        None => snap::SnapshotFacts {
+            free_disk_mb: free,
+            ..Default::default()
+        },
+    }
+}
+
+/// The keeper: one loop per node start, superseded by the generation counter
+/// the moment the node stops or the role is switched off. A cycle in flight
+/// asks `keep_going` at every poll and aborts without offering anything.
+fn spawn_snapshot_keeper(state: &AppState, datadir: PathBuf) {
+    let gen = state.snapshot_serve_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let gen_counter = state.snapshot_serve_gen.clone();
+    let rpc_slot = state.rpc.clone();
+    let status_slot = state.snapshot_serve.clone();
+    let quitting = state.quitting.clone();
+    tauri::async_runtime::spawn(async move {
+        let dir = snap::snapshot_dir(&datadir);
+        let alive =
+            move || gen_counter.load(Ordering::SeqCst) == gen && !quitting.load(Ordering::SeqCst);
+        // A node that just came up needs a moment before its first answers
+        // mean anything; after that, a tick every half minute.
+        let mut wait = std::time::Duration::from_secs(15);
+        loop {
+            tokio::time::sleep(wait).await;
+            wait = std::time::Duration::from_secs(30);
+            if !alive() {
+                return;
+            }
+            let Some(rpc) = rpc_slot.lock().await.clone() else {
+                set_snapshot_status(&status_slot, None);
+                return; // the stop path owns the rest
+            };
+            let facts = snap::read_facts(&rpc, Some(btx_core::disk::free_disk_mb(&datadir))).await;
+            let record = snap::load_record(&dir);
+            let tip = facts.blocks;
+            let base = record.as_ref().map(|r| r.height);
+            let stale_by = tip.zip(base).map(|(t, b)| t.saturating_sub(b));
+            let from_record = |s: &mut snap::ServeStatus| {
+                if let Some(r) = record.as_ref() {
+                    s.base_height = Some(r.height);
+                    s.base_hash = Some(r.block_hash.clone());
+                    s.file_size = Some(r.file_size);
+                    s.sha256 = Some(r.sha256.clone());
+                }
+                s.stale_by = stale_by;
+            };
+
+            if let Some(b) = snap::check(&facts).blocker {
+                let mut s = snap::ServeStatus {
+                    offering: snap::offer_live(&rpc).await,
+                    message: snap::explain(&b),
+                    needs_attention: !b.is_transient(),
+                    ..Default::default()
+                };
+                from_record(&mut s);
+                set_snapshot_status(&status_slot, Some(s));
+                // A permanent blocker needs a person; polling it every half
+                // minute changes nothing and fills the log.
+                wait = std::time::Duration::from_secs(if b.is_transient() { 30 } else { 300 });
+                continue;
+            }
+
+            if snap::refresh_due(tip.unwrap_or(0), base) {
+                eprintln!(
+                    "[snapshot] tip {} is {} blocks past base {}; exporting a fresh snapshot",
+                    tip.unwrap_or(0),
+                    stale_by.unwrap_or(0),
+                    base.map(|b| b.to_string()).unwrap_or_else(|| "none".into())
+                );
+                let phase_slot = status_slot.clone();
+                let previous = record.clone();
+                let on_phase = move |p: snap::CyclePhase| {
+                    let mut s = snap::ServeStatus {
+                        // The OLD offer stays live while the new base matures.
+                        offering: previous.as_ref().map(|_| true),
+                        message: p.message(),
+                        phase: Some(p),
+                        ..Default::default()
+                    };
+                    if let Some(r) = previous.as_ref() {
+                        s.base_height = Some(r.height);
+                        s.base_hash = Some(r.block_hash.clone());
+                    }
+                    set_snapshot_status(&phase_slot, Some(s));
+                };
+                let keep_going = alive.clone();
+                match snap::run_cycle(
+                    &rpc,
+                    &dir,
+                    snap::MATURE_POLL,
+                    snap::MATURE_DEADLINE,
+                    &keep_going,
+                    &on_phase,
+                )
+                .await
+                {
+                    Ok(r) => eprintln!(
+                        "[snapshot] offering base {} ({} bytes, sha256 {}, file_hash {}, {} chunks)",
+                        r.height, r.file_size, r.sha256, r.file_hash, r.chunk_count
+                    ),
+                    Err(e) => {
+                        eprintln!("[snapshot] cycle failed: {e}");
+                        let mut s = snap::ServeStatus {
+                            offering: snap::offer_live(&rpc).await,
+                            message: format!("The last export did not complete: {e}. Trying again."),
+                            ..Default::default()
+                        };
+                        from_record(&mut s);
+                        set_snapshot_status(&status_slot, Some(s));
+                        wait = std::time::Duration::from_secs(300);
+                    }
+                }
+                continue;
+            }
+
+            if snap::offer_live(&rpc).await != Some(true) {
+                match snap::reoffer(
+                    &rpc,
+                    &dir,
+                    facts.blocks,
+                    facts.headers,
+                    facts.initial_block_download,
+                )
+                .await
+                {
+                    Ok(snap::ReofferOutcome::Reoffered { height }) => {
+                        eprintln!("[snapshot] re-offered base {height} after a node start")
+                    }
+                    Ok(snap::ReofferOutcome::BaseNotCanonical { height }) => eprintln!(
+                        "[snapshot] base {height} is no longer on the active chain; \
+                         not re-offering, the next refresh replaces it"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[snapshot] re-offer failed: {e}"),
+                }
+            }
+
+            let offering = snap::offer_live(&rpc).await;
+            let peers_offering = snap::peers_offering(&rpc).await;
+            let mut s = snap::ServeStatus {
+                offering,
+                peers_offering,
+                message: match (record.as_ref(), offering) {
+                    (Some(r), Some(true)) => {
+                        snap::ServeStatus::serving_message(r, tip, peers_offering)
+                    }
+                    (Some(r), _) => format!(
+                        "A snapshot at block {} is on disk and not offered yet; the node has to be \
+                         at the tip and the block still on the chain.",
+                        r.height
+                    ),
+                    (None, _) => "Nothing exported yet.".to_string(),
+                },
+                ..Default::default()
+            };
+            from_record(&mut s);
+            set_snapshot_status(&status_slot, Some(s));
+        }
+    });
+}
+
+async fn maybe_start_snapshot_serve(state: &AppState, datadir: &Path) {
+    if !NodeAppSettings::load(datadir).snapshot_serve_enabled {
+        return;
+    }
+    spawn_snapshot_keeper(state, datadir.to_path_buf());
+}
+
+/// Stop the keeper. With `withdraw`, also take the offer off the wire; without
+/// it (the node is stopping) the offer goes with the process.
+async fn stop_snapshot_serve(state: &AppState, withdraw: bool) {
+    state.snapshot_serve_gen.fetch_add(1, Ordering::SeqCst);
+    set_snapshot_status(&state.snapshot_serve, None);
+    if withdraw {
+        if let Some(rpc) = state.rpc.lock().await.clone() {
+            match snap::withdraw(&rpc).await {
+                Ok(true) => eprintln!("[snapshot] offer withdrawn"),
+                Ok(false) => {}
+                Err(e) => eprintln!("[snapshot] withdraw failed: {e}"),
+            }
+        }
+    }
+}
+
+/// Settings: produce and serve an attested snapshot of the chain state.
+#[tauri::command]
+pub async fn set_snapshot_serve(state: State<'_, AppState>, on: bool) -> Result<String, String> {
+    let datadir = node_datadir();
+    if !on {
+        NodeAppSettings::update(&datadir, |s| s.snapshot_serve_enabled = false);
+        stop_snapshot_serve(&state, true).await;
+        return Ok(
+            "Off. Nothing is offered; the snapshot files stay in the data folder.".to_string(),
+        );
+    }
+    // Gated against the live node BEFORE the setting is saved, the Esplora
+    // rule: a refusal is shown where the switch is, and the switch is not
+    // left on behind it. A transient blocker (the node is behind, or not
+    // running yet) is not a refusal; the keeper waits it out.
+    let facts = snapshot_serve_facts(&state, &datadir).await;
+    if let Some(b) = snap::check(&facts).blocker.filter(|b| !b.is_transient()) {
+        return Err(snap::explain(&b));
+    }
+    NodeAppSettings::update(&datadir, |s| s.snapshot_serve_enabled = true);
+    if state.rpc.lock().await.is_none() {
+        return Ok("Saved. It starts with the node.".to_string());
+    }
+    spawn_snapshot_keeper(&state, datadir);
+    Ok(
+        "On. The first snapshot is exported at the tip and offered once it has ten \
+         confirmations, about fifteen minutes; after that it is refreshed every 500 blocks."
+            .to_string(),
+    )
 }
 
 #[tauri::command]

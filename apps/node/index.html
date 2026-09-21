@@ -383,6 +383,21 @@
             <p class="setting-result" id="witness-result" hidden></p>
           </div>
 
+          <!-- Producer half of the attested-snapshot mechanism
+               (btx_core::snapshot_serve). Opt-in: it needs a node that
+               validates and signs, and the gate's refusal is shown here. -->
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Serve a chain snapshot</span>
+              <span class="setting-desc" id="snapshot-serve-desc">Export the chain state at the tip, sign it, and let new nodes fetch it instead of catching up from a months-old file. Needs a node that checks blocks itself and signs. About 9 MB, refreshed every 500 blocks</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="snapshot-serve-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <p class="setting-result" id="snapshot-serve-result" hidden></p>
+
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Serve wallets (Esplora API)</span>

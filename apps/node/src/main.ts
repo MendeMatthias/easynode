@@ -65,7 +65,26 @@ type NodePhase =
   | { phase: "stopped" }
   | { phase: "error"; message: string };
 
-export interface NodeStatusInfo {
+export interface SnapshotServeStatus {
+  /** true while the offer is on the wire; null when unmeasured. */
+  offering: boolean | null;
+  base_height: number | null;
+  base_hash: string | null;
+  /** Blocks the tip has moved past the offered base. */
+  stale_by: number | null;
+  file_size: number | null;
+  sha256: string | null;
+  /** Peers that advertise a snapshot of their own. */
+  peers_offering: number | null;
+  /** Where a cycle is, while one runs. */
+  phase: { kind: string } | null;
+  /** The sentence beside the switch. */
+  message: string;
+  /** The message names something the operator has to change. */
+  needs_attention: boolean;
+}
+
+interface NodeStatusInfo {
   running: boolean;
   phase: NodePhase;
   uptime_secs: number;
@@ -224,6 +243,10 @@ export interface NodeStatusInfo {
   /** True when the bind address accepts connections from other machines. */
   witness_public: boolean;
   witness_message: string | null;
+  /** Produce and serve an attested snapshot of the chain state: the choice,
+   *  and the keeper's last word (null while off or the node is down). */
+  snapshot_serve_enabled: boolean;
+  snapshot_serve: SnapshotServeStatus | null;
   /** The last self-update check as the backend persisted it: when it finished
    *  (RFC 3339, UTC), one of the five words in UPDATE_CHECK_OUTCOMES, and the
    *  short detail recorded with it. Null/empty until the first check finishes.
@@ -787,6 +810,7 @@ function renderStatus(status: NodeStatusInfo) {
   $("close-signer-warning").hidden = !status.signing_live;
   reflectEsploraRow(status);
   reflectWitnessRow(status);
+  reflectSnapshotServeRow(status);
 
   const mode = visualMode(p, status.rc_stalled);
   orb.className = `status-orb is-${mode}`;
@@ -1074,6 +1098,7 @@ $("settings-btn").addEventListener("click", async () => {
     reflectKeeperRow(lastStatus);
     reflectEsploraRow(lastStatus);
     reflectWitnessRow(lastStatus);
+    reflectSnapshotServeRow(lastStatus);
   }
   // The preflight is a question about the machine, so it is asked when the
   // panel opens rather than on the status poll: it reads the conf, the node
@@ -1304,6 +1329,48 @@ function reflectWitnessRow(status: NodeStatusInfo): void {
   listenDesc.textContent = status.witness_public
     ? "Any machine that can reach this address can ask. Nothing about your wallet or your coins is exposed: it answers block hashes and refuses everything else"
     : "This machine only, unless you change it. Use 0.0.0.0 to let other machines ask. Applies at the next node start";
+}
+
+const SNAPSHOT_SERVE_STATIC_COPY =
+  "Export the chain state at the tip, sign it, and let new nodes fetch it instead of catching up from a months-old file. Needs a node that checks blocks itself and signs. About 9 MB, refreshed every 500 blocks";
+
+$<HTMLInputElement>("snapshot-serve-toggle").addEventListener("change", async (e) => {
+  const box = e.target as HTMLInputElement;
+  const on = box.checked;
+  const result = $("snapshot-serve-result");
+  box.disabled = true;
+  try {
+    const msg = await invoke<string>("set_snapshot_serve", { on });
+    result.classList.remove("is-error");
+    result.textContent = msg;
+  } catch (err) {
+    box.checked = !on;
+    result.classList.add("is-error");
+    result.textContent = String(err);
+  }
+  result.hidden = false;
+  box.disabled = false;
+});
+
+/**
+ * The snapshot row says what the keeper last said: off, saved and waiting
+ * for the node, refused (the gate's sentence, in amber), a cycle's phase, or
+ * what is on offer and how old it is. It never claims an offer is live on the
+ * strength of the setting; `offering` comes from the node's own service bits.
+ */
+function reflectSnapshotServeRow(status: NodeStatusInfo): void {
+  const t = $<HTMLInputElement>("snapshot-serve-toggle");
+  if (document.activeElement !== t) t.checked = status.snapshot_serve_enabled;
+  const desc = $("snapshot-serve-desc");
+  desc.classList.remove("needs-attention");
+  if (!status.snapshot_serve_enabled) {
+    desc.textContent = SNAPSHOT_SERVE_STATIC_COPY;
+  } else if (status.snapshot_serve) {
+    desc.textContent = status.snapshot_serve.message;
+    desc.classList.toggle("needs-attention", status.snapshot_serve.needs_attention);
+  } else {
+    desc.textContent = "Saved — it starts with the node";
+  }
 }
 
 const ESPLORA_STATIC_COPY =
