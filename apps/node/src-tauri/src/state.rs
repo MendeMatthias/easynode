@@ -244,6 +244,16 @@ pub struct NodeAppSettings {
     /// somebody's back.
     #[serde(default = "default_witness_listen")]
     pub witness_listen: String,
+    /// Produce and serve an attested snapshot of the chain state
+    /// (`btx_core::snapshot_serve`): export the UTXO set at the tip, sign it
+    /// with this node's key, wait for it to mature, offer it over P2P, refresh
+    /// it every 500 blocks, and re-offer it after every node start. Off by
+    /// default: it only works on a node that validates and signs, and the gate
+    /// says so where the switch is. What is served is ~9 MB and a fetching
+    /// node takes it in chunks; nothing about this node is exposed beyond a
+    /// service bit and the signed file.
+    #[serde(default)]
+    pub snapshot_serve_enabled: bool,
     /// When the last self-update check finished (RFC 3339, UTC), how it ended
     /// (one of `update_log::UPDATE_CHECK_OUTCOMES`), and the short detail the
     /// front end recorded with it. `None`/empty until the first check has
@@ -317,6 +327,9 @@ impl Default for NodeAppSettings {
             esplora_listen: default_esplora_listen(),
             witness_enabled: true,
             witness_listen: default_witness_listen(),
+            // Opt-in: needs a validating signer, and it changes what other
+            // nodes can fetch from this one.
+            snapshot_serve_enabled: false,
             // No check has finished yet, and the pane says so in those words.
             last_update_check_at: None,
             last_update_check_outcome: None,
@@ -700,6 +713,15 @@ pub struct AppState {
     /// Why the witness is not running although the setting is on. Shown beside
     /// the switch; `None` when it is running or off.
     pub witness_error: Arc<Mutex<Option<String>>>,
+    /// The snapshot keeper's last word (`btx_core::snapshot_serve::ServeStatus`),
+    /// rewritten on every tick and on every phase of a cycle. A sync mutex on
+    /// purpose: the cycle reports phases from a plain closure, and the status
+    /// poll only reads. `None` while the role is off or the node is down.
+    pub snapshot_serve: Arc<std::sync::Mutex<Option<btx_core::snapshot_serve::ServeStatus>>>,
+    /// Generation counter for the keeper loop, bumped on every start and stop;
+    /// a loop whose generation is superseded exits, and a cycle in flight
+    /// aborts at its next poll without offering anything.
+    pub snapshot_serve_gen: Arc<AtomicU64>,
 }
 
 /// Whose node did we attach to? Derived from the `DatadirHolder` seen at the
@@ -759,6 +781,8 @@ impl AppState {
             esplora_gen: Arc::new(AtomicU64::new(0)),
             witness: Arc::new(Mutex::new(None)),
             witness_error: Arc::new(Mutex::new(None)),
+            snapshot_serve: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_serve_gen: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -779,6 +803,10 @@ mod tests {
         assert!(s.wallet_name.is_none());
         assert_eq!(s.on_close, "ask", "the red X asks until the user decides");
         assert!(!s.esplora_enabled, "Esplora mode is opt-in, never default");
+        assert!(
+            !s.snapshot_serve_enabled,
+            "serving a snapshot is opt-in: it needs a validating signer and changes what peers fetch"
+        );
         // Changed 2026-09-16, deliberately. A new install now contributes the
         // three things that are cheap and expose nothing, and first run shows
         // them so it is opt-out. Esplora stays opt-in: it needs a second

@@ -8,6 +8,30 @@ root).
 
 ## [Unreleased]
 
+**A node can now serve a snapshot of the chain to new nodes.** Every new
+node still bootstraps from a file compiled into the engine, and the newest
+one lags the chain by thousands of blocks. BTX has had the mechanism to do
+better since 0.34, four commands that export the chain state, sign it, offer
+it over the network and let another node fetch and load it, and measured on
+20 September across 62 reachable peers nobody used it. On 21 September one
+home RTX 3060 produced, served and round-tripped the first one, with four
+shell scripts and a person watching them. This release makes that a switch:
+"Serve a chain snapshot" in Settings. A node that checks blocks itself and
+signs exports the chain state at the tip (0.15 s, the node is not disturbed:
+its lock was held for 7 ms), waits ten confirmations because the export is
+taken at the unconfirmed tip and the first one ever taken was orphaned in 40
+seconds, offers the matured file, refreshes it every 500 blocks, keeps the
+last two, and re-offers after every node start because the offer lives in
+the running process only and was lost four times in a day before that was
+understood. It also re-makes the links to the mirrors after every offer: the
+engine sends its service bits once, in the connection handshake, so a peer
+connected before the offer never learns of it, which is why the explorer
+lost sight of the first snapshot for two hours. Off by default, refused with
+the reason on a node that follows attestations instead of checking blocks or
+holds no signing key. What this does not do: change what any node LOADS.
+Loading an attested snapshot means trusting the signers for the chain state,
+and that stays a separate decision. See docs/snapshot-serve.md.
+
 ## [0.6.27] - 2026-09-20
 
 **Your node now tells you when it is standing on a single signer, which until

@@ -40,6 +40,7 @@ pub mod service_report;
 pub mod setup;
 pub mod signer;
 pub mod snapshot;
+pub mod snapshot_serve;
 pub mod supply;
 pub mod wallet_format;
 pub mod watchdog;
