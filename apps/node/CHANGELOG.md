@@ -78,9 +78,8 @@ alone would be missing from its signer card.
 
 **One wallet route closes.** 0.34.9 refuses `importwallet` outright
 ("importwallet is disabled (legacy WIF)"), so the text file `dumpwallet` writes
-can no longer be imported. The app passes the engine's refusal through as the
-engine words it; under 0.34.6 it already refused such a file on the app's own
-descriptor wallet. `wallet.dat` and `.btxwallet` imports are unchanged.
+can no longer be imported. How the app now answers such a file is the dumpwallet
+entry further down.
 
 **Which machines check blocks themselves is unchanged, and it is still two
 kinds.** The sealed golden manifest lists NVIDIA `sm_120` and Apple
