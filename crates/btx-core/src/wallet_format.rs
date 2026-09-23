@@ -27,8 +27,14 @@ pub enum WalletFileKind {
     /// these. Also goes to `restorewallet`; btxd decides whether it can still
     /// read it, and its refusal is more informative than any guess we make.
     WalletDatBerkeley,
-    /// The text file `dumpwallet` writes. Goes to `importwallet`, and only into
-    /// a wallet that already exists.
+    /// The text file `dumpwallet` writes: a legacy wallet's WIF keys in plain
+    /// text. Recognised so it gets its own answer, and never imported. On
+    /// v0.34.9, which easyNode pins from 2026-09-23, `importwallet` refuses
+    /// every file with "BTX PQ policy: importwallet is disabled (legacy WIF);
+    /// use importdescriptors with P2MR". On v0.34.6 it imported only into a
+    /// legacy wallet, which easyNode never creates; the one way to have one was
+    /// to restore a legacy wallet.dat on Windows, the only engine of ours built
+    /// with Berkeley DB.
     WalletDump,
     /// Not something we can route.
     Unknown,
@@ -85,12 +91,42 @@ pub fn detect(bytes: &[u8]) -> WalletFileKind {
 /// take, because the old message named only one and left a person holding a
 /// `wallet.dat` with nowhere to go.
 pub fn unknown_file_advice() -> &'static str {
-    "That file is not one we recognise. easyNode takes a wallet.dat from a BTX node, \
-     a .btxwallet file from the browser wallet, or the text file that dumpwallet writes. \
+    "That file is not one we recognise. easyNode takes a wallet.dat from a BTX node \
+     or a .btxwallet file from the browser wallet. \
      On a Mac your node's wallet.dat lives in Library/Application Support/BTX/wallets/ \
      inside your home folder, which Finder hides — press Command-Shift-G in the file \
      picker and paste the path. Stop that node first, or copy the file with backupwallet, \
      so you are not reading a wallet the node is still writing to."
+}
+
+/// What to tell a user who hands us a `dumpwallet` text file: what it is, that
+/// easyNode will not take it, that nothing happened, and which files do bring a
+/// wallet across. It names no engine version on purpose: the refusal is BTX's
+/// post-quantum policy, not a quirk of one release. And it says "easyNode", not
+/// "this node", because the app can be attached to an engine it did not
+/// provision (the miner's, for one), and only what easyNode itself does is true
+/// on every engine.
+pub fn wallet_dump_advice() -> &'static str {
+    "That is a dumpwallet text file: a legacy wallet's private keys, written out in \
+     plain text. easyNode no longer imports those, because BTX's post-quantum policy \
+     switched importwallet off. The file was not sent to your node, so nothing was \
+     imported and nothing was changed. Import your .btxwallet file from the browser \
+     wallet, or a wallet.dat from a current BTX node, instead. Either brings the whole \
+     wallet across on its own."
+}
+
+/// What to tell the user INSTEAD of importing, or `None` when the file goes to
+/// the node. Both answers are about the file alone, so the caller returns them
+/// before it stages anything or asks the node anything, and they hold whether
+/// or not the node is running.
+pub fn advice_instead_of_import(kind: WalletFileKind) -> Option<&'static str> {
+    match kind {
+        WalletFileKind::Unknown => Some(unknown_file_advice()),
+        WalletFileKind::WalletDump => Some(wallet_dump_advice()),
+        WalletFileKind::BrowserBundle
+        | WalletFileKind::WalletDatSqlite
+        | WalletFileKind::WalletDatBerkeley => None,
+    }
 }
 
 #[cfg(test)]
@@ -256,6 +292,73 @@ mod tests {
         let a = unknown_file_advice();
         assert!(a.contains("wallet.dat"));
         assert!(a.contains(".btxwallet"));
-        assert!(a.contains("dumpwallet"));
+        // And none that we do not. The dumpwallet text left this list with the
+        // move to the v0.34.9 engine (2026-09-23), which refuses every one, so
+        // naming it sent people to a file that could only fail there.
+        assert!(!a.contains("dumpwallet"), "{a}");
+    }
+
+    #[test]
+    fn a_dumpwallet_file_is_answered_with_advice_instead_of_being_imported() {
+        // On v0.34.9, easyNode's engine from 2026-09-23, `importwallet` throws
+        // "BTX PQ policy: importwallet is disabled (legacy WIF); use
+        // importdescriptors with P2MR" for every file it is given, so a node
+        // that had a wallet could only answer a dump with that line, raw. A
+        // dump is now answered here, before its keys reach the disk or the node.
+        let dump = detect(b"# Wallet dump created by BTX v0.33.4.1\n");
+        assert_eq!(advice_instead_of_import(dump), Some(wallet_dump_advice()));
+        assert_eq!(
+            advice_instead_of_import(WalletFileKind::Unknown),
+            Some(unknown_file_advice())
+        );
+    }
+
+    #[test]
+    fn the_files_the_engine_still_takes_are_routed_not_answered() {
+        for kind in [
+            WalletFileKind::BrowserBundle,
+            WalletFileKind::WalletDatSqlite,
+            WalletFileKind::WalletDatBerkeley,
+        ] {
+            assert_eq!(advice_instead_of_import(kind), None, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn the_dump_advice_says_what_the_file_is_and_what_to_bring_instead() {
+        let a = wallet_dump_advice();
+        // What the file is, and that it holds keys in the clear.
+        assert!(a.contains("dumpwallet"), "{a}");
+        assert!(a.contains("plain text"), "{a}");
+        // That easyNode will not take it, and that nothing happened. "easyNode",
+        // not "this node": the app can be attached to an engine it did not
+        // provision, and only what easyNode itself does is true on every one.
+        assert!(a.contains("easyNode no longer imports"), "{a}");
+        assert!(a.contains("not sent to your node"), "{a}");
+        assert!(a.contains("nothing was imported"), "{a}");
+        // What does come across.
+        assert!(a.contains(".btxwallet"), "{a}");
+        assert!(a.contains("wallet.dat"), "{a}");
+    }
+
+    #[test]
+    fn neither_advice_trips_the_panels_scan_still_running_check() {
+        // apps/node/src/wallet.ts replaces any import message that matches
+        // /timed out|timeout|error sending request|connection (closed|reset|
+        // refused)/i with "your node is still scanning". Advice that tripped
+        // it would never be read, and nothing on this side would say so.
+        for a in [unknown_file_advice(), wallet_dump_advice()] {
+            let l = a.to_lowercase();
+            for trap in [
+                "timed out",
+                "timeout",
+                "error sending request",
+                "connection closed",
+                "connection reset",
+                "connection refused",
+            ] {
+                assert!(!l.contains(trap), "{trap:?} in: {a}");
+            }
+        }
     }
 }

@@ -32,6 +32,22 @@ holds no signing key. What this does not do: change what any node LOADS.
 Loading an attested snapshot means trusting the signers for the chain state,
 and that stays a separate decision. See docs/snapshot-serve.md.
 
+**A dumpwallet file gets a plain answer instead of an engine error.** v0.34.9,
+the engine this release moves to, switches `importwallet` off under BTX's
+post-quantum policy: it refuses every file with "BTX PQ policy: importwallet
+is disabled (legacy WIF); use importdescriptors with P2MR". easyNode still sent
+a dumpwallet text there. On the 0.34.6 engine it already failed for almost
+everyone: on the descriptor wallets easyNode creates, btxd answered "Only
+legacy wallets are supported by this command", shown raw, and only after the
+plaintext private keys had been staged on disk. The exception was a legacy
+wallet.dat restored on Windows, whose engine is built with Berkeley DB, and
+v0.34.9 closes that route anyway. The file is now recognised and answered
+before anything is staged or sent to the node: what the file is, that easyNode
+no longer imports it, that nothing was changed, and that a .btxwallet file or
+a wallet.dat from a current BTX node brings the wallet across instead. The
+advice for a file the app does not recognise stops naming the dumpwallet
+format.
+
 ## [0.6.27] - 2026-09-20
 
 **Your node now tells you when it is standing on a single signer, which until
