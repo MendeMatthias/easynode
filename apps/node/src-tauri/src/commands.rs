@@ -248,9 +248,10 @@ use crate::state::{
 // the signers and mirrors on the heavier one. The engine difference that
 // matters, read in matmul_v4_rc_gkr.cpp: when a strict-device node's GPU digest
 // disagrees with a header, 0.34.6 (and 0.34.8) record UnconfirmedDigestMismatch,
-// "portable retry disabled in strict mode", and leave the block retryable with
-// nothing that can ever settle it. 0.34.9 (2bfc9716) recomputes it with the
-// portable CPU ExactReplay and rules Valid or InvalidConsensus. That is a
+// "portable retry disabled in strict mode", and leave the block for a second
+// qualified device to settle, which a one-GPU machine does not have. 0.34.9
+// (2bfc9716) recomputes it with the portable CPU ExactReplay and rules Valid or
+// InvalidConsensus. That is a
 // mechanism that can hold a node on the lighter branch, not a proof that it is
 // what holds each one there, or that every parked node recovers: the same
 // census had one 0.34.9 consensus node on the parked branch and three sitting
@@ -276,6 +277,13 @@ use crate::state::{
 // compiles out every `#ifdef ENABLE_MODELNET` block, so btxd never spawns
 // btx-modeld and `-modelnet` is not a registered option at all: do NOT pass
 // -modelnet=0 to this engine, it refuses an unknown parameter at init.
+//
+// ⚠ This engine refuses to start a node that holds a local signing key and
+// pins no key (upstream 235d39be), which is every validating host since 0.6.26.
+// crates/btx-core/src/node.rs `signing_key_self_pin` is what lets them start;
+// the first smoke test of this pin, without it, died three times at init.
+// check-engine-fleet-ready.sh fails any future pin that brings the refusal
+// back without the self-pin.
 //
 // THE INSTALL KEY IS BARE AGAIN: `v0.34.9`. It is the install-directory key
 // (`~/.local/btx/<key>/<platform>`), and `start_node_inner` re-provisions an

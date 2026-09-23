@@ -8,6 +8,100 @@ root).
 
 ## [Unreleased]
 
+**The engine moves to upstream's v0.34.9, because 0.34.6 cannot leave the
+losing side of the 23 September split.** At 00:13 UTC on 23 September the
+network split at height 227,313. By 13:07 UTC one branch was 355 blocks long
+and carried the signers, the mirrors and btxscan.io; the other had stopped at
+227,355, and every consensus node on 0.34.5 or 0.34.6 that the census reached
+was on it, along with two mining pools. What 0.34.6 does wrong, read in its
+source: when a node that checks blocks on its graphics chip computes a
+different digest from the one a block's header claims, it files the block as
+unconfirmed and leaves it to be retried by a second qualified device, which a
+machine with one graphics chip does not have, so nothing ever settles it. 0.34.9
+(upstream `2bfc9716`) recomputes such a block on the processor with the same
+algorithm and rules it valid or invalid. That is the mechanism, not a proof
+that every stuck node recovers: the same census counted two 0.34.9 consensus
+nodes at the heavier branch's tip, three standing at 227,312 and one on the
+stopped branch.
+
+The peers this app dials first are on the stopped branch as well. On the
+afternoon of the 23rd, `89.85.40.184` and `109.199.124.187` both answered at
+227,355, and a node on a branch hands out that branch's headers. So an upgraded
+node has to hear about the heavier branch from its other peers, which usually
+happens and is not guaranteed.
+
+**0.34.9 refuses to start a node that signs, so this release pins the node's
+own key.** Since 0.6.26 every node that checks blocks also signs them, with a
+key the app keeps in the node's folder and pins nowhere. 0.34.9 refuses exactly
+that at startup, with an error about an attestation blocklist that is in fact
+empty (upstream `235d39be`): its new count of usable signers includes a local
+post-quantum key but not a local secp256k1 one. The app now also pins the
+node's own key, which puts the engine in the state 0.34.6 reached by itself,
+measured side by side on the same Mac: the same signer status in every field,
+plus one extra warning. Without it, this update would have stopped every node
+with signing on, which is every Mac with an M1 to M4 and every NVIDIA machine
+that checks blocks, unless its owner switched signing off. The fleet guard now
+checks this pairing and fails the bump without the fix.
+
+**Tested as an upgrade on an M2 Pro, and what that did not prove.** A keeper
+install shaped like 0.6.27 (engine 0.34.6, signing on) was opened with this
+build. The first attempt found the refusal above. With the fix, the app
+installed the new engine over the old one, btxd passed its Metal self-check
+(`m4_class`, strict-device, ready), reported `/BTX:0.34.9/`, kept its signing
+key and reported the same signer state as 0.34.6, started no model helper and
+opened no model port. What an afternoon cannot show is the chain it ends up
+on: the snapshot this app starts from is about 24,000 blocks below the split,
+and a node that checks blocks checks at most four a minute, so reaching 227,313
+takes about four days.
+
+**Built without upstream's model network.** 0.34.7 switched on a "Native Model
+Network" by default: a helper, `btx-modeld`, that btxd starts by itself on port
+29447 on every network interface, to fetch and serve AI models. It also needs
+OpenSSL 3.5, which neither the Linux build machine (Ubuntu 22.04) nor the
+Windows cross-compiler has. This app runs a node for money, so all three
+engines are built with the model network compiled out: no helper, no port, no
+model downloads. One trace stays: btxd writes a small resource-governor file
+into a `modelnet` folder inside the node's data every two seconds, model
+network or not.
+
+**What else changes in the engine, read from the diff.** No consensus rule
+moves at a height, the 203,000 bootstrap snapshot and the golden manifest are
+byte-identical, and no option the app passes was removed. A node that signs no
+longer rolls its own checked chain back onto a lighter sibling because the
+sibling carries a signature (`2ac77d56`); since 0.6.26 every node that
+validates signs, so that fix is ours too. The block-wide count of signature
+operations now includes `OP_CHECKSIGFROMSTACK` and can no longer be zeroed by
+an annex (`477b4e63`, `cd4301fc`), which only matters for blocks near the
+limit. Signers can now pin post-quantum ML-DSA-44 keys beside secp256k1 ones;
+the app pins and counts secp256k1 keys only, so a signer that moved to ML-DSA
+alone would be missing from its signer card.
+
+**One wallet route closes.** 0.34.9 refuses `importwallet` outright
+("importwallet is disabled (legacy WIF)"), so the text file `dumpwallet` writes
+can no longer be imported. The app passes the engine's refusal through as the
+engine words it; under 0.34.6 it already refused such a file on the app's own
+descriptor wallet. `wallet.dat` and `.btxwallet` imports are unchanged.
+
+**Which machines check blocks themselves is unchanged, and it is still two
+kinds.** The sealed golden manifest lists NVIDIA `sm_120` and Apple
+`m4_class`, which btxd assigns to M1 through M4. Every other machine starts
+degraded. A PC whose NVIDIA card does not reproduce the golden digest starts in
+consensus mode without the consensus service bit and cannot check blocks, so it
+stalls; a PC without an NVIDIA driver, and an M5, follow the signers as a
+trusted mirror. The Linux engine no longer carries native code for NVIDIA's
+data-centre `sm_100` cards, because upstream made that build path opt-in;
+`sm_75`, `sm_86`, `sm_89` and `sm_120` are all there.
+
+**Every install moves.** The install key is plain `v0.34.9`, replacing
+`v0.34.6-3013c2c2`, so every existing install re-provisions onto the new engine
+at its first start after the update. CI built the tag commit from a pristine
+tree on all three platforms with `BUILD_GIT_DIRTY 0`: macOS (upstream's release
+gate passes, Metal linked, regtest smoke), Linux (regtest smoke, kernels
+present) and Windows (the mingw cross-compile with its three source patches,
+and a regtest smoke on a real Windows runner). Upstream published 0.34.9's
+`SHA256SUMS` unsigned this time. Our engines are built from source, so that
+touches only the contributor staging scripts, which pin the archive bytes.
+
 **A node can now serve a snapshot of the chain to new nodes.** Every new
 node still bootstraps from a file compiled into the engine, and the newest
 one lags the chain by thousands of blocks. BTX has had the mechanism to do
