@@ -68,8 +68,10 @@ permissions:
 
 env:
   # The release set, from docs/node-release-recipe.md: SASS for Turing through
-  # Blackwell. sm_100 arrives separately via upstream's own isolated MXFP4
-  # rules, which is why it is not listed here and still appears in the binary.
+  # Blackwell. Through v0.34.6, sm_100 also arrived via upstream's own isolated
+  # MXFP4 rules and appeared in the binary without being listed here. From
+  # v0.34.9 that path is opt-in (cmake/BTXCudaSm100.cmake), and run 35867387801
+  # shows sm_120 sm_75 sm_86 sm_89 only.
   DEFAULT_CUDA_ARCHS: "75;86;89;120"
   CUDA_VERSION: "13-3"
   CUDA_HOME: "/usr/local/cuda-13.3"
