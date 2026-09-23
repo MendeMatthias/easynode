@@ -510,10 +510,32 @@ cargo test --locked the_pinned_snapshot_is_still_published -- --ignored
 # downloads the pinned file, checks its size and SHA-256 against the pin
 ```
 
-**Not yet done for 219000: a real `loadtxoutset`.** The 203000 pin had one before
-it shipped (v0.34.5 returned `base_height` 203000 and the manifest's block
-hash). Do it on a v0.34.9 node before the release that carries this pin: let
-headers pass 219000, then
+**Check the file's contents, which needs no node.** A load proves the file
+hashes to the `hash_serialized` the engine compiles in, and that part does not
+need a node: `scripts/check-snapshot-hash.py` recomputes it from the file the
+way the engine does. Take `--expect` and `--base` from the candidate tag's
+`m_assumeutxo_data` entry, not from upstream's manifest:
+
+```bash
+python3 scripts/check-snapshot-hash.py btx-assumeutxo-219000.dat \
+  --expect 3c065aabb529eaab5646825927d9f20a91426dc7e83b4890b575324f5bfccc99 \
+  --base dc51220bc7e5db96e29df9d817ae6179245d33eb8adcaaff765cfec83fdb87c3
+# MATCH, exit 0. On the 203000 file (--expect 6754314323ab...2040) it
+# reproduces the value a real load proved in 0.6.13.
+```
+
+Done for 219000 on 2026-09-23: MATCH. The 64-byte shielded section after the
+coins, which the script does not hash, is byte-identical to the 203000 file's.
+
+**A real `loadtxoutset` is still the stronger check, and for 219000 it did not
+finish.** The 203000 pin had one before it shipped (v0.34.5 returned
+`base_height` 203000 and the manifest's block hash). For 219000, a fresh v0.34.9
+node on 2026-09-23 never reached the base: its header pre-sync twice climbed to
+about 180000 and started over, and after an hour and a half it had not
+finished, while a dozen peers, the app's own bootstrap peers among them, failed
+with `low-work headers sync failure`. What only a load adds is the engine's
+load path, and the 0.6.28 upgrade test loaded the 203000 file on the same
+v0.34.9 binary. When a fresh node can reach the base, let headers pass it, then
 
 ```bash
 btx-cli -datadir=<datadir> -rpcclienttimeout=0 loadtxoutset <path>/btx-assumeutxo-219000.dat

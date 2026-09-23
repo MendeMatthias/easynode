@@ -68,8 +68,16 @@ pub struct SnapshotSpec {
 /// `nchaintx` and `shielded_state_pin` equal v0.34.9's `m_assumeutxo_data`
 /// entry (`hash_serialized` `3c065aab…`, 320540, `94343b76…`), v0.34.9 also
 /// checkpoints 219000 at that block, and api.btxscan.io reports the same hash
-/// at 219000. NOT yet done: a real `loadtxoutset` on a v0.34.9 node, which the
-/// 203000 pin had before it shipped.
+/// at 219000.
+///
+/// The contents are checked too, from the file itself.
+/// `scripts/check-snapshot-hash.py` recomputes `hash_serialized` the way the
+/// engine does and gets `3c065aab…`, the value v0.34.9 compiles in; the same
+/// script reproduces the 203000 file's `67543143…`, which a real load proved.
+/// The 64-byte shielded section after the coins is byte-identical to the
+/// 203000 file's. A real `loadtxoutset` on a v0.34.9 node, which the 203000
+/// pin had, did not finish on 2026-09-23: a fresh node's header pre-sync kept
+/// starting over after the split and never reached the base.
 ///
 /// 219000 is 8313 blocks below the 227313 split, on the chain both branches
 /// share.
