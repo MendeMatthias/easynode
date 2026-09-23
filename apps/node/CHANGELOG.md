@@ -24,6 +24,19 @@ that every stuck node recovers: the same census counted two 0.34.9 consensus
 nodes at the heavier branch's tip, three standing at 227,312 and one on the
 stopped branch.
 
+Nor does an upgraded node jump across. It switches only after it has checked
+every block of the heavier branch since 227,313: a node that parks deep reorgs
+unparks only once that whole stretch is verified, and this app's nodes, which
+do not park, still cannot connect a block they have not checked. A node that
+checks blocks manages about four a minute at best (3.8 measured on 0.34.6), and
+the heavier branch grows by about one a minute, so a node upgraded on the 23rd
+needs roughly three hours, and every day the update waits adds about eight.
+Two hours after the tag the census still showed consensus nodes on 0.34.9, and
+one on an unreleased 0.34.10, where they had been: two at 227,312 and two on
+the stopped branch, one of them upgraded that afternoon. One 0.34.9 node that
+had sat at 227,312 had moved to the heavier branch by switching to follow the
+signers instead, and luckypool.io had moved too.
+
 The peers this app dials first are on the stopped branch as well. On the
 afternoon of the 23rd, `89.85.40.184` and `109.199.124.187` both answered at
 227,355, and a node on a branch hands out that branch's headers. So an upgraded
@@ -51,8 +64,8 @@ installed the new engine over the old one, btxd passed its Metal self-check
 key and reported the same signer state as 0.34.6, started no model helper and
 opened no model port. What an afternoon cannot show is the chain it ends up
 on: the snapshot this app starts from is about 24,000 blocks below the split,
-and a node that checks blocks checks at most four a minute, so reaching 227,313
-takes about four days.
+and a node that checks blocks manages about four a minute at best, so reaching
+227,313 takes about four days.
 
 **Built without upstream's model network.** 0.34.7 switched on a "Native Model
 Network" by default: a helper, `btx-modeld`, that btxd starts by itself on port
