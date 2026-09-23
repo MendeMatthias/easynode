@@ -52,6 +52,10 @@ const BDB_MAGIC_BE: [u8; 4] = [0x00, 0x05, 0x31, 0x62];
 /// First line of a `dumpwallet` file.
 const DUMP_PREFIX: &[u8] = b"# Wallet dump created by";
 
+/// The UTF-8 byte order mark, which some Windows editors write at the start of
+/// a file (Notepad's "UTF-8 with BOM", for one).
+const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
+
 /// Classify by content. Never looks at the file name.
 pub fn detect(bytes: &[u8]) -> WalletFileKind {
     if bytes.starts_with(SQLITE_MAGIC) {
@@ -63,7 +67,11 @@ pub fn detect(bytes: &[u8]) -> WalletFileKind {
             return WalletFileKind::WalletDatBerkeley;
         }
     }
-    if bytes.starts_with(DUMP_PREFIX) {
+    if bytes
+        .strip_prefix(UTF8_BOM)
+        .unwrap_or(bytes)
+        .starts_with(DUMP_PREFIX)
+    {
         return WalletFileKind::WalletDump;
     }
     // Only now is it worth paying for a UTF-8 check plus a JSON parse. A
@@ -276,15 +284,15 @@ mod tests {
     }
 
     #[test]
-    fn a_utf8_bom_defeats_the_dumpwallet_prefix_on_purpose() {
-        // Left as a bounce, not silently absorbed. Detection cannot strip the
-        // BOM on its own: the caller stages the ORIGINAL bytes, so classifying
-        // this as a dump would hand btxd a file whose first line it also fails
-        // to parse, turning a clear refusal into a confusing node error. If this
-        // is ever fixed, fix it by normalising what gets STAGED, then change
-        // this test.
+    fn a_utf8_bom_does_not_hide_a_dumpwallet_file() {
+        // Until 2026-09-23 this was a bounce on purpose, because a dump was
+        // staged as its original bytes and sent to btxd, and the old test said
+        // to change that only by normalising what gets staged. A dump is no
+        // longer staged or sent anywhere, only answered, so seeing past a BOM
+        // costs nothing and gets the person the advice about their own file
+        // instead of "not one we recognise".
         let bom_dump = b"\xef\xbb\xbf# Wallet dump created by BTX v0.33.4.1\n";
-        assert_eq!(detect(bom_dump), WalletFileKind::Unknown);
+        assert_eq!(detect(bom_dump), WalletFileKind::WalletDump);
     }
 
     #[test]
