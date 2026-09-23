@@ -75,9 +75,13 @@ pub struct SnapshotSpec {
 /// engine does and gets `3c065aab…`, the value v0.34.9 compiles in; the same
 /// script reproduces the 203000 file's `67543143…`, which a real load proved.
 /// The 64-byte shielded section after the coins is byte-identical to the
-/// 203000 file's. A real `loadtxoutset` on a v0.34.9 node, which the 203000
-/// pin had, did not finish on 2026-09-23: a fresh node's header pre-sync kept
-/// starting over after the split and never reached the base.
+/// 203000 file's. And a real `loadtxoutset` on the 0.6.28 engine (v0.34.9,
+/// `1c7c2ffb…`, fresh datadir) returned `base_height` 219000, `tip_hash`
+/// `dc51220b…3fdb87c3` and 142076 coins on 2026-09-23, then activated the
+/// snapshot chainstate. The first attempt that day never got there: dialing
+/// anyone, its header pre-sync kept landing on peers parked below the 186000
+/// minimum-work checkpoint. Connected only to the app's curated peers, with the
+/// app's noban whitelist, the next one had headers at the tip in about a minute.
 ///
 /// 219000 is 8313 blocks below the 227313 split, on the chain both branches
 /// share.

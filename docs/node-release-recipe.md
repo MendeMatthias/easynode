@@ -527,18 +527,30 @@ python3 scripts/check-snapshot-hash.py btx-assumeutxo-219000.dat \
 Done for 219000 on 2026-09-23: MATCH. The 64-byte shielded section after the
 coins, which the script does not hash, is byte-identical to the 203000 file's.
 
-**A real `loadtxoutset` is still the stronger check, and for 219000 it did not
-finish.** The 203000 pin had one before it shipped (v0.34.5 returned
-`base_height` 203000 and the manifest's block hash). For 219000, a fresh v0.34.9
-node on 2026-09-23 never reached the base: its header pre-sync twice climbed to
-about 180000 and started over, and after an hour and a half it had not
-finished, while a dozen peers, the app's own bootstrap peers among them, failed
-with `low-work headers sync failure`. What only a load adds is the engine's
-load path, and the 0.6.28 upgrade test loaded the 203000 file on the same
-v0.34.9 binary. When a fresh node can reach the base, let headers pass it, then
+**Then a real `loadtxoutset`, the stronger check. Done for 219000 on
+2026-09-23.** The 203000 pin had one before it shipped (v0.34.5 returned
+`base_height` 203000 and the manifest's block hash). For 219000, the 0.6.28
+engine (v0.34.9, `1c7c2ffb…`) on a fresh datadir returned `base_height` 219000,
+`tip_hash` `dc51220b…3fdb87c3` and `coins_loaded` 142076, and activated the
+snapshot chainstate.
+
+⚠ **Which peers the node talks to decides whether it gets there at all.** The
+first attempt that day dialed anyone and never reached the base: its header
+pre-sync twice climbed to about 180000 and started over, for an hour and a half,
+while a dozen peers failed with `low-work headers sync failure`. v0.34.9's own
+"initial-sync peer selection" comment in `net_processing.cpp` names the cause:
+the sync slot goes to a peer parked below the 186000 minimum-work checkpoint,
+whose chain ends short. The second attempt connected ONLY to the app's curated
+peers (the `-addnode` list in `node.rs` and the seeds, resolved to addresses),
+each also as `-whitelist=in,out,noban@<ip>` the way the app's conf lists them,
+and had headers at the tip in about a minute:
 
 ```bash
-btx-cli -datadir=<datadir> -rpcclienttimeout=0 loadtxoutset <path>/btx-assumeutxo-219000.dat
+btxd -datadir=<scratch> -listen=0 -port=29335 -rpcport=29334 \
+  -connect=<each curated peer> -whitelist=in,out,noban@<each curated ip>
+# once getblockchaininfo reports headers past 219000:
+btx-cli -datadir=<scratch> -rpcport=29334 -rpcclienttimeout=0 \
+  loadtxoutset <path>/btx-assumeutxo-219000.dat
 # expect base_height 219000 and tip_hash
 # dc51220bc7e5db96e29df9d817ae6179245d33eb8adcaaff765cfec83fdb87c3
 ```
