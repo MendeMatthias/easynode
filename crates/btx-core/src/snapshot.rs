@@ -31,6 +31,65 @@ pub struct SnapshotSpec {
     pub anchor_height: u64,
 }
 
+/// The height 219000 snapshot (snapshot_file_version 9, `"snapshot_type":
+/// "rollback"`), pinned from the `snapshot.manifest.json` beside it.
+///
+/// **This is the node app's pin from the v0.34.9 engine on.** It replaces
+/// [`v0_34_5_spec`]. Measured against the tip on 2026-09-23 (227761) it leaves
+/// 8761 blocks to validate after the load instead of 24761. Every one of them
+/// is real work: v0.34.9's `defaultAssumeValid` is block 186000, below both
+/// bases, so nothing past either snapshot is skipped.
+///
+/// ⚠ Fewer blocks to catch up, not less work, and not a duration. The node
+/// still re-validates everything below the base in the background, so the
+/// 16000 blocks move from the catch-up, which decides when the node is useful,
+/// into the background check, which does not. docs/snapshot-serve.md measured a
+/// consensus node splitting its accelerator evenly between the two (an M5,
+/// 17.1 blocks/h each). On that model the higher base never delays reaching
+/// the tip, and it shortens it most on machines fast enough to get there
+/// before the background check ends; a machine that cannot outrun the chain
+/// gains nothing. Do not derive a duration from this pin and do not put one in
+/// user copy.
+///
+/// ⚠ The file is NOT a release asset. The v0.34.9 release ships binaries and
+/// SHA256SUMS only; upstream publishes this file only on the `assumeutxo-219000`
+/// PRE-release (published 2026-09-15), and a pre-release can be edited or
+/// deleted without a new tag. Integrity does not depend on that, because the
+/// SHA gate here and btxd's compiled `hash_serialized` each refuse other bytes.
+/// Availability does: first-run setup aborts when this download fails. Run the
+/// ignored `the_pinned_snapshot_is_still_published_byte_for_byte` in commands.rs
+/// before cutting a release, and re-pin to the release URL if upstream ever
+/// moves the file into one.
+///
+/// Verified 2026-09-23 by downloading the asset: the size and SHA-256 match the
+/// manifest, the pre-release's `SHA256SUMS-assumeutxo-219000.txt` and GitHub's
+/// own asset digest. The file header says mainnet magic `b7545801`, snapshot
+/// version 9, base block `dc51220b…3fdb87c3`. The manifest's `txoutset_hash`,
+/// `nchaintx` and `shielded_state_pin` equal v0.34.9's `m_assumeutxo_data`
+/// entry (`hash_serialized` `3c065aab…`, 320540, `94343b76…`), v0.34.9 also
+/// checkpoints 219000 at that block, and api.btxscan.io reports the same hash
+/// at 219000. NOT yet done: a real `loadtxoutset` on a v0.34.9 node, which the
+/// 203000 pin had before it shipped.
+///
+/// 219000 is 8313 blocks below the 227313 split, on the chain both branches
+/// share.
+///
+/// ⚠ This pin REQUIRES an engine that compiles 219000 into `m_assumeutxo_data`.
+/// v0.34.9 (84b998b4) does. v0.34.5 and v0.34.6 stop at 203000, and there is no
+/// v0.34.7 tag, although the entry's comment calls 219000 the "0.34.7 release
+/// base". Paired with an older engine, `loadtxoutset` refuses and a fast start
+/// becomes a sync from genesis. `NODE_RELEASE_TAG` and this spec move together;
+/// a test in commands.rs holds them to it.
+pub fn v0_34_9_spec() -> SnapshotSpec {
+    SnapshotSpec {
+        url: "https://github.com/btxchain/btx/releases/download/assumeutxo-219000/btx-assumeutxo-219000.dat"
+            .into(),
+        sha256: "78acb7dd7eeec2a17909c6c5f7e12ffa9b4ad2ffcbd9eb464421dcd960868e7b".into(),
+        size_bytes: 9_151_135,
+        anchor_height: 219_000,
+    }
+}
+
 /// The v0.33.2 release snapshot (height 179000, snapshot_file_version 9),
 /// pinned from that release's own `snapshot.manifest.json` (fetched + verified
 /// 2026-08-10, sha cross-checked against the release `SHA256SUMS`). **Superseded
@@ -57,9 +116,14 @@ pub fn v0_33_2_spec() -> SnapshotSpec {
 /// The v0.34.5 release snapshot (height 203000, snapshot_file_version 9),
 /// pinned from that release's own `snapshot-manifest-203000.json`.
 ///
-/// **This is the node app's pin from 0.6.13.** It replaces [`v0_33_2_spec`] and
-/// it is the single biggest change to how long a new user waits. The 179000 pin
-/// left about 26860 blocks to grind after the load; this leaves about 2860.
+/// **Superseded by [`v0_34_9_spec`] as the node app's pin with the v0.34.9
+/// engine**; kept for reference, and as the pin for an engine whose newest base
+/// is 203000 (v0.34.5, v0.34.6). v0.34.9 still carries this entry
+/// byte-identical, so a node that loaded this snapshot keeps working on it.
+///
+/// It was the node app's pin from 0.6.13, replacing [`v0_33_2_spec`], and the
+/// single biggest change to how long a new user waited. The 179000 pin left
+/// about 26860 blocks to grind after the load; this left about 2860.
 ///
 /// ⚠ That is a smaller GAP, not a promise of convergence. Measured 2026-08-31 on
 /// this Mac after a real load: the network produced about 61.8 blocks/hour over
@@ -736,6 +800,62 @@ mod tests {
             dir.path()
         ));
         assert!(!snapshot_file_matches_spec(&v0_34_5_spec(), dir.path()));
+    }
+
+    /// A digest that is not 64 hex characters can never match a download. A
+    /// typo in one does not fail the build or any other test here: it fails
+    /// the integrity check of every fresh install, on the user's machine.
+    /// Retired pins included, since any of them can be pointed back at.
+    #[test]
+    fn every_pin_is_a_digest_a_download_can_match() {
+        for spec in [
+            v0_32_11_spec(),
+            v0_32_12_spec(),
+            v0_33_1_spec(),
+            v0_33_2_spec(),
+            v0_34_5_spec(),
+            v0_34_9_spec(),
+        ] {
+            assert_eq!(spec.sha256.len(), 64, "not a SHA-256: {}", spec.url);
+            assert!(
+                spec.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                "not hex: {}",
+                spec.url
+            );
+            assert!(
+                spec.url
+                    .starts_with("https://github.com/btxchain/btx/releases/download/"),
+                "not an upstream release asset: {}",
+                spec.url
+            );
+            assert!(
+                spec.size_bytes > 0 && spec.anchor_height > 0,
+                "{}",
+                spec.url
+            );
+        }
+    }
+
+    /// A node that loaded the 203000 snapshot and then updated reads the NEW
+    /// pin's base as its anchor, although its snapshot chainstate sits on the
+    /// old one. The sweep has to err toward keeping the file: it waits for
+    /// progress past the newer base, which is later than its own rule, never
+    /// earlier. What that costs is a 9 MB file kept a while longer.
+    #[test]
+    fn a_node_on_the_previous_pin_keeps_its_file_until_it_passes_the_new_base() {
+        let loaded_at = v0_34_5_spec().anchor_height;
+        let pinned = v0_34_9_spec().anchor_height;
+        assert!(pinned > loaded_at, "this test is about a pin that moved up");
+        let past_own_base = loaded_at + SNAPSHOT_SWEEP_MIN_PROGRESS;
+        // Its own base would have released the file here; the new pin keeps it.
+        assert!(snapshot_sweep_allowed(past_own_base, loaded_at, ""));
+        assert!(!snapshot_sweep_allowed(past_own_base, pinned, ""));
+        // Past the new base by the same margin, it goes.
+        assert!(snapshot_sweep_allowed(
+            pinned + SNAPSHOT_SWEEP_MIN_PROGRESS,
+            pinned,
+            ""
+        ));
     }
 
     #[test]

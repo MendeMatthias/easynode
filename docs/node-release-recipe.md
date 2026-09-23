@@ -486,13 +486,40 @@ git show <tag>:src/kernel/chainparams.cpp \
 # any 199'299 or 199'300 line means the tag ships a withdrawn base
 ```
 
-**Our own snapshot pin is safely below the split, so this is a check for future
+**Our own snapshot pin sits on no contested base, so this is a check for future
 pins rather than a live problem.** `snapshot_spec()` in
-`apps/node/src-tauri/src/commands.rs` returns `v0_33_2_spec()` from
-`crates/btx-core/src/snapshot.rs`, whose `anchor_height` is `179_000`. Both read
-and confirmed 2026-08-28. Any future release that moves that pin forward must
-land it on a base the candidate engine still carries and upstream has not
-withdrawn.
+`apps/node/src-tauri/src/commands.rs` returns `v0_34_9_spec()` from
+`crates/btx-core/src/snapshot.rs`, whose `anchor_height` is `219_000`: past the
+withdrawn 199299/199300 bases, on the chain upstream's table and checkpoints
+agree on, and 8,313 blocks below the 227313 split, so both branches share it.
+Read and confirmed 2026-09-23. Any future release that moves that pin forward
+must land it on a base the candidate engine still carries and upstream has not
+withdrawn. Since the v0.34.9 engine the pairing is a test,
+`the_snapshot_pin_is_the_newest_base_the_pinned_engine_carries`: an engine
+version it has no row for fails it until somebody reads that tag's
+`m_assumeutxo_data` and adds one.
+
+**The pinned file sits on an upstream PRE-release** (`assumeutxo-219000`), not on
+a release: the v0.34.9 release ships binaries and SHA256SUMS only. A
+pre-release can be edited or deleted without a new tag, and first-run setup
+aborts when the snapshot download fails. Before cutting a release, from
+`apps/node/src-tauri`:
+
+```bash
+cargo test --locked the_pinned_snapshot_is_still_published -- --ignored
+# downloads the pinned file, checks its size and SHA-256 against the pin
+```
+
+**Not yet done for 219000: a real `loadtxoutset`.** The 203000 pin had one before
+it shipped (v0.34.5 returned `base_height` 203000 and the manifest's block
+hash). Do it on a v0.34.9 node before the release that carries this pin: let
+headers pass 219000, then
+
+```bash
+btx-cli -datadir=<datadir> -rpcclienttimeout=0 loadtxoutset <path>/btx-assumeutxo-219000.dat
+# expect base_height 219000 and tip_hash
+# dc51220bc7e5db96e29df9d817ae6179245d33eb8adcaaff765cfec83fdb87c3
+```
 
 Full reasoning in `LEARNINGS-mac-mining.md` §19.
 

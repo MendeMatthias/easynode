@@ -9,9 +9,11 @@ and the keeper loop in `apps/node/src-tauri/src/commands.rs`.
 
 Every new node bootstraps from a UTXO snapshot compiled into the engine. The
 newest one published with a release is `utxo-btx-main-203000.dat` from
-v0.34.5, and upstream's standalone `assumeutxo-219000` needs a chainparams
-entry that only v0.34.7 carries. With the chain past 226,000 a new node closes
-that gap itself, and a consumer machine in consensus mode splits its
+v0.34.5. Upstream's standalone `assumeutxo-219000` pre-release needs a
+chainparams entry that v0.34.9 carries (its comment says 0.34.7, a version
+upstream never tagged), and the app pins it from the v0.34.9 engine on. Either
+way the file lags the chain by thousands of blocks, a new node closes that gap
+itself, and a consumer machine in consensus mode splits its
 accelerator between the tip and the background re-verification: measured on
 an M5, 17.1 blocks/h each against a chain doing 39/h. It loses ground.
 
