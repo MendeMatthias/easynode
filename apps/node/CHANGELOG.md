@@ -8,6 +8,20 @@ root).
 
 ## [Unreleased]
 
+**A native Windows PC with an NVIDIA card follows the signed chain instead of
+stalling.** The Windows engine is cross-compiled without any GPU code, so it
+cannot check blocks on any card. Since 0.6.23 the app nevertheless started
+every Windows PC that has the NVIDIA driver in the mode meant for checking
+blocks, because it looked only for the driver, and going by the code such a
+node started degraded and stalled. The app now asks whether this platform's
+engine can use the card as well, and on Windows the answer is no, so such a PC
+runs as a trusted mirror like a PC without the driver: it follows the chain
+the pinned signers have signed and can serve history, trusting those keys
+instead of checking the maths itself, and it is no longer offered the signing
+role it could never use. The Linux build under WSL2 is unchanged and still
+checks blocks on a capable card, which makes it the route for a Windows
+machine that should validate. Not yet run on a Windows PC.
+
 ## [0.6.28] - 2026-09-23
 
 **The engine moves to upstream's v0.34.9, because 0.34.6 cannot leave the

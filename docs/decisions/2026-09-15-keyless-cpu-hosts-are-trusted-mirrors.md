@@ -207,6 +207,32 @@ outside that set with a driver would read as `Cpu` and run as a mirror; the
 node still works, the card says "Mirror", and the app's stderr says
 `[node] host backend: cpu (no NVIDIA driver library found)`.
 
+### 2026-09-23: the gap was every native Windows PC, and it is closed
+
+The paragraph above treats the driver as the whole question on Windows, and on
+Windows it is not: the engine this app ships there has no GPU code at all.
+`btxd-windows.yml` cross-compiles with mingw, whose configure prints "Looking
+for a CUDA compiler - NOTFOUND", and the v0.34.9 `btxd.exe` (run 35867391955)
+imports only system DLLs and `libgomp-1.dll`, with no CUDA symbol in it; the
+Linux btxd has 165. So from 0.6.23 every native Windows PC with an NVIDIA
+driver, whatever its card, was classed `Cuda`, launched in explicit consensus
+mode it could never serve, and by the rule above stalled. Read from the binary
+and the code, not run on a Windows PC.
+
+`backend::node_host_backend` now asks both halves: `pc_host_backend(driver,
+BUNDLED_ENGINE_HAS_CUDA)` is `Cuda` only when the driver is present AND the
+platform's engine carries GPU code, and `BUNDLED_ENGINE_HAS_CUDA` is false on
+Windows. A native Windows PC therefore takes the `Cpu` arm of this decision,
+with its trade exactly as stated in "Risks traded": a single-key trusted
+mirror that follows the signed chain and can serve history, instead of a node
+that stalls. It also stops being offered the signer role, which it could never
+exercise: `launches_as_mirror` answers true for it, so `migrate_signer` and the
+start path treat it as a host that does not validate. The Linux build under
+WSL2 is unaffected and still validates on a capable card.
+`EASYBTX_NODE_TRUSTED_MIRROR=0` still forces consensus mode for anyone who
+builds a Windows engine with CUDA themselves; the change that should flip
+`BUNDLED_ENGINE_HAS_CUDA` is a shipped Windows engine able to check blocks.
+
 ## How to verify on a real CPU-only host
 
 A PC with no NVIDIA driver (an AMD or Intel GPU, or none). On Linux the
