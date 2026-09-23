@@ -4190,8 +4190,11 @@ consensus-validator service.";
         let keyless = dir.join("keyless.conf");
         std::fs::write(&keyless, "server=1\n").unwrap();
         let unreadable = dir.join("unreadable.conf");
-        std::fs::write(&unreadable, "server=1\nmatmulattestationsignerkeyfile=no-such.key\n")
-            .unwrap();
+        std::fs::write(
+            &unreadable,
+            "server=1\nmatmulattestationsignerkeyfile=no-such.key\n",
+        )
+        .unwrap();
 
         let own_pin = format!("-matmultrustedpubkey={pubkey}");
         let pins = |args: &[String]| -> Vec<String> {
@@ -4210,7 +4213,10 @@ consensus-validator service.";
         // The mirror arm, same conf: the signers it follows, never itself.
         let (_, args, _) = build_node_command(btxd, &dir, &signing, Backend::Cpu);
         assert_eq!(validation_modes(&args), vec!["trusted"]);
-        assert!(!args.contains(&own_pin), "a mirror pinned its own key: {args:?}");
+        assert!(
+            !args.contains(&own_pin),
+            "a mirror pinned its own key: {args:?}"
+        );
         assert_eq!(pins(&args).len(), BTX_TRUSTED_ATTESTATION_PUBKEYS.len());
         // Nothing to add.
         for conf in [&keyless, &unreadable, &pinned] {
