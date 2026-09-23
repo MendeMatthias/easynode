@@ -23,9 +23,24 @@ pub enum WalletFileKind {
     /// A descriptor `wallet.dat`, which is a SQLite database. This is what
     /// btxd writes today. Goes to `restorewallet`.
     WalletDatSqlite,
-    /// A legacy `wallet.dat`, which is a Berkeley DB file. Older nodes wrote
-    /// these. Also goes to `restorewallet`; btxd decides whether it can still
-    /// read it, and its refusal is more informative than any guess we make.
+    /// A legacy `wallet.dat`, which is a Berkeley DB file, the kind Bitcoin Core
+    /// wrote before descriptor wallets. Recognised so it gets its own answer,
+    /// and never imported. Until 2026-09-23 it went to `restorewallet` and btxd
+    /// decided. On v0.34.9 the macOS and Linux engines are built without
+    /// Berkeley DB and answer -18 "Build does not support Berkeley DB database
+    /// format.", which reached the user raw (measured on macOS). The Windows
+    /// engine is built with it and, going by the source, loads the file as a
+    /// legacy wallet. Neither is an import: mainnet has taken only P2MR outputs
+    /// since its first block, and a legacy wallet's keys are secp256k1 and
+    /// cannot give a P2MR address.
+    ///
+    /// `migratewallet`, which reads the file without Berkeley DB, is no route
+    /// either. It keeps the old keys as secp256k1 `combo()` descriptors and
+    /// gives the wallet a P2MR seed it did not have. And on v0.34.9, measured
+    /// that day with a minimal HD wallet (seed and `hdchain`), it throws
+    /// "vector" partway through, because `mr()` refuses the old seed's xpub,
+    /// and leaves a half-migrated SQLite legacy wallet that cannot be migrated
+    /// again.
     WalletDatBerkeley,
     /// The text file `dumpwallet` writes: a legacy wallet's WIF keys in plain
     /// text. Recognised so it gets its own answer, and never imported. On
@@ -123,17 +138,32 @@ pub fn wallet_dump_advice() -> &'static str {
      wallet across on its own."
 }
 
+/// What to tell a user who hands us a legacy, Berkeley DB `wallet.dat`. The
+/// reason it gives is the chain's, not the engine's, so it holds on every
+/// engine the app can be attached to: BTX mainnet has taken only P2MR outputs
+/// since its first block, and a legacy wallet's keys are secp256k1, so none of
+/// them can hold BTX. It does not say the node cannot read the file, because
+/// the Windows engine, built with Berkeley DB, can.
+pub fn legacy_wallet_dat_advice() -> &'static str {
+    "That is a legacy wallet.dat, a Berkeley DB file of the kind Bitcoin Core and \
+     the coins built on it used to write. Its keys are the old, pre-quantum kind, and \
+     BTX has paid only to post-quantum (P2MR) addresses since its first block, so none \
+     of them can hold BTX. easyNode does not import these. The file was not sent to \
+     your node, so nothing was imported and nothing was changed. If you hold BTX, \
+     import your .btxwallet file from the browser wallet, or a wallet.dat from a \
+     current BTX node, instead."
+}
+
 /// What to tell the user INSTEAD of importing, or `None` when the file goes to
-/// the node. Both answers are about the file alone, so the caller returns them
-/// before it stages anything or asks the node anything, and they hold whether
+/// the node. Every answer is about the file alone, so the caller returns it
+/// before it stages anything or asks the node anything, and it holds whether
 /// or not the node is running.
 pub fn advice_instead_of_import(kind: WalletFileKind) -> Option<&'static str> {
     match kind {
         WalletFileKind::Unknown => Some(unknown_file_advice()),
         WalletFileKind::WalletDump => Some(wallet_dump_advice()),
-        WalletFileKind::BrowserBundle
-        | WalletFileKind::WalletDatSqlite
-        | WalletFileKind::WalletDatBerkeley => None,
+        WalletFileKind::WalletDatBerkeley => Some(legacy_wallet_dat_advice()),
+        WalletFileKind::BrowserBundle | WalletFileKind::WalletDatSqlite => None,
     }
 }
 
@@ -322,13 +352,73 @@ mod tests {
     }
 
     #[test]
+    fn a_legacy_wallet_dat_is_answered_with_advice_instead_of_being_imported() {
+        // Measured on 2026-09-23 against the v0.34.9 macOS engine, mainnet,
+        // with a legacy HD wallet.dat written by Berkeley DB 4.7.25. That engine
+        // is built without Berkeley DB, like the Linux one, and `restorewallet`
+        // answered -18 "Wallet file verification failed. Failed to open
+        // database path '<walletdir>/btxnode'. Build does not support Berkeley
+        // DB database format.", which reached the user raw. The Windows engine
+        // is built with it and, going by the source (not run), would load the
+        // file, into a wallet that cannot hold BTX: mainnet takes only P2MR
+        // outputs, from its first block, and a legacy wallet's keys are
+        // secp256k1. So the file is answered here, the same on every engine,
+        // before it is staged or sent anywhere.
+        let head: [u8; 24] = [
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x31,
+            0x05, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
+        ];
+        assert_eq!(
+            advice_instead_of_import(detect(&head)),
+            Some(legacy_wallet_dat_advice())
+        );
+    }
+
+    #[test]
     fn the_files_the_engine_still_takes_are_routed_not_answered() {
         for kind in [
             WalletFileKind::BrowserBundle,
             WalletFileKind::WalletDatSqlite,
-            WalletFileKind::WalletDatBerkeley,
         ] {
             assert_eq!(advice_instead_of_import(kind), None, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn the_legacy_advice_says_what_the_file_is_and_why_no_btx_is_in_it() {
+        let a = legacy_wallet_dat_advice();
+        // What the file is.
+        assert!(a.contains("legacy wallet"), "{a}");
+        assert!(a.contains("Berkeley DB"), "{a}");
+        // Why nothing in it can be BTX, which is the part that is true on
+        // every engine, including one that can open the file.
+        assert!(a.contains("P2MR"), "{a}");
+        assert!(a.contains("first block"), "{a}");
+        // That easyNode will not take it, and that nothing happened.
+        assert!(a.contains("easyNode does not import"), "{a}");
+        assert!(a.contains("not sent to your node"), "{a}");
+        assert!(a.contains("nothing was imported"), "{a}");
+        // What does come across.
+        assert!(a.contains(".btxwallet"), "{a}");
+        assert!(a.contains("wallet.dat from a current BTX node"), "{a}");
+    }
+
+    #[test]
+    fn the_legacy_advice_does_not_blame_the_engine_or_name_a_platform() {
+        // The Windows engine is built with Berkeley DB and can open the file,
+        // and easyNode can be attached to an engine it did not provision, so
+        // "your node cannot read this" would be false on some of them. The
+        // reason no BTX is in the file does not depend on the build.
+        let l = legacy_wallet_dat_advice().to_lowercase();
+        for word in [
+            "cannot read",
+            "can't read",
+            "does not support",
+            "windows",
+            "mac",
+            "linux",
+        ] {
+            assert!(!l.contains(word), "{word:?} in: {l}");
         }
     }
 
@@ -350,12 +440,16 @@ mod tests {
     }
 
     #[test]
-    fn neither_advice_trips_the_panels_scan_still_running_check() {
+    fn no_advice_trips_the_panels_scan_still_running_check() {
         // apps/node/src/wallet.ts replaces any import message that matches
         // /timed out|timeout|error sending request|connection (closed|reset|
         // refused)/i with "your node is still scanning". Advice that tripped
         // it would never be read, and nothing on this side would say so.
-        for a in [unknown_file_advice(), wallet_dump_advice()] {
+        for a in [
+            unknown_file_advice(),
+            wallet_dump_advice(),
+            legacy_wallet_dat_advice(),
+        ] {
             let l = a.to_lowercase();
             for trap in [
                 "timed out",

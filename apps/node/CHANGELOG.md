@@ -141,6 +141,26 @@ a wallet.dat from a current BTX node brings the wallet across instead. The
 advice for a file the app does not recognise stops naming the dumpwallet
 format.
 
+**A legacy wallet.dat gets a plain answer instead of an engine error.**
+easyNode sent a Berkeley DB wallet.dat, the legacy kind Bitcoin Core wrote
+before descriptor wallets, to `restorewallet` and let the engine decide.
+Measured on 23 September against the v0.34.9 macOS engine, which is built
+without Berkeley DB like the Linux one: it answered "Wallet file verification
+failed. Failed to open database path '...'. Build does not support Berkeley DB
+database format.", shown raw. It left nothing behind, so a later import under
+the same name still worked. The Windows engine is built with Berkeley DB and,
+going by its source, loads the file, into a legacy wallet that cannot hold
+BTX: mainnet has taken only P2MR outputs since its first block, and a legacy
+wallet's keys are secp256k1 and cannot give a P2MR address. `migratewallet`,
+which reads the file without Berkeley DB, is no route either. It keeps the old
+keys as secp256k1 descriptors, and on v0.34.9 it fails partway through for a
+wallet with an HD seed and leaves it half migrated. The file is now recognised
+and answered before anything is staged or sent to the node, the same on every
+engine, including one easyNode is attached to and did not provision: what the
+file is, why no BTX can be in it, that nothing was changed, and that a
+.btxwallet file or a wallet.dat from a current BTX node brings a BTX wallet
+across.
+
 ## [0.6.27] - 2026-09-20
 
 **Your node now tells you when it is standing on a single signer, which until
