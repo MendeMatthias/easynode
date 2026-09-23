@@ -51,15 +51,20 @@ pub struct SnapshotSpec {
 /// gains nothing. Do not derive a duration from this pin and do not put one in
 /// user copy.
 ///
-/// ⚠ The file is NOT a release asset. The v0.34.9 release ships binaries and
-/// SHA256SUMS only; upstream publishes this file only on the `assumeutxo-219000`
-/// PRE-release (published 2026-09-15), and a pre-release can be edited or
-/// deleted without a new tag. Integrity does not depend on that, because the
-/// SHA gate here and btxd's compiled `hash_serialized` each refuse other bytes.
-/// Availability does: first-run setup aborts when this download fails. Run the
-/// ignored `the_pinned_snapshot_is_still_published_byte_for_byte` in commands.rs
-/// before cutting a release, and re-pin to the release URL if upstream ever
-/// moves the file into one.
+/// ⚠ The URL is OUR copy. Upstream does not ship this file with a release: the
+/// v0.34.9 release carries binaries and SHA256SUMS only, and upstream publishes
+/// the file only on its `assumeutxo-219000` PRE-release (published 2026-09-15),
+/// which it can edit or delete without a new tag. First-run setup aborts when
+/// this download fails, so the pin names a byte-identical mirror on
+/// MendeMatthias/EasyBTX-releases (pre-release `assumeutxo-219000`, published
+/// 2026-09-23 with upstream's sums and manifest beside it). Upstream's copy stays
+/// the source of the bytes:
+/// <https://github.com/btxchain/btx/releases/download/assumeutxo-219000/btx-assumeutxo-219000.dat>.
+/// Integrity does not depend on either host, because the SHA gate here and
+/// btxd's compiled `hash_serialized` each refuse other bytes. Keep the mirror for
+/// as long as a release that pins it is installed, and run the ignored
+/// `the_pinned_snapshot_is_still_published_byte_for_byte` in commands.rs before
+/// cutting a release.
 ///
 /// Verified 2026-09-23 by downloading the asset: the size and SHA-256 match the
 /// manifest, the pre-release's `SHA256SUMS-assumeutxo-219000.txt` and GitHub's
@@ -94,7 +99,7 @@ pub struct SnapshotSpec {
 /// a test in commands.rs holds them to it.
 pub fn v0_34_9_spec() -> SnapshotSpec {
     SnapshotSpec {
-        url: "https://github.com/btxchain/btx/releases/download/assumeutxo-219000/btx-assumeutxo-219000.dat"
+        url: "https://github.com/MendeMatthias/EasyBTX-releases/releases/download/assumeutxo-219000/btx-assumeutxo-219000.dat"
             .into(),
         sha256: "78acb7dd7eeec2a17909c6c5f7e12ffa9b4ad2ffcbd9eb464421dcd960868e7b".into(),
         size_bytes: 9_151_135,
@@ -834,10 +839,15 @@ mod tests {
                 "not hex: {}",
                 spec.url
             );
+            // Upstream's own assets, or our byte-identical mirror of one.
             assert!(
-                spec.url
-                    .starts_with("https://github.com/btxchain/btx/releases/download/"),
-                "not an upstream release asset: {}",
+                [
+                    "https://github.com/btxchain/btx/releases/download/",
+                    "https://github.com/MendeMatthias/EasyBTX-releases/releases/download/",
+                ]
+                .iter()
+                .any(|host| spec.url.starts_with(host)),
+                "neither an upstream release asset nor our mirror of one: {}",
                 spec.url
             );
             assert!(
