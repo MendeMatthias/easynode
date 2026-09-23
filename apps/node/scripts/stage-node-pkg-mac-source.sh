@@ -13,9 +13,13 @@
 #     -DBUILD_DAEMON=ON -DBUILD_CLI=ON \
 #     -DBUILD_UTIL=OFF -DBUILD_TX=OFF -DBUILD_WALLET_TOOL=OFF \
 #     -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_TESTS=OFF -DBUILD_FUZZ_BINARY=OFF \
-#     -DENABLE_WALLET=ON -DWITH_SQLITE=ON \
+#     -DENABLE_WALLET=ON -DWITH_SQLITE=ON -DWITH_MODELNET=OFF \
 #     -DBTX_ENABLE_METAL=ON -DBTX_MATMUL_METAL_PRECOMPILE_KERNELS=OFF
 #   cmake --build build -j$(sysctl -n hw.ncpu)
+#
+# ★ WITH_MODELNET=OFF from 0.34.7 on: upstream defaults the model network ON,
+#   which wants a static OpenSSL 3.5 and ships a btxd that spawns btx-modeld.
+#   The release engine is built OFF (btxd-macos.yml); build this one the same.
 #
 # ★ PRECOMPILE_KERNELS=OFF matters: compiling the Metal shaders at build time
 #   needs `xcrun metal`, which ships with full Xcode and NOT with the Command Line

@@ -878,14 +878,10 @@ pub async fn restore_wallet(
         .await
 }
 
-/// `importwallet "<filename>"` — import keys from a `dumpwallet` TEXT file into
-/// the wallet this client is scoped to (call through `RpcClient::for_wallet`).
-/// Legacy path: it needs a wallet that already exists, and btxd refuses it on a
-/// descriptor wallet. The caller decides whether that refusal is worth
-/// surfacing or worth converting into plain advice.
-pub async fn import_wallet_dump(rpc: &dyn Rpc, dump_path: &str) -> AppResult<serde_json::Value> {
-    rpc.call("importwallet", json!([dump_path])).await
-}
+// No `importwallet` wrapper, on purpose: from v0.34.9, easyNode's engine from
+// 2026-09-23, it refuses every dump file.
+// `wallet_format::WalletFileKind::WalletDump` says why, and
+// `wallet_format::wallet_dump_advice()` is what the user is told instead.
 
 /// `exportwalletbundle "<bundle_file>"` — export the CURRENT descriptor
 /// wallet (call through `RpcClient::for_wallet`) as a browser-compatible

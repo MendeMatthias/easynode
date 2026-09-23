@@ -42,6 +42,16 @@
 # without the degraded-start gate, or with the gate but without the override on
 # the mirror arm, is the same outage. This guard catches all three.
 #
+# A FOURTH PAIRING, added 2026-09-23 after it broke a smoke test rather than
+# the fleet. Since 0.6.26 every host that validates also SIGNS: the app writes
+# matmulattestationsignerkeyfile= into its conf and pins no key. 0.34.8 and
+# 0.34.9 refuse exactly that at init ("-matmulattestationblocklist leaves 0
+# unblocked pin member(s), below -matmultrustedthreshold=1", with an empty
+# blocklist): upstream 235d39be made the unblocked-pin check unconditional and
+# does not count the node's own secp256k1 key toward it, where 0.34.6 ran the
+# check only when pins existed. On such a tag node.rs must pin the signer's own
+# key (signing_key_self_pin), or every validating node fails to start.
+#
 # FAIL CLOSED. A file it cannot fetch, a marker it cannot find, a manifest it
 # cannot parse: all failures. This repo has twice shipped breakage behind a
 # guard that quietly stopped matching and kept exiting 0. A guard that cannot
@@ -107,6 +117,13 @@ APP_DEGRADED_GATE="node_allows_degraded_matmul_start"
 # pins a single key on such an engine and this literal is gone, every PC with
 # no NVIDIA driver fails at init. Since 2026-09-15 that is the mirror arm.
 APP_SINGLE_KEY_OVERRIDE="-allowsinglekeytrustedmirror=1"
+# The unguarded unblocked-pin check (see the header). Measured on 2026-09-23:
+# absent on v0.34.4, v0.34.5 and v0.34.6, where the same comparison sits behind
+# `if (!trusted_signers.empty() &&`; present on v0.34.8-rc4 and v0.34.9. Its
+# presence means a node holding a local signing key and no pin is refused.
+SIGNER_UNPINNED_REFUSAL="if (unblocked_pin_members <"
+# The app-side answer: node.rs pins a validating signer's own key.
+APP_SIGNER_SELF_PIN="signing_key_self_pin"
 
 annotate() {
   if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::$1::$2"; fi
@@ -156,6 +173,14 @@ if [ "${1:-}" = "--self-test" ]; then
   printf 'args.push("%s".to_string());\n' "$APP_SINGLE_KEY_OVERRIDE" > "$t/node_override.rs"
   grep -q -- "$APP_SINGLE_KEY_OVERRIDE" "$t/node_ungated.rs"  && { echo "self-test: override check matched a node.rs without the override"; fails=1; }
   grep -q -- "$APP_SINGLE_KEY_OVERRIDE" "$t/node_override.rs" || { echo "self-test: override check MISSED the override"; fails=1; }
+  # The 0.34.6 shape (guarded) must NOT read as a refusal; the 0.34.9 shape must.
+  printf '        if (!trusted_signers.empty() &&\n            unblocked_pin_members < static_cast<size_t>(trusted_threshold)) {\n' > "$t/pin_guarded.cpp"
+  printf '        if (unblocked_pin_members < static_cast<size_t>(trusted_threshold)) {\n' > "$t/pin_unguarded.cpp"
+  grep -qF -- "$SIGNER_UNPINNED_REFUSAL" "$t/pin_guarded.cpp"   && { echo "self-test: signer-pin check matched the 0.34.6 guarded form"; fails=1; }
+  grep -qF -- "$SIGNER_UNPINNED_REFUSAL" "$t/pin_unguarded.cpp" || { echo "self-test: signer-pin check MISSED the unguarded form"; fails=1; }
+  printf 'pub fn %s(conf: &Path, datadir: &Path) -> Option<String> { None }\n' "$APP_SIGNER_SELF_PIN" > "$t/node_selfpin.rs"
+  grep -qF -- "$APP_SIGNER_SELF_PIN" "$t/node_ungated.rs" && { echo "self-test: self-pin check matched a node.rs without it"; fails=1; }
+  grep -qF -- "$APP_SIGNER_SELF_PIN" "$t/node_selfpin.rs" || { echo "self-test: self-pin check MISSED it"; fails=1; }
 
   printf 'BTX_RC_PRODUCTION_GOLDEN_V1\n' > "$t/m0.data"
   printf 'BTX_RC_PRODUCTION_GOLDEN_V1\nid|cuda|sm_120|1|d|1|doc/x|r|f|h\n' > "$t/m1.data"
@@ -218,6 +243,8 @@ CONSENSUS_STARTS=0
 if grep -q "$DEGRADED_START_MARKER" "$INIT_FILE"; then CONSENSUS_STARTS=1; fi
 MIRROR_STARTS=1
 if grep -q "$SINGLE_KEY_REFUSAL" "$INIT_FILE"; then MIRROR_STARTS=0; fi
+UNPINNED_SIGNER_STARTS=1
+if grep -qF -- "$SIGNER_UNPINNED_REFUSAL" "$INIT_FILE"; then UNPINNED_SIGNER_STARTS=0; fi
 
 if [ "$CONSENSUS_STARTS" -eq 1 ]; then
   echo "consensus mode ......... starts off-manifest (degraded, no consensus service bit)"
@@ -229,6 +256,11 @@ if [ "$MIRROR_STARTS" -eq 1 ]; then
 else
   echo "1-of-1 trusted mirror .. REFUSED on mainnet"
 fi
+if [ "$UNPINNED_SIGNER_STARTS" -eq 1 ]; then
+  echo "signer, no pin ......... accepted (its own key seeds the pin)"
+else
+  echo "signer, no pin ......... REFUSED at init (unblocked-pin check counts no local secp key)"
+fi
 
 # --- 3. what does the APP choose? ------------------------------------------
 [ -f "$NODE_RS" ] || die "cannot find $NODE_RS" \
@@ -239,6 +271,8 @@ APP_HAS_DEGRADED_GATE=0
 if grep -q "$APP_DEGRADED_GATE" "$NODE_RS"; then APP_HAS_DEGRADED_GATE=1; fi
 APP_PASSES_SINGLE_KEY_OVERRIDE=0
 if grep -q -- "$APP_SINGLE_KEY_OVERRIDE" "$NODE_RS"; then APP_PASSES_SINGLE_KEY_OVERRIDE=1; fi
+APP_SELF_PINS_SIGNER=0
+if grep -qF -- "$APP_SIGNER_SELF_PIN" "$NODE_RS"; then APP_SELF_PINS_SIGNER=1; fi
 
 if [ "$APP_PINS_SINGLE_KEY" -eq 1 ]; then
   echo "app off-manifest path .. trusted mirror, threshold 1"
@@ -254,6 +288,11 @@ if [ "$APP_PASSES_SINGLE_KEY_OVERRIDE" -eq 1 ]; then
   echo "app single-key override  present ($APP_SINGLE_KEY_OVERRIDE)"
 else
   echo "app single-key override  ABSENT"
+fi
+if [ "$APP_SELF_PINS_SIGNER" -eq 1 ]; then
+  echo "app signer self-pin .... present ($APP_SIGNER_SELF_PIN)"
+else
+  echo "app signer self-pin .... ABSENT"
 fi
 echo
 
@@ -283,6 +322,11 @@ elif [ "$CONSENSUS_STARTS" -eq 1 ] && [ "$MIRROR_STARTS" -eq 0 ] \
      && [ "$APP_PINS_SINGLE_KEY" -eq 1 ] && [ "$APP_HAS_DEGRADED_GATE" -eq 1 ] \
      && [ "$APP_PASSES_SINGLE_KEY_OVERRIDE" -eq 0 ]; then
   note "this tag refuses the 1-of-1 mirror the app hands a PC with no NVIDIA driver unless $APP_SINGLE_KEY_OVERRIDE is passed, and crates/btx-core/src/node.rs no longer passes it"
+fi
+# Separate from the mode question above: every host that validates also signs
+# (0.6.26), so a tag that refuses a key with no pin needs the app's self-pin.
+if [ "$UNPINNED_SIGNER_STARTS" -eq 0 ] && [ "$APP_SELF_PINS_SIGNER" -eq 0 ]; then
+  note "this tag refuses to start a node that holds a local signing key and pins no key, which is every validating host since 0.6.26, and crates/btx-core/src/node.rs does not pin the signer's own key ($APP_SIGNER_SELF_PIN)"
 fi
 
 if [ -z "$PROBLEMS" ]; then

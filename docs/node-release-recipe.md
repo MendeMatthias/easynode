@@ -1066,12 +1066,14 @@ glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
    git -C <btx-clone> worktree add --detach ~/btx-ship "$(. apps/node/scripts/lib/engine-pin.sh; engine_pin_ref apps/node)"
    # 0.6.18: 9eb4e0050e08ea3ef768bac276dac9cbd2e84542
    # 0.6.23: 3013c2c22a9a453e778d6cc426734567d819fa59 (upstream tag v0.34.6)
+   # next:   84b998b4f3272775aaf8c241ac11dc683f4c4e23 (upstream tag v0.34.9)
    cd ~/btx-ship
    cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
      -DBUILD_DAEMON=ON -DBUILD_CLI=ON \
      -DBUILD_UTIL=OFF -DBUILD_TX=OFF -DBUILD_WALLET_TOOL=OFF \
      -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_TESTS=OFF -DBUILD_FUZZ_BINARY=OFF \
      -DENABLE_WALLET=ON -DWITH_SQLITE=ON -DWITH_ZMQ=ON \
+     -DWITH_MODELNET=OFF \
      -DCMAKE_IGNORE_PATH=/mnt/c \
      -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.3/bin/nvcc \
      -DCMAKE_CUDA_ARCHITECTURES="75;86;89;120"

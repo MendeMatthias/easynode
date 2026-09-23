@@ -961,6 +961,13 @@ pub fn build_node_command(
             for mirror in crate::signer::BTX_MIRRORS_FED_BY_SIGNERS {
                 args.push(format!("-addnode={mirror}"));
             }
+            // And the key's pin on itself, without which 0.34.9 refuses to
+            // start a node holding a key (`signing_key_self_pin` has the
+            // measurement). Never on the mirror arm: a mirror that pinned its
+            // own key would take its own word for the proof of work.
+            if let Some(pubkey) = signing_key_self_pin(conf, datadir) {
+                args.push(format!("-matmultrustedpubkey={pubkey}"));
+            }
         }
     }
     // On Metal we set ONLY `BTX_MATMUL_BACKEND` and deliberately do NOT touch the matmul
@@ -1556,6 +1563,54 @@ pub fn launches_as_mirror(btxd: &Path, datadir: &Path, backend: Backend) -> bool
 pub fn signs_here(conf: &Path) -> bool {
     crate::setup::conf_kv(conf, crate::signer::SIGNER_KEY_CONF_KEY)
         .is_some_and(|v| !v.trim().is_empty())
+}
+
+/// The pin a validating signer must carry for its OWN key, or `None` when
+/// there is nothing to add.
+///
+/// WHY. v0.34.9 refuses to start a node that holds a local signing key and
+/// pins no key: "-matmulattestationblocklist leaves 0 unblocked pin
+/// member(s), below -matmultrustedthreshold=1", although the blocklist is
+/// empty. Upstream 235d39be (ML-DSA-44 pins) made that check unconditional and
+/// counts a local ML-DSA key toward it but not a local secp256k1 one; 0.34.6
+/// ran it only when pins existed. Every node this app hands a key to (a
+/// validating host since 0.6.26) is exactly that shape, so without this the
+/// 0.34.9 engine does not start on any of them. Measured 2026-09-23 on an M2
+/// Pro, mainnet parameters, no peers: 0.34.6 with the key alone and 0.34.9
+/// with the key plus this pin both reach "Done loading" and report the same
+/// getmatmultrustedstatus (consensus, local_signer, single_key_pin,
+/// collocated_signer_pin, trusted_signers 1, unblocked_pin_members 1): 0.34.6
+/// already made the local key a pin member of itself, so stating it only
+/// restores that. 0.34.9 adds one warning, "no spare unblocked MatMul pin
+/// member". The same pin on 0.34.6 is harmless, which matters when an
+/// upgrade falls back to the old engine.
+///
+/// The key is read from the file the conf line names (relative to the
+/// datadir, as the engine resolves it on mainnet). `None` when there is no
+/// line, the key cannot be read, or the conf already pins that key: the
+/// engine refuses a duplicate `-matmultrustedpubkey`, and a hand-managed conf
+/// may already carry it.
+pub fn signing_key_self_pin(conf: &Path, datadir: &Path) -> Option<String> {
+    let named = crate::setup::conf_kv(conf, crate::signer::SIGNER_KEY_CONF_KEY)?;
+    let named = named.trim();
+    if named.is_empty() {
+        return None;
+    }
+    let key_path = if Path::new(named).is_absolute() {
+        PathBuf::from(named)
+    } else {
+        datadir.join(named)
+    };
+    let wif = std::fs::read_to_string(key_path).ok()?;
+    let pubkey = crate::signer::wif_to_pubkey_hex(&wif).ok()?;
+    let already_pinned = std::fs::read_to_string(conf).ok().is_some_and(|text| {
+        text.lines().any(|l| {
+            l.trim()
+                .strip_prefix("matmultrustedpubkey=")
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case(&pubkey))
+        })
+    });
+    (!already_pinned).then_some(pubkey)
 }
 
 /// macOS SIGKILLs a downloaded binary with "Code Signature Invalid" at exec when
@@ -4101,6 +4156,73 @@ consensus-validator service.";
         assert_eq!(mirror_addnodes(&args), 0, "{args:?}");
         assert!(launches_as_mirror(btxd, Path::new("/dd"), Backend::Cpu));
         assert!(!launches_as_mirror(btxd, Path::new("/dd"), Backend::Cuda));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 0.34.9 refuses to start a node that holds a signing key and pins none,
+    /// and every host this app hands a key to is one (`signing_key_self_pin`
+    /// has the measurement). The validating arm must pin the key it signs
+    /// with, exactly once; the mirror arm must not pin itself; a conf that
+    /// already pins the key, a key that cannot be read, and no key at all add
+    /// nothing, because the engine also refuses a duplicate pin.
+    #[test]
+    fn a_validating_signer_pins_its_own_key_and_a_mirror_never_does() {
+        let dir = std::env::temp_dir().join(format!("easynode-self-pin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wif = crate::signer::generate_wif();
+        let pubkey = crate::signer::wif_to_pubkey_hex(&wif).unwrap();
+        std::fs::write(dir.join(crate::signer::SIGNER_KEY_FILE), format!("{wif}\n")).unwrap();
+        let signing = dir.join("signing.conf");
+        std::fs::write(
+            &signing,
+            "server=1\nmatmulattestationsignerkeyfile=attestation-signer.key\n",
+        )
+        .unwrap();
+        let pinned = dir.join("pinned.conf");
+        std::fs::write(
+            &pinned,
+            format!(
+                "server=1\nmatmulattestationsignerkeyfile=attestation-signer.key\n\
+                 matmultrustedpubkey={pubkey}\n"
+            ),
+        )
+        .unwrap();
+        let keyless = dir.join("keyless.conf");
+        std::fs::write(&keyless, "server=1\n").unwrap();
+        let unreadable = dir.join("unreadable.conf");
+        std::fs::write(
+            &unreadable,
+            "server=1\nmatmulattestationsignerkeyfile=no-such.key\n",
+        )
+        .unwrap();
+
+        let own_pin = format!("-matmultrustedpubkey={pubkey}");
+        let pins = |args: &[String]| -> Vec<String> {
+            args.iter()
+                .filter(|a| a.starts_with("-matmultrustedpubkey="))
+                .cloned()
+                .collect()
+        };
+        let btxd = Path::new("/x/btx/v0.34.9/lin/btxd");
+
+        // A validating host with a key: one pin, its own, on either GPU.
+        for backend in [Backend::Cuda, Backend::Metal] {
+            let (_, args, _) = build_node_command(btxd, &dir, &signing, backend);
+            assert_eq!(pins(&args), vec![own_pin.clone()], "{args:?}");
+        }
+        // The mirror arm, same conf: the signers it follows, never itself.
+        let (_, args, _) = build_node_command(btxd, &dir, &signing, Backend::Cpu);
+        assert_eq!(validation_modes(&args), vec!["trusted"]);
+        assert!(
+            !args.contains(&own_pin),
+            "a mirror pinned its own key: {args:?}"
+        );
+        assert_eq!(pins(&args).len(), BTX_TRUSTED_ATTESTATION_PUBKEYS.len());
+        // Nothing to add.
+        for conf in [&keyless, &unreadable, &pinned] {
+            let (_, args, _) = build_node_command(btxd, &dir, conf, Backend::Cuda);
+            assert!(pins(&args).is_empty(), "{}: {args:?}", conf.display());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

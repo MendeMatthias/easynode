@@ -218,9 +218,11 @@ pub struct ImportResult {
 const MAX_IMPORT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Does btxd already have a wallet dir by this name? Read-only: `listwalletdir`
-/// answers from disk and never creates or loads anything, which is exactly what
-/// a pre-flight check must not do. An RPC failure answers `false`, and every
-/// caller treats `false` as "refuse", so the unknown case fails closed.
+/// answers from disk and never creates or loads anything. An RPC failure
+/// answers `false`, and the two callers read that differently:
+/// `import_landed_anyway` as "did not land", which keeps a failed import a
+/// failure, and `next_free_wallet_name` as "free", which is safe only because
+/// `restorewallet` is the real gate.
 async fn wallet_dir_has(rpc: &dyn Rpc, name: &str) -> bool {
     api::list_wallet_dir(rpc)
         .await
@@ -264,14 +266,13 @@ async fn import_landed_anyway(rpc: &dyn Rpc, name: &str, err: &AppError) -> bool
 /// and say so rather than looping, and returning `None` makes the caller refuse
 /// rather than overwrite.
 ///
-/// Note the failure direction, because it is the opposite of the dumpwallet
-/// pre-check that shares this helper. `wallet_dir_has` answers `false` on an RPC
-/// error, so here an unreachable node makes the FIRST candidate look free and we
-/// return it optimistically. That is safe, but only because `restorewallet` is
-/// the real gate: if the name is genuinely taken btxd refuses and the error
-/// reaches the user. It is never turned into a success. Do not "harden" this
-/// into returning `None` on error without checking the dump path, which relies
-/// on the same `false` meaning "refuse".
+/// Note the failure direction, because it is the opposite of
+/// `import_landed_anyway`, which shares this helper and reads its `false` as
+/// "did not land". `wallet_dir_has` answers `false` on an RPC error, so here an
+/// unreachable node makes the FIRST candidate look free and we return it
+/// optimistically. That is safe, but only because `restorewallet` is the real
+/// gate: if the name is genuinely taken btxd refuses and the error reaches the
+/// user. It is never turned into a success.
 async fn next_free_wallet_name(rpc: &dyn Rpc) -> Option<String> {
     for n in 2..=16 {
         let candidate = format!("{WALLET_NAME}-{n}");
@@ -302,8 +303,8 @@ fn is_already_exists(message: &str) -> bool {
 /// Create `dir` (0700 on unix) and return a file handle at `path` opened 0600.
 ///
 /// `std::fs::write` creates 0644 under the usual 0022 umask, so the staged file
-/// would be world-readable for the whole import. That file is a wallet.dat, a
-/// PQ master seed bundle, or a dumpwallet text of plaintext private keys. On a
+/// would be world-readable for the whole import. That file is a wallet.dat or a
+/// PQ master seed bundle, and either can carry spending keys. On a
 /// shared Mac that is a window in which any other local account can copy
 /// spending keys. Nothing else in this app sweeps the datadir for these names,
 /// so a crash mid-import would leave the window open forever.
@@ -340,8 +341,9 @@ fn stage_private(
 /// look like a .btxwallet file" and stopped. Now the bytes decide the route:
 ///
 ///   browser bundle JSON  -> `restorewalletbundle`, the PQ seed path
-///   wallet.dat           -> `restorewallet`, sqlite or berkeley, btxd decides
-///   dumpwallet text      -> `importwallet` into a wallet that already exists
+///   wallet.dat, SQLite   -> `restorewallet`, the descriptor wallet btxd writes
+///   wallet.dat, Berkeley -> advice: a legacy wallet cannot hold BTX
+///   dumpwallet text      -> advice: the engine no longer imports these
 ///   anything else        -> advice naming every format we DO take
 ///
 /// Arrives base64 because a `wallet.dat` is binary and the previous signature
@@ -353,7 +355,7 @@ pub async fn wallet_import(
     content_b64: String,
 ) -> Result<Ask<ImportResult>, String> {
     use base64::Engine as _;
-    use btx_core::wallet_format::{detect, unknown_file_advice, WalletFileKind};
+    use btx_core::wallet_format::{advice_instead_of_import, detect, WalletFileKind};
 
     // Base64 inflates by 4/3, so bound the encoded form before decoding rather
     // than after, or a hostile webview could make us allocate first and refuse
@@ -374,10 +376,22 @@ pub async fn wallet_import(
         });
     }
 
+    // A dumpwallet text is answered here, like a file we do not recognise,
+    // before its plaintext keys are staged or the node is asked anything.
+    // On v0.34.9, easyNode's engine from 2026-09-23, `importwallet` refuses
+    // every file, so on a node that had a wallet the old route could only end
+    // in that refusal, shown raw.
+    //
+    // So is a legacy Berkeley DB wallet.dat, from the same day. The macOS and
+    // Linux engines are built without Berkeley DB and refused it raw; the
+    // Windows engine, going by its source, loads it into a wallet that cannot
+    // hold BTX. Answering before the node is asked is also what keeps this
+    // true when the app is attached to an engine it did not provision and
+    // cannot see the build of.
     let kind = detect(&bytes);
-    if kind == WalletFileKind::Unknown {
+    if let Some(advice) = advice_instead_of_import(kind) {
         return Ok(Ask::Unavailable {
-            message: unknown_file_advice().into(),
+            message: advice.into(),
         });
     }
 
@@ -392,24 +406,6 @@ pub async fn wallet_import(
     static IMPORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _import_guard = IMPORT_LOCK.lock().await;
 
-    // A dumpwallet file can only add keys to a wallet that ALREADY exists, and
-    // creating one here is a one-way door: once `btxnode` has a wallet dir, both
-    // `restorewallet` and `restorewalletbundle` fail forever with "already
-    // exists". The previous version called `load_or_create_wallet` here, so a
-    // dump import that btxd then refused (it refuses `importwallet` on the
-    // descriptor wallet `createwallet` makes) left an empty wallet behind that
-    // permanently blocked the user's real wallet.dat and .btxwallet. Decide this
-    // BEFORE any key material reaches the disk.
-    if kind == WalletFileKind::WalletDump && !wallet_dir_has(&rpc, WALLET_NAME).await {
-        return Ok(Ask::Unavailable {
-            message: "A dumpwallet text file can only add keys to a wallet that already \
-                      exists, and this node doesn't have one yet. Import your wallet.dat \
-                      or your .btxwallet file instead — either of those brings the whole \
-                      wallet across on its own."
-                .into(),
-        });
-    }
-
     let datadir = node_datadir();
     // Key material is staged in its OWN directory, 0700, with the file 0600, and
     // the directory is cleared before and after. Name the staged file after what
@@ -418,7 +414,6 @@ pub async fn wallet_import(
     let _ = std::fs::remove_dir_all(&stage); // sweep a crashed import's leftovers
     let tmp = stage.join(match kind {
         WalletFileKind::BrowserBundle => "wallet-import.btxwallet.json",
-        WalletFileKind::WalletDump => "wallet-import.dump.txt",
         _ => "wallet-import.wallet.dat",
     });
     if let Err(e) = stage_private(&stage, &tmp, &bytes) {
@@ -509,7 +504,7 @@ pub async fn wallet_import(
                 Err(e) => (Err(e), false),
             }
         }
-        WalletFileKind::WalletDatSqlite | WalletFileKind::WalletDatBerkeley => {
+        WalletFileKind::WalletDatSqlite => {
             // btxd always rescans on restore, so on a node still backfilling
             // this can fail on the SCAN while the wallet itself is fine. Treat
             // an existing wallet as "already imported" rather than an error, the
@@ -553,20 +548,11 @@ pub async fn wallet_import(
                 Err(e) => (Err(e), false),
             }
         }
-        WalletFileKind::WalletDump => {
-            // The wallet is known to exist (checked before staging), so load it
-            // and let btxd's own refusal — it rejects `importwallet` on a
-            // descriptor wallet — reach the user rather than inventing one.
-            let _ = api::load_wallet(&rpc, WALLET_NAME).await;
-            let wallet_rpc = rpc.for_wallet(WALLET_NAME);
-            (
-                api::import_wallet_dump(&wallet_rpc, &path)
-                    .await
-                    .map(|_| serde_json::json!({"name": WALLET_NAME})),
-                true,
-            )
+        WalletFileKind::WalletDatBerkeley
+        | WalletFileKind::WalletDump
+        | WalletFileKind::Unknown => {
+            unreachable!("returned above")
         }
-        WalletFileKind::Unknown => unreachable!("returned above"),
     };
 
     // A 60 second transport timeout during a multi-hour rescan is the NORMAL
@@ -944,10 +930,11 @@ mod tests {
 
     #[tokio::test]
     async fn wallet_dir_has_answers_false_when_the_node_is_unreachable() {
-        // Pinned deliberately. The dumpwallet pre-check reads this `false` as
-        // "refuse", while next_free_wallet_name reads it as "free". Both are
-        // safe today only because restorewallet is the real gate. If this
-        // default ever changes, BOTH callers have to be revisited.
+        // Pinned deliberately. import_landed_anyway reads this `false` as "did
+        // not land", which keeps a failed import a failure, while
+        // next_free_wallet_name reads it as "free", which is safe only because
+        // restorewallet is the real gate. If this default ever changes, BOTH
+        // callers have to be revisited.
         let rpc = DirRpc::failing();
         assert!(!wallet_dir_has(&rpc, "btxnode").await);
     }
@@ -1052,8 +1039,8 @@ mod tests {
 
     #[test]
     fn the_staged_wallet_file_is_not_world_readable() {
-        // A wallet.dat, a PQ seed bundle and a dumpwallet text all carry
-        // spending keys. std::fs::write would create these 0644.
+        // A wallet.dat and a PQ seed bundle can both carry spending keys.
+        // std::fs::write would create these 0644.
         let dir = std::env::temp_dir().join(format!("ebtx-stage-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let f = dir.join("wallet-import.wallet.dat");

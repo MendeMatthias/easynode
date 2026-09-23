@@ -252,27 +252,35 @@ npm run tauri build           # package it
 itself, so a user does not need Homebrew or a package manager, and that tree is
 about 25 MB of binaries which do not belong in a source repository. The script
 fetches them from the public upstream release, verifies the SHA-256 against the
-signed sums, and stages them into `src-tauri/resources/node-pkg/`. Without it
+release's sums, and stages them into `src-tauri/resources/node-pkg/`. Without it
 `tauri build` fails with `glob pattern resources/node-pkg/**/* path not found`,
 because `tauri.conf.json` declares that directory as a bundle resource.
 
-The staged engine is BTX v0.34.6: upstream's tag `v0.34.6` at commit
-`3013c2c2` (tagged 2026-09-13). The app installs it under the key
-`NODE_RELEASE_TAG` = `v0.34.6-3013c2c2` in `src-tauri/src/commands.rs`, with
-the commit beside it as `NODE_RELEASE_COMMIT`. The key carries the commit on
-purpose: installs from 0.6.18 through 0.6.22 hold the earlier `9eb4e005` build
-under the bare key `v0.34.6`, and the app only re-provisions when the key
-changes. The download-based staging scripts (`stage-node-pkg.sh`,
-`stage-node-pkg-linux.sh`) still sit on 0.34.5 and refuse with "this staging
-script and the engine pin disagree", which is them working; upstream's official
-0.34.6 binaries need glibc 2.38, so the release path builds from source and the
-contributor path IS the source path below: build btxd at that commit and stage
-it with the `-source` script for your platform. Those two must agree: the app
-installs the bundled package into a directory named after the key and then
-checks that the binary reports the version the package declares in its
-`.btxd-version` marker (the version part of the key, `v0.34.6`), so a mismatch
-fails first-run setup rather than quietly running the wrong engine. The script
-writes that marker from what it actually staged.
+The staged engine is BTX v0.34.9: upstream's tag `v0.34.9` at commit
+`84b998b4` (tagged 2026-09-23). The app installs it under the key
+`NODE_RELEASE_TAG` = `v0.34.9` in `src-tauri/src/commands.rs`, with the commit
+beside it as `NODE_RELEASE_COMMIT`. The previous key was `v0.34.6-3013c2c2`,
+suffixed because installs from 0.6.18 through 0.6.22 held an earlier build
+under the bare `v0.34.6`; no install ever used `v0.34.9`, so the bare tag is
+enough to make every install re-provision, which is the only moment the app
+does. The release engine is a source build with `-DWITH_MODELNET=OFF`: 0.34.7
+turned upstream's Native Model Network on by default, and it needs OpenSSL 3.5
+and starts a `btx-modeld` helper the app has no use for.
+
+The download-based staging scripts (`stage-node-pkg.sh`,
+`stage-node-pkg-linux.sh`) fetch upstream's v0.34.9 archives, whose
+`SHA256SUMS` is published unsigned this time, so the scripts pin bytes rather
+than a signature. Upstream builds those archives with the model network ON, so
+the scripts drop its seven helpers (`btx-modeld` and friends) and btxd logs the
+helper as missing and carries on as a monetary node. Upstream's Linux binaries
+need glibc 2.38, so on Linux the contributor path that matters is the source
+path below: build btxd at that commit and stage it with the `-source` script
+for your platform. Those two must agree: the app installs the bundled package
+into a directory named after the key and then checks that the binary reports
+the version the package declares in its `.btxd-version` marker (the version
+part of the key, `v0.34.9`), so a mismatch fails first-run setup rather than
+quietly running the wrong engine. The script writes that marker from what it
+actually staged.
 
 Verified on a Mac with no Homebrew installed: v0.34.5 links no Homebrew
 libraries, so staging needs nothing beyond the standard toolchain. Earlier
@@ -303,13 +311,14 @@ on an Ubuntu 22.04 box for 0.6.15 through 0.6.18.
 
 ```bash
 # 1. build btxd from a PRISTINE checkout of btxchain/btx at the pinned ref,
-#    which is NODE_RELEASE_COMMIT (0.6.23: 3013c2c22a9a453e778d6cc426734567d819fa59,
-#    upstream's tag v0.34.6; `engine_pin_ref apps/node` prints it). The recipe
-#    has the exact cmake flags and the CUDA requirement.
+#    which is NODE_RELEASE_COMMIT (84b998b4f3272775aaf8c241ac11dc683f4c4e23,
+#    upstream's tag v0.34.9; `engine_pin_ref apps/node` prints it). The recipe
+#    has the exact cmake flags, -DWITH_MODELNET=OFF included, and the CUDA
+#    requirement.
 # 2. stage what you built, instead of stage-node-pkg.sh; the second argument
-#    is the version btxd will REPORT: the install key without its -suffix.
+#    is the version btxd will REPORT: the install key without any -suffix.
 #    Omit it and the script derives the same value from the pin.
-./scripts/stage-node-pkg-linux-source.sh ~/btx/build v0.34.6
+./scripts/stage-node-pkg-linux-source.sh ~/btx/build v0.34.9
 # 3. then the usual npm ci && npm run tauri build
 ```
 

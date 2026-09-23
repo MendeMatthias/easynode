@@ -45,17 +45,17 @@ name: Build Windows btxd (mingw cross, smoked on Windows)
 # 0.34 .. 0.34.4 engines; 0.34.5 and later allow a degraded start, which
 # scripts/check-engine-fleet-ready.sh verifies per pin.
 #
-# 3013c2c2 is upstream's tag v0.34.6 (tagged 2026-09-13), one commit past the
-# 9eb4e005 build 0.6.18 through 0.6.22 shipped, and both engine guards pass on
-# it. A SHA rather than the tag name so the artifact is named for the commit,
-# which is what node-win-installer.yml's identity check needs.
+# 84b998b4 is upstream's tag v0.34.9 (tagged 2026-09-23), and both engine
+# guards pass on it. Before that it was 3013c2c2, upstream's tag v0.34.6. A SHA
+# rather than the tag name so the artifact is named for the commit, which is
+# what node-win-installer.yml's identity check needs.
 on:
   workflow_dispatch:
     inputs:
       btxchain_ref:
         description: "btxchain/btx ref to build (default = NODE_RELEASE_COMMIT)"
         required: false
-        default: "3013c2c22a9a453e778d6cc426734567d819fa59"
+        default: "84b998b4f3272775aaf8c241ac11dc683f4c4e23"
   # Self-service trigger. This workflow is dispatch-only, which means a 50 minute
   # build that everything else pins against can only start from a browser, and a
   # release stalls whenever nobody is at a keyboard. Scoped to a throwaway branch
@@ -71,7 +71,7 @@ permissions:
 # fallback there. That is how a build ends up producing an artifact nobody can
 # ship. Every consumer below reads BTXCHAIN_REF instead.
 env:
-  BTXCHAIN_REF: ${{ inputs.btxchain_ref || '3013c2c22a9a453e778d6cc426734567d819fa59' }}
+  BTXCHAIN_REF: ${{ inputs.btxchain_ref || '84b998b4f3272775aaf8c241ac11dc683f4c4e23' }}
 
 jobs:
   build-btxd:
@@ -268,6 +268,11 @@ jobs:
             echo "::error::failed to register the ascend stub in src/CMakeLists.txt"; exit 1; }
           echo "registered:"; grep -n 'ascend/matmul_v4' src/CMakeLists.txt
 
+      # WITH_MODELNET=OFF, as on Linux and macOS. 0.34.7 made the Native Model
+      # Network default ON (CMakeLists.txt:172), and ON is a hard configure
+      # error without OpenSSL 3.5, which the depends tree does not build for
+      # mingw. The app never uses the model plane, and OFF also removes the
+      # `-modelnet` option, so nothing may pass -modelnet=0 to this btxd.
       - name: Configure + build (depends toolchain, NO_STRICT)
         working-directory: btx
         run: |
@@ -275,6 +280,7 @@ jobs:
             -DBUILD_DAEMON=ON -DBUILD_CLI=ON -DBUILD_UTIL=OFF -DBUILD_TX=OFF \
             -DBUILD_WALLET_TOOL=OFF -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_TESTS=OFF \
             -DENABLE_WALLET=ON -DWITH_SQLITE=ON -DWARN_INCOMPATIBLE_BDB=OFF \
+            -DWITH_MODELNET=OFF \
             -DAPPEND_CPPFLAGS="-DNO_STRICT -I$(pwd)/win-compat"
           cmake --build build-win -j"$(nproc)"
 

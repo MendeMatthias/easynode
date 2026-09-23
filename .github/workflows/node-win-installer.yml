@@ -81,10 +81,20 @@ env:
   # 9eb4e005 build under the bare `v0.34.6` key re-provisions onto this one.
   # The staging script asserts VERSION against btxd.exe --version and writes
   # it to .btxd-version; the guard below asserts TAG against NODE_RELEASE_TAG.
-  PROVEN_BTXD_RUN_ID: "34914770368"
-  PROVEN_BTXD_ARTIFACT: "btxd-windows-3013c2c22a9a453e778d6cc426734567d819fa59"
-  PROVEN_BTXD_VERSION: "v0.34.6"
-  PROVEN_BTXD_TAG: "v0.34.6-3013c2c2"
+  #
+  # MOVED 2026-09-23 to upstream's TAG v0.34.9 = 84b998b4, built with
+  # -DWITH_MODELNET=OFF (commands.rs has why). Run 35867391955, dispatched on
+  # claude/engine-v0.34.9 with btxchain_ref=84b998b4…: both jobs green, the
+  # mingw cross-compile (the `near` patch still rewrote 2 sites, the Ascend stub
+  # registered, `native model network ... OFF`) and "regtest smoke on real
+  # Windows", artifact btxd-windows-84b998b4… (19471556 bytes). All four pins
+  # move together. VERSION and TAG are equal again: the binary reports v0.34.9
+  # and the install key is plain v0.34.9, because no install ever used that
+  # key. Still two fields, for the next time they diverge.
+  PROVEN_BTXD_RUN_ID: "35867391955"
+  PROVEN_BTXD_ARTIFACT: "btxd-windows-84b998b4f3272775aaf8c241ac11dc683f4c4e23"
+  PROVEN_BTXD_VERSION: "v0.34.9"
+  PROVEN_BTXD_TAG: "v0.34.9"
 
 permissions:
   contents: read

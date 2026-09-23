@@ -23,12 +23,33 @@ pub enum WalletFileKind {
     /// A descriptor `wallet.dat`, which is a SQLite database. This is what
     /// btxd writes today. Goes to `restorewallet`.
     WalletDatSqlite,
-    /// A legacy `wallet.dat`, which is a Berkeley DB file. Older nodes wrote
-    /// these. Also goes to `restorewallet`; btxd decides whether it can still
-    /// read it, and its refusal is more informative than any guess we make.
+    /// A legacy `wallet.dat`, which is a Berkeley DB file, the kind Bitcoin Core
+    /// wrote before descriptor wallets. Recognised so it gets its own answer,
+    /// and never imported. Until 2026-09-23 it went to `restorewallet` and btxd
+    /// decided. On v0.34.9 the macOS and Linux engines are built without
+    /// Berkeley DB and answer -18 "Build does not support Berkeley DB database
+    /// format.", which reached the user raw (measured on macOS). The Windows
+    /// engine is built with it and, going by the source, loads the file as a
+    /// legacy wallet. Neither is an import: mainnet has taken only P2MR outputs
+    /// since its first block, and a legacy wallet's keys are secp256k1 and
+    /// cannot give a P2MR address.
+    ///
+    /// `migratewallet`, which reads the file without Berkeley DB, is no route
+    /// either. It keeps the old keys as secp256k1 `combo()` descriptors and
+    /// gives the wallet a P2MR seed it did not have. And on v0.34.9, measured
+    /// that day with a minimal HD wallet (seed and `hdchain`), it throws
+    /// "vector" partway through, because `mr()` refuses the old seed's xpub,
+    /// and leaves a half-migrated SQLite legacy wallet that cannot be migrated
+    /// again.
     WalletDatBerkeley,
-    /// The text file `dumpwallet` writes. Goes to `importwallet`, and only into
-    /// a wallet that already exists.
+    /// The text file `dumpwallet` writes: a legacy wallet's WIF keys in plain
+    /// text. Recognised so it gets its own answer, and never imported. On
+    /// v0.34.9, which easyNode pins from 2026-09-23, `importwallet` refuses
+    /// every file with "BTX PQ policy: importwallet is disabled (legacy WIF);
+    /// use importdescriptors with P2MR". On v0.34.6 it imported only into a
+    /// legacy wallet, which easyNode never creates; the one way to have one was
+    /// to restore a legacy wallet.dat on Windows, the only engine of ours built
+    /// with Berkeley DB.
     WalletDump,
     /// Not something we can route.
     Unknown,
@@ -46,6 +67,10 @@ const BDB_MAGIC_BE: [u8; 4] = [0x00, 0x05, 0x31, 0x62];
 /// First line of a `dumpwallet` file.
 const DUMP_PREFIX: &[u8] = b"# Wallet dump created by";
 
+/// The UTF-8 byte order mark, which some Windows editors write at the start of
+/// a file (Notepad's "UTF-8 with BOM", for one).
+const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
+
 /// Classify by content. Never looks at the file name.
 pub fn detect(bytes: &[u8]) -> WalletFileKind {
     if bytes.starts_with(SQLITE_MAGIC) {
@@ -57,7 +82,11 @@ pub fn detect(bytes: &[u8]) -> WalletFileKind {
             return WalletFileKind::WalletDatBerkeley;
         }
     }
-    if bytes.starts_with(DUMP_PREFIX) {
+    if bytes
+        .strip_prefix(UTF8_BOM)
+        .unwrap_or(bytes)
+        .starts_with(DUMP_PREFIX)
+    {
         return WalletFileKind::WalletDump;
     }
     // Only now is it worth paying for a UTF-8 check plus a JSON parse. A
@@ -85,12 +114,57 @@ pub fn detect(bytes: &[u8]) -> WalletFileKind {
 /// take, because the old message named only one and left a person holding a
 /// `wallet.dat` with nowhere to go.
 pub fn unknown_file_advice() -> &'static str {
-    "That file is not one we recognise. easyNode takes a wallet.dat from a BTX node, \
-     a .btxwallet file from the browser wallet, or the text file that dumpwallet writes. \
+    "That file is not one we recognise. easyNode takes a wallet.dat from a BTX node \
+     or a .btxwallet file from the browser wallet. \
      On a Mac your node's wallet.dat lives in Library/Application Support/BTX/wallets/ \
      inside your home folder, which Finder hides — press Command-Shift-G in the file \
      picker and paste the path. Stop that node first, or copy the file with backupwallet, \
      so you are not reading a wallet the node is still writing to."
+}
+
+/// What to tell a user who hands us a `dumpwallet` text file: what it is, that
+/// easyNode will not take it, that nothing happened, and which files do bring a
+/// wallet across. It names no engine version on purpose: the refusal is BTX's
+/// post-quantum policy, not a quirk of one release. And it says "easyNode", not
+/// "this node", because the app can be attached to an engine it did not
+/// provision (the miner's, for one), and only what easyNode itself does is true
+/// on every engine.
+pub fn wallet_dump_advice() -> &'static str {
+    "That is a dumpwallet text file: a legacy wallet's private keys, written out in \
+     plain text. easyNode no longer imports those, because BTX's post-quantum policy \
+     switched importwallet off. The file was not sent to your node, so nothing was \
+     imported and nothing was changed. Import your .btxwallet file from the browser \
+     wallet, or a wallet.dat from a current BTX node, instead. Either brings the whole \
+     wallet across on its own."
+}
+
+/// What to tell a user who hands us a legacy, Berkeley DB `wallet.dat`. The
+/// reason it gives is the chain's, not the engine's, so it holds on every
+/// engine the app can be attached to: BTX mainnet has taken only P2MR outputs
+/// since its first block, and a legacy wallet's keys are secp256k1, so none of
+/// them can hold BTX. It does not say the node cannot read the file, because
+/// the Windows engine, built with Berkeley DB, can.
+pub fn legacy_wallet_dat_advice() -> &'static str {
+    "That is a legacy wallet.dat, a Berkeley DB file of the kind Bitcoin Core and \
+     the coins built on it used to write. Its keys are the old, pre-quantum kind, and \
+     BTX has paid only to post-quantum (P2MR) addresses since its first block, so none \
+     of them can hold BTX. easyNode does not import these. The file was not sent to \
+     your node, so nothing was imported and nothing was changed. If you hold BTX, \
+     import your .btxwallet file from the browser wallet, or a wallet.dat from a \
+     current BTX node, instead."
+}
+
+/// What to tell the user INSTEAD of importing, or `None` when the file goes to
+/// the node. Every answer is about the file alone, so the caller returns it
+/// before it stages anything or asks the node anything, and it holds whether
+/// or not the node is running.
+pub fn advice_instead_of_import(kind: WalletFileKind) -> Option<&'static str> {
+    match kind {
+        WalletFileKind::Unknown => Some(unknown_file_advice()),
+        WalletFileKind::WalletDump => Some(wallet_dump_advice()),
+        WalletFileKind::WalletDatBerkeley => Some(legacy_wallet_dat_advice()),
+        WalletFileKind::BrowserBundle | WalletFileKind::WalletDatSqlite => None,
+    }
 }
 
 #[cfg(test)]
@@ -240,15 +314,15 @@ mod tests {
     }
 
     #[test]
-    fn a_utf8_bom_defeats_the_dumpwallet_prefix_on_purpose() {
-        // Left as a bounce, not silently absorbed. Detection cannot strip the
-        // BOM on its own: the caller stages the ORIGINAL bytes, so classifying
-        // this as a dump would hand btxd a file whose first line it also fails
-        // to parse, turning a clear refusal into a confusing node error. If this
-        // is ever fixed, fix it by normalising what gets STAGED, then change
-        // this test.
+    fn a_utf8_bom_does_not_hide_a_dumpwallet_file() {
+        // Until 2026-09-23 this was a bounce on purpose, because a dump was
+        // staged as its original bytes and sent to btxd, and the old test said
+        // to change that only by normalising what gets staged. A dump is no
+        // longer staged or sent anywhere, only answered, so seeing past a BOM
+        // costs nothing and gets the person the advice about their own file
+        // instead of "not one we recognise".
         let bom_dump = b"\xef\xbb\xbf# Wallet dump created by BTX v0.33.4.1\n";
-        assert_eq!(detect(bom_dump), WalletFileKind::Unknown);
+        assert_eq!(detect(bom_dump), WalletFileKind::WalletDump);
     }
 
     #[test]
@@ -256,6 +330,137 @@ mod tests {
         let a = unknown_file_advice();
         assert!(a.contains("wallet.dat"));
         assert!(a.contains(".btxwallet"));
-        assert!(a.contains("dumpwallet"));
+        // And none that we do not. The dumpwallet text left this list with the
+        // move to the v0.34.9 engine (2026-09-23), which refuses every one, so
+        // naming it sent people to a file that could only fail there.
+        assert!(!a.contains("dumpwallet"), "{a}");
+    }
+
+    #[test]
+    fn a_dumpwallet_file_is_answered_with_advice_instead_of_being_imported() {
+        // On v0.34.9, easyNode's engine from 2026-09-23, `importwallet` throws
+        // "BTX PQ policy: importwallet is disabled (legacy WIF); use
+        // importdescriptors with P2MR" for every file it is given, so a node
+        // that had a wallet could only answer a dump with that line, raw. A
+        // dump is now answered here, before its keys reach the disk or the node.
+        let dump = detect(b"# Wallet dump created by BTX v0.33.4.1\n");
+        assert_eq!(advice_instead_of_import(dump), Some(wallet_dump_advice()));
+        assert_eq!(
+            advice_instead_of_import(WalletFileKind::Unknown),
+            Some(unknown_file_advice())
+        );
+    }
+
+    #[test]
+    fn a_legacy_wallet_dat_is_answered_with_advice_instead_of_being_imported() {
+        // Measured on 2026-09-23 against the v0.34.9 macOS engine, mainnet,
+        // with a legacy HD wallet.dat written by Berkeley DB 4.7.25. That engine
+        // is built without Berkeley DB, like the Linux one, and `restorewallet`
+        // answered -18 "Wallet file verification failed. Failed to open
+        // database path '<walletdir>/btxnode'. Build does not support Berkeley
+        // DB database format.", which reached the user raw. The Windows engine
+        // is built with it and, going by the source (not run), would load the
+        // file, into a wallet that cannot hold BTX: mainnet takes only P2MR
+        // outputs, from its first block, and a legacy wallet's keys are
+        // secp256k1. So the file is answered here, the same on every engine,
+        // before it is staged or sent anywhere.
+        let head: [u8; 24] = [
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x31,
+            0x05, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
+        ];
+        assert_eq!(
+            advice_instead_of_import(detect(&head)),
+            Some(legacy_wallet_dat_advice())
+        );
+    }
+
+    #[test]
+    fn the_files_the_engine_still_takes_are_routed_not_answered() {
+        for kind in [
+            WalletFileKind::BrowserBundle,
+            WalletFileKind::WalletDatSqlite,
+        ] {
+            assert_eq!(advice_instead_of_import(kind), None, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn the_legacy_advice_says_what_the_file_is_and_why_no_btx_is_in_it() {
+        let a = legacy_wallet_dat_advice();
+        // What the file is.
+        assert!(a.contains("legacy wallet"), "{a}");
+        assert!(a.contains("Berkeley DB"), "{a}");
+        // Why nothing in it can be BTX, which is the part that is true on
+        // every engine, including one that can open the file.
+        assert!(a.contains("P2MR"), "{a}");
+        assert!(a.contains("first block"), "{a}");
+        // That easyNode will not take it, and that nothing happened.
+        assert!(a.contains("easyNode does not import"), "{a}");
+        assert!(a.contains("not sent to your node"), "{a}");
+        assert!(a.contains("nothing was imported"), "{a}");
+        // What does come across.
+        assert!(a.contains(".btxwallet"), "{a}");
+        assert!(a.contains("wallet.dat from a current BTX node"), "{a}");
+    }
+
+    #[test]
+    fn the_legacy_advice_does_not_blame_the_engine_or_name_a_platform() {
+        // The Windows engine is built with Berkeley DB and can open the file,
+        // and easyNode can be attached to an engine it did not provision, so
+        // "your node cannot read this" would be false on some of them. The
+        // reason no BTX is in the file does not depend on the build.
+        let l = legacy_wallet_dat_advice().to_lowercase();
+        for word in [
+            "cannot read",
+            "can't read",
+            "does not support",
+            "windows",
+            "mac",
+            "linux",
+        ] {
+            assert!(!l.contains(word), "{word:?} in: {l}");
+        }
+    }
+
+    #[test]
+    fn the_dump_advice_says_what_the_file_is_and_what_to_bring_instead() {
+        let a = wallet_dump_advice();
+        // What the file is, and that it holds keys in the clear.
+        assert!(a.contains("dumpwallet"), "{a}");
+        assert!(a.contains("plain text"), "{a}");
+        // That easyNode will not take it, and that nothing happened. "easyNode",
+        // not "this node": the app can be attached to an engine it did not
+        // provision, and only what easyNode itself does is true on every one.
+        assert!(a.contains("easyNode no longer imports"), "{a}");
+        assert!(a.contains("not sent to your node"), "{a}");
+        assert!(a.contains("nothing was imported"), "{a}");
+        // What does come across.
+        assert!(a.contains(".btxwallet"), "{a}");
+        assert!(a.contains("wallet.dat"), "{a}");
+    }
+
+    #[test]
+    fn no_advice_trips_the_panels_scan_still_running_check() {
+        // apps/node/src/wallet.ts replaces any import message that matches
+        // /timed out|timeout|error sending request|connection (closed|reset|
+        // refused)/i with "your node is still scanning". Advice that tripped
+        // it would never be read, and nothing on this side would say so.
+        for a in [
+            unknown_file_advice(),
+            wallet_dump_advice(),
+            legacy_wallet_dat_advice(),
+        ] {
+            let l = a.to_lowercase();
+            for trap in [
+                "timed out",
+                "timeout",
+                "error sending request",
+                "connection closed",
+                "connection reset",
+                "connection refused",
+            ] {
+                assert!(!l.contains(trap), "{trap:?} in: {a}");
+            }
+        }
     }
 }

@@ -2,8 +2,9 @@
 # Stage the bundled BTX node package for an easyBTX Node build — and make it
 # SELF-CONTAINED (no Homebrew on the user's machine).
 #
-# The app bundles the WHOLE v0.34.5 release package tree (bin/ launcher
-# wrappers + libexec/*.real Mach-O daemons + metal shader libs, ~25 MB) under
+# The app bundles the v0.34.9 release package tree (bin/ launcher wrappers +
+# libexec/*.real Mach-O daemons + metal shader libs), minus the model-plane
+# helpers (see below), under
 # src-tauri/resources/node-pkg/. The tree is gitignored (same rationale as the
 # miner's resources/bin + resources/node-bin: keep binaries out of the source
 # tree) and must be staged before `tauri build` / `tauri dev`.
@@ -30,16 +31,18 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="$APP_DIR/src-tauri/resources/node-pkg"
 
-VERSION="0.34.5"
+VERSION="0.34.9"
 # Refuse to stage a version the app will then refuse. See scripts/lib/engine-pin.sh.
 # shellcheck source=lib/engine-pin.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/engine-pin.sh"
 assert_matches_engine_pin "$APP_DIR" "$VERSION"
 
 TARBALL_URL="https://github.com/btxchain/btx/releases/download/v${VERSION}/btx-${VERSION}-arm64-apple-darwin.tar.gz"
-# From the release's signed SHA256SUMS. Upstream has re-generated release assets
-# in place before — a silent swap must FAIL here, never ship unnoticed.
-TARBALL_SHA256="67e5ed639d2fcc05f8c40d9a945e447140312b7c7505a85c41452e851e98946e"
+# From the release's SHA256SUMS. Upstream has re-generated release assets in
+# place before — a silent swap must FAIL here, never ship unnoticed. v0.34.9
+# publishes that file UNSIGNED (no SHA256SUMS.asc; its notes say the signing
+# key was not on the build host), so this pins the bytes, not a signature.
+TARBALL_SHA256="3cfde53d3a2353c33f5487e530689bc65f30950c3104856d43b25fad0f20010b"
 
 SRC="${EASYBTX_NODE_PKG_SRC:-}"
 if [[ -z "$SRC" && -x "$HOME/btx-node-research/btx-$VERSION/bin/btxd" ]]; then
@@ -79,6 +82,20 @@ mkdir -p "$DEST"
 # doc/ are source-repo extras the app never reads.
 cp -R "$SRC/bin" "$DEST/bin"
 cp -R "$SRC/libexec" "$DEST/libexec"
+
+# ...and without the model plane. From 0.34.7 upstream's archive is built
+# WITH_MODELNET=ON and ships btx-modeld plus six sibling helpers, and an ON btxd
+# starts btx-modeld by itself (-modelnet defaults to 1), bound to 0.0.0.0:29447.
+# The release engine is built WITH_MODELNET=OFF and has none of this, and the app
+# calls none of these binaries. With btx-modeld absent, btxd logs "btx-modeld
+# not found next to btxd; monetary node continues" and runs; measured on this
+# archive's btxd, regtest, 2026-09-23. So a contributor build starts no model
+# helper and opens no model port. It is still not the release engine: this
+# btxd has the model plane compiled in (the -modelnet option, the model P2P
+# messages), where the release build has none of it.
+for helper in btx-modeld btx-modelcheck btx-open btx-capability btx-capabilityd btx-hcpd btx-hosted; do
+  rm -f "$DEST/bin/$helper" "$DEST/libexec/$helper.real"
+done
 
 # ── Vendor non-system dylibs TRANSITIVELY (Homebrew) ────────────────────────
 # The upstream darwin build links some libs from Homebrew and a clean user Mac

@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # Stage the bundled BTX node package for an easyBTX Node LINUX build.
 #
-# Mirrors stage-node-pkg.sh (macOS) but is far simpler: the upstream Linux
-# release binaries are FULLY STATIC ELFs (verified: `file` reports
-# "statically linked" for libexec/*.real), so there is no .so vendoring or
+# Mirrors stage-node-pkg.sh (macOS) but is far simpler: no .so vendoring or
 # rpath pass — download, verify the pinned sha256, copy, sanity-run.
+#
+# The upstream Linux binaries USED to be fully static ELFs. v0.34.9's are not:
+# libexec/btxd.real NEEDs libssl.so.3 and libcrypto.so.3 (OpenSSL 3.5, bundled
+# in the archive's top-level lib/), plus libzmq, libevent, sqlite and libgomp
+# from the host. bin/btxd, the wrapper, puts ../lib on LD_LIBRARY_PATH when it
+# finds libssl.so.3 there, so lib/ is staged beside bin/ and libexec/.
 #
 # Source resolution order:
 #   1. $EASYBTX_NODE_PKG_SRC (explicit override: an extracted package dir)
@@ -13,11 +17,13 @@
 # Usage:  apps/node/scripts/stage-node-pkg-linux.sh
 set -euo pipefail
 
-VERSION="0.34.5"
+VERSION="0.34.9"
 TARBALL_URL="https://github.com/btxchain/btx/releases/download/v${VERSION}/btx-${VERSION}-x86_64-linux-gnu.tar.gz"
-# From the release's signed SHA256SUMS. Upstream has re-generated release
-# assets in place before — a silent swap must FAIL here, never ship unnoticed.
-TARBALL_SHA256="76ad2cab712c29f744c86e93951b4fb09fbbca22f074926d5efb36c3f08c6ba7"
+# From the release's SHA256SUMS. Upstream has re-generated release assets in
+# place before — a silent swap must FAIL here, never ship unnoticed. v0.34.9
+# publishes that file UNSIGNED (no SHA256SUMS.asc), so this pins the bytes, not
+# a signature.
+TARBALL_SHA256="cf7a68e5aad53aad80a8d8eb04d0ba552c319c466dcf34af4c62fc41b0c20f5f"
 # NOTE: upstream publishes no `aarch64-linux-gnu` asset, so there is no ARM-Linux
 # node to stage. This script is x86_64-only by construction and always was; the
 # gap is called out here so nobody spends an afternoon looking for the tarball.
@@ -32,8 +38,9 @@ TARBALL_SHA256="76ad2cab712c29f744c86e93951b4fb09fbbca22f074926d5efb36c3f08c6ba7
 #
 # Two separate reasons this tarball is a developer convenience only:
 #
-#   1. No CUDA. Upstream also publishes btx-0.34.5-x86_64-linux-gnu-cuda12.tar.gz
-#      for that, which this deliberately does not fetch, because see (2).
+#   1. No CUDA. Upstream also publishes -cuda12 and -cuda13 archives for that,
+#      which this deliberately does not fetch, because see (2). v0.34.9's CUDA
+#      fatbins are also Blackwell-only (sm_120), per its release notes.
 #   2. glibc. The official Linux binaries need glibc 2.38, and Ubuntu LTS
 #      machines do not have it, so they will not run for most people anyway.
 #
@@ -78,10 +85,22 @@ fi
 
 rm -rf "$DEST"
 mkdir -p "$DEST"
-# Only the runtime tree: bin/ wrappers + libexec/ static daemons. contrib/ and
+# Only the runtime tree: bin/ wrappers + libexec/ daemons, and lib/ when the
+# archive carries one (v0.34.9's bundled OpenSSL; see the header). contrib/ and
 # doc/ are source-repo extras the app never reads.
 cp -R "$SRC/bin" "$DEST/bin"
 cp -R "$SRC/libexec" "$DEST/libexec"
+if [[ -d "$SRC/lib" ]]; then
+  cp -R "$SRC/lib" "$DEST/lib"
+fi
+# Without the model plane, exactly as stage-node-pkg.sh does and for the same
+# reason: the archive is built WITH_MODELNET=ON, an ON btxd starts btx-modeld on
+# 0.0.0.0:29447 by itself, the release engine is built OFF, and the app calls
+# none of these. Without btx-modeld btxd logs that it is missing and continues.
+# The model plane is still compiled into this btxd; only the helper is gone.
+for helper in btx-modeld btx-modelcheck btx-open btx-capability btx-capabilityd btx-hcpd btx-hosted; do
+  rm -f "$DEST/bin/$helper" "$DEST/libexec/$helper.real"
+done
 chmod +x "$DEST"/bin/* "$DEST"/libexec/*
 
 echo "==> staged node package: $(du -sh "$DEST" | cut -f1) at $DEST"

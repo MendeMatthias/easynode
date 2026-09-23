@@ -239,33 +239,79 @@ use crate::state::{
 // SMOKE PASSED. Upstream's release notes say "CLIENT_VERSION is 0.34.6"; its
 // official binaries need glibc 2.38, so we keep building from source.
 //
-// WHY THE INSTALL KEY IS `v0.34.6-3013c2c2` AND NOT `v0.34.6`. This constant is
-// the install-directory key (`~/.local/btx/<key>/<platform>`), and
-// `start_node_inner` re-provisions an existing install ONLY when it changes.
-// Every 0.6.18 through 0.6.22 install already sits in a directory named
-// `v0.34.6` holding the 9eb4e005 build. Moving the commit while keeping the
-// name would ship the tag build to fresh installs only and leave every
-// returning user on 9eb4e005 forever, with nothing on screen saying so. The
-// `-pr105b` precedent above is the same shape: a suffixed key while the binary
-// reports the unsuffixed version, and the staged package declaring what its
-// btxd really reports in `.btxd-version` (installer.rs, BTXD_VERSION_MARKER),
-// which is what provisioning verifies against. The suffix is the commit's short
-// SHA rather than a counter so the directory name says which engine is inside
-// without running it, and so it can never collide with an upstream tag
-// (upstream tags are vX.Y.Z[.W]). Convention, and the staging scripts hold you
-// to it: the key is `<version btxd reports>[-<qualifier>]`; a qualifier never
-// changes the version part, and `engine_pin_version` in
-// apps/node/scripts/lib/engine-pin.sh strips it. node.rs `parse_tag_version`
-// stops at the first non-digit, so every version gate reads 0.34.6 from it.
-pub const NODE_RELEASE_TAG: &str = "v0.34.6-3013c2c2";
+// ── 2026-09-23: v0.34.9, BECAUSE 0.34.6 CANNOT SETTLE THE 227313 SPLIT ──────
+//
+// Tag `v0.34.9` = `84b998b4f3272775aaf8c241ac11dc683f4c4e23` (annotated tag
+// object 5a5bf643, tagged 2026-09-23 06:17Z), 63 commits past 3013c2c2. The
+// network split at 227313 that night, and the census at 13:07Z had every
+// 0.34.5/0.34.6 consensus node it reached on the branch parked at 227355 and
+// the signers and mirrors on the heavier one. The engine difference that
+// matters, read in matmul_v4_rc_gkr.cpp: when a strict-device node's GPU digest
+// disagrees with a header, 0.34.6 (and 0.34.8) record UnconfirmedDigestMismatch,
+// "portable retry disabled in strict mode", and leave the block for a second
+// qualified device to settle, which a one-GPU machine does not have. 0.34.9
+// (2bfc9716) recomputes it with the portable CPU ExactReplay and rules Valid or
+// InvalidConsensus. That is a
+// mechanism that can hold a node on the lighter branch, not a proof that it is
+// what holds each one there, or that every parked node recovers: the same
+// census had one 0.34.9 consensus node on the parked branch and three sitting
+// at 227312.
+//
+// Verified at the SHA, 2026-09-23. chainparams.cpp keeps the 203000 assumeutxo
+// entry byte-identical and adds 219000, with no 199299/199300 base, so
+// snapshot_spec() does not move. The golden manifest and contrib/matmul-v4 are
+// byte-identical to v0.34.6 (rows cuda/sm_120 and metal/m4_class; two-step seal
+// field 8 855f220b, recomputed seal matches field 9). No btxd option was
+// removed, every one this app passes on argv or in the conf is still
+// registered, and only -matmultrustedpubkey's help text moved (it now mentions
+// ML-DSA-44 pins beside secp). CLIENT_VERSION_BUILD is 9, so btxd reports
+// v0.34.9. Consensus-adjacent changes 0.34.6 lacks, none height-gated:
+// WitnessSigOps now counts OP_CHECKSIGFROMSTACK (477b4e63) and no longer lets an
+// annex zero-rate a P2MR leaf (cd4301fc), an unresolvable ASERT anchor fails
+// closed (cd4301fc), and a consensus signer no longer rolls a heavier validated
+// tip back onto a lower-work attested sibling (2ac77d56).
+//
+// ⚠ Built with -DWITH_MODELNET=OFF on all three platforms. 0.34.7 made the
+// Native Model Network default ON (upstream CMakeLists.txt:172), and it needs
+// OpenSSL 3.5, which neither ubuntu-22.04 nor the mingw depends tree has. OFF
+// compiles out every `#ifdef ENABLE_MODELNET` block, so btxd never spawns
+// btx-modeld and `-modelnet` is not a registered option at all: do NOT pass
+// -modelnet=0 to this engine, it refuses an unknown parameter at init.
+//
+// ⚠ This engine refuses to start a node that holds a local signing key and
+// pins no key (upstream 235d39be), which is every validating host since 0.6.26.
+// crates/btx-core/src/node.rs `signing_key_self_pin` is what lets them start;
+// the first smoke test of this pin, without it, died three times at init.
+// check-engine-fleet-ready.sh fails any future pin that brings the refusal
+// back without the self-pin.
+//
+// THE INSTALL KEY IS BARE AGAIN: `v0.34.9`. It is the install-directory key
+// (`~/.local/btx/<key>/<platform>`), and `start_node_inner` re-provisions an
+// existing install ONLY when it changes. It carried `-3013c2c2` from
+// 2026-09-15 because every 0.6.18 through 0.6.22 install already sat in a
+// directory named `v0.34.6` holding the untagged 9eb4e005 build, and keeping
+// that name would have left every returning user on it with nothing on screen
+// saying so. No commit in this repository ever set the key to `v0.34.9`, so the
+// bare tag moves every install and names no directory a release created. The
+// convention stands for the next time the commit moves under an unchanged
+// version (the `-pr105b` and `-3013c2c2` shape): the key is `<version btxd
+// reports>[-<qualifier>]`, the qualifier is the commit's short SHA so the
+// directory says which engine is inside and never collides with an upstream
+// tag, the staged package declares what its btxd really reports in
+// `.btxd-version` (installer.rs, BTXD_VERSION_MARKER), and `engine_pin_version`
+// in apps/node/scripts/lib/engine-pin.sh strips the qualifier. node.rs
+// `parse_tag_version` stops at the first non-digit, so every version gate reads
+// 0.34.9 from either shape.
+pub const NODE_RELEASE_TAG: &str = "v0.34.9";
 
-/// The exact upstream commit NODE_RELEASE_TAG names. Since 2026-09-15 this is
-/// the commit upstream's tag object `v0.34.6` points at, kept set rather than
-/// cleared: the install key carries a suffix and is not itself an upstream
-/// ref, so the guards, `engine_pin_ref` and the engine build workflows fetch
-/// and check out THIS, never the key. If upstream ever re-tags, this does not
+/// The exact upstream commit NODE_RELEASE_TAG names: the commit upstream's
+/// annotated tag `v0.34.9` points at. Kept set although the key is now itself
+/// an upstream tag, so the guards, `engine_pin_ref` and the engine build
+/// workflows check out a SHA that cannot move under us, and the CI artifacts
+/// are named for the commit (`btxd-<os>-<sha>`), which is what the installer
+/// workflows' identity checks compare. If upstream ever re-tags, this does not
 /// move by itself; re-run both guards on the new commit and choose a new key.
-pub const NODE_RELEASE_COMMIT: &str = "3013c2c22a9a453e778d6cc426734567d819fa59";
+pub const NODE_RELEASE_COMMIT: &str = "84b998b4f3272775aaf8c241ac11dc683f4c4e23";
 
 /// The pinned assumeutxo snapshot this app bootstraps from: the v0.33.2
 /// release's own asset (height 179000), pinned from its snapshot.manifest.json.
