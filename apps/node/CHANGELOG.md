@@ -63,9 +63,11 @@ installed the new engine over the old one, btxd passed its Metal self-check
 (`m4_class`, strict-device, ready), reported `/BTX:0.34.9/`, kept its signing
 key and reported the same signer state as 0.34.6, started no model helper and
 opened no model port. What an afternoon cannot show is the chain it ends up
-on: the snapshot this app starts from is about 24,000 blocks below the split,
-and a node that checks blocks manages about four a minute at best, so reaching
-227,313 takes about four days.
+on: the 203,000 snapshot the tested build started new nodes from is about
+24,000 blocks below the split, and a node that checks blocks manages about four
+a minute at best, so reaching 227,313 from it takes about four days. New nodes
+now start from 219,000 instead, about 8,300 blocks below the split; the fast
+start entry below says what that does and does not change.
 
 **Built without upstream's model network.** 0.34.7 switched on a "Native Model
 Network" by default: a helper, `btx-modeld`, that btxd starts by itself on port
@@ -79,7 +81,8 @@ network or not.
 
 **What else changes in the engine, read from the diff.** No consensus rule
 moves at a height, the 203,000 bootstrap snapshot and the golden manifest are
-byte-identical, and no option the app passes was removed. A node that signs no
+byte-identical, a second bootstrap snapshot at 219,000 is added, and no option
+the app passes was removed. A node that signs no
 longer rolls its own checked chain back onto a lighter sibling because the
 sibling carries a signature (`2ac77d56`); since 0.6.26 every node that
 validates signs, so that fix is ours too. The block-wide count of signature
@@ -113,6 +116,26 @@ present) and Windows (the mingw cross-compile with its three source patches,
 and a regtest smoke on a real Windows runner). Upstream published 0.34.9's
 `SHA256SUMS` unsigned this time. Our engines are built from source, so that
 touches only the contributor staging scripts, which pin the archive bytes.
+
+**New nodes start from block 219,000 instead of 203,000.** v0.34.9 carries a
+second fast start base at height 219,000 beside the 203,000 one, and a new node
+now loads that. It sits about 8,300 blocks below the 227,313 split, on the
+stretch both branches share. Measured against the chain on 23 September, it
+leaves 8,761 blocks to catch up after loading instead of 24,761, and the
+download stays about 9 MB. It is fewer blocks to catch up, not less work: the
+node still re-checks everything below the base in the background, so what
+changes is how soon it reaches the tip. The gain is biggest on fast machines,
+and a machine that cannot keep up with the chain gains nothing from it.
+Upstream publishes this file on a pre-release, `assumeutxo-219000`, not with
+v0.34.9 itself, so we checked it rather than trusting the name: its size and
+SHA-256 match upstream's manifest and sums, and the file names block 219,000 as
+`dc51220b…3fdb87c3`, the block v0.34.9 compiles in and btxscan reports at that
+height. A node that already loaded the 203,000 snapshot keeps it and downloads
+nothing, because v0.34.9 carries that base unchanged. One that downloaded the
+203,000 file but never loaded it fetches the new one on its next start. A node
+that loaded 203,000 and is still below 219,000 reads Syncing after the update
+instead of Live until it passes 219,000. Nothing changed on the node; it had
+thousands of blocks to go either way.
 
 **A node can now serve a snapshot of the chain to new nodes.** Every new
 node still bootstraps from a file compiled into the engine, and the newest

@@ -131,9 +131,12 @@ use crate::state::{
 //      on any candidate. The first only checks the constant; a tag can pass it
 //      and still have no startable mode on most of the fleet, which is exactly
 //      what v0.34.4 does.
-//   2. snapshot_spec() moves WITH this constant. The 203000 assumeutxo base is
-//      compiled into v0.34.5 and is absent from v0.33.4.x, so an engine
-//      downgrade without a matching spec downgrade makes loadtxoutset refuse.
+//   2. snapshot_spec() moves WITH this constant, and since the v0.34.9 engine a
+//      test holds it there:
+//      the_snapshot_pin_is_the_newest_base_the_pinned_engine_carries. The
+//      219000 assumeutxo base is compiled into v0.34.9 and is absent from
+//      v0.34.6 and older, so an engine downgrade without a matching spec
+//      downgrade makes loadtxoutset refuse.
 //
 // Read docs/node-release-recipe.md before cutting a release; it covers the
 // assumeutxo and trusted-mirror conditions the constant check does not.
@@ -258,8 +261,10 @@ use crate::state::{
 // at 227312.
 //
 // Verified at the SHA, 2026-09-23. chainparams.cpp keeps the 203000 assumeutxo
-// entry byte-identical and adds 219000, with no 199299/199300 base, so
-// snapshot_spec() does not move. The golden manifest and contrib/matmul-v4 are
+// entry byte-identical and adds 219000, with no 199299/199300 base. So a node
+// that loaded 203000 keeps working, and snapshot_spec() moves up to 219000 with
+// this engine (v0_34_9_spec; its file is on upstream's `assumeutxo-219000`
+// pre-release, not on a release). The golden manifest and contrib/matmul-v4 are
 // byte-identical to v0.34.6 (rows cuda/sm_120 and metal/m4_class; two-step seal
 // field 8 855f220b, recomputed seal matches field 9). No btxd option was
 // removed, every one this app passes on argv or in the conf is still
@@ -313,14 +318,15 @@ pub const NODE_RELEASE_TAG: &str = "v0.34.9";
 /// move by itself; re-run both guards on the new commit and choose a new key.
 pub const NODE_RELEASE_COMMIT: &str = "84b998b4f3272775aaf8c241ac11dc683f4c4e23";
 
-/// The pinned assumeutxo snapshot this app bootstraps from: the v0.33.2
-/// release's own asset (height 179000), pinned from its snapshot.manifest.json.
-/// The pin MUST track the release — upstream regenerates snapshot.dat assets in
-/// place, so the SHA gate is what catches a mismatched or superseded asset.
-/// (v0.33.2's asset is genuinely different bytes from v0.33.1's: 452282113 vs
-/// 448392435, anchor 179000 vs 155700.)
+/// The pinned assumeutxo snapshot this app bootstraps from: height 219000,
+/// [`btx_core::snapshot::v0_34_9_spec`], pinned from the manifest beside the
+/// file on upstream's `assumeutxo-219000` pre-release. It moves WITH
+/// NODE_RELEASE_TAG, because the base must be one the pinned engine compiles
+/// in; `the_snapshot_pin_is_the_newest_base_the_pinned_engine_carries` holds the
+/// two together. Upstream has regenerated assets in place before (v0.32.11's),
+/// so the SHA gate is what catches a file that is no longer the pinned one.
 pub fn snapshot_spec() -> SnapshotSpec {
-    btx_core::snapshot::v0_34_5_spec()
+    btx_core::snapshot::v0_34_9_spec()
 }
 
 /// The backend btxd is launched with, and since 2026-09-15 the input to the
@@ -4385,8 +4391,8 @@ pub async fn node_footprint(state: State<'_, AppState>) -> Result<NodeFootprint,
 #[cfg(test)]
 mod tests {
     use super::{
-        attached_node_is_ours_to_stop, pre_launch_plan, witness_started_message, AttachedTo,
-        PreLaunchPlan, NODE_RELEASE_COMMIT, NODE_RELEASE_TAG,
+        attached_node_is_ours_to_stop, pre_launch_plan, snapshot_spec, witness_started_message,
+        AttachedTo, PreLaunchPlan, NODE_RELEASE_COMMIT, NODE_RELEASE_TAG,
     };
 
     /// Wrapping a Rust string literal across source lines WITHOUT a trailing
@@ -4734,6 +4740,68 @@ mod tests {
         assert_eq!(
             btx_core::installer::conf_for_profile("full", NODE_RELEASE_TAG),
             btx_core::installer::NODE_FASTSTART_CONF
+        );
+    }
+
+    /// "snapshot_spec() moves WITH this constant" was a comment, and nothing
+    /// held anyone to it. Both ways of breaking it are silent. A base the
+    /// engine does not compile in makes `loadtxoutset` refuse, and every fast
+    /// start becomes a sync from genesis. A base below the newest one it
+    /// carries leaves every new node validating blocks it did not need to.
+    ///
+    /// Each row is read from that tag's `src/kernel/chainparams.cpp`
+    /// (mainnet `m_assumeutxo_data`): the newest base it carries that upstream
+    /// also publishes a file for. An engine with no row fails on purpose: read
+    /// its table, add the row, and move the spec with it.
+    #[test]
+    fn the_snapshot_pin_is_the_newest_base_the_pinned_engine_carries() {
+        let version = NODE_RELEASE_TAG
+            .split_once('-')
+            .map_or(NODE_RELEASE_TAG, |(version, _)| version);
+        let newest_published_base = match version {
+            // Both stop at 203000, published as a v0.34.5 and v0.34.6 release asset.
+            "v0.34.5" | "v0.34.6" => 203_000,
+            // Adds 219000 beside a byte-identical 203000; its file is published
+            // on the `assumeutxo-219000` pre-release only.
+            "v0.34.9" => 219_000,
+            other => panic!(
+                "no record of the assumeutxo bases {other} carries: read `git show \
+                 {other}:src/kernel/chainparams.cpp` (m_assumeutxo_data), add its row \
+                 here, and move snapshot_spec() with it"
+            ),
+        };
+        assert_eq!(
+            snapshot_spec().anchor_height,
+            newest_published_base,
+            "snapshot_spec() must sit on the newest published base engine \
+             {NODE_RELEASE_TAG} compiles in"
+        );
+    }
+
+    /// The one fact about the pin no offline test can check is that the file
+    /// is still there. Since the v0.34.9 engine it lives on an upstream
+    /// PRE-release (`assumeutxo-219000`), which can be edited or deleted
+    /// without a new tag, and first-run setup aborts when this download fails.
+    /// Kept out of CI on purpose, for the reason ci.yml gives for not staging
+    /// the engine there. Run it before cutting a release:
+    ///
+    /// ```text
+    /// cargo test --locked the_pinned_snapshot_is_still_published -- --ignored
+    /// ```
+    ///
+    /// Passed on 2026-09-23 against `assumeutxo-219000` (9151135 bytes).
+    #[tokio::test]
+    #[ignore]
+    async fn the_pinned_snapshot_is_still_published_byte_for_byte() {
+        let spec = snapshot_spec();
+        let dir = tempfile::tempdir().unwrap();
+        btx_core::snapshot::download_snapshot(&spec, dir.path(), &|_| {})
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e}", spec.url));
+        assert!(
+            btx_core::snapshot::snapshot_file_matches_spec(&spec, dir.path()),
+            "downloaded, but not the pinned size and digest: {}",
+            spec.url
         );
     }
 
