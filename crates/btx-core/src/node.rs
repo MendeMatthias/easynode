@@ -516,12 +516,20 @@ pub fn resolve_managed_whitelist_ips() -> Vec<String> {
 // its view of the chain. Checkpoints up to 219000 bound what that set could
 // feed it below the anchor, the snapshot it loads next is pinned by hash, and
 // the grants vanish with the command line. Above the anchor its view is theirs
-// until the restart: on 2026-09-23 every curated source answered at 227355 to
-// 227379, the lighter side of the 227313 split, and the ordinary launch then
-// follows the most work it can find. If every curated source is down the
-// headers never move, and [`header_bootstrap_verdict`] gives up after
-// [`HEADER_BOOTSTRAP_STALL`] and restarts the node the ordinary way, which is
-// slower than this but no worse than before it existed.
+// until the restart. On 2026-09-23 that was the d5f0e92f… side of the 227313
+// split: 109.199.124.187 and 194.93.48.158 served its headers AND bodies to
+// 227420 by 22:50Z. btxscan and the signer mirror followed the heavier tower
+// from b28c3e84…, which jpp reported fails ExactReplay on CPU and GPU (the
+// case upstream's draft 0.34.10 notes call a false header; not replayed here).
+// So "heavier" is not "right": do not move this list toward whichever branch
+// has more headers. After the restart the node hears both; its own validation,
+// or on a mirror its pinned signers, decides, and since #131
+// `crate::known_invalid` refuses b28c3e84… on every node regardless.
+//
+// If every curated source is down the headers never move, and
+// [`header_bootstrap_verdict`] gives up after [`HEADER_BOOTSTRAP_STALL`] and
+// restarts the node the ordinary way, which is slower than this but no worse
+// than before it existed.
 
 /// Sticky per-datadir record that the next launch is a header-bootstrap launch.
 ///
