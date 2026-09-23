@@ -236,6 +236,14 @@ jobs:
           # find_path skips entirely when its cache variable is already set, so
           # passing it is the whole fix. Verified against the guard at
           # src/CMakeLists.txt:1004, which only tests that both are non-empty.
+          #
+          # ⚠ WITH_MODELNET=OFF, deliberately, on all three platforms. 0.34.7
+          # made the Native Model Network default ON (CMakeLists.txt:172). ON
+          # needs a static OpenSSL 3.5 that the depends toolchain here does not
+          # provide, and ships a btxd that spawns btx-modeld by default. The app
+          # runs a monetary node and never uses the model plane. OFF compiles
+          # every `#ifdef ENABLE_MODELNET` block out, including the `-modelnet`
+          # option itself, so nothing may pass -modelnet=0 to this btxd.
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_TOOLCHAIN_FILE=depends/arm64-apple-darwin/toolchain.cmake \
             -DCMAKE_PROJECT_INCLUDE="$SHIMS/zmq-depends.cmake" \
@@ -245,6 +253,7 @@ jobs:
             -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_TESTS=OFF \
             -DBUILD_FUZZ_BINARY=OFF \
             -DENABLE_WALLET=ON -DWITH_SQLITE=ON -DWITH_ZMQ=ON \
+            -DWITH_MODELNET=OFF \
             -DBTX_ENABLE_METAL=ON -DBTX_MATMUL_METAL_PRECOMPILE_KERNELS=OFF
           ninja -C build
 

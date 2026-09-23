@@ -14,8 +14,11 @@
 #     -DBUILD_DAEMON=ON -DBUILD_CLI=ON \
 #     -DBUILD_UTIL=OFF -DBUILD_TX=OFF -DBUILD_WALLET_TOOL=OFF \
 #     -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_TESTS=OFF -DBUILD_FUZZ_BINARY=OFF \
-#     -DENABLE_WALLET=ON -DWITH_SQLITE=ON
+#     -DENABLE_WALLET=ON -DWITH_SQLITE=ON -DWITH_MODELNET=OFF
 #   cmake --build build -j"$(nproc)"
+#
+# ⚠ -DWITH_MODELNET=OFF from 0.34.7 on: upstream defaults the model network ON,
+#   and ON refuses to configure below OpenSSL 3.5, which 22.04 does not have.
 #
 # ⚠ Boost headers are needed even with BUILD_TESTS=OFF; pass
 #   -DBoost_INCLUDE_DIR=<prefix>/usr/include if they are not on a system path.
