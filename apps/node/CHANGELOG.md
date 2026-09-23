@@ -48,47 +48,65 @@ the same size and SHA-256 as in 0.6.28.
 
 ## [0.6.28] - 2026-09-23
 
-**The engine moves to upstream's v0.34.9, because 0.34.6 cannot leave the
-losing side of the 23 September split.** At 00:13 UTC on 23 September the
-network split at height 227,313. By 13:07 UTC one branch was 355 blocks long
-and carried the signers, the mirrors and btxscan.io; the other had stopped at
-227,355, and every consensus node on 0.34.5 or 0.34.6 that the census reached
-was on it, along with two mining pools. What 0.34.6 does wrong, read in its
-source: when a node that checks blocks on its graphics chip computes a
-different digest from the one a block's header claims, it files the block as
-unconfirmed and leaves it to be retried by a second qualified device, which a
-machine with one graphics chip does not have, so nothing ever settles it. 0.34.9
-(upstream `2bfc9716`) recomputes such a block on the processor with the same
-algorithm and rules it valid or invalid. That is the mechanism, not a proof
-that every stuck node recovers: the same census counted two 0.34.9 consensus
-nodes at the heavier branch's tip, three standing at 227,312 and one on the
-stopped branch.
+**Corrected on 24 September: the longer branch is the invalid one.** The first
+version of this entry called the other side of the 23 September split "the
+losing side" and said an upgraded node would cross to the heavier branch. BTX's
+developers said the opposite that night. The valid chain is the one whose block
+227,313 is `d5f0e92f…`. The longer branch starts from `b28c3e84…` at 227,313,
+and btxscan.io, luckypool.io and the signed-confirmation mirrors the census
+reached were all on it. By their account it fails ExactReplay on both the
+processor and the graphics chip, and upstream's next release, 0.34.10, will
+refuse it (upstream PR #203, still open on the 23rd). The census agreed in the
+one way it can: that evening every reachable node on 0.34.9 that checks blocks
+itself was on the `d5f0e92f…` chain, and none was on the longer one. Two nodes
+calling themselves 0.34.10, a version upstream has not released, were on the
+longer branch. We checked the two hashes on a node of our own that night: the
+header chain served by `109.199.124.187` and `194.93.48.158` carries
+`d5f0e92f…` at 227,313, on top of the block both branches share at 227,312
+(`8c36f9a6…`), where btxscan.io carried `b28c3e84…`. That it fails ExactReplay
+is BTX's developers' finding, not ours. An upgraded node that checks blocks
+should stay where it is, and does.
 
-Nor does an upgraded node jump across. It switches only after it has checked
-every block of the heavier branch since 227,313: a node that parks deep reorgs
-unparks only once that whole stretch is verified, and this app's nodes, which
-do not park, still cannot connect a block they have not checked. How long that
-takes depends entirely on the machine, because every block costs one full
-MatMul replay. A Linux box with an NVIDIA card was measured at 3.8 blocks a
-minute on 0.34.6; against a heavier branch growing by about one a minute, such
-a node upgraded on the 23rd needs roughly three hours, and every day the
-update waits adds about eight. An M2 Pro is a different story: its own startup
-check timed one replay at 80 to 125 seconds on 0.34.6 and on 0.34.9 alike, and
-in the app it connected 0.45 blocks a minute. That is less than the chain
-produces, so a Mac of that class that checks blocks falls behind on either
-engine and cannot close the gap to the heavier branch by checking. This update
+**Until confirmations are real again, do not send or accept BTX.** Anything
+before block 227,313 is on both branches and is safe. A payment confirmed on
+the longer branch only is on a chain the network's validating nodes reject.
+
+**The engine moves to upstream's v0.34.9, which decides a disputed block
+instead of leaving it undecided.** At 00:13 UTC on 23 September the network
+split at height 227,313. What 0.34.6 does wrong, read in its source: when a
+node that checks blocks on its graphics chip computes a different digest from
+the one a block's header claims, it files the block as unconfirmed and leaves
+it to be retried by a second qualified device, which a machine with one
+graphics chip does not have, so nothing ever settles it. 0.34.9 (upstream
+`2bfc9716`) recomputes such a block on the processor with the same algorithm
+and rules it valid or invalid, which is how its nodes rule the longer branch
+out.
+
+**What holds the valid chain back is not the engine.** Late on the 23rd every
+reachable node on the valid chain stood at 227,374. Headers for it ran past
+227,440, but the blocks behind them had been mined on rented machines with no
+inbound port, so no public node had them, and no node accepts a block it cannot
+download. Until those blocks reach a public node, the valid chain stands still,
+whatever engine a node runs.
+
+**How fast a machine checks blocks still decides how soon it reaches the tip.**
+Every block costs one full MatMul replay. A Linux box with an NVIDIA card was
+measured at 3.8 blocks a minute on 0.34.6. An M2 Pro's own startup check timed
+one replay at 80 to 125 seconds on 0.34.6 and on 0.34.9 alike, and in the app
+it connected 0.45 blocks a minute. That is less than the chain produces, so a
+Mac of that class that checks blocks falls behind on either engine. This update
 does not change that; which Macs are fast enough is measured nowhere yet.
-Two hours after the tag the census still showed consensus nodes on 0.34.9, and
-one on an unreleased 0.34.10, where they had been: two at 227,312 and two on
-the stopped branch, one of them upgraded that afternoon. One 0.34.9 node that
-had sat at 227,312 had moved to the heavier branch by switching to follow the
-signers instead, and luckypool.io had moved too.
 
-The peers this app dials first are on the stopped branch as well. On the
-afternoon of the 23rd, `89.85.40.184` and `109.199.124.187` both answered at
-227,355, and a node on a branch hands out that branch's headers. So an upgraded
-node has to hear about the heavier branch from its other peers, which usually
-happens and is not guaranteed.
+**A node that follows signatures follows whichever chain its signers sign.** An
+M5 and a PC without an NVIDIA driver do not check blocks; they trust the three
+signing keys pinned in this app. The mirrors the census reached on the 23rd
+were on the longer branch. The signer BTX's developers name as on the valid
+chain all along, `02d5efca…`, is not one of the three keys this app pins. Until
+that changes, treat a mirror's confirmations after 227,313 as unproven.
+
+The peer BTX's developers point nodes at for the valid chain, `89.85.40.184`,
+is the first one this app dials. On the afternoon of the 23rd it and
+`109.199.124.187` both answered on the valid chain, at 227,355.
 
 **0.34.9 refuses to start a node that signs, so this release pins the node's
 own key.** Since 0.6.26 every node that checks blocks also signs them, with a
@@ -112,7 +130,8 @@ key and reported the same signer state as 0.34.6, started no model helper and
 opened no model port. It then loaded the 203,000 snapshot itself, checked
 blocks above it on the Metal GPU and signed each one with its own key. What
 it cannot show is the chain it ends up on. It learned both branches' headers
-and ranks the heavier one first, but at 0.45 blocks a minute this Mac would
+and ranks the heavier one first, which is the invalid one (see the correction
+at the top of this entry), but at 0.45 blocks a minute this Mac would
 need about five weeks to reach 227,313 from 203,000, the base the tested build
 started from. New nodes now start from 219,000 instead, about 8,300 blocks
 below the split, which on the same Mac is about two weeks; the fast start
