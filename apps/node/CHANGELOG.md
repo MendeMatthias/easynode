@@ -118,13 +118,26 @@ trusted mirror. The Linux engine no longer carries native code for NVIDIA's
 data-centre `sm_100` cards, because upstream made that build path opt-in;
 `sm_75`, `sm_86`, `sm_89` and `sm_120` are all there.
 
+On native Windows the first of those cases is every PC with an NVIDIA driver,
+whatever its card. The Windows engine carries no GPU code at all: the
+cross-compiler finds no CUDA compiler, and `btxd.exe` imports no CUDA library.
+The app still sends a PC that has `nvcuda.dll` down the consensus path, which
+that engine cannot take, so going by the build and the app's code such a node
+starts degraded and stalls. This was read from the binary and the code, not
+run on a Windows PC, and it is not new in this release. On such a PC, run the
+Linux build under WSL2, whose engine has the kernels, or set
+`EASYBTX_NODE_TRUSTED_MIRROR=1` to make the native app a mirror.
+
 **Every install moves.** The install key is plain `v0.34.9`, replacing
 `v0.34.6-3013c2c2`, so every existing install re-provisions onto the new engine
-at its first start after the update. CI built the tag commit from a pristine
-tree on all three platforms with `BUILD_GIT_DIRTY 0`: macOS (upstream's release
-gate passes, Metal linked, regtest smoke), Linux (regtest smoke, kernels
-present) and Windows (the mingw cross-compile with its three source patches,
-and a regtest smoke on a real Windows runner). Upstream published 0.34.9's
+at its first start after the update. CI built the tag commit on all three
+platforms. macOS and Linux were built from a pristine tree with
+`BUILD_GIT_DIRTY 0`: macOS passes upstream's release gate, links Metal and
+passed a regtest smoke; Linux passed a regtest smoke with its kernels present.
+Windows is the mingw cross-compile, and two of its three patches edit the
+source tree before the build, so it is not built from a pristine tree, and by
+upstream's own rule its build info records it as dirty. It passed a regtest
+smoke on a real Windows runner. Upstream published 0.34.9's
 `SHA256SUMS` unsigned this time. Our engines are built from source, so that
 touches only the contributor staging scripts, which pin the archive bytes.
 
