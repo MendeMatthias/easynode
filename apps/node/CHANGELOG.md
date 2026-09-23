@@ -8,6 +8,8 @@ root).
 
 ## [Unreleased]
 
+## [0.6.28] - 2026-09-23
+
 **The engine moves to upstream's v0.34.9, because 0.34.6 cannot leave the
 losing side of the 23 September split.** At 00:13 UTC on 23 September the
 network split at height 227,313. By 13:07 UTC one branch was 355 blocks long
@@ -27,10 +29,17 @@ stopped branch.
 Nor does an upgraded node jump across. It switches only after it has checked
 every block of the heavier branch since 227,313: a node that parks deep reorgs
 unparks only once that whole stretch is verified, and this app's nodes, which
-do not park, still cannot connect a block they have not checked. A node that
-checks blocks manages about four a minute at best (3.8 measured on 0.34.6), and
-the heavier branch grows by about one a minute, so a node upgraded on the 23rd
-needs roughly three hours, and every day the update waits adds about eight.
+do not park, still cannot connect a block they have not checked. How long that
+takes depends entirely on the machine, because every block costs one full
+MatMul replay. A Linux box with an NVIDIA card was measured at 3.8 blocks a
+minute on 0.34.6; against a heavier branch growing by about one a minute, such
+a node upgraded on the 23rd needs roughly three hours, and every day the
+update waits adds about eight. An M2 Pro is a different story: its own startup
+check timed one replay at 80 to 125 seconds on 0.34.6 and on 0.34.9 alike, and
+in the app it connected 0.45 blocks a minute. That is less than the chain
+produces, so a Mac of that class that checks blocks falls behind on either
+engine and cannot close the gap to the heavier branch by checking. This update
+does not change that; which Macs are fast enough is measured nowhere yet.
 Two hours after the tag the census still showed consensus nodes on 0.34.9, and
 one on an unreleased 0.34.10, where they had been: two at 227,312 and two on
 the stopped branch, one of them upgraded that afternoon. One 0.34.9 node that
@@ -62,12 +71,14 @@ build. The first attempt found the refusal above. With the fix, the app
 installed the new engine over the old one, btxd passed its Metal self-check
 (`m4_class`, strict-device, ready), reported `/BTX:0.34.9/`, kept its signing
 key and reported the same signer state as 0.34.6, started no model helper and
-opened no model port. What an afternoon cannot show is the chain it ends up
-on: the 203,000 snapshot the tested build started new nodes from is about
-24,000 blocks below the split, and a node that checks blocks manages about four
-a minute at best, so reaching 227,313 from it takes about four days. New nodes
-now start from 219,000 instead, about 8,300 blocks below the split; the fast
-start entry below says what that does and does not change.
+opened no model port. It then loaded the 203,000 snapshot itself, checked
+blocks above it on the Metal GPU and signed each one with its own key. What
+it cannot show is the chain it ends up on. It learned both branches' headers
+and ranks the heavier one first, but at 0.45 blocks a minute this Mac would
+need about five weeks to reach 227,313 from 203,000, the base the tested build
+started from. New nodes now start from 219,000 instead, about 8,300 blocks
+below the split, which on the same Mac is about two weeks; the fast start
+entry below says what that does and does not change.
 
 **Built without upstream's model network.** 0.34.7 switched on a "Native Model
 Network" by default: a helper, `btx-modeld`, that btxd starts by itself on port
