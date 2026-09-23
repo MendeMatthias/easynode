@@ -8,6 +8,23 @@ root).
 
 ## [Unreleased]
 
+**A new node gets its block headers from the app's own peers first, and has
+them in about a minute.** Before it keeps a single header from a peer outside
+its trusted list, the v0.34.9 engine re-checks that peer's chain in a pre-check
+that gets slower with every block. Measured on an M2 Pro on 23 September, one
+healthy peer took 32 minutes to hand a new node its headers this way. Every
+other node a new install met ran its own pre-check on the same thread, and the
+network has many nodes stuck on old forks that answer. In five first runs with
+the app's settings, headers reached the fast-start point about a minute after
+they began arriving twice; once it took 18 minutes, and twice they were still
+short of it after 20 and 30 minutes. A new node now connects only to the app's
+four block-serving peers, each trusted for that one start, until its headers
+pass the fast-start point: about a minute in three runs, one of them with the
+first of those peers unreachable. Then it restarts once and connects to the
+whole network as before; on a Mac the restart repeats the startup check, one to
+two minutes. If those peers deliver nothing for five minutes, it gives up on
+them and starts the usual way. Not yet run in a built app.
+
 **A native Windows PC with an NVIDIA card follows the signed chain instead of
 stalling.** The Windows engine is cross-compiled without any GPU code, so it
 cannot check blocks on any card. Since 0.6.23 the app nevertheless started

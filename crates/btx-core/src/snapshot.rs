@@ -84,9 +84,11 @@ pub struct SnapshotSpec {
 /// `1c7c2ffb…`, fresh datadir) returned `base_height` 219000, `tip_hash`
 /// `dc51220b…3fdb87c3` and 142076 coins on 2026-09-23, then activated the
 /// snapshot chainstate. The first attempt that day never got there: dialing
-/// anyone, its header pre-sync kept landing on peers parked below the 186000
-/// minimum-work checkpoint. Connected only to the app's curated peers, with the
-/// app's noban whitelist, the next one had headers at the tip in about a minute.
+/// anyone, its header pre-sync never finished. Connected only to the app's
+/// curated peers, each noban, the next one had headers at the tip in about a
+/// minute. The cause, measured that evening, is v0.34.9's quadratic low-work
+/// pre-sync, which noban skips; `node.rs` HEADER BOOTSTRAP has the numbers, and
+/// a fresh install now starts that way.
 ///
 /// 219000 is 8313 blocks below the 227313 split, on the chain both branches
 /// share.

@@ -449,6 +449,225 @@ pub fn resolve_managed_whitelist_ips() -> Vec<String> {
     ips
 }
 
+// ── HEADER BOOTSTRAP ─────────────────────────────────────────────────────────
+//
+// A datadir's FIRST header sync talks only to [`block_source_peers`], each with
+// a `noban` grant that exists on that one launch's command line, and the node
+// restarts into ordinary dialling once its headers pass the snapshot anchor.
+//
+// WHY. v0.34.9 will not store a header from a chain with less work than its
+// `nMinimumChainWork` (height 186000) until a low-work PRE-sync has checked the
+// peer's chain twice, and on this chain that check is quadratic in height. For
+// every header, `headerssync.cpp` replays MatMul ASERT difficulty over a
+// synthetic index that has no skip pointers, and `pow.cpp` asks it for
+// `GetAncestor(anchor_height)` with the ASERT anchor at 50000, so every header
+// walks back one `pprev` at a time. It runs on btxd's single message-handler
+// thread. Measured 2026-09-23 on an M2 Pro, with a fresh v0.34.9 datadir
+// connected to ONE healthy peer (89.85.40.184) that had no grant: a batch of
+// 2000 headers took 0.5 s near height 70000 and 20 to 26 s near 150000-172000;
+// the pre-sync needed 10 min 57 s to reach 186000, the redownload pass then
+// started again from height 0 with the same profile, and headers passed 219000
+// after 32 minutes.
+//
+// Worse, it is not one pre-sync. Every peer that answers a `getheaders` with
+// low-work headers gets its own, and the engine probes every peer that
+// advertises a higher chain. The network's parked nodes (185109, 189611,
+// 128514, …) answer those probes, so a fresh node that dials them spends its
+// message-handler rounds on their pre-syncs and takes one batch per round from
+// the peer that could have finished in a minute. Measured the same day with
+// the app's own launch on five fresh datadirs: twice the noban peer at the head
+// of the manual list (89.85.40.184) answered first and headers reached the tip
+// about 50 s after the first one arrived. Three times a peer without the grant
+// answered a probe within seconds of it, the curated 109.199.124.187 or a
+// parked outbound peer (189611, 185109, 185042), and more followed: headers
+// passed the anchor after 18 minutes once, and were still short of it after 20
+// and 30 minutes the other two times.
+// Without the app's whitelist it is the "dial anyone" run in
+// docs/node-release-recipe.md: fifteen pre-syncs in 45 minutes, 66076 headers,
+// and ten `low-work headers sync failure`s, each `non-continuous headers`,
+// because rounds took so long that answers stopped joining the pre-sync they
+// belonged to.
+//
+// `noban` is what skips the pre-sync: "If our peer has NoBan privileges, then
+// bypass our anti-DoS logic" (net_processing.cpp, ProcessHeadersMessage) sends
+// a noban peer's headers straight into the block index. `-connect` is what
+// keeps the parked peers out: it turns off addrman dialling, and with it DNS
+// seeding and the fixed seeds, so nobody but the named peers is ever probed.
+// Neither is enough alone: a connected peer without the grant is the 32-minute
+// run above. Together, measured with this launch on three fresh datadirs:
+// headers past the anchor 58 to 71 s after the first one arrived, one of them
+// with 89.85.40.184 unreachable, and not one pre-sync.
+//
+// WHY IT ENDS AT THE ANCHOR, and why a restart ends it. The cost belongs to a
+// node whose best header is low: once the block index holds headers past the
+// minimum-work height, a peer's headers connect high and no pre-sync starts,
+// and one that does starts from a real index entry, whose skip pointers make
+// the walk short. The snapshot anchor (219000) is past that height and is what
+// the app waits for anyway. `-connect` cannot be undone at runtime, and a node
+// left on four curated peers would never learn another branch, so the app
+// restarts it into the ordinary launch. On a Mac that costs one more MatMul
+// canary, 80 to 125 s.
+//
+// Measured after each of those three: the ordinary launch on the same datadir
+// dialled three to eleven outbound peers, most of them parked, and started no
+// pre-sync at all.
+//
+// WHAT IT COSTS. For the minutes it lasts the node trusts the curated set for
+// its view of the chain. Checkpoints up to 219000 bound what that set could
+// feed it below the anchor, the snapshot it loads next is pinned by hash, and
+// the grants vanish with the command line. Above the anchor its view is theirs
+// until the restart: on 2026-09-23 every curated source answered at 227355 to
+// 227379, the lighter side of the 227313 split, and the ordinary launch then
+// follows the most work it can find. If every curated source is down the
+// headers never move, and [`header_bootstrap_verdict`] gives up after
+// [`HEADER_BOOTSTRAP_STALL`] and restarts the node the ordinary way, which is
+// slower than this but no worse than before it existed.
+
+/// Sticky per-datadir record that the next launch is a header-bootstrap launch.
+///
+/// A file rather than a setting because `build_node_command` decides from the
+/// datadir, as it does for [`matmul_consensus_was_refused`], and because it has
+/// to survive a quit in the middle of the bootstrap: the next start picks the
+/// bootstrap back up instead of dialling everyone with no headers.
+fn header_bootstrap_path(datadir: &Path) -> PathBuf {
+    datadir.join(".header-bootstrap")
+}
+
+/// `EASYBTX_NODE_HEADER_BOOTSTRAP=0` turns the bootstrap off: no marker is
+/// written and an existing one is ignored, so the launch is the ordinary one.
+/// Unset, or any other value, leaves it on. The rollback lever, the way
+/// `EASYBTX_NODE_TRUSTED_MIRROR` is one for the mirror split.
+pub fn header_bootstrap_disabled() -> bool {
+    std::env::var("EASYBTX_NODE_HEADER_BOOTSTRAP")
+        .is_ok_and(|raw| header_bootstrap_switch_is_off(&raw))
+}
+
+/// Pure half of [`header_bootstrap_disabled`]: the spellings of "off" that the
+/// other `EASYBTX_NODE_*` switches accept.
+pub fn header_bootstrap_switch_is_off(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    )
+}
+
+/// Is the next launch of this datadir a header-bootstrap launch?
+pub fn header_bootstrap_pending(datadir: &Path) -> bool {
+    !header_bootstrap_disabled() && header_bootstrap_path(datadir).exists()
+}
+
+/// Should a start that is about to launch btxd on this datadir begin a
+/// bootstrap? Only for a datadir that has never held a block: the same "no
+/// `blocks/` yet" test first-run setup uses for a fresh install. An existing
+/// datadir already has its headers, or is past the point where they are
+/// expensive; one that stopped half-way through a bootstrap still carries the
+/// marker, which is what resumes it.
+pub fn header_bootstrap_wanted(datadir: &Path) -> bool {
+    !header_bootstrap_disabled() && !datadir.join("blocks").exists()
+}
+
+/// Mark the datadir so launches bootstrap until [`end_header_bootstrap`].
+/// Best-effort: a datadir that cannot take the marker launches the ordinary
+/// way, which is what it did before the bootstrap existed.
+pub fn begin_header_bootstrap(datadir: &Path) {
+    let path = header_bootstrap_path(datadir);
+    if let Err(e) = std::fs::write(
+        &path,
+        "This node has not synced its block headers yet. Until it has, easyBTX\n\
+         starts btxd connected only to its curated block sources, so that no\n\
+         parked peer can hold up the header sync. It restarts btxd the ordinary\n\
+         way once the headers pass the snapshot anchor, and deletes this file.\n",
+    ) {
+        eprintln!("[node] could not write {}: {e}", path.display());
+    }
+}
+
+/// Clear the marker, so the next launch dials the ordinary way.
+pub fn end_header_bootstrap(datadir: &Path) {
+    let path = header_bootstrap_path(datadir);
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            eprintln!("[node] could not clear {}: {e}", path.display());
+        }
+    }
+}
+
+/// How long a bootstrap launch may go without its header count moving before
+/// the app gives up on the curated sources and restarts the ordinary way.
+///
+/// The bootstrap it exists for moves every few seconds: headers climb from 0 to
+/// the anchor in under a minute once one curated source answers, and a slow
+/// link still shows movement batch by batch. Five minutes of none means no
+/// curated source is serving, or none has headers past where the count is
+/// stuck, and dialling everyone is then the better bet.
+pub const HEADER_BOOTSTRAP_STALL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// What a bootstrap launch should do after one look at its header count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderBootstrapVerdict {
+    /// Headers are below the anchor and still moving: keep going.
+    Continue,
+    /// Headers reached the anchor: restart into the ordinary launch.
+    Reached,
+    /// No movement for [`HEADER_BOOTSTRAP_STALL`]: give up on the curated
+    /// sources and restart into the ordinary launch.
+    Stalled,
+}
+
+/// Pure decision for one refresher tick. `since_progress` is how long the
+/// header count has read the same, measured by the caller from the last
+/// CHANGE ([`crate::snapshot::track_header_progress`] semantics).
+pub fn header_bootstrap_verdict(
+    headers: u64,
+    anchor_height: u64,
+    since_progress: std::time::Duration,
+) -> HeaderBootstrapVerdict {
+    if crate::snapshot::snapshot_anchor_reached(headers, anchor_height) {
+        HeaderBootstrapVerdict::Reached
+    } else if since_progress >= HEADER_BOOTSTRAP_STALL {
+        HeaderBootstrapVerdict::Stalled
+    } else {
+        HeaderBootstrapVerdict::Continue
+    }
+}
+
+/// The command-line overlay of a bootstrap launch: `-connect` to every block
+/// source, a `noban` grant for each of their addresses, no DNS seeding and no
+/// listening. Everything else about the launch is the ordinary one.
+///
+/// * `-connect` turns off addrman dialling (btxd `init.cpp`: "Do not initiate
+///   other outgoing connections when connecting to trusted nodes"). The manual
+///   `-addnode` set is still dialled, so the discovery relays still answer,
+///   and they hand out no headers: the three measured today returned empty
+///   `headers` messages.
+/// * `-whitelist=in,out,noban@<ip>` for every block source, `in,out` for the
+///   reason [`BTX_ARCHIVE_WHITELIST_IPS`] gives: a `-connect` connection is
+///   OUTGOING. This is where the bootstrap's grant lives, and only here: the
+///   managed conf block keeps its own meaning, and the next launch, having no
+///   overlay, has no grant.
+/// * `-dnsseed=0` is what `-connect` already implies. Stated anyway, because a
+///   soft default loses to any `dnsseed=` in the datadir's `btx_rw.conf`.
+/// * `-listen=0` keeps unknown inbound peers out for the same minutes. The
+///   conf says `listen=1` explicitly, which beats the `-connect` default, so
+///   only the command line can say it.
+///
+/// Every block source is a literal IP, and
+/// `every_block_source_is_a_literal_ip` holds it there, so the grant needs no
+/// DNS and this stays pure.
+pub fn header_bootstrap_args() -> Vec<String> {
+    let sources = block_source_peers();
+    let mut args: Vec<String> = sources.iter().map(|p| format!("-connect={p}")).collect();
+    for peer in &sources {
+        let host = peer.rsplit_once(':').map(|(h, _)| h).unwrap_or(peer);
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            args.push(format!("-whitelist=in,out,noban@{host}"));
+        }
+    }
+    args.push("-dnsseed=0".to_string());
+    args.push("-listen=0".to_string());
+    args
+}
+
 /// Build the (program, args, envs) tuple for launching btxd with the chosen
 /// GPU backend and the faststart-generated config. Pure + unit-testable.
 ///
@@ -535,6 +754,12 @@ pub fn build_node_command(
     // against a foreign conf still dials them.
     for peer in manual_peers() {
         args.push(format!("-addnode={peer}"));
+    }
+    // A datadir's first header sync: only the block sources, each noban on
+    // this command line alone, until the app restarts it past the snapshot
+    // anchor. See HEADER BOOTSTRAP above for the measurements.
+    if header_bootstrap_pending(datadir) {
+        args.extend(header_bootstrap_args());
     }
     // BIP324 v2 transport, explicitly ON. Confirmed upstream 2026-08-31: every
     // archive peer on the network now prefers v2, and a v1 dial to one opens
@@ -4679,6 +4904,169 @@ consensus-validator service.";
         }
         let unique: std::collections::HashSet<_> = sources.iter().collect();
         assert_eq!(unique.len(), sources.len(), "duplicate dial in {sources:?}");
+    }
+
+    // ── Header bootstrap ─────────────────────────────────────────────────────
+
+    /// A fresh datadir's launch talks to the block sources alone, each with a
+    /// noban grant on the command line, and the same launch without the
+    /// marker is the ordinary one, byte for byte.
+    ///
+    /// Measured 2026-09-23 on five fresh v0.34.9 datadirs: with one noban block
+    /// source and everyone else dialled, headers reached the tip in about 50 s
+    /// twice, and three times took 18 minutes or more, because peers without
+    /// the grant (a curated one among them) had each started a quadratic
+    /// low-work pre-sync on the message-handler thread. The overlay removes
+    /// both halves of that: nobody but the block sources is dialled, and every
+    /// one of them is noban, so none of their headers goes through it either.
+    #[test]
+    fn a_fresh_datadir_launches_on_the_block_sources_alone_until_the_marker_clears() {
+        let dir = std::env::temp_dir().join(format!(
+            "easybtx-hbootstrap-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp datadir");
+        let launch = |dir: &Path| {
+            build_node_command(
+                Path::new("/x/.local/btx/v0.34.9/macos-arm64/bin/btxd"),
+                dir,
+                &dir.join("btx.conf"),
+                Backend::Metal,
+            )
+            .1
+        };
+
+        // No marker: the ordinary launch, with none of the overlay in it.
+        assert!(
+            header_bootstrap_wanted(&dir),
+            "no blocks/ yet is a fresh datadir"
+        );
+        assert!(!header_bootstrap_pending(&dir));
+        let ordinary = launch(&dir);
+        for flag in ["-connect=", "-whitelist=", "-dnsseed=", "-listen="] {
+            assert!(
+                !ordinary.iter().any(|a| a.starts_with(flag)),
+                "{flag} on an ordinary launch: {ordinary:?}"
+            );
+        }
+
+        begin_header_bootstrap(&dir);
+        assert!(header_bootstrap_pending(&dir));
+        let bootstrap = launch(&dir);
+
+        // -connect to every block source, in the list's order, and nothing else.
+        let connects: Vec<&str> = bootstrap
+            .iter()
+            .filter_map(|a| a.strip_prefix("-connect="))
+            .collect();
+        assert_eq!(connects, block_source_peers(), "{bootstrap:?}");
+        // A noban grant for every one of them: a -connect peer WITHOUT one
+        // sends its headers through the pre-sync this exists to avoid.
+        for peer in block_source_peers() {
+            let ip = peer.rsplit_once(':').map(|(h, _)| h).unwrap_or(peer);
+            assert!(
+                bootstrap
+                    .iter()
+                    .any(|a| a == &format!("-whitelist=in,out,noban@{ip}")),
+                "{peer} is dialled without a noban grant: {bootstrap:?}"
+            );
+        }
+        // ...and for nothing else. The discovery relays serve no headers and
+        // the grant is a security grant; it goes where it is needed.
+        let grants = bootstrap
+            .iter()
+            .filter(|a| a.starts_with("-whitelist="))
+            .count();
+        assert_eq!(grants, block_source_peers().len(), "{bootstrap:?}");
+        assert!(bootstrap.iter().any(|a| a == "-dnsseed=0"));
+        assert!(bootstrap.iter().any(|a| a == "-listen=0"));
+
+        // The overlay only adds: everything the ordinary launch says, the
+        // bootstrap launch says too, in the same order.
+        let overlay = header_bootstrap_args();
+        let without_overlay: Vec<&String> =
+            bootstrap.iter().filter(|a| !overlay.contains(*a)).collect();
+        assert_eq!(without_overlay, ordinary.iter().collect::<Vec<_>>());
+
+        // Cleared, the next launch is the ordinary one again, and the grants
+        // went with the command line they were on.
+        end_header_bootstrap(&dir);
+        assert!(!header_bootstrap_pending(&dir));
+        assert_eq!(launch(&dir), ordinary);
+        end_header_bootstrap(&dir); // idempotent
+
+        // A datadir that holds blocks is not fresh and never starts one.
+        std::fs::create_dir_all(dir.join("blocks")).expect("blocks dir");
+        assert!(!header_bootstrap_wanted(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The noban grant is written from the peer strings with no DNS, which is
+    /// what keeps `build_node_command` pure. A hostname block source would be
+    /// dialled by `-connect` WITHOUT a grant, and its headers would go through
+    /// the pre-sync. If one is ever added, resolve it the way
+    /// `resolve_managed_whitelist_ips` does before changing this test.
+    #[test]
+    fn every_block_source_is_a_literal_ip() {
+        for peer in block_source_peers() {
+            let host = peer.rsplit_once(':').map(|(h, _)| h).unwrap_or(peer);
+            assert!(
+                host.parse::<std::net::IpAddr>().is_ok(),
+                "{peer} is not a literal IP, so the bootstrap cannot grant it noban"
+            );
+        }
+    }
+
+    /// Movement keeps a bootstrap going, the anchor ends it, and five minutes
+    /// with no movement gives it up. Reaching the anchor wins over a stall: a
+    /// node whose headers passed the anchor is done, however long ago.
+    #[test]
+    fn the_header_bootstrap_ends_at_the_anchor_or_after_a_stall() {
+        use std::time::Duration;
+        let anchor = 219_000;
+        let just_under = HEADER_BOOTSTRAP_STALL - Duration::from_secs(1);
+        assert_eq!(
+            header_bootstrap_verdict(0, anchor, Duration::ZERO),
+            HeaderBootstrapVerdict::Continue
+        );
+        assert_eq!(
+            header_bootstrap_verdict(120_000, anchor, just_under),
+            HeaderBootstrapVerdict::Continue
+        );
+        assert_eq!(
+            header_bootstrap_verdict(0, anchor, HEADER_BOOTSTRAP_STALL),
+            HeaderBootstrapVerdict::Stalled
+        );
+        assert_eq!(
+            header_bootstrap_verdict(anchor - 1, anchor, HEADER_BOOTSTRAP_STALL),
+            HeaderBootstrapVerdict::Stalled
+        );
+        assert_eq!(
+            header_bootstrap_verdict(anchor, anchor, Duration::ZERO),
+            HeaderBootstrapVerdict::Reached
+        );
+        assert_eq!(
+            header_bootstrap_verdict(228_106, anchor, HEADER_BOOTSTRAP_STALL * 3),
+            HeaderBootstrapVerdict::Reached
+        );
+        // The stall window must outlast a working bootstrap by a wide margin:
+        // measured, headers go from 0 to the anchor in under a minute.
+        assert!(HEADER_BOOTSTRAP_STALL >= Duration::from_secs(120));
+    }
+
+    /// `EASYBTX_NODE_HEADER_BOOTSTRAP` turns the bootstrap off only on a
+    /// spelling of "off"; a typo leaves the fix on.
+    #[test]
+    fn the_header_bootstrap_switch_is_off_only_when_it_says_so() {
+        for off in ["0", "false", "OFF", " no ", "False"] {
+            assert!(header_bootstrap_switch_is_off(off), "{off:?}");
+        }
+        for on in ["1", "", "yes", "on", "true", "o"] {
+            assert!(!header_bootstrap_switch_is_off(on), "{on:?}");
+        }
     }
 
     /// `manual_peers` is where the cap and the dedupe live, so it is asserted

@@ -1000,6 +1000,19 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
         }
     }
 
+    // A datadir that has never held a block gets its first headers from the
+    // curated block sources alone (btx_core::node, HEADER BOOTSTRAP), and the
+    // refresher restarts it into the ordinary launch past the snapshot anchor.
+    // Marked here, before the launch plan, because the spawn below reads the
+    // marker; a start that stops half-way leaves it for the next one.
+    if btx_core::node::header_bootstrap_wanted(&datadir) {
+        btx_core::node::begin_header_bootstrap(&datadir);
+        setup_log(
+            &datadir,
+            "fresh datadir: the first header sync uses the curated block sources only",
+        );
+    }
+
     // Record the stop paths BEFORE anything can fail: if the RPC wait times
     // out below, quit must still be able to stop btxd gracefully (btx-cli
     // stop + the 90 s flush grace) instead of dropping into a SIGKILL.
@@ -1206,18 +1219,33 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
         }
     }
 
-    btx_core::snapshot::ensure_snapshot_loaded(
-        rpc.clone(),
-        paths.btx_cli.clone(),
-        datadir.clone(),
-        spec.anchor_height,
-        Arc::new(NodeAppSnapshotFlags {
-            datadir: datadir.clone(),
-        }),
+    let bootstrap_launch = ends_header_bootstrap(
+        btx_core::node::header_bootstrap_pending(&datadir),
+        *state.attached_to.lock().await,
     );
 
+    // Not during a header bootstrap. The load needs the headers the bootstrap
+    // is fetching and would run at the moment the refresher restarts the
+    // node, so it waits for the ordinary launch, which finds the headers
+    // already past the anchor and loads at once.
+    if bootstrap_launch {
+        eprintln!(
+            "[snapshot] header bootstrap launch: the snapshot loads after the restart that ends it"
+        );
+    } else {
+        btx_core::snapshot::ensure_snapshot_loaded(
+            rpc.clone(),
+            paths.btx_cli.clone(),
+            datadir.clone(),
+            spec.anchor_height,
+            Arc::new(NodeAppSnapshotFlags {
+                datadir: datadir.clone(),
+            }),
+        );
+    }
+
     set_phase(app, state, NodePhase::LoadingSnapshot).await;
-    spawn_status_refresher(app.clone(), state);
+    spawn_status_refresher(app.clone(), state, bootstrap_launch);
     // Esplora mode, if chosen: electrs and the front start beside the node.
     // Re-gated against the LIVE node, and any refusal is recorded for the
     // Settings row rather than logged away.
@@ -1469,7 +1497,11 @@ fn spawn_warmup_watcher(app: AppHandle, state: &AppState, datadir: PathBuf) {
 /// report) and it arms the stall watchdog ITSELF — it must never depend on
 /// the UI polling `get_node_status` for any of its inputs, because with the
 /// window hidden nothing polls.
-fn spawn_status_refresher(app: AppHandle, state: &AppState) {
+///
+/// `bootstrap_launch` arms the one restart it ever makes on its own: the end
+/// of a header bootstrap (btx_core::node, HEADER BOOTSTRAP), at the snapshot
+/// anchor or after a stall. See [`end_header_bootstrap_with_restart`].
+fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bool) {
     let gen = state.refresher_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let gen_counter = state.refresher_gen.clone();
     let rpc_slot = state.rpc.clone();
@@ -1529,6 +1561,10 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
         let mut fork_tips: Vec<btx_core::fork::ChainTip> = Vec::new();
         // Refreshed with the tips, on the same tick, from the node's own log.
         let mut at_served_body_tip = false;
+        // Header bootstrap: the last header count seen and when it last
+        // CHANGED, which is what the stall rule measures.
+        let mut bootstrap_headers: Option<u64> = None;
+        let mut bootstrap_moved_at = std::time::Instant::now();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             if gen_counter.load(Ordering::SeqCst) != gen {
@@ -1540,6 +1576,38 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
             match get_blockchain_info(&rpc).await {
                 Ok(chain) => {
                     consecutive_failures = 0;
+                    if bootstrap_launch {
+                        if bootstrap_headers != Some(chain.headers) {
+                            bootstrap_headers = Some(chain.headers);
+                            bootstrap_moved_at = std::time::Instant::now();
+                        }
+                        let verdict = btx_core::node::header_bootstrap_verdict(
+                            chain.headers,
+                            anchor,
+                            bootstrap_moved_at.elapsed(),
+                        );
+                        if verdict != btx_core::node::HeaderBootstrapVerdict::Continue {
+                            let msg = header_bootstrap_end_message(verdict, chain.headers, anchor);
+                            eprintln!("[node-app] {msg}");
+                            setup_log(&node_datadir(), &msg);
+                            let restart_app = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let state = restart_app.state::<AppState>();
+                                if let Err(e) =
+                                    end_header_bootstrap_with_restart(&restart_app, &state).await
+                                {
+                                    eprintln!(
+                                        "[node-app] the restart that ends the header bootstrap \
+                                         failed: {e}"
+                                    );
+                                }
+                            });
+                            // The restart's stop supersedes this refresher;
+                            // returning now keeps it from projecting a phase
+                            // over the restart's own.
+                            return;
+                        }
+                    }
                     // The one chain signal here that does not come from our
                     // peers. Recorded on every successful poll, judged at
                     // render time against the clock then.
@@ -2229,6 +2297,18 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState) {
 /// delete under".
 fn attached_node_is_ours_to_stop(attached: Option<AttachedTo>) -> bool {
     !matches!(attached, Some(AttachedTo::AnotherApp))
+}
+
+/// Should this start end a header bootstrap (btx_core::node, HEADER BOOTSTRAP)
+/// on the node it now serves, by restarting it past the snapshot anchor?
+///
+/// Only while the marker says one is under way, and only on a node this app
+/// may restart: one it launched (which read the marker), or an orphan of its
+/// own (a self-update relaunch in the middle of a bootstrap attaches to one,
+/// and nothing else would ever end it). Never on another live app's node; the
+/// marker then waits for this app's next launch.
+fn ends_header_bootstrap(marker_pending: bool, attached: Option<AttachedTo>) -> bool {
+    marker_pending && attached_node_is_ours_to_stop(attached)
 }
 
 /// Graceful stop shared by the command, the tray, and app exit.
@@ -3247,6 +3327,55 @@ pub async fn restart_node_projected(
     stop_node_inner(state).await;
     set_phase(app, state, NodePhase::Stopped).await;
     start_node_projected(app, state).await
+}
+
+/// End a header bootstrap: stop the node, clear the marker, start it again the
+/// ordinary way. [`restart_node_projected`] with the marker cleared in the
+/// middle.
+///
+/// The ORDER is the point. Cleared before the stop, an app that died in
+/// between would leave a node running on `-connect` with nothing left to say
+/// so, and the next launch would attach to it and never end it. Cleared after
+/// the stop, the worst an interruption can do is one more bootstrap launch,
+/// which finds its headers past the anchor on the refresher's first tick and
+/// restarts again.
+///
+/// A node the user stopped between the refresher's decision and this task is
+/// left stopped, and a quitting app starts nothing: the marker then stays for
+/// the next start, which picks the bootstrap back up.
+async fn end_header_bootstrap_with_restart(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+) -> Result<(), String> {
+    if state.rpc.lock().await.is_none() || state.quitting.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    stop_node_inner(state).await;
+    set_phase(app, state, NodePhase::Stopped).await;
+    btx_core::node::end_header_bootstrap(&node_datadir());
+    start_node_projected(app, state).await
+}
+
+/// What the log says when a header bootstrap ends. Pure, so the two endings
+/// are pinned by a test rather than read off a live node.
+fn header_bootstrap_end_message(
+    verdict: btx_core::node::HeaderBootstrapVerdict,
+    headers: u64,
+    anchor: u64,
+) -> String {
+    use btx_core::node::HeaderBootstrapVerdict as V;
+    match verdict {
+        V::Reached => format!(
+            "header bootstrap done: headers at {headers} passed the snapshot anchor {anchor}; \
+             restarting the node to dial the whole network"
+        ),
+        V::Stalled => format!(
+            "header bootstrap gave up: headers stuck at {headers} for {} min with only the \
+             curated block sources; restarting the node to dial the whole network",
+            btx_core::node::HEADER_BOOTSTRAP_STALL.as_secs() / 60
+        ),
+        V::Continue => format!("header bootstrap continuing at {headers}/{anchor}"),
+    }
 }
 
 #[tauri::command]
@@ -4393,8 +4522,9 @@ pub async fn node_footprint(state: State<'_, AppState>) -> Result<NodeFootprint,
 #[cfg(test)]
 mod tests {
     use super::{
-        attached_node_is_ours_to_stop, pre_launch_plan, snapshot_spec, witness_started_message,
-        AttachedTo, PreLaunchPlan, NODE_RELEASE_COMMIT, NODE_RELEASE_TAG,
+        attached_node_is_ours_to_stop, ends_header_bootstrap, header_bootstrap_end_message,
+        pre_launch_plan, snapshot_spec, witness_started_message, AttachedTo, PreLaunchPlan,
+        NODE_RELEASE_COMMIT, NODE_RELEASE_TAG,
     };
 
     /// Wrapping a Rust string literal across source lines WITHOUT a trailing
@@ -4432,6 +4562,48 @@ mod tests {
         assert!(attached_node_is_ours_to_stop(Some(AttachedTo::Unknown)));
         // Never attached at all: we spawned it, so it is ours.
         assert!(attached_node_is_ours_to_stop(None));
+    }
+
+    /// The header bootstrap ends with a restart, so it is ended only on a node
+    /// this app may restart, and only while the marker says one is under way.
+    #[test]
+    fn a_header_bootstrap_is_ended_only_on_a_node_this_app_may_restart() {
+        // A launch of ours that read the marker.
+        assert!(ends_header_bootstrap(true, None));
+        // Our own orphan after a self-update relaunch mid-bootstrap: nothing
+        // else would ever take it off -connect.
+        assert!(ends_header_bootstrap(true, Some(AttachedTo::OurOrphan)));
+        assert!(ends_header_bootstrap(true, Some(AttachedTo::Unknown)));
+        // The miner's node is never restarted on our account.
+        assert!(!ends_header_bootstrap(true, Some(AttachedTo::AnotherApp)));
+        // No marker, no bootstrap, whoever the node belongs to.
+        for attached in [
+            None,
+            Some(AttachedTo::OurOrphan),
+            Some(AttachedTo::Unknown),
+            Some(AttachedTo::AnotherApp),
+        ] {
+            assert!(!ends_header_bootstrap(false, attached), "{attached:?}");
+        }
+    }
+
+    /// The setup log is where a user's report of "it restarted by itself" gets
+    /// answered, so both endings say what happened and what comes next.
+    #[test]
+    fn the_header_bootstrap_says_why_it_restarts_the_node() {
+        use btx_core::node::HeaderBootstrapVerdict as V;
+        let done = header_bootstrap_end_message(V::Reached, 228_106, 219_000);
+        assert!(done.contains("228106") && done.contains("219000"), "{done}");
+        assert!(done.contains("restarting"), "{done}");
+        let gave_up = header_bootstrap_end_message(V::Stalled, 0, 219_000);
+        assert!(
+            gave_up.contains("gave up") && gave_up.contains("5 min"),
+            "{gave_up}"
+        );
+        assert!(gave_up.contains("restarting"), "{gave_up}");
+        for m in [&done, &gave_up] {
+            assert!(!m.contains("  ") && !m.contains('\n'), "{m:?}");
+        }
     }
     use btx_core::node::DatadirHolder;
 
