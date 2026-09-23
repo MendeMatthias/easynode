@@ -22,6 +22,13 @@ role it could never use. The Linux build under WSL2 is unchanged and still
 checks blocks on a capable card, which makes it the route for a Windows
 machine that should validate. Not yet run on a Windows PC.
 
+**The fast start file now comes from easyBTX's own releases.** New nodes
+download the height 219,000 snapshot from a byte-for-byte copy on easyBTX's
+release page instead of from the pre-release where BTX's developers publish it,
+which they can change or remove at any time. A missing file would have stopped
+every first run at the download step. The file is the same one, checked against
+the same size and SHA-256 as in 0.6.28.
+
 ## [0.6.28] - 2026-09-23
 
 **The engine moves to upstream's v0.34.9, because 0.34.6 cannot leave the

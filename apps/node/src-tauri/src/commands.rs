@@ -263,8 +263,9 @@ use crate::state::{
 // Verified at the SHA, 2026-09-23. chainparams.cpp keeps the 203000 assumeutxo
 // entry byte-identical and adds 219000, with no 199299/199300 base. So a node
 // that loaded 203000 keeps working, and snapshot_spec() moves up to 219000 with
-// this engine (v0_34_9_spec; its file is on upstream's `assumeutxo-219000`
-// pre-release, not on a release). The golden manifest and contrib/matmul-v4 are
+// this engine (v0_34_9_spec; upstream publishes its file only on its
+// `assumeutxo-219000` pre-release, and the pin downloads our byte-identical
+// mirror on EasyBTX-releases). The golden manifest and contrib/matmul-v4 are
 // byte-identical to v0.34.6 (rows cuda/sm_120 and metal/m4_class; two-step seal
 // field 8 855f220b, recomputed seal matches field 9). No btxd option was
 // removed, every one this app passes on argv or in the conf is still
@@ -319,8 +320,9 @@ pub const NODE_RELEASE_TAG: &str = "v0.34.9";
 pub const NODE_RELEASE_COMMIT: &str = "84b998b4f3272775aaf8c241ac11dc683f4c4e23";
 
 /// The pinned assumeutxo snapshot this app bootstraps from: height 219000,
-/// [`btx_core::snapshot::v0_34_9_spec`], pinned from the manifest beside the
-/// file on upstream's `assumeutxo-219000` pre-release. It moves WITH
+/// [`btx_core::snapshot::v0_34_9_spec`], pinned from upstream's manifest and
+/// downloaded from our byte-identical mirror on EasyBTX-releases, because
+/// upstream publishes the file only on a pre-release. It moves WITH
 /// NODE_RELEASE_TAG, because the base must be one the pinned engine compiles
 /// in; `the_snapshot_pin_is_the_newest_base_the_pinned_engine_carries` holds the
 /// two together. Upstream has regenerated assets in place before (v0.32.11's),
@@ -4761,8 +4763,8 @@ mod tests {
         let newest_published_base = match version {
             // Both stop at 203000, published as a v0.34.5 and v0.34.6 release asset.
             "v0.34.5" | "v0.34.6" => 203_000,
-            // Adds 219000 beside a byte-identical 203000; its file is published
-            // on the `assumeutxo-219000` pre-release only.
+            // Adds 219000 beside a byte-identical 203000; upstream publishes its
+            // file on the `assumeutxo-219000` pre-release only, and we mirror it.
             "v0.34.9" => 219_000,
             other => panic!(
                 "no record of the assumeutxo bases {other} carries: read `git show \
@@ -4778,10 +4780,27 @@ mod tests {
         );
     }
 
+    /// First-run setup aborts when the snapshot download fails, so the file the
+    /// pin names has to stay where the pin says for as long as a release that
+    /// carries the pin is installed. Upstream published 219000 only on a
+    /// pre-release it can edit or delete without a new tag, so the app
+    /// downloads a byte-identical copy from our own releases repo instead. The
+    /// SHA gate makes the host irrelevant to integrity; this test makes it a
+    /// decision rather than whatever URL upstream's manifest happened to print.
+    #[test]
+    fn the_pinned_snapshot_downloads_from_a_host_we_control() {
+        let url = snapshot_spec().url;
+        assert!(
+            url.starts_with("https://github.com/MendeMatthias/EasyBTX-releases/releases/download/"),
+            "{url} is not on EasyBTX-releases: mirror the file there (same bytes, same \
+             SHA-256) and pin the copy, or change this test on purpose"
+        );
+    }
+
     /// The one fact about the pin no offline test can check is that the file
-    /// is still there. Since the v0.34.9 engine it lives on an upstream
-    /// PRE-release (`assumeutxo-219000`), which can be edited or deleted
-    /// without a new tag, and first-run setup aborts when this download fails.
+    /// is still there, and first-run setup aborts when this download fails.
+    /// The pin names our mirror (the test above says why), which is a
+    /// pre-release like upstream's and can be deleted by hand just as easily.
     /// Kept out of CI on purpose, for the reason ci.yml gives for not staging
     /// the engine there. Run it before cutting a release:
     ///
@@ -4789,7 +4808,8 @@ mod tests {
     /// cargo test --locked the_pinned_snapshot_is_still_published -- --ignored
     /// ```
     ///
-    /// Passed on 2026-09-23 against `assumeutxo-219000` (9151135 bytes).
+    /// Passed on 2026-09-23 against upstream's `assumeutxo-219000` (9151135
+    /// bytes), before the pin moved to the mirror.
     #[tokio::test]
     #[ignore]
     async fn the_pinned_snapshot_is_still_published_byte_for_byte() {

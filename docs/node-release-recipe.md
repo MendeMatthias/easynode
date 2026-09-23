@@ -499,11 +499,17 @@ withdrawn. Since the v0.34.9 engine the pairing is a test,
 version it has no row for fails it until somebody reads that tag's
 `m_assumeutxo_data` and adds one.
 
-**The pinned file sits on an upstream PRE-release** (`assumeutxo-219000`), not on
-a release: the v0.34.9 release ships binaries and SHA256SUMS only. A
-pre-release can be edited or deleted without a new tag, and first-run setup
-aborts when the snapshot download fails. Before cutting a release, from
-`apps/node/src-tauri`:
+**The pin downloads OUR copy of the file.** Upstream publishes 219000 only on a
+PRE-release (`assumeutxo-219000`); the v0.34.9 release ships binaries and
+SHA256SUMS only, and a pre-release can be edited or deleted without a new tag.
+First-run setup aborts when the snapshot download fails, so the file is mirrored
+byte for byte on `MendeMatthias/EasyBTX-releases`, pre-release
+`assumeutxo-219000`, with upstream's sums and manifest beside it, and the pin
+names the mirror (`the_pinned_snapshot_downloads_from_a_host_we_control` holds
+it there). **Keep that pre-release for as long as a release that pins it is
+installed.** A future pin: mirror the file first, check it against the tag's
+`m_assumeutxo_data` with `scripts/check-snapshot-hash.py`, then pin the copy.
+Before cutting a release, from `apps/node/src-tauri`:
 
 ```bash
 cargo test --locked the_pinned_snapshot_is_still_published -- --ignored
