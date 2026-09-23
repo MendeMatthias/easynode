@@ -341,7 +341,8 @@ fn stage_private(
 /// look like a .btxwallet file" and stopped. Now the bytes decide the route:
 ///
 ///   browser bundle JSON  -> `restorewalletbundle`, the PQ seed path
-///   wallet.dat           -> `restorewallet`, sqlite or berkeley, btxd decides
+///   wallet.dat, SQLite   -> `restorewallet`, the descriptor wallet btxd writes
+///   wallet.dat, Berkeley -> advice: a legacy wallet cannot hold BTX
 ///   dumpwallet text      -> advice: the engine no longer imports these
 ///   anything else        -> advice naming every format we DO take
 ///
@@ -380,6 +381,13 @@ pub async fn wallet_import(
     // On v0.34.9, easyNode's engine from 2026-09-23, `importwallet` refuses
     // every file, so on a node that had a wallet the old route could only end
     // in that refusal, shown raw.
+    //
+    // So is a legacy Berkeley DB wallet.dat, from the same day. The macOS and
+    // Linux engines are built without Berkeley DB and refused it raw; the
+    // Windows engine, going by its source, loads it into a wallet that cannot
+    // hold BTX. Answering before the node is asked is also what keeps this
+    // true when the app is attached to an engine it did not provision and
+    // cannot see the build of.
     let kind = detect(&bytes);
     if let Some(advice) = advice_instead_of_import(kind) {
         return Ok(Ask::Unavailable {
@@ -496,7 +504,7 @@ pub async fn wallet_import(
                 Err(e) => (Err(e), false),
             }
         }
-        WalletFileKind::WalletDatSqlite | WalletFileKind::WalletDatBerkeley => {
+        WalletFileKind::WalletDatSqlite => {
             // btxd always rescans on restore, so on a node still backfilling
             // this can fail on the SCAN while the wallet itself is fine. Treat
             // an existing wallet as "already imported" rather than an error, the
@@ -540,7 +548,11 @@ pub async fn wallet_import(
                 Err(e) => (Err(e), false),
             }
         }
-        WalletFileKind::WalletDump | WalletFileKind::Unknown => unreachable!("returned above"),
+        WalletFileKind::WalletDatBerkeley
+        | WalletFileKind::WalletDump
+        | WalletFileKind::Unknown => {
+            unreachable!("returned above")
+        }
     };
 
     // A 60 second transport timeout during a multi-hour rescan is the NORMAL
