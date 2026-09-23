@@ -664,5 +664,4 @@ mod host_backend_tests {
         assert_eq!(pc_host_backend(false, true), Backend::Cpu);
         assert_eq!(pc_host_backend(false, false), Backend::Cpu);
     }
-
 }
