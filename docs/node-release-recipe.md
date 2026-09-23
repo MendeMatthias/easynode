@@ -543,13 +543,28 @@ snapshot chainstate.
 ⚠ **Which peers the node talks to decides whether it gets there at all.** The
 first attempt that day dialed anyone and never reached the base: its header
 pre-sync twice climbed to about 180000 and started over, for an hour and a half,
-while a dozen peers failed with `low-work headers sync failure`. v0.34.9's own
-"initial-sync peer selection" comment in `net_processing.cpp` names the cause:
-the sync slot goes to a peer parked below the 186000 minimum-work checkpoint,
-whose chain ends short. The second attempt connected ONLY to the app's curated
-peers (the `-addnode` list in `node.rs` and the seeds, resolved to addresses),
-each also as `-whitelist=in,out,noban@<ip>` the way the app's conf lists them,
-and had headers at the tip in about a minute:
+while a dozen peers failed with `low-work headers sync failure`. The second
+attempt connected ONLY to the app's curated peers (the `-addnode` list in
+`node.rs` and the seeds, resolved to addresses), each also as
+`-whitelist=in,out,noban@<ip>` the way the app's conf lists them, and had
+headers at the tip in about a minute.
+
+Measured again the same evening, and the cause is not the sync slot, which is
+what this paragraph first said. It is the low-work pre-sync, and `noban` is
+what skips it. v0.34.9 re-checks a low-work header chain before storing any of
+it, and on this chain the check is quadratic in height (MatMul ASERT difficulty
+replayed over a synthetic index with no skip pointers, back to the anchor at
+50000). One healthy peer without the grant took 32 minutes to deliver headers
+to 219000. Every peer that answers a `getheaders` gets its own pre-sync, all on
+one message-handler thread; with parked peers answering too, rounds take
+minutes, answers stop joining the pre-sync they belong to, and the abort reads
+`non-continuous headers ... (presync phase)` followed by `low-work headers sync
+failure`. That is the dozen failures above, reproduced: the app's launch without
+its whitelist had 66076 headers after 45 minutes, fifteen pre-syncs and ten
+such failures, the mirror and 109.199.124.187 among them. So `-connect` alone
+does not help; the grant on every connected peer does. Since the header
+bootstrap (`node.rs`, HEADER BOOTSTRAP) the app does exactly this for a fresh
+datadir, then restarts into the ordinary launch past the anchor. By hand:
 
 ```bash
 btxd -datadir=<scratch> -listen=0 -port=29335 -rpcport=29334 \
