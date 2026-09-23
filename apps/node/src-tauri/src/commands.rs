@@ -245,14 +245,16 @@ use crate::state::{
 // object 5a5bf643, tagged 2026-09-23 06:17Z), 63 commits past 3013c2c2. The
 // network split at 227313 that night, and the census at 13:07Z had every
 // 0.34.5/0.34.6 consensus node it reached on the branch parked at 227355 and
-// the signers and mirrors on the heavier one. The engine fact behind it, read
-// in matmul_v4_rc_gkr.cpp: when a strict-device node's GPU digest disagrees
-// with a header, 0.34.6 (and 0.34.8) record UnconfirmedDigestMismatch, "portable
-// retry disabled in strict mode", and leave the block retryable with nothing
-// that can ever settle it. 0.34.9 (2bfc9716) recomputes it with the portable CPU
-// ExactReplay and rules Valid or InvalidConsensus. That is the mechanism, not a
-// proof that every parked node recovers: the same census had one 0.34.9
-// consensus node on the parked branch and three sitting at 227312.
+// the signers and mirrors on the heavier one. The engine difference that
+// matters, read in matmul_v4_rc_gkr.cpp: when a strict-device node's GPU digest
+// disagrees with a header, 0.34.6 (and 0.34.8) record UnconfirmedDigestMismatch,
+// "portable retry disabled in strict mode", and leave the block retryable with
+// nothing that can ever settle it. 0.34.9 (2bfc9716) recomputes it with the
+// portable CPU ExactReplay and rules Valid or InvalidConsensus. That is a
+// mechanism that can hold a node on the lighter branch, not a proof that it is
+// what holds each one there, or that every parked node recovers: the same
+// census had one 0.34.9 consensus node on the parked branch and three sitting
+// at 227312.
 //
 // Verified at the SHA, 2026-09-23. chainparams.cpp keeps the 203000 assumeutxo
 // entry byte-identical and adds 219000, with no 199299/199300 base, so

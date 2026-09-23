@@ -97,6 +97,7 @@ fi
 # reason: the archive is built WITH_MODELNET=ON, an ON btxd starts btx-modeld on
 # 0.0.0.0:29447 by itself, the release engine is built OFF, and the app calls
 # none of these. Without btx-modeld btxd logs that it is missing and continues.
+# The model plane is still compiled into this btxd; only the helper is gone.
 for helper in btx-modeld btx-modelcheck btx-open btx-capability btx-capabilityd btx-hcpd btx-hosted; do
   rm -f "$DEST/bin/$helper" "$DEST/libexec/$helper.real"
 done

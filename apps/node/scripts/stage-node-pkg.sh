@@ -89,8 +89,10 @@ cp -R "$SRC/libexec" "$DEST/libexec"
 # The release engine is built WITH_MODELNET=OFF and has none of this, and the app
 # calls none of these binaries. With btx-modeld absent, btxd logs "btx-modeld
 # not found next to btxd; monetary node continues" and runs; measured on this
-# archive's btxd, regtest, 2026-09-23. So a contributor build runs the same
-# monetary-only node a release does.
+# archive's btxd, regtest, 2026-09-23. So a contributor build starts no model
+# helper and opens no model port. It is still not the release engine: this
+# btxd has the model plane compiled in (the -modelnet option, the model P2P
+# messages), where the release build has none of it.
 for helper in btx-modeld btx-modelcheck btx-open btx-capability btx-capabilityd btx-hcpd btx-hosted; do
   rm -f "$DEST/bin/$helper" "$DEST/libexec/$helper.real"
 done
