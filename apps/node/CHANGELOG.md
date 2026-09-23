@@ -141,12 +141,14 @@ Upstream publishes this file on a pre-release, `assumeutxo-219000`, not with
 v0.34.9 itself, so we checked it rather than trusting the name: its size and
 SHA-256 match upstream's manifest and sums, and the file names block 219,000 as
 `dc51220b…3fdb87c3`, the block v0.34.9 compiles in and btxscan reports at that
-height. A node that already loaded the 203,000 snapshot keeps it and downloads
-nothing, because v0.34.9 carries that base unchanged. One that downloaded the
-203,000 file but never loaded it fetches the new one on its next start. A node
-that loaded 203,000 and is still below 219,000 reads Syncing after the update
-instead of Live until it passes 219,000. Nothing changed on the node; it had
-thousands of blocks to go either way.
+height. Its contents check out too: recomputed from the file itself, its coins
+hash to the value v0.34.9 compiles in for that height, the check a node makes
+before it accepts the file. A node that already loaded the 203,000 snapshot
+keeps it and downloads nothing, because v0.34.9 carries that base unchanged.
+One that downloaded the 203,000 file but never loaded it fetches the new one on
+its next start. A node that loaded 203,000 and is still below 219,000 reads
+Syncing after the update instead of Live until it passes 219,000. Nothing
+changed on the node; it had thousands of blocks to go either way.
 
 **A node can now serve a snapshot of the chain to new nodes.** Every new
 node still bootstraps from a file compiled into the engine, and the newest
