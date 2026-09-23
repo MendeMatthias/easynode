@@ -319,6 +319,12 @@ fn cuda_driver_library_impl() -> Option<std::path::PathBuf> {
 ///
 /// Says which it chose, and why, on stderr: a wrong classification is a wrong
 /// consensus posture, and the log is where a maintainer looks first.
+///
+/// ⚠ A driver is only half the question: the ENGINE has to carry GPU code too.
+/// On Windows it does not (`BUNDLED_ENGINE_HAS_CUDA`), so from 0.6.23 to this
+/// change every native Windows PC with an NVIDIA driver was classed `Cuda`,
+/// launched in consensus mode its engine could never serve, and stalled.
+/// `pc_host_backend` now asks both halves.
 pub fn node_host_backend() -> Backend {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
@@ -326,21 +332,46 @@ pub fn node_host_backend() -> Backend {
     }
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {
-        match cuda_driver_library() {
-            Some(lib) => {
-                eprintln!(
-                    "[node] host backend: cuda ({} present), consensus mode on a degraded-start engine",
-                    lib.display()
-                );
-                Backend::Cuda
-            }
-            None => {
-                eprintln!(
-                    "[node] host backend: cpu (no NVIDIA driver library found), trusted mirror on a degraded-start engine"
-                );
-                Backend::Cpu
-            }
+        let driver = cuda_driver_library();
+        let backend = pc_host_backend(driver.is_some(), BUNDLED_ENGINE_HAS_CUDA);
+        match (&driver, backend) {
+            (Some(lib), Backend::Cuda) => eprintln!(
+                "[node] host backend: cuda ({} present), consensus mode on a degraded-start engine",
+                lib.display()
+            ),
+            (Some(lib), _) => eprintln!(
+                "[node] host backend: cpu ({} present, but this platform's engine is built \
+                 without GPU code), trusted mirror on a degraded-start engine",
+                lib.display()
+            ),
+            (None, _) => eprintln!(
+                "[node] host backend: cpu (no NVIDIA driver library found), trusted mirror on a degraded-start engine"
+            ),
         }
+        backend
+    }
+}
+
+/// Whether the btxd this app ships on this OS carries any GPU (CUDA) code.
+///
+/// Linux: yes, `btxd-linux.yml` builds with nvcc and proves the kernels are in
+/// the binary (sm_75/86/89/120 at v0.34.9). Windows: no. `btxd-windows.yml`
+/// cross-compiles with mingw, whose configure prints "Looking for a CUDA
+/// compiler - NOTFOUND", and the v0.34.9 `btxd.exe` (run 35867391955) imports
+/// only system DLLs and `libgomp-1.dll`, with no CUDA symbol in it, where the
+/// Linux btxd has 165. A Windows engine that can check blocks is the change
+/// that flips this, not a newer driver.
+pub const BUNDLED_ENGINE_HAS_CUDA: bool = !cfg!(target_os = "windows");
+
+/// Pure half of `node_host_backend` for a PC: `Cuda` only when BOTH the NVIDIA
+/// driver is present AND the engine can use it. Either one missing is a host
+/// no btxd of ours could validate on, which is what `Cpu` means to
+/// `node::launches_as_mirror`.
+pub fn pc_host_backend(driver_present: bool, engine_has_cuda: bool) -> Backend {
+    if driver_present && engine_has_cuda {
+        Backend::Cuda
+    } else {
+        Backend::Cpu
     }
 }
 
@@ -609,14 +640,29 @@ mod host_backend_tests {
         assert_eq!(node_host_backend(), Backend::Metal);
     }
 
-    /// On a PC the answer is whatever the driver check says, and never Metal.
-    /// Impure by nature (it reads this machine), so it asserts consistency
-    /// between the two public functions rather than a fixed value.
+    /// On a PC the answer is whatever the driver check and the engine say, and
+    /// never Metal. Impure by nature (it reads this machine), so it asserts
+    /// consistency between the public functions rather than a fixed value.
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     #[test]
-    fn a_pc_is_never_metal_and_follows_its_driver() {
+    fn a_pc_is_never_metal_and_follows_its_driver_and_engine() {
         let backend = node_host_backend();
         assert_ne!(backend, Backend::Metal);
-        assert_eq!(backend == Backend::Cuda, cuda_driver_library().is_some());
+        assert_eq!(
+            backend == Backend::Cuda,
+            cuda_driver_library().is_some() && BUNDLED_ENGINE_HAS_CUDA
+        );
     }
+
+    /// The whole truth table, run on every platform: a driver alone is not a
+    /// GPU this node can validate on, and neither is an engine alone.
+    #[test]
+    fn a_pc_is_cuda_only_with_both_a_driver_and_an_engine_that_has_gpu_code() {
+        assert_eq!(pc_host_backend(true, true), Backend::Cuda);
+        // Native Windows with an NVIDIA card: the stall this change removes.
+        assert_eq!(pc_host_backend(true, false), Backend::Cpu);
+        assert_eq!(pc_host_backend(false, true), Backend::Cpu);
+        assert_eq!(pc_host_backend(false, false), Backend::Cpu);
+    }
+
 }
