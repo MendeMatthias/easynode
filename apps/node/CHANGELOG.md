@@ -8,6 +8,23 @@ root).
 
 ## [Unreleased]
 
+## [0.6.29] - 2026-09-24
+
+**The app update that keeps every node off the invalid branch of the 23
+September split.** The engine does not change: this is still BTX v0.34.9, the
+same three builds as 0.6.28, so no node re-installs its engine. BTX published
+0.34.10 early on the 24th, and its developers name the coming 0.34.11 as the
+release mirrors and pools should move to, so the engine moves in a later
+update. What this one changes is what the app asks of the node, below.
+
+A node that follows signatures instead of checking blocks, which is an M5, a
+PC without an NVIDIA driver and, from this update, a native Windows PC, trusts
+three signing keys pinned in the app. On the morning of the 24th none of them
+had signed the valid chain since the split, so such a node now stops at
+227,312, the last block both branches share, rather than confirming blocks the
+network's validators reject. It moves on when one of those keys signs the valid
+chain.
+
 **Every node refuses the invalid branch of the 23 September split.** The app now
 asks the node to mark block 227,313 `b28c3e84…` invalid, the one instruction
 BTX's developers gave every node operator that night, as soon as the node has
