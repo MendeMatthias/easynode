@@ -1559,6 +1559,17 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         let mut gap_since: Option<(std::time::Instant, u64)> = None;
         let mut fork_first_seen: Option<std::time::Instant> = None;
         let mut fork_tips: Vec<btx_core::fork::ChainTip> = Vec::new();
+        // Known-invalid blocks (btx_core::known_invalid): refused with
+        // invalidateblock on the fork tick until every entry is refused, then
+        // not again this run. Off the tick, because on a mirror that followed
+        // the refused branch it disconnects every block above it (about 900
+        // for the 2026-09-23 split), which outlasts both the tick and the RPC
+        // client's 60-second timeout; a timed-out attempt is simply retried,
+        // and the retry finds the block already failed and returns at once.
+        let refusal_done = Arc::new(std::sync::atomic::AtomicBool::new(
+            !btx_core::known_invalid::refusal_enabled(),
+        ));
+        let refusal_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Refreshed with the tips, on the same tick, from the node's own log.
         let mut at_served_body_tip = false;
         // Header bootstrap: the last header count seen and when it last
@@ -1889,6 +1900,39 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         }
                         fork_tick = fork_tick.wrapping_add(1);
                         if fork_tick % FORK_CHECK_EVERY == 1 {
+                            if !refusal_done.load(Ordering::SeqCst)
+                                && !refusal_in_flight.swap(true, Ordering::SeqCst)
+                            {
+                                let rpc = rpc.clone();
+                                let done = refusal_done.clone();
+                                let in_flight = refusal_in_flight.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    use btx_core::known_invalid::{refuse_all, Refusal};
+                                    let mut all_refused = true;
+                                    for (block, outcome) in refuse_all(&rpc).await {
+                                        match outcome {
+                                            Refusal::Refused => eprintln!(
+                                                "[node] refused known-invalid block {} at {} \
+                                                 (the valid chain has {} there)",
+                                                block.hash, block.height, block.valid_sibling
+                                            ),
+                                            Refusal::NotKnownYet => all_refused = false,
+                                            Refusal::Failed(e) => {
+                                                all_refused = false;
+                                                eprintln!(
+                                                    "[node] could not refuse known-invalid block {} \
+                                                     at {} yet: {e}",
+                                                    block.hash, block.height
+                                                );
+                                            }
+                                        }
+                                    }
+                                    if all_refused {
+                                        done.store(true, Ordering::SeqCst);
+                                    }
+                                    in_flight.store(false, Ordering::SeqCst);
+                                });
+                            }
                             if let Ok(tips) = btx_core::node_api::get_chain_tips(&rpc).await {
                                 fork_tips = tips;
                             }

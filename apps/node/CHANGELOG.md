@@ -8,6 +8,22 @@ root).
 
 ## [Unreleased]
 
+**Every node refuses the invalid branch of the 23 September split.** The app now
+asks the node to mark block 227,313 `b28c3e84…` invalid, the one instruction
+BTX's developers gave every node operator that night, as soon as the node has
+seen its header. A node that checks blocks on 0.34.9 already rules that branch
+out, but two kinds of node did not. A mirror, which is an M5 or a PC without an
+NVIDIA driver, follows whatever its pinned signers sign, and the mirrors the
+census reached were on that branch. A mirror that is on it rolls back to
+227,312 and stops there until a signer it trusts signs the valid chain, which
+is safer than confirming blocks the network's validators reject. And a node
+that had the branch's headers but not its blocks showed "a longer chain exists
+that this node cannot obtain", pointing at the invalid branch; once the branch
+is marked invalid that warning stops. The mark is kept in the node's own data,
+so it holds across restarts, and `EASYBTX_NODE_REFUSE_KNOWN_INVALID=0` turns it
+off. The list of refused blocks holds this one block and is meant to be
+emptied again once BTX ships an engine that refuses it by itself.
+
 **A new node gets its block headers from the app's own peers first, and has
 them in about a minute.** Before it keeps a single header from a peer outside
 its trusted list, the v0.34.9 engine re-checks that peer's chain in a pre-check
