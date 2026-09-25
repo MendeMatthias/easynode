@@ -205,6 +205,16 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
 /// numair's fleet archives. Update as the census evolves — the nodes directory
 /// on easybtx.com will carry the live archive flag (service bit 31).
 pub const BTX_ARCHIVE_PEERS: &[&str] = &[
+    // 2026-09-24: btxscan.io's mirror on Azure (the node behind api.btxscan.io,
+    // v0.34.9, on the valid side of the 227313 split). FIRST, because after the
+    // split it is the one reachable peer measured holding `02d5efca`'s
+    // signatures, which is the only key signing the valid chain: probed from a
+    // Mac with pull_attest.py it returned them for the tip, for 227,400 and for
+    // 227,313 `d5f0e92f` itself, while 194.93.48.158 and 109.199.124.187
+    // returned none and 37.230.134.222 refused TCP. A mirror that pins the key
+    // but dials nobody who holds its signatures stays at 227,312 all the same.
+    // Signers already dial it (signer::BTX_MIRRORS_FED_BY_SIGNERS), once.
+    "20.86.181.203:19338",
     // 207.56.229.99, 114.150.94.235 and 195.137.245.82 were measured 0/3 on
     // 2026-09-08 and are listed with that measurement in BTX_BOOTSTRAP_PEERS
     // above. An archive that does not answer cannot be a download source, and
@@ -358,6 +368,8 @@ pub fn manual_peers() -> Vec<&'static str> {
 /// node.btx.tools=164.90.246.229). A stale IP line is harmless — it simply
 /// matches no peer.
 pub const BTX_ARCHIVE_WHITELIST_IPS: &[&str] = &[
+    // btxscan.io's mirror, the archive peer added 2026-09-24 (BTX_ARCHIVE_PEERS).
+    "20.86.181.203",
     "207.56.229.99",
     "37.230.134.222",
     "114.150.94.235",
@@ -1191,8 +1203,14 @@ pub fn build_node_command(
         // Never on the mirror arm: a mirror consumes attestations, and a key
         // there signs nothing (role.rs, the 2026-09-03 case).
         if !mirror_here && signs_here(conf) {
+            // Skip a mirror the manual set already dials: btxscan's is also an
+            // archive peer since 2026-09-24, and a second -addnode for the same
+            // peer spends a slot on nothing.
+            let manual = manual_peers();
             for mirror in crate::signer::BTX_MIRRORS_FED_BY_SIGNERS {
-                args.push(format!("-addnode={mirror}"));
+                if !manual.contains(mirror) {
+                    args.push(format!("-addnode={mirror}"));
+                }
             }
             // And the key's pin on itself, without which 0.34.9 refuses to
             // start a node holding a key (`signing_key_self_pin` has the
@@ -1482,7 +1500,7 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
 /// Compressed secp256k1 public keys trusted to attest Profile-1 ExactReplay.
 ///
 /// Threshold is 1, so this list is a UNION and an extra key can only widen what
-/// the node accepts — it can never cause a rejection. That is why all three sit
+/// the node accepts — it can never cause a rejection. That is why all four sit
 /// here rather than only the two upstream currently publishes.
 ///
 /// Why more than one is required at all. Measured on a parked GPU-less datadir
@@ -1516,6 +1534,16 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
 ///     rotated to `0224e80d` before the 08-20 publication. It is KEPT because
 ///     historical attestations it signed still have to prove quorum after an
 ///     authority-namespace change, and at M=1 a retired key costs nothing.
+///   * `02d5efca` — this project's own signer, an RTX 3060 in consensus mode
+///     (the key `checkin.rs` uses as its real-world sample, and btxscan's pin
+///     since 2026-09-01). Added 2026-09-24 because after the 23 September split
+///     it was the ONLY key signing the valid chain: witness-1 counted it on 100
+///     of 100 blocks up to 228,157, one distinct key, and none of the three
+///     above. With 0.6.29 refusing `b28c3e84` (known_invalid.rs), a mirror
+///     pinning only those three stopped at 227,312 and could not move again.
+///     At M=1 this makes that one machine a full authority for every mirror,
+///     the trade jpp's operator standard (M=2, independent keys) is meant to
+///     retire once a second key signs the valid chain.
 ///
 /// ⚠ Changing this list is not free, and the cost is not where you would look
 /// for it. btxd namespaces its durable attestation archive by
@@ -1531,10 +1559,21 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
 /// stall-recovery knobs baked at mainnet 199299), so the namespace moves for
 /// every upgrading mirror whether or not the keys move with it. Fixing the
 /// signer set in the same release costs one namespace change instead of two.
-pub const BTX_TRUSTED_ATTESTATION_PUBKEYS: [&str; 3] = [
+///
+/// Adding `02d5efca` is NOT free that way, read against the v0.34.9 tag on
+/// 2026-09-24. The namespace still hashes the signer set
+/// (`matmul_trusted_attestations.cpp:215`), and 0.34.10 / 0.34.11rc1 leave the
+/// replay context alone (SCHEMA_VERSION 4, no blockstorage or params change), so
+/// no engine bump moves it for us. `ReconcileMatMulReplayAuthorityContext`
+/// (`blockstorage.cpp:576`) keeps a block's trusted bit only where `HasQuorum`
+/// still proves it: the bounded hot store reloaded from disk still counts, the
+/// durable history behind it does not. Measure a real mirror datadir across
+/// this change before it ships.
+pub const BTX_TRUSTED_ATTESTATION_PUBKEYS: [&str; 4] = [
     "03d90c148db37da28ce47ce15bade88a177728d663da4bc9ba765943b7d4e4f0aa",
     "0224e80df33697385b54b3c69bae1f097f533c0c43e93c29f73ee97319d4a5e04c",
     "028995b25c887ee03eb53a41312d33c8eccf48f261ecf9e91fe2b1e8e50373258a",
+    "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675",
 ];
 
 /// Whether this host should follow the chain past the MatMul v4.7 fork via an
@@ -3814,6 +3853,18 @@ consensus-validator service.";
         }
     }
 
+    /// After the 227313 split the valid chain was signed by `02d5efca` alone, so
+    /// a mirror without it stops at 227,312 for good (0.6.29 refuses the other
+    /// branch). A literal, for the same reason as the test above.
+    #[test]
+    fn the_pin_carries_the_one_key_that_signs_the_valid_side_of_the_227313_split() {
+        assert!(
+            BTX_TRUSTED_ATTESTATION_PUBKEYS
+                .contains(&"02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675"),
+            "the valid chain's signer must be pinned, or every mirror stays at 227,312"
+        );
+    }
+
     /// The refusal detector needs BOTH markers. Verbatim line, captured from a
     /// real v0.33.4.1 run on an Apple M5 (Mac17,2) on 2026-08-25 — a typed
     /// approximation here would let the shape drift away from what btxd emits.
@@ -4260,7 +4311,7 @@ consensus-validator service.";
             .collect()
     }
 
-    /// All three pinned signers and threshold 1: the quorum as this file
+    /// Every pinned signer and threshold 1: the quorum as this file
     /// builds it for Metal's marker path, and since 2026-09-15 for keyless
     /// CPU hosts too.
     fn carries_trusted_quorum(args: &[String]) -> bool {
@@ -4378,15 +4429,34 @@ consensus-validator service.";
             );
         }
 
-        // The same host without a key dials none of them.
+        // The same host without a key adds no signer link: it dials the manual
+        // set and nothing else. (Since 2026-09-24 btxscan's mirror is also an
+        // archive peer, so every host reaches it through that set; what must
+        // not appear is a mirror dialled only because of a key.)
+        let signer_only = |args: &[String]| {
+            let manual = manual_peers();
+            crate::signer::BTX_MIRRORS_FED_BY_SIGNERS
+                .iter()
+                .filter(|m| !manual.contains(m))
+                .filter(|m| args.iter().any(|a| a == &format!("-addnode={m}")))
+                .count()
+        };
+        let manual_args = |args: &[String]| {
+            args.iter()
+                .filter_map(|a| a.strip_prefix("-addnode="))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
         let (_, args, _) = build_node_command(btxd, Path::new("/dd"), &keyless, Backend::Cuda);
-        assert_eq!(mirror_addnodes(&args), 0, "{args:?}");
+        assert_eq!(signer_only(&args), 0, "{args:?}");
+        assert_eq!(manual_args(&args), manual_peers(), "{args:?}");
 
-        // A mirror host with the line in its conf still dials none: a mirror
-        // consumes attestations, and a key there signs nothing.
+        // A mirror host with the line in its conf adds no signer link either: a
+        // mirror consumes attestations, and a key there signs nothing.
         let (_, args, _) = build_node_command(btxd, Path::new("/dd"), &signing, Backend::Cpu);
         assert_eq!(validation_modes(&args), vec!["trusted"]);
-        assert_eq!(mirror_addnodes(&args), 0, "{args:?}");
+        assert_eq!(signer_only(&args), 0, "{args:?}");
+        assert_eq!(manual_args(&args), manual_peers(), "{args:?}");
         assert!(launches_as_mirror(btxd, Path::new("/dd"), Backend::Cpu));
         assert!(!launches_as_mirror(btxd, Path::new("/dd"), Backend::Cuda));
         let _ = std::fs::remove_dir_all(&dir);
@@ -4488,7 +4558,7 @@ consensus-validator service.";
             );
             assert!(
                 carries_trusted_quorum(&args),
-                "all three pinned signers at threshold 1 on {engine}, got {args:?}"
+                "every pinned signer at threshold 1 on {engine}, got {args:?}"
             );
             assert!(
                 carries_single_key_override(&args),
@@ -5110,11 +5180,15 @@ consensus-validator service.";
         // The archive list means what it says: everything in it must advertise
         // the archive role. Asserted as a COUNT because the measurement that
         // emptied it out is in the comments and a silent re-add should trip.
+        // 2026-09-24: 1 became 2. The reading for 20.86.181.203:19338, taken from
+        // a live v0.34.9 peer connection: services 0x82000d08,
+        // MATMUL_ATTESTATION_ARCHIVE among them, and it served `02d5efca`'s
+        // signatures for the tip, 227,400 and 227,313 on request.
         assert_eq!(
             BTX_ARCHIVE_PEERS.len(),
-            1,
-            "only 37.230.134.222 measured as a real archive; adding one needs a \
-             reading, not a hostname"
+            2,
+            "37.230.134.222 and btxscan's 20.86.181.203:19338 are the measured \
+             archives; adding one needs a reading, not a hostname"
         );
         // A tripwire, not a fact about the network: pinned so that adding or
         // dropping a seed cannot pass unnoticed. 2026-09-05: 9 became 7 — one

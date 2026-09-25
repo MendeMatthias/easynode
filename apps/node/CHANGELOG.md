@@ -8,6 +8,24 @@ root).
 
 ## [Unreleased]
 
+**A node that follows signatures moves again, on the valid chain.** Since 0.6.29
+such a node, which is an M5, a PC without an NVIDIA driver or a native Windows
+PC, refuses the invalid branch of the 23 September split and then waits at
+227,312, because none of the three signing keys it trusted had signed the valid
+chain. This update adds the one key that does, `02d5efca…`, this project's own
+signer: on 24 September it signed every one of the last 100 valid blocks and
+was the only key doing so. It also adds btxscan.io's node as a peer the app
+dials, because it is the one reachable node found holding that key's
+signatures; a node that trusts the key but cannot fetch its signatures would
+still wait.
+
+Be clear about what this costs. At one signature per block, which is how these
+nodes have always run, every key they trust can move them on its own, so this
+one machine now does. The plan is two independent keys with both required, as
+BTX's developers propose for every mirror, once a second key signs the valid
+chain. A node that checks blocks itself, an Apple Silicon Mac or a PC with a
+capable NVIDIA card, does not use these keys and is unchanged.
+
 ## [0.6.29] - 2026-09-24
 
 **The app update that keeps every node off the invalid branch of the 23
