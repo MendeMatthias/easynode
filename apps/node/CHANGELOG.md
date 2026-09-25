@@ -8,6 +8,17 @@ root).
 
 ## [Unreleased]
 
+## [0.6.30] - 2026-09-25
+
+**The update that lets a node which follows signatures move again.** The engine
+does not change: this is still BTX v0.34.9, the same three builds as 0.6.28 and
+0.6.29, so no node re-installs its engine. BTX has 0.34.11 as a release
+candidate and a 0.34.12 branch in review; the engine moves when one of them is
+final. Measured before release: a reference node of exactly this kind, stuck at
+219,000, reached the tip on the valid chain in 34 minutes once it had the key
+and the peer below, and a copy of it that had a key added over its existing
+chain started normally and kept following the tip.
+
 **A node that follows signatures moves again, on the valid chain.** Since 0.6.29
 such a node, which is an M5, a PC without an NVIDIA driver or a native Windows
 PC, refuses the invalid branch of the 23 September split and then waits at
