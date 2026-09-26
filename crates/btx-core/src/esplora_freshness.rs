@@ -44,6 +44,9 @@
 //! local tip unknown                                   -> unverified
 //! census unreachable, unparsable, older than 30 min,
 //!   or naming no heaviest chain with a usable tip     -> unverified
+//! heaviest chain marked invalid by the census         -> unverified (no witness)
+//! serves an invalid chain's first invalid block,
+//!   or its tip, before any rule grants `fresh`        -> unverified (an invalid chain)
 //! holds a DEEP competing chain's tip (forked more
 //!   than RACE_DEPTH below the heaviest tip)           -> unverified (another chain)
 //! local tip >= census tip, our block at that height
@@ -64,6 +67,20 @@
 //! What would sharpen this: `recentHashes` per chain in the public feed, a few
 //! blocks below each tip, where a race has settled. Then a served endpoint
 //! could be placed on a chain positively rather than by elimination.
+//!
+//! ── INVALID CHAINS ──────────────────────────────────────────────────────────
+//! The feed now marks a chain `invalid` and names its first invalid block
+//! (`invalidBlock`: a height and a hash prefix). Work on such a chain is no
+//! witness. Read on 2026-09-26 at 16:37Z, the census named the valid chain
+//! heaviest although, by its own figures, the invalid branch from 227313
+//! carried more work since the height both share, so the site already leaves
+//! invalid chains out of `heaviest`. These rules do not rely on that. A
+//! heaviest chain marked invalid is `unverified`, not a search for another
+//! reference: the feed carries no figure that ranks chains forked at
+//! different heights, so any pick here would be a guess. And an endpoint that
+//! serves an invalid chain's first invalid block, or its tip, is `unverified`
+//! before the settled test runs, because a branch that left inside the racing
+//! window shares every settled pair of the chain it left.
 //!
 //! Facts in, verdict out: [`judge`] is pure and tested. The fetching lives in
 //! [`tick`], which the app runs every [`TICK_SECS`] while the front is up.
@@ -177,6 +194,17 @@ pub struct CensusChain {
     pub competing: bool,
     #[serde(default)]
     pub partial: bool,
+    /// The census's word that this chain contains a block the network's
+    /// validating nodes reject. Absent on a feed published before the census
+    /// said so, which decodes to `false`: "not known to be invalid", never
+    /// "valid".
+    #[serde(default)]
+    pub invalid: bool,
+    /// The first block of this chain the census calls invalid, as a
+    /// `(height, hash-prefix)` pair in the same shape as a settled one; `null`
+    /// on a chain it does not call invalid.
+    #[serde(rename = "invalidBlock", default)]
+    pub invalid_block: Option<SettledBlock>,
     /// Settled `(height, hash-prefix)` pairs for this chain, oldest first,
     /// every one at least six blocks below the chain's tip and above its fork.
     /// Empty on a feed published before EasyBTX#468, which is why every rule
@@ -289,6 +317,66 @@ impl CensusChain {
         let ours = hash_at(height)?;
         Some(ours.trim().to_ascii_lowercase().starts_with(&prefix))
     }
+
+    /// Does the census call this chain invalid? Either field is enough: a feed
+    /// that names the invalid block has said so even without the flag, and
+    /// the reverse.
+    pub fn is_invalid(&self) -> bool {
+        self.invalid || self.invalid_block.is_some()
+    }
+
+    /// Is the block the endpoint serves at this chain's invalid block's height
+    /// that block? `None` when the chain names no usable invalid block, the
+    /// endpoint has not reached its height, or the served hash could not be
+    /// read; none of those is evidence.
+    pub fn holds_invalid_block(
+        &self,
+        served_tip: u64,
+        hash_at: &dyn Fn(u64) -> Option<String>,
+    ) -> Option<bool> {
+        let block = self.invalid_block.as_ref()?;
+        let prefix = block.prefix()?;
+        if block.height > served_tip {
+            return None;
+        }
+        let ours = hash_at(block.height)?;
+        Some(ours.trim().to_ascii_lowercase().starts_with(&prefix))
+    }
+
+    /// Is the endpoint positively on this chain, and the chain one the census
+    /// calls invalid? Its invalid block served at that height, or its tip,
+    /// proves it. Settled pairs are not asked: on a short branch the feed's
+    /// pairs can sit at or below the fork (read 2026-09-26: a branch that
+    /// forked at 229448 published pairs from 229438 to 229447), where every
+    /// chain agrees. `false` whenever nothing could be compared.
+    pub fn holds_invalid_part(
+        &self,
+        served_tip: u64,
+        hash_at: &dyn Fn(u64) -> Option<String>,
+    ) -> bool {
+        if !self.is_invalid() {
+            return false;
+        }
+        if self.holds_invalid_block(served_tip, hash_at) == Some(true) {
+            return true;
+        }
+        match self.tip_height {
+            Some(h) if h <= served_tip => self.holds_tip(hash_at) == Some(true),
+            _ => false,
+        }
+    }
+
+    /// " from block 227313 (b28c3e846344ba74…)" when the census names the
+    /// invalid block, for the reason sentence; empty when it does not.
+    fn invalid_from(&self) -> String {
+        let Some(b) = &self.invalid_block else {
+            return String::new();
+        };
+        match b.prefix() {
+            Some(p) => format!(" from block {} ({p}…)", b.height),
+            None => format!(" from block {}", b.height),
+        }
+    }
 }
 
 /// The decision, with its reason in one sentence for the log line and the
@@ -355,6 +443,20 @@ pub fn judge(
             None,
         );
     };
+    // Work on an invalid chain is no witness. The feed read on 2026-09-26
+    // already left the invalid branch out of `heaviest`; this does not rely
+    // on it, and does not pick another chain in its place (module docs).
+    if heaviest.is_invalid() {
+        return verdict(
+            Freshness::Unverified,
+            format!(
+                "the chain census names chain {} heaviest but marks it invalid{}; work on an invalid chain witnesses nothing",
+                heaviest.id,
+                heaviest.invalid_from()
+            ),
+            None,
+        );
+    }
     let (Some(census_tip), Some(prefix)) = (heaviest.tip_height, heaviest.prefix()) else {
         return verdict(
             Freshness::Unverified,
@@ -365,6 +467,23 @@ pub fn judge(
             None,
         );
     };
+
+    // Before anything can read `fresh`: is this endpoint positively on a
+    // chain the census marks invalid? That outranks the settled test below,
+    // which a branch that left inside the racing window would pass.
+    for other in census.chains().iter().filter(|c| c.is_invalid()) {
+        if other.holds_invalid_part(tip, hash_at) {
+            return verdict(
+                Freshness::Unverified,
+                format!(
+                    "this endpoint serves chain {}, which the census marks invalid{}; its height and age do not matter",
+                    other.id,
+                    other.invalid_from()
+                ),
+                Some(census_tip),
+            );
+        }
+    }
 
     // FIRST, and best: can the endpoint be placed on a chain POSITIVELY, by a
     // settled block below the racing window? Everything after this point is
@@ -602,8 +721,19 @@ pub async fn tick(
                 }
             }
         }
+        // The first invalid block each invalid chain names, for the test that
+        // runs before anything can be fresh.
+        for chain in c.chains() {
+            if let Some(b) = &chain.invalid_block {
+                if b.height <= tip && !hashes.contains_key(&b.height) {
+                    if let Some(x) = served_hash_at(client, electrs_base, b.height).await {
+                        hashes.insert(b.height, x);
+                    }
+                }
+            }
+        }
         // Then the tips, for the older rules that run when a feed carries no
-        // settled pairs.
+        // settled pairs, and for the invalid-chain test.
         for chain in c.chains() {
             if let Some(h) = chain.tip_height {
                 if h <= tip && !hashes.contains_key(&h) {
@@ -1007,6 +1137,214 @@ mod tests {
             NOW,
         );
         assert_eq!(v.freshness, Freshness::Fresh, "{v:?}");
+    }
+
+    // ── invalid chains: work on one is no witness ────────────────────────
+    // The feed marks a chain `invalid` and names its first invalid block.
+    // Before these rules read that, a feed flagging an invalid chain heaviest
+    // made an endpoint on it `fresh`, and so did a branch that turned invalid
+    // inside the racing window, through the settled pairs it shares.
+
+    /// The feed as read on 2026-09-26 at 16:37Z, trimmed to two of its five
+    /// chains and three settled pairs each. A is the valid chain and heaviest.
+    /// E is the branch from `b28c3e84…` at 227313, marked invalid, and by the
+    /// feed's own figures it carries MORE work since the height both share
+    /// (log2 25.106 against 24.156, both counted from 227312).
+    const SAMPLE_INVALID: &str = r#"{"schema":2,"checkedAt":1790440634,"chains":{"split":true,"tipHeight":230074,"chains":[
+      {"id":"A","tipHeight":230074,"tipHash":"d7078b67cdba8587","forkHeight":null,"nodes":1,"lengthSinceFork":2762,"log2WorkSinceFork":24.156,"competing":true,"heaviest":true,"invalid":false,"invalidBlock":null,"partial":false,
+       "settled":[{"height":230066,"hash":"0b9d3acdfcef1455"},{"height":230067,"hash":"78526bf08837071a"},{"height":230068,"hash":"1a1c06c8cf2cc9c1"}]},
+      {"id":"E","tipHeight":228908,"tipHash":"817155a71e0fba5b","forkHeight":227312,"nodes":5,"lengthSinceFork":1596,"log2WorkSinceFork":25.106,"competing":true,"heaviest":false,"invalid":true,"invalidBlock":{"height":227313,"hash":"b28c3e846344ba74"},"partial":false,
+       "settled":[{"height":228900,"hash":"2227b1dd900ce161"},{"height":228901,"hash":"4050d3063dd21453"},{"height":228902,"hash":"87483fbfb7a950cb"}]}]}}"#;
+    const NOW_INVALID: u64 = 1790440634 + 60;
+    /// Both blocks at 227313, as `known_invalid` carries them.
+    const E_227313: &str = "b28c3e846344ba744ca1e360792ba4389063b440c260eeb4a8003724478322a0";
+    const A_227313: &str = "d5f0e92fb9a1f551a927902376f105d649dfa6f296304905a0275c1a5cdf8aa2";
+
+    fn invalid_census() -> Census {
+        Census::parse(SAMPLE_INVALID).expect("the invalid feed shape parses")
+    }
+
+    #[test]
+    fn the_invalid_fields_parse_and_an_older_feed_marks_nothing_invalid() {
+        let c = invalid_census();
+        let a = c.heaviest().expect("A is heaviest");
+        assert_eq!(a.id, "A");
+        assert!(!a.is_invalid());
+        let e = c.chains()[1].clone();
+        assert!(e.invalid && e.is_invalid());
+        let b = e.invalid_block.as_ref().unwrap();
+        assert_eq!(b.height, 227313);
+        assert_eq!(b.prefix().as_deref(), Some("b28c3e846344ba74"));
+        // Either field is enough on its own.
+        let mut flag_only = e.clone();
+        flag_only.invalid_block = None;
+        assert!(flag_only.is_invalid());
+        let mut block_only = e;
+        block_only.invalid = false;
+        assert!(block_only.is_invalid());
+        // A feed from before the census said so marks nothing invalid.
+        let old = census();
+        assert!(old.chains().iter().all(|c| !c.is_invalid()));
+        let settled = settled_census();
+        assert!(settled.chains().iter().all(|c| !c.is_invalid()));
+    }
+
+    #[test]
+    fn the_valid_chain_is_still_fresh_beside_a_heavier_invalid_one() {
+        // The 26 September shape: an endpoint on A, past its tip, serving A's
+        // newest settled block and the valid block at 227313.
+        let c = invalid_census();
+        let v = judge(
+            Some(230075),
+            &lookup(&[
+                (227313, A_227313),
+                (228908, &full("ffffffffffffffff")),
+                (230068, &full("1a1c06c8cf2cc9c1")),
+            ]),
+            Some(&c),
+            NOW_INVALID,
+        );
+        assert_eq!(v.freshness, Freshness::Fresh, "{v:?}");
+        assert!(v.reason.contains("230068"), "{}", v.reason);
+        // An endpoint that could not be asked about 227313 at all is not
+        // accused of anything: no answer is not evidence.
+        let v = judge(
+            Some(230075),
+            &lookup(&[(230068, &full("1a1c06c8cf2cc9c1"))]),
+            Some(&c),
+            NOW_INVALID,
+        );
+        assert_eq!(v.freshness, Freshness::Fresh, "{v:?}");
+    }
+
+    #[test]
+    fn an_invalid_chain_is_never_the_witness_however_much_work_it_carries() {
+        // As read, with A heaviest: an endpoint serving E's invalid block is
+        // named as on an invalid chain. Without this rule, and with E's tip
+        // hash unread, it read `stale`, as if it were merely behind.
+        let c = invalid_census();
+        let v = judge(
+            Some(228908),
+            &lookup(&[(227313, E_227313)]),
+            Some(&c),
+            NOW_INVALID,
+        );
+        assert_eq!(v.freshness, Freshness::Unverified, "{v:?}");
+        assert!(v.reason.contains("chain E"), "{}", v.reason);
+        assert!(v.reason.contains("227313"), "{}", v.reason);
+
+        // The feed flags E heaviest, as a census ranking by work alone would.
+        // An endpoint on E, holding its newest settled block and its tip,
+        // read `fresh` before this rule.
+        let mut c = invalid_census();
+        c.chains.as_mut().unwrap().chains[0].heaviest = false;
+        c.chains.as_mut().unwrap().chains[1].heaviest = true;
+        let v = judge(
+            Some(228908),
+            &lookup(&[
+                (227313, E_227313),
+                (228902, &full("87483fbfb7a950cb")),
+                (228908, &full("817155a71e0fba5b")),
+            ]),
+            Some(&c),
+            NOW_INVALID,
+        );
+        assert_eq!(v.freshness, Freshness::Unverified, "{v:?}");
+        assert!(v.reason.contains("marks it invalid"), "{}", v.reason);
+        assert!(v.reason.contains("227313"), "{}", v.reason);
+        // And an endpoint on the valid chain has no witness to be fresh
+        // against either: the feed has no figure to rank the remaining chains
+        // by, so the rules do not pick one.
+        let v = judge(
+            Some(230075),
+            &lookup(&[
+                (227313, A_227313),
+                (228902, &full("ffffffffffffffff")),
+                (230068, &full("1a1c06c8cf2cc9c1")),
+            ]),
+            Some(&c),
+            NOW_INVALID,
+        );
+        assert_eq!(v.freshness, Freshness::Unverified, "{v:?}");
+        assert!(v.reason.contains("marks it invalid"), "{}", v.reason);
+    }
+
+    #[test]
+    fn an_endpoint_on_an_invalid_branch_inside_the_racing_window_is_not_fresh() {
+        // A branch marked invalid that left A three blocks below A's tip. It
+        // shares every settled pair of A, so the settled test alone called an
+        // endpoint on it `fresh`. Its invalid block, or its tip, decides first.
+        let mut c = invalid_census();
+        let x = &mut c.chains.as_mut().unwrap().chains[1];
+        x.fork_height = Some(230071);
+        x.tip_height = Some(230074);
+        x.tip_hash = Some("eeeeeeeeeeeeeeee".into());
+        x.invalid_block = Some(SettledBlock {
+            height: 230072,
+            hash: "eeee00000000eeee".into(),
+        });
+        x.settled.clear();
+        let v = judge(
+            Some(230074),
+            &lookup(&[
+                (230068, &full("1a1c06c8cf2cc9c1")),
+                (230072, &full("eeee00000000eeee")),
+                (230074, &full("eeeeeeeeeeeeeeee")),
+            ]),
+            Some(&c),
+            NOW_INVALID,
+        );
+        assert_eq!(v.freshness, Freshness::Unverified, "{v:?}");
+        assert!(v.reason.contains("chain E"), "{}", v.reason);
+        assert!(v.reason.contains("230072"), "{}", v.reason);
+        // Its tip alone is enough when the invalid block's height was not read.
+        let v = judge(
+            Some(230074),
+            &lookup(&[
+                (230068, &full("1a1c06c8cf2cc9c1")),
+                (230074, &full("eeeeeeeeeeeeeeee")),
+            ]),
+            Some(&c),
+            NOW_INVALID,
+        );
+        assert_eq!(v.freshness, Freshness::Unverified, "{v:?}");
+        assert!(v.reason.contains("chain E"), "{}", v.reason);
+    }
+
+    #[test]
+    fn when_every_chain_is_invalid_nothing_is_fresh() {
+        let mut c = invalid_census();
+        for chain in &mut c.chains.as_mut().unwrap().chains {
+            chain.invalid = true;
+        }
+        // An endpoint holding A's newest settled block and its tip: `fresh`
+        // before this rule.
+        let v = judge(
+            Some(230074),
+            &lookup(&[
+                (230068, &full("1a1c06c8cf2cc9c1")),
+                (230074, &full("d7078b67cdba8587")),
+            ]),
+            Some(&c),
+            NOW_INVALID,
+        );
+        assert_eq!(v.freshness, Freshness::Unverified, "{v:?}");
+        assert!(v.reason.contains("marks it invalid"), "{}", v.reason);
+        // And the same when a census with no valid chain flags none heaviest.
+        for chain in &mut c.chains.as_mut().unwrap().chains {
+            chain.heaviest = false;
+        }
+        let v = judge(
+            Some(230074),
+            &lookup(&[
+                (230068, &full("1a1c06c8cf2cc9c1")),
+                (230074, &full("d7078b67cdba8587")),
+            ]),
+            Some(&c),
+            NOW_INVALID,
+        );
+        assert_eq!(v.freshness, Freshness::Unverified, "{v:?}");
+        assert!(v.reason.contains("no heaviest"), "{}", v.reason);
     }
 
     #[test]

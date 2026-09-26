@@ -8,6 +8,14 @@ root).
 
 ## [Unreleased]
 
+**Esplora mode never calls an endpoint on the invalid side of a split fresh.**
+The census now marks the branch that starts at 227,313 `b28c3e84…` invalid,
+and the guardian that decides whether a wallet endpoint is fresh read neither
+of the new fields. It could have called an endpoint on that branch fresh, and
+it would have taken an invalid chain flagged heaviest as its reference. It now
+says unverified in both cases and names the chain and block. Contributed by
+jpp.
+
 **Stopping or quitting no longer cuts a node off in the middle of saving its
 state.** A node gets 90 seconds to shut down, which is the low end of the
 90 to 120 seconds measured on a Mac at a much shorter chain, and after that it
