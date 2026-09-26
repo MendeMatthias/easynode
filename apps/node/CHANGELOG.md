@@ -8,6 +8,16 @@ root).
 
 ## [Unreleased]
 
+## [0.6.31] - 2026-09-26
+
+**The update that starts a new node near the tip, and tells a node that is
+behind how long it has left.** The engine does not change: this is still BTX
+v0.34.9, the same three builds as 0.6.28 to 0.6.30, so no node re-installs its
+engine. A new node that follows signatures starts from a snapshot this
+project's signer signed instead of block 219,000; a computer too slow to keep
+up is told so and can follow signatures instead; and every node that is
+behind says how long it has left, or that it will not catch up.
+
 **A computer too slow to keep up is told so, and can follow signatures
 instead.** A Mac or an NVIDIA PC checks every block itself, and one that checks
 them slower than the chain makes them never reaches the tip: the one Mac
