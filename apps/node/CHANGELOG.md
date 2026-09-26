@@ -16,6 +16,16 @@ it would have taken an invalid chain flagged heaviest as its reference. It now
 says unverified in both cases and names the chain and block. Contributed by
 jpp.
 
+**Stopping or quitting no longer cuts a node off in the middle of saving its
+state.** A node gets 90 seconds to shut down, which is the low end of the
+90 to 120 seconds measured on a Mac at a much shorter chain, and after that it
+was force-stopped mid-save and the next start spent minutes rebuilding. Now a
+node that is still writing its log after those 90 seconds is still saving and
+is given up to ten minutes; one that has gone quiet is stopped as before. And
+quitting the app no longer kills a node that is taking longer than the app
+waits: it is left to finish on its own, and the next start picks it up, as it
+already did after a Windows update. Raised in a review by jpp.
+
 ## [0.6.31] - 2026-09-26
 
 **The update that starts a new node near the tip, and tells a node that is
