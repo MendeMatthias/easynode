@@ -21,3 +21,10 @@ apps/node/src-tauri/resources/node-pkg/
 # an artifact of a release, not source, and it carries signatures produced on
 # the maintainer's machine.
 apps/node/dist-feed/
+
+# A signing key never belongs in a repository. The updater key signs every
+# update every user installs and cannot be revoked in place, and the release
+# recipe keeps it beside a checkout on the publishing machine: one `git add -A`
+# from a commit. Public keys (`*.key.pub`) are not matched. The content check
+# is .github/workflows/secret-scan.yml.
+*.key
