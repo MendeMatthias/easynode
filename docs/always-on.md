@@ -212,7 +212,8 @@ Because somebody who is not us should be able to pick up any part of it.
 
 That includes forking it. If you take this code and run your own node system on
 BTX, that is a good outcome and exactly what the licence is for. We would rather
-five node projects existed than one.
+five node projects existed than one. [FORKING.md](../FORKING.md) is the
+checklist for doing it without colliding with this app.
 
 What we are trying to do first is narrower and less exciting: heal this system.
 Fix the things that are broken, make the numbers we publish mean what they say,
