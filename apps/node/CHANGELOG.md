@@ -8,6 +8,23 @@ root).
 
 ## [Unreleased]
 
+**A new node that follows signatures starts a few hundred blocks from the tip,
+not ten thousand below it.** A native Windows PC, an M5 or a PC without an
+NVIDIA driver cannot check blocks itself, so it follows this project's signer,
+`02d5efca…`. Until now it started from the snapshot compiled into its engine,
+block 219,000, and then needed a signature for every block since, which one
+reachable peer held; while that peer was stuck, a new node crawled. It now
+starts from the newest snapshot the signer has exported and signed, published
+beside the app's releases and loaded with `loadtxoutsetattested`. The engine
+refuses a snapshot that a key the node trusts did not sign, so where it is
+downloaded from does not have to be trusted. The trade, decided on 26
+September: until its background check reaches that snapshot's height and
+compares the balances, the node takes the signer's word for them as well as
+for each block. A node that checks blocks itself is unchanged, and anything
+that goes wrong on the way falls back to block 219,000 as before. The status
+card no longer says two independent operators sign for such a node; since the
+23 September split, one does.
+
 **A node that is behind says how long it has left, or that it is not catching
 up and by how much.** A new install starts from block 219,000, more than 10,000
 blocks below the tip, and the status line said "still catching up" and a

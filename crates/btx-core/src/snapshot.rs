@@ -593,6 +593,26 @@ pub fn ensure_snapshot_loaded(
     anchor_height: u64,
     flags: Arc<dyn SnapshotFlags>,
 ) {
+    ensure_snapshot_loaded_with(rpc, btx_cli, datadir, anchor_height, flags, false);
+}
+
+/// [`ensure_snapshot_loaded`], and first, when `prefer_attested`, the newest
+/// pair this project's signer has signed (`crate::attested_snapshot`), loaded
+/// with `loadtxoutsetattested`. Only for a node that follows signatures: the
+/// engine refuses the RPC on one that checks blocks itself. Anything short of
+/// a loaded signed pair (none published or pinned above the anchor, a failed
+/// download, headers that stall below its base, a refused manifest) falls
+/// through to the compiled snapshot exactly as [`ensure_snapshot_loaded`]
+/// loads it; a failed attested load leaves the chainstate untouched, so that
+/// path is still open.
+pub fn ensure_snapshot_loaded_with(
+    rpc: RpcClient,
+    btx_cli: PathBuf,
+    datadir: PathBuf,
+    anchor_height: u64,
+    flags: Arc<dyn SnapshotFlags>,
+    prefer_attested: bool,
+) {
     tokio::spawn(async move {
         // FAST PATH (returning node): if a prior run already loaded the snapshot,
         // the persisted flag says so and the snapshot chainstate is on disk —
@@ -624,62 +644,52 @@ pub fn ensure_snapshot_loaded(
             }
         }
 
+        if prefer_attested {
+            if let Some((pair, file, manifest)) =
+                crate::attested_snapshot::prepare(&datadir, anchor_height).await
+            {
+                if wait_for_headers(&rpc, &datadir, pair.height).await {
+                    // A peer may have advanced past / loaded a snapshot during the wait.
+                    if matches!(get_chainstates(&rpc).await, Ok(cs) if cs.snapshot().is_some()) {
+                        flags.mark_loaded();
+                        mark_snapshot_marker(&datadir);
+                        return;
+                    }
+                    eprintln!(
+                        "[snapshot] headers at {}; loading the signed snapshot (loadtxoutsetattested)",
+                        pair.height
+                    );
+                    match run_load(&btx_cli, &datadir, "loadtxoutsetattested", &[&file, &manifest])
+                        .await
+                    {
+                        LoadOutcome::Loaded | LoadOutcome::Superseded => {
+                            eprintln!("[snapshot] signed snapshot {} loaded", pair.height);
+                            flags.mark_loaded();
+                            mark_snapshot_marker(&datadir);
+                            return;
+                        }
+                        LoadOutcome::Failed(e) => eprintln!(
+                            "[snapshot] signed snapshot {} not loaded ({e}); loading the compiled one",
+                            pair.height
+                        ),
+                    }
+                } else {
+                    eprintln!(
+                        "[snapshot] headers stalled short of the signed snapshot's base {}; \
+                         loading the compiled one",
+                        pair.height
+                    );
+                }
+            }
+        }
+
         let snapshot_path = datadir.join("faststart").join("snapshot.dat");
         if !snapshot_path.exists() {
             // No snapshot file to load (e.g. a clean full-sync install) — fine.
             return;
         }
 
-        // Wait for headers to reach the snapshot anchor before loading —
-        // `loadtxoutset` is rejected until then. Patience is free in a
-        // background task, so the ONLY reason to stop is a genuinely STALLED
-        // header sync, never a wall clock: the old fixed budgets (180 s, then
-        // ~30 min) each abandoned a WORKING sync short of the anchor — a
-        // from-genesis header sync took ~65 min in the 2026-07-12 live run,
-        // the 30-min budget expired ~15 min early, and the node fell into a
-        // full sync-from-genesis with snapshot.dat sitting unused. Headers
-        // PRE-sync keeps `getblockchaininfo.headers` at 0, so btxd's own log
-        // line (read_header_presync) counts as forward progress too.
-        const STALL_GIVE_UP_POLLS: u32 = 300; // × 2 s = 10 min of ZERO progress
-        const HEADER_WAIT_POLL_MS: u64 = 2000;
-        let mut headers_ready = false;
-        // LAST seen, not BEST seen: header pre-sync restarts from a low height
-        // on every peer switch, and treating that as a stall abandons a working
-        // sync. See track_header_progress.
-        let mut last_seen: u64 = 0;
-        let mut stalled_polls: u32 = 0;
-        let mut poll_n: u64 = 0;
-        loop {
-            match get_blockchain_info(&rpc).await {
-                Ok(info) if snapshot_anchor_reached(info.headers, anchor_height) => {
-                    headers_ready = true;
-                    break;
-                }
-                Ok(info) => {
-                    let presync = crate::node::read_header_presync(&datadir)
-                        .map(|(h, _)| h)
-                        .unwrap_or(0);
-                    let progress = info.headers.max(presync);
-                    (last_seen, stalled_polls) =
-                        track_header_progress(progress, last_seen, stalled_polls);
-                    if poll_n % 10 == 0 {
-                        eprintln!(
-                            "[snapshot] waiting for headers to reach snapshot anchor: {}/{}",
-                            progress, anchor_height
-                        );
-                    }
-                }
-                Err(_) => {
-                    stalled_polls += 1;
-                }
-            }
-            if stalled_polls >= STALL_GIVE_UP_POLLS {
-                break;
-            }
-            poll_n += 1;
-            tokio::time::sleep(std::time::Duration::from_millis(HEADER_WAIT_POLL_MS)).await;
-        }
-        if !headers_ready {
+        if !wait_for_headers(&rpc, &datadir, anchor_height).await {
             eprintln!(
                 "[snapshot] header sync stalled short of the snapshot anchor; \
                  leaving the node to sync the slow way (non-fatal)"
@@ -695,30 +705,8 @@ pub fn ensure_snapshot_loaded(
         }
 
         eprintln!("[snapshot] headers at anchor, no snapshot chainstate yet; running loadtxoutset");
-        let cli = btx_cli.clone();
-        let dd = datadir.clone();
-        let snap = snapshot_path.clone();
-        // loadtxoutset can take a while to read+validate the snapshot file; run it
-        // on a blocking thread with rpcclienttimeout=0 (no client-side timeout),
-        // mirroring the faststart wrapper's documented invocation.
-        let result = tokio::task::spawn_blocking(move || {
-            let mut cmd = std::process::Command::new(&cli);
-            cmd.arg(format!("-datadir={}", dd.display()))
-                .arg("-rpcclienttimeout=0")
-                .arg("loadtxoutset")
-                .arg(&snap);
-            // Don't flash a console window on Windows. Compiled out on macOS.
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-            }
-            cmd.output()
-        })
-        .await;
-
-        match result {
-            Ok(Ok(out)) if out.status.success() => {
+        match run_load(&btx_cli, &datadir, "loadtxoutset", &[&snapshot_path]).await {
+            LoadOutcome::Loaded => {
                 eprintln!("[snapshot] loadtxoutset succeeded; snapshot chainstate activating");
                 // C3: persist loaded=true ONLY here — on a confirmed successful
                 // loadtxoutset. `disk::reclaim_disk` gates deleting snapshot.dat
@@ -726,25 +714,115 @@ pub fn ensure_snapshot_loaded(
                 flags.mark_loaded();
                 mark_snapshot_marker(&datadir);
             }
-            Ok(Ok(out)) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                // "Work does not exceed active chainstate" means a peer already
-                // advanced the chain past the snapshot — that's success, not error.
-                if stderr.contains("Work does not exceed active chainstate") {
-                    eprintln!("[snapshot] snapshot already superseded by active chain; continuing");
-                    // Active chain already past the snapshot — snapshot.dat is
-                    // safe to drop on the next reclaim, exactly as if it had
-                    // been loaded into the snapshot chainstate.
-                    flags.mark_loaded();
-                    mark_snapshot_marker(&datadir);
-                } else {
-                    eprintln!("[snapshot] loadtxoutset failed (non-fatal): {stderr}");
-                }
+            LoadOutcome::Superseded => {
+                eprintln!("[snapshot] snapshot already superseded by active chain; continuing");
+                // Active chain already past the snapshot — snapshot.dat is
+                // safe to drop on the next reclaim, exactly as if it had
+                // been loaded into the snapshot chainstate.
+                flags.mark_loaded();
+                mark_snapshot_marker(&datadir);
             }
-            Ok(Err(e)) => eprintln!("[snapshot] could not spawn loadtxoutset (non-fatal): {e}"),
-            Err(e) => eprintln!("[snapshot] loadtxoutset task panicked (non-fatal): {e}"),
+            LoadOutcome::Failed(e) => eprintln!("[snapshot] loadtxoutset failed (non-fatal): {e}"),
         }
     });
+}
+
+/// Wait for the node's headers to reach `target` — a snapshot load is
+/// rejected until then. Patience is free in a background task, so the ONLY
+/// reason to stop is a genuinely STALLED header sync, never a wall clock: the
+/// old fixed budgets (180 s, then ~30 min) each abandoned a WORKING sync short
+/// of the anchor — a from-genesis header sync took ~65 min in the 2026-07-12
+/// live run, the 30-min budget expired ~15 min early, and the node fell into a
+/// full sync-from-genesis with snapshot.dat sitting unused. Headers PRE-sync
+/// keeps `getblockchaininfo.headers` at 0, so btxd's own log line
+/// (read_header_presync) counts as forward progress too. `true` when reached.
+async fn wait_for_headers(rpc: &RpcClient, datadir: &Path, target: u64) -> bool {
+    const STALL_GIVE_UP_POLLS: u32 = 300; // × 2 s = 10 min of ZERO progress
+    const HEADER_WAIT_POLL_MS: u64 = 2000;
+    // LAST seen, not BEST seen: header pre-sync restarts from a low height
+    // on every peer switch, and treating that as a stall abandons a working
+    // sync. See track_header_progress.
+    let mut last_seen: u64 = 0;
+    let mut stalled_polls: u32 = 0;
+    let mut poll_n: u64 = 0;
+    loop {
+        match get_blockchain_info(rpc).await {
+            Ok(info) if snapshot_anchor_reached(info.headers, target) => return true,
+            Ok(info) => {
+                let presync = crate::node::read_header_presync(datadir)
+                    .map(|(h, _)| h)
+                    .unwrap_or(0);
+                let progress = info.headers.max(presync);
+                (last_seen, stalled_polls) =
+                    track_header_progress(progress, last_seen, stalled_polls);
+                if poll_n % 10 == 0 {
+                    eprintln!(
+                        "[snapshot] waiting for headers to reach snapshot anchor: {}/{}",
+                        progress, target
+                    );
+                }
+            }
+            Err(_) => {
+                stalled_polls += 1;
+            }
+        }
+        if stalled_polls >= STALL_GIVE_UP_POLLS {
+            return false;
+        }
+        poll_n += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(HEADER_WAIT_POLL_MS)).await;
+    }
+}
+
+/// What a `loadtxoutset` / `loadtxoutsetattested` call came to.
+#[derive(Debug, PartialEq)]
+enum LoadOutcome {
+    Loaded,
+    /// "Work does not exceed active chainstate": a peer already advanced the
+    /// chain past the snapshot — that's success, not error.
+    Superseded,
+    Failed(String),
+}
+
+fn load_outcome(success: bool, stderr: &str) -> LoadOutcome {
+    if success {
+        LoadOutcome::Loaded
+    } else if stderr.contains("Work does not exceed active chainstate") {
+        LoadOutcome::Superseded
+    } else {
+        LoadOutcome::Failed(stderr.trim().to_string())
+    }
+}
+
+/// Run one snapshot-load RPC through btx-cli. The load can take a while to
+/// read+validate the snapshot file; run it on a blocking thread with
+/// rpcclienttimeout=0 (no client-side timeout), mirroring the faststart
+/// wrapper's documented invocation.
+async fn run_load(btx_cli: &Path, datadir: &Path, method: &str, files: &[&Path]) -> LoadOutcome {
+    let cli = btx_cli.to_path_buf();
+    let dd = datadir.to_path_buf();
+    let method = method.to_string();
+    let files: Vec<PathBuf> = files.iter().map(|f| f.to_path_buf()).collect();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(&cli);
+        cmd.arg(format!("-datadir={}", dd.display()))
+            .arg("-rpcclienttimeout=0")
+            .arg(&method)
+            .args(&files);
+        // Don't flash a console window on Windows. Compiled out on macOS.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        cmd.output()
+    })
+    .await;
+    match result {
+        Ok(Ok(out)) => load_outcome(out.status.success(), &String::from_utf8_lossy(&out.stderr)),
+        Ok(Err(e)) => LoadOutcome::Failed(format!("could not spawn {}: {e}", btx_cli.display())),
+        Err(e) => LoadOutcome::Failed(format!("load task panicked: {e}")),
+    }
 }
 
 #[cfg(test)]
@@ -771,6 +849,30 @@ mod tests {
         // A node BELOW the base has not loaded it (or is reindexing): not
         // progress, and saturating arithmetic must not read it as a huge lead.
         assert!(!snapshot_sweep_allowed(base - 5_000, base, ""));
+    }
+
+    /// Both loads read their result the same way, so a signed snapshot the
+    /// chain has already passed counts as loaded, and anything else the
+    /// engine says is a failure that leaves the compiled snapshot to load.
+    #[test]
+    fn a_load_result_is_read_the_same_way_for_both_rpcs() {
+        assert_eq!(load_outcome(true, ""), LoadOutcome::Loaded);
+        assert_eq!(
+            load_outcome(
+                false,
+                "error code: -32603\nWork does not exceed active chainstate"
+            ),
+            LoadOutcome::Superseded
+        );
+        assert_eq!(
+            load_outcome(
+                false,
+                "Attested UTXO snapshot manifest rejected: untrusted-signer\n"
+            ),
+            LoadOutcome::Failed(
+                "Attested UTXO snapshot manifest rejected: untrusted-signer".into()
+            )
+        );
     }
 
     /// A node that just died failing to rewind a block may need the snapshot

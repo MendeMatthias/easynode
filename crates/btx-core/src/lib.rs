@@ -16,6 +16,7 @@
 //! items that were `pub(crate)` inside the miner were widened mechanically
 //! during the extraction — no behavior changed.
 
+pub mod attested_snapshot;
 pub mod backend;
 pub mod checkin;
 pub mod datadir;

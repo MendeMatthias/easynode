@@ -134,6 +134,12 @@ describe("validationView", () => {
       rc_trusted_mirror: true,
     });
     expect(v.state).toBe("Mirror");
+    // Since the 23 September split one key signs the valid chain; the copy
+    // must not promise two independent operators, or unconditional balance
+    // checks for a node that started from a snapshot.
+    expect(v.note).not.toMatch(/two independent/);
+    expect(v.note).toMatch(/one signer/);
+    expect(v.note).toMatch(/re-checks the snapshot it started from/);
     expect(v.state).not.toBe("strict-device");
     expect(v.note).toMatch(/block 185,000/);
     // It must not repeat the old promise that the node stops there.

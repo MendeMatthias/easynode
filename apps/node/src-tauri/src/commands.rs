@@ -1233,7 +1233,14 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
             "[snapshot] header bootstrap launch: the snapshot loads after the restart that ends it"
         );
     } else {
-        btx_core::snapshot::ensure_snapshot_loaded(
+        // A node that follows signatures starts from the newest snapshot this
+        // project's signer has signed, a few hundred blocks from the tip,
+        // instead of the compiled one thousands below it
+        // (btx_core::attested_snapshot; the owner's decision of 2026-09-26).
+        // One that checks blocks itself cannot load a signed snapshot, the
+        // engine refuses it, so it keeps the compiled one. Same rule as the
+        // -matmulvalidation arm, through `signer_applies_here`.
+        btx_core::snapshot::ensure_snapshot_loaded_with(
             rpc.clone(),
             paths.btx_cli.clone(),
             datadir.clone(),
@@ -1241,6 +1248,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
             Arc::new(NodeAppSnapshotFlags {
                 datadir: datadir.clone(),
             }),
+            !signer_applies_here,
         );
     }
 
@@ -1636,9 +1644,16 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         // connected blocks past the snapshot base and has not
                         // died failing to rewind one — see
                         // `snapshot::snapshot_sweep_allowed`.
+                        // Measured from the signed pair's base when one is on
+                        // disk: it sits above the compiled anchor, and "built
+                        // on it" means past the snapshot actually loaded.
+                        let base = btx_core::attested_snapshot::pair_height_on_disk(&dd)
+                            .map_or(snapshot_spec().anchor_height, |h| {
+                                h.max(snapshot_spec().anchor_height)
+                            });
                         let allowed = btx_core::snapshot::snapshot_sweep_allowed(
                             chain.blocks,
-                            snapshot_spec().anchor_height,
+                            base,
                             &btx_core::node::node_log_tail(&dd, 64 * 1024),
                         );
                         let swept = btx_core::disk::sweep_loaded_snapshot(&dd, loaded, allowed);
@@ -1653,8 +1668,9 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         // while the flag was the only gate; now that the sweep
                         // can legitimately defer, `snapshot_swept = loaded`
                         // would turn "not yet" into "never this session".
-                        snapshot_swept =
-                            swept.is_some() || !dd.join("faststart").join("snapshot.dat").exists();
+                        snapshot_swept = swept.is_some()
+                            || (!dd.join("faststart").join("snapshot.dat").exists()
+                                && !btx_core::attested_snapshot::pair_dir(&dd).exists());
                     }
                     // Independent reads — one round-trip instead of two.
                     // getpeerinfo replaces getconnectioncount (its length IS
