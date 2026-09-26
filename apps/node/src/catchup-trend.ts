@@ -127,17 +127,45 @@ export const timeToGo = (behind: number, closingPerHour: number): string | null 
  *  adding more than the chain in the last hour that still reads stalled over
  *  ten minutes (a burst of blocks, a reorg) keeps the plain wording rather than
  *  showing "adds 50 while the network adds 40" under "not catching up". */
-export const catchupLine = (behind: number, samples: CatchupSample[], now: number): string => {
-  const n = behind.toLocaleString("en-US");
+/** The trend, with the hour's pace standing in when the last ten minutes
+ *  cannot judge (a node just back from syncing, a paused poll): that span is
+ *  judged by the trend's own rule, at least TREND_MIN_CLOSED blocks closed,
+ *  rather than left silent. */
+const judge = (
+  samples: CatchupSample[],
+  now: number,
+): { trend: CatchupTrend; pace: CatchupPace | null } => {
   const pace = catchupPace(samples, now);
   let trend = catchupTrend(samples, now);
-  // No recent history to judge on (a node just back from syncing, a paused
-  // poll) but an hour's pace to hand: judge that span by the trend's own rule,
-  // at least TREND_MIN_CLOSED blocks closed, rather than stay silent.
   if (trend === "unknown" && pace) {
     const closed = (pace.closingPerHour * pace.spanMs) / 3_600_000;
     trend = closed >= TREND_MIN_CLOSED ? "converging" : "stalled";
   }
+  return { trend, pace };
+};
+
+/** Below this many blocks an hour a node is too slow for the chain, not held
+ *  to its pace. The cadence hold (btxchain/btx#140) keeps a node that is a few
+ *  dozen behind at one block per 90 s, about 40 an hour, the chain's own
+ *  rate, and a measured 38 or 39 from that must not read as a slow machine.
+ *  The machines this is for sit far below: an M2 Pro checking blocks does
+ *  about 27, the node reported on 2026-09-26 did 8. */
+export const TOO_SLOW_FOR_THE_CHAIN_PER_HOUR = 32;
+
+/** The blocks an hour this node adds when it is measured falling behind for
+ *  good: not catching up, and adding well under what the chain makes. Null
+ *  otherwise, the cadence hold included, which no switch would fix. The
+ *  status screen offers the switch to follow signatures only on this. */
+export const cannotCatchUp = (samples: CatchupSample[], now: number): number | null => {
+  const { trend, pace } = judge(samples, now);
+  if (trend !== "stalled" || !pace) return null;
+  const added = Math.max(0, Math.round(pace.addedPerHour));
+  return added < TOO_SLOW_FOR_THE_CHAIN_PER_HOUR ? added : null;
+};
+
+export const catchupLine = (behind: number, samples: CatchupSample[], now: number): string => {
+  const n = behind.toLocaleString("en-US");
+  const { trend, pace } = judge(samples, now);
   if (trend === "stalled") {
     const plain = `Your node is live but not catching up. It is ${n} blocks behind and the gap is not closing.`;
     if (!pace) return plain;

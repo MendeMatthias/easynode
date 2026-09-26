@@ -8,6 +8,18 @@ root).
 
 ## [Unreleased]
 
+**A computer too slow to keep up is told so, and can follow signatures
+instead.** A Mac or an NVIDIA PC checks every block itself, and one that checks
+them slower than the chain makes them never reaches the tip: the one Mac
+measured, an M2 Pro, does about 27 an hour against the chain's 40. When the
+status screen measures that, far under the chain's pace for fifteen minutes and
+more, it says so with both numbers and offers to follow signatures instead, as
+a Windows PC does. Nothing changes until the owner clicks twice; the node then
+restarts, stops checking the proof of work itself and cannot sign. Settings
+has the switch back, and the same choice for anyone who wants it. A node held
+to the chain's own pace, the cadence hold, is never offered it: that is not a
+slow machine.
+
 **A new node that follows signatures starts a few hundred blocks from the tip,
 not ten thousand below it.** A native Windows PC, an M5 or a PC without an
 NVIDIA driver cannot check blocks itself, so it follows this project's signer,

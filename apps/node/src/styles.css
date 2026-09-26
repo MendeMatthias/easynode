@@ -537,6 +537,7 @@ body {
 
 .fork-card { border-color: rgba(251, 191, 36, 0.5); font-size: 13px; }
 .fork-card p { color: var(--color-amber); margin: 0; line-height: 1.45; }
+.follow-card button { margin-top: var(--space-s); }
 
 /* Your node's role: one fact per line, each ending in a sentence on whether it
    helps. The mark is the only judgement on the card and it is deliberately
