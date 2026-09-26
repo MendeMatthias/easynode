@@ -450,7 +450,10 @@ const ATTACHED_STOP_GRACE: std::time::Duration =
     std::time::Duration::from_secs(btx_core::node::SHUTDOWN_GRACE_SECS);
 /// Backstop on the whole graceful quit: a wedged btxd must never turn "quit"
 /// back into a force-quit. Strictly larger than the stop grace, so a healthy
-/// flush finishes on its own terms rather than being cut off by the backstop.
+/// flush finishes while the app still waits. A flush that runs longer is no
+/// longer killed when the backstop abandons the wait: the stop leaves btxd to
+/// finish on its own (`NodeController::stop`), and the next start recognises
+/// the orphan, as it always has after a Windows self-update.
 const QUIT_GRACE: std::time::Duration = std::time::Duration::from_secs(95);
 
 /// Single writer for the phase: also mirrors it onto the tray, so tray text
@@ -4870,10 +4873,11 @@ mod tests {
     }
 
     /// The two quit budgets are INDEPENDENT literals, and their order is the
-    /// invariant: the backstop must outlast the flush it is backstopping.
-    /// Lowering `QUIT_GRACE` below the stop grace would silently re-introduce
-    /// the mid-flush kill from the other direction — the quit would force-exit
-    /// while btxd was still writing, with no log line to say so.
+    /// invariant: the backstop must outlast the stop's grace, so an ordinary
+    /// flush finishes while the app waits and the next start is clean. (Since
+    /// 2026-09-26 a backstop that fires no longer kills btxd, it leaves it to
+    /// finish; staying above the grace still spares the next start an orphan
+    /// to deal with.)
     /// (`ATTACHED_STOP_GRACE` is *derived* from the managed path's grace, so
     /// the two stop paths cannot drift apart at all — that needs no test.)
     #[test]

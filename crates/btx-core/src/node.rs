@@ -2261,12 +2261,24 @@ pub async fn stop_unmanaged_node(datadir: &Path, btx_cli: &Path, grace: std::tim
     // The daemon writes its own pid to <datadir>/btxd.pid and removes it at
     // the very end of shutdown; once that pid is no longer alive the datadir
     // lock is free (checking the flock itself portably would need the lock).
-    let deadline = std::time::Instant::now() + grace;
+    // Past `grace`, a node whose log still moves is still flushing and is
+    // given until SHUTDOWN_HARD_CAP_SECS (`keep_waiting_for_exit`).
+    let started = std::time::Instant::now();
+    let mut log = LogMotion::new(datadir);
     let mut stopped = false;
-    while std::time::Instant::now() < deadline {
+    let mut said_extending = false;
+    while keep_waiting_for_exit(started.elapsed(), log.since_moved(), grace) {
         if !btxd_pidfile_alive(datadir) {
             stopped = true;
             break;
+        }
+        if !said_extending && started.elapsed() >= grace {
+            said_extending = true;
+            eprintln!(
+                "[node] btxd still shutting down after {}s and its log is still moving; \
+                 waiting up to {SHUTDOWN_HARD_CAP_SECS}s before forcing it",
+                grace.as_secs()
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
@@ -2394,6 +2406,72 @@ async fn force_kill_foreign_btxd(datadir: &Path) {
 /// our own child ([`NodeController::stop`]) or one we merely attached to — the
 /// datadir does not care which process started it.
 pub const SHUTDOWN_GRACE_SECS: u64 = 90;
+
+/// Past its grace, a stopping btxd whose `debug.log` is still moving is still
+/// shutting down and is left to finish, for up to this long in all.
+///
+/// The grace alone sits at the LOW end of the flush it budgets for (90-120 s
+/// at ~185k, measured above, and the chain has grown since), so a fixed
+/// deadline killed healthy nodes mid-flush on slow machines. The log is the
+/// one progress signal every platform has. Raised by jpp's review of the stop
+/// paths, 2026-09-26.
+pub const SHUTDOWN_HARD_CAP_SECS: u64 = 600;
+
+/// ...and past the grace, a log that has not moved for this long reads as
+/// wedged. Twice the longest silent stretch measured in a shutdown, the
+/// shielded flush's 30-60 s.
+pub const SHUTDOWN_QUIET_SECS: u64 = 120;
+
+/// Keep waiting for a stopping btxd to exit? Always inside `grace`; past it,
+/// only while the log has moved SINCE THE STOP WAS ASKED, recently, and the
+/// hard cap has not passed. `since_log_moved` is `None` while the log has not
+/// moved at all since then: a node that has written nothing is not "still
+/// flushing", and gets exactly its grace, as before. Pure, so the policy is
+/// tested apart from any process.
+pub fn keep_waiting_for_exit(
+    elapsed: std::time::Duration,
+    since_log_moved: Option<std::time::Duration>,
+    grace: std::time::Duration,
+) -> bool {
+    if elapsed < grace {
+        return true;
+    }
+    elapsed < std::time::Duration::from_secs(SHUTDOWN_HARD_CAP_SECS)
+        && since_log_moved.is_some_and(|d| d < std::time::Duration::from_secs(SHUTDOWN_QUIET_SECS))
+}
+
+/// Tracks when `<datadir>/debug.log` last changed size after the stop was
+/// asked, for [`keep_waiting_for_exit`].
+struct LogMotion {
+    path: PathBuf,
+    last_len: Option<u64>,
+    moved_at: Option<std::time::Instant>,
+}
+
+impl LogMotion {
+    /// Baselined at the moment of the stop request: only movement after it
+    /// counts.
+    fn new(datadir: &Path) -> Self {
+        let path = datadir.join("debug.log");
+        let last_len = std::fs::metadata(&path).ok().map(|m| m.len());
+        Self {
+            path,
+            last_len,
+            moved_at: None,
+        }
+    }
+
+    /// Time since the log last moved, or `None` if it has not moved since the
+    /// stop was asked.
+    fn since_moved(&mut self) -> Option<std::time::Duration> {
+        let len = std::fs::metadata(&self.path).ok().map(|m| m.len());
+        if len != self.last_len {
+            self.last_len = len;
+            self.moved_at = Some(std::time::Instant::now());
+        }
+        self.moved_at.map(|t| t.elapsed())
+    }
+}
 
 /// Watch a JUST-SPAWNED btxd child for `watch_for`: returns `false` if the
 /// child exited within the window, `true` if it is still alive at the end.
@@ -3108,8 +3186,21 @@ impl NodeController {
     /// Fix: poll `try_wait()` for up to `SHUTDOWN_GRACE_SECS` (90 s) before
     /// falling back to SIGKILL. A clean exit leaves no marker → next start
     /// loads in ~1 second instead of ~8 minutes.
+    ///
+    /// Past the grace the wait goes on while `debug.log` still moves, up to
+    /// [`SHUTDOWN_HARD_CAP_SECS`] ([`keep_waiting_for_exit`]). And a wait that
+    /// is ABANDONED, which is what the app's quit backstop does, leaves btxd to
+    /// finish on its own instead of killing it: the child is held so that
+    /// dropping this future does not fire `kill_on_drop`. A node that finishes
+    /// its flush after the app has gone is the clean outcome, and the next
+    /// start already recognises an orphan (`pre_launch_plan`), the state a
+    /// Windows self-update has always left behind.
     pub async fn stop(&mut self, btx_cli: &Path, datadir: &Path) -> AppResult<()> {
         const POLL_INTERVAL_MS: u64 = 500;
+
+        // Out of the controller BEFORE the request, so nothing that drops the
+        // controller from here on can kill a node that is shutting down.
+        let child = self.child.take().map(std::mem::ManuallyDrop::new);
 
         // Issue the graceful stop request. btxd's stop RPC returns once it has
         // received the request, NOT when it has finished flushing.
@@ -3121,27 +3212,40 @@ impl NodeController {
         stop_cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         let _ = stop_cmd.status().await;
 
-        if let Some(mut c) = self.child.take() {
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS);
+        if let Some(mut c) = child {
+            let grace = std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS);
+            let started = std::time::Instant::now();
+            let mut log = LogMotion::new(datadir);
             let mut exited = false;
-            while std::time::Instant::now() < deadline {
+            let mut said_extending = false;
+            while keep_waiting_for_exit(started.elapsed(), log.since_moved(), grace) {
                 // try_wait returns Ok(Some(status)) once the child has exited
                 // (any exit reason). On Err we still keep polling — the next
-                // iteration may succeed, and the deadline bounds the loop.
+                // iteration may succeed, and the policy bounds the loop.
                 if matches!(c.try_wait(), Ok(Some(_))) {
                     exited = true;
                     break;
+                }
+                if !said_extending && started.elapsed() >= grace {
+                    said_extending = true;
+                    eprintln!(
+                        "[node] btxd still shutting down after {SHUTDOWN_GRACE_SECS}s and its log \
+                         is still moving; waiting up to {SHUTDOWN_HARD_CAP_SECS}s before forcing it"
+                    );
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
             }
             if !exited {
                 eprintln!(
-                    "[node] btxd did not exit within {SHUTDOWN_GRACE_SECS}s of graceful stop; \
-                     sending SIGKILL (next start may rebuild shielded state)"
+                    "[node] btxd did not exit after {}s of graceful stop (log quiet or cap \
+                     reached); sending SIGKILL (next start may rebuild shielded state)",
+                    started.elapsed().as_secs()
                 );
                 let _ = c.kill().await;
             }
+            // Finished with it either way: the process has exited or been
+            // killed, so the handle's own kill_on_drop has nothing left to do.
+            drop(std::mem::ManuallyDrop::into_inner(c));
         }
         let _ = std::fs::remove_file(pidfile_path(datadir));
         Ok(())
@@ -3513,6 +3617,60 @@ mod tests {
         let _ = holder.kill().await;
     }
 
+    /// Past its grace, a node that is still writing its log is still
+    /// flushing, and is waited for until it exits rather than cut off at the
+    /// grace. Before 2026-09-26 this returned at the grace, with the node
+    /// still mid-flush and the force-kill next in line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_unmanaged_node_waits_out_a_flush_that_is_still_logging() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = tmp.path().join("btx-cli");
+        std::fs::write(&cli, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = tmp.path().join("debug.log");
+        std::fs::write(&log, "").unwrap();
+
+        // A "flush" that logs a line every half second for four seconds and
+        // then exits: twice the grace it is given.
+        let script = format!(
+            "for i in 1 2 3 4 5 6 7 8; do echo flushing >> '{}'; sleep 0.5; done",
+            log.display()
+        );
+        let holder = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .spawn()
+            .unwrap();
+        let pid = holder.id().unwrap();
+        std::fs::write(tmp.path().join("btxd.pid"), pid.to_string()).unwrap();
+        // Reap it the moment it exits, as its real parent would: an unreaped
+        // child stays a zombie that still reads as alive.
+        let reaper = tokio::spawn(async move {
+            let mut holder = holder;
+            holder.wait().await
+        });
+
+        let grace = std::time::Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        stop_unmanaged_node(tmp.path(), &cli, grace).await;
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= std::time::Duration::from_millis(3500),
+            "returned after {waited:?}, at the grace, while the node was still logging"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(10),
+            "returned after {waited:?}: the wait must end when the node exits"
+        );
+        assert!(
+            reaper.is_finished(),
+            "the wait must end because the node exited"
+        );
+    }
+
     // ── Launch-watch: telling a lock-race death from a slow startup ─────────
 
     /// Drive the REAL NodeController::start against a shim script so the watch
@@ -3642,6 +3800,78 @@ mod tests {
         .await
         .expect("a caller-driven start always runs");
         assert_eq!(c.restarts, 0);
+    }
+
+    /// The grace is a floor, not a deadline: past it a node whose log still
+    /// moves keeps its flush, a quiet one is forced, and the cap ends it all.
+    #[test]
+    fn a_stopping_node_keeps_its_flush_while_its_log_moves() {
+        let s = std::time::Duration::from_secs;
+        let grace = s(SHUTDOWN_GRACE_SECS);
+        // Inside the grace nothing else is asked, however quiet the log.
+        assert!(keep_waiting_for_exit(s(10), None, grace));
+        assert!(keep_waiting_for_exit(s(89), None, grace));
+        // A log that has not moved since the stop: exactly the grace, as before.
+        assert!(!keep_waiting_for_exit(s(90), None, grace));
+        // Past it: moving recently keeps waiting, quiet for the window forces.
+        assert!(keep_waiting_for_exit(s(100), Some(s(5)), grace));
+        assert!(keep_waiting_for_exit(
+            s(200),
+            Some(s(SHUTDOWN_QUIET_SECS - 1)),
+            grace
+        ));
+        assert!(!keep_waiting_for_exit(
+            s(200),
+            Some(s(SHUTDOWN_QUIET_SECS)),
+            grace
+        ));
+        // The cap wins over a moving log: a node that logs forever is wedged too.
+        assert!(!keep_waiting_for_exit(
+            s(SHUTDOWN_HARD_CAP_SECS),
+            Some(s(0)),
+            grace
+        ));
+        // The quiet window must cover the longest silent stretch measured in a
+        // shutdown (the shielded flush, up to 60 s) with room to spare.
+        assert!(SHUTDOWN_QUIET_SECS >= 2 * 60);
+        assert!(SHUTDOWN_HARD_CAP_SECS > SHUTDOWN_GRACE_SECS + SHUTDOWN_QUIET_SECS);
+    }
+
+    /// The quit backstop abandons the stop; it must not kill the node with it.
+    /// Before 2026-09-26 the child's kill_on_drop fired when the stop future
+    /// was dropped, SIGKILLing a node mid-flush on every quit that outlasted
+    /// the backstop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_abandoned_stop_leaves_the_node_to_finish() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // A node that ignores the stop request, like one deep in a flush.
+        let mut controller = start_shim(tmp.path(), "trap '' TERM\nexec sleep 30").await;
+        let pid = controller.child.as_ref().and_then(|c| c.id()).expect("pid");
+        let cli = tmp.path().join("btx-cli");
+        std::fs::write(&cli, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let abandoned = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            controller.stop(&cli, tmp.path()),
+        )
+        .await;
+        assert!(
+            abandoned.is_err(),
+            "the stop was still waiting when abandoned"
+        );
+        drop(controller);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            crate::platform::process_is_alive(pid),
+            "an abandoned stop must leave the node running to finish its flush"
+        );
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status();
     }
 
     #[cfg(unix)]
