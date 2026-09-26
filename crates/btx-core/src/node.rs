@@ -2261,24 +2261,23 @@ pub async fn stop_unmanaged_node(datadir: &Path, btx_cli: &Path, grace: std::tim
     // The daemon writes its own pid to <datadir>/btxd.pid and removes it at
     // the very end of shutdown; once that pid is no longer alive the datadir
     // lock is free (checking the flock itself portably would need the lock).
-    // Past `grace`, a node whose log still moves is still flushing and is
-    // given until SHUTDOWN_HARD_CAP_SECS (`keep_waiting_for_exit`).
+    // Past `grace`, a node that is still logging or still using CPU is still
+    // working, and is waited for (`keep_waiting_for_exit`).
     let started = std::time::Instant::now();
-    let mut log = LogMotion::new(datadir);
+    let mut watch = ShutdownWatch::new(datadir, btxd_pidfile_pid(datadir), grace).await;
     let mut stopped = false;
-    let mut said_extending = false;
-    while keep_waiting_for_exit(started.elapsed(), log.since_moved(), grace) {
+    let mut notes = ExtensionNotes::default();
+    loop {
+        let progress = watch.progress().await;
+        if !keep_waiting_for_exit(started.elapsed(), progress, grace) {
+            break;
+        }
         if !btxd_pidfile_alive(datadir) {
             stopped = true;
             break;
         }
-        if !said_extending && started.elapsed() >= grace {
-            said_extending = true;
-            eprintln!(
-                "[node] btxd still shutting down after {}s and its log is still moving; \
-                 waiting up to {SHUTDOWN_HARD_CAP_SECS}s before forcing it",
-                grace.as_secs()
-            );
+        if started.elapsed() >= grace {
+            notes.note(progress, started.elapsed());
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
@@ -2412,36 +2411,172 @@ pub const SHUTDOWN_GRACE_SECS: u64 = 90;
 ///
 /// The grace alone sits at the LOW end of the flush it budgets for (90-120 s
 /// at ~185k, measured above, and the chain has grown since), so a fixed
-/// deadline killed healthy nodes mid-flush on slow machines. The log is the
-/// one progress signal every platform has. Raised by jpp's review of the stop
-/// paths, 2026-09-26.
+/// deadline killed healthy nodes mid-flush on slow machines. Raised by jpp's
+/// review of the stop paths, 2026-09-26.
 pub const SHUTDOWN_HARD_CAP_SECS: u64 = 600;
 
-/// ...and past the grace, a log that has not moved for this long reads as
-/// wedged. Twice the longest silent stretch measured in a shutdown, the
-/// shielded flush's 30-60 s.
+/// Past its grace, a stopping btxd that is still using CPU is left to finish
+/// for up to this long in all, logging or not.
+///
+/// The log is not the only sign of work. On the 0.34.9 engine a stop cannot
+/// cancel a protected ExactReplay, a replay logs nothing while it runs (only
+/// the shielded rebuild logs progress), and a CPU replay of a ~141 TMAC episode
+/// can take hours. Cutting one off wastes the replay and leaves an unclean
+/// shutdown, and on a pruned keeper the rebuild after it cannot read the blocks
+/// it needs. So a busy node is waited for, and the window says why. jpp,
+/// 2026-09-26; the engine's own fix is 0.34.10's cancel-on-shutdown (6c1eced9),
+/// after which this cap should almost never be reached.
+pub const SHUTDOWN_BUSY_CAP_SECS: u64 = 6 * 60 * 60;
+
+/// ...and past the grace, a node that has neither logged nor used CPU for this
+/// long reads as wedged. Twice the longest silent stretch measured in a
+/// shutdown, the shielded flush's 30-60 s.
 pub const SHUTDOWN_QUIET_SECS: u64 = 120;
 
-/// Keep waiting for a stopping btxd to exit? Always inside `grace`; past it,
-/// only while the log has moved SINCE THE STOP WAS ASKED, recently, and the
-/// hard cap has not passed. `since_log_moved` is `None` while the log has not
-/// moved at all since then: a node that has written nothing is not "still
-/// flushing", and gets exactly its grace, as before. Pure, so the policy is
-/// tested apart from any process.
+/// A stopping node counts as busy when it used at least this share of one CPU
+/// core between two samples. A replay keeps a core or more saturated; a node
+/// waiting on anything else uses next to none.
+pub const SHUTDOWN_BUSY_CPU_PERCENT: u64 = 20;
+
+/// What a stopping btxd has shown since the stop was asked: how long ago its
+/// `debug.log` last grew, and how long ago it last used CPU in earnest. `None`
+/// for a sign it has not shown at all since then.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShutdownProgress {
+    pub since_log_moved: Option<std::time::Duration>,
+    pub since_cpu_busy: Option<std::time::Duration>,
+}
+
+impl ShutdownProgress {
+    /// Busy with CPU within the quiet window.
+    pub fn cpu_busy(&self) -> bool {
+        within_quiet_window(self.since_cpu_busy)
+    }
+}
+
+fn within_quiet_window(since: Option<std::time::Duration>) -> bool {
+    since.is_some_and(|d| d < std::time::Duration::from_secs(SHUTDOWN_QUIET_SECS))
+}
+
+/// Keep waiting for a stopping btxd to exit? Always inside `grace`. Past it,
+/// only while it has shown work SINCE THE STOP WAS ASKED, recently: using CPU,
+/// up to [`SHUTDOWN_BUSY_CAP_SECS`]; only logging, up to
+/// [`SHUTDOWN_HARD_CAP_SECS`]. A node that has shown neither gets exactly its
+/// grace, as before. Pure, so the policy is tested apart from any process.
 pub fn keep_waiting_for_exit(
     elapsed: std::time::Duration,
-    since_log_moved: Option<std::time::Duration>,
+    progress: ShutdownProgress,
     grace: std::time::Duration,
 ) -> bool {
     if elapsed < grace {
         return true;
     }
-    elapsed < std::time::Duration::from_secs(SHUTDOWN_HARD_CAP_SECS)
-        && since_log_moved.is_some_and(|d| d < std::time::Duration::from_secs(SHUTDOWN_QUIET_SECS))
+    if progress.cpu_busy() {
+        return elapsed < std::time::Duration::from_secs(SHUTDOWN_BUSY_CAP_SECS);
+    }
+    within_quiet_window(progress.since_log_moved)
+        && elapsed < std::time::Duration::from_secs(SHUTDOWN_HARD_CAP_SECS)
+}
+
+/// Whether `cpu` of CPU time over `wall` of wall time is a node at work. Pure.
+pub fn cpu_was_busy(cpu: std::time::Duration, wall: std::time::Duration) -> bool {
+    !wall.is_zero()
+        && cpu.as_secs_f64() * 100.0 >= wall.as_secs_f64() * SHUTDOWN_BUSY_CPU_PERCENT as f64
+}
+
+/// How often a stop samples the node's CPU: every 5 s, or four times within a
+/// short grace so a busy node is seen before the grace runs out.
+fn cpu_sample_every(grace: std::time::Duration) -> std::time::Duration {
+    (grace / 4).clamp(
+        std::time::Duration::from_millis(250),
+        std::time::Duration::from_secs(5),
+    )
+}
+
+/// Watches a stopping btxd for signs of work, for [`keep_waiting_for_exit`]:
+/// its log, and the CPU its process uses.
+struct ShutdownWatch {
+    log: LogMotion,
+    pid: Option<u32>,
+    sample_every: std::time::Duration,
+    last_cpu: Option<(std::time::Instant, std::time::Duration)>,
+    busy_at: Option<std::time::Instant>,
+}
+
+impl ShutdownWatch {
+    /// Baselined at the moment of the stop request. Without a pid only the log
+    /// is watched, which is the policy before CPU counted.
+    async fn new(datadir: &Path, pid: Option<u32>, grace: std::time::Duration) -> Self {
+        let mut watch = Self {
+            log: LogMotion::new(datadir),
+            pid,
+            sample_every: cpu_sample_every(grace),
+            last_cpu: None,
+            busy_at: None,
+        };
+        watch.last_cpu = watch.read_cpu().await;
+        watch
+    }
+
+    async fn read_cpu(&self) -> Option<(std::time::Instant, std::time::Duration)> {
+        let cpu = crate::platform::process_cpu_time(self.pid?).await?;
+        Some((std::time::Instant::now(), cpu))
+    }
+
+    async fn progress(&mut self) -> ShutdownProgress {
+        match self.last_cpu {
+            // A failed first read is retried, so one bad sample does not turn
+            // the CPU signal off for the whole stop.
+            None if self.pid.is_some() => self.last_cpu = self.read_cpu().await,
+            Some((at, cpu)) if at.elapsed() >= self.sample_every => {
+                if let Some((now, cpu_now)) = self.read_cpu().await {
+                    if cpu_was_busy(cpu_now.saturating_sub(cpu), now - at) {
+                        self.busy_at = Some(now);
+                    }
+                    self.last_cpu = Some((now, cpu_now));
+                }
+            }
+            _ => {}
+        }
+        ShutdownProgress {
+            since_log_moved: self.log.since_moved(),
+            since_cpu_busy: self.busy_at.map(|t| t.elapsed()),
+        }
+    }
+}
+
+/// Says why a stop is still waiting past its grace, once per reason rather
+/// than on every poll.
+#[derive(Default)]
+struct ExtensionNotes {
+    log: bool,
+    cpu: bool,
+}
+
+impl ExtensionNotes {
+    fn note(&mut self, progress: ShutdownProgress, elapsed: std::time::Duration) {
+        if progress.cpu_busy() {
+            if !std::mem::replace(&mut self.cpu, true) {
+                eprintln!(
+                    "[node] btxd still shutting down after {}s and still using CPU, most likely \
+                     a block check this engine cannot cancel (it logs nothing while it runs); \
+                     waiting for it, up to {}h, rather than cutting it off",
+                    elapsed.as_secs(),
+                    SHUTDOWN_BUSY_CAP_SECS / 3600
+                );
+            }
+        } else if !std::mem::replace(&mut self.log, true) {
+            eprintln!(
+                "[node] btxd still shutting down after {}s and its log is still moving; \
+                 waiting up to {SHUTDOWN_HARD_CAP_SECS}s before forcing it",
+                elapsed.as_secs()
+            );
+        }
+    }
 }
 
 /// Tracks when `<datadir>/debug.log` last changed size after the stop was
-/// asked, for [`keep_waiting_for_exit`].
+/// asked, for [`ShutdownWatch`].
 struct LogMotion {
     path: PathBuf,
     last_len: Option<u64>,
@@ -2503,12 +2638,18 @@ pub async fn child_survives_launch_watch(
 /// Whether the daemon-written `<datadir>/btxd.pid` (NOT our easybtx-node.pid)
 /// points at a live process. Used to wait out a foreign daemon's shutdown.
 pub fn btxd_pidfile_alive(datadir: &Path) -> bool {
-    let pid: Option<u32> = std::fs::read_to_string(datadir.join("btxd.pid"))
-        .ok()
-        .and_then(|s| s.trim().parse().ok());
     // Cross-platform liveness (kill(pid,0) on unix, OpenProcess on Windows) so the
     // foreign-daemon shutdown wait works on Windows too, not just unix.
-    pid.map(crate::platform::process_is_alive).unwrap_or(false)
+    btxd_pidfile_pid(datadir)
+        .map(crate::platform::process_is_alive)
+        .unwrap_or(false)
+}
+
+/// The pid btxd wrote to `<datadir>/btxd.pid`, if the file holds one.
+fn btxd_pidfile_pid(datadir: &Path) -> Option<u32> {
+    std::fs::read_to_string(datadir.join("btxd.pid"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
 }
 
 /// Returns the path of the btxd log file EasyBTX redirects stdout/stderr into.
@@ -3187,8 +3328,9 @@ impl NodeController {
     /// falling back to SIGKILL. A clean exit leaves no marker → next start
     /// loads in ~1 second instead of ~8 minutes.
     ///
-    /// Past the grace the wait goes on while `debug.log` still moves, up to
-    /// [`SHUTDOWN_HARD_CAP_SECS`] ([`keep_waiting_for_exit`]). And a wait that
+    /// Past the grace the wait goes on while btxd still shows work: its
+    /// `debug.log` moving, up to [`SHUTDOWN_HARD_CAP_SECS`], or its CPU busy,
+    /// up to [`SHUTDOWN_BUSY_CAP_SECS`] ([`keep_waiting_for_exit`]). And a wait that
     /// is ABANDONED, which is what the app's quit backstop does, leaves btxd to
     /// finish on its own instead of killing it: the child is held so that
     /// dropping this future does not fire `kill_on_drop`. A node that finishes
@@ -3215,10 +3357,14 @@ impl NodeController {
         if let Some(mut c) = child {
             let grace = std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS);
             let started = std::time::Instant::now();
-            let mut log = LogMotion::new(datadir);
+            let mut watch = ShutdownWatch::new(datadir, c.id(), grace).await;
             let mut exited = false;
-            let mut said_extending = false;
-            while keep_waiting_for_exit(started.elapsed(), log.since_moved(), grace) {
+            let mut notes = ExtensionNotes::default();
+            loop {
+                let progress = watch.progress().await;
+                if !keep_waiting_for_exit(started.elapsed(), progress, grace) {
+                    break;
+                }
                 // try_wait returns Ok(Some(status)) once the child has exited
                 // (any exit reason). On Err we still keep polling — the next
                 // iteration may succeed, and the policy bounds the loop.
@@ -3226,19 +3372,15 @@ impl NodeController {
                     exited = true;
                     break;
                 }
-                if !said_extending && started.elapsed() >= grace {
-                    said_extending = true;
-                    eprintln!(
-                        "[node] btxd still shutting down after {SHUTDOWN_GRACE_SECS}s and its log \
-                         is still moving; waiting up to {SHUTDOWN_HARD_CAP_SECS}s before forcing it"
-                    );
+                if started.elapsed() >= grace {
+                    notes.note(progress, started.elapsed());
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
             }
             if !exited {
                 eprintln!(
-                    "[node] btxd did not exit after {}s of graceful stop (log quiet or cap \
-                     reached); sending SIGKILL (next start may rebuild shielded state)",
+                    "[node] btxd did not exit after {}s of graceful stop (no log or CPU activity, \
+                     or the cap reached); sending SIGKILL (next start may rebuild shielded state)",
                     started.elapsed().as_secs()
                 );
                 let _ = c.kill().await;
@@ -3671,6 +3813,56 @@ mod tests {
         );
     }
 
+    /// The case jpp named: a node busy with a block check that writes nothing
+    /// to its log. Modelled by a process that burns a core for four to five
+    /// seconds, twice its grace, and never logs. Before CPU counted, the wait ended at
+    /// the grace and the node was killed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_unmanaged_node_waits_out_a_silent_block_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = tmp.path().join("btx-cli");
+        std::fs::write(&cli, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(tmp.path().join("debug.log"), "").unwrap();
+
+        // perl, because it ships with both macOS and every Debian and Ubuntu
+        // base system, and burns the CPU in its OWN process: a shell loop
+        // would spend it in `date` children the pid does not count. `time` is
+        // whole seconds, so this runs between four and five.
+        let holder = tokio::process::Command::new("perl")
+            .arg("-e")
+            .arg("my $e = time + 5; 1 while time < $e;")
+            .spawn()
+            .expect("perl");
+        let pid = holder.id().unwrap();
+        std::fs::write(tmp.path().join("btxd.pid"), pid.to_string()).unwrap();
+        let reaper = tokio::spawn(async move {
+            let mut holder = holder;
+            holder.wait().await
+        });
+
+        let grace = std::time::Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        stop_unmanaged_node(tmp.path(), &cli, grace).await;
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= std::time::Duration::from_millis(3500),
+            "returned after {waited:?}, at the grace, while the node was busy"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(12),
+            "returned after {waited:?}: the wait must end when the node exits"
+        );
+        let status = reaper.await.unwrap().unwrap();
+        assert!(
+            status.success(),
+            "the node was killed ({status:?}) instead of left to finish"
+        );
+    }
+
     // ── Launch-watch: telling a lock-race death from a slow startup ─────────
 
     /// Drive the REAL NodeController::start against a shim script so the watch
@@ -3808,33 +4000,106 @@ mod tests {
     fn a_stopping_node_keeps_its_flush_while_its_log_moves() {
         let s = std::time::Duration::from_secs;
         let grace = s(SHUTDOWN_GRACE_SECS);
+        let log = |since: Option<std::time::Duration>| ShutdownProgress {
+            since_log_moved: since,
+            since_cpu_busy: None,
+        };
         // Inside the grace nothing else is asked, however quiet the log.
-        assert!(keep_waiting_for_exit(s(10), None, grace));
-        assert!(keep_waiting_for_exit(s(89), None, grace));
+        assert!(keep_waiting_for_exit(s(10), log(None), grace));
+        assert!(keep_waiting_for_exit(s(89), log(None), grace));
         // A log that has not moved since the stop: exactly the grace, as before.
-        assert!(!keep_waiting_for_exit(s(90), None, grace));
+        assert!(!keep_waiting_for_exit(s(90), log(None), grace));
         // Past it: moving recently keeps waiting, quiet for the window forces.
-        assert!(keep_waiting_for_exit(s(100), Some(s(5)), grace));
+        assert!(keep_waiting_for_exit(s(100), log(Some(s(5))), grace));
         assert!(keep_waiting_for_exit(
             s(200),
-            Some(s(SHUTDOWN_QUIET_SECS - 1)),
+            log(Some(s(SHUTDOWN_QUIET_SECS - 1))),
             grace
         ));
         assert!(!keep_waiting_for_exit(
             s(200),
-            Some(s(SHUTDOWN_QUIET_SECS)),
+            log(Some(s(SHUTDOWN_QUIET_SECS))),
             grace
         ));
         // The cap wins over a moving log: a node that logs forever is wedged too.
         assert!(!keep_waiting_for_exit(
             s(SHUTDOWN_HARD_CAP_SECS),
-            Some(s(0)),
+            log(Some(s(0))),
             grace
         ));
         // The quiet window must cover the longest silent stretch measured in a
         // shutdown (the shielded flush, up to 60 s) with room to spare.
         assert!(SHUTDOWN_QUIET_SECS >= 2 * 60);
         assert!(SHUTDOWN_HARD_CAP_SECS > SHUTDOWN_GRACE_SECS + SHUTDOWN_QUIET_SECS);
+    }
+
+    /// jpp, 2026-09-26: on 0.34.9 a protected ExactReplay cannot be cancelled,
+    /// logs nothing while it runs, and on CPU can take hours. A node still
+    /// using CPU is waited for, well past the log's cap, and silence alone no
+    /// longer ends the wait. Before this, the same node was forced at 90 s plus
+    /// the log's quiet window.
+    #[test]
+    fn a_stopping_node_that_is_still_using_cpu_is_not_cut_off() {
+        let s = std::time::Duration::from_secs;
+        let grace = s(SHUTDOWN_GRACE_SECS);
+        let busy = |since_cpu: u64, since_log: Option<u64>| ShutdownProgress {
+            since_log_moved: since_log.map(s),
+            since_cpu_busy: Some(s(since_cpu)),
+        };
+        // Silent and busy: waited for past the grace, and past the log's cap.
+        assert!(keep_waiting_for_exit(s(95), busy(3, None), grace));
+        assert!(keep_waiting_for_exit(
+            s(SHUTDOWN_HARD_CAP_SECS + 1),
+            busy(3, None),
+            grace
+        ));
+        assert!(keep_waiting_for_exit(s(3 * 3600), busy(3, None), grace));
+        // A busy node whose log is also stale by then is still waited for.
+        assert!(keep_waiting_for_exit(
+            s(1000),
+            busy(3, Some(SHUTDOWN_QUIET_SECS * 5)),
+            grace
+        ));
+        // CPU gone quiet for the whole window: it is not working any more.
+        assert!(!keep_waiting_for_exit(
+            s(1000),
+            busy(SHUTDOWN_QUIET_SECS, None),
+            grace
+        ));
+        // And even a busy node has a ceiling.
+        assert!(!keep_waiting_for_exit(
+            s(SHUTDOWN_BUSY_CAP_SECS),
+            busy(0, Some(0)),
+            grace
+        ));
+        // Nothing seen at all: exactly the grace, as before.
+        assert!(!keep_waiting_for_exit(
+            s(90),
+            ShutdownProgress::default(),
+            grace
+        ));
+        // The ceiling has to outlast a CPU replay of hours, and the log's cap.
+        const _: () = assert!(SHUTDOWN_BUSY_CAP_SECS >= 4 * 3600);
+        const _: () = assert!(SHUTDOWN_BUSY_CAP_SECS > SHUTDOWN_HARD_CAP_SECS);
+    }
+
+    #[test]
+    fn busy_means_a_real_share_of_a_core() {
+        let ms = std::time::Duration::from_millis;
+        // A replay saturates a core or more.
+        assert!(cpu_was_busy(ms(5000), ms(5000)));
+        assert!(cpu_was_busy(ms(9000), ms(5000)));
+        // The threshold, 20 % of one core, and just under it.
+        assert!(cpu_was_busy(ms(1000), ms(5000)));
+        assert!(!cpu_was_busy(ms(999), ms(5000)));
+        // A node waiting on anything else uses next to nothing.
+        assert!(!cpu_was_busy(ms(20), ms(5000)));
+        assert!(!cpu_was_busy(ms(0), ms(5000)));
+        assert!(!cpu_was_busy(ms(100), ms(0)));
+        // Sampled every 5 s, or four times inside a short grace.
+        assert_eq!(cpu_sample_every(ms(90_000)), ms(5000));
+        assert_eq!(cpu_sample_every(ms(2000)), ms(500));
+        assert_eq!(cpu_sample_every(ms(100)), ms(250));
     }
 
     /// The quit backstop abandons the stop; it must not kill the node with it.

@@ -16,15 +16,20 @@ it would have taken an invalid chain flagged heaviest as its reference. It now
 says unverified in both cases and names the chain and block. Contributed by
 jpp.
 
-**Stopping or quitting no longer cuts a node off in the middle of saving its
-state.** A node gets 90 seconds to shut down, which is the low end of the
-90 to 120 seconds measured on a Mac at a much shorter chain, and after that it
-was force-stopped mid-save and the next start spent minutes rebuilding. Now a
-node that is still writing its log after those 90 seconds is still saving and
-is given up to ten minutes; one that has gone quiet is stopped as before. And
-quitting the app no longer kills a node that is taking longer than the app
-waits: it is left to finish on its own, and the next start picks it up, as it
-already did after a Windows update. Raised in a review by jpp.
+**Stopping or quitting no longer cuts a node off while it is still working.**
+A node gets 90 seconds to shut down, which is the low end of the 90 to 120
+seconds measured on a Mac at a much shorter chain, and after that it was
+force-stopped, mid-save or mid-check, and the next start spent minutes
+rebuilding. Now a node that is still working after those 90 seconds is waited
+for: up to ten minutes while it is still writing its log, and up to six hours
+while it is still using the processor. The second matters on this engine: a
+block check cannot be cancelled by a stop, writes nothing to the log while it
+runs, and on a processor rather than a graphics card can take hours. A node
+that is doing neither is stopped as before. While a stop runs long, the window
+says so instead of freezing on the last status. And quitting the app no longer
+kills a node that is taking longer than the app waits: it is left to finish on
+its own, and the next start picks it up, as it already did after a Windows
+update. Raised in a review by jpp.
 
 ## [0.6.31] - 2026-09-26
 
