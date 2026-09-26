@@ -1310,7 +1310,9 @@ async fn spawn_node_with_lock_retry(
                 app,
                 state,
                 NodePhase::Warming {
-                    message: "Waiting for the previous node to finish shutting down…".to_string(),
+                    message: "Waiting for the previous node to finish shutting down. If it is \
+                              in the middle of checking a block, this can take a while…"
+                        .to_string(),
                 },
             )
             .await;
@@ -2374,6 +2376,44 @@ fn ends_header_bootstrap(marker_pending: bool, attached: Option<AttachedTo>) -> 
     marker_pending && attached_node_is_ours_to_stop(attached)
 }
 
+/// What the window says while a stop runs past its grace. The node is still
+/// working: saving its state, or on the 0.34.9 engine a block check that a
+/// stop cannot cancel and that can take hours on a CPU. Waiting is the safe
+/// choice, and quitting is too: a quit leaves the node to finish on its own.
+const STILL_STOPPING: &str = "Your node is finishing its work before it stops. This can take \
+     a while. You can quit easyNode in the meantime; the node finishes on its own.";
+
+/// When [`STILL_STOPPING`] goes up: a little past the stop's own grace, which
+/// starts only once `btx-cli stop` has answered, so a node that is forced at
+/// the grace never flashes it.
+const STILL_STOPPING_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(btx_core::node::SHUTDOWN_GRACE_SECS + 5);
+
+/// Runs `stop`. If it outlasts `after` (the stop's grace), the window shows
+/// [`STILL_STOPPING`] until it returns, and then whatever it showed before,
+/// unless something else has changed the phase meanwhile. Without this a long
+/// stop left the last status on screen, frozen, since the refresher is
+/// stopped first.
+async fn stop_with_note(
+    state: &AppState,
+    after: std::time::Duration,
+    stop: impl std::future::Future<Output = ()>,
+) {
+    let mut stop = std::pin::pin!(stop);
+    if tokio::time::timeout(after, &mut stop).await.is_ok() {
+        return;
+    }
+    let note = NodePhase::Warming {
+        message: STILL_STOPPING.to_string(),
+    };
+    let before = std::mem::replace(&mut *state.phase.lock().await, note.clone());
+    stop.await;
+    let mut phase = state.phase.lock().await;
+    if *phase == note {
+        *phase = before;
+    }
+}
+
 /// Graceful stop shared by the command, the tray, and app exit.
 pub async fn stop_node_inner(state: &AppState) {
     // Kill the refresher first so it can't overwrite the Stopped phase.
@@ -2389,7 +2429,10 @@ pub async fn stop_node_inner(state: &AppState) {
         let mut guard = state.node.lock().await;
         if let Some(controller) = guard.as_mut() {
             if let Some((btx_cli, datadir)) = launch.as_ref() {
-                let _ = controller.stop(btx_cli, datadir).await;
+                stop_with_note(state, STILL_STOPPING_AFTER, async {
+                    let _ = controller.stop(btx_cli, datadir).await;
+                })
+                .await;
             }
             *guard = None;
         } else if let Some((btx_cli, datadir)) = launch.as_ref() {
@@ -2401,7 +2444,12 @@ pub async fn stop_node_inner(state: &AppState) {
                 // the very next quit takes this branch. The old 10 s wait here
                 // (inherited from stop_foreign_node) force-killed btxd mid-flush
                 // and cost a multi-minute shielded-state rebuild on the next start.
-                btx_core::node::stop_unmanaged_node(datadir, btx_cli, ATTACHED_STOP_GRACE).await;
+                stop_with_note(
+                    state,
+                    STILL_STOPPING_AFTER,
+                    btx_core::node::stop_unmanaged_node(datadir, btx_cli, ATTACHED_STOP_GRACE),
+                )
+                .await;
             } else {
                 // ATTACHED TO SOMEONE ELSE'S NODE. Detach, do not stop.
                 //
@@ -4870,6 +4918,38 @@ mod tests {
             pre_launch_plan(false, false, NOTHING, FIRST_LOOK),
             PreLaunchPlan::SpawnFresh
         );
+    }
+
+    /// A stop that runs past its grace says so, and hands the window back to
+    /// whatever it showed before once it ends; a quick one never flashes the
+    /// note; and a phase something else set meanwhile is left alone.
+    #[tokio::test]
+    async fn a_long_stop_says_so_and_then_gives_the_status_back() {
+        let ms = std::time::Duration::from_millis;
+        let note = super::NodePhase::Warming {
+            message: super::STILL_STOPPING.to_string(),
+        };
+        let state = super::AppState::new();
+        *state.phase.lock().await = super::NodePhase::Stopped;
+
+        super::stop_with_note(&state, ms(500), async {}).await;
+        assert_eq!(*state.phase.lock().await, super::NodePhase::Stopped);
+
+        let during = std::sync::Mutex::new(None);
+        super::stop_with_note(&state, ms(20), async {
+            tokio::time::sleep(ms(120)).await;
+            *during.lock().unwrap() = Some(state.phase.lock().await.clone());
+        })
+        .await;
+        assert_eq!(during.into_inner().unwrap(), Some(note));
+        assert_eq!(*state.phase.lock().await, super::NodePhase::Stopped);
+
+        super::stop_with_note(&state, ms(20), async {
+            tokio::time::sleep(ms(120)).await;
+            *state.phase.lock().await = super::NodePhase::Welcome;
+        })
+        .await;
+        assert_eq!(*state.phase.lock().await, super::NodePhase::Welcome);
     }
 
     /// The two quit budgets are INDEPENDENT literals, and their order is the

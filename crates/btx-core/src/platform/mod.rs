@@ -117,6 +117,19 @@ pub async fn process_name(pid: u32) -> Option<String> {
     imp::process_name(pid).await
 }
 
+/// The CPU time `pid` has used so far, user plus system, or `None` when it
+/// cannot be read (the process is gone, or the platform refused). Linux reads
+/// `/proc/<pid>/stat`, macOS `ps -o time=`, Windows `GetProcessTimes`.
+///
+/// Used by the stop paths ([`crate::node::keep_waiting_for_exit`]) to tell a
+/// btxd that is still working through its shutdown from one that is idle or
+/// wedged: on the 0.34.9 engine a protected ExactReplay cannot be cancelled by
+/// a stop and writes nothing to the log while it runs, so the CPU it burns is
+/// the only sign it is alive.
+pub async fn process_cpu_time(pid: u32) -> Option<std::time::Duration> {
+    imp::process_cpu_time(pid).await
+}
+
 /// Force-terminate `pid` (last resort). unix: `SIGKILL`; Windows:
 /// `TerminateProcess`. Best-effort; callers must confirm the pid is the intended
 /// target (alive + named btxd) first — this does no safety checking itself.
