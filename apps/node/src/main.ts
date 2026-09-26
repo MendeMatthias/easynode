@@ -11,7 +11,7 @@ import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { AmbientLine } from "./ambient";
 import { validationView } from "./validation";
-import { type CatchupSample, catchupTrend, pushSample } from "./catchup-trend";
+import { type CatchupSample, catchupLine, pushSample } from "./catchup-trend";
 import {
   classifyCheckFailure,
   checkFailureMessage,
@@ -829,7 +829,11 @@ function renderStatus(status: NodeStatusInfo) {
   // wording below can tell a closing gap from a pinned one. Cheap, bounded,
   // and the only place the sample is available.
   if (p.phase === "ready") {
-    catchupSamples = pushSample(catchupSamples, { at: Date.now(), behind: p.blocks_behind }, Date.now());
+    catchupSamples = pushSample(
+      catchupSamples,
+      { at: Date.now(), behind: p.blocks_behind, height: p.height },
+      Date.now(),
+    );
   } else if (p.phase !== "syncing") {
     // A stop, an error or a fresh start invalidates the history: a gap
     // measured before a restart says nothing about the one after it.
@@ -862,12 +866,12 @@ function renderStatus(status: NodeStatusInfo) {
         // was catching up. That wording reads as slow internet and sends people
         // hunting peers, which is what happened on 2026-09-06 and 2026-09-13.
         // So say which of the two is happening, from the gap's own trend.
+        //
+        // And say how long: the line carries the node's own measured pace, a
+        // time to go while the gap closes and the two rates side by side when
+        // it does not (catchup-trend.ts, where the wording is tested).
         badge.textContent = "LIVE";
-        const trend = catchupTrend(catchupSamples, Date.now());
-        sub.textContent =
-          trend === "stalled"
-            ? `Your node is live but not catching up. It is ${fmtInt(p.blocks_behind)} blocks behind and the gap is not closing.`
-            : `Your node is live, still catching up — ${fmtInt(p.blocks_behind)} blocks behind`;
+        sub.textContent = catchupLine(p.blocks_behind, catchupSamples, Date.now());
       } else {
         // "LIVE", not "READY": the node is running and serving the network now —
         // "ready" reads like it's waiting to do something.

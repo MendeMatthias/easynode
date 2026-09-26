@@ -8,6 +8,19 @@ root).
 
 ## [Unreleased]
 
+**A node that is behind says how long it has left, or that it is not catching
+up and by how much.** A new install starts from block 219,000, more than 10,000
+blocks below the tip, and the status line said "still catching up" and a
+number, which gave nobody a way to tell a two-hour wait from one that never
+ends. On 26 September a new node reported 4 blocks in 30 minutes, and the only
+way its owner could learn whether that would ever finish was to ask. The line
+now carries the node's own pace, measured over up to the last hour: "about 2
+days to go at this pace" while the gap closes, and "It adds about 8 blocks an
+hour while the network adds about 40" when it does not. The figures appear
+after fifteen minutes of measuring, and until then the line reads as before.
+They are the node's own measurement, not a promise: a node that speeds up or
+slows down gets a new figure.
+
 ## [0.6.30] - 2026-09-25
 
 **The update that lets a node which follows signatures move again.** The engine
