@@ -1792,6 +1792,44 @@ pub fn clear_matmul_consensus_refused(datadir: &Path) {
     }
 }
 
+/// The owner's choice to follow signatures on a machine that could check
+/// blocks itself. The app offers it only when it has measured the machine
+/// adding fewer blocks an hour than the chain makes, a node that will never
+/// reach the tip (catchup-trend.ts; the owner's decision of 2026-09-26), and
+/// sets it only on the owner's click.
+///
+/// A file for the same reason as the refusal marker above: every path that
+/// decides the launch reads it through [`launches_as_mirror`], with nothing to
+/// thread through. Unlike that marker a node upgrade does not clear it: it
+/// records a person's choice, not a verdict a newer engine could change.
+/// Settings clears it.
+fn follow_signatures_path(datadir: &Path) -> std::path::PathBuf {
+    datadir.join(".follow-signatures")
+}
+
+/// Has the owner chosen to follow signatures on this datadir's host?
+pub fn follows_signatures_by_choice(datadir: &Path) -> bool {
+    follow_signatures_path(datadir).exists()
+}
+
+/// Record or withdraw the owner's choice. Idempotent both ways.
+pub fn set_follows_signatures_by_choice(datadir: &Path, on: bool) -> std::io::Result<()> {
+    let path = follow_signatures_path(datadir);
+    if on {
+        std::fs::write(
+            &path,
+            "The owner chose, in the app, to follow signatures instead of checking\n\
+             blocks on this machine, which was adding fewer blocks an hour than\n\
+             the chain makes. Settings switches it back.\n",
+        )
+    } else {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Whether THIS launch should run as a trusted mirror.
 ///
 /// `trusted_mirror_enabled` answers the static question ("is this a host class
@@ -1818,8 +1856,15 @@ pub fn trusted_mirror_required(backend: Backend, datadir: &Path) -> bool {
 /// keeps a Cpu host in consensus. Unset, the backend decides: a Cuda host
 /// validates, a Cpu host mirrors (2026-09-15), a refused Mac mirrors, and
 /// Metal with a clear marker validates. Only on an engine that allows a
-/// degraded start; before 0.34.5 the split does not apply.
+/// degraded start; before 0.34.5 the split does not apply. The owner's choice
+/// to follow signatures ([`follows_signatures_by_choice`]) makes any host a
+/// mirror, unless the operator's word is `=0`.
 pub fn launches_as_mirror(btxd: &Path, datadir: &Path, backend: Backend) -> bool {
+    // The owner's choice outranks the backend split, a Cuda host included,
+    // and yields only to the operator's explicit =0.
+    if follows_signatures_by_choice(datadir) && trusted_mirror_override() != Some(false) {
+        return true;
+    }
     let degraded_start = node_allows_degraded_matmul_start(btxd);
     let cuda_validates_here = degraded_start
         && matches!(backend, Backend::Cuda)
@@ -4000,6 +4045,40 @@ consensus-validator service.";
         clear_matmul_consensus_refused(&dir);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The owner's choice makes a machine that could validate follow
+    /// signatures, Metal and Cuda alike, and withdrawing it restores the
+    /// launch it had. Nothing else touches it: an engine upgrade clears the
+    /// refusal marker, never this one.
+    #[test]
+    fn the_owners_choice_to_follow_signatures_decides_the_launch() {
+        let tmp = tempfile::tempdir().expect("temp datadir");
+        let dir = tmp.path();
+        let btxd = Path::new("/x/btx/v0.34.9/mac/btxd");
+        assert!(!follows_signatures_by_choice(dir));
+        assert!(!launches_as_mirror(btxd, dir, Backend::Metal));
+
+        set_follows_signatures_by_choice(dir, true).unwrap();
+        assert!(follows_signatures_by_choice(dir));
+        for backend in [Backend::Metal, Backend::Cuda, Backend::Cpu] {
+            assert!(launches_as_mirror(btxd, dir, backend), "{backend:?}");
+        }
+        let (_, args, _) = build_node_command(btxd, dir, &dir.join("btx.conf"), Backend::Metal);
+        assert!(args.iter().any(|a| a == "-matmulvalidation=trusted"));
+        assert!(args.iter().any(|a| a == "-matmultrustedthreshold=1"));
+
+        clear_matmul_consensus_refused(dir);
+        assert!(
+            follows_signatures_by_choice(dir),
+            "an upgrade must not undo a choice"
+        );
+
+        set_follows_signatures_by_choice(dir, false).unwrap();
+        assert!(!follows_signatures_by_choice(dir));
+        assert!(!launches_as_mirror(btxd, dir, Backend::Metal));
+        // Withdrawing twice is not an error.
+        set_follows_signatures_by_choice(dir, false).unwrap();
     }
 
     /// A non-Metal host is a mirror on the static rule alone, with or without

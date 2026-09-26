@@ -173,6 +173,16 @@
           <p id="fork-msg"></p>
         </div>
 
+        <!-- A machine that checks blocks itself, measured adding far fewer
+             blocks an hour than the chain makes, will never reach the tip.
+             Offered, never done for the owner: the button records the choice
+             (btx_core::node::follows_signatures_by_choice) and restarts the
+             node; Settings takes it back. The owner's decision, 2026-09-26. -->
+        <div class="card fork-card follow-card" id="follow-card" hidden>
+          <p id="follow-msg"></p>
+          <button id="follow-btn" class="btn-secondary" type="button">Follow signatures instead</button>
+        </div>
+
         <!-- Which role this node actually fills, one fact per line, each with
              a sentence on whether it helps (btx_core::role). Exists because no
              screen said it: a key pinned on a trusted mirror signed nothing
@@ -307,6 +317,21 @@
               <span class="slider"></span>
             </label>
           </div>
+
+          <!-- The way back from the status screen's offer, and the same choice
+               for anyone who wants it on a machine that could check blocks.
+               Hidden on a machine that follows signatures anyway. -->
+          <div class="setting-row" id="follow-row" hidden>
+            <div class="setting-text">
+              <span class="setting-name">Follow signatures instead of checking blocks</span>
+              <span class="setting-desc">For a machine too slow to keep up with the chain. Your node follows the signatures of a node that checks blocks, as a Windows PC does, stops checking the proof of work itself and cannot sign. It restarts to apply the change</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="follow-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <p class="setting-result" id="follow-result" hidden></p>
 
           <!-- The signer role (btx_core::signer). The switch is the whole
                ask of the 2026-09-16 outage: btxscan froze because ONE key on

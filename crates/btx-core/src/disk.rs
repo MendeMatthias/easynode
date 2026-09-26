@@ -229,10 +229,27 @@ pub fn sweep_loaded_snapshot(
     if !(caller_loaded_flag && sweep_allowed && crate::snapshot::snapshot_marker_present(datadir)) {
         return None;
     }
+    let mut freed: u64 = 0;
+    let mut removed = false;
     let snap = datadir.join("faststart").join("snapshot.dat");
-    let bytes = std::fs::metadata(&snap).ok()?.len();
-    std::fs::remove_file(&snap).ok()?;
-    Some(bytes)
+    if let Ok(meta) = std::fs::metadata(&snap) {
+        if std::fs::remove_file(&snap).is_ok() {
+            freed += meta.len();
+            removed = true;
+        }
+    }
+    // The signed pair a node that follows signatures loads instead
+    // (`attested_snapshot`) goes under the same gate: once the node has built
+    // on a snapshot, neither file is read again.
+    let pairs = crate::attested_snapshot::pair_dir(datadir);
+    if pairs.is_dir() {
+        let bytes = dir_size_bytes(&pairs);
+        if std::fs::remove_dir_all(&pairs).is_ok() {
+            freed += bytes;
+            removed = true;
+        }
+    }
+    removed.then_some(freed)
 }
 
 /// Chain/node directories that lite-pool can safely reclaim. NEVER includes
@@ -607,6 +624,30 @@ mod tests {
         // Idempotent once gone.
         assert_eq!(sweep_loaded_snapshot(&dd, true, true), None);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_signed_pair_is_swept_under_the_same_gate_as_the_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dd = tmp.path();
+        let pairs = crate::attested_snapshot::pair_dir(dd);
+        std::fs::create_dir_all(&pairs).unwrap();
+        std::fs::write(pairs.join("utxo-btx-main-229500.dat"), vec![0u8; 1000]).unwrap();
+        std::fs::write(pairs.join("snapshot-manifest-229500.json"), vec![0u8; 335]).unwrap();
+        // No compiled snapshot.dat at all: a node whose 219,000 download failed
+        // still loads the signed pair, and the pair must still be swept.
+        assert_eq!(sweep_loaded_snapshot(dd, true, true), None, "no marker yet");
+        assert!(pairs.is_dir());
+        crate::snapshot::mark_snapshot_marker(dd);
+        assert_eq!(
+            sweep_loaded_snapshot(dd, true, false),
+            None,
+            "not built on yet"
+        );
+        assert!(pairs.is_dir());
+        assert_eq!(sweep_loaded_snapshot(dd, true, true), Some(1335));
+        assert!(!pairs.exists());
+        assert_eq!(sweep_loaded_snapshot(dd, true, true), None);
     }
 
     // ── prune_old_quarantines / quarantine_entries_to_prune ────────────────

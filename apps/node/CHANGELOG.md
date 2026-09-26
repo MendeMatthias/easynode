@@ -8,6 +8,35 @@ root).
 
 ## [Unreleased]
 
+**A computer too slow to keep up is told so, and can follow signatures
+instead.** A Mac or an NVIDIA PC checks every block itself, and one that checks
+them slower than the chain makes them never reaches the tip: the one Mac
+measured, an M2 Pro, does about 27 an hour against the chain's 40. When the
+status screen measures that, far under the chain's pace for fifteen minutes and
+more, it says so with both numbers and offers to follow signatures instead, as
+a Windows PC does. Nothing changes until the owner clicks twice; the node then
+restarts, stops checking the proof of work itself and cannot sign. Settings
+has the switch back, and the same choice for anyone who wants it. A node held
+to the chain's own pace, the cadence hold, is never offered it: that is not a
+slow machine.
+
+**A new node that follows signatures starts a few hundred blocks from the tip,
+not ten thousand below it.** A native Windows PC, an M5 or a PC without an
+NVIDIA driver cannot check blocks itself, so it follows this project's signer,
+`02d5efca…`. Until now it started from the snapshot compiled into its engine,
+block 219,000, and then needed a signature for every block since, which one
+reachable peer held; while that peer was stuck, a new node crawled. It now
+starts from the newest snapshot the signer has exported and signed, published
+beside the app's releases and loaded with `loadtxoutsetattested`. The engine
+refuses a snapshot that a key the node trusts did not sign, so where it is
+downloaded from does not have to be trusted. The trade, decided on 26
+September: until its background check reaches that snapshot's height and
+compares the balances, the node takes the signer's word for them as well as
+for each block. A node that checks blocks itself is unchanged, and anything
+that goes wrong on the way falls back to block 219,000 as before. The status
+card no longer says two independent operators sign for such a node; since the
+23 September split, one does.
+
 **A node that is behind says how long it has left, or that it is not catching
 up and by how much.** A new install starts from block 219,000, more than 10,000
 blocks below the tip, and the status line said "still catching up" and a

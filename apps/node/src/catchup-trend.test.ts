@@ -9,6 +9,8 @@ import {
   TREND_MIN_SPAN_MS,
   TREND_WINDOW_MS,
   type CatchupSample,
+  TOO_SLOW_FOR_THE_CHAIN_PER_HOUR,
+  cannotCatchUp,
   catchupLine,
   catchupPace,
   catchupTrend,
@@ -297,5 +299,52 @@ describe("catchupLine", () => {
     expect(pace!.addedPerHour).toBeLessThan(10);
     expect(catchupLine(10_812, s, now)).toContain("not catching up");
     expect(catchupLine(10_812, s, now)).toContain("It adds about 8 blocks an hour");
+  });
+});
+
+describe("cannotCatchUp", () => {
+  it("names the slow node's pace, the case the switch exists for", () => {
+    expect(cannotCatchUp(slowNode(), T0 + min(30))).toBe(8);
+  });
+
+  it("names a node that has not moved as adding none", () => {
+    const s = [
+      { at: T0, behind: 400, height: 227_312 },
+      { at: T0 + min(20), behind: 413, height: 227_312 },
+    ];
+    expect(cannotCatchUp(s, T0 + min(20))).toBe(0);
+  });
+
+  it("never offers the switch for the cadence hold, which it would not fix", () => {
+    // 39 an hour against the chain's 40: a node held to the chain's pace.
+    const s = [
+      { at: T0, behind: 90, height: 227_000 },
+      { at: T0 + min(10), behind: 90, height: 227_006 },
+      { at: T0 + min(20), behind: 91, height: 227_013 },
+    ];
+    expect(cannotCatchUp(s, T0 + min(20))).toBeNull();
+    expect(TOO_SLOW_FOR_THE_CHAIN_PER_HOUR).toBeLessThan(CHAIN_BLOCKS_PER_HOUR);
+  });
+
+  it("never offers it to a node that is catching up, or before the pace is measured", () => {
+    const closing = [
+      { at: T0, behind: 10_800, height: 219_000 },
+      { at: T0 + min(10), behind: 10_769, height: 219_038 },
+      { at: T0 + min(20), behind: 10_737, height: 219_076 },
+    ];
+    expect(cannotCatchUp(closing, T0 + min(20))).toBeNull();
+    const early = slowNode().filter((x) => x.at <= T0 + min(10));
+    expect(cannotCatchUp(early, T0 + min(10))).toBeNull();
+    expect(cannotCatchUp([], T0)).toBeNull();
+  });
+
+  it("offers it on the M2 Pro's measured pace", () => {
+    // 27 an hour checking blocks, from the 0.6.29 changelog.
+    const s = [
+      { at: T0, behind: 5_000, height: 220_000 },
+      { at: T0 + min(10), behind: 5_002, height: 220_004 },
+      { at: T0 + min(20), behind: 5_004, height: 220_009 },
+    ];
+    expect(cannotCatchUp(s, T0 + min(20))).toBe(27);
   });
 });

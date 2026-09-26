@@ -68,17 +68,48 @@ activated it in 2 s. It took four shell scripts and a person watching them.
 
 ## What the role does not do
 
-It does not change what any node loads. `loadtxoutsetattested` refuses on a
-consensus node by design ("Strict consensus nodes must refuse this RPC"), and
-`fetchattestedutxosnapshot` is only available under `matmulvalidation=trusted`.
-Loading an attested snapshot therefore means running as a trusted mirror and
-taking the signers' word for the chain state. At a 1-of-1 quorum that is one
-key's word. easyNode's bootstrap (`btx_core::snapshot`) still loads the
-compiled pin with `loadtxoutset`, and pointing it at an attested snapshot is a
-trust decision to make separately, not a URL to swap.
+It does not change what the producing node loads, and it does not publish.
+`loadtxoutsetattested` refuses on a consensus node by design ("Strict
+consensus nodes must refuse this RPC"), and `fetchattestedutxosnapshot` is only
+available under `matmulvalidation=trusted`. Loading an attested snapshot
+therefore means running as a trusted mirror and taking the signers' word for
+the chain state. At a 1-of-1 quorum that is one key's word.
 
 A snapshot only helps importers that pin the producing key. A signed file
 nobody pins is a signed file.
+
+## Who loads it, from 0.6.31
+
+Mende decided on 2026-09-26 that a node which follows signatures should start
+from the newest signed pair rather than the compiled 219,000 snapshot. The code
+is `crates/btx-core/src/attested_snapshot.rs` and
+`snapshot::ensure_snapshot_loaded_with`.
+
+* **Who.** A node that launches as a trusted mirror (a native Windows PC, an
+  M5, a PC without an NVIDIA driver). A node that checks blocks itself keeps
+  the compiled snapshot; the engine would refuse the signed one.
+* **From where.** Over HTTPS, not P2P: this machine is at home, behind a
+  router, at an address that moves, and a new node rarely reaches it.
+  `utxo-snapshot-latest/attested-snapshot.json` on
+  MendeMatthias/EasyBTX-releases names the newest pair, and the pair itself
+  is the pre-release `utxo-snapshot-<height>`, files named as the keeper
+  names them. When the pointer is missing or fails its checks, the node uses
+  the 225,927 pair the app pins. When that fails too, it loads the compiled
+  snapshot exactly as before.
+* **What is checked, and by whom.** The app checks sizes and SHA-256s so a
+  bad download never reaches the engine. Trust is the engine's:
+  `VerifyUtxoSnapshotManifest` refuses a manifest not signed by a pinned key,
+  so the host and the pointer never need to be trusted.
+* **What it costs in trust.** The node takes the signer's word for the
+  balances at the base, where a mirror started from the compiled snapshot
+  takes it only for each block's proof of work. Temporarily: the background
+  chainstate re-checks every block below the base and compares the result with
+  the signed hash (`MaybeCompleteSnapshotValidation` uses
+  `m_attested_assumeutxo`), and a mismatch invalidates the snapshot chainstate.
+* **Publishing.** `scripts/publish-attested-snapshot.sh`, run on the machine
+  with this role on, from cron every six hours. It publishes only a pair that
+  matches the keeper's record and carries `02d5efca`'s signature, replaces the
+  pointer, reads it back, and keeps the newest three pairs plus 225,927.
 
 ## Things that are not obvious
 

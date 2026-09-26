@@ -146,12 +146,19 @@ export function validationView(status: ValidationInput): ValidationView {
     }
     return {
       state: "Mirror",
+      // "Two independent operators" stopped being true at the 23 September
+      // split: one key signs the valid chain, this project's own (0.6.30).
+      // And a node that follows signatures now starts from a snapshot that key
+      // signed (btx_core::attested_snapshot), so "the balances, your node
+      // still checks" is only true once the background check reaches it. The
+      // sentence below holds for the compiled snapshot and the signed one.
       note:
         "This machine cannot check the new proof of work itself, so instead of stopping at " +
-        "block 185,000 your node follows the chain using signed confirmations from two " +
-        "independent operators who did check it. Everything else, the blocks, the " +
-        "transactions and the balances, your node still checks on its own. The trade is " +
-        "real: for that one check you are trusting those two, not verifying it yourself.",
+        "block 185,000 your node follows the chain using signed confirmations from a node " +
+        "that did check it. Today that is one signer, run by this project. Your node still " +
+        "checks the blocks and transactions on its own, and it re-checks the snapshot it " +
+        "started from in the background. The trade is real: for the proof of work you are " +
+        "trusting that signer, not verifying it yourself.",
       cls: "is-degraded",
     };
   }

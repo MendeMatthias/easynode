@@ -1233,7 +1233,14 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
             "[snapshot] header bootstrap launch: the snapshot loads after the restart that ends it"
         );
     } else {
-        btx_core::snapshot::ensure_snapshot_loaded(
+        // A node that follows signatures starts from the newest snapshot this
+        // project's signer has signed, a few hundred blocks from the tip,
+        // instead of the compiled one thousands below it
+        // (btx_core::attested_snapshot; the owner's decision of 2026-09-26).
+        // One that checks blocks itself cannot load a signed snapshot, the
+        // engine refuses it, so it keeps the compiled one. Same rule as the
+        // -matmulvalidation arm, through `signer_applies_here`.
+        btx_core::snapshot::ensure_snapshot_loaded_with(
             rpc.clone(),
             paths.btx_cli.clone(),
             datadir.clone(),
@@ -1241,6 +1248,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
             Arc::new(NodeAppSnapshotFlags {
                 datadir: datadir.clone(),
             }),
+            !signer_applies_here,
         );
     }
 
@@ -1636,9 +1644,16 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         // connected blocks past the snapshot base and has not
                         // died failing to rewind one — see
                         // `snapshot::snapshot_sweep_allowed`.
+                        // Measured from the signed pair's base when one is on
+                        // disk: it sits above the compiled anchor, and "built
+                        // on it" means past the snapshot actually loaded.
+                        let base = btx_core::attested_snapshot::pair_height_on_disk(&dd)
+                            .map_or(snapshot_spec().anchor_height, |h| {
+                                h.max(snapshot_spec().anchor_height)
+                            });
                         let allowed = btx_core::snapshot::snapshot_sweep_allowed(
                             chain.blocks,
-                            snapshot_spec().anchor_height,
+                            base,
                             &btx_core::node::node_log_tail(&dd, 64 * 1024),
                         );
                         let swept = btx_core::disk::sweep_loaded_snapshot(&dd, loaded, allowed);
@@ -1653,8 +1668,9 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         // while the flag was the only gate; now that the sweep
                         // can legitimately defer, `snapshot_swept = loaded`
                         // would turn "not yet" into "never this session".
-                        snapshot_swept =
-                            swept.is_some() || !dd.join("faststart").join("snapshot.dat").exists();
+                        snapshot_swept = swept.is_some()
+                            || (!dd.join("faststart").join("snapshot.dat").exists()
+                                && !btx_core::attested_snapshot::pair_dir(&dd).exists());
                     }
                     // Independent reads — one round-trip instead of two.
                     // getpeerinfo replaces getconnectioncount (its length IS
@@ -2666,6 +2682,10 @@ pub struct NodeStatusInfo {
     /// of signed attestations rather than replaying the proof itself. True on
     /// machines btxd will not accept, which would otherwise park at 184,999.
     pub rc_trusted_mirror: bool,
+    /// The owner chose to follow signatures on a machine that could check
+    /// blocks itself (`btx_core::node::follows_signatures_by_choice`). Drives
+    /// the Settings switch that takes it back.
+    pub follow_signatures: bool,
     /// Bytes this node has uploaded to peers this run (`getnettotals`).
     ///
     /// Feeds the "Helping the network" card: chain data other people actually
@@ -3126,6 +3146,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         rc_reason: rc_policy.as_ref().and_then(|p| p.reason.clone()),
         rc_stalled,
         rc_trusted_mirror: rc_policy.as_ref().is_some_and(|p| p.trusted_mirror),
+        follow_signatures: btx_core::node::follows_signatures_by_choice(&datadir),
         archive_peers,
         stall: state.stall_verdict.lock().await.clone(),
         node_profile: settings.node_profile.clone(),
@@ -3651,6 +3672,34 @@ pub async fn record_update_check(outcome: String, detail: String) -> Result<(), 
         &outcome,
         &detail,
     )
+}
+
+/// Follow signatures instead of checking blocks on this machine, or go back.
+/// Offered on the status screen only when the app has measured this machine
+/// adding fewer blocks an hour than the chain makes (catchup-trend.ts), and
+/// set only on the owner's click; Settings carries the way back. The launch
+/// reads the choice (`btx_core::node::launches_as_mirror`), so a running node
+/// restarts to take it up, the way Explorer mode does.
+#[tauri::command]
+pub async fn set_follow_signatures(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    on: bool,
+) -> Result<(), String> {
+    btx_core::node::set_follows_signatures_by_choice(&node_datadir(), on)
+        .map_err(|e| format!("could not record the choice: {e}"))?;
+    eprintln!(
+        "[node-app] the owner chose to {} on this machine",
+        if on {
+            "follow signatures"
+        } else {
+            "check blocks"
+        }
+    );
+    if state.rpc.lock().await.is_some() {
+        restart_node_projected(&app, &state).await?;
+    }
+    Ok(())
 }
 
 #[tauri::command]

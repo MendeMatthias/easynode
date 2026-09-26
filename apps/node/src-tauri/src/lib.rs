@@ -37,6 +37,7 @@ pub fn run() {
             commands::open_data_folder,
             commands::set_keep_awake,
             commands::set_node_profile,
+            commands::set_follow_signatures,
             commands::set_attestation_serve,
             commands::set_signer,
             commands::set_signer_publish,

@@ -11,7 +11,13 @@ import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { AmbientLine } from "./ambient";
 import { validationView } from "./validation";
-import { type CatchupSample, catchupLine, pushSample } from "./catchup-trend";
+import {
+  CHAIN_BLOCKS_PER_HOUR,
+  type CatchupSample,
+  cannotCatchUp,
+  catchupLine,
+  pushSample,
+} from "./catchup-trend";
 import {
   classifyCheckFailure,
   checkFailureMessage,
@@ -188,6 +194,8 @@ interface NodeStatusInfo {
   rc_stalled: boolean;
   /** Following the chain via an attestation quorum instead of local replay. */
   rc_trusted_mirror: boolean;
+  /** The owner chose to follow signatures on a machine that could validate. */
+  follow_signatures: boolean;
   /**
    * Bytes uploaded to peers this run. Null when stopped or when the node did
    * not answer `getnettotals` — the UI drops the claim rather than showing a
@@ -755,6 +763,98 @@ $<HTMLInputElement>("signer-publish-toggle").addEventListener("change", async (e
   void tick();
 });
 
+/** The status screen's offer to follow signatures: only on a machine that
+ *  checks blocks itself, running, behind, and measured adding far fewer blocks
+ *  an hour than the chain makes (catchup-trend.ts `cannotCatchUp`, which the
+ *  cadence hold never trips). Nothing changes until the owner clicks. */
+function reflectFollowOffer(status: NodeStatusInfo): void {
+  const card = $("follow-card");
+  const p = status.phase;
+  const added =
+    p.phase === "ready" &&
+    !status.rc_stalled &&
+    status.rc_validates_independently &&
+    p.blocks_behind >= LAG_WORTH_SAYING
+      ? cannotCatchUp(catchupSamples, Date.now())
+      : null;
+  if (added === null) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  const pace = added === 0 ? "has added no blocks lately" : `adds about ${added} block${added === 1 ? "" : "s"} an hour`;
+  $("follow-msg").textContent =
+    `This computer checks every block itself and ${pace}, fewer than the ${CHAIN_BLOCKS_PER_HOUR} ` +
+    "the network makes, so it will not catch up this way. It can follow signatures instead, as a " +
+    "Windows PC does: it then stops checking the proof of work itself and cannot sign. You can " +
+    "switch back in Settings.";
+}
+
+function reflectFollowRow(status: NodeStatusInfo): void {
+  // Only where it is a choice: a machine that checks blocks, or one whose
+  // owner already chose. A machine that follows signatures anyway has none.
+  $("follow-row").hidden = !(status.follow_signatures || status.rc_validates_independently);
+  const t = $<HTMLInputElement>("follow-toggle");
+  if (document.activeElement !== t) t.checked = status.follow_signatures;
+}
+
+async function setFollowSignatures(on: boolean): Promise<void> {
+  await invoke("set_follow_signatures", { on });
+  void tick();
+}
+
+// Two steps, like Remove: the first click says what happens, the second does
+// it. The node restarts, so this is not a toggle to brush by accident.
+let followArmTimer: ReturnType<typeof setTimeout> | undefined;
+$("follow-btn").addEventListener("click", async () => {
+  const btn = $<HTMLButtonElement>("follow-btn");
+  if (btn.dataset.armed !== "1") {
+    btn.dataset.armed = "1";
+    btn.textContent = "Click again to restart and follow signatures";
+    clearTimeout(followArmTimer);
+    followArmTimer = setTimeout(() => {
+      btn.dataset.armed = "";
+      btn.textContent = "Follow signatures instead";
+    }, 6000);
+    return;
+  }
+  clearTimeout(followArmTimer);
+  btn.dataset.armed = "";
+  btn.disabled = true;
+  btn.textContent = "Restarting…";
+  try {
+    await setFollowSignatures(true);
+    $("follow-card").hidden = true;
+    catchupSamples = [];
+  } catch (err) {
+    showToast(String(err));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Follow signatures instead";
+  }
+});
+
+$<HTMLInputElement>("follow-toggle").addEventListener("change", async (e) => {
+  const box = e.target as HTMLInputElement;
+  const on = box.checked;
+  const result = $("follow-result");
+  box.disabled = true;
+  try {
+    await setFollowSignatures(on);
+    result.classList.remove("is-error");
+    result.textContent = on
+      ? "Your node restarted and follows signatures now."
+      : "Your node restarted and checks blocks itself again.";
+    catchupSamples = [];
+  } catch (err) {
+    box.checked = !on;
+    result.classList.add("is-error");
+    result.textContent = String(err);
+  }
+  result.hidden = false;
+  box.disabled = false;
+});
+
 $<HTMLInputElement>("signer-toggle").addEventListener("change", async (e) => {
   const box = e.target as HTMLInputElement;
   const on = box.checked;
@@ -811,6 +911,7 @@ function renderStatus(status: NodeStatusInfo) {
   reflectEsploraRow(status);
   reflectWitnessRow(status);
   reflectSnapshotServeRow(status);
+  reflectFollowRow(status);
 
   const mode = visualMode(p, status.rc_stalled);
   orb.className = `status-orb is-${mode}`;
@@ -839,6 +940,8 @@ function renderStatus(status: NodeStatusInfo) {
     // measured before a restart says nothing about the one after it.
     catchupSamples = [];
   }
+
+  reflectFollowOffer(status);
 
   let height = 0;
   switch (p.phase) {
