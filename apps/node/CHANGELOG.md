@@ -8,6 +8,14 @@ root).
 
 ## [Unreleased]
 
+**Esplora mode never calls an endpoint on the invalid side of a split fresh.**
+The census now marks the branch that starts at 227,313 `b28c3e84…` invalid,
+and the guardian that decides whether a wallet endpoint is fresh read neither
+of the new fields. It could have called an endpoint on that branch fresh, and
+it would have taken an invalid chain flagged heaviest as its reference. It now
+says unverified in both cases and names the chain and block. Contributed by
+jpp.
+
 ## [0.6.31] - 2026-09-26
 
 **The update that starts a new node near the tip, and tells a node that is
