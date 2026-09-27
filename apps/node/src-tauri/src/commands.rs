@@ -1035,6 +1035,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     *state.recent_signers.lock().await = None;
     *state.fork.lock().await = None;
     *state.tip_median_time.lock().await = None;
+    state.engine_warnings.lock().await.clear();
 
     set_phase(app, state, NodePhase::Starting).await;
 
@@ -1530,6 +1531,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
     let signer_offer_slot = state.signer_offer.clone();
     let fork_slot = state.fork.clone();
     let tip_time_slot = state.tip_median_time.clone();
+    let engine_warnings_slot = state.engine_warnings.clone();
     let anchor = snapshot_spec().anchor_height;
 
     tauri::async_runtime::spawn(async move {
@@ -1636,6 +1638,9 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     // peers. Recorded on every successful poll, judged at
                     // render time against the clock then.
                     *tip_time_slot.lock().await = Some(chain.median_time);
+                    // What the engine is warning about, from the same answer.
+                    *engine_warnings_slot.lock().await =
+                        btx_core::engine_warnings::from_node(&chain);
                     // Housekeeping: free the ~450 MB bootstrap snapshot the
                     // moment its load is confirmed (C3-gated; safe while btxd
                     // runs — it never holds the file after loadtxoutset).
@@ -2489,6 +2494,7 @@ pub async fn stop_node_inner(state: &AppState) {
     *state.matmul_trusted.lock().await = None;
     *state.fork.lock().await = None;
     *state.tip_median_time.lock().await = None;
+    state.engine_warnings.lock().await.clear();
     // Release the keep-awake assertion — the Mac may sleep again.
     *state.sleep_guard.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
@@ -2686,6 +2692,15 @@ pub struct NodeStatusInfo {
     /// sentence for people.
     pub tip_age_secs: Option<u64>,
     pub tip_stale_message: Option<String>,
+    /// The network's signers have confirmed blocks this node has not even
+    /// received (`btx_core::engine_warnings`). For the chain card when neither
+    /// the tip's age nor a known longer branch says anything, which is exactly
+    /// the case it exists for: blocks equal headers, no branch is known, and
+    /// the tip is not old enough to be stale yet. `None` otherwise.
+    pub behind_signers_message: Option<String>,
+    /// Everything else btxd is warning about, one sentence each, those that
+    /// ask for attention first. Empty when stopped or when there is nothing.
+    pub engine_notes: Vec<btx_core::engine_warnings::EngineNote>,
     /// The nickname the user has chosen (empty = none). This is what WILL be
     /// broadcast; `subversion` below is what IS.
     pub node_nickname: String,
@@ -2727,8 +2742,14 @@ pub struct NodeStatusInfo {
     /// btxd is in `strict-device` mode with a provider that did NOT qualify —
     /// the stall. The node is up and looks healthy but cannot advance past the
     /// fork height. Derived from btxd's own `ready=` flag, not from scanning
-    /// for a failure string (see `node::node_rc_status`).
+    /// for a failure string (see `node::node_rc_status`), or from btxd's
+    /// standing warning that it cannot check the next block, which it keeps up
+    /// for as long as that is true.
     pub rc_stalled: bool,
+    /// That standing warning as the sentence the Block checking card shows in
+    /// place of its generic one, with btxd's reason (`btx_core::engine_warnings`).
+    /// `None` when the engine is not saying it.
+    pub rc_unverifiable_message: Option<String>,
     /// This node follows the chain past the MatMul v4.7 fork through a quorum
     /// of signed attestations rather than replaying the proof itself. True on
     /// machines btxd will not accept, which would otherwise park at 184,999.
@@ -2923,6 +2944,39 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
     } else {
         (None, false)
     };
+
+    // What btxd itself is warning about (btx_core::engine_warnings). Two of
+    // them have a card of their own; the rest are listed as notes.
+    let engine_warnings = if running {
+        state.engine_warnings.lock().await.clone()
+    } else {
+        Vec::new()
+    };
+    let cannot_verify = engine_warnings.iter().find(|w| {
+        matches!(
+            w,
+            btx_core::engine_warnings::EngineWarning::CannotVerifyBlocks { .. }
+        )
+    });
+    // The engine's standing warning outranks the startup log line cached
+    // above. That line is written once, so a chip quarantined an hour into a
+    // run is reported here and nowhere else.
+    let rc_stalled = rc_stalled || cannot_verify.is_some();
+    let rc_unverifiable_message = cannot_verify.map(|w| w.message());
+    let behind_signers_message = engine_warnings
+        .iter()
+        .find(|w| {
+            matches!(
+                w,
+                btx_core::engine_warnings::EngineWarning::BehindSigners { .. }
+            )
+        })
+        .map(|w| w.message());
+    let engine_notes: Vec<_> = engine_warnings
+        .iter()
+        .filter(|w| w.is_note())
+        .map(|w| w.note())
+        .collect();
 
     // Take a CLONE of the handle and drop the guard before any await. Holding
     // `state.rpc` across a network round-trip is what every other call site in
@@ -3172,6 +3226,8 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         tip_stale,
         tip_age_secs,
         tip_stale_message,
+        behind_signers_message,
+        engine_notes,
         fork,
         node_nickname: settings.node_nickname.clone(),
         broadcast_nickname: subversion
@@ -3196,6 +3252,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
             .unwrap_or(false),
         rc_reason: rc_policy.as_ref().and_then(|p| p.reason.clone()),
         rc_stalled,
+        rc_unverifiable_message,
         rc_trusted_mirror: rc_policy.as_ref().is_some_and(|p| p.trusted_mirror),
         follow_signatures: btx_core::node::follows_signatures_by_choice(&datadir),
         archive_peers,

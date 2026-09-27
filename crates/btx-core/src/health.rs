@@ -119,6 +119,7 @@ mod tests {
             median_time: 0, // unknown, which tip_is_stale reads as "not stale"
             is_stale: false,
             behind_best_header: 0,
+            warnings: Vec::new(),
         }
     }
     fn mining(enabled: bool, pause: bool, reason: &str) -> MiningInfo {

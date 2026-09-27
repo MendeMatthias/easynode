@@ -173,6 +173,14 @@
           <p id="fork-msg"></p>
         </div>
 
+        <!-- What btxd itself is warning about (btx_core::engine_warnings),
+             beyond what the Block checking and chain cards say: a wrong
+             clock, an out-of-date engine, a chain the node refused. Amber
+             lines ask something of the person; quiet ones only explain. -->
+        <div class="card fork-card engine-card" id="engine-card" hidden>
+          <div id="engine-notes"></div>
+        </div>
+
         <!-- A machine that checks blocks itself, measured adding far fewer
              blocks an hour than the chain makes, will never reach the tip.
              Offered, never done for the owner: the button records the choice

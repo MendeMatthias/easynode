@@ -12,6 +12,32 @@ const base: ValidationInput = {
 };
 
 describe("validationView", () => {
+  it("lets the engine's standing warning outrank the startup verdict", () => {
+    // The log said Full at startup; the engine has since quarantined the chip.
+    const note = "This machine's graphics chip did not pass the node engine's own check.";
+    const v = validationView({
+      ...base,
+      rc_mode: "strict-device",
+      rc_validates_independently: true,
+      rc_stalled: true,
+      rc_unverifiable_message: note,
+    });
+    expect(v.state).toBe("Stopped");
+    expect(v.note).toBe(note);
+    expect(v.cls).toBe("is-stalled");
+    // And it does not wait for a log verdict that may never be readable.
+    expect(
+      validationView({ ...base, uptime_secs: 30, rc_mode: null, rc_unverifiable_message: note })
+        .state,
+    ).toBe("Stopped");
+  });
+
+  it("keeps the generic stalled sentence when the engine gives none", () => {
+    const v = validationView({ ...base, rc_mode: "strict-device", rc_stalled: true });
+    expect(v.state).toBe("Stopped");
+    expect(v.note).toMatch(/cannot check the new proof of work/);
+  });
+
   it("explains the startup episode instead of showing a blank card", () => {
     // btxd runs one full production episode before it will judge the machine —
     // 102-218 s measured on an M2 Pro. The card used to be hidden for that whole

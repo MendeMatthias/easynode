@@ -23,6 +23,12 @@ export type ValidationInput = {
   rc_validates_independently: boolean;
   rc_may_fall_behind: boolean;
   rc_stalled: boolean;
+  /**
+   * btxd's standing warning that this machine cannot check the next block, as
+   * a sentence rendered in Rust (btx_core::engine_warnings) with btxd's reason.
+   * Null or absent when the engine is not saying it.
+   */
+  rc_unverifiable_message?: string | null;
   /** Following the chain via an attestation quorum instead of local replay. */
   rc_trusted_mirror: boolean;
   /**
@@ -82,6 +88,16 @@ export function validationView(status: ValidationInput): ValidationView {
       note: status.stall.summary,
       cls: "is-stalled",
     };
+  }
+
+  // The engine's own standing warning that it cannot check the next block.
+  // It outranks everything read from the log below: btxd writes its startup
+  // verdict once, so a chip that qualified at startup and was quarantined an
+  // hour later still reads "Full" there. The sentence is the engine's case,
+  // not the generic one, which tells an Apple Silicon Mac that Apple Silicon
+  // runs it fine.
+  if (status.rc_unverifiable_message) {
+    return { state: "Stopped", note: status.rc_unverifiable_message, cls: "is-stalled" };
   }
 
   if (!status.rc_mode) {

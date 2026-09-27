@@ -179,6 +179,14 @@ interface NodeStatusInfo {
   tip_stale: boolean;
   tip_age_secs: number | null;
   tip_stale_message: string | null;
+  /** The network's signers have confirmed blocks this node has not even
+   *  received: the one early sign of a node on a branch the network left,
+   *  when blocks equal headers and the tip is not old yet. Rendered in Rust
+   *  (btx_core::engine_warnings), like fork_message. */
+  behind_signers_message: string | null;
+  /** Everything else btxd is warning about, one sentence each, those that ask
+   *  for attention first. Rendered in Rust; empty when there is nothing. */
+  engine_notes: { message: string; needs_attention: boolean }[];
   node_nickname: string;
   broadcast_nickname: string | null;
   subversion: string | null;
@@ -192,6 +200,9 @@ interface NodeStatusInfo {
   rc_may_fall_behind: boolean;
   rc_reason: string | null;
   rc_stalled: boolean;
+  /** btxd's standing warning that it cannot check the next block, as the
+   *  Block checking card's sentence. Null when the engine is not saying it. */
+  rc_unverifiable_message: string | null;
   /** Following the chain via an attestation quorum instead of local replay. */
   rc_trusted_mirror: boolean;
   /** The owner chose to follow signatures on a machine that could validate. */
@@ -903,6 +914,7 @@ function renderStatus(status: NodeStatusInfo) {
 
   reflectPeerNames(status);
   reflectFork(status);
+  reflectEngineNotes(status);
   renderRole(status);
   reflectSignerRow(status);
   // The close dialog's warning follows the wire on every tick, so a dialog
@@ -1652,13 +1664,50 @@ function reflectFork(status: NodeStatusInfo): void {
   // we cannot reach"; a stale tip says "the newest block we have is hours old
   // however healthy everything else reads", which is the condition every
   // peer-derived signal in this app is blind to by construction.
-  const message = status.tip_stale_message ?? status.fork_message;
+  //
+  // Behind the signers comes last because it is the earliest and the least
+  // specific: it fires minutes into a split the node cannot see, before the
+  // tip is old enough to be stale, and says less than either once they do.
+  const message =
+    status.tip_stale_message ?? status.fork_message ?? status.behind_signers_message;
   if (!running || !message) {
     card.hidden = true;
     return;
   }
   card.hidden = false;
   $("fork-msg").textContent = message;
+}
+
+/**
+ * What btxd itself is warning about, beyond what the Block checking and chain
+ * cards already say: a wrong clock, an engine that is out of date, a chain
+ * the node refused. The sentences are btx_core::engine_warnings'; this only
+ * lays them out, amber for the ones that ask something of the person, quiet
+ * for the ones that only explain. Hidden on any phase that is not running,
+ * like the fork card.
+ */
+function reflectEngineNotes(status: NodeStatusInfo): void {
+  const card = $("engine-card");
+  const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
+  if (!running || status.engine_notes.length === 0) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  card.classList.toggle(
+    "is-calm",
+    !status.engine_notes.some((n) => n.needs_attention),
+  );
+  const list = $("engine-notes");
+  // Elements and textContent, never innerHTML: an unrecognised warning is
+  // shown in the engine's own words.
+  list.textContent = "";
+  for (const note of status.engine_notes) {
+    const p = document.createElement("p");
+    p.className = note.needs_attention ? "" : "is-calm";
+    p.textContent = note.message;
+    list.appendChild(p);
+  }
 }
 
 /**

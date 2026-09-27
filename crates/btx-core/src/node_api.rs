@@ -47,6 +47,40 @@ pub struct BlockchainInfo {
     /// zero means "not reported" as much as it means "caught up".
     #[serde(rename = "behind_best_header", default)]
     pub behind_best_header: u64,
+    /// btxd's standing warnings, in its own words. [`crate::engine_warnings`]
+    /// turns them into sentences a person can act on.
+    ///
+    /// An ARRAY of strings on v0.34.x, or ONE string (every warning joined by a
+    /// newline, "" for none) on a node started with `-deprecatedrpc=warnings`,
+    /// which a hand-edited btx.conf can set. Both decode to the same list.
+    ///
+    /// Decoding this field can never fail the whole call: a shape nobody
+    /// anticipated decodes to an empty list. Losing the warnings is a small
+    /// loss; losing `getblockchaininfo` blinds the refresher to everything.
+    #[serde(default, deserialize_with = "warnings_in_any_shape")]
+    pub warnings: Vec<String>,
+}
+
+/// See [`BlockchainInfo::warnings`]. Non-string array entries and blank lines
+/// are dropped rather than rejected.
+fn warnings_in_any_shape<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    let lines: Vec<String> = match v {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|i| i.as_str().map(str::to_string))
+            .collect(),
+        serde_json::Value::String(joined) => joined.split('\n').map(str::to_string).collect(),
+        _ => Vec::new(),
+    };
+    Ok(lines
+        .into_iter()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
 }
 
 impl BlockchainInfo {
@@ -1161,6 +1195,7 @@ mod tests {
             median_time: 0,
             is_stale: false,
             behind_best_header: 0,
+            warnings: Vec::new(),
         };
         assert!(!caught_up.tip_unsafe_to_act_on());
 
@@ -1237,6 +1272,61 @@ mod tests {
         let bi: BlockchainInfo = serde_json::from_value(v).unwrap();
         assert_eq!(bi.median_time, 0);
         assert!(!tip_is_stale(bi.median_time, 1_800_000_000));
+        assert!(bi.warnings.is_empty(), "no field, no warnings");
+    }
+
+    #[test]
+    fn warnings_decode_from_the_array_and_from_the_deprecated_string() {
+        let base = || {
+            json!({
+                "blocks": 230_000, "headers": 230_000,
+                "verificationprogress": 1.0, "initialblockdownload": false
+            })
+        };
+        // v0.34.x: one array entry per warning.
+        let mut v = base();
+        v["warnings"] = json!(["first warning", "second warning"]);
+        let bi: BlockchainInfo = serde_json::from_value(v).unwrap();
+        assert_eq!(bi.warnings, vec!["first warning", "second warning"]);
+
+        // -deprecatedrpc=warnings: every warning in one string, joined by a
+        // newline (node/warnings.cpp GetWarningsForRpc). The same list.
+        let mut v = base();
+        v["warnings"] = json!("first warning\nsecond warning");
+        let bi: BlockchainInfo = serde_json::from_value(v).unwrap();
+        assert_eq!(bi.warnings, vec!["first warning", "second warning"]);
+
+        // The deprecated form of "no warnings" is an empty string, not a list.
+        let mut v = base();
+        v["warnings"] = json!("");
+        let bi: BlockchainInfo = serde_json::from_value(v).unwrap();
+        assert!(bi.warnings.is_empty());
+    }
+
+    #[test]
+    fn an_unexpected_warnings_shape_never_fails_the_whole_call() {
+        // The refresher reads height, headers and the tip's age from this same
+        // answer. A warnings field it cannot read must cost the warnings only.
+        for odd in [
+            json!(null),
+            json!(7),
+            json!({"a": 1}),
+            json!([1, null, "kept"]),
+        ] {
+            let mut v = json!({
+                "blocks": 230_000, "headers": 230_000,
+                "verificationprogress": 1.0, "initialblockdownload": false
+            });
+            v["warnings"] = odd.clone();
+            let bi: BlockchainInfo = serde_json::from_value(v)
+                .unwrap_or_else(|e| panic!("warnings {odd} broke the decode: {e}"));
+            assert_eq!(bi.blocks, 230_000);
+            assert!(
+                bi.warnings.iter().all(|w| w == "kept"),
+                "{odd}: {:?}",
+                bi.warnings
+            );
+        }
     }
 
     #[tokio::test]
