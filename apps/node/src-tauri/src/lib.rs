@@ -11,6 +11,7 @@ mod ask;
 mod commands;
 mod state;
 mod tray;
+mod update_binding;
 mod update_log;
 mod update_timer;
 mod wallet;
@@ -22,7 +23,15 @@ use crate::state::{node_datadir, AppState, NodeAppSettings, NodePhase};
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        // Every update the plugin offers must be signed under this app's
+        // name at the version the feed announces (update_binding). Both
+        // update paths, the webview's and the six-hourly timer's, go through
+        // this comparator.
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .default_version_comparator(update_binding::comparator)
+                .build(),
+        )
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -77,6 +86,9 @@ pub fn run() {
         ])
         .setup(|app| {
             tray::build_tray(app.handle())?;
+
+            // The high-water mark update_binding refuses to go below.
+            update_binding::remember_running_version(&node_datadir(), &app.package_info().version);
 
             // The six-hourly self-update check, on a tokio timer rather than
             // the webview's setInterval, which the hypothesis in update_timer

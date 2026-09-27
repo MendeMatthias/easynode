@@ -8,6 +8,44 @@ root).
 
 ## [Unreleased]
 
+## [0.6.31] - 2026-09-27
+
+**The update that starts a new node near the tip, tells a node that is
+behind how long it has left, and takes an update only when it was signed for
+that version.** The engine does not change: this is still BTX v0.34.9, the
+same three builds as 0.6.28 to 0.6.30, so no node re-installs its engine. A
+new node that follows signatures starts from a snapshot this project's signer
+signed instead of block 219,000; a computer too slow to keep up, or whose
+graphics chip stops passing the engine's check, is told so and can follow
+signatures instead; every node that is behind says how long it has left, or
+that it will not catch up; and the status screen shows the engine's own
+warnings in plain words. An update signed for another version is refused, a
+gap found by jpp. Stopping no longer cuts off a node that is still working,
+and Esplora mode never calls an endpoint on the invalid side of the split
+fresh.
+
+**An update is taken only when its signature was made for that version.** The
+app has always refused an update the release key did not sign. It now also
+refuses one whose signature was made for another version, another platform or
+the easyBTX miner, which signs with the same key, so an old or wrong build
+cannot be passed off as a new one. It also never takes an update below the
+highest version it has run. A refused update is written to the update log and
+shown in Settings as a failed check with its reason, and the download on
+easybtx.com/node always works by hand. The release scripts refuse to publish a
+feed the app would refuse. Found by jpp.
+
+**A computer too slow to keep up is told so, and can follow signatures
+instead.** A Mac or an NVIDIA PC checks every block itself, and one that checks
+them slower than the chain makes them never reaches the tip: the one Mac
+measured, an M2 Pro, does about 27 an hour against the chain's 40. When the
+status screen measures that, far under the chain's pace for fifteen minutes and
+more, it says so with both numbers and offers to follow signatures instead, as
+a Windows PC does. Nothing changes until the owner clicks twice; the node then
+restarts, stops checking the proof of work itself and cannot sign. Settings
+has the switch back, and the same choice for anyone who wants it. A node held
+to the chain's own pace, the cadence hold, is never offered it: that is not a
+slow machine.
+
 **The status screen says what the node engine itself is warning about.** The
 engine keeps a list of standing warnings, and the app never read it. It now
 shows them in plain words, where they belong:
@@ -35,30 +73,6 @@ catches up, and its deep-reorg notice. That one stays up until the next
 restart, and on this network it mostly means a node has just rejoined the
 main chain after being stuck on a dead branch; blaming an attack for the
 recovery helps nobody.
-
-## [0.6.31] - 2026-09-27
-
-**The update that starts a new node near the tip, and tells a node that is
-behind how long it has left.** The engine does not change: this is still BTX
-v0.34.9, the same three builds as 0.6.28 to 0.6.30, so no node re-installs its
-engine. A new node that follows signatures starts from a snapshot this
-project's signer signed instead of block 219,000; a computer too slow to keep
-up is told so and can follow signatures instead; and every node that is
-behind says how long it has left, or that it will not catch up. Stopping no
-longer cuts off a node that is still working, and Esplora mode never calls an
-endpoint on the invalid side of the split fresh.
-
-**A computer too slow to keep up is told so, and can follow signatures
-instead.** A Mac or an NVIDIA PC checks every block itself, and one that checks
-them slower than the chain makes them never reaches the tip: the one Mac
-measured, an M2 Pro, does about 27 an hour against the chain's 40. When the
-status screen measures that, far under the chain's pace for fifteen minutes and
-more, it says so with both numbers and offers to follow signatures instead, as
-a Windows PC does. Nothing changes until the owner clicks twice; the node then
-restarts, stops checking the proof of work itself and cannot sign. Settings
-has the switch back, and the same choice for anyone who wants it. A node held
-to the chain's own pace, the cadence hold, is never offered it: that is not a
-slow machine.
 
 **A new node that follows signatures starts a few hundred blocks from the tip,
 not ten thousand below it.** A native Windows PC, an M5 or a PC without an

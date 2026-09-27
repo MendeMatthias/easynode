@@ -37,6 +37,7 @@ use tauri::{AppHandle, Emitter};
 use tauri_plugin_updater::UpdaterExt;
 
 use crate::state::node_datadir;
+use crate::update_binding;
 use crate::update_log;
 
 /// The first check waits this long after the timer is armed at launch. The
@@ -140,16 +141,33 @@ async fn check_once(app: &AppHandle) {
     let datadir = node_datadir();
     let current = app.package_info().version.to_string();
 
+    // A refusal left by an earlier check belongs to that check's record.
+    let _ = update_binding::take_refusal();
     let checked = match app.updater_builder().build() {
         Ok(updater) => updater.check().await,
         Err(e) => Err(e),
     };
+    // Whatever the check came to, a refusal it left is this check's, and is
+    // taken now so it cannot relabel a later one.
+    let refusal = update_binding::take_refusal();
     let update = match checked {
         Err(e) => {
             settle(app, &datadir, "check-failed", "", &check_failure_detail(&e));
             return;
         }
+        // Refused by update_binding: the plugin says "nothing to install",
+        // and the record says why, rather than calling the version current.
         Ok(None) => {
+            if let Some(reason) = refusal {
+                settle(
+                    app,
+                    &datadir,
+                    "check-failed",
+                    "",
+                    &format!("automatic: {reason}"),
+                );
+                return;
+            }
             let detail = format!("automatic: v{current} is current");
             settle(app, &datadir, "no-update", "", &detail);
             return;
