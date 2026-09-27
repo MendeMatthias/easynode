@@ -8,29 +8,6 @@ root).
 
 ## [Unreleased]
 
-**Esplora mode never calls an endpoint on the invalid side of a split fresh.**
-The census now marks the branch that starts at 227,313 `b28c3e84…` invalid,
-and the guardian that decides whether a wallet endpoint is fresh read neither
-of the new fields. It could have called an endpoint on that branch fresh, and
-it would have taken an invalid chain flagged heaviest as its reference. It now
-says unverified in both cases and names the chain and block. Contributed by
-jpp.
-
-**Stopping or quitting no longer cuts a node off while it is still working.**
-A node gets 90 seconds to shut down, which is the low end of the 90 to 120
-seconds measured on a Mac at a much shorter chain, and after that it was
-force-stopped, mid-save or mid-check, and the next start spent minutes
-rebuilding. Now a node that is still working after those 90 seconds is waited
-for: up to ten minutes while it is still writing its log, and up to six hours
-while it is still using the processor. The second matters on this engine: a
-block check cannot be cancelled by a stop, writes nothing to the log while it
-runs, and on a processor rather than a graphics card can take hours. A node
-that is doing neither is stopped as before. While a stop runs long, the window
-says so instead of freezing on the last status. And quitting the app no longer
-kills a node that is taking longer than the app waits: it is left to finish on
-its own, and the next start picks it up, as it already did after a Windows
-update. Raised in a review by jpp.
-
 ## [0.6.31] - 2026-09-26
 
 **The update that starts a new node near the tip, and tells a node that is
@@ -39,7 +16,9 @@ v0.34.9, the same three builds as 0.6.28 to 0.6.30, so no node re-installs its
 engine. A new node that follows signatures starts from a snapshot this
 project's signer signed instead of block 219,000; a computer too slow to keep
 up is told so and can follow signatures instead; and every node that is
-behind says how long it has left, or that it will not catch up.
+behind says how long it has left, or that it will not catch up. Stopping no
+longer cuts off a node that is still working, and Esplora mode never calls an
+endpoint on the invalid side of the split fresh.
 
 **A computer too slow to keep up is told so, and can follow signatures
 instead.** A Mac or an NVIDIA PC checks every block itself, and one that checks
@@ -82,6 +61,29 @@ hour while the network adds about 40" when it does not. The figures appear
 after fifteen minutes of measuring, and until then the line reads as before.
 They are the node's own measurement, not a promise: a node that speeds up or
 slows down gets a new figure.
+
+**Stopping or quitting no longer cuts a node off while it is still working.**
+A node gets 90 seconds to shut down, which is the low end of the 90 to 120
+seconds measured on a Mac at a much shorter chain, and after that it was
+force-stopped, mid-save or mid-check, and the next start spent minutes
+rebuilding. Now a node that is still working after those 90 seconds is waited
+for: up to ten minutes while it is still writing its log, and up to six hours
+while it is still using the processor. The second matters on this engine: a
+block check cannot be cancelled by a stop, writes nothing to the log while it
+runs, and on a processor rather than a graphics card can take hours. A node
+that is doing neither is stopped as before. While a stop runs long, the window
+says so instead of freezing on the last status. And quitting the app no longer
+kills a node that is taking longer than the app waits: it is left to finish on
+its own, and the next start picks it up, as it already did after a Windows
+update. Raised in a review by jpp.
+
+**Esplora mode never calls an endpoint on the invalid side of a split fresh.**
+The census now marks the branch that starts at 227,313 `b28c3e84…` invalid,
+and the guardian that decides whether a wallet endpoint is fresh read neither
+of the new fields. It could have called an endpoint on that branch fresh, and
+it would have taken an invalid chain flagged heaviest as its reference. It now
+says unverified in both cases and names the chain and block. Contributed by
+jpp.
 
 ## [0.6.30] - 2026-09-25
 
