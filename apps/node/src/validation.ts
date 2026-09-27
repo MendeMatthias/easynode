@@ -197,3 +197,48 @@ export function validationView(status: ValidationInput): ValidationView {
   // A mode we have no copy for. Show it plainly rather than inventing meaning.
   return { state: status.rc_mode, note: "", cls: "" };
 }
+
+/** The subset of the node status the follow-signatures decisions need. */
+export type FollowInput = {
+  rc_stalled: boolean;
+  rc_trusted_mirror: boolean;
+  rc_validates_independently: boolean;
+  /** The owner already chose to follow signatures on this machine. */
+  follow_signatures: boolean;
+};
+
+/**
+ * The status screen's offer to follow signatures on a machine that cannot
+ * check blocks at all: its graphics chip did not pass the engine's own check,
+ * so the node sits still (rc_stalled, from the startup verdict or from the
+ * engine's standing warning). Null when the offer does not apply.
+ *
+ * The slow-machine offer (catchup-trend.ts) is the owner's decision of
+ * 2026-09-26: offered, never done for them. This is the same offer for a
+ * clearer case. A slow machine gives something up by switching; a machine
+ * that cannot check blocks gives up nothing, because it is not checking them
+ * now. It cannot sign now either, so a signer loses nothing by it.
+ */
+export function stalledFollowOffer(status: FollowInput): string | null {
+  if (!status.rc_stalled || status.rc_trusted_mirror || status.follow_signatures) return null;
+  return (
+    "This computer cannot check new blocks itself, so your node has stopped following the " +
+    "chain. It can follow signatures instead, as a Windows PC does: it then keeps up using " +
+    "signed confirmations from nodes that do check, and cannot sign. You can switch back in " +
+    "Settings."
+  );
+}
+
+/**
+ * Whether Settings shows the follow-signatures switch: wherever it is a real
+ * choice. A machine that checks blocks, one whose owner already chose, and
+ * one whose chip failed the check, which is the machine that needs the way
+ * out most. Not on a machine that follows signatures anyway.
+ */
+export function followRowVisible(status: FollowInput): boolean {
+  return (
+    status.follow_signatures ||
+    status.rc_validates_independently ||
+    (status.rc_stalled && !status.rc_trusted_mirror)
+  );
+}

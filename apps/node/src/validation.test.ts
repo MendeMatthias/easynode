@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { validationView, type ValidationInput } from "./validation";
+import {
+  followRowVisible,
+  stalledFollowOffer,
+  validationView,
+  type FollowInput,
+  type ValidationInput,
+} from "./validation";
 
 const base: ValidationInput = {
   running: true,
@@ -237,5 +243,51 @@ describe("classified stall verdicts", () => {
       stall: null,
     });
     expect(v.state).toBe("Mirror");
+  });
+});
+
+describe("the way out for a machine whose chip cannot check blocks", () => {
+  const checking: FollowInput = {
+    rc_stalled: false,
+    rc_trusted_mirror: false,
+    rc_validates_independently: true,
+    follow_signatures: false,
+  };
+  // Stalled: the chip failed the check at startup (the log says ready=0), or
+  // the engine's standing warning says so later in the run.
+  const stalled: FollowInput = { ...checking, rc_stalled: true, rc_validates_independently: false };
+
+  it("offers to follow signatures, and says what the switch costs", () => {
+    const offer = stalledFollowOffer(stalled);
+    expect(offer).toMatch(/cannot check new blocks itself/);
+    expect(offer).toMatch(/follow signatures instead/);
+    expect(offer).toMatch(/cannot sign/);
+    expect(offer).toMatch(/switch back in Settings/);
+  });
+
+  it("stays quiet where there is nothing to offer", () => {
+    // A machine that checks blocks: the slow-machine offer decides there.
+    expect(stalledFollowOffer(checking)).toBeNull();
+    // A mirror already follows signatures, and the owner who chose already did.
+    expect(stalledFollowOffer({ ...stalled, rc_trusted_mirror: true })).toBeNull();
+    expect(stalledFollowOffer({ ...stalled, follow_signatures: true })).toBeNull();
+  });
+
+  it("keeps the Settings switch on the machine that needs it most", () => {
+    // The old rule showed it only where the node checks blocks, which a
+    // stalled machine does not, so the one machine with no other way out had
+    // no switch either.
+    expect(followRowVisible(stalled)).toBe(true);
+    expect(followRowVisible(checking)).toBe(true);
+    const chosen = { ...checking, rc_validates_independently: false, follow_signatures: true };
+    expect(followRowVisible(chosen)).toBe(true);
+    // A machine that follows signatures anyway has no choice to make.
+    const mirror: FollowInput = {
+      rc_stalled: false,
+      rc_trusted_mirror: true,
+      rc_validates_independently: false,
+      follow_signatures: false,
+    };
+    expect(followRowVisible(mirror)).toBe(false);
   });
 });

@@ -10,7 +10,7 @@ import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { AmbientLine } from "./ambient";
-import { validationView } from "./validation";
+import { followRowVisible, stalledFollowOffer, validationView } from "./validation";
 import {
   CHAIN_BLOCKS_PER_HOUR,
   type CatchupSample,
@@ -774,13 +774,22 @@ $<HTMLInputElement>("signer-publish-toggle").addEventListener("change", async (e
   void tick();
 });
 
-/** The status screen's offer to follow signatures: only on a machine that
- *  checks blocks itself, running, behind, and measured adding far fewer blocks
- *  an hour than the chain makes (catchup-trend.ts `cannotCatchUp`, which the
- *  cadence hold never trips). Nothing changes until the owner clicks. */
+/** The status screen's offer to follow signatures: on a machine whose chip
+ *  cannot check blocks at all (validation.ts `stalledFollowOffer`), or on one
+ *  that checks blocks itself, running, behind, and measured adding far fewer
+ *  blocks an hour than the chain makes (catchup-trend.ts `cannotCatchUp`,
+ *  which the cadence hold never trips). Nothing changes until the owner
+ *  clicks. */
 function reflectFollowOffer(status: NodeStatusInfo): void {
   const card = $("follow-card");
   const p = status.phase;
+  const stalled =
+    p.phase === "ready" || p.phase === "syncing" ? stalledFollowOffer(status) : null;
+  if (stalled !== null) {
+    card.hidden = false;
+    $("follow-msg").textContent = stalled;
+    return;
+  }
   const added =
     p.phase === "ready" &&
     !status.rc_stalled &&
@@ -802,9 +811,10 @@ function reflectFollowOffer(status: NodeStatusInfo): void {
 }
 
 function reflectFollowRow(status: NodeStatusInfo): void {
-  // Only where it is a choice: a machine that checks blocks, or one whose
-  // owner already chose. A machine that follows signatures anyway has none.
-  $("follow-row").hidden = !(status.follow_signatures || status.rc_validates_independently);
+  // Only where it is a choice: a machine that checks blocks, one whose chip
+  // failed the check, or one whose owner already chose. A machine that
+  // follows signatures anyway has none.
+  $("follow-row").hidden = !followRowVisible(status);
   const t = $<HTMLInputElement>("follow-toggle");
   if (document.activeElement !== t) t.checked = status.follow_signatures;
 }

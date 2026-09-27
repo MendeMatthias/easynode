@@ -13,11 +13,13 @@ engine keeps a list of standing warnings, and the app never read it. It now
 shows them in plain words, where they belong:
 
 - A graphics chip that stops passing the engine's own check now reads NOT
-  FOLLOWING, with the engine's reason and the one thing that helps: restart
-  easyNode, which runs the check again. Until now the app only read the
-  engine's verdict from its startup, so a chip that failed an hour into a run
-  kept showing a green LIVE. This is also how a signer whose card stops
-  qualifying after an engine update would show up.
+  FOLLOWING, with the engine's reason and what helps: restart easyNode, which
+  runs the check again, or follow signatures instead, which the status screen
+  now offers on such a machine and Settings always has for it. Until now the
+  app only read the engine's verdict from its startup, so a chip that failed
+  an hour into a run kept showing a green LIVE, and a machine whose chip
+  failed had no switch to follow signatures at all. This is also how a signer
+  whose card stops qualifying after an engine update would show up.
 - When the network's signers have confirmed blocks this node has not even
   received, the chain card says so. It is the first sign of a node sitting on
   a branch the rest of the network has left, minutes in, while every other
