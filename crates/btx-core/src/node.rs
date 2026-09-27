@@ -1500,7 +1500,7 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
 /// Compressed secp256k1 public keys trusted to attest Profile-1 ExactReplay.
 ///
 /// Threshold is 1, so this list is a UNION and an extra key can only widen what
-/// the node accepts — it can never cause a rejection. That is why all four sit
+/// the node accepts — it can never cause a rejection. That is why all six sit
 /// here rather than only the two upstream currently publishes.
 ///
 /// Why more than one is required at all. Measured on a parked GPU-less datadir
@@ -1544,6 +1544,16 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
 ///     At M=1 this makes that one machine a full authority for every mirror,
 ///     the trade jpp's operator standard (M=2, independent keys) is meant to
 ///     retire once a second key signs the valid chain.
+///   * `03047189`, `02c9cfb7` — two easyNode signers run by ONE community
+///     operator on two machines behind one address (zbtx2 and zbtx3), offered
+///     on 2026-09-26 and 27 and granted full signing authority by the project
+///     owner on 2026-09-27. Added so the valid chain does not hang on the 3060
+///     alone: that day nobody who could restart, test or roll it back could
+///     reach it, and a mirror that trusts one unreachable signer stops
+///     whenever it does. Both keys are valid secp256k1 points (checked before
+///     pinning). What they buy is uptime, not independence: at M=1 each is a
+///     full authority on its own, and under a future M=2 these two must count
+///     as ONE operator, or that operator alone meets the threshold.
 ///
 /// ⚠ Changing this list is not free, and the cost is not where you would look
 /// for it. btxd namespaces its durable attestation archive by
@@ -1569,11 +1579,19 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
 /// still proves it: the bounded hot store reloaded from disk still counts, the
 /// durable history behind it does not. Measure a real mirror datadir across
 /// this change before it ships.
-pub const BTX_TRUSTED_ATTESTATION_PUBKEYS: [&str; 4] = [
+///
+/// Measured on 2026-09-25 by the btxscan tooling, on a copy of the reference
+/// mirror's datadir under v0.34.9: adding a `-matmultrustedpubkey` over an
+/// existing attested chain started, kept its chain and followed the tip. The
+/// cost is the re-acquired recent archive, not the chain. Adding the two keys
+/// below it on 2026-09-27 is the same kind of change.
+pub const BTX_TRUSTED_ATTESTATION_PUBKEYS: [&str; 6] = [
     "03d90c148db37da28ce47ce15bade88a177728d663da4bc9ba765943b7d4e4f0aa",
     "0224e80df33697385b54b3c69bae1f097f533c0c43e93c29f73ee97319d4a5e04c",
     "028995b25c887ee03eb53a41312d33c8eccf48f261ecf9e91fe2b1e8e50373258a",
     "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675",
+    "03047189023913e1922c80c895ee2a9e2eff6df05438654749e1a4f95019578a24",
+    "02c9cfb77d7e4dce0cd6b7968fee1dd53d31ef06c764185e120c825fab8c0572a0",
 ];
 
 /// Whether this host should follow the chain past the MatMul v4.7 fork via an
@@ -4403,6 +4421,22 @@ consensus-validator service.";
                 .contains(&"02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675"),
             "the valid chain's signer must be pinned, or every mirror stays at 227,312"
         );
+    }
+
+    /// The second operator's two keys: without them every mirror hangs on the
+    /// 3060 alone, a machine nobody could reach on 2026-09-27. A literal, for
+    /// the same reason as the tests above.
+    #[test]
+    fn the_pin_carries_a_second_operator_so_one_machine_cannot_hang_every_mirror() {
+        for key in [
+            "03047189023913e1922c80c895ee2a9e2eff6df05438654749e1a4f95019578a24",
+            "02c9cfb77d7e4dce0cd6b7968fee1dd53d31ef06c764185e120c825fab8c0572a0",
+        ] {
+            assert!(
+                BTX_TRUSTED_ATTESTATION_PUBKEYS.contains(&key),
+                "the second operator's signer {key} must be pinned"
+            );
+        }
     }
 
     /// The refusal detector needs BOTH markers. Verbatim line, captured from a
