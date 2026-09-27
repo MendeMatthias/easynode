@@ -3,7 +3,7 @@
 //! # The problem this exists to solve
 //!
 //! btxd keeps a list of standing warnings and returns it in
-//! `getblockchaininfo.warnings`. Until 0.6.32 the app did not read it, so the
+//! `getblockchaininfo.warnings`. Until 0.6.31 the app did not read it, so the
 //! engine could be saying, in so many words, that this machine can no longer
 //! verify blocks, and the status screen would carry on showing a green LIVE.
 //!
