@@ -62,7 +62,10 @@ Mende wants it out.
 - Version lives in FIVE files: package.json, package-lock.json (×2),
   tauri.conf.json, Cargo.toml, Cargo.lock. Plus CHANGELOG.
 - Rename the mac tarball to `BTX-Node_<ver>_aarch64.app.tar.gz` before the feed
-  sees it, and rename its `.sig` too (signature is over content, stays valid).
+  sees it, and let `build-node-feed.sh --mac` sign the renamed file. Do NOT
+  carry the bundler's `.sig` over: it names `easyBTX Node.app.tar.gz` in its
+  signed comment, and 0.6.31 and later refuse an update signed under any name
+  but its release name.
 - Build the `.dmg` by hand with `hdiutil` — the recipe's build command skips it,
   but the website's Mac button points at it.
 - Append the mac sums to `SHA256SUMS` manually; there is no mac node CI.

@@ -194,9 +194,17 @@ expect_name() {
 [ -n "$LINUX_APPIMAGE" ] && expect_name "$LINUX_APPIMAGE" "BTX-Node_${VERSION}_amd64.AppImage"
 [ -n "$WIN_SETUP" ]      && expect_name "$WIN_SETUP"      "BTX-Node_${VERSION}_x64-setup.exe"
 
-# Mac .app.tar.gz.sig is produced by the build; only sign it if it's missing.
+# The mac build signs its tarball itself, but under the bundler's name,
+# "easyBTX Node.app.tar.gz", and a signature carries the name it was made under
+# in its signed comment. easyNode 0.6.31 and later refuse an update signed
+# under any name but its release name (update_binding.rs), and a .sig renamed
+# along with the tarball still carries the old one. This used to sign only when
+# no .sig was there, so the renamed one went through untouched and the release
+# failed at verify with advice to run this script. So the tarball is always
+# signed here, under the name it has now, whatever .sig sits beside it.
 if [ -n "$MAC_TGZ" ]; then
-  [ -f "${MAC_TGZ}.sig" ] || sign "$MAC_TGZ"
+  rm -f "${MAC_TGZ}.sig"
+  sign "$MAC_TGZ"
   verify "$MAC_TGZ"
 fi
 if [ -n "$LINUX_APPIMAGE" ]; then sign "$LINUX_APPIMAGE"; verify "$LINUX_APPIMAGE"; fi
