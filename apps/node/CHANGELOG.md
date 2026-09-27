@@ -8,6 +8,15 @@ root).
 
 ## [Unreleased]
 
+**A node that follows signatures no longer hangs on one machine.** Since the
+23 September split such a node has trusted one signer on the valid chain, this
+project's own, a single computer in a home. When it is off, or signs the losing
+side of a race, every node that follows signatures stops, as btxscan did on 16
+and 17 September. Two more signers are now trusted, run by one community
+operator on two machines. One signature is still enough, so this adds uptime,
+not independence: each trusted signer can decide on its own which blocks such a
+node accepts. The status card now says whom the node trusts.
+
 ## [0.6.31] - 2026-09-27
 
 **The update that starts a new node near the tip, and tells a node that is
