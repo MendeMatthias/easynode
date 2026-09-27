@@ -33,10 +33,20 @@ for that branch, a following update lifts the hold, reconsidering the block on
 every node, and `EASYBTX_NODE_REFUSE_KNOWN_INVALID=0` turns refusals off on one
 machine today.
 
+**It also brings everything listed under 0.6.31, which was never published
+on its own.** Coming from 0.6.30, this is the update that takes an update only
+when it was signed for that version (found by jpp), starts a new node that
+follows signatures near the tip, tells a node that is behind how long it has
+left, tells a computer too slow to keep up and offers it to follow signatures,
+shows the engine's own warnings in plain words, and no longer cuts off a node
+that is still stopping.
+
 The engine does not change: this is still BTX v0.34.9, the same builds as
-0.6.28 to 0.6.31, so no node re-installs its engine.
+0.6.28 to 0.6.30, so no node re-installs its engine.
 
 ## [0.6.31] - 2026-09-27
+
+Never published on its own: everything below ships in 0.6.32.
 
 **The update that starts a new node near the tip, tells a node that is
 behind how long it has left, and takes an update only when it was signed for
