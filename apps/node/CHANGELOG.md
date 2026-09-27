@@ -8,7 +8,7 @@ root).
 
 ## [Unreleased]
 
-## [0.6.31] - 2026-09-26
+## [0.6.31] - 2026-09-27
 
 **The update that starts a new node near the tip, and tells a node that is
 behind how long it has left.** The engine does not change: this is still BTX
