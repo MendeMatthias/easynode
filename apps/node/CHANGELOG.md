@@ -8,6 +8,8 @@ root).
 
 ## [Unreleased]
 
+## [0.6.32] - 2026-09-27
+
 **Every node is held off two branches until BTX's developers rule on them.**
 On 27 September a branch that left the valid chain at 228,145 (`8240c62e…` at
 228,146) began serving its blocks: about 3,280 of them, all paying one address,
@@ -30,6 +32,9 @@ Be clear about what this is: a decision, not a verdict. If the developers rule
 for that branch, a following update lifts the hold, reconsidering the block on
 every node, and `EASYBTX_NODE_REFUSE_KNOWN_INVALID=0` turns refusals off on one
 machine today.
+
+The engine does not change: this is still BTX v0.34.9, the same builds as
+0.6.28 to 0.6.31, so no node re-installs its engine.
 
 ## [0.6.31] - 2026-09-27
 
