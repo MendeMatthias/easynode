@@ -1928,7 +1928,9 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                                 let done = refusal_done.clone();
                                 let in_flight = refusal_in_flight.clone();
                                 tauri::async_runtime::spawn(async move {
-                                    use btx_core::known_invalid::{refuse_all, Refusal};
+                                    use btx_core::known_invalid::{
+                                        lift_all, refuse_all, refuse_held, Lift, Refusal,
+                                    };
                                     let mut all_refused = true;
                                     for (block, outcome) in refuse_all(&rpc).await {
                                         match outcome {
@@ -1937,13 +1939,53 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                                                  (the valid chain has {} there)",
                                                 block.hash, block.height, block.valid_sibling
                                             ),
-                                            Refusal::NotKnownYet => all_refused = false,
+                                            Refusal::NotKnownYet | Refusal::Waiting => {
+                                                all_refused = false
+                                            }
                                             Refusal::Failed(e) => {
                                                 all_refused = false;
                                                 eprintln!(
                                                     "[node] could not refuse known-invalid block {} \
                                                      at {} yet: {e}",
                                                     block.hash, block.height
+                                                );
+                                            }
+                                        }
+                                    }
+                                    // Held branches: refused by decision, in order, B before
+                                    // the dead branch (btx_core::known_invalid, 2026-09-27).
+                                    for (branch, outcome) in refuse_held(&rpc).await {
+                                        match outcome {
+                                            Refusal::Refused => eprintln!(
+                                                "[node] holding this node off the branch from {} \
+                                                 at {}: {}",
+                                                branch.root, branch.height, branch.why
+                                            ),
+                                            Refusal::NotKnownYet | Refusal::Waiting => {
+                                                all_refused = false
+                                            }
+                                            Refusal::Failed(e) => {
+                                                all_refused = false;
+                                                eprintln!(
+                                                    "[node] could not hold this node off {} at {} \
+                                                     yet: {e}",
+                                                    branch.root, branch.height
+                                                );
+                                            }
+                                        }
+                                    }
+                                    // A hold a release has lifted: reconsidered, so the node
+                                    // follows the most-work chain again.
+                                    for (root, outcome) in lift_all(&rpc).await {
+                                        match outcome {
+                                            Lift::Lifted => eprintln!(
+                                                "[node] lifted the hold on the branch from {root}"
+                                            ),
+                                            Lift::NotKnownYet => {}
+                                            Lift::Failed(e) => {
+                                                all_refused = false;
+                                                eprintln!(
+                                                    "[node] could not lift the hold on {root} yet: {e}"
                                                 );
                                             }
                                         }

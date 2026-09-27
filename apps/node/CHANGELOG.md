@@ -8,6 +8,29 @@ root).
 
 ## [Unreleased]
 
+**Every node is held off two branches until BTX's developers rule on them.**
+On 27 September a branch that left the valid chain at 228,145 (`8240c62e…` at
+228,146) began serving its blocks: about 3,280 of them, all paying one address,
+held back since 24 September. Its first block checks out, so it is not invalid,
+and BTX's developers have not said which chain wins. But every node this app
+starts follows the heaviest chain it can check, so a node that re-checks that
+branch switches to it, and every node that follows signatures goes wherever its
+signer goes. This update refuses the branch's first block on every node, the
+way the invalid branch of 23 September is refused, and says so in the node
+log.
+
+It also refuses the first block of the dead branch from 229,400 (`b3a099ad…`),
+where btxscan.io and this project's signer stopped on 26 September. A node on
+it drops to 229,399 and follows the valid chain from there as ordinary new
+blocks. The first branch is refused first, so a node leaving the dead branch
+never finds the other as the heaviest chain in reach; if the first cannot be
+refused yet, the second waits.
+
+Be clear about what this is: a decision, not a verdict. If the developers rule
+for that branch, a following update lifts the hold, reconsidering the block on
+every node, and `EASYBTX_NODE_REFUSE_KNOWN_INVALID=0` turns refusals off on one
+machine today.
+
 ## [0.6.31] - 2026-09-27
 
 **The update that starts a new node near the tip, and tells a node that is
