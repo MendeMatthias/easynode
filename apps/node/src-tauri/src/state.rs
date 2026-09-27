@@ -691,6 +691,12 @@ pub struct AppState {
     /// Stored raw rather than pre-judged so the verdict is computed against
     /// the clock at render time, never against the clock at poll time.
     pub tip_median_time: Arc<Mutex<Option<i64>>>,
+    /// What btxd itself is warning about, recognised and filtered by
+    /// `btx_core::engine_warnings::from_node` on every successful
+    /// `getblockchaininfo`. Empty when stopped. Kept through a failed poll, like
+    /// `tip_median_time`: one lost answer is not the engine taking a warning
+    /// back, and a warning that blinks on and off reads as a false alarm.
+    pub engine_warnings: Arc<Mutex<Vec<btx_core::engine_warnings::EngineWarning>>>,
     /// The archive-peer census, computed ONCE per refresher tick from a single
     /// getpeerinfo and shared by the status snapshot, the watchdog and the
     /// service report. The UI poll used to run its own full getpeerinfo every
@@ -779,6 +785,7 @@ impl AppState {
             signer_offer: Arc::new(Mutex::new(None)),
             fork: Arc::new(Mutex::new(None)),
             tip_median_time: Arc::new(Mutex::new(None)),
+            engine_warnings: Arc::new(Mutex::new(Vec::new())),
             archive_peers_cache: Arc::new(Mutex::new(None)),
             peer_nicknames_cache: Arc::new(Mutex::new(Vec::new())),
             esplora: Arc::new(Mutex::new(None)),

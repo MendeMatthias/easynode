@@ -145,7 +145,7 @@ def main(argv):
     except InvalidSignature:
         _die(f"{artifact}: the trusted comment is not authentic")
 
-    # And the authentic comment must name THIS file. easyNode 0.6.32 and later
+    # And the authentic comment must name THIS file. easyNode 0.6.31 and later
     # accept an update only when the name its build was signed under is the
     # release name for the version and platform the feed lists it under
     # (update_binding.rs), so a build signed under any other name, the
@@ -155,7 +155,7 @@ def main(argv):
         _die(
             f"{artifact}: signed as {name!r}, not as {Path(artifact).name!r}. Sign the "
             f"file under its release name (build-node-feed.sh does), or easyNode "
-            f"0.6.32 and later will refuse the update"
+            f"0.6.31 and later will refuse the update"
         )
 
     print(f"OK  {Path(artifact).name}")

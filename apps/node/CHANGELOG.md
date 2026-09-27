@@ -8,6 +8,22 @@ root).
 
 ## [Unreleased]
 
+## [0.6.31] - 2026-09-27
+
+**The update that starts a new node near the tip, tells a node that is
+behind how long it has left, and takes an update only when it was signed for
+that version.** The engine does not change: this is still BTX v0.34.9, the
+same three builds as 0.6.28 to 0.6.30, so no node re-installs its engine. A
+new node that follows signatures starts from a snapshot this project's signer
+signed instead of block 219,000; a computer too slow to keep up, or whose
+graphics chip stops passing the engine's check, is told so and can follow
+signatures instead; every node that is behind says how long it has left, or
+that it will not catch up; and the status screen shows the engine's own
+warnings in plain words. An update signed for another version is refused, a
+gap found by jpp. Stopping no longer cuts off a node that is still working,
+and Esplora mode never calls an endpoint on the invalid side of the split
+fresh.
+
 **An update is taken only when its signature was made for that version.** The
 app has always refused an update the release key did not sign. It now also
 refuses one whose signature was made for another version, another platform or
@@ -17,18 +33,6 @@ highest version it has run. A refused update is written to the update log and
 shown in Settings as a failed check with its reason, and the download on
 easybtx.com/node always works by hand. The release scripts refuse to publish a
 feed the app would refuse. Found by jpp.
-
-## [0.6.31] - 2026-09-27
-
-**The update that starts a new node near the tip, and tells a node that is
-behind how long it has left.** The engine does not change: this is still BTX
-v0.34.9, the same three builds as 0.6.28 to 0.6.30, so no node re-installs its
-engine. A new node that follows signatures starts from a snapshot this
-project's signer signed instead of block 219,000; a computer too slow to keep
-up is told so and can follow signatures instead; and every node that is
-behind says how long it has left, or that it will not catch up. Stopping no
-longer cuts off a node that is still working, and Esplora mode never calls an
-endpoint on the invalid side of the split fresh.
 
 **A computer too slow to keep up is told so, and can follow signatures
 instead.** A Mac or an NVIDIA PC checks every block itself, and one that checks
@@ -41,6 +45,34 @@ restarts, stops checking the proof of work itself and cannot sign. Settings
 has the switch back, and the same choice for anyone who wants it. A node held
 to the chain's own pace, the cadence hold, is never offered it: that is not a
 slow machine.
+
+**The status screen says what the node engine itself is warning about.** The
+engine keeps a list of standing warnings, and the app never read it. It now
+shows them in plain words, where they belong:
+
+- A graphics chip that stops passing the engine's own check now reads NOT
+  FOLLOWING, with the engine's reason and what helps: restart easyNode, which
+  runs the check again, or follow signatures instead, which the status screen
+  now offers on such a machine and Settings always has for it. Until now the
+  app only read the engine's verdict from its startup, so a chip that failed
+  an hour into a run kept showing a green LIVE, and a machine whose chip
+  failed had no switch to follow signatures at all. This is also how a signer
+  whose card stops qualifying after an engine update would show up.
+- When the network's signers have confirmed blocks this node has not even
+  received, the chain card says so. It is the first sign of a node sitting on
+  a branch the rest of the network has left, minutes in, while every other
+  number still looks healthy.
+- A wrong computer clock gets a sentence saying how to fix it, and an engine
+  that says it is out of date says so.
+- A chain the node refused, for the wrong difficulty or for breaking the
+  rules, is explained calmly, so a block explorer showing different numbers
+  makes sense. Nothing to do there, and it does not look like an alarm.
+
+Warnings nobody can act on stay off the screen: the engine's pacing while it
+catches up, and its deep-reorg notice. That one stays up until the next
+restart, and on this network it mostly means a node has just rejoined the
+main chain after being stuck on a dead branch; blaming an attack for the
+recovery helps nobody.
 
 **A new node that follows signatures starts a few hundred blocks from the tip,
 not ten thousand below it.** A native Windows PC, an M5 or a PC without an

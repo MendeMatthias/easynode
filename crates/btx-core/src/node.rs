@@ -1795,8 +1795,10 @@ pub fn clear_matmul_consensus_refused(datadir: &Path) {
 /// The owner's choice to follow signatures on a machine that could check
 /// blocks itself. The app offers it only when it has measured the machine
 /// adding fewer blocks an hour than the chain makes, a node that will never
-/// reach the tip (catchup-trend.ts; the owner's decision of 2026-09-26), and
-/// sets it only on the owner's click.
+/// reach the tip (catchup-trend.ts; the owner's decision of 2026-09-26), or
+/// when the machine's graphics chip failed the engine's check and the node
+/// does not move at all (validation.ts `stalledFollowOffer`). It sets it only
+/// on the owner's click.
 ///
 /// A file for the same reason as the refusal marker above: every path that
 /// decides the launch reads it through [`launches_as_mirror`], with nothing to

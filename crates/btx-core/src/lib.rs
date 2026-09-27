@@ -21,6 +21,7 @@ pub mod backend;
 pub mod checkin;
 pub mod datadir;
 pub mod disk;
+pub mod engine_warnings;
 pub mod error;
 pub mod esplora;
 pub mod esplora_freshness;

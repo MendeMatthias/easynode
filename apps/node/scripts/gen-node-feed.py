@@ -165,7 +165,7 @@ def _check_sig(target, sig, want_key_id=None, want_name=None):
         )
     if want_name is None:
         return
-    # easyNode 0.6.32 and later take an update only when every entry's build
+    # easyNode 0.6.31 and later take an update only when every entry's build
     # was signed under the release name for its platform and this version
     # (update_binding.rs). One entry signed under another name, the bundler's
     # "easyBTX Node.app.tar.gz" for instance, and they refuse the release, so
@@ -174,7 +174,7 @@ def _check_sig(target, sig, want_key_id=None, want_name=None):
     if named != want_name:
         raise ValueError(
             f"{target}: signed as {named!r}, but this release must be signed as "
-            f"{want_name!r}. easyNode 0.6.32 and later refuse any other name. "
+            f"{want_name!r}. easyNode 0.6.31 and later refuse any other name. "
             f"Rename the file to {want_name} and sign it again "
             f"(build-node-feed.sh does both)."
         )
@@ -293,7 +293,7 @@ def self_test():
             pass
 
     # Every entry must be signed under ITS release name at THIS version, or
-    # easyNode 0.6.32+ refuses the whole release (update_binding.rs).
+    # easyNode 0.6.31+ refuses the whole release (update_binding.rs).
     unbound = (
         # The bundler's own signature, which named the 0.6.30 Mac build.
         ("darwin-aarch64", _fake_sig(name="easyBTX Node.app.tar.gz")),

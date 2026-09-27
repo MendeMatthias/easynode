@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { validationView, type ValidationInput } from "./validation";
+import {
+  followRowVisible,
+  stalledFollowOffer,
+  validationView,
+  type FollowInput,
+  type ValidationInput,
+} from "./validation";
 
 const base: ValidationInput = {
   running: true,
@@ -12,6 +18,32 @@ const base: ValidationInput = {
 };
 
 describe("validationView", () => {
+  it("lets the engine's standing warning outrank the startup verdict", () => {
+    // The log said Full at startup; the engine has since quarantined the chip.
+    const note = "This machine's graphics chip did not pass the node engine's own check.";
+    const v = validationView({
+      ...base,
+      rc_mode: "strict-device",
+      rc_validates_independently: true,
+      rc_stalled: true,
+      rc_unverifiable_message: note,
+    });
+    expect(v.state).toBe("Stopped");
+    expect(v.note).toBe(note);
+    expect(v.cls).toBe("is-stalled");
+    // And it does not wait for a log verdict that may never be readable.
+    expect(
+      validationView({ ...base, uptime_secs: 30, rc_mode: null, rc_unverifiable_message: note })
+        .state,
+    ).toBe("Stopped");
+  });
+
+  it("keeps the generic stalled sentence when the engine gives none", () => {
+    const v = validationView({ ...base, rc_mode: "strict-device", rc_stalled: true });
+    expect(v.state).toBe("Stopped");
+    expect(v.note).toMatch(/cannot check the new proof of work/);
+  });
+
   it("explains the startup episode instead of showing a blank card", () => {
     // btxd runs one full production episode before it will judge the machine —
     // 102-218 s measured on an M2 Pro. The card used to be hidden for that whole
@@ -211,5 +243,51 @@ describe("classified stall verdicts", () => {
       stall: null,
     });
     expect(v.state).toBe("Mirror");
+  });
+});
+
+describe("the way out for a machine whose chip cannot check blocks", () => {
+  const checking: FollowInput = {
+    rc_stalled: false,
+    rc_trusted_mirror: false,
+    rc_validates_independently: true,
+    follow_signatures: false,
+  };
+  // Stalled: the chip failed the check at startup (the log says ready=0), or
+  // the engine's standing warning says so later in the run.
+  const stalled: FollowInput = { ...checking, rc_stalled: true, rc_validates_independently: false };
+
+  it("offers to follow signatures, and says what the switch costs", () => {
+    const offer = stalledFollowOffer(stalled);
+    expect(offer).toMatch(/cannot check new blocks itself/);
+    expect(offer).toMatch(/follow signatures instead/);
+    expect(offer).toMatch(/cannot sign/);
+    expect(offer).toMatch(/switch back in Settings/);
+  });
+
+  it("stays quiet where there is nothing to offer", () => {
+    // A machine that checks blocks: the slow-machine offer decides there.
+    expect(stalledFollowOffer(checking)).toBeNull();
+    // A mirror already follows signatures, and the owner who chose already did.
+    expect(stalledFollowOffer({ ...stalled, rc_trusted_mirror: true })).toBeNull();
+    expect(stalledFollowOffer({ ...stalled, follow_signatures: true })).toBeNull();
+  });
+
+  it("keeps the Settings switch on the machine that needs it most", () => {
+    // The old rule showed it only where the node checks blocks, which a
+    // stalled machine does not, so the one machine with no other way out had
+    // no switch either.
+    expect(followRowVisible(stalled)).toBe(true);
+    expect(followRowVisible(checking)).toBe(true);
+    const chosen = { ...checking, rc_validates_independently: false, follow_signatures: true };
+    expect(followRowVisible(chosen)).toBe(true);
+    // A machine that follows signatures anyway has no choice to make.
+    const mirror: FollowInput = {
+      rc_stalled: false,
+      rc_trusted_mirror: true,
+      rc_validates_independently: false,
+      follow_signatures: false,
+    };
+    expect(followRowVisible(mirror)).toBe(false);
   });
 });

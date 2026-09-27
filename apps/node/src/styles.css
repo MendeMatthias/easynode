@@ -538,6 +538,12 @@ body {
 .fork-card { border-color: rgba(251, 191, 36, 0.5); font-size: 13px; }
 .fork-card p { color: var(--color-amber); margin: 0; line-height: 1.45; }
 .follow-card button { margin-top: var(--space-s); }
+/* Engine notes: amber lines ask something of the person, quiet lines only
+   explain. A card holding only quiet lines drops the amber border too, so an
+   explanation never dresses as an alarm. */
+#engine-notes { display: flex; flex-direction: column; gap: var(--space-s); }
+.engine-card.is-calm { border-color: var(--color-border); }
+.engine-card p.is-calm { color: var(--color-muted); }
 
 /* Your node's role: one fact per line, each ending in a sentence on whether it
    helps. The mark is the only judgement on the card and it is deliberately

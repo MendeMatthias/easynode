@@ -173,11 +173,21 @@
           <p id="fork-msg"></p>
         </div>
 
+        <!-- What btxd itself is warning about (btx_core::engine_warnings),
+             beyond what the Block checking and chain cards say: a wrong
+             clock, an out-of-date engine, a chain the node refused. Amber
+             lines ask something of the person; quiet ones only explain. -->
+        <div class="card fork-card engine-card" id="engine-card" hidden>
+          <div id="engine-notes"></div>
+        </div>
+
         <!-- A machine that checks blocks itself, measured adding far fewer
-             blocks an hour than the chain makes, will never reach the tip.
-             Offered, never done for the owner: the button records the choice
-             (btx_core::node::follows_signatures_by_choice) and restarts the
-             node; Settings takes it back. The owner's decision, 2026-09-26. -->
+             blocks an hour than the chain makes, will never reach the tip;
+             one whose graphics chip failed the engine's check does not move
+             at all. Offered, never done for the owner: the button records the
+             choice (btx_core::node::follows_signatures_by_choice) and restarts
+             the node; Settings takes it back. The owner's decision,
+             2026-09-26. -->
         <div class="card fork-card follow-card" id="follow-card" hidden>
           <p id="follow-msg"></p>
           <button id="follow-btn" class="btn-secondary" type="button">Follow signatures instead</button>
@@ -324,7 +334,7 @@
           <div class="setting-row" id="follow-row" hidden>
             <div class="setting-text">
               <span class="setting-name">Follow signatures instead of checking blocks</span>
-              <span class="setting-desc">For a machine too slow to keep up with the chain. Your node follows the signatures of a node that checks blocks, as a Windows PC does, stops checking the proof of work itself and cannot sign. It restarts to apply the change</span>
+              <span class="setting-desc">For a machine too slow to keep up with the chain, or whose graphics chip cannot check blocks. Your node follows the signatures of a node that checks blocks, as a Windows PC does, stops checking the proof of work itself and cannot sign. It restarts to apply the change</span>
             </div>
             <label class="switch">
               <input type="checkbox" id="follow-toggle" />
