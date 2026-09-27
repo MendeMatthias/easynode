@@ -22,6 +22,11 @@ btx-core = { path = "../../../crates/btx-core" }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 base64 = "0.21"
 tauri-plugin-updater = "2"
+# Already in the tree through tauri-plugin-updater. Direct, so update_binding
+# reads a signature's trusted comment with the very parser the plugin verifies
+# it with, and compares versions with the plugin's own type.
+minisign-verify = "0.2"
+semver = "1"
 tauri-plugin-process = "2"
 # Launch at login (spec: menu-bar tray + launch-at-login + keep-awake).
 tauri-plugin-autostart = "2"

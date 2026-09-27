@@ -3717,12 +3717,36 @@ pub async fn mark_welcome_shown() -> Result<(), String> {
 /// recheck runs in `update_timer` and records without this command.
 #[tauri::command]
 pub async fn record_update_check(outcome: String, detail: String) -> Result<(), String> {
+    // The webview's check reports "no update" when update_binding refused the
+    // offer, because to the plugin a refusal IS no update. Record the refusal
+    // instead, with the check's own "manual:"/"automatic:" label, so the pane
+    // and the log say an update was refused and why.
+    let (outcome, detail) =
+        match refused_record(&outcome, &detail, crate::update_binding::take_refusal()) {
+            Some(refused) => refused,
+            None => (outcome, detail),
+        };
     crate::update_log::record(
         &node_datadir(),
         crate::update_log::now_secs(),
         &outcome,
         &detail,
     )
+}
+
+/// The record for a "no update" that was really a refusal, or `None` to keep
+/// the front end's own. Pure half of [`record_update_check`].
+fn refused_record(
+    outcome: &str,
+    detail: &str,
+    refusal: Option<String>,
+) -> Option<(String, String)> {
+    if outcome != "no-update" {
+        return None;
+    }
+    let reason = refusal?;
+    let label = detail.split_once(':').map_or("check", |(label, _)| label);
+    Some(("check-failed".to_string(), format!("{label}: {reason}")))
 }
 
 /// Follow signatures instead of checking blocks on this machine, or go back.
@@ -4667,9 +4691,33 @@ pub async fn node_footprint(state: State<'_, AppState>) -> Result<NodeFootprint,
 mod tests {
     use super::{
         attached_node_is_ours_to_stop, ends_header_bootstrap, header_bootstrap_end_message,
-        pre_launch_plan, snapshot_spec, witness_started_message, AttachedTo, PreLaunchPlan,
-        NODE_RELEASE_COMMIT, NODE_RELEASE_TAG,
+        pre_launch_plan, refused_record, snapshot_spec, witness_started_message, AttachedTo,
+        PreLaunchPlan, NODE_RELEASE_COMMIT, NODE_RELEASE_TAG,
     };
+
+    /// To the plugin a refused update IS no update, so the webview reports
+    /// "no-update". The record must say what happened instead.
+    #[test]
+    fn a_refused_update_is_recorded_as_a_refusal_not_as_current() {
+        let refusal = Some("refused v0.9.0: its linux-x86_64 build is signed as X".to_string());
+        assert_eq!(
+            refused_record("no-update", "manual: v0.6.32 is current", refusal.clone()),
+            Some((
+                "check-failed".to_string(),
+                "manual: refused v0.9.0: its linux-x86_64 build is signed as X".to_string()
+            ))
+        );
+        // Nothing refused: the front end's own record stands.
+        assert_eq!(
+            refused_record("no-update", "manual: v0.6.32 is current", None),
+            None
+        );
+        // Any other outcome is the front end's to report.
+        assert_eq!(
+            refused_record("found", "manual: v0.9.0 offered", refusal),
+            None
+        );
+    }
 
     /// Wrapping a Rust string literal across source lines WITHOUT a trailing
     /// `\\` keeps every space of the indentation. That is how this message

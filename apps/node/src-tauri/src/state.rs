@@ -269,6 +269,11 @@ pub struct NodeAppSettings {
     pub last_update_check_outcome: Option<String>,
     #[serde(default)]
     pub last_update_check_detail: String,
+    /// The highest version of this app that has run on this install, so an
+    /// update below it is never taken (`update_binding`). `None` until the
+    /// first launch that records it; never a pre-release.
+    #[serde(default)]
+    pub update_high_water: Option<String>,
 }
 
 fn default_on_close() -> String {
@@ -334,6 +339,7 @@ impl Default for NodeAppSettings {
             last_update_check_at: None,
             last_update_check_outcome: None,
             last_update_check_detail: String::new(),
+            update_high_water: None,
         }
     }
 }

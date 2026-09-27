@@ -120,7 +120,21 @@ def load_pubkey_from_conf(path=TAURI_CONF):
         raise ValueError(f"no plugins.updater.pubkey in {path}")
 
 
-def _check_sig(target, sig, want_key_id=None):
+def _signed_name(decoded):
+    """The file name a minisign signature was made over: the `file:` field of
+    its trusted comment, read from the THIRD line exactly as the app's
+    verifier reads it (minisign-verify's Signature::decode). The first line is
+    an untrusted comment and may say anything."""
+    lines = decoded.split("\n")
+    if len(lines) < 3 or not lines[2].startswith("trusted comment: "):
+        return None
+    for field in lines[2][len("trusted comment: "):].rstrip("\r").split("\t"):
+        if field.startswith("file:"):
+            return field[len("file:"):]
+    return None
+
+
+def _check_sig(target, sig, want_key_id=None, want_name=None):
     if not sig or not sig.strip():
         raise ValueError(f"{target}: empty signature")
     # A tauri .sig file is base64 wrapping the real minisign signature, which
@@ -149,6 +163,21 @@ def _check_sig(target, sig, want_key_id=None):
             f"trusts {want_key_id[::-1].hex().upper()} — this feed would be "
             f"REJECTED by every client. Wrong signing key."
         )
+    if want_name is None:
+        return
+    # easyNode 0.6.32 and later take an update only when every entry's build
+    # was signed under the release name for its platform and this version
+    # (update_binding.rs). One entry signed under another name, the bundler's
+    # "easyBTX Node.app.tar.gz" for instance, and they refuse the release, so
+    # this feed would stop their updates. Refused here, before it can ship.
+    named = _signed_name(decoded)
+    if named != want_name:
+        raise ValueError(
+            f"{target}: signed as {named!r}, but this release must be signed as "
+            f"{want_name!r}. easyNode 0.6.32 and later refuse any other name. "
+            f"Rename the file to {want_name} and sign it again "
+            f"(build-node-feed.sh does both)."
+        )
 
 
 def build_feed(version, tag, notes, pub_date, mac_sig=None, linux_sig=None,
@@ -171,7 +200,7 @@ def build_feed(version, tag, notes, pub_date, mac_sig=None, linux_sig=None,
         )
     platforms = {}
     for target, sig in supplied.items():
-        _check_sig(target, sig, want)
+        _check_sig(target, sig, want, ASSET[target].format(v=version))
         # URL is DERIVED, never passed in: that is what makes the stale-key
         # loop described at the top of this file unrepresentable here.
         url = f"{REPO}/{tag}/{ASSET[target].format(v=version)}"
@@ -195,15 +224,20 @@ def write_atomic(path, data):
         raise
 
 
-def _fake_sig(key_id=b"\x01\x02\x03\x04\x05\x06\x07\x08"):
-    """A structurally valid tauri .sig carrying a chosen key id."""
+def _fake_sig(key_id=b"\x01\x02\x03\x04\x05\x06\x07\x08", name="x"):
+    """A structurally valid tauri .sig carrying a chosen key id and file name."""
     body = base64.b64encode(b"ED" + key_id + b"\x00" * 64).decode()
     raw = (
         "untrusted comment: signature from tauri secret key\n"
         f"{body}\n"
-        "trusted comment: x\nZg==\n"
+        f"trusted comment: timestamp:0\tfile:{name}\nZg==\n"
     )
     return base64.b64encode(raw.encode()).decode()
+
+
+def _named(target, version, key_id=b"\x01\x02\x03\x04\x05\x06\x07\x08"):
+    """A fake signature for `target`, signed under its release name."""
+    return _fake_sig(key_id, ASSET[target].format(v=version))
 
 
 def _fake_pubkey(key_id=b"\x01\x02\x03\x04\x05\x06\x07\x08"):
@@ -213,10 +247,11 @@ def _fake_pubkey(key_id=b"\x01\x02\x03\x04\x05\x06\x07\x08"):
 
 
 def self_test():
-    sig = _fake_sig()
     pub = _fake_pubkey()
+    mac, linux, win = (_named(t, "0.5.1") for t in
+                       ("darwin-aarch64", "linux-x86_64", "windows-x86_64"))
     feed = build_feed("0.5.1", "node-v0.5.1", "notes", "2026-07-15T00:00:00Z",
-                      sig, sig, sig, pubkey=pub)
+                      mac, linux, win, pubkey=pub)
     assert set(feed["platforms"]) == {"darwin-aarch64", "linux-x86_64", "windows-x86_64"}, feed
     assert feed["platforms"]["darwin-aarch64"]["url"].endswith(
         "node-v0.5.1/BTX-Node_0.5.1_aarch64.app.tar.gz"
@@ -227,25 +262,28 @@ def self_test():
 
     # A single-platform feed is legitimate, and its URL is minted at the NEW
     # version — the stale-key loop cannot be expressed.
-    only_linux = build_feed("0.6.5", "node-v0.6.5", "n", "d", linux_sig=sig, pubkey=pub)
+    only_linux = build_feed("0.6.5", "node-v0.6.5", "n", "d",
+                            linux_sig=_named("linux-x86_64", "0.6.5"), pubkey=pub)
     assert set(only_linux["platforms"]) == {"linux-x86_64"}, only_linux
     assert only_linux["platforms"]["linux-x86_64"]["url"].endswith(
         "node-v0.6.5/BTX-Node_0.6.5_amd64.AppImage"
     ), only_linux
 
     # Mac-only and windows-only both work too.
-    assert set(build_feed("0.6.4", "node-v0.6.4", "n", "d", mac_sig=sig,
+    assert set(build_feed("0.6.4", "node-v0.6.4", "n", "d",
+                          mac_sig=_named("darwin-aarch64", "0.6.4"),
                           pubkey=pub)["platforms"]) == {"darwin-aarch64"}
-    assert set(build_feed("0.6.4", "node-v0.6.4", "n", "d", win_sig=sig,
+    assert set(build_feed("0.6.4", "node-v0.6.4", "n", "d",
+                          win_sig=_named("windows-x86_64", "0.6.4"),
                           pubkey=pub)["platforms"]) == {"windows-x86_64"}
 
     # Signatures are still verified, and a wrong signing key is caught.
-    wrong = _fake_sig(b"\x09\x09\x09\x09\x09\x09\x09\x09")
+    wrong = _named("linux-x86_64", "0.5.1", b"\x09\x09\x09\x09\x09\x09\x09\x09")
     for bad in (
-        lambda: build_feed("9.9.9", "node-v0.5.1", "", "", sig, sig, sig),   # version/tag mismatch
+        lambda: build_feed("9.9.9", "node-v0.5.1", "", "", mac, linux, win),   # version/tag mismatch
         lambda: build_feed("0.5.1", "node-v0.5.1", "", ""),                  # no platforms at all
         lambda: build_feed("0.5.1", "node-v0.5.1", "", "", mac_sig="not a sig"),  # bad sig
-        lambda: build_feed("0.5", "node-v0.5", "", "", mac_sig=sig),         # non-semver
+        lambda: build_feed("0.5", "node-v0.5", "", "", mac_sig=mac),         # non-semver
         lambda: build_feed("0.5.1", "node-v0.5.1", "", "", linux_sig=wrong, pubkey=pub),  # wrong key
     ):
         try:
@@ -253,6 +291,36 @@ def self_test():
             raise AssertionError("expected ValueError")
         except ValueError:
             pass
+
+    # Every entry must be signed under ITS release name at THIS version, or
+    # easyNode 0.6.32+ refuses the whole release (update_binding.rs).
+    unbound = (
+        # The bundler's own signature, which named the 0.6.30 Mac build.
+        ("darwin-aarch64", _fake_sig(name="easyBTX Node.app.tar.gz")),
+        # A genuine older build, offered as this version.
+        ("linux-x86_64", _named("linux-x86_64", "0.5.0")),
+        # Another platform's build under this platform's key.
+        ("linux-x86_64", _named("windows-x86_64", "0.5.1")),
+        # The miner, which the same key signs.
+        ("linux-x86_64", _fake_sig(name="easyBTX_0.5.1_amd64.AppImage")),
+    )
+    for target, bad_sig in unbound:
+        arg = {"darwin-aarch64": "mac_sig", "linux-x86_64": "linux_sig"}[target]
+        try:
+            build_feed("0.5.1", "node-v0.5.1", "", "", pubkey=pub, **{arg: bad_sig})
+            raise AssertionError(f"accepted an unbound {target} signature")
+        except ValueError as e:
+            assert "must be signed as" in str(e), e
+
+    # The untrusted first line is not the trusted comment, however it reads.
+    forged = base64.b64decode(_named("linux-x86_64", "0.5.0")).decode().split("\n")
+    forged[0] = "trusted comment: timestamp:0\tfile:BTX-Node_0.5.1_amd64.AppImage"
+    forged = base64.b64encode("\n".join(forged).encode()).decode()
+    try:
+        build_feed("0.5.1", "node-v0.5.1", "", "", linux_sig=forged, pubkey=pub)
+        raise AssertionError("read the untrusted comment as the signed one")
+    except ValueError:
+        pass
 
     # The REAL embedded pubkey must parse, so a conf change cannot silently
     # disable key-id verification.

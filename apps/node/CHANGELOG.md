@@ -8,6 +8,16 @@ root).
 
 ## [Unreleased]
 
+**An update is taken only when its signature was made for that version.** The
+app has always refused an update the release key did not sign. It now also
+refuses one whose signature was made for another version, another platform or
+the easyBTX miner, which signs with the same key, so an old or wrong build
+cannot be passed off as a new one. It also never takes an update below the
+highest version it has run. A refused update is written to the update log and
+shown in Settings as a failed check with its reason, and the download on
+easybtx.com/node always works by hand. The release scripts refuse to publish a
+feed the app would refuse. Found by jpp.
+
 ## [0.6.31] - 2026-09-27
 
 **The update that starts a new node near the tip, and tells a node that is
