@@ -875,6 +875,8 @@ dependencies = [
  "async-trait",
  "base64 0.21.7",
  "btx-core",
+ "minisign-verify",
+ "semver",
  "serde",
  "serde_json",
  "tauri",

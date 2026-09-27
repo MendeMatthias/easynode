@@ -964,6 +964,17 @@ anything is signed, published or flipped live:
    tarball is built by hand and has no CI sums file. The gate does not cover
    it, and this page must not be read as saying it does.
 
+   ⚠ **Sign every build under its release name, the mac tarball included.** A
+   signature names the file it was made over, in its signed comment, and
+   easyNode 0.6.32 and later take an update only when every entry in the feed
+   was signed under the release name for its platform and the feed's version
+   (`update_binding.rs`). The bundler signs the mac tarball as
+   `easyBTX Node.app.tar.gz`, which names no version: rename it to
+   `BTX-Node_<ver>_aarch64.app.tar.gz` first and sign THAT (`build-node-feed.sh
+   --mac` checks the name and signs it). `gen-node-feed.py` and
+   `verify-updater-sig.py` refuse a signature made under any other name,
+   because a feed carrying one would stop every 0.6.32+ install from updating.
+
 6. **Build the feed** (signs the keyless CI artifacts locally and
    minisign-verifies each one against the app's embedded pubkey
    `RWSiwrxz2pJDXR4AchfYB5DQzvD8VbIE3D87Ft4D/km76xZIikK6XE9y`). Pass only the
