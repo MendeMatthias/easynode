@@ -8,7 +8,7 @@ root).
 
 ## [Unreleased]
 
-## [0.6.32] - 2026-09-27
+## [0.6.32] - 2026-09-28
 
 **Every node is held off two branches until BTX's developers rule on them.**
 On 27 September a branch that left the valid chain at 228,145 (`8240c62e…` at
