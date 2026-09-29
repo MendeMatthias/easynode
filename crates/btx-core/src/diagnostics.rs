@@ -176,17 +176,28 @@ pub struct RedactionContext {
 
 pub fn redact(text: &str, ctx: &RedactionContext) -> String {
     let mut out = text.to_string();
-    for s in ctx.secrets.iter().map(|s| s.trim()).filter(|s| s.len() >= 8) {
+    // 4 is the floor, not 1: an empty or 1-3 character "secret" would match
+    // all over an ordinary report and shred it.
+    for s in ctx.secrets.iter().map(|s| s.trim()).filter(|s| s.len() >= 4) {
         out = out.replace(s, "[removed]");
     }
-    if let Some(home) = ctx.home.as_deref().filter(|h| h.len() > 1) {
+    if let Some(home) = ctx
+        .home
+        .as_deref()
+        .map(|h| h.trim_end_matches(['/', '\\']))
+        .filter(|h| h.len() > 1)
+    {
         out = out.replace(home, "~");
     }
     out.lines().map(|l| redact_line(l, ctx)).collect::<Vec<_>>().join("\n")
 }
 
 fn is_separator(c: char) -> bool {
-    c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '=' | '"' | '\'' | '<' | '>' | '{' | '}')
+    c.is_whitespace()
+        || matches!(
+            c,
+            ',' | ';' | '(' | ')' | '=' | '"' | '\'' | '<' | '>' | '{' | '}' | '/' | '@' | '|'
+        )
 }
 
 fn redact_line(line: &str, ctx: &RedactionContext) -> String {
@@ -206,7 +217,11 @@ fn redact_line(line: &str, ctx: &RedactionContext) -> String {
 }
 
 fn redact_token(tok: &str, ctx: &RedactionContext) -> String {
-    let core = tok.trim_end_matches('.');
+    // Trailing sentence/URL punctuation, not part of the address itself:
+    // "84.32.49.226:19335." (end of a sentence) and "...:19335:" (a stray
+    // colon) must both still be recognised. `[` and `]` are never trimmed:
+    // they belong to a bracketed IPv6 host like `[2001:db8::7]:19335`.
+    let core = tok.trim_end_matches(['.', ':']);
     let tail = &tok[core.len()..];
     if core.is_empty() {
         return tok.to_string();
@@ -391,6 +406,125 @@ mod tests {
             &ctx("unusedsecret"),
         );
         assert_eq!(out, "(validation.cpp:17539) net_processing.cpp:1234 init.cpp:3961");
+    }
+
+    /// A peer IP wrapped in a URL, an `@`-prefixed userinfo, a stray trailing
+    /// colon, or `|`-delimited log formatting must all still be caught; an
+    /// ordinary update URL and the already-redacted home path must not be
+    /// touched by the wider tokenizing this needs.
+    #[test]
+    fn url_wrapped_and_delimited_peer_addresses_are_redacted() {
+        let context = ctx("unusedsecret");
+        for wrapped in [
+            "http://84.32.49.226:19335/",
+            "user@84.32.49.226:19335",
+            "84.32.49.226:19335:",
+            "|84.32.49.226|",
+        ] {
+            let out = redact(wrapped, &context);
+            assert!(!out.contains("84.32.49.226"), "IP survived in {wrapped:?}:\n{out}");
+        }
+        for safe in [
+            "https://easybtx.com/updater/latest-node.json",
+            "~/.easybtx/debug.log",
+        ] {
+            let out = redact(safe, &context);
+            assert_eq!(out, safe, "survivor mangled: {safe:?} -> {out:?}");
+        }
+    }
+
+    /// The `secrets` floor is 4 characters, not 8: a short passphrase or
+    /// token must still be removed, while the floor itself keeps a 1-3
+    /// character string from being treated as a secret and shredding the
+    /// whole report.
+    #[test]
+    fn secrets_as_short_as_four_characters_are_removed() {
+        let context = RedactionContext {
+            home: None,
+            secrets: vec!["ab12cd".into(), "no".into()],
+            published_hosts: crate::node::published_peer_hosts(),
+        };
+        let out = redact("token ab12cd appears here, unlike no which is too short", &context);
+        assert!(!out.contains("ab12cd"), "6-character secret survived:\n{out}");
+        assert!(out.contains(" no "), "a 2-character string must not be treated as a secret:\n{out}");
+    }
+
+    /// The real pipeline: `redact(&render(&input), &ctx)`. An unpublished
+    /// peer, a WIF and a URL carrying an unpublished IP inside a log line,
+    /// and an engine warning string must all disappear, while the published
+    /// peer, its `peer N` label and the report's section headings survive.
+    #[test]
+    fn redact_of_render_hides_every_private_value_end_to_end() {
+        let wif = crate::signer::generate_wif();
+        let input = DiagnosticsInput {
+            generated_at: "2026-09-29 14:05 UTC".into(),
+            app_version: "0.7.0".into(),
+            engine_pinned: "v0.34.9 (84b998b4)".into(),
+            engine_running: Some("/BTX:0.34.9/".into()),
+            platform: "macos aarch64, installed from a dmg".into(),
+            role: "follows signatures".into(),
+            signer_pubkey: None,
+            status_line: "LIVE · Up to date".into(),
+            window_lines: vec!["All caught up.".into()],
+            phase: "ready".into(),
+            chain: Some(BlockchainInfo {
+                blocks: 233_480,
+                headers: 233_481,
+                warnings: vec!["Cadence burst hold".into()],
+                ..Default::default()
+            }),
+            best_block_hash: Some("11bd18812b6afcd1".into()),
+            chainstates: None,
+            tips: vec![],
+            held: vec![],
+            peers: vec![
+                PeerInfo {
+                    id: 4,
+                    addr: "109.199.124.187:19335".into(),
+                    subver: "/BTX:0.34.11/".into(),
+                    synced_headers: 233_481,
+                    synced_blocks: 233_480,
+                    servicesnames: vec!["NETWORK_LIMITED".into()],
+                    connection_type: "manual".into(),
+                    ..Default::default()
+                },
+                PeerInfo {
+                    id: 7,
+                    addr: "84.32.49.226:19335".into(),
+                    subver: "/BTX:0.34.9/".into(),
+                    synced_headers: 200_000,
+                    synced_blocks: 200_000,
+                    connection_type: "inbound".into(),
+                    ..Default::default()
+                },
+            ],
+            attested_tip: None,
+            stall: None,
+            log_warnings: vec![format!(
+                "[warning] signing key backup contains {wif}, update check via \
+                 http://84.32.49.226:19335/status failed"
+            )],
+        };
+        let context = RedactionContext {
+            home: Some("/Users/alice".into()),
+            secrets: vec![wif.clone()],
+            published_hosts: crate::node::published_peer_hosts(),
+        };
+        let out = redact(&render(&input), &context);
+        for gone in [wif.as_str(), "84.32.49.226"] {
+            assert!(!out.contains(gone), "{gone} survived end to end:\n{out}");
+        }
+        for kept in [
+            "easyNode diagnostics",
+            "Chain",
+            "Held branches",
+            "Peers (0 in, 2 out)",
+            "peer 4: 109.199.124.187:19335",
+            "Engine notices",
+            "Last warning lines of debug.log",
+        ] {
+            assert!(out.contains(kept), "{kept} missing end to end:\n{out}");
+        }
     }
 
     #[test]
