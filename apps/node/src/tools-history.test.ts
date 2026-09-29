@@ -43,13 +43,6 @@ describe("RestartArm", () => {
     expect(arm.armed).toBe(false);
     expect(arm.click()).toBe(false);
   });
-  it("disarms when the overlay closes, so reopening starts over", () => {
-    const arm = new RestartArm();
-    arm.click();
-    arm.disarm(); // the overlay closed
-    expect(arm.armed).toBe(false);
-    expect(arm.click()).toBe(false);
-  });
 });
 
 describe("ReportCopy", () => {

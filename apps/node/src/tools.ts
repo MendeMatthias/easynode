@@ -63,6 +63,14 @@ function say(text: string): void {
   r.hidden = false;
 }
 
+/** Clears the action line, so a sentence from the last open (a refusal, a
+ * fetch result) is not left under buttons it may no longer describe. */
+function unsay(): void {
+  const r = $("tools-action-result");
+  r.textContent = "";
+  r.hidden = true;
+}
+
 export function initTools(): void {
   const overlay = $("tools-overlay");
   const history = new History(50);
@@ -98,14 +106,15 @@ export function initTools(): void {
   };
 
   /** The single close path for every way the overlay can close, so nothing
-   * (an armed restart, a pending confirm, a built report) survives to the
-   * next open. */
+   * (an armed restart, a pending confirm, a built report, the last action's
+   * sentence) survives to the next open. */
   const closeTools = () => {
     overlay.hidden = true;
     resetRestartArm();
     pendingToken = null;
     $("tools-confirm").hidden = true;
     resetReport();
+    unsay();
   };
 
   const open = async () => {

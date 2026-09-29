@@ -845,6 +845,7 @@ mod tests {
                 PeerInfo {
                     id: 7,
                     addr: "84.32.49.226:19335".into(),
+                    inbound: true,
                     subver: "/BTX:0.34.9/".into(),
                     synced_headers: 200_000,
                     synced_blocks: 200_000,
@@ -872,7 +873,7 @@ mod tests {
             "easyNode diagnostics",
             "Chain",
             "Held branches",
-            "Peers (0 in, 2 out)",
+            "Peers (1 in, 1 out)",
             "peer 4: 109.199.124.187:19335",
             "Engine notices",
             "Last warning lines of debug.log",

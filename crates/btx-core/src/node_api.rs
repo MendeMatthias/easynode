@@ -325,12 +325,12 @@ pub struct ConnectionCounts {
     pub localservicesnames: Vec<String>,
 }
 
-/// The per-peer subset a trusted mirror's health depends on (`getpeerinfo`).
-///
 fn minus_one() -> i64 {
     -1
 }
 
+/// The per-peer subset a trusted mirror's health depends on (`getpeerinfo`).
+///
 /// `bytesrecv_per_msg.mmattest` is the honest "is anyone feeding me
 /// attestations" signal — the field that identified the ONE working archive
 /// during the api.btxscan.io incident. Everything defaults so partial peer
