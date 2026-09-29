@@ -10,13 +10,14 @@ use tauri::{AppHandle, State};
 use btx_core::console_policy::{self, ConfirmBook, Decision};
 use btx_core::diagnostics::{self, DiagnosticsInput, HeldBranchState, RedactionContext};
 use btx_core::engine_warnings::Notice;
+use btx_core::error::AppError;
 use btx_core::node_api as api;
 use btx_core::rpc::{Rpc, RpcClient};
 use btx_core::stuck_blocks::{self, FetchPlan};
 
 use crate::ask::{degrade, Ask};
 use crate::commands::{destructive_allowed, node_ownership, restart_node_projected};
-use crate::state::{node_datadir, AppState};
+use crate::state::{node_datadir, AppState, NodePhase};
 
 /// Hosts this app itself talks to that are not node peers: the update feed
 /// and release host, and the block explorer API. Diagnostics must never
@@ -56,6 +57,87 @@ pub enum ConsoleAnswer {
     Confirm { token: String, sentence: String },
     Refused { sentence: String },
     Stopped,
+    Warming,
+}
+
+/// Why there is no RPC client to use. The client is only armed once a start
+/// has finished, so a node that is still starting (a long rebuild can take
+/// an hour) has none either; the app's own phase tells the two apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoNode {
+    Starting,
+    Stopped,
+}
+
+/// What every Tools surface says to a node that is on its way up, whether
+/// the app is still starting it or the engine answers RPC_IN_WARMUP (-28).
+const STILL_STARTING: &str = "Your node is still starting. Try again in a moment.";
+
+fn no_node(phase: &NodePhase) -> NoNode {
+    match phase {
+        NodePhase::Preparing | NodePhase::Starting | NodePhase::Warming { .. } => NoNode::Starting,
+        _ => NoNode::Stopped,
+    }
+}
+
+async fn no_node_now(state: &State<'_, AppState>) -> NoNode {
+    no_node(&*state.phase.lock().await)
+}
+
+/// RPC_IN_WARMUP: the engine is up but still verifying or rebuilding, as in
+/// `crate::ask::degrade`.
+fn is_warming(e: &AppError) -> bool {
+    matches!(e, AppError::Rpc { code: -28, .. })
+}
+
+fn console_without_node(n: NoNode) -> ConsoleAnswer {
+    match n {
+        NoNode::Starting => ConsoleAnswer::Warming,
+        NoNode::Stopped => ConsoleAnswer::Stopped,
+    }
+}
+
+fn console_error(e: AppError) -> ConsoleAnswer {
+    if is_warming(&e) {
+        return ConsoleAnswer::Warming;
+    }
+    ConsoleAnswer::Output {
+        text: format!("The node answered: {e}"),
+    }
+}
+
+fn ask_without_node<T: Serialize>(n: NoNode) -> Ask<T> {
+    match n {
+        NoNode::Starting => Ask::Warming,
+        NoNode::Stopped => Ask::Stopped,
+    }
+}
+
+fn fetch_without_node(n: NoNode) -> String {
+    match n {
+        NoNode::Starting => STILL_STARTING.into(),
+        NoNode::Stopped => "Start your node first.".into(),
+    }
+}
+
+fn fetch_error(e: AppError) -> String {
+    if is_warming(&e) {
+        return STILL_STARTING.into();
+    }
+    e.to_string()
+}
+
+/// The role and engine lines of a report the node could not answer for.
+/// The rest of the report (the phase, with the engine's own warm-up line,
+/// and the debug.log lines) does not need the node and is always there.
+fn describe_without_answers(input: &mut DiagnosticsInput, n: NoNode) {
+    match n {
+        NoNode::Starting => {
+            input.role = "not known yet, the node is still starting".into();
+            input.engine_running = Some("still starting".into());
+        }
+        NoNode::Stopped => input.role = "node not running".into(),
+    }
 }
 
 pub(crate) fn answer_text(v: &Value) -> String {
@@ -71,15 +153,13 @@ async fn rpc_handle(state: &State<'_, AppState>) -> Option<RpcClient> {
 
 async fn run_call(state: &State<'_, AppState>, call: console_policy::Call) -> ConsoleAnswer {
     let Some(rpc) = rpc_handle(state).await else {
-        return ConsoleAnswer::Stopped;
+        return console_without_node(no_node_now(state).await);
     };
     match rpc.call(&call.method, Value::Array(call.params)).await {
         Ok(v) => ConsoleAnswer::Output {
             text: answer_text(&v),
         },
-        Err(e) => ConsoleAnswer::Output {
-            text: format!("The node answered: {e}"),
-        },
+        Err(e) => console_error(e),
     }
 }
 
@@ -124,7 +204,7 @@ pub async fn tools_console_confirm(
 #[tauri::command]
 pub async fn tools_engine_notices(state: State<'_, AppState>) -> Result<Ask<Vec<Notice>>, String> {
     let Some(rpc) = rpc_handle(&state).await else {
-        return Ok(Ask::Stopped);
+        return Ok(ask_without_node(no_node_now(&state).await));
     };
     Ok(match api::get_blockchain_info(&rpc).await {
         Ok(info) => Ask::Ready(btx_core::engine_warnings::all_notices(&info)),
@@ -172,7 +252,7 @@ async fn missing_blocks(
         let h = rpc
             .call("getblockheader", json!([hash, true]))
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(fetch_error)?;
         let height = h["height"]
             .as_u64()
             .ok_or("The node sent a header without a height.")?;
@@ -192,16 +272,16 @@ async fn missing_blocks(
 
 #[tauri::command]
 pub async fn tools_fetch_stuck_blocks(state: State<'_, AppState>) -> Result<FetchOutcome, String> {
-    let rpc = rpc_handle(&state).await.ok_or("Start your node first.")?;
-    let info = api::get_blockchain_info(&rpc)
-        .await
-        .map_err(|e| e.to_string())?;
+    let Some(rpc) = rpc_handle(&state).await else {
+        return Err(fetch_without_node(no_node_now(&state).await));
+    };
+    let info = api::get_blockchain_info(&rpc).await.map_err(fetch_error)?;
     let tip_hash = rpc
         .call("getbestblockhash", json!([]))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(fetch_error)?;
     let tip_hash = tip_hash.as_str().unwrap_or("").to_string();
-    let tips = api::get_chain_tips(&rpc).await.map_err(|e| e.to_string())?;
+    let tips = api::get_chain_tips(&rpc).await.map_err(fetch_error)?;
     let done = |message: String| FetchOutcome {
         message,
         tip_before: info.blocks,
@@ -216,7 +296,7 @@ pub async fn tools_fetch_stuck_blocks(state: State<'_, AppState>) -> Result<Fetc
         Ok(m) => m,
         Err(sentence) => return Ok(done(sentence)),
     };
-    let peers = api::get_peer_info(&rpc).await.map_err(|e| e.to_string())?;
+    let peers = api::get_peer_info(&rpc).await.map_err(fetch_error)?;
     let reqs = match stuck_blocks::plan(&missing, &peers) {
         FetchPlan::Nothing(sentence) => return Ok(done(sentence)),
         FetchPlan::Ask(reqs) => reqs,
@@ -291,8 +371,20 @@ pub async fn tools_diagnostics(
         )),
         ..Default::default()
     };
-    if let Some(rpc) = &rpc {
-        input.chain = api::get_blockchain_info(rpc).await.ok();
+    let mut answering = None;
+    match &rpc {
+        None => describe_without_answers(&mut input, no_node_now(&state).await),
+        // While the engine warms up it answers every call with -28, so the
+        // first answer decides: the rest would only repeat it.
+        Some(rpc) => match api::get_blockchain_info(rpc).await {
+            Err(e) if is_warming(&e) => describe_without_answers(&mut input, NoNode::Starting),
+            chain => {
+                input.chain = chain.ok();
+                answering = Some(rpc);
+            }
+        },
+    }
+    if let Some(rpc) = answering {
         input.best_block_hash = rpc
             .call("getbestblockhash", json!([]))
             .await
@@ -334,8 +426,6 @@ pub async fn tools_diagnostics(
                 state: held_state.into(),
             });
         }
-    } else {
-        input.role = "node not running".into();
     }
     let ctx = RedactionContext {
         home: home_dir_display(),
@@ -388,6 +478,107 @@ fn chrono_like_now() -> String {
 mod tests {
     use super::answer_text;
     use serde_json::json;
+
+    mod a_node_that_is_still_starting {
+        use super::super::*;
+        use btx_core::engine_warnings::Notice;
+
+        const STARTING: &str = "Your node is still starting. Try again in a moment.";
+
+        fn warming() -> NodePhase {
+            NodePhase::Warming {
+                message: "Verifying blocks...".into(),
+            }
+        }
+
+        fn in_warmup() -> AppError {
+            AppError::Rpc {
+                code: -28,
+                message: "Verifying blocks...".into(),
+            }
+        }
+
+        /// The RPC client is only armed once a start has finished, so the
+        /// phase is what tells a starting node from a stopped one.
+        #[test]
+        fn is_told_apart_from_a_stopped_one_by_the_phase() {
+            for p in [NodePhase::Preparing, NodePhase::Starting, warming()] {
+                assert_eq!(no_node(&p), NoNode::Starting, "{p:?}");
+            }
+            for p in [
+                NodePhase::Stopped,
+                NodePhase::Welcome,
+                NodePhase::Error {
+                    message: "x".into(),
+                },
+            ] {
+                assert_eq!(no_node(&p), NoNode::Stopped, "{p:?}");
+            }
+        }
+
+        #[test]
+        fn the_command_window_says_it_is_starting_not_stopped() {
+            let starting = serde_json::to_value(console_without_node(NoNode::Starting)).unwrap();
+            assert_eq!(starting, json!({"kind": "warming"}));
+            let stopped = serde_json::to_value(console_without_node(NoNode::Stopped)).unwrap();
+            assert_eq!(stopped, json!({"kind": "stopped"}));
+            let warmup = serde_json::to_value(console_error(in_warmup())).unwrap();
+            assert_eq!(warmup, json!({"kind": "warming"}));
+            let other = console_error(AppError::Rpc {
+                code: -8,
+                message: "Block height out of range".into(),
+            });
+            assert!(
+                matches!(&other, ConsoleAnswer::Output { text } if text.contains("Block height out of range")),
+                "{other:?}"
+            );
+        }
+
+        #[test]
+        fn engine_notices_say_it_is_starting_not_stopped() {
+            let starting =
+                serde_json::to_value(ask_without_node::<Vec<Notice>>(NoNode::Starting)).unwrap();
+            assert_eq!(starting, json!({"state": "warming"}));
+            let stopped =
+                serde_json::to_value(ask_without_node::<Vec<Notice>>(NoNode::Stopped)).unwrap();
+            assert_eq!(stopped, json!({"state": "stopped"}));
+        }
+
+        #[test]
+        fn fetch_a_stuck_block_says_it_is_starting_not_stopped() {
+            assert_eq!(fetch_without_node(NoNode::Starting), STARTING);
+            assert_eq!(
+                fetch_without_node(NoNode::Stopped),
+                "Start your node first."
+            );
+            assert_eq!(fetch_error(in_warmup()), STARTING);
+        }
+
+        /// The report is still produced, with the phase and the log lines,
+        /// and its role and engine lines say the node is starting.
+        #[test]
+        fn the_diagnostics_report_says_it_is_starting_not_stopped() {
+            let mut input = DiagnosticsInput {
+                phase: format!("{:?}", warming()),
+                log_warnings: vec!["2026-09-29T10:00:00Z [warning] still verifying".into()],
+                ..Default::default()
+            };
+            describe_without_answers(&mut input, NoNode::Starting);
+            let report = diagnostics::render(&input);
+            assert!(!report.contains("not running"), "{report}");
+            assert!(
+                report.contains("Role: not known yet, the node is still starting"),
+                "{report}"
+            );
+            assert!(report.contains("(running: still starting)"), "{report}");
+            assert!(report.contains("Phase: Warming"), "{report}");
+            assert!(report.contains("still verifying"), "{report}");
+
+            let mut stopped = DiagnosticsInput::default();
+            describe_without_answers(&mut stopped, NoNode::Stopped);
+            assert!(diagnostics::render(&stopped).contains("Role: node not running"));
+        }
+    }
 
     #[test]
     fn strings_print_raw_and_objects_print_pretty() {

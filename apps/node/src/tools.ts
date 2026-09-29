@@ -9,7 +9,11 @@ type ConsoleAnswer =
   | { kind: "output"; text: string }
   | { kind: "confirm"; token: string; sentence: string }
   | { kind: "refused"; sentence: string }
-  | { kind: "stopped" };
+  | { kind: "stopped" }
+  | { kind: "warming" };
+
+/** A node on its way up is not a stopped one: said the same on every surface. */
+const STILL_STARTING = "Your node is still starting. Try again in a moment.";
 
 interface Notice {
   raw: string;
@@ -153,8 +157,10 @@ export function initTools(): void {
       p.textContent = text;
       box.appendChild(p);
     };
-    if (!ans || ans.state === "warming") {
+    if (!ans) {
       add("The node is not answering yet.", "tools-note");
+    } else if (ans.state === "warming") {
+      add(STILL_STARTING, "tools-note");
     } else if (ans.state === "stopped") {
       add("Start your node to see its notices.", "tools-note");
     } else if (ans.state === "unavailable") {
@@ -229,6 +235,9 @@ export function initTools(): void {
         break;
       case "stopped":
         render(line, "Start your node to run commands.");
+        break;
+      case "warming":
+        render(line, STILL_STARTING);
         break;
       case "confirm":
         pendingToken = a.token;
