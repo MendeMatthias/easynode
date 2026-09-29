@@ -31,7 +31,7 @@ sha2 = "0.10"
 # encode it as the WIF the engine reads, derive the public key the operator
 # shows. Pure Rust on purpose: this crate builds on three CI runners with no C
 # toolchain assumptions, and a signing key is not the place for a build script.
-k256 = { version = "0.13", default-features = false, features = ["arithmetic", "std"] }
+k256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa", "std"] }
 bs58 = { version = "0.5", features = ["check"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 # Cross-platform home/data dir resolution (resolves %APPDATA% on Windows).
