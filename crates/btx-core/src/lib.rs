@@ -37,6 +37,7 @@ pub mod known_invalid;
 pub mod nickname;
 pub mod node;
 pub mod node_api;
+pub mod operators;
 pub mod platform;
 pub mod power;
 pub mod role;
