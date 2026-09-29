@@ -49,6 +49,18 @@
 //! build never raises the mark, so running a test build cannot hold back real
 //! releases.
 //!
+//! # What this copy will not download on its own
+//!
+//! Two offers are declined before anything is downloaded, with a notice that
+//! says what to do instead (docs/decisions/2026-09-28-deb-installs-update-
+//! themselves.md). A copy installed from the .deb, offered a release that lists
+//! the AppImage and no .deb: the plugin would fetch the ~467 MB AppImage and
+//! `install_deb` would refuse it, at every launch and every six hours. And, on
+//! an automatic check, a version whose verified download already failed to
+//! install on this machine; "Check now" clears that memory first, so a press
+//! always tries. Both are kept in the same slot as a refusal, and recorded as a
+//! failed check whose detail is the notice.
+//!
 //! # What a mistake here costs
 //!
 //! A feed the app refuses stops every update. So the refusal is written down
@@ -96,6 +108,56 @@ pub fn expected_signed_name(platform: &str, version: &str) -> Option<String> {
         .iter()
         .find(|(key, _)| *key == platform)
         .map(|(_, suffix)| format!("{ASSET_PREFIX}{version}{suffix}"))
+}
+
+/// Where a person gets any build by hand.
+pub const DOWNLOADS_AT: &str = "easybtx.com/node";
+
+/// Every notice for an update this copy will not download on its own carries
+/// this phrase, and the Settings pane finds the notice by it. `HAND_INSTALL_MARK`
+/// in `src/update-check.ts` is the same text, and `update-check.test.ts` reads
+/// this file to keep the two equal.
+pub const HAND_INSTALL_MARK: &str = "install it by hand";
+
+/// What a .deb copy does by hand for `version`: fetch the package, then the
+/// command.
+fn deb_steps(version: &str) -> String {
+    let deb = expected_signed_name(DEB_KEY, version).unwrap_or_default();
+    format!("get the .deb from {DOWNLOADS_AT} and run sudo apt install ./{deb}")
+}
+
+/// The notice for a .deb copy offered a release with no .deb in it.
+pub fn deb_hand_install_notice(version: &str) -> String {
+    format!(
+        "v{version} is out. This copy came from a .deb, so {HAND_INSTALL_MARK}: {}",
+        deb_steps(version)
+    )
+}
+
+/// The notice for a version whose install already failed on this machine.
+pub fn failed_before_notice(version: &str, deb: bool) -> String {
+    let how = if deb {
+        format!("{HAND_INSTALL_MARK}: {}", deb_steps(version))
+    } else {
+        format!("{HAND_INSTALL_MARK} from {DOWNLOADS_AT}")
+    };
+    format!(
+        "v{version} failed to install here, so it is not downloaded again. \
+         Press Check now to try again, or {how}"
+    )
+}
+
+/// True when a release lists the AppImage and no .deb. A .deb copy handed such
+/// a release would get the AppImage (the plugin falls back from
+/// `linux-x86_64-deb` to `linux-x86_64`), and `install_deb` refuses it after
+/// the whole download: `InvalidUpdaterFormat`.
+pub fn offers_only_the_appimage(data: &RemoteReleaseInner) -> bool {
+    match data {
+        RemoteReleaseInner::Static { platforms } => {
+            platforms.contains_key(APPIMAGE_KEY) && !platforms.contains_key(DEB_KEY)
+        }
+        RemoteReleaseInner::Dynamic(_) => false,
+    }
 }
 
 /// The file name a Tauri signature was made over: the `file:` field of its
@@ -159,6 +221,20 @@ pub enum Decision {
     NotNewer,
     /// Newer, but not bound to its version. Refused, with the reason.
     Refuse(String),
+    /// Newer and bound, but not for this copy to download on its own: a .deb
+    /// copy offered only the AppImage, or a version whose install already
+    /// failed here. The notice says what to do instead.
+    Decline(String),
+}
+
+/// What this install knows about itself, beyond its version, when it judges
+/// an offer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThisInstall {
+    /// Installed from the .deb: the bundler stamped `Deb` into this binary.
+    pub deb: bool,
+    /// A version whose verified download failed to install here.
+    pub failed: Option<Version>,
 }
 
 /// The rule, pure. `current` is the running version, `high_water` the highest
@@ -181,33 +257,81 @@ pub fn decide(
     }
 }
 
-/// The last refusal, kept for whichever caller records the check's outcome.
-/// The comparator can only answer yes or no, and a no alone would be recorded
-/// as "no update", which is exactly the silence this module must not have.
+/// [`decide`], then what this install knows about itself. Pure: `here.deb`
+/// comes from the binary and `here.failed` from the settings file, both read
+/// by [`comparator`], never here.
+pub fn decide_here(
+    current: &Version,
+    high_water: Option<&Version>,
+    here: &ThisInstall,
+    release: &RemoteRelease,
+) -> Decision {
+    let decision = decide(current, high_water, release);
+    if decision != Decision::Offer {
+        return decision;
+    }
+    let version = release.version.to_string();
+    if here.deb && offers_only_the_appimage(&release.data) {
+        return Decision::Decline(deb_hand_install_notice(&version));
+    }
+    if here.failed.as_ref() == Some(&release.version) {
+        return Decision::Decline(failed_before_notice(&version, here.deb));
+    }
+    Decision::Offer
+}
+
+/// The last refusal or notice, kept for whichever caller records the check's
+/// outcome. The comparator can only answer yes or no, and a no alone would be
+/// recorded as "no update", which is exactly the silence this module must not
+/// have.
 static REFUSAL: Mutex<Option<String>> = Mutex::new(None);
 
 /// The plugin's version comparator (`lib.rs`). Both update paths use it.
 pub fn comparator(current: Version, release: RemoteRelease) -> bool {
-    judge(&current, high_water(&node_datadir()).as_ref(), &release)
+    let datadir = node_datadir();
+    let here = ThisInstall {
+        deb: is_deb_install(),
+        failed: failed_install(&datadir),
+    };
+    judge(&current, high_water(&datadir).as_ref(), &here, &release)
 }
 
-/// [`decide`], with a refusal kept for the record.
-fn judge(current: &Version, mark: Option<&Version>, release: &RemoteRelease) -> bool {
-    match decide(current, mark, release) {
-        Decision::Offer => true,
-        Decision::NotNewer => false,
-        Decision::Refuse(reason) => {
-            let reason = format!("refused v{}: {reason}", release.version);
-            eprintln!("[update] {reason}");
-            *REFUSAL.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
-            false
-        }
-    }
+/// This binary was packed into a .deb. The bundler stamps the package type
+/// into the binary it packs (`usr/bin/easybtx-node` in the 0.6.32 .deb carries
+/// `__TAURI_BUNDLE_TYPE_VAR_DEB`); a dev or test build carries none, and a Mac
+/// always reads as `App`.
+fn is_deb_install() -> bool {
+    tauri::utils::platform::bundle_type() == Some(tauri::utils::config::BundleType::Deb)
 }
 
-/// Take the refusal the last check left, if any.
+/// [`decide_here`], with a refusal or a notice kept for the record.
+fn judge(
+    current: &Version,
+    mark: Option<&Version>,
+    here: &ThisInstall,
+    release: &RemoteRelease,
+) -> bool {
+    let kept = match decide_here(current, mark, here, release) {
+        Decision::Offer => return true,
+        Decision::NotNewer => return false,
+        Decision::Refuse(reason) => format!("refused v{}: {reason}", release.version),
+        Decision::Decline(notice) => notice,
+    };
+    eprintln!("[update] {kept}");
+    *REFUSAL.lock().unwrap_or_else(|e| e.into_inner()) = Some(kept);
+    false
+}
+
+/// Take the refusal or notice the last check left, if any.
 pub fn take_refusal() -> Option<String> {
     REFUSAL.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+/// The refusal or notice the last check left, without taking it. The front
+/// end reads it to say on screen what `record_update_check`, which takes it
+/// right after, writes down.
+pub fn peek_refusal() -> Option<String> {
+    REFUSAL.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// The highest version this install has run, or `None` if it was never
@@ -510,11 +634,186 @@ mod tests {
 
     #[test]
     fn a_refusal_is_kept_for_the_record_and_taken_once() {
+        // The one test that touches the shared slot: tests run in parallel,
+        // and a second one would take this one's record.
         let _ = take_refusal();
-        assert!(!judge(&ver("0.6.32"), None, &bound_0630_as("0.9.0")));
+        let here = ThisInstall::default();
+        assert!(!judge(&ver("0.6.32"), None, &here, &bound_0630_as("0.9.0")));
         let reason = take_refusal().expect("the refusal is kept");
         assert!(reason.starts_with("refused v0.9.0: "), "{reason}");
         assert_eq!(take_refusal(), None, "taken once");
+
+        // A decline is kept as its notice, whole, and peeking leaves it for
+        // the record to take.
+        assert!(!judge(
+            &ver("0.6.29"),
+            None,
+            &deb_copy(),
+            &bound_0630_as("0.6.30")
+        ));
+        let notice = deb_hand_install_notice("0.6.30");
+        assert_eq!(peek_refusal(), Some(notice.clone()));
+        assert_eq!(
+            peek_refusal(),
+            Some(notice.clone()),
+            "peeking takes nothing"
+        );
+        assert_eq!(take_refusal(), Some(notice));
+        assert_eq!(peek_refusal(), None);
+    }
+
+    fn deb_copy() -> ThisInstall {
+        ThisInstall {
+            deb: true,
+            failed: None,
+        }
+    }
+
+    /// The AppImage-only feed a .deb copy read until now: it downloaded the
+    /// ~467 MB AppImage, `install_deb` refused it, and it did so again at the
+    /// next launch and every six hours. Now nothing is downloaded, and the
+    /// record gives the command.
+    #[test]
+    fn a_deb_copy_declines_a_release_that_offers_only_the_appimage() {
+        let r = bound_0630_as("0.6.30");
+        assert!(offers_only_the_appimage(&r.data));
+        match decide_here(&ver("0.6.29"), None, &deb_copy(), &r) {
+            Decision::Decline(notice) => {
+                assert_eq!(
+                    notice,
+                    "v0.6.30 is out. This copy came from a .deb, so install it by hand: \
+                     get the .deb from easybtx.com/node and run \
+                     sudo apt install ./BTX-Node_0.6.30_amd64.deb"
+                );
+            }
+            other => panic!("expected a decline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_appimage_copy_is_never_declined_by_the_deb_guard() {
+        let r = bound_0630_as("0.6.30");
+        assert_eq!(
+            decide_here(&ver("0.6.29"), None, &ThisInstall::default(), &r),
+            Decision::Offer
+        );
+    }
+
+    #[test]
+    fn a_deb_copy_takes_a_release_that_lists_its_deb() {
+        let r = deb_feed("0.6.34", "BTX-Node_0.6.34_amd64.deb");
+        assert!(!offers_only_the_appimage(&r.data));
+        assert_eq!(
+            decide_here(&ver("0.6.33"), None, &deb_copy(), &r),
+            Decision::Offer
+        );
+    }
+
+    /// The guard comes after the rules that were there first: a tampered feed
+    /// is still reported as tampered on a .deb copy, and nothing newer is
+    /// still the ordinary "no update".
+    #[test]
+    fn the_guard_never_hides_a_refusal_or_a_current_version() {
+        let tampered = bound_0630_as("0.9.0");
+        assert!(matches!(
+            decide_here(&ver("0.6.32"), None, &deb_copy(), &tampered),
+            Decision::Refuse(_)
+        ));
+        let current = bound_0630_as("0.6.30");
+        assert_eq!(
+            decide_here(&ver("0.6.30"), None, &deb_copy(), &current),
+            Decision::NotNewer
+        );
+    }
+
+    #[test]
+    fn an_automatic_check_does_not_download_a_version_that_failed_here_again() {
+        let r = bound_0630_as("0.6.30");
+        let failed = ThisInstall {
+            deb: false,
+            failed: Some(ver("0.6.30")),
+        };
+        match decide_here(&ver("0.6.29"), None, &failed, &r) {
+            Decision::Decline(notice) => assert_eq!(
+                notice,
+                "v0.6.30 failed to install here, so it is not downloaded again. \
+                 Press Check now to try again, or install it by hand from easybtx.com/node"
+            ),
+            other => panic!("expected a decline, got {other:?}"),
+        }
+        // A .deb copy is given the command.
+        let failed_deb = ThisInstall {
+            deb: true,
+            failed: Some(ver("0.6.34")),
+        };
+        let deb = deb_feed("0.6.34", "BTX-Node_0.6.34_amd64.deb");
+        match decide_here(&ver("0.6.33"), None, &failed_deb, &deb) {
+            Decision::Decline(notice) => assert!(
+                notice.ends_with("sudo apt install ./BTX-Node_0.6.34_amd64.deb"),
+                "{notice}"
+            ),
+            other => panic!("expected a decline, got {other:?}"),
+        }
+        // Any other version is downloaded as usual.
+        let older_failure = ThisInstall {
+            deb: false,
+            failed: Some(ver("0.6.29")),
+        };
+        assert_eq!(
+            decide_here(&ver("0.6.28"), None, &older_failure, &r),
+            Decision::Offer
+        );
+    }
+
+    /// "Check now" forgets the failed version before it checks
+    /// (`forget_failed_update`), so a press always tries.
+    #[test]
+    fn check_now_clears_the_failed_version_so_it_tries_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = bound_0630_as("0.6.30");
+        remember_failed_install(dir.path(), "0.6.30").unwrap();
+        let here = ThisInstall {
+            deb: false,
+            failed: failed_install(dir.path()),
+        };
+        assert!(matches!(
+            decide_here(&ver("0.6.29"), None, &here, &r),
+            Decision::Decline(_)
+        ));
+        forget_failed_install(dir.path());
+        let here = ThisInstall {
+            deb: false,
+            failed: failed_install(dir.path()),
+        };
+        assert_eq!(
+            decide_here(&ver("0.6.29"), None, &here, &r),
+            Decision::Offer
+        );
+    }
+
+    /// A notice is recorded as `<trigger>: <notice>` and a record holds
+    /// `update_log::DETAIL_MAX_CHARS`, so the command must fit whole even for
+    /// a long version. Each carries the phrase the pane finds it by, and none
+    /// uses an em-dash.
+    #[test]
+    fn every_notice_fits_one_record_whole() {
+        let long = "10.100.1000";
+        for notice in [
+            deb_hand_install_notice(long),
+            failed_before_notice(long, true),
+            failed_before_notice(long, false),
+        ] {
+            let line = format!("automatic: {notice}");
+            assert!(
+                line.chars().count() <= crate::update_log::DETAIL_MAX_CHARS,
+                "{} chars: {line}",
+                line.chars().count()
+            );
+            assert!(notice.starts_with("v10.100.1000 "), "{notice}");
+            assert!(notice.contains(HAND_INSTALL_MARK), "{notice}");
+            assert!(notice.contains(DOWNLOADS_AT), "{notice}");
+            assert!(!notice.contains('\u{2014}'), "{notice}");
+        }
     }
 
     #[test]
