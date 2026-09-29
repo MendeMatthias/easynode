@@ -2690,7 +2690,11 @@ pub fn published_peer_hosts() -> Vec<String> {
         .chain(BTX_DISCOVERY_PEERS.iter())
         .chain(crate::signer::BTX_MIRRORS_FED_BY_SIGNERS.iter())
     {
-        let host = peer.rsplit_once(':').map(|(h, _)| h).unwrap_or(peer).to_string();
+        let host = peer
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(peer)
+            .to_string();
         if !out.contains(&host) {
             out.push(host);
         }
@@ -6125,8 +6129,14 @@ matmul: metal runtime_probe_ok, selecting metal\n\
     #[test]
     fn published_peers_are_the_ones_the_app_ships() {
         let hosts = published_peer_hosts();
-        assert!(hosts.contains(&"20.86.181.203".to_string()), "btxscan's mirror");
-        assert!(hosts.contains(&"109.199.124.187".to_string()), "an archive peer");
+        assert!(
+            hosts.contains(&"20.86.181.203".to_string()),
+            "btxscan's mirror"
+        );
+        assert!(
+            hosts.contains(&"109.199.124.187".to_string()),
+            "an archive peer"
+        );
         assert!(hosts.contains(&"node.btx.dev".to_string()));
         assert!(hosts.iter().all(|h| !h.contains(':')), "no ports");
     }

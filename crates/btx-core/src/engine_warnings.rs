@@ -326,7 +326,10 @@ const HIDDEN: [(&str, &str, &str); 5] = [
 ];
 
 fn hidden_kind(t: &str) -> Option<(&'static str, &'static str)> {
-    HIDDEN.iter().find(|(phrase, _, _)| t.contains(phrase)).map(|(_, sentence, why)| (*sentence, *why))
+    HIDDEN
+        .iter()
+        .find(|(phrase, _, _)| t.contains(phrase))
+        .map(|(_, sentence, why)| (*sentence, *why))
 }
 
 pub fn all_notices(info: &BlockchainInfo) -> Vec<Notice> {
@@ -342,7 +345,9 @@ pub fn all_notices(info: &BlockchainInfo) -> Vec<Notice> {
                 hidden_because: Some(why),
             },
             None => {
-                let kind = classify(w).unwrap_or(EngineWarning::Other { text: first_sentence(w) });
+                let kind = classify(w).unwrap_or(EngineWarning::Other {
+                    text: first_sentence(w),
+                });
                 Notice {
                     raw: w.to_string(),
                     message: kind.message(),
@@ -801,7 +806,10 @@ mod tests {
     }
 
     fn info_with(warnings: &[&str]) -> BlockchainInfo {
-        BlockchainInfo { warnings: warnings.iter().map(|w| w.to_string()).collect(), ..Default::default() }
+        BlockchainInfo {
+            warnings: warnings.iter().map(|w| w.to_string()).collect(),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -819,12 +827,17 @@ mod tests {
             assert!(!notice.needs_attention);
         }
         assert!(n[0].message.contains("pacing"));
-        assert_eq!(n[0].raw, "Cadence burst hold active: pacing background validation");
+        assert_eq!(
+            n[0].raw,
+            "Cadence burst hold active: pacing background validation"
+        );
     }
 
     #[test]
     fn all_notices_shows_what_the_home_screen_shows_unhidden() {
-        let n = all_notices(&info_with(&["Warning: Found invalid chain more than 6 blocks longer than our best chain."]));
+        let n = all_notices(&info_with(&[
+            "Warning: Found invalid chain more than 6 blocks longer than our best chain.",
+        ]));
         assert_eq!(n.len(), 1);
         assert_eq!(n[0].hidden_because, None);
         assert!(n[0].message.contains("longer chain"));
@@ -845,9 +858,16 @@ mod tests {
 
     #[test]
     fn notice_sentences_are_plain() {
-        for raw in ["Cadence burst hold", "Deep reorg detected", "pre-release test build", "Unrecognised block version"] {
+        for raw in [
+            "Cadence burst hold",
+            "Deep reorg detected",
+            "pre-release test build",
+            "Unrecognised block version",
+        ] {
             let n = &all_notices(&info_with(&[raw]))[0];
-            assert!(!n.message.contains('\u{2014}') && !n.hidden_because.unwrap().contains('\u{2014}'));
+            assert!(
+                !n.message.contains('\u{2014}') && !n.hidden_because.unwrap().contains('\u{2014}')
+            );
         }
     }
 }

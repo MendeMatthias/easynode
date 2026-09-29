@@ -54,7 +54,12 @@ struct Shape {
 }
 
 const fn free(name: &'static str) -> Shape {
-    Shape { name, required: &[], optional: &[], class: Class::Free }
+    Shape {
+        name,
+        required: &[],
+        optional: &[],
+        class: Class::Free,
+    }
 }
 
 const ALLOWED: &[Shape] = &[
@@ -70,9 +75,24 @@ const ALLOWED: &[Shape] = &[
     free("getblockcount"),
     free("getbestblockhash"),
     free("getconnectioncount"),
-    Shape { name: "getblockhash", required: &[(Arg::Int(0, i32::MAX as i64), "height")], optional: &[], class: Class::Free },
-    Shape { name: "getblockheader", required: &[(Arg::Hash, "blockhash")], optional: &[(Arg::Bool, "verbose")], class: Class::Free },
-    Shape { name: "getblock", required: &[(Arg::Hash, "blockhash")], optional: &[(Arg::Int(0, 3), "verbosity")], class: Class::Free },
+    Shape {
+        name: "getblockhash",
+        required: &[(Arg::Int(0, i32::MAX as i64), "height")],
+        optional: &[],
+        class: Class::Free,
+    },
+    Shape {
+        name: "getblockheader",
+        required: &[(Arg::Hash, "blockhash")],
+        optional: &[(Arg::Bool, "verbose")],
+        class: Class::Free,
+    },
+    Shape {
+        name: "getblock",
+        required: &[(Arg::Hash, "blockhash")],
+        optional: &[(Arg::Int(0, 3), "verbosity")],
+        class: Class::Free,
+    },
     Shape {
         name: "getrawtransaction",
         required: &[(Arg::Hash, "txid")],
@@ -85,10 +105,18 @@ const ALLOWED: &[Shape] = &[
         optional: &[(Arg::Bool, "include_mempool")],
         class: Class::Free,
     },
-    Shape { name: "help", required: &[], optional: &[(Arg::CommandName, "command")], class: Class::Free },
+    Shape {
+        name: "help",
+        required: &[],
+        optional: &[(Arg::CommandName, "command")],
+        class: Class::Free,
+    },
     Shape {
         name: "addnode",
-        required: &[(Arg::IpLiteral, "ip[:port]"), (Arg::Exactly("onetry"), "onetry")],
+        required: &[
+            (Arg::IpLiteral, "ip[:port]"),
+            (Arg::Exactly("onetry"), "onetry"),
+        ],
         optional: &[],
         class: Class::Confirm,
     },
@@ -133,10 +161,13 @@ pub(crate) const REFUSALS: &[(&[&str], &str)] = &[
 
 /// `"run"` or `"confirm"` for a command this window can run, else `None`.
 pub fn class_of(name: &str) -> Option<&'static str> {
-    ALLOWED.iter().find(|s| s.name == name).map(|s| match s.class {
-        Class::Free => "run",
-        Class::Confirm => "confirm",
-    })
+    ALLOWED
+        .iter()
+        .find(|s| s.name == name)
+        .map(|s| match s.class {
+            Class::Free => "run",
+            Class::Confirm => "confirm",
+        })
 }
 
 pub fn decide(line: &str) -> Decision {
@@ -163,7 +194,10 @@ pub fn decide(line: &str) -> Decision {
         }
         return match parse_args(shape, args) {
             Ok(params) => {
-                let call = Call { method: name, params };
+                let call = Call {
+                    method: name,
+                    params,
+                };
                 match shape.class {
                     Class::Free => Decision::Run(call),
                     Class::Confirm => {
@@ -243,14 +277,19 @@ fn parse_one(kind: Arg, a: &str) -> Option<Value> {
     match kind {
         Arg::Hash => (a.len() == 64 && a.chars().all(|c| c.is_ascii_hexdigit()))
             .then(|| json!(a.to_ascii_lowercase())),
-        Arg::Int(lo, hi) => a.parse::<i64>().ok().filter(|n| (lo..=hi).contains(n)).map(|n| json!(n)),
+        Arg::Int(lo, hi) => a
+            .parse::<i64>()
+            .ok()
+            .filter(|n| (lo..=hi).contains(n))
+            .map(|n| json!(n)),
         Arg::Bool => match a.to_ascii_lowercase().as_str() {
             "true" | "1" => Some(json!(true)),
             "false" | "0" => Some(json!(false)),
             _ => None,
         },
         Arg::IpLiteral => {
-            let ok = a.parse::<std::net::SocketAddr>().is_ok() || a.parse::<std::net::IpAddr>().is_ok();
+            let ok =
+                a.parse::<std::net::SocketAddr>().is_ok() || a.parse::<std::net::IpAddr>().is_ok();
             ok.then(|| json!(a))
         }
         Arg::Exactly(word) => a.eq_ignore_ascii_case(word).then(|| json!(word)),
@@ -269,7 +308,11 @@ fn confirm_sentence(call: &Call) -> String {
         ),
         "getblockfrompeer" => {
             let hash = call.params[0].as_str().unwrap_or("");
-            format!("Ask peer {} for block {}...?", call.params[1], &hash[..16.min(hash.len())])
+            format!(
+                "Ask peer {} for block {}...?",
+                call.params[1],
+                &hash[..16.min(hash.len())]
+            )
         }
         other => format!("Run {other}?"),
     }
@@ -301,7 +344,10 @@ fn refusal_for(name: &str) -> String {
     if name == "addnode" {
         return PEERS.into();
     }
-    if name.starts_with("z_") || name.starts_with("bridge_") || engine_category(name) == Some("Wallet") {
+    if name.starts_with("z_")
+        || name.starts_with("bridge_")
+        || engine_category(name) == Some("Wallet")
+    {
         return WALLET.into();
     }
     format!("This window runs a short list of read-only commands. {name} isn't one of them. Type help to see them.")
@@ -380,18 +426,45 @@ mod tests {
     #[test]
     fn every_read_only_command_runs() {
         for name in [
-            "getblockchaininfo", "getchaintips", "getpeerinfo", "getnetworkinfo",
-            "getmempoolinfo", "getmatmulattestedtip", "getmatmultrustedstatus", "uptime",
-            "getchainstates", "getblockcount", "getbestblockhash", "getconnectioncount",
+            "getblockchaininfo",
+            "getchaintips",
+            "getpeerinfo",
+            "getnetworkinfo",
+            "getmempoolinfo",
+            "getmatmulattestedtip",
+            "getmatmultrustedstatus",
+            "uptime",
+            "getchainstates",
+            "getblockcount",
+            "getbestblockhash",
+            "getconnectioncount",
         ] {
-            assert_eq!(run(name), Call { method: name.into(), params: vec![] });
+            assert_eq!(
+                run(name),
+                Call {
+                    method: name.into(),
+                    params: vec![]
+                }
+            );
         }
         assert_eq!(run("getblockhash 228146").params, vec![json!(228146)]);
         assert_eq!(run(&format!("getblockheader {H}")).params, vec![json!(H)]);
-        assert_eq!(run(&format!("getblockheader {H} false")).params, vec![json!(H), json!(false)]);
-        assert_eq!(run(&format!("getblock {H} 2")).params, vec![json!(H), json!(2)]);
-        assert_eq!(run(&format!("getrawtransaction {H} 1 {H}")).params, vec![json!(H), json!(1), json!(H)]);
-        assert_eq!(run(&format!("gettxout {H} 0 true")).params, vec![json!(H), json!(0), json!(true)]);
+        assert_eq!(
+            run(&format!("getblockheader {H} false")).params,
+            vec![json!(H), json!(false)]
+        );
+        assert_eq!(
+            run(&format!("getblock {H} 2")).params,
+            vec![json!(H), json!(2)]
+        );
+        assert_eq!(
+            run(&format!("getrawtransaction {H} 1 {H}")).params,
+            vec![json!(H), json!(1), json!(H)]
+        );
+        assert_eq!(
+            run(&format!("gettxout {H} 0 true")).params,
+            vec![json!(H), json!(0), json!(true)]
+        );
         assert_eq!(run("help stop").params, vec![json!("stop")]);
     }
 
@@ -411,7 +484,13 @@ mod tests {
     fn the_two_actions_ask_first_and_never_run_directly() {
         match decide("addnode 1.2.3.4:19335 onetry") {
             Decision::Confirm { call, sentence } => {
-                assert_eq!(call, Call { method: "addnode".into(), params: vec![json!("1.2.3.4:19335"), json!("onetry")] });
+                assert_eq!(
+                    call,
+                    Call {
+                        method: "addnode".into(),
+                        params: vec![json!("1.2.3.4:19335"), json!("onetry")]
+                    }
+                );
                 assert!(sentence.contains("1.2.3.4:19335"));
             }
             other => panic!("expected Confirm, got {other:?}"),
@@ -423,7 +502,10 @@ mod tests {
             }
             other => panic!("expected Confirm, got {other:?}"),
         }
-        assert!(matches!(decide("addnode [2001:db8::1]:19335 onetry"), Decision::Confirm { .. }));
+        assert!(matches!(
+            decide("addnode [2001:db8::1]:19335 onetry"),
+            Decision::Confirm { .. }
+        ));
     }
 
     #[test]
@@ -447,7 +529,10 @@ mod tests {
             ("offerattestedutxosnapshot a b", "Snapshots"),
             ("withdrawattestedutxosnapshot", "Snapshots"),
             ("fetchattestedutxosnapshot", "Snapshots"),
-            ("addmatmulattestationblocklist 02aa", "signatures the node trusts"),
+            (
+                "addmatmulattestationblocklist 02aa",
+                "signatures the node trusts",
+            ),
             ("clearmintedattestation", "signatures the node trusts"),
             ("submitmatmulattestations x", "signatures the node trusts"),
             ("submitmatmulrefutation x", "signatures the node trusts"),
@@ -514,24 +599,53 @@ mod tests {
         assert_eq!(names.len(), 299);
         // Only these come out as anything but a refusal. An engine bump that
         // adds a command changes the fixture, and this list shows the change.
-        let mut allowed: Vec<&str> = names.iter().copied().filter(|n| class_of(n).is_some()).collect();
+        let mut allowed: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| class_of(n).is_some())
+            .collect();
         allowed.sort_unstable();
-        assert_eq!(allowed, vec![
-            "addnode", "getbestblockhash", "getblock", "getblockchaininfo", "getblockcount",
-            "getblockfrompeer", "getblockhash", "getblockheader", "getchainstates", "getchaintips",
-            "getconnectioncount", "getmatmulattestedtip", "getmatmultrustedstatus", "getmempoolinfo",
-            "getnetworkinfo", "getpeerinfo", "getrawtransaction", "gettxout", "help", "uptime",
-        ]);
+        assert_eq!(
+            allowed,
+            vec![
+                "addnode",
+                "getbestblockhash",
+                "getblock",
+                "getblockchaininfo",
+                "getblockcount",
+                "getblockfrompeer",
+                "getblockhash",
+                "getblockheader",
+                "getchainstates",
+                "getchaintips",
+                "getconnectioncount",
+                "getmatmulattestedtip",
+                "getmatmultrustedstatus",
+                "getmempoolinfo",
+                "getnetworkinfo",
+                "getpeerinfo",
+                "getrawtransaction",
+                "gettxout",
+                "help",
+                "uptime",
+            ]
+        );
         // Every named refusal is a real command, so a typo cannot hide one.
         for (group, _) in REFUSALS {
             for n in *group {
-                assert!(names.contains(n) || HIDDEN_ENGINE_COMMANDS.contains(n), "{n} is not an engine command");
+                assert!(
+                    names.contains(n) || HIDDEN_ENGINE_COMMANDS.contains(n),
+                    "{n} is not an engine command"
+                );
             }
         }
     }
 
     fn a_call() -> Call {
-        Call { method: "addnode".into(), params: vec![json!("1.2.3.4"), json!("onetry")] }
+        Call {
+            method: "addnode".into(),
+            params: vec![json!("1.2.3.4"), json!("onetry")],
+        }
     }
 
     #[test]
@@ -539,8 +653,15 @@ mod tests {
         let t0 = std::time::Instant::now();
         let mut book = ConfirmBook::new();
         book.issue("abc".into(), a_call(), t0);
-        assert_eq!(book.redeem("abc", t0 + std::time::Duration::from_secs(5)), Some(a_call()));
-        assert_eq!(book.redeem("abc", t0 + std::time::Duration::from_secs(6)), None, "used twice");
+        assert_eq!(
+            book.redeem("abc", t0 + std::time::Duration::from_secs(5)),
+            Some(a_call())
+        );
+        assert_eq!(
+            book.redeem("abc", t0 + std::time::Duration::from_secs(6)),
+            None,
+            "used twice"
+        );
     }
 
     #[test]
@@ -548,10 +669,20 @@ mod tests {
         let t0 = std::time::Instant::now();
         let mut book = ConfirmBook::new();
         book.issue("abc".into(), a_call(), t0);
-        assert_eq!(book.redeem("abc", t0 + CONFIRM_TTL + std::time::Duration::from_millis(1)), None);
+        assert_eq!(
+            book.redeem(
+                "abc",
+                t0 + CONFIRM_TTL + std::time::Duration::from_millis(1)
+            ),
+            None
+        );
         book.issue("abc".into(), a_call(), t0);
         assert_eq!(book.redeem("xyz", t0), None);
-        assert_eq!(book.redeem("abc", t0), None, "a wrong token cancels the pending call");
+        assert_eq!(
+            book.redeem("abc", t0),
+            None,
+            "a wrong token cancels the pending call"
+        );
     }
 
     #[test]

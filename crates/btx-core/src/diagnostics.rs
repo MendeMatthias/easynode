@@ -15,8 +15,11 @@ pub fn warning_lines(log_tail: &str) -> Vec<String> {
         .lines()
         .filter(|l| {
             let low = l.to_ascii_lowercase();
-            low.contains("[warning]") || low.contains("[error]") || low.contains("warning:")
-                || low.contains("error:") || l.contains("Cadence burst hold")
+            low.contains("[warning]")
+                || low.contains("[error]")
+                || low.contains("warning:")
+                || low.contains("error:")
+                || l.contains("Cadence burst hold")
         })
         .map(|l| cut(l.trim_end(), LOG_LINE_CHARS))
         .collect();
@@ -96,7 +99,10 @@ pub fn render(i: &DiagnosticsInput) -> String {
         i.platform
     ));
     o.push(format!("Role: {}", i.role));
-    o.push(format!("Signing key: {}", i.signer_pubkey.as_deref().unwrap_or("off")));
+    o.push(format!(
+        "Signing key: {}",
+        i.signer_pubkey.as_deref().unwrap_or("off")
+    ));
     o.push(String::new());
     o.push(format!("Status: {}", i.status_line));
     o.extend(i.window_lines.iter().cloned());
@@ -106,8 +112,14 @@ pub fn render(i: &DiagnosticsInput) -> String {
     match &i.chain {
         Some(c) => o.push(format!(
             "  blocks {} · headers {} · progress {:.4} · first sync {}",
-            group(c.blocks), group(c.headers), c.verification_progress,
-            if c.initial_block_download { "yes" } else { "no" }
+            group(c.blocks),
+            group(c.headers),
+            c.verification_progress,
+            if c.initial_block_download {
+                "yes"
+            } else {
+                "no"
+            }
         )),
         None => o.push("  not answering".into()),
     }
@@ -119,46 +131,91 @@ pub fn render(i: &DiagnosticsInput) -> String {
             match &c.snapshot_blockhash {
                 Some(base) => o.push(format!(
                     "  snapshot chain state at {} (base {}), checked: {}",
-                    group(c.blocks), &base[..16.min(base.len())], if c.validated { "yes" } else { "not yet" }
+                    group(c.blocks),
+                    &base[..16.min(base.len())],
+                    if c.validated { "yes" } else { "not yet" }
                 )),
                 None => o.push(format!("  history check at {}", group(c.blocks))),
             }
         }
     }
-    let others: Vec<&ChainTip> = i.tips.iter().filter(|t| t.status != "active" && t.branchlen > 1).collect();
-    o.push(format!("Chain tips ({}), branches longer than one block:", i.tips.len()));
+    let others: Vec<&ChainTip> = i
+        .tips
+        .iter()
+        .filter(|t| t.status != "active" && t.branchlen > 1)
+        .collect();
+    o.push(format!(
+        "Chain tips ({}), branches longer than one block:",
+        i.tips.len()
+    ));
     for t in &others {
-        o.push(format!("  {} {} length {} {}", group(t.height), &t.hash[..16.min(t.hash.len())], t.branchlen, t.status));
+        o.push(format!(
+            "  {} {} length {} {}",
+            group(t.height),
+            &t.hash[..16.min(t.hash.len())],
+            t.branchlen,
+            t.status
+        ));
     }
     o.push("Held branches".into());
     for h in &i.held {
         o.push(format!("  {} {}: {}", group(h.height), h.root, h.state));
     }
     let inbound = i.peers.iter().filter(|p| p.inbound).count();
-    o.push(format!("Peers ({} in, {} out)", inbound, i.peers.len() - inbound));
+    o.push(format!(
+        "Peers ({} in, {} out)",
+        inbound,
+        i.peers.len() - inbound
+    ));
     for p in &i.peers {
         o.push(format!(
             "  peer {}: {} {} headers {} blocks {} · {} · {}",
-            p.id, p.addr, p.subver, p.synced_headers, p.synced_blocks, history(p), p.connection_type
+            p.id,
+            p.addr,
+            p.subver,
+            p.synced_headers,
+            p.synced_blocks,
+            history(p),
+            p.connection_type
         ));
     }
     if let Some(a) = &i.attested_tip {
         o.push(format!(
             "Signed frontier: height {} · {} behind · on this chain: {}",
             a.height.map(group).unwrap_or_else(|| "unknown".into()),
-            a.blocks_behind.map(|b| b.to_string()).unwrap_or_else(|| "unknown".into()),
-            match a.on_active_chain { Some(true) => "yes", Some(false) => "no", None => "unknown" }
+            a.blocks_behind
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            match a.on_active_chain {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unknown",
+            }
         ));
     }
-    let notices = i.chain.as_ref().map(crate::engine_warnings::all_notices).unwrap_or_default();
+    let notices = i
+        .chain
+        .as_ref()
+        .map(crate::engine_warnings::all_notices)
+        .unwrap_or_default();
     o.push(format!("Engine notices ({})", notices.len()));
     for n in &notices {
-        let hidden = if n.hidden_because.is_some() { " (not shown on the home screen)" } else { "" };
+        let hidden = if n.hidden_because.is_some() {
+            " (not shown on the home screen)"
+        } else {
+            ""
+        };
         o.push(format!("  - {}{}", n.message, hidden));
         o.push(format!("    engine: {}", n.raw));
     }
-    o.push(format!("Watchdog: {}", i.stall.as_deref().unwrap_or("nothing to report")));
-    o.push(format!("Last warning lines of debug.log ({})", i.log_warnings.len()));
+    o.push(format!(
+        "Watchdog: {}",
+        i.stall.as_deref().unwrap_or("nothing to report")
+    ));
+    o.push(format!(
+        "Last warning lines of debug.log ({})",
+        i.log_warnings.len()
+    ));
     for l in &i.log_warnings {
         o.push(format!("  {l}"));
     }
@@ -178,7 +235,12 @@ pub fn redact(text: &str, ctx: &RedactionContext) -> String {
     let mut out = text.to_string();
     // 4 is the floor, not 1: an empty or 1-3 character "secret" would match
     // all over an ordinary report and shred it.
-    for s in ctx.secrets.iter().map(|s| s.trim()).filter(|s| s.len() >= 4) {
+    for s in ctx
+        .secrets
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| s.len() >= 4)
+    {
         out = out.replace(s, "[removed]");
     }
     if let Some(home) = ctx
@@ -189,7 +251,10 @@ pub fn redact(text: &str, ctx: &RedactionContext) -> String {
     {
         out = out.replace(home, "~");
     }
-    out.lines().map(|l| redact_line(l, ctx)).collect::<Vec<_>>().join("\n")
+    out.lines()
+        .map(|l| redact_line(l, ctx))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn is_separator(c: char) -> bool {
@@ -227,7 +292,11 @@ fn redact_token(tok: &str, ctx: &RedactionContext) -> String {
         return tok.to_string();
     }
     if let Some(host) = address_host(core) {
-        if ctx.published_hosts.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
+        if ctx
+            .published_hosts
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(&host))
+        {
             return tok.to_string();
         }
         return format!("[peer address]{tail}");
@@ -270,7 +339,8 @@ fn address_host(t: &str) -> Option<String> {
         // `v0.34.9` must not.
         _ => {
             let low = t.to_ascii_lowercase();
-            (low.ends_with(".onion") || low.ends_with(".i2p") || low.ends_with(".local")).then_some(low)
+            (low.ends_with(".onion") || low.ends_with(".i2p") || low.ends_with(".local"))
+                .then_some(low)
         }
     }
 }
@@ -300,7 +370,9 @@ const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz
 /// WIF, extended keys and the like: long base58, not plain hex (hashes and
 /// public keys are hex and stay).
 fn looks_like_key(t: &str) -> bool {
-    t.len() >= 50 && t.chars().all(|c| BASE58.contains(c)) && !t.chars().all(|c| c.is_ascii_hexdigit())
+    t.len() >= 50
+        && t.chars().all(|c| BASE58.contains(c))
+        && !t.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn looks_like_address(t: &str) -> bool {
@@ -329,7 +401,10 @@ mod tests {
             log.push_str(&format!("2026-09-29T10:00:{i:02}Z [warning] thing {i}\n"));
             log.push_str("2026-09-29T10:00:00Z ordinary line\n");
         }
-        log.push_str(&format!("2026-09-29T10:01:00Z [error] {}\n", "x".repeat(400)));
+        log.push_str(&format!(
+            "2026-09-29T10:01:00Z [error] {}\n",
+            "x".repeat(400)
+        ));
         let lines = warning_lines(&log);
         assert_eq!(lines.len(), 20);
         assert!(lines[0].contains("thing 11"));
@@ -341,7 +416,15 @@ mod tests {
     #[test]
     fn redaction_removes_every_item_on_the_never_list() {
         let wif = crate::signer::generate_wif();
-        let shaped: String = "P".chars().chain("abcdefghijkmnopqrstuvwxyz123456789".chars().cycle().take(51)).collect();
+        let shaped: String = "P"
+            .chars()
+            .chain(
+                "abcdefghijkmnopqrstuvwxyz123456789"
+                    .chars()
+                    .cycle()
+                    .take(51),
+            )
+            .collect();
         let text = format!(
             "cookie __cookie__:cookiepassword123\n\
              key {wif}\n\
@@ -354,20 +437,42 @@ mod tests {
              pubkey 02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675"
         );
         let out = redact(&text, &ctx(&wif));
-        for gone in ["cookiepassword123", wif.as_str(), shaped.as_str(), "/Users/alice", "84.32.49.226", "2001:db8::7", "abcdefghijklmnop.onion", "btx1qxyz"] {
+        for gone in [
+            "cookiepassword123",
+            wif.as_str(),
+            shaped.as_str(),
+            "/Users/alice",
+            "84.32.49.226",
+            "2001:db8::7",
+            "abcdefghijklmnop.onion",
+            "btx1qxyz",
+        ] {
             assert!(!out.contains(gone), "{gone} survived:\n{out}");
         }
-        for kept in ["~/.easybtx/debug.log", "109.199.124.187:19335", "20.86.181.203:19338", "node.btx.dev:19335",
-                     "8240c62e62b47fc675610908c03045c244de1dfc06246209830ba9d98468952c",
-                     "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675", "peer 12"] {
+        for kept in [
+            "~/.easybtx/debug.log",
+            "109.199.124.187:19335",
+            "20.86.181.203:19338",
+            "node.btx.dev:19335",
+            "8240c62e62b47fc675610908c03045c244de1dfc06246209830ba9d98468952c",
+            "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675",
+            "peer 12",
+        ] {
             assert!(out.contains(kept), "{kept} was removed:\n{out}");
         }
-        assert!(out.contains("[peer address]") && out.contains("[key removed]") && out.contains("[address removed]"));
+        assert!(
+            out.contains("[peer address]")
+                && out.contains("[key removed]")
+                && out.contains("[address removed]")
+        );
     }
 
     #[test]
     fn version_numbers_and_times_are_not_mistaken_for_addresses() {
-        let out = redact("engine v0.34.9 at 2026-09-29T10:11:20Z height 233,470", &ctx("unusedsecret"));
+        let out = redact(
+            "engine v0.34.9 at 2026-09-29T10:11:20Z height 233,470",
+            &ctx("unusedsecret"),
+        );
         assert_eq!(out, "engine v0.34.9 at 2026-09-29T10:11:20Z height 233,470");
     }
 
@@ -379,9 +484,18 @@ mod tests {
             "mirror node.btx.dev:19335 home myhome-node.duckdns.org:19335",
             &ctx("unusedsecret"),
         );
-        assert!(out.contains("node.btx.dev:19335"), "published host removed:\n{out}");
-        assert!(!out.contains("myhome-node.duckdns.org"), "unpublished host survived:\n{out}");
-        assert!(out.contains("[peer address]"), "no redaction marker:\n{out}");
+        assert!(
+            out.contains("node.btx.dev:19335"),
+            "published host removed:\n{out}"
+        );
+        assert!(
+            !out.contains("myhome-node.duckdns.org"),
+            "unpublished host survived:\n{out}"
+        );
+        assert!(
+            out.contains("[peer address]"),
+            "no redaction marker:\n{out}"
+        );
     }
 
     /// A machine's own `.local` name is never a published peer host, so it
@@ -392,9 +506,18 @@ mod tests {
             "host Alices-MacBook-Pro.local and Bobs-PC.LOCAL:19335",
             &ctx("unusedsecret"),
         );
-        assert!(!out.contains("Alices-MacBook-Pro"), "bare .local name survived:\n{out}");
-        assert!(!out.contains("Bobs-PC"), ".local name with a port survived:\n{out}");
-        assert!(out.contains("[peer address]"), "no redaction marker:\n{out}");
+        assert!(
+            !out.contains("Alices-MacBook-Pro"),
+            "bare .local name survived:\n{out}"
+        );
+        assert!(
+            !out.contains("Bobs-PC"),
+            ".local name with a port survived:\n{out}"
+        );
+        assert!(
+            out.contains("[peer address]"),
+            "no redaction marker:\n{out}"
+        );
     }
 
     /// `file.cpp:line` is how the engine cites its own source, never a peer;
@@ -405,7 +528,10 @@ mod tests {
             "(validation.cpp:17539) net_processing.cpp:1234 init.cpp:3961",
             &ctx("unusedsecret"),
         );
-        assert_eq!(out, "(validation.cpp:17539) net_processing.cpp:1234 init.cpp:3961");
+        assert_eq!(
+            out,
+            "(validation.cpp:17539) net_processing.cpp:1234 init.cpp:3961"
+        );
     }
 
     /// A peer IP wrapped in a URL, an `@`-prefixed userinfo, a stray trailing
@@ -422,7 +548,10 @@ mod tests {
             "|84.32.49.226|",
         ] {
             let out = redact(wrapped, &context);
-            assert!(!out.contains("84.32.49.226"), "IP survived in {wrapped:?}:\n{out}");
+            assert!(
+                !out.contains("84.32.49.226"),
+                "IP survived in {wrapped:?}:\n{out}"
+            );
         }
         for safe in [
             "https://easybtx.com/updater/latest-node.json",
@@ -444,9 +573,18 @@ mod tests {
             secrets: vec!["ab12cd".into(), "no".into()],
             published_hosts: crate::node::published_peer_hosts(),
         };
-        let out = redact("token ab12cd appears here, unlike no which is too short", &context);
-        assert!(!out.contains("ab12cd"), "6-character secret survived:\n{out}");
-        assert!(out.contains(" no "), "a 2-character string must not be treated as a secret:\n{out}");
+        let out = redact(
+            "token ab12cd appears here, unlike no which is too short",
+            &context,
+        );
+        assert!(
+            !out.contains("ab12cd"),
+            "6-character secret survived:\n{out}"
+        );
+        assert!(
+            out.contains(" no "),
+            "a 2-character string must not be treated as a secret:\n{out}"
+        );
     }
 
     /// The real pipeline: `redact(&render(&input), &ctx)`. An unpublished
@@ -540,18 +678,50 @@ mod tests {
             status_line: "LIVE · Up to date".into(),
             window_lines: vec!["All caught up.".into()],
             phase: "ready".into(),
-            chain: Some(BlockchainInfo { blocks: 233480, headers: 233481, warnings: vec!["Cadence burst hold".into()], ..Default::default() }),
+            chain: Some(BlockchainInfo {
+                blocks: 233480,
+                headers: 233481,
+                warnings: vec!["Cadence burst hold".into()],
+                ..Default::default()
+            }),
             best_block_hash: Some("11bd18812b6afcd1".into()),
             chainstates: None,
             tips: vec![],
-            held: vec![HeldBranchState { height: 228146, root: "8240c62e62b47fc6".into(), state: "not on this node's chain".into() }],
-            peers: vec![PeerInfo { id: 4, addr: "109.199.124.187:19335".into(), subver: "/BTX:0.34.11/".into(), synced_headers: 233481, synced_blocks: 233480, servicesnames: vec!["NETWORK_LIMITED".into()], connection_type: "manual".into(), ..Default::default() }],
+            held: vec![HeldBranchState {
+                height: 228146,
+                root: "8240c62e62b47fc6".into(),
+                state: "not on this node's chain".into(),
+            }],
+            peers: vec![PeerInfo {
+                id: 4,
+                addr: "109.199.124.187:19335".into(),
+                subver: "/BTX:0.34.11/".into(),
+                synced_headers: 233481,
+                synced_blocks: 233480,
+                servicesnames: vec!["NETWORK_LIMITED".into()],
+                connection_type: "manual".into(),
+                ..Default::default()
+            }],
             attested_tip: None,
             stall: None,
             log_warnings: vec!["[warning] something".into()],
         };
         let r = render(&input);
-        for part in ["easyNode diagnostics", "App 0.7.0", "Role: follows signatures", "Status: LIVE", "blocks 233,480", "Held branches", "228,146", "Peers (0 in, 1 out)", "peer 4: 109.199.124.187:19335", "recent history", "Engine notices (1)", "not shown on the home screen", "Last warning lines of debug.log (1)"] {
+        for part in [
+            "easyNode diagnostics",
+            "App 0.7.0",
+            "Role: follows signatures",
+            "Status: LIVE",
+            "blocks 233,480",
+            "Held branches",
+            "228,146",
+            "Peers (0 in, 1 out)",
+            "peer 4: 109.199.124.187:19335",
+            "recent history",
+            "Engine notices (1)",
+            "not shown on the home screen",
+            "Last warning lines of debug.log (1)",
+        ] {
             assert!(r.contains(part), "missing {part}:\n{r}");
         }
         assert!(!r.contains('\u{2014}'));

@@ -1078,7 +1078,10 @@ mod tests {
 
     #[test]
     fn peer_sync_heights_decode_and_default_to_minus_one() {
-        let with: PeerInfo = serde_json::from_value(json!({"id": 4, "synced_headers": 233472, "synced_blocks": 225928})).unwrap();
+        let with: PeerInfo = serde_json::from_value(
+            json!({"id": 4, "synced_headers": 233472, "synced_blocks": 225928}),
+        )
+        .unwrap();
         assert_eq!((with.synced_headers, with.synced_blocks), (233472, 225928));
         let without: PeerInfo = serde_json::from_value(json!({"id": 5})).unwrap();
         assert_eq!((without.synced_headers, without.synced_blocks), (-1, -1));
