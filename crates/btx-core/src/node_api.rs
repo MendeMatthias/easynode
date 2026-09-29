@@ -3,7 +3,7 @@ use crate::rpc::Rpc;
 use serde::Deserialize;
 use serde_json::json;
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 pub struct BlockchainInfo {
     pub blocks: u64,
     #[serde(default)]
