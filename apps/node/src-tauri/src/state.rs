@@ -644,6 +644,12 @@ pub struct AppState {
     /// know the method, and absence is reported as unknown, never as "no".
     /// Cleared on every stop/start like the others. See `btx_core::role`.
     pub matmul_trusted: Arc<Mutex<Option<btx_core::node_api::MatmulTrustedStatus>>>,
+    /// The engine's `getmatmulattestedtip` signed frontier from the refresher's
+    /// last tick that got an answer. The role card's chain position reads it:
+    /// a node that knows of no newer headers is not at the tip when signed
+    /// blocks it lacks exist, and a node stranded on another branch is exactly
+    /// that. Cleared on every stop/start like the others.
+    pub signed_frontier: Arc<Mutex<Option<btx_core::node_api::AttestedTip>>>,
     /// Who signed the newest hundred blocks, from the node's own attestation
     /// store, kept current by the refresher only while the engine reports a
     /// local signer (`btx_core::signer::RecentSigners`). This is how the role
@@ -779,6 +785,7 @@ impl AppState {
             stall_verdict: Arc::new(Mutex::new(None)),
             archive_service: Arc::new(Mutex::new(None)),
             matmul_trusted: Arc::new(Mutex::new(None)),
+            signed_frontier: Arc::new(Mutex::new(None)),
             recent_signers: Arc::new(Mutex::new(None)),
             signer_pubkey: Arc::new(Mutex::new(None)),
             signer_applies_here: Arc::new(Mutex::new(None)),

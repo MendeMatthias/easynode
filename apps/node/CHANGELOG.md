@@ -18,6 +18,12 @@ leaves out anything private: keys, wallet details, other people's addresses
 and your home folder. For the curious, a command window runs a short list of
 read-only node commands, and asks before the two that do something.
 
+**The role card no longer says "At the tip" on a node that is not there.** It
+used to say so whenever the node knew of no newer blocks, and a node cut off
+from everyone, or left on a branch the others have moved on from, knows of no
+newer blocks either. Now a newest block more than two hours old, or signed
+blocks the node does not have, overrule it, and the line says which one it is.
+
 ## [0.6.32] - 2026-09-28
 
 **Every node is held off two branches until BTX's developers rule on them.**
