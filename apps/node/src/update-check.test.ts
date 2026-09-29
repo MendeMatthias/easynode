@@ -561,6 +561,17 @@ describe("updateCheck() keeps a failed install from downloading again, and a pre
     expect(body.slice(0, forget)).toMatch(/if \(manual\) \{\s*await $/);
   });
 
+  it("never lets clearing the failed version or reading the refusal end a press in silence", () => {
+    // Without the catch a failing forget rejects updateCheck(), and a press
+    // ends with nothing on screen. Each failure is a console warning instead.
+    expect(body).toMatch(
+      /await invoke\("forget_failed_update"\)\.catch\(\(e\) =>\s*console\.warn\("update-check: could not clear the failed version", e\),?\s*\);/,
+    );
+    expect(fn("peekUpdateRefusal")).toMatch(
+      /invoke<string \| null>\("peek_update_refusal"\)\.catch\(\(e\) => \{\s*console\.warn\("update-check: could not read the refusal", e\);\s*return null;\s*\}\);/,
+    );
+  });
+
   it("downloads, then installs, and remembers a version only when the install failed", () => {
     expect(body).not.toContain("downloadAndInstall(");
     const download = body.indexOf("await update.download()");

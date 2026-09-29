@@ -2235,9 +2235,13 @@ function recordUpdateCheck(branch: UpdateCheckBranch, manual: boolean): Promise<
 
 // What update_binding kept about the check that just ran: why it declined or
 // refused the offer, or null. Read before recordUpdateCheck, which takes it.
-// A failure to read it is a null, never a reason for the check to fail.
+// A failure to read it is a console warning and a null, never a reason for
+// the check to fail.
 function peekUpdateRefusal(): Promise<string | null> {
-  return invoke<string | null>("peek_update_refusal").catch(() => null);
+  return invoke<string | null>("peek_update_refusal").catch((e) => {
+    console.warn("update-check: could not read the refusal", e);
+    return null;
+  });
 }
 
 async function updateCheck(manual = false): Promise<void> {
