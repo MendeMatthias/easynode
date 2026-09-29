@@ -234,12 +234,50 @@ fn address_host(t: &str) -> Option<String> {
     if let Ok(ip) = t.parse::<IpAddr>() {
         return Some(ip.to_string());
     }
-    let host = match t.rsplit_once(':') {
-        Some((h, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => h,
-        _ => t,
-    };
-    let low = host.to_ascii_lowercase();
-    (low.ends_with(".onion") || low.ends_with(".i2p")).then_some(low)
+    match t.rsplit_once(':') {
+        // A numeric port after the colon: this is `host:port`. Engine source
+        // references (`validation.cpp:17539`) have exactly this shape and
+        // must be left alone; everything else with a dotted, lettered host
+        // is a DNS-style peer address, published or not.
+        Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+            if is_source_reference(host) {
+                return None;
+            }
+            let low = host.to_ascii_lowercase();
+            (low.ends_with(".onion")
+                || low.ends_with(".i2p")
+                || low.ends_with(".local")
+                || looks_like_dns_host(&low))
+            .then_some(low)
+        }
+        // No numeric port: only a bare onion/i2p address or a bare ".local"
+        // machine name counts as an address. A bare version number like
+        // `v0.34.9` must not.
+        _ => {
+            let low = t.to_ascii_lowercase();
+            (low.ends_with(".onion") || low.ends_with(".i2p") || low.ends_with(".local")).then_some(low)
+        }
+    }
+}
+
+/// Whether `host` is the engine's own way of citing a line in its source,
+/// e.g. `validation.cpp` in `validation.cpp:17539`: a dotted name whose last
+/// label is a source, header or data-file extension, never a network host.
+fn is_source_reference(host: &str) -> bool {
+    const EXTENSIONS: [&str; 12] = [
+        "cpp", "h", "hpp", "c", "rs", "py", "ts", "js", "log", "conf", "json", "dat",
+    ];
+    match host.rsplit_once('.') {
+        Some((_, ext)) => EXTENSIONS.iter().any(|e| e.eq_ignore_ascii_case(ext)),
+        None => false,
+    }
+}
+
+/// A DNS-style peer host: a label separator and at least one letter, so a
+/// bare version number's dotted form (`0.34.9`) is never mistaken for one
+/// (it never carries a `:port` either, which the caller already requires).
+fn looks_like_dns_host(host: &str) -> bool {
+    host.contains('.') && host.chars().any(|c| c.is_ascii_alphabetic())
 }
 
 const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -316,6 +354,43 @@ mod tests {
     fn version_numbers_and_times_are_not_mistaken_for_addresses() {
         let out = redact("engine v0.34.9 at 2026-09-29T10:11:20Z height 233,470", &ctx("unusedsecret"));
         assert_eq!(out, "engine v0.34.9 at 2026-09-29T10:11:20Z height 233,470");
+    }
+
+    /// An unpublished DNS-style peer host must not survive, and a published
+    /// one must, exactly as the equivalent IP-shaped hosts already do.
+    #[test]
+    fn unpublished_dns_hostnames_are_redacted_but_published_ones_stay() {
+        let out = redact(
+            "mirror node.btx.dev:19335 home myhome-node.duckdns.org:19335",
+            &ctx("unusedsecret"),
+        );
+        assert!(out.contains("node.btx.dev:19335"), "published host removed:\n{out}");
+        assert!(!out.contains("myhome-node.duckdns.org"), "unpublished host survived:\n{out}");
+        assert!(out.contains("[peer address]"), "no redaction marker:\n{out}");
+    }
+
+    /// A machine's own `.local` name is never a published peer host, so it
+    /// must go whether or not it carries a port, and regardless of case.
+    #[test]
+    fn bare_machine_names_ending_in_dot_local_are_redacted() {
+        let out = redact(
+            "host Alices-MacBook-Pro.local and Bobs-PC.LOCAL:19335",
+            &ctx("unusedsecret"),
+        );
+        assert!(!out.contains("Alices-MacBook-Pro"), "bare .local name survived:\n{out}");
+        assert!(!out.contains("Bobs-PC"), ".local name with a port survived:\n{out}");
+        assert!(out.contains("[peer address]"), "no redaction marker:\n{out}");
+    }
+
+    /// `file.cpp:line` is how the engine cites its own source, never a peer;
+    /// the exact shape that could be confused with `host:port` must survive.
+    #[test]
+    fn engine_source_references_are_not_mistaken_for_addresses() {
+        let out = redact(
+            "(validation.cpp:17539) net_processing.cpp:1234 init.cpp:3961",
+            &ctx("unusedsecret"),
+        );
+        assert_eq!(out, "(validation.cpp:17539) net_processing.cpp:1234 init.cpp:3961");
     }
 
     #[test]
