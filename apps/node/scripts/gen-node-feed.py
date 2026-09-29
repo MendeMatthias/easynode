@@ -556,6 +556,14 @@ def _self_test_main(d, pub):
                 "--out a link to a node-deb.json not written yet")
         assert os.listdir(fresh) == ["main.json"], os.listdir(fresh)
 
+    # A write that fails says so, and never that it wrote: here --out is a
+    # directory, which passes every check and then cannot be replaced.
+    blocked = folder("blocked")
+    os.makedirs(os.path.join(blocked, MAIN_FEED_NAME))
+    err = refused(["--linux-sig", good_linux, "--out",
+                   os.path.join(blocked, MAIN_FEED_NAME)], "a write that fails")
+    assert isinstance(err, OSError), err
+
 
 def _read(path):
     with open(path) as f:
@@ -616,6 +624,8 @@ def main():
         print(f"wrote {deb_out}: version {deb['version']}, platform {DEB_KEY}")
     if not feed:
         return
+    # Written first, then said: a write that fails never reads as done.
+    write_feed(a.out, feed)
     names = ", ".join(sorted(feed["platforms"]))
     print(f"wrote {a.out} — version {feed['version']}, platforms: {names}")
     missing = sorted(set(MAIN_KEYS) - set(feed["platforms"]))
@@ -627,7 +637,6 @@ def main():
               "only surfaces check errors on a MANUAL check, so the automatic "
               "one is silent. Expect 'Check now' on those platforms to say "
               "\"Couldn't check right now — are you online?\" — harmless.)")
-    write_feed(a.out, feed)
 
 
 if __name__ == "__main__":
