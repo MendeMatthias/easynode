@@ -558,17 +558,36 @@ describe("staleCard on a syncing node", () => {
   });
 
   it("turns amber on a node adding fewer blocks than the chain, with both rates", () => {
-    // 8 an hour, the node of 2026-09-26, still syncing.
+    // 12 an hour, a slow machine checking blocks, still syncing.
     const s = feed(
       [0, 10, 20, 30].map((m, i): [number, TrendPhase] => [
         T0 + min(m),
-        { phase: "syncing", height: 130_000 + [0, 1, 3, 4][i], headers: 226_000 + [0, 7, 13, 20][i] },
+        { phase: "syncing", height: 130_000 + [0, 2, 4, 6][i], headers: 226_000 + [0, 7, 13, 20][i] },
       ]),
     );
-    expect(staleCard(STALE, syncingAt(130_004, 226_020), s, T0 + min(30))).toEqual({
-      message: `${STALE} It adds about 8 blocks an hour while the network adds about ${CHAIN_BLOCKS_PER_HOUR}.`,
+    expect(staleCard(STALE, syncingAt(130_006, 226_020), s, T0 + min(30))).toEqual({
+      message: `${STALE} It adds about 12 blocks an hour while the network adds about ${CHAIN_BLOCKS_PER_HOUR}.`,
       tone: "amber",
     });
+  });
+
+  it("turns amber about twenty minutes after a fast sync stops, not an hour later", () => {
+    // Scripted through the real poll: 1,000 blocks an hour for an hour, then
+    // stuck. Averaged over the hour, the pace stays above the chain's 40
+    // until minute 117; read off the last twenty minutes, the stall shows
+    // about twenty minutes after it starts.
+    let s: CatchupSample[] = [];
+    let firstAmber: number | null = null;
+    for (let at = T0; at <= T0 + min(150) && firstAmber === null; at += 1500) {
+      const m = (at - T0) / 60_000;
+      const height = 120_000 + Math.floor((Math.min(m, 60) * 1_000) / 60);
+      const reading = trendReading({ phase: "syncing", height, headers: 226_000 }, at);
+      s = recordReading(s, reading, at);
+      if (staleCard(STALE, reading, s, at)?.tone === "amber") firstAmber = m;
+    }
+    expect(firstAmber).not.toBeNull();
+    expect(firstAmber!).toBeGreaterThan(60 + 15);
+    expect(firstAmber!).toBeLessThanOrEqual(60 + 21);
   });
 
   it("never turns the header fetch amber", () => {

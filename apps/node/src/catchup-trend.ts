@@ -207,6 +207,13 @@ export const catchupLine = (behind: number, samples: CatchupSample[], now: numbe
  *  few seconds behind its header. */
 export const HEADERS_AHEAD_IS_BEHIND = 2;
 
+/** How far back a syncing node's pace is read. Shorter than the hour a live
+ *  node's pace reads: a sync that runs at 1,000 blocks an hour and then stops
+ *  would average above the chain's 40 for most of an hour after it stopped.
+ *  Twenty minutes is about 13 blocks of chain, and still longer than the 15
+ *  minutes `catchupPace` needs before it says anything. */
+export const SYNCING_PACE_WINDOW_MS = 20 * 60 * 1000;
+
 /** The neutral line for a node that is behind before its trend is measured. */
 export const CHECKING_CATCHUP = "Checking whether your node is catching up...";
 
@@ -300,11 +307,12 @@ export const recordReading = (
  *  - no newer block known, or one header ahead (a block in flight, as the
  *    role card reads it): amber, Rust's sentence unchanged.
  *
- *  A syncing node is judged by the blocks it adds, not by the gap (its headers
- *  can outrun them): no stale sentence at the chain's 40 an hour or more,
- *  amber with the pace below it, neutral until the pace is measured. Fetching
- *  headers only, it stays neutral: there is nothing to measure yet, and the
- *  design's calm card "does not hide a real stall" only once there is. */
+ *  A syncing node is judged by the blocks it adds over the last twenty
+ *  minutes (`SYNCING_PACE_WINDOW_MS`), not by the gap (its headers can outrun
+ *  them): no stale sentence at the chain's 40 an hour or more, amber with the
+ *  pace below it, neutral until the pace is measured. Fetching headers only,
+ *  it stays neutral: there is nothing to measure yet, and the design's calm
+ *  card "does not hide a real stall" only once there is. */
 export const staleCard = (
   tipStaleMessage: string | null,
   reading: TrendReading,
@@ -322,7 +330,8 @@ export const staleCard = (
     return { message: said ? `${tipStaleMessage} ${said}` : tipStaleMessage, tone: "amber" };
   };
   if (reading.kind === "syncing") {
-    const pace = catchupPace(samples.filter((s) => s.syncing), now);
+    const recent = samples.filter((s) => s.syncing && now - s.at <= SYNCING_PACE_WINDOW_MS);
+    const pace = catchupPace(recent, now);
     if (!pace) return checking;
     return pace.addedPerHour < CHAIN_BLOCKS_PER_HOUR ? withPace(pace) : null;
   }
