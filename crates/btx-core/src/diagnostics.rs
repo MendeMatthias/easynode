@@ -300,34 +300,86 @@ fn redact_line(line: &str, ctx: &RedactionContext) -> String {
     out
 }
 
+/// Trailing sentence/URL punctuation, never part of the value before it:
+/// "84.32.49.226:19335." (end of a sentence), "...:19335:" (a stray colon)
+/// and "...:19335…" (a cut line) must all still be recognised.
+const TRAILING: [char; 3] = ['.', ':', '…'];
+
+/// How many places in one piece of a token an address may start: the piece
+/// itself and after its first `:` or `[` characters. Bounds the work on a
+/// pathological log line; real ones have a handful.
+const MAX_STARTS: usize = 16;
+
 fn redact_token(tok: &str, ctx: &RedactionContext) -> String {
-    // Trailing sentence/URL punctuation, not part of the address itself:
-    // "84.32.49.226:19335." (end of a sentence), "...:19335:" (a stray
-    // colon) and "...:19335…" (a cut line) must all still be recognised.
-    // `[` and `]` are never trimmed: they belong to a bracketed IPv6 host
-    // like `[2001:db8::7]:19335`.
-    let core = tok.trim_end_matches(['.', ':', '…']);
-    let tail = &tok[core.len()..];
-    if core.is_empty() {
-        return tok.to_string();
+    // Keys first: a WIF or an extended key is a long base58 run wherever it
+    // sits in the token (`key:<WIF>`, `[<WIF>]`, `<WIF>]`), and the pieces
+    // around it are still searched for an address.
+    let mut out = String::with_capacity(tok.len());
+    let mut rest = tok;
+    while let Some((s, e)) = key_run(rest) {
+        out.push_str(&redact_piece(&rest[..s], ctx));
+        out.push_str("[key removed]");
+        rest = &rest[e..];
     }
-    if let Some(host) = address_host(core) {
-        if ctx
-            .published_hosts
-            .iter()
-            .any(|h| h.eq_ignore_ascii_case(&host))
-        {
-            return tok.to_string();
+    out.push_str(&redact_piece(rest, ctx));
+    out
+}
+
+/// A piece of a token with no key in it. Each address in it becomes a
+/// marker and the punctuation around it stays: `addr:[peer address]`,
+/// `[[peer address]]`. A published peer is left as it is.
+fn redact_piece(piece: &str, ctx: &RedactionContext) -> String {
+    let mut out = String::with_capacity(piece.len());
+    let mut rest = piece;
+    while let Some((s, e, found)) = find_private(rest) {
+        out.push_str(&rest[..s]);
+        match found {
+            Found::Peer(host)
+                if ctx
+                    .published_hosts
+                    .iter()
+                    .any(|h| h.eq_ignore_ascii_case(&host)) =>
+            {
+                out.push_str(&rest[s..e])
+            }
+            Found::Peer(_) => out.push_str("[peer address]"),
+            Found::Address => out.push_str("[address removed]"),
         }
-        return format!("[peer address]{tail}");
+        rest = &rest[e..];
     }
-    if looks_like_key(core) {
-        return format!("[key removed]{tail}");
+    out.push_str(rest);
+    out
+}
+
+enum Found {
+    Peer(String),
+    Address,
+}
+
+/// The first peer address or payment address in `piece`, as a byte span:
+/// the whole piece (`84.32.49.226:19335`, `[2001:db8::7]:19335`), or a part
+/// that starts after a `:` or a `[` (`addr:1.2.3.4`, `[1.2.3.4]`). Trailing
+/// punctuation and closing brackets stay outside the span.
+fn find_private(piece: &str) -> Option<(usize, usize, Found)> {
+    let starts = std::iter::once(0)
+        .chain(piece.match_indices([':', '[']).map(|(i, _)| i + 1))
+        .take(MAX_STARTS);
+    for s in starts {
+        let whole = piece[s..].trim_end_matches(TRAILING);
+        let unbracketed = whole.trim_end_matches(']').trim_end_matches(TRAILING);
+        for c in [whole, unbracketed] {
+            if c.is_empty() {
+                continue;
+            }
+            if let Some(host) = address_host(c) {
+                return Some((s, s + c.len(), Found::Peer(host)));
+            }
+            if looks_like_address(c) {
+                return Some((s, s + c.len(), Found::Address));
+            }
+        }
     }
-    if looks_like_address(core) {
-        return format!("[address removed]{tail}");
-    }
-    tok.to_string()
+    None
 }
 
 fn address_host(t: &str) -> Option<String> {
@@ -344,7 +396,15 @@ fn address_host(t: &str) -> Option<String> {
         // must be left alone; everything else with a dotted, lettered host
         // is a DNS-style peer address, published or not.
         Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
-            if is_source_reference(host) {
+            // `[1.2.3.4]:19335`: an IPv4 host in the brackets IPv6 uses.
+            let host = host
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .unwrap_or(host);
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                return Some(ip.to_string());
+            }
+            if is_source_reference(host) || !could_be_host_name(host) {
                 return None;
             }
             let low = host.to_ascii_lowercase();
@@ -358,6 +418,9 @@ fn address_host(t: &str) -> Option<String> {
         // machine name counts as an address. A bare version number like
         // `v0.34.9` must not.
         _ => {
+            if !could_be_host_name(t) {
+                return None;
+            }
             let low = t.to_ascii_lowercase();
             (low.ends_with(".onion") || low.ends_with(".i2p") || low.ends_with(".local"))
                 .then_some(low)
@@ -365,13 +428,21 @@ fn address_host(t: &str) -> Option<String> {
     }
 }
 
+/// A host name never holds `:`, `[` or `]`. When one of them is there, the
+/// name starts after it, and `find_private` tries that start on its own:
+/// `addr:node.example.com:19335` is the host `node.example.com`, not
+/// `addr:node.example.com`, so a published peer written that way stays.
+fn could_be_host_name(host: &str) -> bool {
+    !host.contains([':', '[', ']'])
+}
+
 /// Whether `host` is the engine's own way of citing a line in its source,
-/// e.g. `validation.cpp` in `validation.cpp:17539`: a dotted name whose last
-/// label is a source, header or data-file extension, never a network host.
+/// e.g. `validation.cpp` in `validation.cpp:17539` or its `-logsourcelocations`
+/// prefix `[validation.cpp:17539]`. Only the two extensions the engine cites
+/// count: `.rs`, `.py` and most other file extensions are also country or
+/// generic domains, and `mynode.example.rs:19335` is a peer.
 fn is_source_reference(host: &str) -> bool {
-    const EXTENSIONS: [&str; 12] = [
-        "cpp", "h", "hpp", "c", "rs", "py", "ts", "js", "log", "conf", "json", "dat",
-    ];
+    const EXTENSIONS: [&str; 2] = ["cpp", "h"];
     match host.rsplit_once('.') {
         Some((_, ext)) => EXTENSIONS.iter().any(|e| e.eq_ignore_ascii_case(ext)),
         None => false,
@@ -383,6 +454,29 @@ fn is_source_reference(host: &str) -> bool {
 /// (it never carries a `:port` either, which the caller already requires).
 fn looks_like_dns_host(host: &str) -> bool {
     host.contains('.') && host.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// The first run of base58 characters in `t` that is long enough to be a
+/// key, as a byte span. Base58 is ASCII, so a run always starts and ends on
+/// a character boundary.
+fn key_run(t: &str) -> Option<(usize, usize)> {
+    let b = t.as_bytes();
+    let is_base58 = |x: u8| BASE58.as_bytes().contains(&x);
+    let mut i = 0;
+    while i < b.len() {
+        if !is_base58(b[i]) {
+            i += 1;
+            continue;
+        }
+        let s = i;
+        while i < b.len() && is_base58(b[i]) {
+            i += 1;
+        }
+        if looks_like_key(&t[s..i]) {
+            return Some((s, i));
+        }
+    }
+    None
 }
 
 const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -593,6 +687,95 @@ mod tests {
             let out = redact(safe, &context);
             assert_eq!(out, safe, "survivor mangled: {safe:?} -> {out:?}");
         }
+    }
+
+    /// Redact `text` with no secret known, so only the shape of a value can
+    /// give it away, and return what comes out.
+    fn shape_only(text: &str) -> String {
+        redact(text, &ctx("unusedsecret"))
+    }
+
+    // Each shape below came out unchanged before: `[`, `]` and a leading
+    // `word:` glued the value to its token, and the token as a whole was
+    // neither an address nor base58. Engine forks bring their own log
+    // formats, so none of them can be ruled out.
+
+    #[test]
+    fn an_ip_in_square_brackets_is_redacted() {
+        assert_eq!(shape_only("from [1.2.3.4]"), "from [[peer address]]");
+    }
+
+    #[test]
+    fn an_ip_and_port_in_square_brackets_is_redacted() {
+        assert_eq!(shape_only("from [1.2.3.4:19335]"), "from [[peer address]]");
+    }
+
+    #[test]
+    fn a_bracketed_ip_with_the_port_outside_is_redacted() {
+        let out = shape_only("from [1.2.3.4]:19335");
+        assert!(!out.contains("1.2.3.4"), "IP survived:\n{out}");
+    }
+
+    #[test]
+    fn an_ip_before_a_closing_bracket_is_redacted() {
+        assert_eq!(shape_only("from 1.2.3.4]"), "from [peer address]]");
+    }
+
+    #[test]
+    fn an_ip_after_a_word_and_a_colon_is_redacted() {
+        assert_eq!(shape_only("addr:1.2.3.4"), "addr:[peer address]");
+    }
+
+    #[test]
+    fn a_key_after_a_word_and_a_colon_is_redacted() {
+        let wif = crate::signer::generate_wif();
+        assert_eq!(shape_only(&format!("key:{wif}")), "key:[key removed]");
+    }
+
+    #[test]
+    fn a_key_in_square_brackets_is_redacted() {
+        let wif = crate::signer::generate_wif();
+        assert_eq!(shape_only(&format!("[{wif}]")), "[[key removed]]");
+    }
+
+    #[test]
+    fn a_key_before_a_closing_bracket_is_redacted() {
+        let wif = crate::signer::generate_wif();
+        assert_eq!(shape_only(&format!("{wif}]")), "[key removed]]");
+    }
+
+    /// Unchanged by the bracket handling: the whole `[v6]:port` is one
+    /// address, as it always was.
+    #[test]
+    fn a_bracketed_ipv6_with_a_port_is_still_redacted_whole() {
+        assert_eq!(
+            shape_only("peer [2001:db8::7]:19335 and addr:[2001:db8::7]:19335"),
+            "peer [peer address] and addr:[peer address]"
+        );
+    }
+
+    /// `.rs` is Serbia's country domain, not only a Rust file.
+    #[test]
+    fn a_host_under_the_rs_domain_is_redacted() {
+        let out = shape_only("peer mynode.example.rs:19335");
+        assert!(!out.contains("mynode"), "host survived:\n{out}");
+    }
+
+    /// `.py` is Paraguay's country domain, not only a Python file.
+    #[test]
+    fn a_host_under_the_py_domain_is_redacted() {
+        let out = shape_only("peer mynode.example.py:19335");
+        assert!(!out.contains("mynode"), "host survived:\n{out}");
+    }
+
+    /// The engine's own `-logsourcelocations` prefix is bracketed, so the
+    /// bracket handling must still see `validation.cpp:17539` as a source
+    /// line; a published peer in brackets stays too.
+    #[test]
+    fn bracketed_engine_source_lines_and_published_peers_stay() {
+        let text = "[validation.cpp:17539] [ProcessNewBlock] [logging.h:88] \
+                    via [109.199.124.187:19335]";
+        assert_eq!(shape_only(text), text);
     }
 
     /// The `secrets` floor is 4 characters, not 8: a short passphrase or
