@@ -117,7 +117,7 @@ pub fn run() {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let state = handle.state::<AppState>();
-                    if let Err(message) = commands::guarded_setup(&handle, &state).await {
+                    if let Err(message) = commands::guarded_setup(&handle, &state, None).await {
                         eprintln!("[e2e] setup pipeline failed: {message}");
                     }
                 });

@@ -351,6 +351,28 @@ fn node_backend() -> Backend {
     btx_core::backend::node_host_backend()
 }
 
+/// This machine's backend as the setup screen sees it, asked of the host once
+/// per app run. `node_host_backend` reads the loader cache on a PC and logs its
+/// answer, which is too much for a status poll every 1.5 s, and the hardware
+/// does not change while the app is open.
+fn setup_backend() -> Backend {
+    static BACKEND: std::sync::OnceLock<Backend> = std::sync::OnceLock::new();
+    *BACKEND.get_or_init(node_backend)
+}
+
+/// Whether this machine may check blocks itself (`Backend::may_check_blocks`):
+/// whether the setup screen lets the owner pick Full check.
+fn full_check_possible() -> bool {
+    setup_backend().may_check_blocks()
+}
+
+/// Whether the setup screen selects Full check first
+/// (`Backend::full_check_first`): on an NVIDIA machine, not on a Mac, where
+/// Quick start comes first (the owner's decision of 2026-09-29).
+fn full_check_first() -> bool {
+    setup_backend().full_check_first()
+}
+
 /// The Settings line for one attempt to offer the public signing key.
 ///
 /// Every outcome gets a sentence a person can act on, including the ones that
@@ -2831,6 +2853,20 @@ pub struct NodeStatusInfo {
     /// blocks itself (`btx_core::node::follows_signatures_by_choice`). Drives
     /// the Settings switch that takes it back.
     pub follow_signatures: bool,
+    /// Whether this machine may check blocks itself, as far as the app can
+    /// know before the engine's first start (`full_check_possible`). The setup
+    /// screen greys out Full check when it is false.
+    pub full_check_possible: bool,
+    /// Whether the setup screen selects Full check first (`full_check_first`):
+    /// true on an NVIDIA machine, false on a Mac, where Quick start comes
+    /// first and Full check can still be picked. Read only while
+    /// `full_check_possible` is true.
+    pub full_check_first: bool,
+    /// The engine refused this Mac's graphics chip at a start, and the app
+    /// moved the node to following signatures
+    /// (`btx_core::node::matmul_consensus_was_refused`). The status screen
+    /// says so once.
+    pub chip_refused: bool,
     /// Bytes this node has uploaded to peers this run (`getnettotals`).
     ///
     /// Feeds the "Helping the network" card: chain data other people actually
@@ -3349,6 +3385,9 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         rc_unverifiable_message,
         rc_trusted_mirror: rc_policy.as_ref().is_some_and(|p| p.trusted_mirror),
         follow_signatures: btx_core::node::follows_signatures_by_choice(&datadir),
+        full_check_possible: full_check_possible(),
+        full_check_first: full_check_first(),
+        chip_refused: btx_core::node::matmul_consensus_was_refused(&datadir),
         archive_peers,
         stall: state.stall_verdict.lock().await.clone(),
         node_profile: settings.node_profile.clone(),
@@ -3389,9 +3428,15 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
 
 // ── First-run setup pipeline ────────────────────────────────────────────────
 
+/// `choice` is the setup screen's Quick start or Full check. `None` (an older
+/// window, the E2E seam) is setup as it was before the choice existed.
 #[tauri::command]
-pub async fn begin_setup(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    guarded_setup(&app, &state).await
+pub async fn begin_setup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    choice: Option<btx_core::node::StartChoice>,
+) -> Result<(), String> {
+    guarded_setup(&app, &state, choice).await
 }
 
 /// Append a timestamped line to `<datadir>/setup.log`. A GUI app has no
@@ -3417,6 +3462,7 @@ fn setup_log(datadir: &Path, msg: &str) {
 pub(crate) async fn guarded_setup(
     app: &AppHandle,
     state: &State<'_, AppState>,
+    choice: Option<btx_core::node::StartChoice>,
 ) -> Result<(), String> {
     if state
         .setup_running
@@ -3425,7 +3471,7 @@ pub(crate) async fn guarded_setup(
     {
         return Err("setup is already running".to_string());
     }
-    let result = run_setup_pipeline(app, state).await;
+    let result = run_setup_pipeline(app, state, choice).await;
     state.setup_running.store(false, Ordering::SeqCst);
     if let Err(msg) = &result {
         setup_log(&node_datadir(), &format!("ERROR: {msg}"));
@@ -3441,7 +3487,11 @@ pub(crate) async fn guarded_setup(
     result
 }
 
-async fn run_setup_pipeline(app: &AppHandle, state: &State<'_, AppState>) -> Result<(), String> {
+async fn run_setup_pipeline(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    choice: Option<btx_core::node::StartChoice>,
+) -> Result<(), String> {
     let datadir = node_datadir();
     std::fs::create_dir_all(&datadir)
         .map_err(|e| format!("couldn't create {}: {e}", datadir.display()))?;
@@ -3449,6 +3499,20 @@ async fn run_setup_pipeline(app: &AppHandle, state: &State<'_, AppState>) -> Res
         &datadir,
         &format!("setup started (app v{})", env!("CARGO_PKG_VERSION")),
     );
+
+    // 0. The owner's pick on the setup screen, recorded before the first start
+    //    reads it (`launches_as_mirror`). No pick leaves the marker as it is.
+    if let Some(choice) = choice {
+        btx_core::node::apply_start_choice(&datadir, choice, full_check_possible()).map_err(
+            |e| {
+                format!(
+                    "couldn't record your start choice in {}: {e}",
+                    datadir.display()
+                )
+            },
+        )?;
+        setup_log(&datadir, &format!("start choice: {choice:?}"));
+    }
 
     // 1. Disk preflight. A fresh install (no chain yet) must fit the whole
     //    un-pruned chain, so it gates on DISK_REQUIRED_FRESH; a resume needs only
