@@ -10,6 +10,7 @@
 mod ask;
 mod commands;
 mod state;
+mod tools;
 mod tray;
 mod update_binding;
 mod update_log;
@@ -44,6 +45,13 @@ pub fn run() {
             commands::start_node,
             commands::stop_node,
             commands::open_data_folder,
+            tools::tools_console_run,
+            tools::tools_console_confirm,
+            tools::tools_engine_notices,
+            tools::tools_diagnostics,
+            tools::tools_fetch_stuck_blocks,
+            tools::tools_restart_check,
+            tools::tools_restart_node,
             commands::set_keep_awake,
             commands::set_node_profile,
             commands::set_follow_signatures,

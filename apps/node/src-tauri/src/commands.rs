@@ -4625,7 +4625,7 @@ pub fn destructive_allowed(owner: NodeOwnership) -> Result<(), String> {
 
 /// Work out [`NodeOwnership`] from what this app knows, probing the datadir
 /// only when it holds nothing itself.
-async fn node_ownership(state: &AppState, datadir: &Path) -> NodeOwnership {
+pub(crate) async fn node_ownership(state: &AppState, datadir: &Path) -> NodeOwnership {
     if let Some(attached) = *state.attached_to.lock().await {
         return match attached {
             AttachedTo::AnotherApp => NodeOwnership::AnotherApp,

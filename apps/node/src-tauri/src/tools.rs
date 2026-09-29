@@ -1,0 +1,427 @@
+//! Tools: one overlay with quick actions, Copy diagnostics and the command
+//! window. Every decision is a pure function in btx-core; this module only
+//! gathers answers from the node and hands them over.
+//! docs/decisions/2026-09-29-tools-and-command-window.md
+
+use serde::Serialize;
+use serde_json::{json, Value};
+use tauri::{AppHandle, State};
+
+use btx_core::console_policy::{self, ConfirmBook, Decision};
+use btx_core::diagnostics::{self, DiagnosticsInput, HeldBranchState, RedactionContext};
+use btx_core::engine_warnings::Notice;
+use btx_core::node_api as api;
+use btx_core::rpc::{Rpc, RpcClient};
+use btx_core::stuck_blocks::{self, FetchPlan};
+
+use crate::ask::{degrade, Ask};
+use crate::commands::{destructive_allowed, node_ownership, restart_node_projected};
+use crate::state::{node_datadir, AppState};
+
+/// Hosts this app itself talks to that are not node peers: the update feed
+/// and release host, and the block explorer API. Diagnostics must never
+/// redact these out from under `published_peer_hosts`, or a report that
+/// mentions them (e.g. an update-check URL) shreds the app's own name.
+const APP_SERVICE_HOSTS: &[&str] = &[
+    "easybtx.com",
+    "witness-1.easybtx.com",
+    "github.com",
+    "api.btxscan.io",
+    "btxscan.io",
+];
+
+/// Every host diagnostics may name: the node's own published peers plus this
+/// app's own services.
+fn published_hosts() -> Vec<String> {
+    let mut hosts = btx_core::node::published_peer_hosts();
+    hosts.extend(APP_SERVICE_HOSTS.iter().map(|s| s.to_string()));
+    hosts
+}
+
+/// The person's home folder, written as `~` in a diagnostics report. No
+/// `dirs` dependency here (btx-core has one; this app crate does not), so
+/// read the platform's own env var directly.
+fn home_dir_display() -> Option<String> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|p| std::path::PathBuf::from(p).display().to_string())
+}
+
+static CONFIRM: std::sync::Mutex<ConfirmBook> = std::sync::Mutex::new(ConfirmBook::new());
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConsoleAnswer {
+    Output { text: String },
+    Confirm { token: String, sentence: String },
+    Refused { sentence: String },
+    Stopped,
+}
+
+pub(crate) fn answer_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+async fn rpc_handle(state: &State<'_, AppState>) -> Option<RpcClient> {
+    state.rpc.lock().await.clone()
+}
+
+async fn run_call(state: &State<'_, AppState>, call: console_policy::Call) -> ConsoleAnswer {
+    let Some(rpc) = rpc_handle(state).await else {
+        return ConsoleAnswer::Stopped;
+    };
+    match rpc.call(&call.method, Value::Array(call.params)).await {
+        Ok(v) => ConsoleAnswer::Output {
+            text: answer_text(&v),
+        },
+        Err(e) => ConsoleAnswer::Output {
+            text: format!("The node answered: {e}"),
+        },
+    }
+}
+
+#[tauri::command]
+pub async fn tools_console_run(
+    line: String,
+    state: State<'_, AppState>,
+) -> Result<ConsoleAnswer, String> {
+    Ok(match console_policy::decide(&line) {
+        Decision::Run(call) => run_call(&state, call).await,
+        Decision::Local(text) => ConsoleAnswer::Output { text },
+        Decision::Refuse(sentence) => ConsoleAnswer::Refused { sentence },
+        Decision::Confirm { call, sentence } => {
+            let token = console_policy::new_token();
+            CONFIRM.lock().unwrap_or_else(|e| e.into_inner()).issue(
+                token.clone(),
+                call,
+                std::time::Instant::now(),
+            );
+            ConsoleAnswer::Confirm { token, sentence }
+        }
+    })
+}
+
+#[tauri::command]
+pub async fn tools_console_confirm(
+    token: String,
+    state: State<'_, AppState>,
+) -> Result<ConsoleAnswer, String> {
+    let call = CONFIRM
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .redeem(&token, std::time::Instant::now());
+    Ok(match call {
+        Some(call) => run_call(&state, call).await,
+        None => ConsoleAnswer::Refused {
+            sentence: "That confirmation has expired. Run the command again.".into(),
+        },
+    })
+}
+
+#[tauri::command]
+pub async fn tools_engine_notices(state: State<'_, AppState>) -> Result<Ask<Vec<Notice>>, String> {
+    let Some(rpc) = rpc_handle(&state).await else {
+        return Ok(Ask::Stopped);
+    };
+    Ok(match api::get_blockchain_info(&rpc).await {
+        Ok(info) => Ask::Ready(btx_core::engine_warnings::all_notices(&info)),
+        Err(e) => degrade(e),
+    })
+}
+
+/// `None` when Restart node may run; otherwise the sentence saying why not.
+#[tauri::command]
+pub async fn tools_restart_check(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let owner = node_ownership(&state, &node_datadir()).await;
+    Ok(destructive_allowed(owner).err())
+}
+
+#[tauri::command]
+pub async fn tools_restart_node(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    destructive_allowed(node_ownership(&state, &node_datadir()).await)?;
+    restart_node_projected(&app, &state).await
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FetchOutcome {
+    pub message: String,
+    pub tip_before: u64,
+    pub tip_after: u64,
+}
+
+/// Walk back from `target` to the block above `tip_height`, and check it
+/// sits on the node's own tip.
+async fn missing_blocks(
+    rpc: &RpcClient,
+    target: &btx_core::fork::ChainTip,
+    tip_height: u64,
+    tip_hash: &str,
+) -> Result<Vec<(u64, String)>, String> {
+    if target.height.saturating_sub(tip_height) > stuck_blocks::MAX_WALK {
+        return Err(
+            "Your node is far behind. That is catching up, not a stuck block; leave it running."
+                .into(),
+        );
+    }
+    let mut chain = Vec::new();
+    let mut hash = target.hash.clone();
+    loop {
+        let h = rpc
+            .call("getblockheader", json!([hash, true]))
+            .await
+            .map_err(|e| e.to_string())?;
+        let height = h["height"]
+            .as_u64()
+            .ok_or("The node sent a header without a height.")?;
+        chain.push((height, hash.clone()));
+        let prev = h["previousblockhash"].as_str().unwrap_or("").to_string();
+        if height <= tip_height + 1 {
+            if prev != tip_hash {
+                return Err("The newest headers are on another branch than your node's tip. The node decides that on its own.".into());
+            }
+            break;
+        }
+        hash = prev;
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
+#[tauri::command]
+pub async fn tools_fetch_stuck_blocks(state: State<'_, AppState>) -> Result<FetchOutcome, String> {
+    let rpc = rpc_handle(&state).await.ok_or("Start your node first.")?;
+    let info = api::get_blockchain_info(&rpc)
+        .await
+        .map_err(|e| e.to_string())?;
+    let tip_hash = rpc
+        .call("getbestblockhash", json!([]))
+        .await
+        .map_err(|e| e.to_string())?;
+    let tip_hash = tip_hash.as_str().unwrap_or("").to_string();
+    let tips = api::get_chain_tips(&rpc).await.map_err(|e| e.to_string())?;
+    let done = |message: String| FetchOutcome {
+        message,
+        tip_before: info.blocks,
+        tip_after: info.blocks,
+    };
+    let Some(target) = stuck_blocks::target_tip(&tips, info.blocks) else {
+        return Ok(done(
+            "Your node has every block it knows of. Nothing to fetch.".into(),
+        ));
+    };
+    let missing = match missing_blocks(&rpc, target, info.blocks, &tip_hash).await {
+        Ok(m) => m,
+        Err(sentence) => return Ok(done(sentence)),
+    };
+    let peers = api::get_peer_info(&rpc).await.map_err(|e| e.to_string())?;
+    let reqs = match stuck_blocks::plan(&missing, &peers) {
+        FetchPlan::Nothing(sentence) => return Ok(done(sentence)),
+        FetchPlan::Ask(reqs) => reqs,
+    };
+    let mut asked = Vec::new();
+    for r in &reqs {
+        if rpc
+            .call("getblockfrompeer", json!([r.hash, r.peer_id]))
+            .await
+            .is_ok()
+        {
+            asked.push(r.clone());
+        }
+    }
+    if asked.is_empty() {
+        return Ok(done(
+            "The peers did not take the request. Give it a few minutes.".into(),
+        ));
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+    let after = api::get_blockchain_info(&rpc)
+        .await
+        .map(|i| i.blocks)
+        .unwrap_or(info.blocks);
+    let moved = if after > info.blocks {
+        format!(" The tip moved from {} to {}.", info.blocks, after)
+    } else {
+        " No block has connected yet; the node may still be checking them.".to_string()
+    };
+    Ok(FetchOutcome {
+        message: format!("{}{}", stuck_blocks::summary(&asked), moved),
+        tip_before: info.blocks,
+        tip_after: after,
+    })
+}
+
+#[tauri::command]
+pub async fn tools_diagnostics(
+    status_line: String,
+    window_lines: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let datadir = node_datadir();
+    let rpc = rpc_handle(&state).await;
+    let mut input = DiagnosticsInput {
+        generated_at: format!("{} UTC", chrono_like_now()),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        engine_pinned: format!(
+            "{} ({})",
+            crate::commands::NODE_RELEASE_TAG,
+            &crate::commands::NODE_RELEASE_COMMIT[..8]
+        ),
+        platform: format!(
+            "{} {}, installed as {:?}",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            tauri::utils::platform::bundle_type()
+        ),
+        status_line,
+        window_lines,
+        phase: format!("{:?}", *state.phase.lock().await),
+        signer_pubkey: state.signer_pubkey.lock().await.clone(),
+        stall: state
+            .stall_verdict
+            .lock()
+            .await
+            .as_ref()
+            .map(|v| v.summary.to_string()),
+        log_warnings: diagnostics::warning_lines(&btx_core::node::debug_log_tail(
+            &datadir,
+            diagnostics::LOG_TAIL_BYTES,
+        )),
+        ..Default::default()
+    };
+    if let Some(rpc) = &rpc {
+        input.chain = api::get_blockchain_info(rpc).await.ok();
+        input.best_block_hash = rpc
+            .call("getbestblockhash", json!([]))
+            .await
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string));
+        input.engine_running = rpc
+            .call("getnetworkinfo", json!([]))
+            .await
+            .ok()
+            .and_then(|v| v["subversion"].as_str().map(str::to_string));
+        input.chainstates = api::get_chainstates(rpc).await.ok();
+        input.tips = api::get_chain_tips(rpc).await.unwrap_or_default();
+        input.peers = api::get_peer_info(rpc).await.unwrap_or_default();
+        input.attested_tip = api::get_attested_tip(rpc).await.ok();
+        let trusted = api::get_matmul_trusted_status(rpc).await.ok();
+        input.role = match trusted {
+            Some(t) if t.trusted_mirror => "follows signatures".into(),
+            Some(t) => format!("checks blocks itself ({})", t.matmul_validation_mode),
+            None => "unknown".into(),
+        };
+        for h in btx_core::known_invalid::HELD_BRANCHES {
+            let on_chain = rpc
+                .call("getblockhash", json!([h.height]))
+                .await
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s == h.root));
+            let known = rpc
+                .call("getblockheader", json!([h.root, true]))
+                .await
+                .is_ok();
+            let held_state = match (known, on_chain) {
+                (_, Some(true)) => "ON THIS NODE'S CHAIN",
+                (true, _) => "seen, not on this node's chain",
+                (false, _) => "not seen by this node",
+            };
+            input.held.push(HeldBranchState {
+                height: h.height,
+                root: h.root[..16].to_string(),
+                state: held_state.into(),
+            });
+        }
+    } else {
+        input.role = "node not running".into();
+    }
+    let ctx = RedactionContext {
+        home: home_dir_display(),
+        secrets: secrets(&datadir),
+        published_hosts: published_hosts(),
+    };
+    Ok(diagnostics::redact(&diagnostics::render(&input), &ctx))
+}
+
+/// The cookie password and the signing key's own text, read only to be removed.
+fn secrets(datadir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(cookie) = std::fs::read_to_string(datadir.join(".cookie")) {
+        if let Some((_, pass)) = cookie.trim().split_once(':') {
+            out.push(pass.to_string());
+        }
+    }
+    if let Ok(wif) = std::fs::read_to_string(btx_core::signer::signer_key_path(datadir)) {
+        out.push(wif.trim().to_string());
+    }
+    out
+}
+
+/// "2026-09-29 14:05" in UTC, without a date crate.
+fn chrono_like_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    // Civil-from-days (Howard Hinnant), proleptic Gregorian.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+        rem / 3_600,
+        (rem % 3_600) / 60
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::answer_text;
+    use serde_json::json;
+
+    #[test]
+    fn strings_print_raw_and_objects_print_pretty() {
+        assert_eq!(
+            answer_text(&json!("line one\nline two")),
+            "line one\nline two"
+        );
+        assert_eq!(answer_text(&json!({"a": 1})), "{\n  \"a\": 1\n}");
+        assert_eq!(answer_text(&json!(null)), "null");
+    }
+
+    #[test]
+    fn the_date_helper_formats_like_utc() {
+        let s = super::chrono_like_now();
+        assert_eq!(s.len(), 16);
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[10..11], " ");
+    }
+
+    /// Task 5's diagnostics::redact only ever sees hosts this app hands it
+    /// through `RedactionContext.published_hosts`; if this app's own update
+    /// feed / release host / explorer API is missing from that list, a
+    /// report that names one of them gets shredded as if it were a stranger's
+    /// peer address.
+    #[test]
+    fn published_hosts_include_the_node_s_own_service_hosts() {
+        let hosts = super::published_hosts();
+        assert!(
+            hosts.iter().any(|h| h == "easybtx.com"),
+            "missing easybtx.com: {hosts:?}"
+        );
+        assert!(
+            hosts.iter().any(|h| h == "20.86.181.203"),
+            "missing 20.86.181.203: {hosts:?}"
+        );
+    }
+}
