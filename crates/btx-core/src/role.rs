@@ -333,7 +333,8 @@ impl NodeRole {
 
     /// Attach whether the node started from a signed snapshot whose older
     /// history is still being checked (`node::on_signed_snapshot` while the
-    /// status carries a history check).
+    /// engine reports that history unchecked,
+    /// `node_api::HistoryProgress::unchecked`).
     pub fn with_signed_snapshot(mut self, on_signed_snapshot: bool) -> Self {
         self.on_signed_snapshot = on_signed_snapshot;
         self

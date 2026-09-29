@@ -1059,7 +1059,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     *state.fork.lock().await = None;
     *state.tip_median_time.lock().await = None;
     state.engine_warnings.lock().await.clear();
-    *state.history_check.lock().await = None;
+    *state.history_check.lock().await = Default::default();
 
     set_phase(app, state, NodePhase::Starting).await;
 
@@ -1574,7 +1574,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         let mut snapshot_swept = false;
         // The snapshot block's own height, read from its header once per
         // snapshot (btx_core::node_api::refresh_history_check).
-        let mut history_base: Option<(String, u64)> = None;
+        let mut history_base = btx_core::node_api::HistoryBase::default();
         // Trusted-mirror stall watchdog state (Paper 3 §3, progress rule
         // refined — see btx_core::watchdog): while a connectable gap exists,
         // only BLOCK movement is progress; at the frontier and during
@@ -1722,21 +1722,21 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         get_chainstates(&rpc),
                         btx_core::node_api::get_peer_info(&rpc)
                     );
-                    let chainstates_read = chainstates.is_ok();
+                    // Whether a snapshot's older history is still being
+                    // checked, and how far that has got, for the role
+                    // sentence and the status screen's line and bar. A failed
+                    // getchainstates keeps the last answer (btx_core).
+                    let previous = *history_slot.lock().await;
+                    let history = btx_core::node_api::refresh_history_check(
+                        &rpc,
+                        &chainstates,
+                        &mut history_base,
+                        previous,
+                    )
+                    .await;
+                    *history_slot.lock().await = history;
                     let chainstates = chainstates.unwrap_or_default();
                     let peer_infos = peer_infos.ok();
-                    // How far the background check of the snapshot's older
-                    // history has got, for the status screen's line and bar.
-                    // A failed getchainstates keeps the last answer: one lost
-                    // call is not the check finishing.
-                    if chainstates_read {
-                        *history_slot.lock().await = btx_core::node_api::refresh_history_check(
-                            &rpc,
-                            &chainstates,
-                            &mut history_base,
-                        )
-                        .await;
-                    }
                     // A FAILED MEASUREMENT IS NOT ZERO PEERS. `peers` is an i64
                     // on the phase, so it cannot carry "unknown" the way
                     // bytes_sent, inbound_peers and archive_peers do — and this
@@ -2584,7 +2584,7 @@ pub async fn stop_node_inner(state: &AppState) {
     *state.fork.lock().await = None;
     *state.tip_median_time.lock().await = None;
     state.engine_warnings.lock().await.clear();
-    *state.history_check.lock().await = None;
+    *state.history_check.lock().await = Default::default();
     // Release the keep-awake assertion — the Mac may sleep again.
     *state.sleep_guard.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
@@ -2794,7 +2794,9 @@ pub struct NodeStatusInfo {
     /// How far the background check of the snapshot's older history has got
     /// (`btx_core::node_api::HistoryCheck`), for the status screen's
     /// "Checking older history" line and bar. `None` when the node is stopped,
-    /// never loaded a snapshot, or the engine reports the check done.
+    /// never loaded a snapshot, or the engine reports the check done, and
+    /// while the snapshot's own height (the check's base) has not been read
+    /// yet: the line is never shown against a guessed base.
     pub history_check: Option<btx_core::node_api::HistoryCheck>,
     /// The nickname the user has chosen (empty = none). This is what WILL be
     /// broadcast; `subversion` below is what IS.
@@ -3198,15 +3200,17 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
     } else {
         None
     };
-    let history_check = if running {
+    let history = if running {
         *state.history_check.lock().await
     } else {
-        None
+        Default::default()
     };
+    let history_check = history.check;
     // A validating node on a signed snapshot says its older history is still
-    // being checked, for as long as the check runs (btx_core::role).
-    let on_signed_snapshot =
-        history_check.is_some() && btx_core::node::on_signed_snapshot(&datadir);
+    // being checked, for as long as the engine reports it unchecked
+    // (btx_core::role). Not gated on the line's base height: the sentence
+    // needs none, and a getblockheader that keeps failing would hold it back.
+    let on_signed_snapshot = history.unchecked && btx_core::node::on_signed_snapshot(&datadir);
     let role = net.as_ref().filter(|_| running).map(|n| {
         btx_core::role::node_role(
             matmul_trusted.as_ref(),
