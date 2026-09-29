@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | approved by the owner on 2026-09-28, the first of three options discussed: the app installs its own .deb after one password prompt. To ship in 0.6.33 |
+| Status | approved by the owner on 2026-09-28, the first of three options discussed: the app installs its own .deb after one password prompt. To ship in 0.6.33. Ships as 0.7.0: read 0.7.0 wherever this record says 0.6.33 |
 | Date | 2026-09-28 |
 | Supersedes | the manual-only rule for .deb installs, "told a new version exists and is updated by hand" on the site's node page |
 | Leaves alone | `latest-node.json` and every install that reads it; the update binding's rule (#148) that every feed entry is signed under its release name; the AppImage, Mac and Windows update paths |
@@ -123,6 +123,8 @@ manual command instead.
 
 ## Rollout
 
+This ships as 0.7.0, not 0.6.33; read 0.7.0 for 0.6.33 below.
+
 - 0.6.33 ships all of the above, and its site PR publishes `node-deb.json` for
   0.6.33 itself. That changes nothing on the day, since no .deb install runs
   0.6.33 yet, and it makes the path live from the start.
@@ -142,6 +144,10 @@ manual command instead.
 - No .rpm and no Linux ARM.
 - Headless servers and WSL still update by hand. They now say so plainly
   instead of downloading the AppImage on every check.
+- It does not change how the updater signing key is kept or used. What the key
+  guards does change: a .deb install runs the installer as root after the
+  password prompt, so on a .deb machine the key now guards root, where through
+  the AppImage it only ever reached the user's own account.
 
 ## Rollback
 
