@@ -21,6 +21,7 @@ pub mod backend;
 pub mod checkin;
 pub mod console_policy;
 pub mod datadir;
+pub mod diagnostics;
 pub mod disk;
 pub mod engine_warnings;
 pub mod error;
