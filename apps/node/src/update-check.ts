@@ -231,6 +231,63 @@ export function describeWhen(at: Date, now: Date): string {
 
 const VERSION_IN_DETAIL = /\bv\d+\.\d+\.\d+\b/;
 
+// ── An update this copy will not download on its own ────────────────────────
+//
+// update_binding.rs declines two offers before anything is downloaded: a copy
+// installed from the .deb, offered a release with only the AppImage in it,
+// and, on an automatic check, a version whose install already failed on this
+// machine. To the plugin both are "no update". The notice update_binding
+// keeps says what to do instead, and every such notice carries the phrase
+// below; the record is a failed check with the notice as its detail.
+
+/** The phrase every such notice carries. `HAND_INSTALL_MARK` in
+ *  src-tauri/src/update_binding.rs is the same text, and
+ *  update-check.test.ts reads that file to keep the two equal. */
+export const HAND_INSTALL_MARK = "install it by hand";
+
+const TRIGGER = /^(?:manual|automatic): /;
+
+/** The notice in `text`, which is either what update_binding kept or a
+ *  recorded detail (the same notice behind its trigger), or null. */
+export function handInstallNotice(text: string): string | null {
+  const notice = text.replace(TRIGGER, "");
+  return notice.includes(HAND_INSTALL_MARK) ? notice : null;
+}
+
+/** The banner for such a notice. The steps themselves are in Settings, in
+ *  the sentence beside "Check now". */
+export function handInstallBanner(notice: string): { head: string; tail: string } {
+  const v = VERSION_IN_DETAIL.exec(notice)?.[0];
+  return {
+    head: v ? `${v} is out.` : "An update is out.",
+    tail: "Install it by hand, the steps are in Settings.",
+  };
+}
+
+/**
+ * The sentence beside "Check now" when a pressed check ended with nothing to
+ * install. `refusal` is what update_binding kept, if anything: to the plugin
+ * a declined or refused offer is "no update", and saying "latest version"
+ * then would be untrue.
+ */
+export function noUpdateMessage(
+  refusal: string | null,
+  currentVersion: string,
+  downloadsAt: string,
+): string {
+  if (!refusal) {
+    return currentVersion
+      ? `You're on the latest version (v${currentVersion}).`
+      : "You're on the latest version.";
+  }
+  const notice = handInstallNotice(refusal);
+  if (notice) return notice;
+  return (
+    `This copy did not take the update it was offered (${refusal.slice(0, 160)}). ` +
+    `Downloads are at ${downloadsAt}.`
+  );
+}
+
 /** The outcome in plain words. `detail` only lends the version number. An
  *  outcome this build does not know (a file written by a newer one) is shown
  *  as its word rather than hidden. */
@@ -240,6 +297,9 @@ export function plainOutcome(outcome: string, detail: string, downloadsAt: strin
     case "no-update":
       return "you're on the latest version";
     case "check-failed":
+      if (handInstallNotice(detail)) {
+        return `${v ?? "an update"} is out, install it by hand from ${downloadsAt}`;
+      }
       return /no build for this platform/.test(detail)
         ? "no build for this platform yet"
         : "couldn't check";

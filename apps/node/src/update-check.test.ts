@@ -22,8 +22,12 @@ import {
   classifyCheckFailure,
   checkFailureMessage,
   describeWhen,
+  handInstallBanner,
+  handInstallNotice,
+  HAND_INSTALL_MARK,
   installErrorFromDetail,
   lastCheckLine,
+  noUpdateMessage,
   plainOutcome,
   updateCheckRecord,
   UPDATE_CHECK_OUTCOMES,
@@ -449,6 +453,89 @@ describe("installErrorFromDetail", () => {
       "",
     ]) {
       expect(installErrorFromDetail(d)).toBe(d);
+    }
+  });
+});
+
+// ── An update this copy will not download on its own ─────────────────────────
+// update_binding.rs declines two offers before anything is downloaded: a .deb
+// copy offered only the AppImage, and, on an automatic check, a version whose
+// install already failed here. Its notices are the strings below, verbatim
+// (update_binding.rs pins the same text in its own tests).
+
+const DEB_NOTICE =
+  "v0.6.34 is out. This copy came from a .deb, so install it by hand: " +
+  "get the .deb from easybtx.com/node and run sudo apt install ./BTX-Node_0.6.34_amd64.deb";
+const FAILED_NOTICE =
+  "v0.6.34 failed to install here, so it is not downloaded again. " +
+  "Press Check now to try again, or install it by hand from easybtx.com/node";
+const REFUSED = "refused v0.9.0: its linux-x86_64 build is signed as X, not Y";
+
+describe("an update this copy will not download on its own", () => {
+  it("is found by the same phrase in TypeScript and in Rust", () => {
+    const src = read("../src-tauri/src/update_binding.rs");
+    const m = /HAND_INSTALL_MARK: &str = "([^"]+)"/.exec(src);
+    expect(m, "HAND_INSTALL_MARK in update_binding.rs").not.toBeNull();
+    expect(HAND_INSTALL_MARK).toBe(m![1]);
+  });
+
+  it("reads a notice from a refusal or from a recorded detail", () => {
+    expect(handInstallNotice(DEB_NOTICE)).toBe(DEB_NOTICE);
+    expect(handInstallNotice(`automatic: ${DEB_NOTICE}`)).toBe(DEB_NOTICE);
+    expect(handInstallNotice(`manual: ${FAILED_NOTICE}`)).toBe(FAILED_NOTICE);
+    // A refused feed and an ordinary detail are not notices.
+    expect(handInstallNotice(REFUSED)).toBeNull();
+    expect(handInstallNotice(`automatic: ${REFUSED}`)).toBeNull();
+    expect(handInstallNotice("automatic: v0.6.33 is current")).toBeNull();
+    expect(handInstallNotice("")).toBeNull();
+  });
+
+  it("puts the version in the banner and sends the reader to Settings", () => {
+    expect(handInstallBanner(DEB_NOTICE)).toEqual({
+      head: "v0.6.34 is out.",
+      tail: "Install it by hand, the steps are in Settings.",
+    });
+    expect(handInstallBanner("install it by hand").head).toBe("An update is out.");
+  });
+
+  it("never says 'latest version' after a pressed check that was declined or refused", () => {
+    expect(noUpdateMessage(null, "0.6.33", "easybtx.com/node")).toBe(
+      "You're on the latest version (v0.6.33).",
+    );
+    expect(noUpdateMessage(null, "", "easybtx.com/node")).toBe("You're on the latest version.");
+    // A notice is written for people already, and it carries the command.
+    expect(noUpdateMessage(DEB_NOTICE, "0.6.33", "easybtx.com/node")).toBe(DEB_NOTICE);
+    const refused = noUpdateMessage(REFUSED, "0.6.33", "easybtx.com/node");
+    expect(refused).not.toMatch(/latest version/);
+    expect(refused).toContain(REFUSED);
+    expect(refused).toContain("easybtx.com/node");
+    expect(noUpdateMessage("x".repeat(500), "0.6.33", "e.com").length).toBeLessThan(260);
+  });
+
+  it("shows the Last check line in plain words, with the version", () => {
+    const now = new Date(2026, 8, 29, 16, 30);
+    const at = new Date(2026, 8, 29, 14, 3).toISOString();
+    for (const notice of [DEB_NOTICE, FAILED_NOTICE]) {
+      expect(
+        lastCheckLine(
+          { at, outcome: "check-failed", detail: `automatic: ${notice}` },
+          now,
+          "easybtx.com/node",
+        ),
+      ).toBe("Last check: today 14:03 — v0.6.34 is out, install it by hand from easybtx.com/node");
+    }
+    // A refusal still reads as a failed check.
+    expect(plainOutcome("check-failed", `automatic: ${REFUSED}`, "e")).toBe("couldn't check");
+  });
+
+  it("adds no em-dash of its own", () => {
+    for (const text of [
+      handInstallBanner(DEB_NOTICE).head,
+      handInstallBanner(DEB_NOTICE).tail,
+      noUpdateMessage(REFUSED, "0.6.33", "easybtx.com/node"),
+      plainOutcome("check-failed", DEB_NOTICE, "easybtx.com/node"),
+    ]) {
+      expect(text).not.toContain("—");
     }
   });
 });
