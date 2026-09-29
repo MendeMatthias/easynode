@@ -8,6 +8,16 @@ root).
 
 ## [Unreleased]
 
+**Tools: the things support used to need a terminal for, behind one button.**
+A new wrench button at the top opens Tools. From there you can restart the
+node, ask good peers for a block your node is stuck on, open the data folder,
+and see every notice the node engine reports, including the ones the home
+screen leaves out and why. **Copy diagnostics** puts a short report on your
+clipboard to paste into a support chat. It shows you the report first and
+leaves out anything private: keys, wallet details, other people's addresses
+and your home folder. For the curious, a command window runs a short list of
+read-only node commands, and asks before the two that do something.
+
 ## [0.6.32] - 2026-09-28
 
 **Every node is held off two branches until BTX's developers rule on them.**
