@@ -42,6 +42,38 @@ export class History {
   }
 }
 
+/**
+ * Restart node's two-click arm/disarm state, pulled out of the DOM glue so it
+ * has a test. The actual 5-second timer and the "overlay just closed" event
+ * both live in tools.ts; either one calls `disarm()` to cancel the arm.
+ */
+export class RestartArm {
+  private armedFlag = false;
+
+  get armed(): boolean {
+    return this.armedFlag;
+  }
+
+  /**
+   * A click on Restart node. The first click only arms it (returns false);
+   * a second click while armed returns true, meaning "actually restart now",
+   * and disarms so a third click starts over.
+   */
+  click(): boolean {
+    if (this.armedFlag) {
+      this.armedFlag = false;
+      return true;
+    }
+    this.armedFlag = true;
+    return false;
+  }
+
+  /** The arm timeout elapsed, or the overlay closed: back to disarmed. */
+  disarm(): void {
+    this.armedFlag = false;
+  }
+}
+
 // The note counts against DISPLAY_LIMIT itself, so the shown text (content
 // plus note) never exceeds the cap and is always shorter than the original.
 const TRUNCATION_NOTE = "\n\n(The answer is longer than this window shows. Copy takes the whole answer.)";

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { History, capForDisplay, DISPLAY_LIMIT } from "./tools-history";
+import { History, RestartArm, capForDisplay, DISPLAY_LIMIT } from "./tools-history";
 
 describe("History", () => {
   it("keeps the last 50 and recalls them with up and down", () => {
@@ -24,6 +24,31 @@ describe("History", () => {
     h.push({ line: "getblockcount", answer: "233480" });
     h.push({ line: "uptime", answer: "120" });
     expect(h.allText()).toBe("> getblockcount\n233480\n\n> uptime\n120");
+  });
+});
+
+describe("RestartArm", () => {
+  it("arms on the first click and restarts on the second", () => {
+    const arm = new RestartArm();
+    expect(arm.armed).toBe(false);
+    expect(arm.click()).toBe(false);
+    expect(arm.armed).toBe(true);
+    expect(arm.click()).toBe(true);
+    expect(arm.armed).toBe(false);
+  });
+  it("disarms by timeout, so the next click only arms again", () => {
+    const arm = new RestartArm();
+    arm.click();
+    arm.disarm(); // the 5s timer fired
+    expect(arm.armed).toBe(false);
+    expect(arm.click()).toBe(false);
+  });
+  it("disarms when the overlay closes, so reopening starts over", () => {
+    const arm = new RestartArm();
+    arm.click();
+    arm.disarm(); // the overlay closed
+    expect(arm.armed).toBe(false);
+    expect(arm.click()).toBe(false);
   });
 });
 

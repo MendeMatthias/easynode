@@ -3,7 +3,7 @@
 // is set as text, never HTML.
 
 import { invoke } from "@tauri-apps/api/core";
-import { History, capForDisplay } from "./tools-history";
+import { History, RestartArm, capForDisplay } from "./tools-history";
 
 type ConsoleAnswer =
   | { kind: "output"; text: string }
@@ -59,8 +59,26 @@ function say(text: string): void {
 export function initTools(): void {
   const overlay = $("tools-overlay");
   const history = new History(50);
+  const restartArm = new RestartArm();
   let pendingToken: string | null = null;
   let restartArmTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** The 5s timer elapsed, or the overlay is closing: back to one click away. */
+  const resetRestartArm = () => {
+    clearTimeout(restartArmTimer);
+    restartArmTimer = undefined;
+    restartArm.disarm();
+    $<HTMLButtonElement>("tools-restart").textContent = "Restart node";
+  };
+
+  /** The single close path for every way the overlay can close, so nothing
+   * (an armed restart, a pending confirm) survives to the next open. */
+  const closeTools = () => {
+    overlay.hidden = true;
+    resetRestartArm();
+    pendingToken = null;
+    $("tools-confirm").hidden = true;
+  };
 
   const open = async () => {
     overlay.hidden = false;
@@ -69,28 +87,25 @@ export function initTools(): void {
     const why = await invoke<string | null>("tools_restart_check").catch(() => null);
     restart.disabled = why !== null;
     restart.title = why ?? "";
+    if (why !== null) say(why);
   };
   $("tools-btn").addEventListener("click", () => void open());
-  $("tools-close").addEventListener("click", () => (overlay.hidden = true));
+  $("tools-close").addEventListener("click", () => closeTools());
   overlay.addEventListener("click", (e) => {
-    if (e.target === overlay) overlay.hidden = true;
+    if (e.target === overlay) closeTools();
   });
 
-  // Restart node: two clicks, disarmed after five seconds.
+  // Restart node: two clicks, disarmed after five seconds or on close.
   $("tools-restart").addEventListener("click", async () => {
     const btn = $<HTMLButtonElement>("tools-restart");
-    if (btn.dataset.armed !== "1") {
-      btn.dataset.armed = "1";
+    if (!restartArm.click()) {
       btn.textContent = "Click again to restart the node";
       clearTimeout(restartArmTimer);
-      restartArmTimer = setTimeout(() => {
-        btn.dataset.armed = "";
-        btn.textContent = "Restart node";
-      }, 5000);
+      restartArmTimer = setTimeout(resetRestartArm, 5000);
       return;
     }
     clearTimeout(restartArmTimer);
-    btn.dataset.armed = "";
+    restartArmTimer = undefined;
     btn.textContent = "Restarting...";
     btn.disabled = true;
     try {
@@ -138,8 +153,12 @@ export function initTools(): void {
       p.textContent = text;
       box.appendChild(p);
     };
-    if (!ans || ans.state !== "ready") {
-      add(ans?.state === "stopped" ? "Start your node to see its notices." : "The node is not answering yet.", "tools-note");
+    if (!ans || ans.state === "warming") {
+      add("The node is not answering yet.", "tools-note");
+    } else if (ans.state === "stopped") {
+      add("Start your node to see its notices.", "tools-note");
+    } else if (ans.state === "unavailable") {
+      add(ans.data.message, "tools-note");
     } else if (ans.data.length === 0) {
       add("The engine reports nothing right now.", "tools-note");
     } else {
@@ -171,7 +190,14 @@ export function initTools(): void {
 
   // The command window.
   const input = $<HTMLInputElement>("tools-line");
+  const runBtn = $<HTMLButtonElement>("tools-run");
   const list = $("tools-history");
+  /** While a console call is in flight, so a second answer cannot land out
+   * of order ahead of the first. */
+  const setConsoleBusy = (busy: boolean) => {
+    input.disabled = busy;
+    runBtn.disabled = busy;
+  };
   const render = (line: string, answer: string) => {
     history.push({ line, answer });
     const item = document.createElement("div");
@@ -218,14 +244,19 @@ export function initTools(): void {
     input.value = "";
     $("tools-confirm").hidden = true;
     pendingToken = null;
-    const a = await invoke<ConsoleAnswer>("tools_console_run", { line }).catch(
-      (e): ConsoleAnswer => ({ kind: "refused", sentence: String(e) }),
-    );
-    show(line, a);
+    setConsoleBusy(true);
+    try {
+      const a = await invoke<ConsoleAnswer>("tools_console_run", { line }).catch(
+        (e): ConsoleAnswer => ({ kind: "refused", sentence: String(e) }),
+      );
+      show(line, a);
+    } finally {
+      setConsoleBusy(false);
+    }
   };
-  $("tools-run").addEventListener("click", () => void runLine());
+  runBtn.addEventListener("click", () => void runLine());
   input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") void runLine();
+    if (e.key === "Enter" && !input.disabled) void runLine();
     if (e.key === "ArrowUp") {
       input.value = history.up();
       e.preventDefault();
@@ -241,10 +272,15 @@ export function initTools(): void {
     pendingToken = null;
     $("tools-confirm").hidden = true;
     if (!token) return;
-    const a = await invoke<ConsoleAnswer>("tools_console_confirm", { token }).catch(
-      (e): ConsoleAnswer => ({ kind: "refused", sentence: String(e) }),
-    );
-    show(line, a);
+    setConsoleBusy(true);
+    try {
+      const a = await invoke<ConsoleAnswer>("tools_console_confirm", { token }).catch(
+        (e): ConsoleAnswer => ({ kind: "refused", sentence: String(e) }),
+      );
+      show(line, a);
+    } finally {
+      setConsoleBusy(false);
+    }
   });
   $("tools-confirm-no").addEventListener("click", () => {
     pendingToken = null;
