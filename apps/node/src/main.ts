@@ -1783,9 +1783,15 @@ function reflectChipNotice(status: NodeStatusInfo): void {
   } catch {
     // No storage: show it until OK is pressed in this run.
   }
-  $("chip-card").hidden =
-    chipNoticeClosed ||
-    !chipNoticeVisible(status.chip_refused, status.rc_trusted_mirror, seen, status.node_tag);
+  const card = $("chip-card");
+  const shown =
+    !chipNoticeClosed &&
+    chipNoticeVisible(status.chip_refused, status.rc_trusted_mirror, seen, status.node_tag);
+  // Spoken through the region that is always there, once, as the notice
+  // appears: a poll that rewrote the same text could repeat it.
+  if (shown && card.hidden) $("chip-announce").textContent = $("chip-msg").textContent;
+  if (!shown) $("chip-announce").textContent = "";
+  card.hidden = !shown;
 }
 
 /** The element focus moves to when `leaving` is about to hide with focus in
@@ -1821,6 +1827,7 @@ $("chip-ok").addEventListener("click", () => {
   // focuses a clicked button): hiding it would drop focus to the page.
   const next = card.contains(document.activeElement) ? focusTargetAfter(card, screenStatus) : null;
   card.hidden = true;
+  $("chip-announce").textContent = "";
   next?.focus();
 });
 

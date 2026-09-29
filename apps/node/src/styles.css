@@ -586,6 +586,21 @@ body {
    your node is catching up...", said quietly, never as an alarm. */
 #fork-card.is-calm { border-color: var(--color-border); }
 #fork-card.is-calm p { color: var(--color-muted); }
+/* In the accessibility tree, off the screen: for a live region that must
+   exist before it speaks. Never display:none, which takes it out of the
+   tree. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
 /* The one-time note after the engine turned this Mac's chip down. */
 .chip-card { font-size: 13px; }
 .chip-card p { margin: 0; line-height: 1.45; }

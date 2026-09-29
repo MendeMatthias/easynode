@@ -104,8 +104,22 @@ describe("the setup screen and the chip notice for a screen reader", () => {
     expect(tagOf("start-choice")).toContain('aria-describedby="start-choice-note"');
   });
 
-  it("announces the chip notice politely when it appears", () => {
-    expect(tagOf("chip-card")).toContain('role="status"');
+  it("announces the chip notice through a live region that is always there", () => {
+    // A region that appears together with its text may not be announced
+    // (VoiceOver on WebKit), so the one that speaks is present from the
+    // start, outside both screens, visually hidden but in the tree.
+    const announce = tagOf("chip-announce");
+    expect(announce).toContain('role="status"');
+    expect(announce).toContain('class="visually-hidden"');
+    expect(announce).not.toMatch(/\bhidden\b(?!")/);
+    expect(INDEX.indexOf('id="chip-announce"')).toBeLessThan(INDEX.indexOf('id="screen-wizard"'));
+    const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+    const rule = css.match(/\.visually-hidden\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(rule).toContain("clip");
+    expect(rule).not.toMatch(/display:\s*none|visibility:\s*hidden/);
+    // The card shows and hides; it is not a live region itself, so the
+    // sentence is not said twice.
+    expect(tagOf("chip-card")).not.toContain('role="status"');
   });
 });
 

@@ -76,6 +76,12 @@
         <span id="update-banner-text"><strong>Update available</strong></span>
       </section>
 
+      <!-- What the chip notice below says, spoken once when the notice
+           appears (main.ts reflectChipNotice). Always present and outside
+           both screens: a live region that appears together with its text
+           may not be announced (VoiceOver on WebKit). Visually hidden. -->
+      <p id="chip-announce" class="visually-hidden" role="status"></p>
+
       <!-- ── Wizard (first run) ──────────────────────────────────────── -->
       <section id="screen-wizard" class="screen" hidden>
         <div class="hero">
@@ -234,10 +240,10 @@
 
         <!-- Once per engine, after the engine refused this Mac's graphics
              chip and the app moved the node to following signatures
-             (start-choice.ts chipNoticeVisible). OK remembers it. A polite
-             live region, so a screen reader says it when it appears. -->
-        <div class="card chip-card" id="chip-card" role="status" hidden>
-          <p>This Mac's graphics chip didn't pass the engine's check, so your node follows signatures. Nothing for you to do.</p>
+             (start-choice.ts chipNoticeVisible). OK remembers it. A screen
+             reader hears it through #chip-announce, which is always there. -->
+        <div class="card chip-card" id="chip-card" hidden>
+          <p id="chip-msg">This Mac's graphics chip didn't pass the engine's check, so your node follows signatures. Nothing for you to do.</p>
           <button id="chip-ok" class="btn-secondary" type="button">OK</button>
         </div>
 
