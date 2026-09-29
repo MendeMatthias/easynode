@@ -1105,8 +1105,8 @@ anything is signed, published or flipped live:
    It asks for your password once, the way installing any system package does.
    A .deb copy older than 0.7.0 is told about the new version, and you install
    it by hand one last time with the command on this page. On a machine with no
-   desktop to show the prompt, a .deb copy shows that command every time. The
-   AppImage updates itself without asking."
+   desktop to show the prompt, a .deb copy tries once, then shows the command to
+   install it by hand. The AppImage updates itself without asking."
 
    Pins live in `site/src/pages/node.astro`: `REL_CURRENT` + `relPage` +
    `dl.mac` + `dl.win` move on a **mac/windows** release, `REL_LINUX` +
