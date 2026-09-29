@@ -1788,6 +1788,27 @@ function reflectChipNotice(status: NodeStatusInfo): void {
     !chipNoticeVisible(status.chip_refused, status.rc_trusted_mirror, seen, status.node_tag);
 }
 
+/** The element focus moves to when `leaving` is about to hide with focus in
+ *  it: the next one on the screen that can take focus, or the one before it
+ *  when there is none after. Without this a keyboard user is dropped back to
+ *  the top of the page. */
+function focusTargetAfter(leaving: HTMLElement, screen: HTMLElement): HTMLElement | null {
+  const candidates = Array.from(
+    screen.querySelectorAll<HTMLElement>(
+      'button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter(
+    (el) => !leaving.contains(el) && !el.matches(":disabled") && el.getClientRects().length > 0,
+  );
+  const after = candidates.find(
+    (el) => leaving.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING,
+  );
+  const before = candidates.filter(
+    (el) => leaving.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_PRECEDING,
+  );
+  return after ?? before[before.length - 1] ?? null;
+}
+
 $("chip-ok").addEventListener("click", () => {
   chipNoticeClosed = true;
   try {
@@ -1795,7 +1816,12 @@ $("chip-ok").addEventListener("click", () => {
   } catch {
     // Closed for this run; it may show again on the next.
   }
-  $("chip-card").hidden = true;
+  const card = $("chip-card");
+  // Only when the card held focus (a keyboard press, or a browser that
+  // focuses a clicked button): hiding it would drop focus to the page.
+  const next = card.contains(document.activeElement) ? focusTargetAfter(card, screenStatus) : null;
+  card.hidden = true;
+  next?.focus();
 });
 
 /**

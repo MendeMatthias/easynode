@@ -92,6 +92,23 @@ describe("the line under the choices", () => {
   });
 });
 
+describe("the setup screen and the chip notice for a screen reader", () => {
+  const tagOf = (id: string): string => {
+    const m = INDEX.match(new RegExp(`<[^>]*\\bid="${id}"[^>]*>`));
+    if (!m) throw new Error(`no #${id} in index.html`);
+    return m[0];
+  };
+
+  it("reads the line under the choices as the choice's description", () => {
+    expect(tagOf("start-choice")).toContain('role="radiogroup"');
+    expect(tagOf("start-choice")).toContain('aria-describedby="start-choice-note"');
+  });
+
+  it("announces the chip notice politely when it appears", () => {
+    expect(tagOf("chip-card")).toContain('role="status"');
+  });
+});
+
 describe("setupArgs", () => {
   it("hands begin_setup the choice under the names the Rust side reads", () => {
     expect(setupArgs("quick_start")).toEqual({ choice: "quick_start" });

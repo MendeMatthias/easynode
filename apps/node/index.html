@@ -103,7 +103,7 @@
                decision of 2026-09-29), and greys Full check out where the
                machine cannot check blocks (start-choice.ts); begin_setup
                records the pick before the first start. -->
-          <fieldset class="start-choice" id="start-choice" role="radiogroup" aria-label="How your node starts">
+          <fieldset class="start-choice" id="start-choice" role="radiogroup" aria-label="How your node starts" aria-describedby="start-choice-note">
             <label class="choice" id="choice-quick-label">
               <input type="radio" name="start-choice" value="quick_start" id="choice-quick" />
               <span class="choice-text">
@@ -186,9 +186,11 @@
           <!-- The background check of the snapshot's older history
                (NodeStatusInfo.history_check, history-check.ts). Gone once the
                engine reports it done. No time estimate on purpose. The line
-               is the bar's accessible name; the bar carries the percentage. -->
+               is the bar's accessible name; the bar carries the percentage.
+               The line itself is hidden from screen readers, so it is heard
+               once, as the bar's name. -->
           <div class="history-check" id="history-check" hidden>
-            <div class="history-line" id="history-line"></div>
+            <div class="history-line" id="history-line" aria-hidden="true"></div>
             <div class="progress-track history-track" id="history-bar" role="progressbar"
                  aria-labelledby="history-line" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="progress-fill" id="history-fill"></div></div>
           </div>
@@ -232,8 +234,9 @@
 
         <!-- Once per engine, after the engine refused this Mac's graphics
              chip and the app moved the node to following signatures
-             (start-choice.ts chipNoticeVisible). OK remembers it. -->
-        <div class="card chip-card" id="chip-card" hidden>
+             (start-choice.ts chipNoticeVisible). OK remembers it. A polite
+             live region, so a screen reader says it when it appears. -->
+        <div class="card chip-card" id="chip-card" role="status" hidden>
           <p>This Mac's graphics chip didn't pass the engine's check, so your node follows signatures. Nothing for you to do.</p>
           <button id="chip-ok" class="btn-secondary" type="button">OK</button>
         </div>

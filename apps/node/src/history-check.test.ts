@@ -1,5 +1,14 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { historyCheckView } from "./history-check";
+
+const INDEX = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+/** An element's opening tag in index.html. */
+const tagOf = (id: string): string => {
+  const m = INDEX.match(new RegExp(`<[^>]*\\bid="${id}"[^>]*>`));
+  if (!m) throw new Error(`no #${id} in index.html`);
+  return m[0];
+};
 
 describe("historyCheckView", () => {
   it("reads as the decision wrote it", () => {
@@ -37,5 +46,14 @@ describe("historyCheckView", () => {
     expect(historyCheckView(null)).toBeNull();
     expect(historyCheckView({ checked: 5, base: 0 })).toBeNull();
     expect(historyCheckView({ checked: Number.NaN, base: 225_927 })).toBeNull();
+  });
+});
+
+describe("the history line for a screen reader", () => {
+  it("is heard once, as the bar's name, with the bar's value after it", () => {
+    expect(tagOf("history-bar")).toContain('role="progressbar"');
+    expect(tagOf("history-bar")).toContain('aria-labelledby="history-line"');
+    // Without this the line is read twice: as text, then as the bar's name.
+    expect(tagOf("history-line")).toContain('aria-hidden="true"');
   });
 });
