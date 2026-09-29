@@ -201,6 +201,12 @@ export const catchupLine = (behind: number, samples: CatchupSample[], now: numbe
     : `Your node is live, still catching up — ${n} blocks behind`;
 };
 
+/** Headers beyond blocks at which the stale card calls a node behind: two,
+ *  the role card's `HEADERS_AHEAD_IS_BEHIND` (crates/btx-core/src/role.rs),
+ *  so the two cards agree. One header ahead is a block in flight, its body a
+ *  few seconds behind its header. */
+export const HEADERS_AHEAD_IS_BEHIND = 2;
+
 /** The neutral line for a node that is behind before its trend is measured. */
 export const CHECKING_CATCHUP = "Checking whether your node is catching up...";
 
@@ -240,7 +246,8 @@ export type TrendPhase =
  *    restart says nothing about the one after it, so the samples start over.
  *
  *  `behind` is how many blocks the node knows of beyond its tip (headers
- *  minus blocks), the stale card's "is behind". */
+ *  minus blocks). The stale card calls it behind from
+ *  `HEADERS_AHEAD_IS_BEHIND` on. */
 export type TrendReading =
   | { kind: "live" | "syncing"; behind: number; sample: CatchupSample }
   | { kind: "headers" }
@@ -290,7 +297,8 @@ export const recordReading = (
  *  - behind, trend not measured yet: neutral, "Checking whether your node is
  *    catching up...".
  *  - behind, gap not closing: amber, Rust's sentence and the pace.
- *  - no newer block known: amber, Rust's sentence unchanged.
+ *  - no newer block known, or one header ahead (a block in flight, as the
+ *    role card reads it): amber, Rust's sentence unchanged.
  *
  *  A syncing node is judged by the blocks it adds, not by the gap (its headers
  *  can outrun them): no stale sentence at the chain's 40 an hour or more,
@@ -306,7 +314,9 @@ export const staleCard = (
   if (!tipStaleMessage) return null;
   const checking: StaleCard = { message: CHECKING_CATCHUP, tone: "neutral" };
   if (reading.kind === "headers") return checking;
-  if (reading.kind === "stopped" || !(reading.behind > 0)) return { message: tipStaleMessage, tone: "amber" };
+  if (reading.kind === "stopped" || !(reading.behind >= HEADERS_AHEAD_IS_BEHIND)) {
+    return { message: tipStaleMessage, tone: "amber" };
+  }
   const withPace = (pace: CatchupPace | null): StaleCard => {
     const said = paceSentence(pace);
     return { message: said ? `${tipStaleMessage} ${said}` : tipStaleMessage, tone: "amber" };

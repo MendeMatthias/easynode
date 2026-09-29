@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CHAIN_BLOCKS_PER_HOUR,
+  HEADERS_AHEAD_IS_BEHIND,
   HISTORY_WINDOW_MS,
   MAX_SAMPLES,
   PACE_MIN_SPAN_MS,
@@ -474,6 +475,22 @@ describe("staleCard", () => {
     // tip is the real "not following the chain".
     expect(staleCard(STALE, live(0), closingNode(), T0 + min(20))).toEqual({ message: STALE, tone: "amber" });
     expect(staleCard(STALE, STOPPED, [], T0)).toEqual({ message: STALE, tone: "amber" });
+  });
+
+  it("calls one header ahead a block in flight, as the role card does", () => {
+    // role.rs HEADERS_AHEAD_IS_BEHIND: a body follows its header by seconds,
+    // so one header ahead is at the tip, and with the newest block two hours
+    // old that is today's sentence, on a live node and a syncing one alike.
+    expect(HEADERS_AHEAD_IS_BEHIND).toBe(2);
+    expect(staleCard(STALE, live(1), [], T0)).toEqual({ message: STALE, tone: "amber" });
+    expect(staleCard(STALE, live(1), closingNode(), T0 + min(20))).toEqual({ message: STALE, tone: "amber" });
+    expect(staleCard(STALE, syncingAt(130_000, 130_001), [], T0)).toEqual({ message: STALE, tone: "amber" });
+    // Two ahead is behind, on both cards.
+    expect(staleCard(STALE, live(2), [], T0)).toEqual({ message: CHECKING_CATCHUP, tone: "neutral" });
+    expect(staleCard(STALE, syncingAt(130_000, 130_002), [], T0)).toEqual({
+      message: CHECKING_CATCHUP,
+      tone: "neutral",
+    });
   });
 
   it("turns amber when a closing gap stops closing", () => {
