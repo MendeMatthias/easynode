@@ -131,12 +131,14 @@ pub fn spawn(app: AppHandle) {
 /// the JavaScript `check()` with no options asks the plugin for (its `check`
 /// command calls `updater_builder()` and sets only what it was passed), so
 /// the endpoints, the public key and the target come from `tauri.conf.json`
-/// on both paths. On `found` the record is written BEFORE the download, so a
-/// check that found something and died mid-download still left the finding
-/// behind. On `installed` the restart is requested the way the front end's
-/// `relaunch()` requests it (the process plugin's `restart` command is
-/// `app.request_restart()`), which `lib.rs` recognises by `RESTART_EXIT_CODE`
-/// and lets through without stopping btxd.
+/// on both paths. The download and the install run apart, on both paths, so
+/// a verified download that then fails to install can be remembered
+/// (`update_binding::remember_failed_install`). On `found` the record is
+/// written BEFORE the download, so a check that found something and died
+/// mid-download still left the finding behind. On `installed` the restart is
+/// requested the way the front end's `relaunch()` requests it (the process
+/// plugin's `restart` command is `app.request_restart()`), which `lib.rs`
+/// recognises by `RESTART_EXIT_CODE` and lets through without stopping btxd.
 async fn check_once(app: &AppHandle) {
     let datadir = node_datadir();
     let current = app.package_info().version.to_string();
@@ -179,7 +181,24 @@ async fn check_once(app: &AppHandle) {
     let detail = format!("automatic: v{version} offered, downloading");
     settle(app, &datadir, "found", &version, &detail);
 
-    if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
+    // Downloaded and verified first, then installed, so a failure knows which
+    // half it was. A download that broke off is retried at the next check, as
+    // before. A verified download that would not install is remembered, and
+    // the next automatic check leaves that version alone (update_binding), so
+    // a .deb copy that cannot show the password prompt does not fetch the same
+    // package every six hours.
+    let bytes = match update.download(|_, _| {}, || {}).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let detail = format!("automatic: v{version}: {}", error_text(&e));
+            settle(app, &datadir, "install-failed", &version, &detail);
+            return;
+        }
+    };
+    if let Err(e) = update.install(bytes) {
+        if let Err(why) = update_binding::remember_failed_install(&datadir, &version) {
+            eprintln!("[update-timer] could not remember v{version} as failed: {why}");
+        }
         let detail = format!("automatic: v{version}: {}", error_text(&e));
         settle(app, &datadir, "install-failed", &version, &detail);
         return;
@@ -319,6 +338,28 @@ mod tests {
         let mut want = update_log::UPDATE_CHECK_OUTCOMES.to_vec();
         want.sort_unstable();
         assert_eq!(used, want);
+    }
+
+    /// A verified download that would not install is remembered, so the next
+    /// automatic check leaves that version alone (`update_binding`); a
+    /// download that broke off is not, and is retried at the next check as
+    /// before. Telling the two apart needs the download and the install apart.
+    #[test]
+    fn only_an_install_that_failed_after_a_verified_download_is_remembered() {
+        let src = include_str!("update_timer.rs");
+        let start = src.find("async fn check_once(").unwrap();
+        let body = &src[start..src.find("\nfn settle(").unwrap()];
+        assert!(
+            !body.contains("download_and_install("),
+            "the two halves are apart"
+        );
+        let download = body.find("update.download(").expect("the download");
+        let install = body.find("update.install(").expect("the install");
+        let remember = body
+            .find("update_binding::remember_failed_install(")
+            .expect("the failure is remembered");
+        assert!(download < install && install < remember);
+        assert_eq!(body.matches("remember_failed_install(").count(), 1);
     }
 
     #[test]
