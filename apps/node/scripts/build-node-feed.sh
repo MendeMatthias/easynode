@@ -41,8 +41,8 @@
 #   # Linux-only release (mac + windows stay where they are). A Linux release
 #   # passes the .deb too: it is signed like the rest and goes into its OWN feed,
 #   # node-deb.json, beside latest-node.json, which only .deb installs read.
-#   build-node-feed.sh --version 0.6.33 \
-#     --linux dist/BTX-Node_0.6.33_amd64.AppImage --deb dist/BTX-Node_0.6.33_amd64.deb
+#   build-node-feed.sh --version 0.7.0 \
+#     --linux dist/BTX-Node_0.7.0_amd64.AppImage --deb dist/BTX-Node_0.7.0_amd64.deb
 #
 #   # Full train:
 #   build-node-feed.sh --version 0.5.1 --mac a.app.tar.gz --linux b.AppImage --win c.exe
@@ -57,6 +57,10 @@
 #   1. npx tauri signer sign -f "$KEY" -p "" <artifact>      (Windows)
 #   2. minisign -V -P <pubkey> -x <decoded .sig> -m <artifact>   (WSL)
 #   3. gen-node-feed.py --version … --linux-sig <artifact>.sig
+# On a Linux release, steps 1 and 2 run for the .deb too, and step 3 also
+# passes --deb-sig BTX-Node_<ver>_amd64.deb.sig, which writes node-deb.json
+# beside --out. The .deb must be signed under that name, so sign it after
+# any rename.
 # Step 3 independently re-checks that the signature carries the key id baked
 # into tauri.conf.json, so a wrong key still cannot reach the feed.
 set -euo pipefail

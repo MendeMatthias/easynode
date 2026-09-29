@@ -48,7 +48,7 @@ Usage:
 
   # A Linux release also passes the .deb's signature. It goes into its own
   # feed, node-deb.json, written beside --out, and never into latest-node.json:
-  gen-node-feed.py --version 0.6.33 --tag node-v0.6.33 \
+  gen-node-feed.py --version 0.7.0 --tag node-v0.7.0 \
      --linux-sig <file> --deb-sig <file> ... --out latest-node.json
 
   gen-node-feed.py --self-test
