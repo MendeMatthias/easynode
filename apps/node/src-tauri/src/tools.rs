@@ -50,6 +50,81 @@ fn home_dir_display() -> Option<String> {
         .map(|p| std::path::PathBuf::from(p).display().to_string())
 }
 
+/// Plain words for how this binary got onto the machine, from tauri's own
+/// `BundleType` (`None` when tauri could not tell: a dev build, or a target
+/// tauri does not recognise). One arm per variant, so a bundle format the
+/// mapping has not been taught yet fails a test here, not a report someone
+/// pastes into support chat with a bare `Some(Whatever)` in it.
+fn install_words(bundle: Option<tauri::utils::config::BundleType>) -> &'static str {
+    use tauri::utils::config::BundleType::*;
+    match bundle {
+        None => "the install type is unknown",
+        Some(App) => "installed as a Mac app",
+        Some(Dmg) => "installed as a .dmg",
+        Some(Deb) => "installed as a .deb",
+        Some(AppImage) => "installed as an AppImage",
+        Some(Rpm) => "installed as an .rpm",
+        Some(Msi) => "installed as a Windows installer (msi)",
+        Some(Nsis) => "installed as a Windows installer (nsis)",
+    }
+}
+
+/// Thousands-grouped digits, matching how `btx_core::diagnostics::render`
+/// writes its own numbers, so the phase line reads like the rest of the
+/// report it sits in.
+fn group(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The phase line of a diagnostics report: what the app's own state machine
+/// is doing right now, in plain words instead of `NodePhase`'s Debug form
+/// (`Syncing { height: 0, headers: 0, progress: 1.0, peers: 0 }`). One arm
+/// per variant, so a new phase fails a test here rather than only ever
+/// showing up as a Debug dump in a report someone pastes into support chat.
+fn phase_words(phase: &NodePhase) -> String {
+    match phase {
+        NodePhase::Welcome => "not set up yet".into(),
+        NodePhase::Downloading { progress } => {
+            format!("downloading the snapshot, {:.0}%", progress * 100.0)
+        }
+        NodePhase::Preparing => "preparing the node".into(),
+        NodePhase::Starting => "starting".into(),
+        NodePhase::Warming { message } => format!("warming up: {message}"),
+        NodePhase::LoadingSnapshot => "loading the snapshot".into(),
+        NodePhase::Syncing {
+            height,
+            headers,
+            peers,
+            ..
+        } => format!(
+            "syncing, height {} of {} headers, {} peers",
+            group(*height),
+            group(*headers),
+            peers
+        ),
+        NodePhase::Ready {
+            height,
+            peers,
+            blocks_behind,
+        } => format!(
+            "ready at {}, {} peers, {} behind",
+            group(*height),
+            peers,
+            group(*blocks_behind)
+        ),
+        NodePhase::Stopped => "stopped".into(),
+        NodePhase::Error { message } => format!("error: {message}"),
+    }
+}
+
 static CONFIRM: std::sync::Mutex<ConfirmBook> = std::sync::Mutex::new(ConfirmBook::new());
 
 #[derive(Debug, Clone, Serialize)]
@@ -404,14 +479,14 @@ pub async fn tools_diagnostics(
             &crate::commands::NODE_RELEASE_COMMIT[..8]
         ),
         platform: format!(
-            "{} {}, installed as {:?}",
+            "{} {}, {}",
             std::env::consts::OS,
             std::env::consts::ARCH,
-            tauri::utils::platform::bundle_type()
+            install_words(tauri::utils::platform::bundle_type())
         ),
         status_line,
         window_lines,
-        phase: format!("{:?}", *state.phase.lock().await),
+        phase: phase_words(&*state.phase.lock().await),
         signer_pubkey: state.signer_pubkey.lock().await.clone(),
         stall: state
             .stall_verdict
@@ -582,6 +657,130 @@ mod tests {
         }
     }
 
+    /// One arm per `BundleType` variant in the locked tauri-utils
+    /// (~/.cargo/registry/src/*/tauri-utils-2.9.3/src/config.rs), plus
+    /// `None`, so a future bundle format the mapping has not been taught
+    /// yet fails here instead of showing up as `Some(Whatever)` in a report.
+    mod install_words {
+        use super::super::*;
+        use tauri::utils::config::BundleType;
+
+        #[test]
+        fn no_bundle_type_says_the_install_type_is_unknown() {
+            assert_eq!(install_words(None), "the install type is unknown");
+        }
+
+        #[test]
+        fn every_bundle_type_gets_plain_words() {
+            assert_eq!(
+                install_words(Some(BundleType::App)),
+                "installed as a Mac app"
+            );
+            assert_eq!(install_words(Some(BundleType::Dmg)), "installed as a .dmg");
+            assert_eq!(install_words(Some(BundleType::Deb)), "installed as a .deb");
+            assert_eq!(
+                install_words(Some(BundleType::AppImage)),
+                "installed as an AppImage"
+            );
+            assert_eq!(install_words(Some(BundleType::Rpm)), "installed as an .rpm");
+            assert_eq!(
+                install_words(Some(BundleType::Msi)),
+                "installed as a Windows installer (msi)"
+            );
+            assert_eq!(
+                install_words(Some(BundleType::Nsis)),
+                "installed as a Windows installer (nsis)"
+            );
+        }
+    }
+
+    /// One arm per `NodePhase` variant, checked against the exact wording
+    /// `tools_diagnostics` puts on the report's "Phase:" line.
+    mod phase_words {
+        use super::super::*;
+
+        #[test]
+        fn welcome_is_not_set_up_yet() {
+            assert_eq!(phase_words(&NodePhase::Welcome), "not set up yet");
+        }
+
+        #[test]
+        fn downloading_shows_its_percent() {
+            assert_eq!(
+                phase_words(&NodePhase::Downloading { progress: 0.5 }),
+                "downloading the snapshot, 50%"
+            );
+        }
+
+        #[test]
+        fn preparing_is_preparing_the_node() {
+            assert_eq!(phase_words(&NodePhase::Preparing), "preparing the node");
+        }
+
+        #[test]
+        fn starting_is_starting() {
+            assert_eq!(phase_words(&NodePhase::Starting), "starting");
+        }
+
+        #[test]
+        fn warming_carries_the_engine_s_own_message() {
+            assert_eq!(
+                phase_words(&NodePhase::Warming {
+                    message: "Verifying blocks...".into(),
+                }),
+                "warming up: Verifying blocks..."
+            );
+        }
+
+        #[test]
+        fn loading_snapshot_is_loading_the_snapshot() {
+            assert_eq!(
+                phase_words(&NodePhase::LoadingSnapshot),
+                "loading the snapshot"
+            );
+        }
+
+        #[test]
+        fn syncing_names_height_headers_and_peers() {
+            assert_eq!(
+                phase_words(&NodePhase::Syncing {
+                    height: 0,
+                    headers: 0,
+                    progress: 1.0,
+                    peers: 0,
+                }),
+                "syncing, height 0 of 0 headers, 0 peers"
+            );
+        }
+
+        #[test]
+        fn ready_groups_the_height_and_names_peers_and_blocks_behind() {
+            assert_eq!(
+                phase_words(&NodePhase::Ready {
+                    height: 233_480,
+                    peers: 8,
+                    blocks_behind: 0,
+                }),
+                "ready at 233,480, 8 peers, 0 behind"
+            );
+        }
+
+        #[test]
+        fn stopped_is_stopped() {
+            assert_eq!(phase_words(&NodePhase::Stopped), "stopped");
+        }
+
+        #[test]
+        fn error_carries_its_own_message() {
+            assert_eq!(
+                phase_words(&NodePhase::Error {
+                    message: "btxd exited".into(),
+                }),
+                "error: btxd exited"
+            );
+        }
+    }
+
     mod a_node_that_is_still_starting {
         use super::super::*;
         use btx_core::engine_warnings::Notice;
@@ -662,7 +861,7 @@ mod tests {
         #[test]
         fn the_diagnostics_report_says_it_is_starting_not_stopped() {
             let mut input = DiagnosticsInput {
-                phase: format!("{:?}", warming()),
+                phase: phase_words(&warming()),
                 log_warnings: vec!["2026-09-29T10:00:00Z [warning] still verifying".into()],
                 ..Default::default()
             };
@@ -674,7 +873,10 @@ mod tests {
                 "{report}"
             );
             assert!(report.contains("(running: still starting)"), "{report}");
-            assert!(report.contains("Phase: Warming"), "{report}");
+            assert!(
+                report.contains("Phase: warming up: Verifying blocks..."),
+                "{report}"
+            );
             assert!(report.contains("still verifying"), "{report}");
 
             let mut stopped = DiagnosticsInput::default();
