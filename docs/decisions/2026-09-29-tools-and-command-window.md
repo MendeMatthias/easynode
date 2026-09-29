@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | proposed 2026-09-29 for 0.7.0. The owner approved the design on 2026-09-29 ("keep it simple: one Tools entry point instead of new screens everywhere"). This document waits for the owner's review before any code |
+| Status | approved by the owner on 2026-09-29 for 0.7.0, with the four choices at the end as proposed ("ok please continue"). The design itself was approved the same day ("keep it simple: one Tools entry point instead of new screens everywhere"). Amended the same day to match the confirmed-snapshot decision: Fast-forward is for every node the app owns, and the automatic catch-up help lives there |
 | Date | 2026-09-29 |
 | Supersedes | "open a terminal and grep debug.log" as the support path; the watchdog's note that the fix for a gated block fetch is `getblockfrompeer`, "which nothing in this app does yet" |
 | Leaves alone | the status screen as home; Settings; Ask your node; the Wallet panel; the fixed 560x780 window; every RPC the app already makes on its own; the four warnings the status screen hides on purpose (they stay hidden there) |
@@ -59,8 +59,8 @@ home. Inside, top to bottom:
 1. **Now**: one line, the status line exactly as the home screen shows it,
    with the height, the headers and the peer count.
 2. **Quick actions**: four buttons (section 2).
-3. **Fast-forward**, shown only on a node that follows signatures and has
-   fallen far behind (section 3).
+3. **Fast-forward**, shown only on a node that has fallen far behind a
+   confirmed snapshot (section 3).
 4. **Copy diagnostics** (section 4).
 5. **Command window**, folded under "Command window (advanced)" (section 5).
 
@@ -83,7 +83,9 @@ The overlay scrolls, as every overlay does in this window.
   16 blocks") and, 20 seconds later, whether the tip moved. It never adds,
   bans or disconnects a peer. A bigger gap gets its first 16 blocks only: this
   is for a stuck tip, not for catching up. With nothing missing, or no peer
-  that has the block, it says so in a sentence.
+  that has the block, it says so in a sentence. Catching up from far behind
+  gets automatic help of the same kind, decided in the confirmed-snapshot
+  decision; this button is for the case that help does not cover.
 - **Open data folder.** The existing `open_data_folder`, moved here as well as
   staying in Settings.
 - **Engine notices.** Opens a list of every warning the engine reports right
@@ -97,9 +99,11 @@ The overlay scrolls, as every overlay does in this window.
 The loading itself belongs to the co-signed snapshots decision. This document
 fixes only the button:
 
-- Shown only when all of these hold: the node follows signatures; the app owns
-  the node; a confirmed snapshot is available (checked as that decision
-  requires); and it is more than 1,000 blocks ahead of the node's tip.
+- Shown only when all of these hold: the app owns the node; a confirmed
+  snapshot is available (checked as that decision requires); and it is more
+  than 1,000 blocks ahead of the node's tip. This holds for a node that checks
+  blocks as much as for one that follows signatures: the confirmed-snapshot
+  decision loads the snapshot for both.
 - The button reads "Fast-forward to block 232,000". The first click shows
   what will happen, in these words or close to them: "Your node stops, sets
   its chain data aside, loads the confirmed snapshot at block 232,000 and
@@ -235,9 +239,9 @@ default: a command is refused unless it is in the first four rows.
 - It does not upload diagnostics. Copy only; the person chooses where to paste.
 - It does not become a log viewer. Twenty lines, for the question at hand.
 - It does not add a top-level screen or change the window size.
-- It does not change what the app does on its own. The watchdog still does
-  not call `getblockfrompeer` by itself; that could follow once the manual
-  button has shown it works.
+- It does not decide what the app does on its own. The automatic catch-up
+  help, which also uses `getblockfrompeer`, is decided in the
+  confirmed-snapshot decision.
 
 ## Rollback
 
