@@ -44,12 +44,13 @@ returns 200.
 The app updates itself from there afterwards, and will only ever install a build
 signed by the release key.
 
-> **On Linux, pick the `.AppImage` if you want automatic updates.** The updater
-> can replace an AppImage in place; it cannot replace a `.deb`, because the
-> installed files live under `/usr` and belong to root. A `.deb` install is a
-> perfectly good node — it just tells you when a new version exists and leaves
-> the install to you and `dpkg`. That is a real difference between the two
-> downloads, so it is said here rather than discovered later.
+> **On Linux, both downloads can update themselves, in different ways.** The
+> `.AppImage` replaces itself in place without asking. A `.deb` install, from
+> 0.7.0 on, installs the new `.deb` after asking for your password once,
+> because its files live under `/usr` and belong to root. On a machine with no
+> desktop to show that prompt, a `.deb` copy shows the command instead and
+> leaves the install to you and `apt`. A `.deb` copy older than 0.7.0 moves to
+> 0.7.0 by hand once.
 
 > ⚠ **Do not use the "Latest" button on the releases repo.**
 > [EasyBTX-releases](https://github.com/MendeMatthias/EasyBTX-releases) hosts
