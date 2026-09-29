@@ -606,9 +606,11 @@ describe("staleCard on a syncing node", () => {
   });
 
   it("leaves a live node's judgement as it was", () => {
-    // Readings taken while syncing sit at both ends of a live node's history
-    // (a run of lost getchainstates reads as syncing, with the background
-    // chainstate's height). They are not part of its gap.
+    // Readings taken while syncing sit at both ends of a live node's history.
+    // A run of lost getchainstates can read as syncing: the refresher then
+    // falls back to getblockchaininfo's `blocks`, the active chain's height.
+    // Whatever their numbers (far off here on purpose, so a leak would show),
+    // they are not part of its gap.
     const syncing = (at: number): CatchupSample => ({ at, behind: 98_612, height: 131_200, syncing: true });
     const mixed = [syncing(T0 - min(5)), ...slowNode(), syncing(T0 + min(31))];
     const now = T0 + min(31);
