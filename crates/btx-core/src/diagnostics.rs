@@ -1,6 +1,6 @@
 //! Copy diagnostics: one plain-text report a person can paste into a support
 //! chat, and the redaction that keeps anything private out of it. Pure: the
-//! Tauri side gathers the inputs and calls `redact(&render(..), ..)`.
+//! Tauri side gathers the inputs and calls `report(..)`.
 
 use crate::fork::ChainTip;
 use crate::node_api::{AttestedTip, BlockchainInfo, ChainStates, PeerInfo};
@@ -9,7 +9,12 @@ pub const LOG_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 pub const LOG_WARNING_LINES: usize = 20;
 pub const LOG_LINE_CHARS: usize = 240;
 
-/// The last warning or error lines of a log tail, oldest first.
+/// The last warning or error lines of a log tail, oldest first, whole.
+///
+/// Not cut here: a cut that lands inside an address or a key leaves a piece
+/// the redaction can no longer recognise (`84.32.49.226:193…`, the first 30
+/// characters of a WIF). [`report`] cuts each line to [`LOG_LINE_CHARS`]
+/// only after it has been redacted.
 pub fn warning_lines(log_tail: &str) -> Vec<String> {
     let mut lines: Vec<String> = log_tail
         .lines()
@@ -21,7 +26,7 @@ pub fn warning_lines(log_tail: &str) -> Vec<String> {
                 || low.contains("error:")
                 || l.contains("Cadence burst hold")
         })
-        .map(|l| cut(l.trim_end(), LOG_LINE_CHARS))
+        .map(|l| l.trim_end().to_string())
         .collect();
     let skip = lines.len().saturating_sub(LOG_WARNING_LINES);
     lines.drain(..skip);
@@ -231,6 +236,20 @@ pub struct RedactionContext {
     pub published_hosts: Vec<String>,
 }
 
+/// The report exactly as it may leave the app, in the only safe order: each
+/// debug.log line is redacted whole and cut to [`LOG_LINE_CHARS`] after, so
+/// a cut can never split an address or a key into a piece that no longer
+/// looks like one. Then the whole report is redacted once more.
+pub fn report(input: &DiagnosticsInput, ctx: &RedactionContext) -> String {
+    let mut shown = input.clone();
+    shown.log_warnings = input
+        .log_warnings
+        .iter()
+        .map(|l| cut(&redact(l, ctx), LOG_LINE_CHARS))
+        .collect();
+    redact(&render(&shown), ctx)
+}
+
 pub fn redact(text: &str, ctx: &RedactionContext) -> String {
     let mut out = text.to_string();
     // 4 is the floor, not 1: an empty or 1-3 character "secret" would match
@@ -283,10 +302,11 @@ fn redact_line(line: &str, ctx: &RedactionContext) -> String {
 
 fn redact_token(tok: &str, ctx: &RedactionContext) -> String {
     // Trailing sentence/URL punctuation, not part of the address itself:
-    // "84.32.49.226:19335." (end of a sentence) and "...:19335:" (a stray
-    // colon) must both still be recognised. `[` and `]` are never trimmed:
-    // they belong to a bracketed IPv6 host like `[2001:db8::7]:19335`.
-    let core = tok.trim_end_matches(['.', ':']);
+    // "84.32.49.226:19335." (end of a sentence), "...:19335:" (a stray
+    // colon) and "...:19335…" (a cut line) must all still be recognised.
+    // `[` and `]` are never trimmed: they belong to a bracketed IPv6 host
+    // like `[2001:db8::7]:19335`.
+    let core = tok.trim_end_matches(['.', ':', '…']);
     let tail = &tok[core.len()..];
     if core.is_empty() {
         return tok.to_string();
@@ -394,8 +414,10 @@ mod tests {
         }
     }
 
+    /// The last twenty, whole: the cut to 240 characters happens in
+    /// `report`, after redaction, never here.
     #[test]
-    fn warning_lines_keep_the_last_twenty_warnings_cut_to_length() {
+    fn warning_lines_keep_the_last_twenty_warnings_and_report_cuts_them() {
         let mut log = String::new();
         for i in 0..30 {
             log.push_str(&format!("2026-09-29T10:00:{i:02}Z [warning] thing {i}\n"));
@@ -403,14 +425,25 @@ mod tests {
         }
         log.push_str(&format!(
             "2026-09-29T10:01:00Z [error] {}\n",
-            "x".repeat(400)
+            "a long line ".repeat(40)
         ));
         let lines = warning_lines(&log);
         assert_eq!(lines.len(), 20);
         assert!(lines[0].contains("thing 11"));
-        assert!(lines[19].chars().count() <= 241);
+        assert!(lines[19].chars().count() > 400, "cut too early");
         assert!(lines.iter().all(|l| !l.contains("ordinary")));
         assert!(warning_lines("Cadence burst hold at 82000\n")[0].contains("Cadence"));
+        let input = DiagnosticsInput {
+            log_warnings: lines,
+            ..Default::default()
+        };
+        let out = report(&input, &ctx("unusedsecret"));
+        let long = out
+            .lines()
+            .find(|l| l.contains("[error]"))
+            .expect("the long line is in the report");
+        assert_eq!(long.trim_start().chars().count(), LOG_LINE_CHARS + 1);
+        assert!(long.ends_with('…'));
     }
 
     #[test]
@@ -587,12 +620,12 @@ mod tests {
         );
     }
 
-    /// The real pipeline: `redact(&render(&input), &ctx)`. An unpublished
+    /// The real pipeline: `report(&input, &ctx)`. An unpublished
     /// peer, a WIF and a URL carrying an unpublished IP inside a log line,
     /// and an engine warning string must all disappear, while the published
     /// peer, its `peer N` label and the report's section headings survive.
     #[test]
-    fn redact_of_render_hides_every_private_value_end_to_end() {
+    fn report_hides_every_private_value_end_to_end() {
         let wif = crate::signer::generate_wif();
         let input = DiagnosticsInput {
             generated_at: "2026-09-29 14:05 UTC".into(),
@@ -648,7 +681,7 @@ mod tests {
             secrets: vec![wif.clone()],
             published_hosts: crate::node::published_peer_hosts(),
         };
-        let out = redact(&render(&input), &context);
+        let out = report(&input, &context);
         for gone in [wif.as_str(), "84.32.49.226"] {
             assert!(!out.contains(gone), "{gone} survived end to end:\n{out}");
         }
@@ -663,6 +696,77 @@ mod tests {
         ] {
             assert!(out.contains(kept), "{kept} missing end to end:\n{out}");
         }
+    }
+
+    /// A debug.log line is redacted first and cut to LOG_LINE_CHARS after,
+    /// so the cut can never leave a piece of an address or a key that the
+    /// redaction no longer recognises. An unpublished peer address and a
+    /// WIF (once as the app's own known secret, once as a stranger's key
+    /// only its shape gives away) are placed across character 240 at every
+    /// offset that touches the cut, and go through the real pipeline:
+    /// `warning_lines`, then `report`.
+    #[test]
+    fn a_log_line_cut_at_240_characters_keeps_no_piece_of_an_address_or_a_key() {
+        let wif = crate::signer::generate_wif();
+        let prefix = "2026-09-29T10:00:00Z [warning] ";
+        let rest = "and the rest of the line, long enough that it is always cut";
+        let mut leaks = Vec::new();
+        let mut uncut = Vec::new();
+        for known_secret in [true, false] {
+            let context = RedactionContext {
+                home: None,
+                secrets: if known_secret {
+                    vec![wif.clone()]
+                } else {
+                    vec![]
+                },
+                published_hosts: crate::node::published_peer_hosts(),
+            };
+            for (name, private, fragment) in [
+                ("peer address", "84.32.49.226:19335", "84.32"),
+                ("WIF", wif.as_str(), &wif[..8]),
+            ] {
+                for start in (LOG_LINE_CHARS - private.len())..=LOG_LINE_CHARS {
+                    // Words, not one long run: a run of 50+ letters is itself
+                    // key-shaped and would be removed, and the cut with it.
+                    let filler: String = "log words "
+                        .chars()
+                        .cycle()
+                        .take(start - prefix.len() - 1)
+                        .collect();
+                    let log = format!("{prefix}{filler} {private} {rest}\n");
+                    let input = DiagnosticsInput {
+                        log_warnings: warning_lines(&log),
+                        ..Default::default()
+                    };
+                    let out = report(&input, &context);
+                    let case = format!("{name} at {start} (known secret: {known_secret})");
+                    if out.contains(fragment) {
+                        leaks.push(case.clone());
+                    }
+                    let shown = out
+                        .lines()
+                        .find(|l| l.contains("[warning]"))
+                        .expect("the log line is in the report");
+                    if shown.trim_start().chars().count() != LOG_LINE_CHARS + 1
+                        || !shown.ends_with('…')
+                    {
+                        uncut.push(case);
+                    }
+                }
+            }
+        }
+        assert!(leaks.is_empty(), "a piece survived the cut: {leaks:#?}");
+        assert!(uncut.is_empty(), "not cut at {LOG_LINE_CHARS}: {uncut:#?}");
+    }
+
+    /// Belt and braces for the cut: the `…` it appends is trailing
+    /// punctuation, never part of the address it follows.
+    #[test]
+    fn a_trailing_ellipsis_does_not_hide_an_address() {
+        let out = redact("peer 84.32.49.226:19335…", &ctx("unusedsecret"));
+        assert!(!out.contains("84.32.49.226"), "IP survived:\n{out}");
+        assert_eq!(out, "peer [peer address]…");
     }
 
     #[test]

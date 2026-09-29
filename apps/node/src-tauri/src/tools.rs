@@ -342,7 +342,7 @@ pub async fn tools_diagnostics(
         secrets: secrets(&datadir),
         published_hosts: published_hosts(),
     };
-    Ok(diagnostics::redact(&diagnostics::render(&input), &ctx))
+    Ok(diagnostics::report(&input, &ctx))
 }
 
 /// The cookie password and the signing key's own text, read only to be removed.
