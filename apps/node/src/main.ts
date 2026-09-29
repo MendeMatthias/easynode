@@ -538,6 +538,9 @@ function reflectStartChoice(status: NodeStatusInfo, inProgress: boolean): void {
   $("choice-quick-label").classList.toggle("is-selected", quick.checked);
   $("choice-full-label").classList.toggle("is-selected", full.checked);
   $("choice-full-label").classList.toggle("is-disabled", view.fullCheckDisabled);
+  // Locked, not dimmed: the pick stays readable while setup runs.
+  $("choice-quick-label").classList.toggle("is-locked", inProgress);
+  $("choice-full-label").classList.toggle("is-locked", inProgress);
   const reason = $("choice-full-reason");
   reason.hidden = !view.fullCheckDisabled;
   reason.textContent = view.fullCheckDisabled ? NO_GPU_REASON : "";

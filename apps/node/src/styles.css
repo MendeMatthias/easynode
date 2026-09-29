@@ -233,7 +233,13 @@ body {
   cursor: pointer;
 }
 .choice.is-selected { border-color: var(--color-accent); }
-.choice.is-disabled { cursor: default; opacity: 0.55; }
+/* Dim the control, not the explanation: the reason under a greyed-out Full
+   check keeps the normal muted colour so it stays readable. */
+.choice.is-disabled,
+.choice.is-locked { cursor: default; }
+.choice.is-disabled input,
+.choice.is-disabled .choice-name,
+.choice.is-disabled .choice-desc { opacity: 0.55; }
 .choice input { margin-top: 4px; accent-color: var(--color-accent); }
 .choice-text { display: flex; flex-direction: column; gap: 2px; }
 .choice-name { font-size: 14px; font-weight: 700; }
