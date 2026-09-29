@@ -238,6 +238,33 @@ pub fn remember_running_version(datadir: &Path, running: &Version) {
     }
 }
 
+/// The version whose verified download failed to install here, if any.
+pub fn failed_install(datadir: &Path) -> Option<Version> {
+    NodeAppSettings::load(datadir)
+        .update_install_failed
+        .and_then(|v| Version::parse(&v).ok())
+}
+
+/// Remember that `version` was downloaded and verified here and then failed to
+/// install, so the automatic checks leave it alone. Anything that is not a
+/// version is refused unwritten: the front end passes it in.
+pub fn remember_failed_install(datadir: &Path, version: &str) -> Result<(), String> {
+    let v = Version::parse(version).map_err(|e| format!("not a version: {version:?} ({e})"))?;
+    NodeAppSettings::update(datadir, |s| s.update_install_failed = Some(v.to_string()));
+    Ok(())
+}
+
+/// Forget it, before "Check now", so a press always tries. Writes the settings
+/// file only when there is something to forget.
+pub fn forget_failed_install(datadir: &Path) {
+    if NodeAppSettings::load(datadir)
+        .update_install_failed
+        .is_some()
+    {
+        NodeAppSettings::update(datadir, |s| s.update_install_failed = None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,6 +515,53 @@ mod tests {
         let reason = take_refusal().expect("the refusal is kept");
         assert!(reason.starts_with("refused v0.9.0: "), "{reason}");
         assert_eq!(take_refusal(), None, "taken once");
+    }
+
+    #[test]
+    fn a_failed_install_round_trips_through_the_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(failed_install(dir.path()), None);
+        remember_failed_install(dir.path(), "0.6.34").unwrap();
+        assert_eq!(failed_install(dir.path()), Some(ver("0.6.34")));
+        // The latest failure replaces an earlier one.
+        remember_failed_install(dir.path(), "0.6.35").unwrap();
+        assert_eq!(failed_install(dir.path()), Some(ver("0.6.35")));
+        forget_failed_install(dir.path());
+        assert_eq!(failed_install(dir.path()), None);
+    }
+
+    /// The front end passes the version in, so anything else is refused
+    /// before the settings file is touched.
+    #[test]
+    fn only_a_version_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(remember_failed_install(dir.path(), "not a version").is_err());
+        assert!(remember_failed_install(dir.path(), "").is_err());
+        assert_eq!(failed_install(dir.path()), None);
+        assert!(!dir.path().join(crate::state::SETTINGS_FILE_NAME).exists());
+    }
+
+    /// "Check now" clears it before every press; with nothing to clear, the
+    /// settings file is not rewritten.
+    #[test]
+    fn forgetting_nothing_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        forget_failed_install(dir.path());
+        assert!(!dir.path().join(crate::state::SETTINGS_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn remembering_a_failure_leaves_the_other_settings_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        NodeAppSettings::update(dir.path(), |s| {
+            s.node_nickname = "alice".into();
+            s.update_high_water = Some("0.6.33".into());
+        });
+        remember_failed_install(dir.path(), "0.6.34").unwrap();
+        let s = NodeAppSettings::load(dir.path());
+        assert_eq!(s.node_nickname, "alice");
+        assert_eq!(s.update_high_water.as_deref(), Some("0.6.33"));
+        assert_eq!(s.update_install_failed.as_deref(), Some("0.6.34"));
     }
 
     /// A genuine release signature with its trusted comment rewritten to name
