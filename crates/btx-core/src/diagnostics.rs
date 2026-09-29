@@ -284,7 +284,221 @@ fn is_separator(c: char) -> bool {
         )
 }
 
+/// One line of the report. IP addresses, keys and payment addresses are
+/// found wherever they sit in the line, whatever punctuation is glued to
+/// them, so no log format can hide one by where it puts a bracket. Host
+/// names come last, token by token: only the token around a name tells a
+/// peer (`node.example.com:19335`) from prose and source lines.
 fn redact_line(line: &str, ctx: &RedactionContext) -> String {
+    let line = splice(line, ipv6_spans(line, ctx));
+    let line = splice(&line, ipv4_spans(&line, ctx));
+    let line = splice(&line, key_spans(&line));
+    let line = splice(&line, payment_address_spans(&line));
+    redact_names(&line, ctx)
+}
+
+/// A part of a line to replace: its byte span and what goes in its place.
+type Span = (usize, usize, &'static str);
+
+/// `line` with each span replaced. Spans come in order; one that overlaps
+/// the span before it is skipped, since that text is already gone.
+fn splice(line: &str, spans: Vec<Span>) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut at = 0;
+    for (s, e, with) in spans {
+        if s < at {
+            continue;
+        }
+        out.push_str(&line[at..s]);
+        out.push_str(with);
+        at = e;
+    }
+    out.push_str(&line[at..]);
+    out
+}
+
+/// Every maximal run of bytes in `line` that `class` accepts, as byte spans.
+/// `class` only ever accepts ASCII, so a span always starts and ends on a
+/// character boundary.
+fn runs(line: &str, class: impl Fn(u8) -> bool) -> Vec<(usize, usize)> {
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if !class(b[i]) {
+            i += 1;
+            continue;
+        }
+        let s = i;
+        while i < b.len() && class(b[i]) {
+            i += 1;
+        }
+        out.push((s, i));
+    }
+    out
+}
+
+/// Whether `ip` is one of the peers this app publishes, which stay.
+fn is_published_ip(ip: std::net::IpAddr, ctx: &RedactionContext) -> bool {
+    ctx.published_hosts.iter().any(|h| {
+        h.trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|p| p == ip)
+    })
+}
+
+fn is_port(t: &str) -> bool {
+    (1..=5).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `[ip]:port` around the address at `s..e`: the brackets and the port
+/// belong to it and go with it, as a socket address always has. Without a
+/// port the brackets are the log's own and stay: `[[peer address]]`.
+fn with_brackets_and_port(line: &str, s: usize, e: usize) -> (usize, usize) {
+    let b = line.as_bytes();
+    if s == 0 || b[s - 1] != b'[' || !line[e..].starts_with("]:") {
+        return (s, e);
+    }
+    let digits = line[e + 2..].bytes().take_while(u8::is_ascii_digit).count();
+    if is_port(&line[e + 2..e + 2 + digits]) {
+        (s - 1, e + 2 + digits)
+    } else {
+        (s, e)
+    }
+}
+
+/// IPv6 addresses anywhere in a line: maximal runs of hex digits, `:` and
+/// `.` that parse as `Ipv6Addr`, bracketed or not, with a `:port` when they
+/// carry one. A run glued to a word is a C++ name
+/// (`Chainstate::ActivateBestChain` holds the run `e::Ac`), never an address.
+fn ipv6_spans(line: &str, ctx: &RedactionContext) -> Vec<Span> {
+    let b = line.as_bytes();
+    let word = |x: u8| x.is_ascii_alphanumeric() || x == b'_';
+    let mut out = Vec::new();
+    for (s, e) in runs(line, |x| x.is_ascii_hexdigit() || x == b':' || x == b'.') {
+        let mut cs = s;
+        let mut ce = e;
+        // `peer:fe80::1`: one leading colon belongs to the word before it.
+        if line[cs..ce].starts_with(':') && !line[cs..ce].starts_with("::") {
+            cs += 1;
+        }
+        // End of a sentence, or a stray colon; never the `::` of `fe80::`.
+        while ce > cs && b[ce - 1] == b'.' {
+            ce -= 1;
+        }
+        if line[cs..ce].ends_with(':') && !line[cs..ce].ends_with("::") {
+            ce -= 1;
+        }
+        let core = &line[cs..ce];
+        if !core.bytes().any(|x| x.is_ascii_hexdigit()) {
+            continue; // `::` on its own is punctuation, not a peer
+        }
+        if (cs > 0 && word(b[cs - 1])) || (ce < b.len() && word(b[ce])) {
+            continue;
+        }
+        // Unbracketed with a port, `2001:db8::7:19335`, when the whole run
+        // is not an address by itself.
+        let ip = core.parse::<std::net::Ipv6Addr>().ok().or_else(|| {
+            core.rsplit_once(':')
+                .filter(|(_, port)| is_port(port))
+                .and_then(|(host, _)| host.parse().ok())
+        });
+        let Some(ip) = ip else { continue };
+        if is_published_ip(std::net::IpAddr::V6(ip), ctx) {
+            continue;
+        }
+        let (s, e) = with_brackets_and_port(line, cs, ce);
+        out.push((s, e, "[peer address]"));
+    }
+    out
+}
+
+/// Four dot-separated decimal octets, each 0-255 and at most three digits.
+fn parse_ipv4(t: &str) -> Option<std::net::Ipv4Addr> {
+    let mut octets = [0u8; 4];
+    let mut parts = t.split('.');
+    for o in &mut octets {
+        let p = parts.next()?;
+        if !(1..=3).contains(&p.len()) || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        *o = p.parse().ok()?;
+    }
+    parts.next().is_none().then_some(octets.into())
+}
+
+/// IPv4 addresses anywhere in a line: maximal runs of digits, `.` and `:`,
+/// cut at each `:` into parts, and every part that is four octets is an
+/// address, with the part after it as its port when that is a port. Times
+/// (`10:11:20`), versions (`0.34.9`), heights and byte counts are never four
+/// octets.
+fn ipv4_spans(line: &str, ctx: &RedactionContext) -> Vec<Span> {
+    let mut out = Vec::new();
+    for (s, e) in runs(line, |x| x.is_ascii_digit() || x == b'.' || x == b':') {
+        let mut parts = Vec::new();
+        let mut at = s;
+        for p in line[s..e].split(':') {
+            parts.push((at, at + p.len()));
+            at += p.len() + 1;
+        }
+        let mut i = 0;
+        while i < parts.len() {
+            let (ps, pe) = parts[i];
+            i += 1;
+            let part = &line[ps..pe];
+            let lead = part.len() - part.trim_start_matches('.').len();
+            let cs = ps + lead;
+            let ce = cs + line[cs..pe].trim_end_matches('.').len();
+            let Some(ip) = parse_ipv4(&line[cs..ce]) else {
+                continue;
+            };
+            let mut ce2 = ce;
+            if ce == pe && i < parts.len() {
+                let (qs, qe) = parts[i];
+                let port = line[qs..qe].trim_end_matches('.');
+                if is_port(port) {
+                    ce2 = qs + port.len();
+                    i += 1;
+                }
+            }
+            if is_published_ip(std::net::IpAddr::V4(ip), ctx) {
+                continue;
+            }
+            let (s, e) = if ce2 == ce {
+                with_brackets_and_port(line, cs, ce)
+            } else {
+                (cs, ce2)
+            };
+            out.push((s, e, "[peer address]"));
+        }
+    }
+    out
+}
+
+/// Keys anywhere in a line: a run of base58 long enough to be a WIF or an
+/// extended key, whatever is glued to it.
+fn key_spans(line: &str) -> Vec<Span> {
+    runs(line, |x| BASE58.as_bytes().contains(&x))
+        .into_iter()
+        .filter(|&(s, e)| looks_like_key(&line[s..e]))
+        .map(|(s, e)| (s, e, "[key removed]"))
+        .collect()
+}
+
+/// Payment addresses anywhere in a line: a run of letters and digits that
+/// reads as a `btx1` address.
+fn payment_address_spans(line: &str) -> Vec<Span> {
+    runs(line, |x| x.is_ascii_alphanumeric())
+        .into_iter()
+        .filter(|&(s, e)| looks_like_address(&line[s..e]))
+        .map(|(s, e)| (s, e, "[address removed]"))
+        .collect()
+}
+
+/// Host names, token by token (IP addresses in tokens are caught here too,
+/// as a second net under the line-wide scans above).
+fn redact_names(line: &str, ctx: &RedactionContext) -> String {
     let mut out = String::with_capacity(line.len());
     let mut token = String::new();
     for c in line.chars() {
@@ -310,25 +524,10 @@ const TRAILING: [char; 3] = ['.', ':', '…'];
 /// pathological log line; real ones have a handful.
 const MAX_STARTS: usize = 16;
 
-fn redact_token(tok: &str, ctx: &RedactionContext) -> String {
-    // Keys first: a WIF or an extended key is a long base58 run wherever it
-    // sits in the token (`key:<WIF>`, `[<WIF>]`, `<WIF>]`), and the pieces
-    // around it are still searched for an address.
-    let mut out = String::with_capacity(tok.len());
-    let mut rest = tok;
-    while let Some((s, e)) = key_run(rest) {
-        out.push_str(&redact_piece(&rest[..s], ctx));
-        out.push_str("[key removed]");
-        rest = &rest[e..];
-    }
-    out.push_str(&redact_piece(rest, ctx));
-    out
-}
-
-/// A piece of a token with no key in it. Each address in it becomes a
-/// marker and the punctuation around it stays: `addr:[peer address]`,
-/// `[[peer address]]`. A published peer is left as it is.
-fn redact_piece(piece: &str, ctx: &RedactionContext) -> String {
+/// A token of a line. Each address in it becomes a marker and the
+/// punctuation around it stays: `addr:[peer address]`. A published peer is
+/// left as it is.
+fn redact_token(piece: &str, ctx: &RedactionContext) -> String {
     let mut out = String::with_capacity(piece.len());
     let mut rest = piece;
     while let Some((s, e, found)) = find_private(rest) {
@@ -454,29 +653,6 @@ fn is_source_reference(host: &str) -> bool {
 /// (it never carries a `:port` either, which the caller already requires).
 fn looks_like_dns_host(host: &str) -> bool {
     host.contains('.') && host.chars().any(|c| c.is_ascii_alphabetic())
-}
-
-/// The first run of base58 characters in `t` that is long enough to be a
-/// key, as a byte span. Base58 is ASCII, so a run always starts and ends on
-/// a character boundary.
-fn key_run(t: &str) -> Option<(usize, usize)> {
-    let b = t.as_bytes();
-    let is_base58 = |x: u8| BASE58.as_bytes().contains(&x);
-    let mut i = 0;
-    while i < b.len() {
-        if !is_base58(b[i]) {
-            i += 1;
-            continue;
-        }
-        let s = i;
-        while i < b.len() && is_base58(b[i]) {
-            i += 1;
-        }
-        if looks_like_key(&t[s..i]) {
-            return Some((s, i));
-        }
-    }
-    None
 }
 
 const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -775,6 +951,119 @@ mod tests {
     fn bracketed_engine_source_lines_and_published_peers_stay() {
         let text = "[validation.cpp:17539] [ProcessNewBlock] [logging.h:88] \
                     via [109.199.124.187:19335]";
+        assert_eq!(shape_only(text), text);
+    }
+
+    // N1: an address is found wherever it sits in a line, whatever is glued
+    // to it. Each shape below came out unchanged after the I1 fix, because
+    // an address was only found where it ran to the end of its token.
+
+    #[test]
+    fn an_ip_before_an_exclamation_mark_is_redacted() {
+        assert_eq!(shape_only("from 1.2.3.4!"), "from [peer address]!");
+    }
+
+    #[test]
+    fn an_ip_before_a_question_mark_is_redacted() {
+        assert_eq!(shape_only("from 1.2.3.4?"), "from [peer address]?");
+    }
+
+    #[test]
+    fn an_ip_and_port_before_punctuation_is_redacted() {
+        assert_eq!(shape_only("from 1.2.3.4:19335!"), "from [peer address]!");
+    }
+
+    #[test]
+    fn an_ip_and_port_after_a_hash_sign_is_redacted() {
+        assert_eq!(shape_only("from #1.2.3.4:19335"), "from #[peer address]");
+    }
+
+    #[test]
+    fn an_ip_in_backticks_is_redacted() {
+        assert_eq!(shape_only("from `1.2.3.4`"), "from `[peer address]`");
+    }
+
+    #[test]
+    fn an_ip_after_a_hyphen_is_redacted() {
+        assert_eq!(shape_only("from peer-1.2.3.4"), "from peer-[peer address]");
+    }
+
+    #[test]
+    fn two_bracketed_ips_that_touch_are_both_redacted() {
+        assert_eq!(
+            shape_only("from [84.32.49.226][5.6.7.8]"),
+            "from [[peer address]][[peer address]]"
+        );
+    }
+
+    #[test]
+    fn a_bracketed_ip_touching_a_published_one_is_redacted_and_the_published_one_stays() {
+        assert_eq!(
+            shape_only("from [84.32.49.226][109.199.124.187]"),
+            "from [[peer address]][109.199.124.187]"
+        );
+    }
+
+    #[test]
+    fn two_ips_with_ports_joined_by_a_colon_are_both_redacted() {
+        assert_eq!(
+            shape_only("from 84.32.49.226:19335:5.6.7.8:19335"),
+            "from [peer address]:[peer address]"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_before_punctuation_is_redacted() {
+        assert_eq!(shape_only("from 2001:db8::7!"), "from [peer address]!");
+    }
+
+    #[test]
+    fn two_ips_joined_by_punctuation_are_both_redacted() {
+        assert_eq!(
+            shape_only("from 1.2.3.4!5.6.7.8"),
+            "from [peer address]![peer address]"
+        );
+    }
+
+    #[test]
+    fn an_ip_and_port_in_parentheses_is_redacted() {
+        assert_eq!(
+            shape_only("from (84.32.49.226:19335)"),
+            "from ([peer address])"
+        );
+    }
+
+    #[test]
+    fn a_key_glued_between_punctuation_is_redacted() {
+        let wif = crate::signer::generate_wif();
+        for (text, want) in [
+            (format!("!{wif}?"), "![key removed]?"),
+            (format!("#{wif}#"), "#[key removed]#"),
+            (format!("key:{wif}!"), "key:[key removed]!"),
+            (format!("`{wif}`"), "`[key removed]`"),
+        ] {
+            assert_eq!(shape_only(&text), want);
+        }
+    }
+
+    /// The published-peer exemption holds however the peer is wrapped.
+    #[test]
+    fn a_published_ip_glued_to_punctuation_stays() {
+        let text = "via 109.199.124.187! #109.199.124.187:19335 `109.199.124.187` \
+                    (109.199.124.187:19335)? [20.86.181.203][109.199.124.187]";
+        assert_eq!(shape_only(text), text);
+    }
+
+    /// Finding addresses anywhere in a line must not find them where there
+    /// are none: times, versions, heights, byte counts, hashes, outpoints,
+    /// C++ names and the engine's source lines, glued to punctuation too.
+    #[test]
+    fn times_versions_numbers_hashes_and_names_are_not_addresses_anywhere() {
+        let text = "2026-09-29T10:11:20.123456Z [msghand] (10:11:20)! v0.34.9, \
+                    /BTX:0.34.11/ #233,470 height=233470 1048576 bytes 14:05? \
+                    8240c62e62b47fc675610908c03045c244de1dfc06246209830ba9d98468952c:0 \
+                    [validation.cpp:17539] [Chainstate::ActivateBestChain] \
+                    CConnman::ThreadSocketHandler DB::Read progress=0.999871";
         assert_eq!(shape_only(text), text);
     }
 
