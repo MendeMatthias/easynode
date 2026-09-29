@@ -13,6 +13,7 @@ use btx_core::console_policy::{self, ConfirmBook, Decision};
 use btx_core::diagnostics::{self, DiagnosticsInput, HeldBranchState, RedactionContext};
 use btx_core::engine_warnings::Notice;
 use btx_core::error::AppError;
+use btx_core::header_path::{HeaderPath, PathStatus};
 use btx_core::node_api as api;
 use btx_core::rpc::{Rpc, RpcClient};
 use btx_core::stuck_blocks::{self, FetchPlan};
@@ -362,7 +363,8 @@ pub struct FetchOutcome {
 }
 
 /// Walk back from `target` to the block above `tip_height`, and check it
-/// sits on the node's own tip.
+/// sits on the node's own tip. The walk is the one the catch-up help keeps
+/// between ticks (`btx_core::header_path`); here it runs once per click.
 async fn missing_blocks(
     rpc: &RpcClient,
     target: &btx_core::fork::ChainTip,
@@ -375,28 +377,16 @@ async fn missing_blocks(
                 .into(),
         );
     }
-    let mut chain = Vec::new();
-    let mut hash = target.hash.clone();
-    loop {
-        let h = rpc
-            .call("getblockheader", json!([hash, true]))
-            .await
-            .map_err(fetch_error)?;
-        let height = h["height"]
-            .as_u64()
-            .ok_or("The node sent a header without a height.")?;
-        chain.push((height, hash.clone()));
-        let prev = h["previousblockhash"].as_str().unwrap_or("").to_string();
-        if height <= tip_height + 1 {
-            if prev != tip_hash {
-                return Err("The newest headers are on another branch than your node's tip. The node decides that on its own.".into());
-            }
-            break;
-        }
-        hash = prev;
+    let mut path = HeaderPath::new();
+    path.retarget(target.height, &target.hash);
+    path.walk(rpc, tip_height, usize::MAX)
+        .await
+        .map_err(fetch_error)?;
+    match path.status(tip_height, tip_hash) {
+        PathStatus::Ready => Ok(path.next(tip_height, usize::MAX)),
+        PathStatus::OtherBranch => Err("The newest headers are on another branch than your node's tip. The node decides that on its own.".into()),
+        PathStatus::Nothing | PathStatus::Walking => Ok(Vec::new()),
     }
-    chain.reverse();
-    Ok(chain)
 }
 
 #[tauri::command]
