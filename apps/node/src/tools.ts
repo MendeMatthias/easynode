@@ -1,0 +1,256 @@
+// Tools: quick actions, Copy diagnostics and the command window. The window
+// sends only the typed line; Rust decides what runs. Everything the node says
+// is set as text, never HTML.
+
+import { invoke } from "@tauri-apps/api/core";
+import { History, capForDisplay } from "./tools-history";
+
+type ConsoleAnswer =
+  | { kind: "output"; text: string }
+  | { kind: "confirm"; token: string; sentence: string }
+  | { kind: "refused"; sentence: string }
+  | { kind: "stopped" };
+
+interface Notice {
+  raw: string;
+  message: string;
+  needs_attention: boolean;
+  hidden_because: string | null;
+}
+type Ask<T> =
+  | { state: "ready"; data: T }
+  | { state: "stopped" }
+  | { state: "warming" }
+  | { state: "unavailable"; data: { message: string } };
+
+const $ = <T extends HTMLElement = HTMLElement>(id: string): T => document.getElementById(id) as T;
+
+/** The status line exactly as the home screen shows it. */
+function statusLine(): string {
+  const badge = ($("status-badge").textContent ?? "").trim();
+  const sub = ($("status-sub").textContent ?? "").trim();
+  return [badge, sub].filter(Boolean).join(" · ");
+}
+
+/** The fork card's message, only while that card is actually shown. */
+function windowLines(): string[] {
+  const card = $("fork-card");
+  if (card.hidden) return [];
+  const text = ($("fork-msg").textContent ?? "").trim();
+  return text ? [text] : [];
+}
+
+async function copy(text: string, btn: HTMLButtonElement, label: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+    btn.textContent = "Copied";
+  } catch {
+    btn.textContent = "Couldn't copy";
+  }
+  setTimeout(() => (btn.textContent = label), 1500);
+}
+
+function say(text: string): void {
+  const r = $("tools-action-result");
+  r.textContent = text;
+  r.hidden = false;
+}
+
+export function initTools(): void {
+  const overlay = $("tools-overlay");
+  const history = new History(50);
+  let pendingToken: string | null = null;
+  let restartArmTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const open = async () => {
+    overlay.hidden = false;
+    $("tools-now").textContent = statusLine();
+    const restart = $<HTMLButtonElement>("tools-restart");
+    const why = await invoke<string | null>("tools_restart_check").catch(() => null);
+    restart.disabled = why !== null;
+    restart.title = why ?? "";
+  };
+  $("tools-btn").addEventListener("click", () => void open());
+  $("tools-close").addEventListener("click", () => (overlay.hidden = true));
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.hidden = true;
+  });
+
+  // Restart node: two clicks, disarmed after five seconds.
+  $("tools-restart").addEventListener("click", async () => {
+    const btn = $<HTMLButtonElement>("tools-restart");
+    if (btn.dataset.armed !== "1") {
+      btn.dataset.armed = "1";
+      btn.textContent = "Click again to restart the node";
+      clearTimeout(restartArmTimer);
+      restartArmTimer = setTimeout(() => {
+        btn.dataset.armed = "";
+        btn.textContent = "Restart node";
+      }, 5000);
+      return;
+    }
+    clearTimeout(restartArmTimer);
+    btn.dataset.armed = "";
+    btn.textContent = "Restarting...";
+    btn.disabled = true;
+    try {
+      await invoke("tools_restart_node");
+      say("Your node restarted.");
+    } catch (e) {
+      say(String(e));
+    } finally {
+      btn.textContent = "Restart node";
+      btn.disabled = false;
+    }
+  });
+
+  $("tools-fetch").addEventListener("click", async () => {
+    const btn = $<HTMLButtonElement>("tools-fetch");
+    btn.disabled = true;
+    say("Asking peers for the next blocks...");
+    try {
+      const out = await invoke<{ message: string }>("tools_fetch_stuck_blocks");
+      say(out.message);
+    } catch (e) {
+      say(String(e));
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  $("tools-open-folder").addEventListener("click", () => {
+    void invoke("open_data_folder").catch((e) => say(String(e)));
+  });
+
+  $("tools-notices-btn").addEventListener("click", async () => {
+    const box = $("tools-notices");
+    const btn = $("tools-notices-btn");
+    if (!box.hidden) {
+      box.hidden = true;
+      btn.setAttribute("aria-expanded", "false");
+      return;
+    }
+    box.replaceChildren();
+    const ans = await invoke<Ask<Notice[]>>("tools_engine_notices").catch(() => null);
+    const add = (text: string, cls: string) => {
+      const p = document.createElement("p");
+      p.className = cls;
+      p.textContent = text;
+      box.appendChild(p);
+    };
+    if (!ans || ans.state !== "ready") {
+      add(ans?.state === "stopped" ? "Start your node to see its notices." : "The node is not answering yet.", "tools-note");
+    } else if (ans.data.length === 0) {
+      add("The engine reports nothing right now.", "tools-note");
+    } else {
+      for (const n of ans.data) {
+        add(n.message, n.needs_attention ? "tools-notice is-attention" : "tools-notice");
+        if (n.hidden_because) add(`Not shown on the home screen: ${n.hidden_because}`, "tools-note");
+        add(`Engine: ${n.raw}`, "tools-raw");
+      }
+    }
+    box.hidden = false;
+    btn.setAttribute("aria-expanded", "true");
+  });
+
+  $("tools-diag-btn").addEventListener("click", async () => {
+    const btn = $<HTMLButtonElement>("tools-diag-btn");
+    const pre = $("tools-diag");
+    btn.disabled = true;
+    try {
+      const text = await invoke<string>("tools_diagnostics", { statusLine: statusLine(), windowLines: windowLines() });
+      pre.textContent = text;
+      pre.hidden = false;
+      await copy(text, btn, "Copy diagnostics");
+    } catch (e) {
+      say(String(e));
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // The command window.
+  const input = $<HTMLInputElement>("tools-line");
+  const list = $("tools-history");
+  const render = (line: string, answer: string) => {
+    history.push({ line, answer });
+    const item = document.createElement("div");
+    item.className = "tools-entry";
+    const head = document.createElement("div");
+    head.className = "tools-entry-head";
+    const cmd = document.createElement("code");
+    cmd.textContent = `> ${line}`;
+    const btn = document.createElement("button");
+    btn.className = "link-row";
+    btn.type = "button";
+    btn.textContent = "Copy";
+    btn.addEventListener("click", () => void copy(answer, btn, "Copy"));
+    head.append(cmd, btn);
+    const out = document.createElement("pre");
+    out.className = "tools-pre";
+    out.textContent = capForDisplay(answer);
+    item.append(head, out);
+    list.prepend(item);
+    while (list.children.length > 50) list.lastElementChild?.remove();
+  };
+  const show = (line: string, a: ConsoleAnswer) => {
+    switch (a.kind) {
+      case "output":
+        render(line, a.text);
+        break;
+      case "refused":
+        render(line, a.sentence);
+        break;
+      case "stopped":
+        render(line, "Start your node to run commands.");
+        break;
+      case "confirm":
+        pendingToken = a.token;
+        $("tools-confirm-text").textContent = a.sentence;
+        $("tools-confirm").hidden = false;
+        $("tools-confirm").dataset.line = line;
+        break;
+    }
+  };
+  const runLine = async () => {
+    const line = input.value.trim();
+    if (!line) return;
+    input.value = "";
+    $("tools-confirm").hidden = true;
+    pendingToken = null;
+    const a = await invoke<ConsoleAnswer>("tools_console_run", { line }).catch(
+      (e): ConsoleAnswer => ({ kind: "refused", sentence: String(e) }),
+    );
+    show(line, a);
+  };
+  $("tools-run").addEventListener("click", () => void runLine());
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") void runLine();
+    if (e.key === "ArrowUp") {
+      input.value = history.up();
+      e.preventDefault();
+    }
+    if (e.key === "ArrowDown") {
+      input.value = history.down();
+      e.preventDefault();
+    }
+  });
+  $("tools-confirm-yes").addEventListener("click", async () => {
+    const token = pendingToken;
+    const line = $("tools-confirm").dataset.line ?? "";
+    pendingToken = null;
+    $("tools-confirm").hidden = true;
+    if (!token) return;
+    const a = await invoke<ConsoleAnswer>("tools_console_confirm", { token }).catch(
+      (e): ConsoleAnswer => ({ kind: "refused", sentence: String(e) }),
+    );
+    show(line, a);
+  });
+  $("tools-confirm-no").addEventListener("click", () => {
+    pendingToken = null;
+    $("tools-confirm").hidden = true;
+  });
+  $("tools-copy-all").addEventListener("click", () => {
+    void copy(history.allText(), $<HTMLButtonElement>("tools-copy-all"), "Copy all");
+  });
+}
