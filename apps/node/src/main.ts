@@ -1739,10 +1739,16 @@ function reflectArchiveService(status: NodeStatusInfo): void {
  * so a stale alarm never outlives the condition, and hidden on any phase that
  * is not running: a stopped node has no view of the chain to be behind with.
  */
+/** Whether the stale sentence was amber on a syncing node at the last poll.
+ *  A syncing node's card keeps amber until its hour's pace is back at the
+ *  chain's (catchup-trend.ts `staleCard`, `wasAmber`), so it does not blink. */
+let syncingStaleAmber = false;
+
 function reflectFork(status: NodeStatusInfo, reading: TrendReading): void {
   const card = $("fork-card");
   const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
-  const stale = staleCard(status.tip_stale_message, reading, catchupSamples, Date.now());
+  const stale = staleCard(status.tip_stale_message, reading, catchupSamples, Date.now(), syncingStaleAmber);
+  syncingStaleAmber = reading.kind === "syncing" && stale?.tone === "amber";
   const shown = chainCardMessage(stale, status.fork_message, status.behind_signers_message);
   if (!running || !shown) {
     card.hidden = true;

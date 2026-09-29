@@ -207,12 +207,12 @@ export const catchupLine = (behind: number, samples: CatchupSample[], now: numbe
  *  few seconds behind its header. */
 export const HEADERS_AHEAD_IS_BEHIND = 2;
 
-/** How far back a syncing node's pace is read. Shorter than the hour a live
- *  node's pace reads: a sync that runs at 1,000 blocks an hour and then stops
+/** A syncing node that added no blocks over this long is stalled, whatever
+ *  its hour reads: a sync that ran at 1,000 blocks an hour and then stopped
  *  would average above the chain's 40 for most of an hour after it stopped.
- *  Twenty minutes is about 13 blocks of chain, and still longer than the 15
- *  minutes `catchupPace` needs before it says anything. */
-export const SYNCING_PACE_WINDOW_MS = 20 * 60 * 1000;
+ *  Only "none at all" is judged this short: twenty minutes is about 13 blocks
+ *  of chain, so a pace read off it swings by 3 an hour per block. */
+export const SYNCING_STOP_WINDOW_MS = 20 * 60 * 1000;
 
 /** The neutral line for a node that is behind before its trend is measured. */
 export const CHECKING_CATCHUP = "Checking whether your node is catching up...";
@@ -307,17 +307,27 @@ export const recordReading = (
  *  - no newer block known, or one header ahead (a block in flight, as the
  *    role card reads it): amber, Rust's sentence unchanged.
  *
- *  A syncing node is judged by the blocks it adds over the last twenty
- *  minutes (`SYNCING_PACE_WINDOW_MS`), not by the gap (its headers can outrun
- *  them): no stale sentence at the chain's 40 an hour or more, amber with the
- *  pace below it, neutral until the pace is measured. Fetching headers only,
- *  it stays neutral: there is nothing to measure yet, and the design's calm
- *  card "does not hide a real stall" only once there is. */
+ *  A syncing node is judged by the blocks it adds, not by the gap (its
+ *  headers can outrun them), and neutral until that is measured:
+ *  - amber when it added no blocks over the last twenty minutes
+ *    (`SYNCING_STOP_WINDOW_MS`);
+ *  - amber when, over the last hour, it added fewer blocks than the chain
+ *    made by more than one. One block in or out of the window moves a pace
+ *    read off an hour or less by a block's worth, so without the margin a
+ *    node at about the chain's own rate blinks amber on every block;
+ *  - once amber (`wasAmber`, the card at the last poll), amber until the
+ *    hour's pace is back at 40 or more, so a node a little slower than the
+ *    chain does not blink either;
+ *  - otherwise no stale sentence.
+ *  Fetching headers only, it stays neutral: there is nothing to measure yet,
+ *  and the design's calm card "does not hide a real stall" only once there
+ *  is. */
 export const staleCard = (
   tipStaleMessage: string | null,
   reading: TrendReading,
   samples: CatchupSample[],
   now: number,
+  wasAmber = false,
 ): StaleCard | null => {
   if (!tipStaleMessage) return null;
   const checking: StaleCard = { message: CHECKING_CATCHUP, tone: "neutral" };
@@ -330,10 +340,18 @@ export const staleCard = (
     return { message: said ? `${tipStaleMessage} ${said}` : tipStaleMessage, tone: "amber" };
   };
   if (reading.kind === "syncing") {
-    const recent = samples.filter((s) => s.syncing && now - s.at <= SYNCING_PACE_WINDOW_MS);
-    const pace = catchupPace(recent, now);
-    if (!pace) return checking;
-    return pace.addedPerHour < CHAIN_BLOCKS_PER_HOUR ? withPace(pace) : null;
+    const syncing = samples.filter((s) => s.syncing);
+    const recent = catchupPace(
+      syncing.filter((s) => now - s.at <= SYNCING_STOP_WINDOW_MS),
+      now,
+    );
+    if (recent && !(recent.addedPerHour > 0)) return withPace(recent);
+    const hour = catchupPace(syncing, now);
+    if (!hour) return checking;
+    const hours = hour.spanMs / 3_600_000;
+    const clearlyBelow = hour.addedPerHour * hours + 1 < CHAIN_BLOCKS_PER_HOUR * hours;
+    const stillBelow = wasAmber && hour.addedPerHour < CHAIN_BLOCKS_PER_HOUR;
+    return clearlyBelow || stillBelow ? withPace(hour) : null;
   }
   const { trend, pace } = judge(samples, now);
   if (trend === "converging") return null;

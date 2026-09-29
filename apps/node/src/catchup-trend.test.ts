@@ -571,6 +571,77 @@ describe("staleCard on a syncing node", () => {
     });
   });
 
+  /** A syncing node adding one block every `secondsPerBlock`, the first
+   *  `offsetS` seconds into a block, polled every 1.5 s through the window's
+   *  own path and carrying the last card as main.ts does. The card at every
+   *  poll. */
+  const syncingCards = (secondsPerBlock: number, toMin: number, offsetS = 0) => {
+    let s: CatchupSample[] = [];
+    let wasAmber = false;
+    const cards: { m: number; tone: string; message?: string }[] = [];
+    for (let at = T0; at <= T0 + min(toMin); at += 1500) {
+      const height = 130_000 + Math.floor((at - T0 + offsetS * 1000) / (secondsPerBlock * 1000));
+      const reading = trendReading({ phase: "syncing", height, headers: 226_000 }, at);
+      s = recordReading(s, reading, at);
+      const card = staleCard(STALE, reading, s, at, wasAmber);
+      wasAmber = card?.tone === "amber";
+      cards.push({ m: (at - T0) / 60_000, tone: card?.tone ?? "hidden", message: card?.message });
+    }
+    return cards;
+  };
+  const tonesFrom = (cards: { m: number; tone: string }[], fromMin: number) =>
+    new Set(cards.filter((c) => c.m >= fromMin).map((c) => c.tone));
+
+  it("does not blink on a node adding blocks at about the chain's own rate", () => {
+    // 89.2 s a block is 40.4 an hour. Read off an hour or less, one block in
+    // or out of the window moves the pace by a block's worth, and a plain
+    // "below 40" flipped the card on most blocks: 81 times in an hour at
+    // 89.2 s, 80 at 90 s, and through the first hour on the hour's own read.
+    for (const secondsPerBlock of [85, 89.2, 90]) {
+      for (const offsetS of [0, 30, 60]) {
+        const cards = syncingCards(secondsPerBlock, 150, offsetS);
+        expect(tonesFrom(cards.filter((c) => c.m < 15), 0)).toEqual(new Set(["neutral"]));
+        expect(tonesFrom(cards, 15)).toEqual(new Set(["hidden"]));
+      }
+    }
+  });
+
+  it("turns a node a little slower than the chain amber, and keeps it amber", () => {
+    // 95 s a block is 37.9 an hour: it never catches up.
+    for (const offsetS of [0, 30, 60]) {
+      const cards = syncingCards(95, 150, offsetS);
+      const first = cards.findIndex((c) => c.tone === "amber");
+      expect(first).toBeGreaterThan(-1);
+      expect(cards[first].m).toBeLessThan(60);
+      expect(tonesFrom(cards.slice(first), 0)).toEqual(new Set(["amber"]));
+      expect(cards[cards.length - 1].message).toBe(
+        `${STALE} It adds about 38 blocks an hour while the network adds about ${CHAIN_BLOCKS_PER_HOUR}.`,
+      );
+    }
+  });
+
+  it("lets the card go once the hour's pace is back at the chain's or above", () => {
+    // 95 s a block for an hour, then a block a minute: amber, then hidden
+    // for good once the hour reads 40 or more.
+    let s: CatchupSample[] = [];
+    let wasAmber = false;
+    const tones: { m: number; tone: string }[] = [];
+    for (let at = T0; at <= T0 + min(180); at += 1500) {
+      const m = (at - T0) / 60_000;
+      const height = 130_000 + (m <= 60 ? Math.floor((m * 60) / 95) : Math.floor(3_600 / 95) + Math.floor(m - 60));
+      const reading = trendReading({ phase: "syncing", height, headers: 226_000 }, at);
+      s = recordReading(s, reading, at);
+      const card = staleCard(STALE, reading, s, at, wasAmber);
+      wasAmber = card?.tone === "amber";
+      tones.push({ m, tone: card?.tone ?? "hidden" });
+    }
+    expect(tones.find((t) => t.m >= 59 && t.m <= 60)?.tone).toBe("amber");
+    const back = tones.findIndex((t) => t.m > 60 && t.tone === "hidden");
+    expect(back).toBeGreaterThan(-1);
+    expect(tones[back].m).toBeLessThan(120);
+    expect(new Set(tones.slice(back).map((t) => t.tone))).toEqual(new Set(["hidden"]));
+  });
+
   it("turns amber about twenty minutes after a fast sync stops, not an hour later", () => {
     // Scripted through the real poll: 1,000 blocks an hour for an hour, then
     // stuck. Averaged over the hour, the pace stays above the chain's 40
