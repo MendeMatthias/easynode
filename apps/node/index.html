@@ -97,6 +97,37 @@
               <span class="fact-value" id="wizard-free-disk">—</span>
             </div>
           </div>
+          <!-- The one question (docs/decisions/2026-09-29-quick-start-full-
+               check-and-progress.md). main.ts selects Full check first on an
+               NVIDIA machine and Quick start first on a Mac (the owner's
+               decision of 2026-09-29), and greys Full check out where the
+               machine cannot check blocks (start-choice.ts); begin_setup
+               records the pick before the first start. -->
+          <fieldset class="start-choice" id="start-choice" role="radiogroup" aria-label="How your node starts">
+            <label class="choice" id="choice-quick-label">
+              <input type="radio" name="start-choice" value="quick_start" id="choice-quick" />
+              <span class="choice-text">
+                <span class="choice-name">Quick start</span>
+                <span class="choice-desc">Follows signatures, ready in minutes.</span>
+              </span>
+            </label>
+            <label class="choice" id="choice-full-label">
+              <input type="radio" name="start-choice" value="full_check" id="choice-full" />
+              <span class="choice-text">
+                <span class="choice-name">Full check</span>
+                <span class="choice-desc">Validates every block, takes longer the first time.</span>
+                <span class="choice-reason" id="choice-full-reason" hidden></span>
+              </span>
+            </label>
+            <!-- The owner's wording until a second operator is on the list
+                 (2026-09-29); then "confirmed by two node operators". -->
+            <p class="wizard-note start-choice-note">
+              Both start from a recent signed snapshot. Full check then checks
+              every new block on this computer's graphics card and checks the
+              older history in the background. You can switch later in
+              Settings.
+            </p>
+          </fieldset>
           <button id="setup-btn" class="btn-primary" type="button">
             <span class="btn-spinner" aria-hidden="true"></span>
             <span class="btn-label" id="setup-btn-label">Set up my node</span>

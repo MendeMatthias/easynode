@@ -18,6 +18,7 @@ import {
   catchupLine,
   pushSample,
 } from "./catchup-trend";
+import { NO_GPU_REASON, type StartChoice, setupArgs, startChoiceView } from "./start-choice";
 import {
   classifyCheckFailure,
   checkFailureMessage,
@@ -208,6 +209,12 @@ interface NodeStatusInfo {
   rc_trusted_mirror: boolean;
   /** The owner chose to follow signatures on a machine that could validate. */
   follow_signatures: boolean;
+  /** This machine may check blocks itself, as far as the app can know before
+   *  the engine's first start. The setup screen greys out Full check when not. */
+  full_check_possible: boolean;
+  /** The setup screen selects Full check first: an NVIDIA machine. False on a
+   *  Mac, where Quick start comes first and Full check can still be picked. */
+  full_check_first: boolean;
   /**
    * Bytes uploaded to peers this run. Null when stopped or when the node did
    * not answer `getnettotals` — the UI drops the claim rather than showing a
@@ -515,6 +522,45 @@ function setStep(active: number, downloadPct?: number) {
   }
 }
 
+/** The owner's pick on the setup screen, null until they touch it, so the
+ *  default can follow what the machine can do (start-choice.ts). */
+let pickedChoice: StartChoice | null = null;
+
+function reflectStartChoice(status: NodeStatusInfo, inProgress: boolean): void {
+  const view = startChoiceView(status.full_check_possible, status.full_check_first, pickedChoice);
+  const quick = $<HTMLInputElement>("choice-quick");
+  const full = $<HTMLInputElement>("choice-full");
+  quick.checked = view.selected === "quick_start";
+  full.checked = view.selected === "full_check";
+  // No changing course once setup has started; the choice is already recorded.
+  quick.disabled = inProgress;
+  full.disabled = inProgress || view.fullCheckDisabled;
+  $("choice-quick-label").classList.toggle("is-selected", quick.checked);
+  $("choice-full-label").classList.toggle("is-selected", full.checked);
+  $("choice-full-label").classList.toggle("is-disabled", view.fullCheckDisabled);
+  const reason = $("choice-full-reason");
+  reason.hidden = !view.fullCheckDisabled;
+  reason.textContent = view.fullCheckDisabled ? NO_GPU_REASON : "";
+}
+
+/** What the setup button sends: the owner's pick, or the default for this
+ *  machine. */
+function currentChoice(): StartChoice {
+  return startChoiceView(
+    lastStatus?.full_check_possible ?? false,
+    lastStatus?.full_check_first ?? false,
+    pickedChoice,
+  ).selected;
+}
+
+for (const id of ["choice-quick", "choice-full"]) {
+  $<HTMLInputElement>(id).addEventListener("change", (e) => {
+    const box = e.target as HTMLInputElement;
+    if (box.checked) pickedChoice = box.value as StartChoice;
+    if (lastStatus) reflectStartChoice(lastStatus, setupInFlight);
+  });
+}
+
 function renderWizard(status: NodeStatusInfo) {
   showScreen("wizard");
   const p = status.phase;
@@ -525,6 +571,8 @@ function renderWizard(status: NodeStatusInfo) {
     p.phase === "starting" ||
     p.phase === "warming" ||
     p.phase === "loading_snapshot";
+
+  reflectStartChoice(status, inProgress);
 
   // The button IS the live readout while setting up; idle otherwise.
   if (inProgress) setSetupButton(true, setupPhaseLabel(p));
@@ -1148,6 +1196,7 @@ async function beginSetup() {
   // Immediate feedback on the click: the button becomes a spinner + live label
   // and the "come back later" note appears, before any backend round-trip.
   setSetupButton(true, "Setting up your node…");
+  if (lastStatus) reflectStartChoice(lastStatus, true);
   $<HTMLButtonElement>("retry-btn").disabled = true;
   wizardProgress.hidden = false;
   setStep(0);
@@ -1159,7 +1208,7 @@ async function beginSetup() {
     // Completion truth comes from the polled status.setup_complete — a
     // resolved invoke is NOT proof (the backend rejects a duplicate run with
     // an error, and older builds resolved it silently).
-    await invoke("begin_setup");
+    await invoke("begin_setup", setupArgs(currentChoice()));
   } catch (e) {
     $("wizard-error-msg").textContent = String(e);
     wizardError.hidden = false;
