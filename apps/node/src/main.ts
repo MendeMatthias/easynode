@@ -31,6 +31,7 @@ import {
 import { contributionView } from "./contribution";
 import { mountPowerCore } from "./power-core";
 import { initAsk } from "./ask";
+import { initTools } from "./tools";
 import { initWallet, reflectWalletEnabled } from "./wallet";
 type PowerCore = ReturnType<typeof mountPowerCore>;
 
@@ -2338,6 +2339,7 @@ void (async () => {
   // initAsk/initWallet means a throw in those can't leave the X unwired.
   initCloseDialog();
   initAsk();
+  initTools();
   initWallet();
   try {
     const v = await getVersion();

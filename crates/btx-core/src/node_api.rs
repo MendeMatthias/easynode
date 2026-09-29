@@ -3,7 +3,7 @@ use crate::rpc::Rpc;
 use serde::Deserialize;
 use serde_json::json;
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 pub struct BlockchainInfo {
     pub blocks: u64,
     #[serde(default)]
@@ -325,6 +325,10 @@ pub struct ConnectionCounts {
     pub localservicesnames: Vec<String>,
 }
 
+fn minus_one() -> i64 {
+    -1
+}
+
 /// The per-peer subset a trusted mirror's health depends on (`getpeerinfo`).
 ///
 /// `bytesrecv_per_msg.mmattest` is the honest "is anyone feeding me
@@ -369,6 +373,13 @@ pub struct PeerInfo {
     /// text chosen by a stranger.
     #[serde(default)]
     pub subver: String,
+    /// The last header this peer announced that we also have, `-1` when none.
+    /// Which peer to ask for a stuck block is chosen by this.
+    #[serde(default = "minus_one")]
+    pub synced_headers: i64,
+    /// The last block we know this peer has, `-1` when none.
+    #[serde(default = "minus_one")]
+    pub synced_blocks: i64,
 }
 
 pub async fn get_peer_info(rpc: &dyn Rpc) -> AppResult<Vec<PeerInfo>> {
@@ -942,7 +953,7 @@ mod tests {
     use super::*;
     use crate::rpc::Rpc;
     use async_trait::async_trait;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -1063,6 +1074,17 @@ mod tests {
             summarize_archive_peers(&peers),
             ArchivePeerSummary::default()
         );
+    }
+
+    #[test]
+    fn peer_sync_heights_decode_and_default_to_minus_one() {
+        let with: PeerInfo = serde_json::from_value(
+            json!({"id": 4, "synced_headers": 233472, "synced_blocks": 225928}),
+        )
+        .unwrap();
+        assert_eq!((with.synced_headers, with.synced_blocks), (233472, 225928));
+        let without: PeerInfo = serde_json::from_value(json!({"id": 5})).unwrap();
+        assert_eq!((without.synced_headers, without.synced_blocks), (-1, -1));
     }
 
     struct FakeRpc {

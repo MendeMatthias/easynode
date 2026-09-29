@@ -19,7 +19,9 @@
 pub mod attested_snapshot;
 pub mod backend;
 pub mod checkin;
+pub mod console_policy;
 pub mod datadir;
+pub mod diagnostics;
 pub mod disk;
 pub mod engine_warnings;
 pub mod error;
@@ -44,6 +46,7 @@ pub mod setup;
 pub mod signer;
 pub mod snapshot;
 pub mod snapshot_serve;
+pub mod stuck_blocks;
 pub mod supply;
 pub mod wallet_format;
 pub mod watchdog;

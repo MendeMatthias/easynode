@@ -225,14 +225,7 @@ pub fn classify(raw: &str) -> Option<EngineWarning> {
     if t.is_empty() {
         return None;
     }
-    const NOT_SHOWN: [&str; 5] = [
-        "Cadence burst hold",
-        "Deep reorg detected",
-        "pre-release test build",
-        "attempting to activate unknown new rules",
-        "Unrecognised block version",
-    ];
-    if NOT_SHOWN.iter().any(|p| t.contains(p)) {
+    if hidden_kind(t).is_some() {
         return None;
     }
     if t.contains("strict-device validation is unavailable") {
@@ -290,6 +283,80 @@ pub fn from_node(info: &BlockchainInfo) -> Vec<EngineWarning> {
     // Stable, so the engine's own order holds within each group.
     out.sort_by_key(|w| !w.needs_attention());
     out
+}
+
+/// A warning as Tools shows it: every one the engine reports, the hidden
+/// kinds included, each with the reason the home screen leaves it out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Notice {
+    pub raw: String,
+    pub message: String,
+    pub needs_attention: bool,
+    /// Why the home screen leaves it out; `None` when it is shown there.
+    pub hidden_because: Option<&'static str>,
+}
+
+/// The kinds the home screen hides on purpose: (phrase, sentence, reason).
+const HIDDEN: [(&str, &str, &str); 5] = [
+    (
+        "Cadence burst hold",
+        "The engine is pacing how fast it adds blocks while it catches up, to leave room for new ones.",
+        "Local pacing while catching up. The engine says this is not a problem with the chain.",
+    ),
+    (
+        "Deep reorg detected",
+        "Since it started, the node switched branches deeper than usual. On this network that is usually a node rejoining the main chain.",
+        "It stays until the next restart, even after what caused it is over.",
+    ),
+    (
+        "pre-release test build",
+        "The node engine is a test build.",
+        "Which engine ships is this project's choice, not something to act on.",
+    ),
+    (
+        "attempting to activate unknown new rules",
+        "Some miners are signalling rules this engine does not know yet.",
+        "Signalling is not activation. Nobody needs to act on it.",
+    ),
+    (
+        "Unrecognised block version",
+        "Some miners are signalling rules this engine does not know yet.",
+        "Signalling is not activation. Nobody needs to act on it.",
+    ),
+];
+
+fn hidden_kind(t: &str) -> Option<(&'static str, &'static str)> {
+    HIDDEN
+        .iter()
+        .find(|(phrase, _, _)| t.contains(phrase))
+        .map(|(_, sentence, why)| (*sentence, *why))
+}
+
+pub fn all_notices(info: &BlockchainInfo) -> Vec<Notice> {
+    info.warnings
+        .iter()
+        .map(|w| w.trim())
+        .filter(|w| !w.is_empty())
+        .map(|w| match hidden_kind(w) {
+            Some((sentence, why)) => Notice {
+                raw: w.to_string(),
+                message: sentence.to_string(),
+                needs_attention: false,
+                hidden_because: Some(why),
+            },
+            None => {
+                let kind = classify(w).unwrap_or(EngineWarning::Other {
+                    text: first_sentence(w),
+                });
+                Notice {
+                    raw: w.to_string(),
+                    message: kind.message(),
+                    needs_attention: kind.needs_attention(),
+                    hidden_because: None,
+                }
+            }
+        })
+        .collect()
 }
 
 /// The integer that directly follows `marker`, e.g. "height " in "at height
@@ -736,5 +803,71 @@ mod tests {
         assert_eq!(group(1_000), "1,000");
         assert_eq!(group(227_313), "227,313");
         assert_eq!(group(1_234_567), "1,234,567");
+    }
+
+    fn info_with(warnings: &[&str]) -> BlockchainInfo {
+        BlockchainInfo {
+            warnings: warnings.iter().map(|w| w.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn all_notices_keeps_the_hidden_ones_and_says_why() {
+        let n = all_notices(&info_with(&[
+            "Cadence burst hold active: pacing background validation",
+            "Warning: Deep reorg detected (depth 400)",
+            "This is a pre-release test build - use at your own risk",
+            "Warning: Unrecognised block version being mined",
+        ]));
+        assert_eq!(n.len(), 4);
+        for notice in &n {
+            assert!(notice.hidden_because.is_some(), "{notice:?}");
+            assert!(!notice.message.is_empty());
+            assert!(!notice.needs_attention);
+        }
+        assert!(n[0].message.contains("pacing"));
+        assert_eq!(
+            n[0].raw,
+            "Cadence burst hold active: pacing background validation"
+        );
+    }
+
+    #[test]
+    fn all_notices_shows_what_the_home_screen_shows_unhidden() {
+        let n = all_notices(&info_with(&[
+            "Warning: Found invalid chain more than 6 blocks longer than our best chain.",
+        ]));
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0].hidden_because, None);
+        assert!(n[0].message.contains("longer chain"));
+    }
+
+    #[test]
+    fn hiding_did_not_change_for_the_home_screen() {
+        for raw in [
+            "Cadence burst hold active",
+            "Deep reorg detected",
+            "pre-release test build",
+            "attempting to activate unknown new rules",
+            "Unrecognised block version",
+        ] {
+            assert_eq!(classify(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn notice_sentences_are_plain() {
+        for raw in [
+            "Cadence burst hold",
+            "Deep reorg detected",
+            "pre-release test build",
+            "Unrecognised block version",
+        ] {
+            let n = &all_notices(&info_with(&[raw]))[0];
+            assert!(
+                !n.message.contains('\u{2014}') && !n.hidden_because.unwrap().contains('\u{2014}')
+            );
+        }
     }
 }

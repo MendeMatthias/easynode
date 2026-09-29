@@ -31,6 +31,12 @@
             <circle cx="12" cy="16.6" r="0.6" fill="currentColor" stroke="none"></circle>
           </svg>
         </button>
+        <button id="tools-btn" class="icon-btn" type="button" aria-label="Tools" aria-haspopup="dialog" title="Tools">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L4 17v3h3l5.3-5.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.1-.6-.6-2.1z"></path>
+          </svg>
+        </button>
         <button id="wallet-btn" class="icon-btn" type="button" aria-label="Wallet" aria-haspopup="dialog" title="Wallet" hidden>
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
                stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -937,6 +943,48 @@
             The bigger picture — global network stats <span class="link-ext" aria-hidden="true">↗</span>
             <span class="ask-cite link-row-cite"><span class="cite-dot cite-dot-ext"></span> via btxprice.com — an external site, not your node</span>
           </button>
+        </div>
+      </div>
+
+      <!-- ── Tools overlay ───────────────────────────────────────────── -->
+      <div class="overlay" id="tools-overlay" hidden>
+        <div class="overlay-panel ask-panel" role="dialog" aria-modal="true" aria-labelledby="tools-title">
+          <div class="overlay-head">
+            <h2 id="tools-title">Tools</h2>
+            <button id="tools-close" class="icon-btn" type="button" aria-label="Close">✕</button>
+          </div>
+          <p class="tools-now" id="tools-now"></p>
+
+          <h3 class="tools-h">Quick actions</h3>
+          <div class="tools-actions">
+            <button id="tools-restart" class="btn-secondary" type="button">Restart node</button>
+            <button id="tools-fetch" class="btn-secondary" type="button">Fetch a stuck block</button>
+            <button id="tools-open-folder" class="btn-secondary" type="button">Open data folder</button>
+            <button id="tools-notices-btn" class="btn-secondary" type="button" aria-expanded="false">Engine notices</button>
+          </div>
+          <p class="setting-result" id="tools-action-result" hidden></p>
+          <div class="tools-notices" id="tools-notices" hidden></div>
+
+          <h3 class="tools-h">Diagnostics</h3>
+          <button id="tools-diag-btn" class="btn-secondary" type="button">Copy diagnostics</button>
+          <p class="tools-note">Shows what it copies first. Nothing is uploaded; you choose where to paste it.</p>
+          <pre class="tools-pre" id="tools-diag" hidden></pre>
+
+          <details class="tools-console">
+            <summary>Command window (advanced)</summary>
+            <p class="tools-note">Runs a short list of read-only node commands. Type help to see them.</p>
+            <div class="tools-console-row">
+              <input id="tools-line" type="text" spellcheck="false" autocomplete="off" aria-label="Command" placeholder="getblockchaininfo" />
+              <button id="tools-run" class="btn-secondary" type="button">Run</button>
+            </div>
+            <div class="tools-confirm" id="tools-confirm" hidden>
+              <p id="tools-confirm-text"></p>
+              <button id="tools-confirm-yes" class="btn-secondary" type="button">Yes, do it</button>
+              <button id="tools-confirm-no" class="btn-secondary" type="button">Cancel</button>
+            </div>
+            <button id="tools-copy-all" class="link-row" type="button">Copy all</button>
+            <div class="tools-history" id="tools-history"></div>
+          </details>
         </div>
       </div>
 
