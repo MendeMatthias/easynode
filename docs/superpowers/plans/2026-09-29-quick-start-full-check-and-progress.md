@@ -2,17 +2,26 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Amended 2026-09-29 (night).** The plan was written at `origin/main` `b008f98`. Three things changed:
+>
+> 1. **Owner decision A (29 September): "preselect Quick start on Macs, Full check on NVIDIA machines".** Engine 0.34.9 does not move a refused Mac to Quick start by itself, and a `local_accelerator_failure` is not recorded as a refusal. So `Backend::may_check_blocks` (Metal and Cuda) still decides whether Full check *can* be picked, and a new `Backend::full_check_first` (Cuda only), shipped as the status field `full_check_first`, decides which choice is selected first. Cpu: Quick start, Full check greyed out with the reason, as before. Changed: Global Constraints, Decisions 5 and 6 and a new Decision 10, Tasks 2, 5, 8, 9, 11 and 12 (and one type anchor in Task 10), the coverage table, and the third bullet of "Where the design does not match the code", which this resolves. Checked: a Mac that keeps the preselected Quick start gets the `.follow-signatures` marker (`may_check_blocks` is true on Metal), so it follows signatures from its first start instead of trying the chip; Task 2's test now shows the Mac case by name.
+> 2. **Owner decision B (29 September): "Wizard copy says 'from a recent signed snapshot' until a second operator is on the list."** The line under the choices is now "Both start from a recent signed snapshot. Full check then checks every new block on this computer's graphics card and checks the older history in the background. You can switch later in Settings." Changed: Global Constraints, Task 9's markup, Task 12's screen check, and the second bullet of "Where the design does not match the code". The changelog and the tests never quoted the line.
+> 3. **Rebased onto `origin/main` `aed8755` (Tools, #154).** Every line citation and find-this-text anchor was re-checked there. Tools moved `main.ts` down by one line after its imports, `index.html` by six after the header, `lib.rs` by eight, the `node.rs` tests by 29 and the `node_api.rs` tests by 22; `commands.rs`, `state.rs`, `role.rs`, `backend.rs`, `catchup-trend.ts` and `styles.css` anchors did not move. The expected test counts now include the tests Tools added. Tasks 3 and 4 say which anchor to use if #160 (`claude/role-card-not-at-tip`, not merged yet) lands first. Task 10 notes that Tools reads the chain card.
+>
+> The amended code blocks and counts were not run; see "Dry run" at the end.
+
 **Goal:** Build spec C of easyNode 0.7.0 as approved on 2026-09-29: the setup screen asks Quick start or Full check and hands the answer to `begin_setup`; the status screen shows the background check of the snapshot's older history as one line and a thin bar; a validating node on a signed snapshot says its older history is still being checked; the stale-tip card stays calm while the gap closes; and a Mac whose chip the engine refused is told so once.
 
-**Architecture:** Every rule is a small pure function with its own tests: the history check and the base-height cache in `btx_core::node_api`, the start choice in `btx_core::node` and `btx_core::backend`, the role sentence in `btx_core::role`, the stale card in `catchup-trend.ts`, and the history line and setup-screen rules in two new TypeScript modules. The Tauri shell only wires them: the refresher projects `getchainstates` into one new `AppState` slot, `get_node_status` ships three new fields, and `begin_setup` takes an optional choice. `main.ts` lays the answers out in the existing wizard and status screen.
+**Architecture:** Every rule is a small pure function with its own tests: the history check and the base-height cache in `btx_core::node_api`, the start choice in `btx_core::node` and `btx_core::backend`, the role sentence in `btx_core::role`, the stale card in `catchup-trend.ts`, and the history line and setup-screen rules in two new TypeScript modules. The Tauri shell only wires them: the refresher projects `getchainstates` into one new `AppState` slot, `get_node_status` ships four new fields, and `begin_setup` takes an optional choice. `main.ts` lays the answers out in the existing wizard and status screen.
 
 **Tech Stack:** Rust (`crates/btx-core`, Tauri 2 shell in `apps/node/src-tauri`), TypeScript with Vite and Vitest (`apps/node`), plain HTML and CSS.
 
-**Source of the requirements:** `docs/decisions/2026-09-29-quick-start-full-check-and-progress.md` on this branch (all three "Choices for the owner" approved as proposed), and sections 7 and 8 of `docs/decisions/2026-09-29-every-node-starts-near-the-tip.md` on `origin/claude/cosigned-snapshots`.
+**Source of the requirements:** `docs/decisions/2026-09-29-quick-start-full-check-and-progress.md` on this branch (all three "Choices for the owner" approved as proposed, then choice 1 and the wizard line changed by the owner's decisions A and B of 29 September, see the amendment note above), and sections 7 and 8 of `docs/decisions/2026-09-29-every-node-starts-near-the-tip.md` on `origin/claude/cosigned-snapshots`.
 
 ## Global Constraints
 
-- Branch: `claude/ui-start-choice-and-progress`. It holds only the decision document on top of `origin/main` at `b008f98`. Every path below is relative to the repository root; every cited line number is on `origin/main`.
+- Branch: `claude/ui-start-choice-and-progress`. It holds only the decision document and this plan on top of `origin/main` at `b008f98`. Before Task 1, rebase it onto `origin/main` at `aed8755` (Tools, #154): its two commits touch only these two documents, which Tools does not, so the rebase is clean. Every path below is relative to the repository root; every cited line number is on `origin/main` at `aed8755`.
+- If #160 (`claude/role-card-not-at-tip`, "At the tip only when the clock and the signed frontier agree") merges before this work starts, rebase onto it too. It moves two anchors in Task 3 (`role.rs`) and one in Task 4 (`commands.rs`); each task says what to find instead. It also adds three `btx-core` library tests (all in `role.rs`), so add 3 to every `btx-core` library count below. Line numbers in `commands.rs` after line 1032 and in `role.rs` after line 45 move with it; the text anchors do not, except the three named in Tasks 3 and 4.
 - Commits: one per task, message ends with a blank line and `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Prefixes follow the log: `core:` for `crates/btx-core`, `node:` for `apps/node`, `changelog:` for the changelog.
 - CI gates, run before each commit for the part the task touched:
   - `crates/btx-core`: `cargo fmt --all --check`, `cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious`, `cargo test --locked`.
@@ -20,19 +29,23 @@
   - `apps/node`: `npx tsc --noEmit`, `npm test`, `npx vite build`.
 - The window stays 560x780. No new top-level screens and no new overlays (the only new overlay in 0.7.0 is Tools, decided separately). The status screen stays home; every new line sits in the existing scrolling `.screen`.
 - User-facing copy: friendly, simple, no hype, no guarantees, **no em-dashes**. Existing strings that already contain one (`catchupLine`'s "still catching up — ") are not touched.
-- Copy, verbatim from the design:
+- Copy, verbatim from the design, except the line under the choices, which is the owner's (decision B):
   - Choice 1: "Quick start", with "Follows signatures, ready in minutes."
   - Choice 2: "Full check", with "Validates every block, takes longer the first time."
-  - The line under them: "Both start from a snapshot confirmed by two node operators. Full check then checks every new block on this computer's graphics card and checks the older history in the background. You can switch later in Settings."
+  - The line under them: "Both start from a recent signed snapshot. Full check then checks every new block on this computer's graphics card and checks the older history in the background. You can switch later in Settings." (The design's "confirmed by two node operators" comes back once a second operator is on the list.)
   - Full check greyed out: "This computer has no graphics card the BTX engine can check blocks with."
   - Refused Mac, once: "This Mac's graphics chip didn't pass the engine's check, so your node follows signatures. Nothing for you to do."
   - History line: "Checking older history: 131,200 of 225,927 (58%)" (numbers from the node). No time estimate.
   - Role line on a signed snapshot: "Checks every new block itself. Its older history is still being checked."
   - Stale card, trend not measured: "Checking whether your node is catching up..." (three full stops, as the design writes it), neutral, not amber.
   - Stale card, gap not closing: today's sentence followed by "It adds about A blocks an hour while the network adds about 40."
-  - Stale card, no newer block known: today's sentence unchanged (`apps/node/src-tauri/src/commands.rs:3145-3156`).
-- Names on the wire: `begin_setup` takes an optional argument `choice`, `"quick_start"` or `"full_check"`; no choice is setup as it is today. New status fields: `history_check` (`{ checked, base }` or null), `full_check_possible`, `chip_refused`.
-- Full check is selected first where the backend is Metal or Cuda (`Backend::may_check_blocks`), and cannot be picked on Cpu.
+  - Stale card, no newer block known: today's sentence unchanged (`apps/node/src-tauri/src/commands.rs:3145-3157`; `3162-3173` once #160 has merged).
+- Names on the wire: `begin_setup` takes an optional argument `choice`, `"quick_start"` or `"full_check"`; no choice is setup as it is today. New status fields: `history_check` (`{ checked, base }` or null), `full_check_possible`, `full_check_first`, `chip_refused`.
+- Which choice the setup screen offers and selects first (the owner's decision A of 29 September):
+  - Cuda (an NVIDIA card the bundled engine can use): Full check selected first.
+  - Metal (an Apple Silicon Mac): Quick start selected first; Full check can still be picked.
+  - Cpu: Quick start; Full check greyed out, with the reason sentence.
+  - `Backend::may_check_blocks` (Metal and Cuda) decides whether Full check can be picked; `Backend::full_check_first` (Cuda only) decides whether it is selected first. The window reads both from the status (`full_check_possible`, `full_check_first`) and holds no hardware rule of its own.
 - The history check's base is the snapshot block's own height, from `getblockheader`, never the compiled 219,000.
 - A signed snapshot is detected by the file `<datadir>/chainstate_snapshot/attested_assumeutxo`.
 - Out of scope: finding, checking, downloading or loading any snapshot (spec B), and the Tools overlay.
@@ -43,30 +56,31 @@
 2. **"Is behind" means the node knows of at least one block beyond its tip** (`blocks_behind > 0` on `ready`, `headers - height > 0` on `syncing`). Anything else is row 4.
 3. **The role sentence replaces the validation note rather than being appended to it.** The current note says the node "takes nobody's word for the chain", which is not yet true on a signed snapshot. The value ("Checking every block itself") and the green verdict stay.
 4. **The role sentence shows while the history check runs and the `attested_assumeutxo` file exists.** So it goes the moment the engine reports the check done, not only at the next restart, when the engine deletes the file.
-5. **Quick start on a machine that cannot check blocks writes no marker.** That machine follows signatures anyway, and a marker would make the Settings switch appear and do nothing.
-6. **Whether Full check is possible is asked of the host once per app run** (`OnceLock`), because `node_host_backend` reads the loader cache and logs on every call. The `EASYBTX_NODE_TRUSTED_MIRROR` override is not consulted for the setup screen.
+5. **Quick start on a machine that cannot check blocks writes no marker.** That machine follows signatures anyway, and a marker would make the Settings switch appear and do nothing. A Mac is not such a machine: `may_check_blocks` is true on Metal, so a Mac that keeps the preselected Quick start (decision A) gets the marker, follows signatures from its first start, and has the Settings switch to move to Full check. Without the marker, `launches_as_mirror` would try the chip at the first start, which is exactly what Quick start on a Mac is meant to avoid.
+6. **The host's backend is asked once per app run** (`OnceLock`), because `node_host_backend` reads the loader cache and logs on every call. Both setup answers, whether Full check is possible and whether it is selected first, come from that one reading. The `EASYBTX_NODE_TRUSTED_MIRROR` override is not consulted for the setup screen.
 7. **The history line stays hidden until the snapshot's own height has been read**, never shown against a guessed base, and its percentage is rounded down so it never reads 100% before the engine says done. A failed `getchainstates` keeps the last answer.
 8. **The refused-Mac notice** shows when the app's refusal marker exists and the engine reports the node follows signatures (`rc_trusted_mirror`), with an OK button. OK is remembered per engine tag in `localStorage`, so a newer engine that tries the chip again and is refused again says so once more.
 9. **The follow-signatures marker file's text is reworded** to cover Quick start. No code reads the text.
+10. **What is selected first is decided in Rust, next to what can be picked** (`Backend::full_check_first` beside `Backend::may_check_blocks`, shipped as `full_check_first` beside `full_check_possible`), so the owner's rule (decision A: Full check first on NVIDIA, Quick start first on a Mac) lives in one tested place and the window only lays it out.
 
 ## Where the design does not match the code
 
 These are reported, not fixed, by this plan:
 
-- **A refused Mac is not moved to Quick start on the engine that ships.** The design says a Mac whose chip the engine refuses "moves to Quick start, as it does today". Since 0.34.5 the engine does not refuse at start; it logs a degraded start and keeps running (`crates/btx-core/src/node.rs:1365-1397`, `node_allows_degraded_matmul_start`; the app pins `v0.34.9`, `commands.rs:311`). The app records a refusal only for an init refusal with `canary=missing_golden` (`node.rs:1665`, `commands.rs:1410-1432`), and a `local_accelerator_failure` like the owner's M2 Pro on 29 September is deliberately excluded (`node.rs:4410-4440`). Such a Mac shows "NOT FOLLOWING" and gets the two-click "Follow signatures instead" offer (`main.ts:783-811`, `validation.ts:222-230`). So the "Nothing for you to do" notice, built here exactly as approved, will only appear on the older path. Making the degraded start move the node on its own would reverse the owner's 2026-09-26 rule "offered, never done for them" and `node.rs`'s rule that a device fault must not fall back silently. That is a new decision, not part of this plan.
-- **The wizard's first sentence depends on spec B and on a second operator.** "Both start from a snapshot confirmed by two node operators" is true only once spec B loads confirmed snapshots and a second operator is on the list (spec B, section 1: "While the list holds a single operator, nothing counts as confirmed and every node uses the fallbacks"). Today a validating node starts at the compiled 219,000 and a mirror at the single-signed 225,927. Do not release Task 9 before that holds, or ask the owner for fallback wording.
-- **Full check first on every Apple Silicon Mac** (approved choice 1) will, on 0.34.9, put Macs whose chip fails the check into the degraded state above. The owner's M2 Pro is one. Worth knowing before release.
+- **A refused Mac is not moved to Quick start on the engine that ships.** The design says a Mac whose chip the engine refuses "moves to Quick start, as it does today". Since 0.34.5 the engine does not refuse at start; it logs a degraded start and keeps running (`crates/btx-core/src/node.rs:1365-1397`, `node_allows_degraded_matmul_start`; the app pins `v0.34.9`, `commands.rs:311`). The app records a refusal only for an init refusal with `canary=missing_golden` (`node.rs:1665`, `commands.rs:1410-1432`), and a `local_accelerator_failure` like the owner's M2 Pro on 29 September is deliberately excluded (`node.rs:4439-4468`). Such a Mac shows "NOT FOLLOWING" and gets the two-click "Follow signatures instead" offer (`main.ts:784-812`, `validation.ts:222-230`). So the "Nothing for you to do" notice, built here exactly as approved, will only appear on the older path. Making the degraded start move the node on its own would reverse the owner's 2026-09-26 rule "offered, never done for them" and `node.rs`'s rule that a device fault must not fall back silently. That is a new decision, not part of this plan. The owner weighed this on 29 September and chose decision A instead (Quick start first on a Mac, see the third bullet); the notice stays built as approved.
+- **The wizard's first sentence (resolved by the owner's decision B, 29 September).** The design's "Both start from a snapshot confirmed by two node operators" is true only once spec B loads confirmed snapshots and a second operator is on the list (spec B, section 1: "While the list holds a single operator, nothing counts as confirmed and every node uses the fallbacks"). The owner chose the wording for 0.7.0: "Wizard copy says 'from a recent signed snapshot' until a second operator is on the list." This plan uses "Both start from a recent signed snapshot." One condition is left: the sentence is true for Full check only where a validating node really starts from a signed snapshot. On `aed8755` a validating node starts at the compiled 219,000, which carries no signature, and a mirror at the single-signed 225,927; with spec B (section 9) every node tries a confirmed snapshot, then the pinned 225,927 pair, and only then the compiled 219,000. So Task 9 still ships with spec B's loading path, not before it. "Recent" also ages: the pinned pair is from 21 September and falls about 960 blocks further behind the tip each day, so the word stays true only while newer snapshots keep being published. When a second operator is on the list, the design's sentence comes back.
+- **Full check first on every Apple Silicon Mac (resolved by the owner's decision A, 29 September).** Approved choice 1 would have put, on 0.34.9, every Mac whose chip fails the engine's check into the degraded state above; the owner's M2 Pro is one. The owner chose Quick start first on a Mac and Full check first on an NVIDIA machine, and this plan builds that (`Backend::full_check_first`, Tasks 2, 5, 8 and 9). A Mac owner who picks Full check by hand can still land in the degraded state, and then gets the existing two-click offer, not the chip notice. Worth knowing before release: this changes today's default on a Mac. A fresh Mac setup has so far tried to check blocks; one that keeps Quick start follows signatures, cannot sign, and keeps the `.follow-signatures` marker across engine upgrades (node upgrades clear only the refusal marker), so a Mac whose chip would pass stays a mirror until its owner switches in Settings.
 
 ## File structure
 
 | File | Change | Responsibility |
 |---|---|---|
 | `crates/btx-core/src/node_api.rs` | modify | `ChainStates::unchecked_snapshot_base`, `HistoryCheck`, `history_check`, `get_block_height`, `refresh_history_check`, and their tests |
-| `crates/btx-core/src/backend.rs` | modify | `Backend::may_check_blocks` and its test |
+| `crates/btx-core/src/backend.rs` | modify | `Backend::may_check_blocks`, `Backend::full_check_first` and their tests |
 | `crates/btx-core/src/node.rs` | modify | `StartChoice`, `apply_start_choice`, `on_signed_snapshot`, the marker text, and their tests |
 | `crates/btx-core/src/role.rs` | modify | `NodeRole::with_signed_snapshot` and the validation sentence on a signed snapshot, with its test |
 | `apps/node/src-tauri/src/state.rs` | modify | the `history_check` slot |
-| `apps/node/src-tauri/src/commands.rs` | modify | refresher projection, slot clearing, `NodeStatusInfo` fields, role wiring, `begin_setup(choice)`, `full_check_possible` |
+| `apps/node/src-tauri/src/commands.rs` | modify | refresher projection, slot clearing, `NodeStatusInfo` fields, role wiring, `begin_setup(choice)`, `setup_backend`, `full_check_possible`, `full_check_first` |
 | `apps/node/src-tauri/src/lib.rs` | modify | the E2E seam passes no choice |
 | `apps/node/src/catchup-trend.ts` | modify | `paceSentence` (shared), `staleCard`, `CHECKING_CATCHUP` |
 | `apps/node/src/catchup-trend.test.ts` | modify | one test per table row, the crossing, the restart, and `paceSentence` |
@@ -86,7 +100,7 @@ Task order: 1, 2, 3 (core) then 4, 5 (shell) then 6, 7, 8 (pure TypeScript) then
 ### Task 1: The history check, pure (`btx-core`)
 
 **Files:**
-- Modify: `crates/btx-core/src/node_api.rs:220-225` (inside `impl ChainStates`), `:227` (before `get_blockchain_info`), tests after `:1457-1479`
+- Modify: `crates/btx-core/src/node_api.rs:220-225` (inside `impl ChainStates`), `:227` (before `get_blockchain_info`), tests after `:1479-1501`
 
 **Interfaces:**
 - Consumes: `ChainStates`, `ChainstateEntry`, `Rpc`, `AppResult`, `json!` (all already in `node_api.rs`).
@@ -99,7 +113,7 @@ Task order: 1, 2, 3 (core) then 4, 5 (shell) then 6, 7, 8 (pure TypeScript) then
 
 - [ ] **Step 1: Write the failing tests**
 
-In `crates/btx-core/src/node_api.rs`, in `mod tests`, find the end of `fully_validated_single_chainstate_has_no_snapshot` (lines 1477-1479):
+In `crates/btx-core/src/node_api.rs`, in `mod tests`, find the end of `fully_validated_single_chainstate_has_no_snapshot` (lines 1500-1501; Tools added `PeerInfo.synced_headers`/`synced_blocks` and a test above it, and the test module now imports `serde_json::{json, Value}` itself, which the code below uses as is):
 
 ```rust
         assert!(cs.active().unwrap().validated);
@@ -379,7 +393,7 @@ pub async fn refresh_history_check(
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run (in `crates/btx-core`): `cargo test --locked --lib node_api::`
-Expected: PASS, `test result: ok. 42 passed`, including `history_check_is_nothing_without_a_snapshot`, `history_check_reports_a_snapshot_being_checked`, `history_check_is_nothing_once_the_check_is_done`, `history_check_counts_to_the_snapshots_own_base`, `block_height_is_read_from_the_header`, `the_snapshots_height_is_read_once_per_snapshot`.
+Expected: PASS, `test result: ok. 43 passed` (37 on `aed8755`, Tools' `peer_sync_heights_decode_and_default_to_minus_one` among them, plus these 6), including `history_check_is_nothing_without_a_snapshot`, `history_check_reports_a_snapshot_being_checked`, `history_check_is_nothing_once_the_check_is_done`, `history_check_counts_to_the_snapshots_own_base`, `block_height_is_read_from_the_header`, `the_snapshots_height_is_read_once_per_snapshot`.
 
 - [ ] **Step 5: Format and lint**
 
@@ -401,18 +415,19 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `crates/btx-core/src/backend.rs:25-31` (inside `impl Backend`), tests after `:659-666`
-- Modify: `crates/btx-core/src/node.rs:1796-1801` (doc), `:1818-1833` (marker text, then new items after it), tests after `:4551-4579`
+- Modify: `crates/btx-core/src/node.rs:1796-1801` (doc), `:1818-1833` (marker text, then new items after it), tests after `:4580-4608`
 
 **Interfaces:**
 - Consumes: `set_follows_signatures_by_choice`, `follows_signatures_by_choice`, `launches_as_mirror`, `Backend` (existing).
 - Produces:
-  - `impl Backend { pub fn may_check_blocks(&self) -> bool }` (Metal and Cuda true, Cpu false)
+  - `impl Backend { pub fn may_check_blocks(&self) -> bool }` (Metal and Cuda true, Cpu false): whether Full check can be picked
+  - `impl Backend { pub fn full_check_first(&self) -> bool }` (Cuda true, Metal and Cpu false): whether Full check is selected first (the owner's decision A)
   - `#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)] #[serde(rename_all = "snake_case")] pub enum StartChoice { QuickStart, FullCheck }` in `btx_core::node`
   - `pub fn apply_start_choice(datadir: &Path, choice: StartChoice, may_check_blocks: bool) -> std::io::Result<()>` in `btx_core::node`
 
 - [ ] **Step 1: Write the failing tests**
 
-In `crates/btx-core/src/backend.rs`, at the end of `mod host_backend_tests`, find (lines 663-667):
+In `crates/btx-core/src/backend.rs`, at the end of `mod host_backend_tests`, find (lines 664-667):
 
 ```rust
         assert_eq!(pc_host_backend(false, true), Backend::Cpu);
@@ -436,10 +451,22 @@ Replace with:
         assert!(Backend::Cuda.may_check_blocks());
         assert!(!Backend::Cpu.may_check_blocks());
     }
+
+    /// Full check is selected first only on an NVIDIA card. A Mac may still
+    /// pick it, but starts on Quick start, because engine 0.34.9 leaves a Mac
+    /// whose chip fails its check degraded rather than moving it (the owner's
+    /// decision of 2026-09-29).
+    #[test]
+    fn only_an_nvidia_card_has_full_check_selected_first() {
+        assert!(Backend::Cuda.full_check_first());
+        assert!(!Backend::Metal.full_check_first());
+        assert!(Backend::Metal.may_check_blocks(), "a Mac can still pick it");
+        assert!(!Backend::Cpu.full_check_first());
+    }
 }
 ```
 
-In `crates/btx-core/src/node.rs`, find the end of `the_owners_choice_to_follow_signatures_decides_the_launch` (lines 4577-4579):
+In `crates/btx-core/src/node.rs`, find the end of `the_owners_choice_to_follow_signatures_decides_the_launch` (lines 4606-4608):
 
 ```rust
         // Withdrawing twice is not an error.
@@ -461,15 +488,25 @@ and insert directly after it:
         let dir = tmp.path();
         let btxd = Path::new("/x/btx/v0.34.9/mac/btxd");
 
-        apply_start_choice(dir, StartChoice::QuickStart, true).unwrap();
+        // A Mac that keeps the preselected Quick start: Metal may check
+        // blocks, so the marker is written and the node follows signatures
+        // from its first start instead of trying the chip. An NVIDIA machine
+        // that picks Quick start is the same.
+        let mac = Backend::Metal.may_check_blocks();
+        apply_start_choice(dir, StartChoice::QuickStart, mac).unwrap();
         assert!(follows_signatures_by_choice(dir));
         assert!(launches_as_mirror(btxd, dir, Backend::Metal));
+        assert!(launches_as_mirror(btxd, dir, Backend::Cuda));
 
-        apply_start_choice(dir, StartChoice::FullCheck, true).unwrap();
+        // A Mac that picks Full check: no marker, the chip is tried.
+        apply_start_choice(dir, StartChoice::FullCheck, mac).unwrap();
         assert!(!follows_signatures_by_choice(dir));
         assert!(!launches_as_mirror(btxd, dir, Backend::Metal));
 
-        apply_start_choice(dir, StartChoice::QuickStart, false).unwrap();
+        // No usable GPU: Quick start writes nothing, and the node follows
+        // signatures anyway.
+        let no_gpu = Backend::Cpu.may_check_blocks();
+        apply_start_choice(dir, StartChoice::QuickStart, no_gpu).unwrap();
         assert!(!follows_signatures_by_choice(dir));
         assert!(launches_as_mirror(btxd, dir, Backend::Cpu));
 
@@ -495,8 +532,8 @@ and insert directly after it:
 
 - [ ] **Step 2: Run the tests to see them fail**
 
-Run (in `crates/btx-core`): `cargo test --locked --lib -- the_setup_choice the_window_names only_a_graphics`
-Expected: FAIL to compile with `cannot find type `StartChoice` in this scope` and `no method named `may_check_blocks``.
+Run (in `crates/btx-core`): `cargo test --locked --lib -- the_setup_choice the_window_names only_a_graphics only_an_nvidia`
+Expected: FAIL to compile with `cannot find type `StartChoice` in this scope`, `no method named `may_check_blocks`` and `no method named `full_check_first``.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -530,6 +567,16 @@ Replace with:
     /// (`node::node_rc_status`); this is only what the setup screen can offer.
     pub fn may_check_blocks(&self) -> bool {
         !matches!(self, Backend::Cpu)
+    }
+
+    /// Whether the setup screen selects Full check first on this backend: only
+    /// on an NVIDIA card. A Mac may check blocks and can still pick Full
+    /// check, but engine 0.34.9 does not move a Mac whose chip fails its check
+    /// to Quick start by itself (a `local_accelerator_failure` is not recorded
+    /// as a refusal), so a Mac starts on Quick start (the owner's decision of
+    /// 2026-09-29).
+    pub fn full_check_first(&self) -> bool {
+        matches!(self, Backend::Cuda)
     }
 ```
 
@@ -606,6 +653,8 @@ pub enum StartChoice {
 ///
 /// Quick start writes the follow-signatures marker on a machine that may check
 /// blocks (`Backend::may_check_blocks`), so Settings can take it back later.
+/// That includes a Mac, where Quick start is selected first: without the
+/// marker, [`launches_as_mirror`] would try the chip at the first start.
 /// Full check removes it. A machine that cannot check blocks gets no marker
 /// either way: it follows signatures anyway, and a marker there would show a
 /// Settings switch that changes nothing.
@@ -623,8 +672,8 @@ pub fn apply_start_choice(
 
 - [ ] **Step 4: Run the tests to see them pass**
 
-Run (in `crates/btx-core`): `cargo test --locked --lib -- the_setup_choice the_window_names only_a_graphics the_owners_choice`
-Expected: PASS, `test result: ok. 4 passed`.
+Run (in `crates/btx-core`): `cargo test --locked --lib -- the_setup_choice the_window_names only_a_graphics only_an_nvidia the_owners_choice`
+Expected: PASS, `test result: ok. 5 passed`.
 
 - [ ] **Step 5: Format, lint, full suite**
 
@@ -635,7 +684,7 @@ Expected: no fmt diff; clippy `Finished`; `test result: ok.` with 0 failed. `nod
 
 ```bash
 git add crates/btx-core/src/backend.rs crates/btx-core/src/node.rs
-git commit -m "core: the setup choice writes or removes the follow-signatures marker
+git commit -m "core: the setup choice writes or removes the follow-signatures marker, and Full check comes first only on an NVIDIA card
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -646,7 +695,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `crates/btx-core/src/node.rs` (a new function after `apply_start_choice` from Task 2; a test after `the_window_names_the_choice`)
-- Modify: `crates/btx-core/src/role.rs:174-175` (field), `:289-292` (constructor), `:309-312` (builder), `:353-356` (validation line), test after `:829-845`
+- Modify: `crates/btx-core/src/role.rs:174-175` (field), `:289-292` (constructor), `:309-312` (builder), `:353-356` (validation line), test after `:829-845` (all unchanged by Tools)
+
+If #160 has merged first, two of these anchors read differently; Step 3 gives both. #160 leaves `with_distinct_signers`, `validation_line`, the test anchor and the wire-shape test as they are.
 
 **Interfaces:**
 - Consumes: `StartChoice` tests from Task 2 (only as an anchor).
@@ -812,6 +863,16 @@ Replace with (the field is `#[serde(skip)]` because `the_wire_shape_is_what_the_
 }
 ```
 
+If #160 has merged first, the last field is `signed_frontier` instead; find
+
+```rust
+    #[serde(skip)]
+    signed_frontier: Option<AttestedTip>,
+}
+```
+
+and put the same doc comment, `#[serde(skip)]` and `on_signed_snapshot: bool,` between `signed_frontier: Option<AttestedTip>,` and the closing `}`.
+
 Find the end of the `NodeRole` literal in `node_role` (lines 289-292):
 
 ```rust
@@ -830,6 +891,8 @@ Replace with:
     }
 }
 ```
+
+If #160 has merged first, the literal ends `tip_age_secs: None,` then `signed_frontier: None,` after `distinct_signers: None,`; add `on_signed_snapshot: false,` after `signed_frontier: None,` instead.
 
 Find `with_distinct_signers` (lines 309-312):
 
@@ -890,7 +953,7 @@ Expected: PASS, `a_signed_snapshot_is_read_from_the_engines_own_file ... ok` and
 - [ ] **Step 5: Format, lint, full suite**
 
 Run (in `crates/btx-core`): `cargo fmt --all --check && cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious && cargo test --locked`
-Expected: no fmt diff; clippy `Finished`; `test result: ok. 559 passed; 0 failed; 2 ignored` for the library (548 before Task 1; the wire-shape test included).
+Expected: no fmt diff; clippy `Finished`; `test result: ok. 624 passed; 0 failed; 2 ignored` for the library (612 before Task 1: the dry run's 548 on `b008f98` plus the 64 tests Tools added; the 12 from Tasks 1 to 3 and the wire-shape test included). If #160 has merged first: 627 and 615. These counts are derived by counting test attributes on `origin/main` (calibrated against the dry run on `b008f98`, where the same count gave 548 and 2 ignored on a Mac), not run; if yours differ only by tests you did not write, trust the run.
 
 - [ ] **Step 6: Commit**
 
@@ -907,7 +970,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `apps/node/src-tauri/src/state.rs:699` (slot), `:788` (constructor)
-- Modify: `apps/node/src-tauri/src/commands.rs:1036-1038` (clear on start), `:1534` and `:1548` (refresher locals), `:1696-1697` (projection), `:2537-2539` (clear on stop), `:2745` (struct field), `:3115-3127` (role), `:3272` (struct literal)
+- Modify: `apps/node/src-tauri/src/commands.rs:1037-1038` (clear on start), `:1534` and `:1548` (refresher locals), `:1696-1697` (projection), `:2538-2539` (clear on stop), `:2745` (struct field), `:3115-3127` (role), `:3272` (struct literal)
 
 **Interfaces:**
 - Consumes: `btx_core::node_api::{HistoryCheck, refresh_history_check}` (Task 1), `btx_core::node::on_signed_snapshot` and `NodeRole::with_signed_snapshot` (Task 3).
@@ -919,7 +982,7 @@ This task is wiring. The rules it wires are tested in Tasks 1 and 3; the shell h
 
 Run: `mkdir -p apps/node/src-tauri/resources/node-pkg && test -n "$(ls -A apps/node/src-tauri/resources/node-pkg)" || echo "CI placeholder. Not a node package." > apps/node/src-tauri/resources/node-pkg/CI-PLACEHOLDER`
 Then (in `apps/node/src-tauri`): `cargo test --locked`
-Expected: `test result: ok. 85 passed; 0 failed; 1 ignored`. The placeholder path is in `.gitignore:18` and is never committed.
+Expected: `test result: ok. 108 passed; 0 failed; 1 ignored` (85 on `b008f98` plus the 23 tests in Tools' `tools.rs`; counted, not run). The placeholder path is in `.gitignore:18` and is never committed.
 
 - [ ] **Step 2: Add the slot**
 
@@ -956,7 +1019,7 @@ Replace with:
 
 - [ ] **Step 3: Clear it on every start and stop**
 
-In `apps/node/src-tauri/src/commands.rs` the block below appears twice, in `start_node_inner` (lines 1036-1038) and in `stop_node_inner` (lines 2537-2539):
+In `apps/node/src-tauri/src/commands.rs` the block below appears twice, in `start_node_inner` (lines 1037-1038) and in `stop_node_inner` (lines 2538-2539). (#160 adds a `signed_frontier` line above each, which leaves these two lines as they are.)
 
 ```rust
     *state.tip_median_time.lock().await = None;
@@ -1091,6 +1154,16 @@ Replace with:
     });
 ```
 
+If #160 has merged first: the `let role` anchor above is unchanged (it sits at about line 3141, under #160's new tip-age and signed-frontier block, and the history check goes between that block and `let role`), but the chain now ends
+
+```rust
+        .with_tip_age(tip_age_secs)
+        .with_signed_frontier(signed_frontier.as_ref())
+    });
+```
+
+so find those three lines and add `.with_signed_snapshot(on_signed_snapshot)` after `.with_signed_frontier(signed_frontier.as_ref())`.
+
 In the `Ok(NodeStatusInfo { ... })` literal, find (lines 3271-3273):
 
 ```rust
@@ -1111,7 +1184,7 @@ Replace with:
 - [ ] **Step 6: Build, test, format, lint**
 
 Run (in `apps/node/src-tauri`): `cargo fmt --all --check && cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious && cargo test --locked`
-Expected: no fmt diff; clippy `Finished` without `error`; `test result: ok. 85 passed; 0 failed; 1 ignored`.
+Expected: no fmt diff; clippy `Finished` without `error`; `test result: ok. 108 passed; 0 failed; 1 ignored`.
 
 - [ ] **Step 7: Commit**
 
@@ -1128,11 +1201,13 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `apps/node/src-tauri/src/commands.rs:350-352` (helper after `node_backend`), `:2802` (fields), `:3299` (literal), `:3340-3343` (`begin_setup`), `:3365-3376` (`guarded_setup`), `:3392-3399` (`run_setup_pipeline`)
-- Modify: `apps/node/src-tauri/src/lib.rs:112`
+- Modify: `apps/node/src-tauri/src/lib.rs:120` (was 112; Tools registered its commands above it)
 
 **Interfaces:**
-- Consumes: `btx_core::node::{StartChoice, apply_start_choice, matmul_consensus_was_refused}` and `Backend::may_check_blocks` (Task 2).
-- Produces: `begin_setup(choice: Option<StartChoice>)` (JS: `invoke("begin_setup", { choice: "quick_start" | "full_check" })`); `guarded_setup(app, state, choice: Option<StartChoice>)`; `NodeStatusInfo.full_check_possible: bool`, `NodeStatusInfo.chip_refused: bool`; private `fn full_check_possible() -> bool`.
+- Consumes: `btx_core::node::{StartChoice, apply_start_choice, matmul_consensus_was_refused}`, `Backend::may_check_blocks` and `Backend::full_check_first` (Task 2).
+- Produces: `begin_setup(choice: Option<StartChoice>)` (JS: `invoke("begin_setup", { choice: "quick_start" | "full_check" })`); `guarded_setup(app, state, choice: Option<StartChoice>)`; `NodeStatusInfo.full_check_possible: bool`, `NodeStatusInfo.full_check_first: bool`, `NodeStatusInfo.chip_refused: bool`; private `fn setup_backend() -> Backend`, `fn full_check_possible() -> bool`, `fn full_check_first() -> bool`.
+
+No other caller of `guarded_setup` or `begin_setup` exists on `aed8755` (Tools adds none), so the two call sites below are all of them.
 
 Wiring again: `apply_start_choice` and the serde names are tested in Task 2; Task 12 checks that the window's click reaches `begin_setup` with the choice.
 
@@ -1153,17 +1228,30 @@ fn node_backend() -> Backend {
     btx_core::backend::node_host_backend()
 }
 
-/// Whether this machine may check blocks itself (`Backend::may_check_blocks`),
-/// asked of the host once per app run. `node_host_backend` reads the loader
-/// cache on a PC and logs its answer, which is too much for a status poll
-/// every 1.5 s, and the hardware does not change while the app is open.
+/// This machine's backend as the setup screen sees it, asked of the host once
+/// per app run. `node_host_backend` reads the loader cache on a PC and logs its
+/// answer, which is too much for a status poll every 1.5 s, and the hardware
+/// does not change while the app is open.
+fn setup_backend() -> Backend {
+    static BACKEND: std::sync::OnceLock<Backend> = std::sync::OnceLock::new();
+    *BACKEND.get_or_init(node_backend)
+}
+
+/// Whether this machine may check blocks itself (`Backend::may_check_blocks`):
+/// whether the setup screen lets the owner pick Full check.
 fn full_check_possible() -> bool {
-    static POSSIBLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *POSSIBLE.get_or_init(|| node_backend().may_check_blocks())
+    setup_backend().may_check_blocks()
+}
+
+/// Whether the setup screen selects Full check first
+/// (`Backend::full_check_first`): on an NVIDIA machine, not on a Mac, where
+/// Quick start comes first (the owner's decision of 2026-09-29).
+fn full_check_first() -> bool {
+    setup_backend().full_check_first()
 }
 ```
 
-- [ ] **Step 2: Two status fields**
+- [ ] **Step 2: Three status fields**
 
 In `pub struct NodeStatusInfo`, find (lines 2799-2802):
 
@@ -1185,6 +1273,11 @@ Replace with:
     /// know before the engine's first start (`full_check_possible`). The setup
     /// screen greys out Full check when it is false.
     pub full_check_possible: bool,
+    /// Whether the setup screen selects Full check first (`full_check_first`):
+    /// true on an NVIDIA machine, false on a Mac, where Quick start comes
+    /// first and Full check can still be picked. Read only while
+    /// `full_check_possible` is true.
+    pub full_check_first: bool,
     /// The engine refused this Mac's graphics chip at a start, and the app
     /// moved the node to following signatures
     /// (`btx_core::node::matmul_consensus_was_refused`). The status screen
@@ -1203,6 +1296,7 @@ Replace with:
 ```rust
         follow_signatures: btx_core::node::follows_signatures_by_choice(&datadir),
         full_check_possible: full_check_possible(),
+        full_check_first: full_check_first(),
         chip_refused: btx_core::node::matmul_consensus_was_refused(&datadir),
 ```
 
@@ -1307,7 +1401,7 @@ async fn run_setup_pipeline(
     }
 ```
 
-In `apps/node/src-tauri/src/lib.rs`, find (line 112):
+In `apps/node/src-tauri/src/lib.rs`, find (line 120):
 
 ```rust
                     if let Err(message) = commands::guarded_setup(&handle, &state).await {
@@ -1322,13 +1416,13 @@ Replace with:
 - [ ] **Step 4: Build, test, format, lint**
 
 Run (in `apps/node/src-tauri`): `cargo fmt --all --check && cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious && cargo test --locked`
-Expected: no fmt diff; clippy `Finished` without `error`; `test result: ok. 85 passed; 0 failed; 1 ignored`.
+Expected: no fmt diff; clippy `Finished` without `error`; `test result: ok. 108 passed; 0 failed; 1 ignored`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add apps/node/src-tauri/src/commands.rs apps/node/src-tauri/src/lib.rs
-git commit -m "node: begin_setup records Quick start or Full check before the first start
+git commit -m "node: begin_setup records Quick start or Full check before the first start, and the status says which one this machine selects first
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1712,7 +1806,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `export type StartChoice = "quick_start" | "full_check"`; `export const NO_GPU_REASON: string`; `export type StartChoiceView = { selected: StartChoice; fullCheckDisabled: boolean }`; `export function startChoiceView(fullCheckPossible: boolean, picked: StartChoice | null): StartChoiceView`; `export function setupArgs(choice: StartChoice): { choice: StartChoice }`; `export function chipNoticeVisible(chipRefused: boolean, followsSignatures: boolean, seenForTag: string | null, tag: string): boolean`.
+- Produces: `export type StartChoice = "quick_start" | "full_check"`; `export const NO_GPU_REASON: string`; `export type StartChoiceView = { selected: StartChoice; fullCheckDisabled: boolean }`; `export function startChoiceView(fullCheckPossible: boolean, fullCheckFirst: boolean, picked: StartChoice | null): StartChoiceView` (the two booleans are `NodeStatusInfo.full_check_possible` and `.full_check_first`, Task 5); `export function setupArgs(choice: StartChoice): { choice: StartChoice }`; `export function chipNoticeVisible(chipRefused: boolean, followsSignatures: boolean, seenForTag: string | null, tag: string): boolean`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1723,24 +1817,34 @@ import { describe, expect, it } from "vitest";
 import { NO_GPU_REASON, chipNoticeVisible, setupArgs, startChoiceView } from "./start-choice";
 
 describe("startChoiceView", () => {
-  it("selects Full check first where the machine may check blocks", () => {
-    expect(startChoiceView(true, null)).toEqual({ selected: "full_check", fullCheckDisabled: false });
+  it("selects Full check first on an NVIDIA machine", () => {
+    expect(startChoiceView(true, true, null)).toEqual({ selected: "full_check", fullCheckDisabled: false });
+  });
+
+  it("selects Quick start first on a Mac, and Full check can still be picked", () => {
+    expect(startChoiceView(true, false, null)).toEqual({ selected: "quick_start", fullCheckDisabled: false });
+    expect(startChoiceView(true, false, "full_check")).toEqual({
+      selected: "full_check",
+      fullCheckDisabled: false,
+    });
   });
 
   it("keeps the owner's pick across polls", () => {
-    expect(startChoiceView(true, "quick_start")).toEqual({
+    expect(startChoiceView(true, true, "quick_start")).toEqual({
       selected: "quick_start",
       fullCheckDisabled: false,
     });
-    expect(startChoiceView(true, "full_check").selected).toBe("full_check");
+    expect(startChoiceView(true, true, "full_check").selected).toBe("full_check");
   });
 
   it("does not let a machine with no usable GPU pick Full check", () => {
-    expect(startChoiceView(false, null)).toEqual({ selected: "quick_start", fullCheckDisabled: true });
-    expect(startChoiceView(false, "full_check")).toEqual({
+    expect(startChoiceView(false, false, null)).toEqual({ selected: "quick_start", fullCheckDisabled: true });
+    expect(startChoiceView(false, false, "full_check")).toEqual({
       selected: "quick_start",
       fullCheckDisabled: true,
     });
+    // Rust never says "first" without "possible", but if it did, greyed out wins.
+    expect(startChoiceView(false, true, null)).toEqual({ selected: "quick_start", fullCheckDisabled: true });
     expect(NO_GPU_REASON).toBe(
       "This computer has no graphics card the BTX engine can check blocks with.",
     );
@@ -1795,12 +1899,21 @@ export const NO_GPU_REASON = "This computer has no graphics card the BTX engine 
 
 export type StartChoiceView = { selected: StartChoice; fullCheckDisabled: boolean };
 
-/** Full check is selected first where the machine may check blocks, and
- *  cannot be picked where it cannot. The owner's own pick, once made, holds
- *  across polls. */
-export function startChoiceView(fullCheckPossible: boolean, picked: StartChoice | null): StartChoiceView {
+/** Which choice is selected, and whether Full check can be picked. Both
+ *  answers come from Rust (`full_check_possible`, `full_check_first`); the
+ *  owner's rule of 2026-09-29 behind them:
+ *  - an NVIDIA machine: Full check selected first;
+ *  - a Mac: Quick start selected first, Full check still there to pick;
+ *  - a machine that cannot check blocks: Quick start, Full check greyed out.
+ *  The owner's own pick, once made, holds across polls. */
+export function startChoiceView(
+  fullCheckPossible: boolean,
+  fullCheckFirst: boolean,
+  picked: StartChoice | null,
+): StartChoiceView {
   if (!fullCheckPossible) return { selected: "quick_start", fullCheckDisabled: true };
-  return { selected: picked ?? "full_check", fullCheckDisabled: false };
+  const first: StartChoice = fullCheckFirst ? "full_check" : "quick_start";
+  return { selected: picked ?? first, fullCheckDisabled: false };
 }
 
 /** The arguments `begin_setup` takes. */
@@ -1828,7 +1941,7 @@ export function chipNoticeVisible(
 - [ ] **Step 4: Run it to see it pass**
 
 Run (in `apps/node`): `npx vitest run src/start-choice.test.ts && npx tsc --noEmit`
-Expected: `Tests  6 passed (6)`; tsc prints nothing.
+Expected: `Tests  7 passed (7)`; tsc prints nothing.
 
 - [ ] **Step 5: Commit**
 
@@ -1844,19 +1957,19 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ### Task 9: The wizard asks one question (window)
 
 **Files:**
-- Modify: `apps/node/index.html:84-94` (inside the wizard card, before the setup button)
+- Modify: `apps/node/index.html:89-100` (inside the wizard card, before the setup button; six lines lower than on `b008f98`, below Tools' header button)
 - Modify: `apps/node/src/styles.css:211-215` (after `.wizard-note`)
-- Modify: `apps/node/src/main.ts:14-20` (imports), `:209` (type), before `:517` (`renderWizard`), `:528-529`, `:1149-1150`, `:1161`
+- Modify: `apps/node/src/main.ts:14-20` (imports), `:210` (type), before `:518` (`renderWizard`), `:529-530`, `:1150-1151`, `:1162` (each one line lower than on `b008f98`, below Tools' `import { initTools }`)
 
 **Interfaces:**
-- Consumes: `startChoiceView`, `setupArgs`, `NO_GPU_REASON`, `StartChoice` (Task 8); `NodeStatusInfo.full_check_possible` (Task 5); `begin_setup(choice)` (Task 5).
+- Consumes: `startChoiceView`, `setupArgs`, `NO_GPU_REASON`, `StartChoice` (Task 8); `NodeStatusInfo.full_check_possible` and `.full_check_first` (Task 5); `begin_setup(choice)` (Task 5).
 - Produces: DOM ids `start-choice`, `choice-quick`, `choice-quick-label`, `choice-full`, `choice-full-label`, `choice-full-reason`; `main.ts` functions `reflectStartChoice(status, inProgress)` and `currentChoice()`.
 
 The window has no DOM test harness (`vitest.config.ts`: Node environment, pure logic only). The rules are tested in Task 8; this task is checked by the typecheck, the bundle, and Task 12.
 
 - [ ] **Step 1: The markup**
 
-In `apps/node/index.html`, inside `<div class="card wizard-card">`, find (lines 93-94):
+In `apps/node/index.html`, inside `<div class="card wizard-card">`, find (lines 99-100):
 
 ```html
           </div>
@@ -1868,10 +1981,11 @@ Replace with:
 ```html
           </div>
           <!-- The one question (docs/decisions/2026-09-29-quick-start-full-
-               check-and-progress.md). main.ts selects Full check first where
-               the machine may check blocks and greys it out where it cannot
-               (start-choice.ts); begin_setup records the pick before the
-               first start. -->
+               check-and-progress.md). main.ts selects Full check first on an
+               NVIDIA machine and Quick start first on a Mac (the owner's
+               decision of 2026-09-29), and greys Full check out where the
+               machine cannot check blocks (start-choice.ts); begin_setup
+               records the pick before the first start. -->
           <fieldset class="start-choice" id="start-choice" aria-label="How your node starts">
             <label class="choice" id="choice-quick-label">
               <input type="radio" name="start-choice" value="quick_start" id="choice-quick" />
@@ -1888,11 +2002,13 @@ Replace with:
                 <span class="choice-reason" id="choice-full-reason" hidden></span>
               </span>
             </label>
+            <!-- The owner's wording until a second operator is on the list
+                 (2026-09-29); then "confirmed by two node operators". -->
             <p class="wizard-note start-choice-note">
-              Both start from a snapshot confirmed by two node operators. Full
-              check then checks every new block on this computer's graphics
-              card and checks the older history in the background. You can
-              switch later in Settings.
+              Both start from a recent signed snapshot. Full check then checks
+              every new block on this computer's graphics card and checks the
+              older history in the background. You can switch later in
+              Settings.
             </p>
           </fieldset>
           <button id="setup-btn" class="btn-primary" type="button">
@@ -1964,7 +2080,7 @@ Replace with:
 import { NO_GPU_REASON, type StartChoice, setupArgs, startChoiceView } from "./start-choice";
 ```
 
-Find (lines 208-209):
+Find (lines 209-210):
 
 ```ts
   /** The owner chose to follow signatures on a machine that could validate. */
@@ -1979,11 +2095,14 @@ Replace with:
   /** This machine may check blocks itself, as far as the app can know before
    *  the engine's first start. The setup screen greys out Full check when not. */
   full_check_possible: boolean;
+  /** The setup screen selects Full check first: an NVIDIA machine. False on a
+   *  Mac, where Quick start comes first and Full check can still be picked. */
+  full_check_first: boolean;
 ```
 
 - [ ] **Step 4: Reflect the choice**
 
-Find (line 517):
+Find (line 518):
 
 ```ts
 function renderWizard(status: NodeStatusInfo) {
@@ -1997,7 +2116,7 @@ Replace with:
 let pickedChoice: StartChoice | null = null;
 
 function reflectStartChoice(status: NodeStatusInfo, inProgress: boolean): void {
-  const view = startChoiceView(status.full_check_possible, pickedChoice);
+  const view = startChoiceView(status.full_check_possible, status.full_check_first, pickedChoice);
   const quick = $<HTMLInputElement>("choice-quick");
   const full = $<HTMLInputElement>("choice-full");
   quick.checked = view.selected === "quick_start";
@@ -2016,7 +2135,11 @@ function reflectStartChoice(status: NodeStatusInfo, inProgress: boolean): void {
 /** What the setup button sends: the owner's pick, or the default for this
  *  machine. */
 function currentChoice(): StartChoice {
-  return startChoiceView(lastStatus?.full_check_possible ?? false, pickedChoice).selected;
+  return startChoiceView(
+    lastStatus?.full_check_possible ?? false,
+    lastStatus?.full_check_first ?? false,
+    pickedChoice,
+  ).selected;
 }
 
 for (const id of ["choice-quick", "choice-full"]) {
@@ -2030,7 +2153,7 @@ for (const id of ["choice-quick", "choice-full"]) {
 function renderWizard(status: NodeStatusInfo) {
 ```
 
-Find (lines 528-529, in `renderWizard`):
+Find (lines 529-530, in `renderWizard`):
 
 ```ts
   // The button IS the live readout while setting up; idle otherwise.
@@ -2048,7 +2171,7 @@ Replace with:
 
 - [ ] **Step 5: Send it**
 
-In `beginSetup`, find (lines 1149-1150):
+In `beginSetup`, find (lines 1150-1151):
 
 ```ts
   setSetupButton(true, "Setting up your node…");
@@ -2063,7 +2186,7 @@ Replace with:
   $<HTMLButtonElement>("retry-btn").disabled = true;
 ```
 
-Find (line 1161):
+Find (line 1162):
 
 ```ts
     await invoke("begin_setup");
@@ -2078,7 +2201,7 @@ Replace with:
 - [ ] **Step 6: Typecheck, test, build**
 
 Run (in `apps/node`): `npx tsc --noEmit && npm test && npx vite build`
-Expected: tsc prints nothing; `Test Files  9 passed (9)`, `Tests  137 passed (137)`; vite ends with `✓ built in`.
+Expected: tsc prints nothing; `Test Files  10 passed (10)`, `Tests  147 passed (147)` (128 in 8 files on `aed8755`, Tools' `tools-history.test.ts` among them, plus 8, 4 and 7 from Tasks 6 to 8; counted, not run); vite ends with `✓ built in`.
 
 - [ ] **Step 7: Commit**
 
@@ -2094,17 +2217,19 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ### Task 10: The status screen: the history line, the calm stale card, the chip notice (window)
 
 **Files:**
-- Modify: `apps/node/index.html:145` (after the status line), `:180-182` (after the engine card)
+- Modify: `apps/node/index.html:151` (after the status line), `:186-188` (after the engine card); six lines lower than on `b008f98`
 - Modify: `apps/node/src/styles.css:393-398` (after `.status-sub`), `:540` (after `.follow-card button`)
-- Modify: `apps/node/src/main.ts` (imports from Task 9, the type from Task 9, `renderStatus` at `:925-927` and `:966`, `reflectFork` at `:1670-1689`)
+- Modify: `apps/node/src/main.ts` (imports from Task 9, the type from Task 9, `renderStatus` at `:926-928` and `:967`, `reflectFork` at `:1671-1690`; each one line lower than on `b008f98`)
 
 **Interfaces:**
 - Consumes: `staleCard` (Task 6), `historyCheckView`, `HistoryCheck` (Task 7), `chipNoticeVisible` (Task 8), `NodeStatusInfo.history_check` (Task 4) and `.chip_refused` (Task 5), existing `catchupSamples`, `lastStatus`, `$`.
 - Produces: DOM ids `history-check`, `history-line`, `history-fill`, `chip-card`, `chip-ok`; `main.ts` functions `reflectHistoryCheck(status)`, `reflectChipNotice(status)`; `localStorage` key `ebtx-node.chip-notice-seen` (value: the engine tag).
 
+Tools reads the chain card as shown: `windowLines` in `apps/node/src/tools.ts:39-45` puts `#fork-msg` into Copy diagnostics only while `#fork-card` is not hidden, and `statusLine` (`:32-37`, shown at the top of Tools and in the report) reads `#status-badge` and `#status-sub`. Both keep working unchanged. After this task, Copy diagnostics carries the calm "Checking whether your node is catching up..." line in the first minutes and no stale sentence while the gap closes, which is what the window says; the history line sits beside `#status-sub`, not inside it, so it stays out of Tools' status line. Nothing in `tools.ts` needs changing.
+
 - [ ] **Step 1: The markup**
 
-In `apps/node/index.html`, find (lines 145-146):
+In `apps/node/index.html`, find (lines 151-152):
 
 ```html
           <div class="status-sub" id="status-sub"></div>
@@ -2125,7 +2250,7 @@ Replace with:
         </div>
 ```
 
-Find (lines 180-182):
+Find (lines 186-188):
 
 ```html
         <div class="card fork-card engine-card" id="engine-card" hidden>
@@ -2232,13 +2357,13 @@ import {
 Find (after Task 9):
 
 ```ts
-  full_check_possible: boolean;
+  full_check_first: boolean;
 ```
 
 Replace with:
 
 ```ts
-  full_check_possible: boolean;
+  full_check_first: boolean;
   /** The engine refused this Mac's graphics chip, so the node follows
    *  signatures. The status screen says so once per engine. */
   chip_refused: boolean;
@@ -2249,7 +2374,7 @@ Replace with:
 
 - [ ] **Step 4: Call the new reflectors, and judge the stale card after the sample**
 
-In `renderStatus`, find (lines 925-927):
+In `renderStatus`, find (lines 926-928):
 
 ```ts
   reflectPeerNames(status);
@@ -2266,7 +2391,7 @@ Replace with:
   reflectHistoryCheck(status);
 ```
 
-Find (lines 966-968):
+Find (lines 967-969):
 
 ```ts
   reflectFollowOffer(status);
@@ -2286,7 +2411,7 @@ Replace with:
 
 - [ ] **Step 5: The stale card, the history line, the chip notice**
 
-Find the whole of `reflectFork` (lines 1670-1689):
+Find the whole of `reflectFork` (lines 1671-1690):
 
 ```ts
 function reflectFork(status: NodeStatusInfo): void {
@@ -2403,7 +2528,7 @@ $("chip-ok").addEventListener("click", () => {
 - [ ] **Step 6: Typecheck, test, build**
 
 Run (in `apps/node`): `npx tsc --noEmit && npm test && npx vite build`
-Expected: tsc prints nothing; `Test Files  9 passed (9)`, `Tests  137 passed (137)`; vite ends with `✓ built in`.
+Expected: tsc prints nothing; `Test Files  10 passed (10)`, `Tests  147 passed (147)` (128 in 8 files on `aed8755`, Tools' `tools-history.test.ts` among them, plus 8, 4 and 7 from Tasks 6 to 8; counted, not run); vite ends with `✓ built in`.
 
 - [ ] **Step 7: Commit**
 
@@ -2419,7 +2544,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ### Task 11: The changelog
 
 **Files:**
-- Modify: `apps/node/CHANGELOG.md` (under `## [Unreleased]`, after any entries already there, such as the Tools entry)
+- Modify: `apps/node/CHANGELOG.md` (under `## [Unreleased]`, after the entries already there: on `aed8755` that is the Tools entry, "**Tools: the things support used to need a terminal for, behind one button.**", and #160 adds its role-card entry after it if merged first)
 
 - [ ] **Step 1: Add the entry**
 
@@ -2428,9 +2553,11 @@ Add under `## [Unreleased]`, after the last paragraph already in that section:
 ```markdown
 **Setup asks one question: Quick start or Full check.** Quick start follows
 signatures and is ready in minutes. Full check checks every block on this
-computer's graphics card and takes longer the first time. Full check is
-selected first where the node engine may be able to use the graphics card; a
-computer without one gets Quick start, and the screen says why. You can switch
+computer's graphics card and takes longer the first time. On a computer with
+an NVIDIA graphics card, Full check is selected first. On a Mac, Quick start
+is selected first, because some Mac graphics chips don't pass the engine's
+check; you can still pick Full check. A computer without a graphics card
+the engine can use gets Quick start, and the screen says why. You can switch
 later in Settings. If the engine turns down a Mac's graphics chip and the app
 moves the node to following signatures, the status screen says so once.
 
@@ -2480,7 +2607,7 @@ Create `apps/node/public/mock.js`:
 ```js
 // CHECK ONLY, never commit: fake Tauri IPC so the window renders in a browser.
 (function () {
-  const scen = location.hash.slice(1) || "wizard-gpu";
+  const scen = location.hash.slice(1) || "wizard-nvidia";
   const STALE = "The newest block this node has is 200 hours old. That is measured against the clock, not against what its peers report, so it holds even when every peer agrees with it. The node is not following the chain.";
   const base = {
     running: true, uptime_secs: 600, disk_free_mb: 300000, disk_warn_mb: 20000, disk_critical_mb: 5000,
@@ -2496,7 +2623,7 @@ Create `apps/node/public/mock.js`:
     peer_nicknames: [], service_report_enabled: false, wallet_enabled: false, on_close: "ask",
     rc_mode: "strict-device", rc_validates_independently: false, rc_may_fall_behind: false, rc_reason: null,
     rc_stalled: false, rc_unverifiable_message: null, rc_trusted_mirror: true, follow_signatures: false,
-    full_check_possible: true, chip_refused: true, history_check: { checked: 131200, base: 225927 },
+    full_check_possible: true, full_check_first: false, chip_refused: true, history_check: { checked: 131200, base: 225927 },
     bytes_sent: 1000000, inbound_peers: 0, archive_peers: null, stall: null, node_profile: "full",
     datadir_pruned: false, keeper_engine_ready: false, esplora_enabled: false, esplora_listen: "127.0.0.1:3002",
     esplora_serving_on: null, esplora_running: false, esplora_indexing: false, esplora_freshness: null, esplora_message: null,
@@ -2507,7 +2634,7 @@ Create `apps/node/public/mock.js`:
   };
   let status = base;
   if (scen.startsWith("wizard")) {
-    status = { ...base, running: false, setup_complete: false, phase: { phase: "welcome" }, full_check_possible: scen === "wizard-gpu", uptime_secs: 0 };
+    status = { ...base, running: false, setup_complete: false, phase: { phase: "welcome" }, full_check_possible: scen !== "wizard-cpu", full_check_first: scen === "wizard-nvidia", uptime_secs: 0 };
   }
   let cb = 0;
   window.__TAURI_INTERNALS__ = {
@@ -2544,7 +2671,8 @@ and temporarily put this line directly above it:
 
 Run (in `apps/node`): `npx vite --port 1530 --strictPort`, open it in a browser sized to 560x780, and check:
 
-- `http://localhost:1530/#wizard-gpu`: Full check selected; the setup button is on screen without scrolling (the dry run measured its bottom at 649 px of 780). Click Quick start, wait for a poll (1.5 s): Quick start stays selected. Click Set up my node; in the console, `window.__calls.filter(c => c[0] === "begin_setup")` is `[["begin_setup", {"choice": "quick_start"}]]`.
+- `http://localhost:1530/#wizard-nvidia`: Full check selected; the setup button is on screen without scrolling (the dry run measured its bottom at 649 px of 780 on `b008f98`; Tools' button sits in the existing header row, so expect the same); the line under the choices reads "Both start from a recent signed snapshot. Full check then checks every new block on this computer's graphics card and checks the older history in the background. You can switch later in Settings." Click Quick start, wait for a poll (1.5 s): Quick start stays selected. Click Set up my node; in the console, `window.__calls.filter(c => c[0] === "begin_setup")` is `[["begin_setup", {"choice": "quick_start"}]]`.
+- `http://localhost:1530/#wizard-mac` (reload after changing the hash): Quick start selected, Full check not greyed out and no reason line under it. Click Full check, wait for a poll: Full check stays selected. Click Set up my node: the call is `[["begin_setup", {"choice": "full_check"}]]`.
 - `http://localhost:1530/#wizard-cpu` (reload after changing the hash): Quick start selected, Full check greyed out and not clickable, with "This computer has no graphics card the BTX engine can check blocks with." under it.
 - `http://localhost:1530/#status`: "Checking older history: 131,200 of 225,927 (58%)" with a bar at 58% under the status line; the chain card reads "Checking whether your node is catching up..." in the quiet colours; the role card's note reads "Checks every new block itself. Its older history is still being checked."; the chip notice shows, OK hides it and `localStorage.getItem("ebtx-node.chip-notice-seen")` is `"v0.34.9"`.
 
@@ -2557,8 +2685,9 @@ Expected: nothing listed.
 
 On a Mac, a Windows PC and a Linux machine, with a fresh data folder each time:
 
-- Quick start: the node starts as a mirror; `.follow-signatures` is in the data folder on the Mac and on the Linux machine with an NVIDIA card, and absent on Windows (its engine has no GPU code, so Full check is greyed out there). Settings shows the follow-signatures switch on the Mac and Linux.
-- Full check: the node starts validating where the card qualifies; `setup.log` has `start choice: FullCheck`; there is no `.follow-signatures`.
+- What is selected first: Quick start on the Mac, with Full check still clickable; Full check on the Linux machine with an NVIDIA card; Quick start on Windows, with Full check greyed out and the reason under it (its engine has no GPU code).
+- Quick start: the node starts as a mirror; `.follow-signatures` is in the data folder on the Mac (kept as preselected) and on the Linux machine with an NVIDIA card (picked by hand), and absent on Windows. `setup.log` has `start choice: QuickStart`. Settings shows the follow-signatures switch on the Mac and Linux.
+- Full check (picked by hand on the Mac, the default on Linux with NVIDIA): the node starts validating where the card qualifies; `setup.log` has `start choice: FullCheck`; there is no `.follow-signatures`. A Mac whose chip fails the engine's check shows "NOT FOLLOWING" and the existing "Follow signatures instead" offer, not the chip notice (see "Where the design does not match the code").
 - Then switch in Settings and watch the node restart the other way.
 - On a node that started from a snapshot, the history line appears and its numbers move; on a node started from the compiled 219,000 snapshot, the base reads 219,000; on a signed snapshot (spec B), it reads that snapshot's own height.
 
@@ -2570,11 +2699,11 @@ On a Mac, a Windows PC and a Linux machine, with a fresh data folder each time:
 
 | Design requirement | Task |
 |---|---|
-| Two choices above "Set up my node", with the line under them | 9 |
-| Full check selected first where the machine may check blocks; Quick start where it cannot | 2 (`may_check_blocks`), 5 (`full_check_possible`), 8, 9 |
+| Two choices above "Set up my node", with the line under them (in the owner's wording of 29 September, decision B) | 9, 12 |
+| Which choice is selected first, as the owner decided on 29 September (decision A): Full check on an NVIDIA machine; Quick start on a Mac, with Full check still selectable; Quick start where the machine cannot check blocks | 2 (`may_check_blocks`, `full_check_first`), 5 (`full_check_possible`, `full_check_first`), 8, 9, 12 |
 | Full check greyed out with the reason on a machine without a usable GPU | 8, 9 |
 | Refused Mac told once: "...Nothing for you to do." | 5 (`chip_refused`), 8, 10 (see "Where the design does not match the code") |
-| `begin_setup` takes the choice and writes or removes `.follow-signatures` before the first start | 2, 5 |
+| `begin_setup` takes the choice and writes or removes `.follow-signatures` before the first start, a Mac that keeps Quick start included | 2, 5 |
 | History line and thin bar under the status line, base from the snapshot's own header, gone when done, no estimate | 1, 4, 7, 10 |
 | One new field `history_check`, from the `getchainstates` the refresher already reads | 1, 4 |
 | Role line on a validating node on a signed snapshot, detected by `attested_assumeutxo`, gone when the check is done | 3, 4 |
@@ -2582,7 +2711,7 @@ On a Mac, a Windows PC and a Linux machine, with a fresh data folder each time:
 | Fork and "behind the signers" keep their place after the stale sentence | 10 |
 | Tests: one per row, a crossing, a restart | 6 |
 | Tests: `history_check` with no snapshot, a snapshot being checked, a finished check, a signed snapshot's own base | 1 |
-| Tests: the choice reaches `begin_setup`; no-GPU cannot pick Full check | 2 (serde names, marker), 8 (`setupArgs`, `startChoiceView`), 12 (the click, in a browser) |
+| Tests: the choice reaches `begin_setup`; no-GPU cannot pick Full check; a Mac starts on Quick start, an NVIDIA machine on Full check | 2 (serde names, marker, `full_check_first`), 8 (`setupArgs`, `startChoiceView`), 12 (the clicks, in a browser) |
 | By hand on Mac, Windows, Linux | 12 |
 | 560x780, no new screens | Global Constraints; 12 measures the wizard |
 | Rollback: `begin_setup` without a choice behaves as today; the card and the line can be switched off in one place | 5 (`Option`), 6 (`staleCard`), 10 (`reflectHistoryCheck`) |
@@ -2591,6 +2720,8 @@ The `getchainstates` fixtures are the recorded shape already in `node_api.rs` (`
 
 **Placeholder scan.** No "TBD", "TODO", "similar to", or step without its code. Every edit names the text to find and the text that replaces it.
 
-**Type consistency.** `HistoryCheck { checked, base }` (Rust) and `{ checked: number; base: number }` (TypeScript); `StartChoice::{QuickStart, FullCheck}` and `"quick_start" | "full_check"`; `refresh_history_check(&dyn Rpc, &ChainStates, &mut Option<(String, u64)>)` in Tasks 1 and 4; `with_signed_snapshot(bool)` in Tasks 3 and 4; `apply_start_choice(&Path, StartChoice, bool)` in Tasks 2 and 5; `staleCard(string | null, number | null, CatchupSample[], number)` in Tasks 6 and 10; `chipNoticeVisible(boolean, boolean, string | null, string)` in Tasks 8 and 10; DOM ids match between Tasks 9, 10 and 12.
+**Type consistency.** `HistoryCheck { checked, base }` (Rust) and `{ checked: number; base: number }` (TypeScript); `StartChoice::{QuickStart, FullCheck}` and `"quick_start" | "full_check"`; `refresh_history_check(&dyn Rpc, &ChainStates, &mut Option<(String, u64)>)` in Tasks 1 and 4; `with_signed_snapshot(bool)` in Tasks 3 and 4; `apply_start_choice(&Path, StartChoice, bool)` in Tasks 2 and 5; `full_check_first` (Rust `Backend` method, shell helper, status field) and `fullCheckFirst` (TypeScript) in Tasks 2, 5, 8, 9 and 12; `startChoiceView(boolean, boolean, StartChoice | null)` in Tasks 8 and 9; `staleCard(string | null, number | null, CatchupSample[], number)` in Tasks 6 and 10; `chipNoticeVisible(boolean, boolean, string | null, string)` in Tasks 8 and 10; DOM ids match between Tasks 9, 10 and 12.
 
 **Dry run.** Every code block above was applied to a throwaway worktree of `origin/claude/ui-start-choice-and-progress` and run: `crates/btx-core` fmt, clippy (`-D clippy::correctness -D clippy::suspicious`) and `cargo test --locked` (559 passed, 2 ignored; the timing test noted in Task 2 failed twice straight after a clippy build and passed on every quiet re-run); `apps/node/src-tauri` fmt, clippy and `cargo test --locked` (85 passed, 1 ignored) after Task 4 and again after Task 5; `apps/node` `npx tsc --noEmit`, `npm test` (137 passed) and `npx vite build`, with Task 9 alone typechecked separately and Tasks 9 and 10 together reproducing the checked `main.ts` byte for byte; and the browser check of Task 12 at 560x780. Each failing-test step was run first and failed as stated. Then the worktree was reset and this document's own code blocks were applied mechanically, in order, by a script following each find, replace, insert, append and create step (Tasks 1 to 11); the result matched the dry run's code exactly, the changelog aside, and every gate passed again.
+
+**Not run since the amendment of 29 September (night).** The dry run above was on `b008f98`. The amendments were not run: decision A's code (`Backend::full_check_first` and its test, the Mac lines of `the_setup_choice_writes_or_removes_the_marker`, `setup_backend`/`full_check_first` and the status field in the shell, the three-argument `startChoiceView` and its new test, the two `main.ts` call sites, the mock's `wizard-mac` scenario), decision B's copy, and the rebase onto `aed8755`. The anchors were checked by reading `origin/main` at `aed8755`, not by applying them. The test counts are derived: test attributes were counted on `origin/main` and the same count on `b008f98` reproduced the dry run's numbers (548 and 2 ignored for `btx-core` on a Mac, 85 and 1 ignored for the shell, 119 for `apps/node` before Tasks 6 to 8). Treat each written count as a check, and if a run differs only by tests this plan did not write, trust the run.
