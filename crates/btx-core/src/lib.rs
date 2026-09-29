@@ -48,6 +48,7 @@ pub mod setup;
 pub mod signer;
 pub mod snapshot;
 pub mod snapshot_serve;
+pub mod snapshot_start;
 pub mod stuck_blocks;
 pub mod supply;
 pub mod wallet_format;
