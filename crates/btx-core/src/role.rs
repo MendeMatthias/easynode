@@ -41,9 +41,10 @@
 //! Deliberately pure, like [`crate::frontier`], so the UI cannot disagree with
 //! it and every sentence has a test.
 
-use crate::frontier::ArchiveService;
+use crate::frontier::{ArchiveService, FRONTIER_LAG_STOPS_HISTORY};
 use crate::node_api::{
-    MatmulTrustedStatus, NODE_MATMUL_ATTESTATION_ARCHIVE_BIT, NODE_MATMUL_CONSENSUS_BIT,
+    AttestedTip, MatmulTrustedStatus, NODE_MATMUL_ATTESTATION_ARCHIVE_BIT,
+    NODE_MATMUL_CONSENSUS_BIT, TIP_STALE_AFTER_SECS,
 };
 use serde::Serialize;
 
@@ -172,6 +173,15 @@ pub struct NodeRole {
     /// `/signers/recent`, where nothing read it; the point of carrying it
     /// here is that the operator is told.
     pub distinct_signers: Option<u64>,
+    /// Seconds since this node's newest block, by its median time, or `None`
+    /// when the node did not say. Not serialised: the status payload carries
+    /// its own `tip_age_secs`.
+    #[serde(skip)]
+    tip_age_secs: Option<u64>,
+    /// `getmatmulattestedtip.signed_frontier`, or `None` when it was not read.
+    /// Not serialised, for the same reason as `archive`.
+    #[serde(skip)]
+    signed_frontier: Option<AttestedTip>,
 }
 
 /// Parse `getnetworkinfo.localservices` (16 hex chars, `0x` tolerated).
@@ -288,6 +298,8 @@ pub fn node_role(
         archive_pending_restart,
         signed_recent: None,
         distinct_signers: None,
+        tip_age_secs: None,
+        signed_frontier: None,
     }
 }
 
@@ -308,6 +320,20 @@ impl NodeRole {
     /// because a mirror has no key of its own and still needs this number.
     pub fn with_distinct_signers(mut self, distinct_signers: Option<u64>) -> Self {
         self.distinct_signers = distinct_signers;
+        self
+    }
+
+    /// Attach the age of the newest block. With the signed frontier below, the
+    /// two witnesses that can overrule the header count: a node that knows of
+    /// no newer headers may simply be cut off from everyone who has them.
+    pub fn with_tip_age(mut self, tip_age_secs: Option<u64>) -> Self {
+        self.tip_age_secs = tip_age_secs;
+        self
+    }
+
+    /// Attach what `getmatmulattestedtip` said about the signed frontier.
+    pub fn with_signed_frontier(mut self, signed_frontier: Option<&AttestedTip>) -> Self {
+        self.signed_frontier = signed_frontier.cloned();
         self
     }
 
@@ -608,23 +634,54 @@ impl NodeRole {
                 None,
                 "Waiting for the node to report its height.".to_string(),
             ),
-            Some(0) => (
-                "At the tip".to_string(),
-                Some(true),
-                "Holds every block it knows about, so what it serves is current.".to_string(),
-            ),
-            Some(n) if n < HEADERS_AHEAD_IS_BEHIND => (
-                "At the tip, one block arriving".to_string(),
-                Some(true),
-                "One block is on its way, which is normal between blocks.".to_string(),
-            ),
-            Some(n) => (
+            Some(n) if n >= HEADERS_AHEAD_IS_BEHIND => (
                 format!("{n} blocks behind"),
                 Some(false),
                 "Knows about blocks it does not have yet, so what it serves is not current. \
                  Leaving it running and connected is usually all it needs."
                     .to_string(),
             ),
+            // The header count says nothing newer is known, which is not the
+            // same as nothing newer existing. A node cut off from its peers,
+            // or left on a branch the rest abandoned, knows of nothing newer
+            // for as long as it sits there. Two witnesses can overrule it.
+            Some(n) => match (self.signed_frontier_lag(), self.stale_tip_age()) {
+                (Some((lag, false)), _) => (
+                    format!("On a different branch, {lag} blocks behind the signed chain"),
+                    Some(false),
+                    "This node and the signers are on different branches, so what it serves \
+                     is not what the signed chain holds. Leaving it running and connected \
+                     usually settles it."
+                        .to_string(),
+                ),
+                (Some((lag, true)), _) => (
+                    format!("{lag} blocks behind the signed chain"),
+                    Some(false),
+                    "Other nodes have signed blocks this one does not have yet, so what it \
+                     serves is not current. Leaving it running and connected is usually all \
+                     it needs."
+                        .to_string(),
+                ),
+                (None, Some(age)) => (
+                    format!("Not moving, newest block {}", age_words(age)),
+                    Some(false),
+                    "It knows of no newer blocks, yet a new one normally arrives every minute \
+                     or two. Either it is cut off from the nodes that have them or the whole \
+                     network is waiting, and until blocks move again what it serves is out of \
+                     date."
+                        .to_string(),
+                ),
+                (None, None) if n == 0 => (
+                    "At the tip".to_string(),
+                    Some(true),
+                    "Holds every block it knows about, so what it serves is current.".to_string(),
+                ),
+                (None, None) => (
+                    "At the tip, one block arriving".to_string(),
+                    Some(true),
+                    "One block is on its way, which is normal between blocks.".to_string(),
+                ),
+            },
         };
         RoleLine {
             label: "Chain position",
@@ -632,6 +689,35 @@ impl NodeRole {
             helps,
             note,
         }
+    }
+
+    /// Signed blocks this node's active chain lacks, when that is more than a
+    /// block in flight, with whether the frontier sits on this node's own
+    /// chain. `on_active_chain` unreported counts as on it: only the engine's
+    /// explicit `false` is the stranded shape.
+    fn signed_frontier_lag(&self) -> Option<(u64, bool)> {
+        let t = self.signed_frontier.as_ref()?;
+        let lag = t
+            .blocks_behind
+            .filter(|&b| b >= FRONTIER_LAG_STOPS_HISTORY)?;
+        Some((lag as u64, t.on_active_chain != Some(false)))
+    }
+
+    /// The newest block's age, only once it is past the stale limit. Strictly
+    /// past, as [`crate::node_api::tip_is_stale`] draws it.
+    fn stale_tip_age(&self) -> Option<u64> {
+        self.tip_age_secs
+            .filter(|&age| age > TIP_STALE_AFTER_SECS as u64)
+    }
+}
+
+/// "3 hours old", or "3 days old" from two days on.
+fn age_words(secs: u64) -> String {
+    let hours = secs / 3600;
+    if hours >= 48 {
+        format!("{} days old", secs / 86_400)
+    } else {
+        format!("{hours} hours old")
     }
 }
 
@@ -1372,6 +1458,127 @@ mod tests {
         assert_eq!(pos(None).helps, None);
     }
 
+    fn position(r: NodeRole) -> RoleLine {
+        line(&r.lines(), "Chain position").clone()
+    }
+
+    fn frontier(behind: i64, on_active_chain: Option<bool>) -> AttestedTip {
+        AttestedTip {
+            height: Some(233_470),
+            blocks_behind: Some(behind),
+            on_active_chain,
+        }
+    }
+
+    /// A node that knows of no newer headers is not therefore at the tip. An
+    /// isolated node, or one left on a branch the rest have abandoned, sees
+    /// nothing newer and reported "At the tip" for as long as it sat there.
+    /// The clock is the one witness its peers cannot talk it out of: a newest
+    /// block older than [`TIP_STALE_AFTER_SECS`] overrules the header count.
+    #[test]
+    fn a_stale_tip_is_never_called_at_the_tip() {
+        let stale = (TIP_STALE_AFTER_SECS as u64) + 3600;
+        for behind in [Some(0), Some(1)] {
+            let p = position(
+                node_role(None, PLAIN_BITS, &[], 0, 0, behind, None).with_tip_age(Some(stale)),
+            );
+            assert_ne!(p.value, "At the tip", "{behind:?}");
+            assert!(!p.value.starts_with("At the tip"), "{behind:?}: {p:?}");
+            assert_eq!(p.helps, Some(false), "{behind:?}");
+            assert!(p.value.contains("3 hours old"), "{p:?}");
+        }
+        // Exactly the limit is still ordinary slowness, the same boundary
+        // node_api::tip_is_stale draws, so the two never disagree.
+        let at_limit = position(
+            node_role(None, PLAIN_BITS, &[], 0, 0, Some(0), None)
+                .with_tip_age(Some(TIP_STALE_AFTER_SECS as u64)),
+        );
+        assert_eq!(at_limit.value, "At the tip");
+        // Days read as days.
+        let days = position(
+            node_role(None, PLAIN_BITS, &[], 0, 0, Some(0), None).with_tip_age(Some(3 * 86_400)),
+        );
+        assert!(days.value.contains("3 days old"), "{days:?}");
+        // A node that is plainly catching up keeps its count: "40 blocks
+        // behind" is the more useful sentence, and its old tip is expected.
+        let syncing = position(
+            node_role(None, PLAIN_BITS, &[], 0, 0, Some(40), None).with_tip_age(Some(stale)),
+        );
+        assert_eq!(syncing.value, "40 blocks behind");
+        // No tip time is no evidence.
+        let unknown =
+            position(node_role(None, PLAIN_BITS, &[], 0, 0, Some(0), None).with_tip_age(None));
+        assert_eq!(unknown.value, "At the tip");
+    }
+
+    /// The signed frontier is the second witness. `getmatmulattestedtip`
+    /// counts signed blocks this node's active chain does not have, including
+    /// signed hashes whose bodies it never got, so it sees a stranded node
+    /// that the header count cannot. One signed block ahead is a block in
+    /// flight, the same tolerance as the header count and as
+    /// [`crate::frontier::FRONTIER_LAG_STOPS_HISTORY`].
+    #[test]
+    fn a_node_behind_the_signed_frontier_is_never_called_at_the_tip() {
+        let ahead = position(
+            node_role(None, PLAIN_BITS, &[], 0, 0, Some(0), None)
+                .with_signed_frontier(Some(&frontier(17, Some(true)))),
+        );
+        assert_eq!(ahead.value, "17 blocks behind the signed chain");
+        assert_eq!(ahead.helps, Some(false));
+
+        // The engine's own words for this shape: "large with
+        // on_active_chain=false is a stranded fork".
+        let stranded = position(
+            node_role(None, PLAIN_BITS, &[], 0, 0, Some(0), None)
+                .with_signed_frontier(Some(&frontier(17, Some(false)))),
+        );
+        assert_eq!(
+            stranded.value,
+            "On a different branch, 17 blocks behind the signed chain"
+        );
+        assert_eq!(stranded.helps, Some(false));
+
+        let in_flight = position(
+            node_role(None, PLAIN_BITS, &[], 0, 0, Some(0), None)
+                .with_signed_frontier(Some(&frontier(1, Some(true)))),
+        );
+        assert_eq!(in_flight.value, "At the tip");
+
+        let unmeasured = position(
+            node_role(None, PLAIN_BITS, &[], 0, 0, Some(0), None).with_signed_frontier(Some(
+                &AttestedTip {
+                    height: None,
+                    blocks_behind: None,
+                    on_active_chain: None,
+                },
+            )),
+        );
+        assert_eq!(unmeasured.value, "At the tip");
+
+        // Headers already say it is catching up: that count stands.
+        let syncing = position(
+            node_role(None, PLAIN_BITS, &[], 0, 0, Some(40), None)
+                .with_signed_frontier(Some(&frontier(45, Some(true)))),
+        );
+        assert_eq!(syncing.value, "40 blocks behind");
+    }
+
+    /// A stranded node usually shows both: an old tip AND a frontier that has
+    /// moved on. The frontier wins because it says what is missing, and the
+    /// different-branch sentence is the one that tells a person what happened.
+    #[test]
+    fn the_signed_frontier_outranks_the_clock_when_both_speak() {
+        let p = position(
+            node_role(None, PLAIN_BITS, &[], 0, 0, Some(0), None)
+                .with_tip_age(Some(7 * 3600))
+                .with_signed_frontier(Some(&frontier(17, Some(false)))),
+        );
+        assert_eq!(
+            p.value,
+            "On a different branch, 17 blocks behind the signed chain"
+        );
+    }
+
     /// Every sentence is for a person. No wire names, no engine identifiers,
     /// a full stop at the end, and no blame.
     #[test]
@@ -1402,9 +1609,24 @@ mod tests {
             for b in bits {
                 for v in &verdicts {
                     for (inbound, up) in [(0, 0), (0, 86_400), (3, 86_400)] {
-                        for behind in [None, Some(0), Some(1), Some(40)] {
+                        for (behind, tip_age, frontier_at) in [
+                            (None, None, None),
+                            (Some(0), None, None),
+                            (Some(1), None, None),
+                            (Some(40), None, None),
+                            (Some(0), Some(9 * 3600), None),
+                            (Some(0), None, Some((17, Some(true)))),
+                            (Some(0), None, Some((17, Some(false)))),
+                        ] {
+                            let tip = frontier_at.map(|(n, on)| AttestedTip {
+                                height: Some(233_470),
+                                blocks_behind: Some(n),
+                                on_active_chain: on,
+                            });
                             let lines =
                                 node_role(s.as_ref(), b, &[], inbound, up, behind, v.as_ref())
+                                    .with_tip_age(tip_age)
+                                    .with_signed_frontier(tip.as_ref())
                                     .lines();
                             assert_eq!(lines.len(), 5);
                             for l in &lines {

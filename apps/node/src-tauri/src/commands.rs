@@ -1032,6 +1032,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     state.peer_nicknames_cache.lock().await.clear();
     *state.archive_service.lock().await = None;
     *state.matmul_trusted.lock().await = None;
+    *state.signed_frontier.lock().await = None;
     *state.recent_signers.lock().await = None;
     *state.fork.lock().await = None;
     *state.tip_median_time.lock().await = None;
@@ -1526,6 +1527,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
     let nickname_slot = state.peer_nicknames_cache.clone();
     let archive_service_slot = state.archive_service.clone();
     let matmul_trusted_slot = state.matmul_trusted.clone();
+    let signed_frontier_slot = state.signed_frontier.clone();
     let recent_signers_slot = state.recent_signers.clone();
     let signer_pubkey_slot = state.signer_pubkey.clone();
     let signer_offer_slot = state.signer_offer.clone();
@@ -1800,22 +1802,26 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     // (6 ms) and getpeerinfo (8 ms) this tick already makes,
                     // against a 3-second period. About a third of one percent.
                     //
-                    // And only nodes it can tell something ever pay it: a node
-                    // that does not serve attestations is given the answer
-                    // directly and the RPC is skipped. That is also why the
-                    // settings read below is not wasteful — on a non-serving
-                    // node it REPLACES the RPC rather than adding to it.
+                    // Every node pays it since 0.7.0, serving or not. The
+                    // archive verdict still needs it only when serving (a
+                    // node that does not serve is NotServing whatever the
+                    // frontier says, pinned in frontier.rs), but the role
+                    // card's chain position needs it on every node: one that
+                    // knows of no newer headers said "At the tip" while
+                    // stranded on another branch, and the signed frontier is
+                    // the witness that sees it. Only a successful answer
+                    // overwrites the slot, as with the trusted status below.
                     {
                         let serving =
                             NodeAppSettings::load(&node_datadir()).attestation_serve_enabled;
-                        let blocks_behind = if serving {
-                            btx_core::node_api::get_attested_tip(&rpc)
-                                .await
-                                .ok()
-                                .and_then(|t| t.blocks_behind)
-                        } else {
-                            None
-                        };
+                        let attested = btx_core::node_api::get_attested_tip(&rpc).await.ok();
+                        let blocks_behind = attested
+                            .as_ref()
+                            .filter(|_| serving)
+                            .and_then(|t| t.blocks_behind);
+                        if attested.is_some() {
+                            *signed_frontier_slot.lock().await = attested;
+                        }
                         // Whether we hold a signing key decides what the
                         // archive bit actually delivers, so it is read here
                         // rather than assumed. An engine that does not know the
@@ -2534,6 +2540,7 @@ pub async fn stop_node_inner(state: &AppState) {
     state.peer_nicknames_cache.lock().await.clear();
     *state.archive_service.lock().await = None;
     *state.matmul_trusted.lock().await = None;
+    *state.signed_frontier.lock().await = None;
     *state.fork.lock().await = None;
     *state.tip_median_time.lock().await = None;
     state.engine_warnings.lock().await.clear();
@@ -3112,6 +3119,25 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
             _ => (None, None),
         }
     };
+    // The newest block's age and the signed frontier: the two witnesses that
+    // can overrule "At the tip" (btx_core::role). Read before the role so the
+    // card and the stale banner below use the same age.
+    let tip_median_time = *state.tip_median_time.lock().await;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let tip_stale = tip_median_time
+        .map(|mt| btx_core::node_api::tip_is_stale(mt, now_unix))
+        .unwrap_or(false);
+    let tip_age_secs = tip_median_time
+        .filter(|mt| *mt > 0)
+        .map(|mt| now_unix.saturating_sub(mt).max(0) as u64);
+    let signed_frontier = if running {
+        state.signed_frontier.lock().await.clone()
+    } else {
+        None
+    };
     let role = net.as_ref().filter(|_| running).map(|n| {
         btx_core::role::node_role(
             matmul_trusted.as_ref(),
@@ -3124,6 +3150,8 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         )
         .with_signed_recent(signed_recent)
         .with_distinct_signers(distinct_signers)
+        .with_tip_age(tip_age_secs)
+        .with_signed_frontier(signed_frontier.as_ref())
     });
     let role_lines = role.as_ref().map(|r| r.lines()).unwrap_or_default();
     let signing_live = role.as_ref().is_some_and(|r| r.signs_for_mirrors());
@@ -3131,17 +3159,6 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
 
     let subversion = net.map(|c| c.subversion).filter(|s| !s.is_empty());
     let fork = state.fork.lock().await.clone();
-    let tip_median_time = *state.tip_median_time.lock().await;
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let tip_stale = tip_median_time
-        .map(|mt| btx_core::node_api::tip_is_stale(mt, now_unix))
-        .unwrap_or(false);
-    let tip_age_secs = tip_median_time
-        .filter(|mt| *mt > 0)
-        .map(|mt| now_unix.saturating_sub(mt).max(0) as u64);
     let tip_stale_message = if tip_stale {
         tip_age_secs.map(|secs| {
             let hours = secs / 3600;
