@@ -3,6 +3,8 @@
 //! gathers answers from the node and hands them over.
 //! docs/decisions/2026-09-29-tools-and-command-window.md
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, State};
@@ -212,15 +214,67 @@ pub async fn tools_engine_notices(state: State<'_, AppState>) -> Result<Ask<Vec<
     })
 }
 
+/// Set while a restart from Tools runs. The button is only one way in: Tools
+/// can be closed and reopened mid-restart, and a second restart would stop
+/// the node the first one is starting, then fail its own start on top.
+static RESTARTING: AtomicBool = AtomicBool::new(false);
+
+const ALREADY_RESTARTING: &str = "Your node is already restarting. Give it a moment.";
+
+/// Holds a flag for as long as it lives and clears it on every way out: a
+/// return, an early `?`, an error from the restart, or a panic.
+struct Claim<'a>(&'a AtomicBool);
+
+impl<'a> Claim<'a> {
+    /// The flag, if nobody holds it yet.
+    fn take(flag: &'a AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Claim(flag))
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Why Restart node may not run right now, before asking who owns the node:
+/// a restart is already running, or a start is (its stop would end the node
+/// that start is bringing up).
+fn restart_busy(restarting: bool, starting: bool) -> Option<&'static str> {
+    if restarting {
+        Some(ALREADY_RESTARTING)
+    } else if starting {
+        Some(STILL_STARTING)
+    } else {
+        None
+    }
+}
+
 /// `None` when Restart node may run; otherwise the sentence saying why not.
 #[tauri::command]
 pub async fn tools_restart_check(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let busy = restart_busy(
+        RESTARTING.load(Ordering::SeqCst),
+        state.start_in_flight.load(Ordering::SeqCst),
+    );
+    if let Some(sentence) = busy {
+        return Ok(Some(sentence.into()));
+    }
     let owner = node_ownership(&state, &node_datadir()).await;
     Ok(destructive_allowed(owner).err())
 }
 
 #[tauri::command]
 pub async fn tools_restart_node(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let Some(_restarting) = Claim::take(&RESTARTING) else {
+        return Err(ALREADY_RESTARTING.into());
+    };
+    if let Some(sentence) = restart_busy(false, state.start_in_flight.load(Ordering::SeqCst)) {
+        return Err(sentence.into());
+    }
     destructive_allowed(node_ownership(&state, &node_datadir()).await)?;
     restart_node_projected(&app, &state).await
 }
@@ -478,6 +532,55 @@ fn chrono_like_now() -> String {
 mod tests {
     use super::answer_text;
     use serde_json::json;
+
+    mod restart_node {
+        use super::super::*;
+
+        /// A restart already running refuses a second one (Tools closed and
+        /// reopened mid-restart), and a start in progress refuses one too:
+        /// its stop would end the node that start is bringing up.
+        #[test]
+        fn refuses_while_a_restart_or_a_start_is_running() {
+            assert_eq!(restart_busy(true, false), Some(ALREADY_RESTARTING));
+            assert_eq!(restart_busy(true, true), Some(ALREADY_RESTARTING));
+            assert_eq!(restart_busy(false, true), Some(STILL_STARTING));
+            assert_eq!(restart_busy(false, false), None);
+        }
+
+        #[test]
+        fn only_one_claim_at_a_time() {
+            let flag = AtomicBool::new(false);
+            let first = Claim::take(&flag);
+            assert!(first.is_some());
+            assert!(Claim::take(&flag).is_none(), "a second restart got in");
+            drop(first);
+            assert!(Claim::take(&flag).is_some(), "the flag stayed set");
+        }
+
+        /// The flag is cleared on every way out of a restart: success, an
+        /// early refusal, an error from the restart itself, and a panic.
+        #[test]
+        fn the_claim_is_released_on_every_exit_path() {
+            fn restart(flag: &AtomicBool, outcome: Result<(), &str>) -> Result<(), String> {
+                let _claim = Claim::take(flag).ok_or(ALREADY_RESTARTING)?;
+                assert!(flag.load(Ordering::SeqCst), "held but not set");
+                outcome.map_err(str::to_string)?;
+                Ok(())
+            }
+            let flag = AtomicBool::new(false);
+            assert!(restart(&flag, Ok(())).is_ok());
+            assert!(!flag.load(Ordering::SeqCst), "set after a success");
+            assert!(restart(&flag, Err("the node kept exiting")).is_err());
+            assert!(!flag.load(Ordering::SeqCst), "set after an error");
+            let panicked = std::panic::catch_unwind(|| {
+                let _claim = Claim::take(&flag).unwrap();
+                assert!(flag.load(Ordering::SeqCst), "held but not set");
+                panic!("the restart panicked");
+            });
+            assert!(panicked.is_err());
+            assert!(!flag.load(Ordering::SeqCst), "set after a panic");
+        }
+    }
 
     mod a_node_that_is_still_starting {
         use super::super::*;

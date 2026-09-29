@@ -66,13 +66,16 @@ export function initTools(): void {
   const restartArm = new RestartArm();
   let pendingToken: string | null = null;
   let restartArmTimer: ReturnType<typeof setTimeout> | undefined;
+  /** A restart this window started is still running. Rust refuses a second
+   * one either way; this only keeps the button saying so across a close. */
+  let restartInFlight = false;
 
   /** The 5s timer elapsed, or the overlay is closing: back to one click away. */
   const resetRestartArm = () => {
     clearTimeout(restartArmTimer);
     restartArmTimer = undefined;
     restartArm.disarm();
-    $<HTMLButtonElement>("tools-restart").textContent = "Restart node";
+    if (!restartInFlight) $<HTMLButtonElement>("tools-restart").textContent = "Restart node";
   };
 
   /** The single close path for every way the overlay can close, so nothing
@@ -89,7 +92,7 @@ export function initTools(): void {
     $("tools-now").textContent = statusLine();
     const restart = $<HTMLButtonElement>("tools-restart");
     const why = await invoke<string | null>("tools_restart_check").catch(() => null);
-    restart.disabled = why !== null;
+    restart.disabled = restartInFlight || why !== null;
     restart.title = why ?? "";
     if (why !== null) say(why);
   };
@@ -112,14 +115,17 @@ export function initTools(): void {
     restartArmTimer = undefined;
     btn.textContent = "Restarting...";
     btn.disabled = true;
+    restartInFlight = true;
     try {
       await invoke("tools_restart_node");
       say("Your node restarted.");
     } catch (e) {
       say(String(e));
     } finally {
+      restartInFlight = false;
       btn.textContent = "Restart node";
       btn.disabled = false;
+      btn.title = "";
     }
   });
 
