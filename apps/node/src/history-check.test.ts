@@ -18,9 +18,19 @@ describe("historyCheckView", () => {
 
   it("never counts past the base", () => {
     expect(historyCheckView({ checked: 230_000, base: 225_927 })).toEqual({
-      line: "Checking older history: 225,927 of 225,927 (100%)",
-      pct: 100,
+      line: "Checking older history: 225,927 of 225,927 (99%)",
+      pct: 99,
     });
+  });
+
+  it("never reads 100% while the check is still reported, even at the base", () => {
+    // The field goes away only when the engine reports the check done, so
+    // while it is here the check is not done, whatever the numbers say.
+    expect(historyCheckView({ checked: 225_927, base: 225_927 })).toEqual({
+      line: "Checking older history: 225,927 of 225,927 (99%)",
+      pct: 99,
+    });
+    expect(historyCheckView({ checked: 1, base: 1 })?.pct).toBe(99);
   });
 
   it("shows nothing without a check", () => {
