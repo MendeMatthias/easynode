@@ -709,6 +709,44 @@ mod tests {
         );
     }
 
+    /// A feed that lists the AppImage and the .deb, each signed under its own
+    /// release name, is offered to a .deb copy: the guard declines only a
+    /// release that has no .deb for it.
+    #[test]
+    fn a_deb_copy_takes_a_release_that_lists_both_linux_builds() {
+        let mut v = feed();
+        v["platforms"]
+            .as_object_mut()
+            .unwrap()
+            .remove("darwin-aarch64");
+        v["platforms"]["linux-x86_64-deb"] = serde_json::json!({
+            "signature": sig_named("BTX-Node_0.6.30_amd64.deb"),
+            "url": "https://github.com/MendeMatthias/EasyBTX-releases/releases/download/node-v0.6.30/BTX-Node_0.6.30_amd64.deb",
+        });
+        let r = release(v);
+        assert!(!offers_only_the_appimage(&r.data));
+        assert_eq!(
+            decide_here(&ver("0.6.29"), None, &deb_copy(), &r),
+            Decision::Offer
+        );
+    }
+
+    /// A .deb copy handed only the AppImage gets the .deb's notice even when
+    /// that version also failed here before: downloading it could never have
+    /// worked, and the notice says why and gives the command.
+    #[test]
+    fn the_deb_notice_outranks_failed_before() {
+        let r = bound_0630_as("0.6.30");
+        let failed_deb = ThisInstall {
+            deb: true,
+            failed: Some(ver("0.6.30")),
+        };
+        assert_eq!(
+            decide_here(&ver("0.6.29"), None, &failed_deb, &r),
+            Decision::Decline(deb_hand_install_notice("0.6.30"))
+        );
+    }
+
     /// The guard comes after the rules that were there first: a tampered feed
     /// is still reported as tampered on a .deb copy, and nothing newer is
     /// still the ordinary "no update".
