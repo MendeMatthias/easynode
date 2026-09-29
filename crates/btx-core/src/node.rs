@@ -2673,6 +2673,31 @@ pub fn node_log_tail(datadir: &Path, max: u64) -> String {
         .unwrap_or_default()
 }
 
+/// Tail of the engine's own `debug.log`, as text. Empty when missing.
+pub fn debug_log_tail(datadir: &Path, max: u64) -> String {
+    read_tail(&datadir.join("debug.log"), max)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default()
+}
+
+/// The hosts of every peer the app ships in its source. These are public, so
+/// diagnostics may name them; any other peer address is removed.
+pub fn published_peer_hosts() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for peer in BTX_BOOTSTRAP_PEERS
+        .iter()
+        .chain(BTX_ARCHIVE_PEERS.iter())
+        .chain(BTX_DISCOVERY_PEERS.iter())
+        .chain(crate::signer::BTX_MIRRORS_FED_BY_SIGNERS.iter())
+    {
+        let host = peer.rsplit_once(':').map(|(h, _)| h).unwrap_or(peer).to_string();
+        if !out.contains(&host) {
+            out.push(host);
+        }
+    }
+    out
+}
+
 /// Pull btxd's OWN matmul-backend line out of its captured log. btxd runs an
 /// INDEPENDENT runtime probe (separate from the app's `btx-matmul-backend-info`
 /// probe) and logs the result with a `runtime_probe_ok` / `runtime_probe_failed`
@@ -6087,5 +6112,22 @@ matmul: metal runtime_probe_ok, selecting metal\n\
     fn node_not_ours_when_pidfile_unreadable() {
         // Pidfile exists but had no numeric pid → treat as foreign.
         assert!(!node_is_ours(true, None, false));
+    }
+
+    #[test]
+    fn debug_log_tail_reads_only_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("debug.log"), "old line\nnew line\n").unwrap();
+        assert_eq!(debug_log_tail(dir.path(), 9), "new line\n");
+        assert_eq!(debug_log_tail(&dir.path().join("missing"), 100), "");
+    }
+
+    #[test]
+    fn published_peers_are_the_ones_the_app_ships() {
+        let hosts = published_peer_hosts();
+        assert!(hosts.contains(&"20.86.181.203".to_string()), "btxscan's mirror");
+        assert!(hosts.contains(&"109.199.124.187".to_string()), "an archive peer");
+        assert!(hosts.contains(&"node.btx.dev".to_string()));
+        assert!(hosts.iter().all(|h| !h.contains(':')), "no ports");
     }
 }
