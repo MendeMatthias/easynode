@@ -646,12 +646,18 @@ impl NodeRole {
             // or left on a branch the rest abandoned, knows of nothing newer
             // for as long as it sits there. Two witnesses can overrule it.
             Some(n) => match (self.signed_frontier_lag(), self.stale_tip_age()) {
+                // `on_active_chain` false has two causes the RPC does not
+                // tell apart (SignedFrontierIsOnActiveChain returns false when
+                // the signed hash has no block index here): a different
+                // branch, or a header this node never heard of. The note
+                // names both rather than guess.
                 (Some((lag, false)), _) => (
-                    format!("On a different branch, {lag} blocks behind the signed chain"),
+                    format!("{lag} blocks behind the signed chain"),
                     Some(false),
-                    "This node and the signers are on different branches, so what it serves \
-                     is not what the signed chain holds. Leaving it running and connected \
-                     usually settles it."
+                    "The signed blocks do not follow on from this node's newest block. Either \
+                     it has not heard of them yet or it is on a different branch, and until \
+                     that settles what it serves is not current. Leaving it running and \
+                     connected usually settles it."
                         .to_string(),
                 ),
                 (Some((lag, true)), _) => (
@@ -1526,17 +1532,21 @@ mod tests {
         assert_eq!(ahead.value, "17 blocks behind the signed chain");
         assert_eq!(ahead.helps, Some(false));
 
-        // The engine's own words for this shape: "large with
-        // on_active_chain=false is a stranded fork".
+        // Off the active chain: a different branch, or a signed header this
+        // node never heard of. The engine does not say which, so the count
+        // stands and the note names both.
         let stranded = position(
             node_role(None, PLAIN_BITS, &[], 0, 0, Some(0), None)
                 .with_signed_frontier(Some(&frontier(17, Some(false)))),
         );
-        assert_eq!(
-            stranded.value,
-            "On a different branch, 17 blocks behind the signed chain"
-        );
+        assert_eq!(stranded.value, "17 blocks behind the signed chain");
         assert_eq!(stranded.helps, Some(false));
+        assert!(stranded.note.contains("different branch"), "{stranded:?}");
+        assert!(
+            stranded.note.contains("not heard of them yet"),
+            "{stranded:?}"
+        );
+        assert!(!ahead.note.contains("different branch"), "{ahead:?}");
 
         let in_flight = position(
             node_role(None, PLAIN_BITS, &[], 0, 0, Some(0), None)
@@ -1564,8 +1574,7 @@ mod tests {
     }
 
     /// A stranded node usually shows both: an old tip AND a frontier that has
-    /// moved on. The frontier wins because it says what is missing, and the
-    /// different-branch sentence is the one that tells a person what happened.
+    /// moved on. The frontier wins because it says how much is missing.
     #[test]
     fn the_signed_frontier_outranks_the_clock_when_both_speak() {
         let p = position(
@@ -1573,10 +1582,8 @@ mod tests {
                 .with_tip_age(Some(7 * 3600))
                 .with_signed_frontier(Some(&frontier(17, Some(false)))),
         );
-        assert_eq!(
-            p.value,
-            "On a different branch, 17 blocks behind the signed chain"
-        );
+        assert_eq!(p.value, "17 blocks behind the signed chain");
+        assert!(p.note.contains("different branch"), "{p:?}");
     }
 
     /// Every sentence is for a person. No wire names, no engine identifiers,
