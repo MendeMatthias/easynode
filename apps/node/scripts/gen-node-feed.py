@@ -58,20 +58,24 @@ import tempfile
 
 REPO = "https://github.com/MendeMatthias/EasyBTX-releases/releases/download"
 # Release asset names follow the node convention BTX-Node_<ver>_<arch>.<ext>.
+# PLATFORM_SUFFIXES in apps/node/src-tauri/src/update_binding.rs is the same
+# table, and a test there reads this file to keep the two equal.
 #
-# linux-x86_64 is the AppImage, deliberately, and there is no `.deb` key: the
-# updater cannot install one. BundleType::Deb reaches install_deb and fails
-# InvalidUpdaterFormat, and when bundle detection returns None it falls through
-# to install_appimage, which renames over a root-owned /usr path and gets
-# EACCES. Adding a deb entry here would not give deb users an update path; it
-# would make every one of them download ~450 MB on a six-hour timer to reach a
-# guaranteed failure. They are told to update by hand instead (README, and the
-# banner the app shows when an install fails).
+# linux-x86_64 is the AppImage. linux-x86_64-deb is the .deb, and it lives in
+# its OWN feed, node-deb.json, which only a .deb install reads (the app asks
+# for node-{{bundle_type}}.json first; docs/decisions/2026-09-28-deb-installs-
+# update-themselves.md). It must never appear in latest-node.json: easyNode
+# 0.6.32 refuses a whole release that lists a key it does not know, so one
+# stray key there stops every 0.6.32 install from updating, on every platform.
 ASSET = {
     "darwin-aarch64": "BTX-Node_{v}_aarch64.app.tar.gz",
     "linux-x86_64": "BTX-Node_{v}_amd64.AppImage",
+    "linux-x86_64-deb": "BTX-Node_{v}_amd64.deb",
     "windows-x86_64": "BTX-Node_{v}_x64-setup.exe",
 }
+DEB_KEY = "linux-x86_64-deb"
+# The keys latest-node.json may carry: every one but the .deb's.
+MAIN_KEYS = tuple(k for k in ASSET if k != DEB_KEY)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 TAURI_CONF = os.path.join(_HERE, "..", "src-tauri", "tauri.conf.json")
@@ -363,7 +367,7 @@ def main():
     )
     names = ", ".join(sorted(feed["platforms"]))
     print(f"wrote {a.out} — version {feed['version']}, platforms: {names}")
-    missing = sorted(set(ASSET) - set(feed["platforms"]))
+    missing = sorted(set(MAIN_KEYS) - set(feed["platforms"]))
     if missing:
         print(f"NOTE: no key for {', '.join(missing)} — those clients stay on "
               f"their current build and download nothing, which is the intended "

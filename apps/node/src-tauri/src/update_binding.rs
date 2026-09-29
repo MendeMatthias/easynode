@@ -69,12 +69,23 @@ use crate::state::{node_datadir, NodeAppSettings};
 /// Every artifact of this app is signed under a name that starts with this.
 pub const ASSET_PREFIX: &str = "BTX-Node_";
 
+/// The AppImage's platform key. Every Linux install read it until the .deb
+/// had a feed of its own.
+pub const APPIMAGE_KEY: &str = "linux-x86_64";
+
+/// The .deb's platform key. It is listed in `node-deb.json` and NEVER in
+/// `latest-node.json`: 0.6.32 refuses a whole release that lists a key it does
+/// not know ("it lists X, which no release of this app has", below), so this
+/// key there would stop every 0.6.32 install from updating, on every platform.
+pub const DEB_KEY: &str = "linux-x86_64-deb";
+
 /// Each platform key a feed may carry, and the end of the name its artifact is
 /// signed under. `ASSET` in `apps/node/scripts/gen-node-feed.py` is the same
 /// table, and a test below reads that file to keep the two equal.
-pub const PLATFORM_SUFFIXES: [(&str, &str); 3] = [
+pub const PLATFORM_SUFFIXES: [(&str, &str); 4] = [
     ("darwin-aarch64", "_aarch64.app.tar.gz"),
-    ("linux-x86_64", "_amd64.AppImage"),
+    (APPIMAGE_KEY, "_amd64.AppImage"),
+    (DEB_KEY, "_amd64.deb"),
     ("windows-x86_64", "_x64-setup.exe"),
 ];
 
@@ -477,6 +488,67 @@ mod tests {
         let reason = take_refusal().expect("the refusal is kept");
         assert!(reason.starts_with("refused v0.9.0: "), "{reason}");
         assert_eq!(take_refusal(), None, "taken once");
+    }
+
+    /// A genuine release signature with its trusted comment rewritten to name
+    /// `file`. Its cryptography no longer holds, which does not matter here:
+    /// the binding reads the name before anything is downloaded, and the
+    /// plugin verifies the bytes and the comment at download.
+    fn sig_named(file: &str) -> String {
+        let real = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(sig(&feed(), "linux-x86_64"))
+                .unwrap(),
+        )
+        .unwrap();
+        let mut lines: Vec<String> = real.lines().map(str::to_string).collect();
+        lines[2] = format!("trusted comment: timestamp:1790340476\tfile:{file}");
+        base64::engine::general_purpose::STANDARD.encode(lines.join("\n") + "\n")
+    }
+
+    /// A `node-deb.json` the way `gen-node-feed.py --deb-sig` writes it: one
+    /// entry, `linux-x86_64-deb`, its build signed as `signed_as`.
+    fn deb_feed(version: &str, signed_as: &str) -> RemoteRelease {
+        release(serde_json::json!({
+            "version": version,
+            "notes": "n",
+            "pub_date": "2026-09-29T00:00:00Z",
+            "platforms": {
+                "linux-x86_64-deb": {
+                    "signature": sig_named(signed_as),
+                    "url": format!(
+                        "https://github.com/MendeMatthias/EasyBTX-releases/releases/download/node-v{version}/BTX-Node_{version}_amd64.deb"
+                    ),
+                }
+            }
+        }))
+    }
+
+    /// The .deb has a feed of its own, `node-deb.json`, and its one entry is
+    /// bound like every other: signed under `BTX-Node_<version>_amd64.deb`.
+    #[test]
+    fn a_deb_feed_signed_under_its_name_is_offered() {
+        assert_eq!(
+            signed_name(&sig_named("BTX-Node_0.6.34_amd64.deb")).as_deref(),
+            Some("BTX-Node_0.6.34_amd64.deb")
+        );
+        let r = deb_feed("0.6.34", "BTX-Node_0.6.34_amd64.deb");
+        assert_eq!(binding_refusal("0.6.34", &r.data), None);
+        assert_eq!(decide(&ver("0.6.33"), None, &r), Decision::Offer);
+    }
+
+    /// The AppImage's signature under the .deb's key is another platform's
+    /// build, and is refused like the Windows installer under Linux's.
+    #[test]
+    fn a_deb_feed_signed_under_the_appimage_name_is_refused() {
+        let r = deb_feed("0.6.34", "BTX-Node_0.6.34_amd64.AppImage");
+        assert_eq!(
+            binding_refusal("0.6.34", &r.data).as_deref(),
+            Some(
+                "its linux-x86_64-deb build is signed as BTX-Node_0.6.34_amd64.AppImage, \
+                 not BTX-Node_0.6.34_amd64.deb"
+            )
+        );
     }
 
     /// `gen-node-feed.py` mints the names this module expects. If the two
