@@ -2300,6 +2300,12 @@ async function updateCheck(manual = false): Promise<void> {
   // before. A verified download that would not install is remembered, and the
   // automatic checks leave that version alone, so a copy that cannot install
   // it does not fetch it again every six hours. "Check now" still tries.
+  //
+  // On a .deb copy the install waits in the password prompt until someone
+  // answers it. That wait happens inside the plugin: its install command runs
+  // the blocking install on one of the backend's async workers, and that is
+  // the plugin's code, left alone here. The six-hourly timer runs its own
+  // install on the blocking pool instead (update_timer.rs).
   let downloaded = false;
   try {
     await update.download();

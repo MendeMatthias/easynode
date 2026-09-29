@@ -271,7 +271,19 @@ async fn check_once(app: &AppHandle) {
             return;
         }
     };
-    if let Err(e) = update.install(bytes) {
+    // The install blocks until it is done, and on a .deb copy that is until
+    // the password prompt is answered, which can take hours. So it runs on
+    // the blocking pool, not on one of the async workers, which on a one- or
+    // two-core box would stall the refresher and every other background task
+    // for as long as the prompt stays open. An install that panicked there
+    // comes back as the pool's error, and counts as a failed install like
+    // any other: the download before it was verified.
+    let installed = match tauri::async_runtime::spawn_blocking(move || update.install(bytes)).await
+    {
+        Ok(result) => result,
+        Err(e) => Err(tauri_plugin_updater::Error::from(e)),
+    };
+    if let Err(e) = installed {
         if let Err(why) = update_binding::remember_failed_install(&datadir, &version) {
             eprintln!("[update-timer] could not remember v{version} as failed: {why}");
         }
@@ -436,6 +448,22 @@ mod tests {
             .expect("the failure is remembered");
         assert!(download < install && install < remember);
         assert_eq!(body.matches("remember_failed_install(").count(), 1);
+    }
+
+    /// A .deb copy's install blocks until the password prompt is answered,
+    /// which can take hours. It runs on the blocking pool, so a prompt left
+    /// open does not hold one of the async workers (on a one- or two-core
+    /// box, the refresher and every other background task with it).
+    #[test]
+    fn the_install_runs_off_the_async_workers() {
+        let src = include_str!("update_timer.rs");
+        let start = src.find("async fn check_once(").unwrap();
+        let body = &src[start..src.find("\nfn settle(").unwrap()];
+        assert_eq!(body.matches("update.install(").count(), 1);
+        assert!(
+            body.contains("tauri::async_runtime::spawn_blocking(move || update.install(bytes))"),
+            "the install is handed to the blocking pool"
+        );
     }
 
     /// 2026-09-15T14:03:22Z, and a record written `ago` seconds before it.
