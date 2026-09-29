@@ -712,6 +712,10 @@ mod tests {
     /// A feed that lists the AppImage and the .deb, each signed under its own
     /// release name, is offered to a .deb copy: the guard declines only a
     /// release that has no .deb for it.
+    ///
+    /// This shape exists only to test the comparator. No published feed ever
+    /// looks like it: `linux-x86_64-deb` lives alone in `node-deb.json`, and
+    /// `latest-node.json` must never carry it (0.6.32 refuses the release).
     #[test]
     fn a_deb_copy_takes_a_release_that_lists_both_linux_builds() {
         let mut v = feed();

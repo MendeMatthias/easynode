@@ -58,7 +58,10 @@ pub const FIRST_CHECK_DELAY: Duration = Duration::from_secs(2 * 60);
 /// then would download the package again and open a second prompt. A `found`
 /// that has stood an hour is taken as a check that will not finish (the
 /// webview reloaded mid-download, or nobody is there to answer the prompt),
-/// and the tick checks rather than wait on it for good.
+/// and the tick checks rather than wait on it for good. Ticks after the first
+/// are six hours apart, so in practice this guards the first tick, two
+/// minutes after launch, which is when the launch check's prompt may still be
+/// open.
 const FOUND_HOLDS_FOR: Duration = Duration::from_secs(60 * 60);
 
 /// Up while this timer's own check downloads and installs. The ticks run one
