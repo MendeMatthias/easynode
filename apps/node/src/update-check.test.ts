@@ -539,3 +539,64 @@ describe("an update this copy will not download on its own", () => {
     }
   });
 });
+
+// ── main.ts: the failed version, the declined offer, and "Check now" ─────────
+// Read from main.ts, the way the tests above read it: updateCheck() is a thin
+// Tauri veneer that cannot run under vitest, but its order can be pinned.
+
+describe("updateCheck() keeps a failed install from downloading again, and a press still tries", () => {
+  const main = read("./main.ts");
+  const lib = read("../src-tauri/src/lib.rs");
+  const fn = (name: string) => {
+    const s = main.indexOf(`function ${name}(`);
+    expect(s, `function ${name} in main.ts`).toBeGreaterThan(-1);
+    return main.slice(s, main.indexOf("\n}\n", s));
+  };
+  const body = fn("updateCheck");
+
+  it("clears the failed version before a pressed check, and only then", () => {
+    const forget = body.indexOf('invoke("forget_failed_update")');
+    expect(forget).toBeGreaterThan(-1);
+    expect(forget).toBeLessThan(body.indexOf("await checkForUpdate()"));
+    expect(body.slice(0, forget)).toMatch(/if \(manual\) \{\s*await $/);
+  });
+
+  it("downloads, then installs, and remembers a version only when the install failed", () => {
+    expect(body).not.toContain("downloadAndInstall(");
+    const download = body.indexOf("await update.download()");
+    const downloaded = body.indexOf("downloaded = true;");
+    const install = body.indexOf("await update.install()");
+    const remember = body.indexOf('invoke("remember_failed_update"');
+    expect(download).toBeGreaterThan(-1);
+    expect(download < downloaded && downloaded < install && install < remember).toBe(true);
+    expect(body.slice(install, remember)).toMatch(/if \(downloaded\) \{\s*void $/);
+  });
+
+  it("reads why an offer was declined before the record takes it, and shows it", () => {
+    const peek = body.indexOf("await peekUpdateRefusal()");
+    expect(peek).toBeGreaterThan(-1);
+    expect(peek).toBeLessThan(body.indexOf('branch: "no-update"'));
+    expect(body).toContain("paintHandInstall(declined");
+    expect(body).toContain("noUpdateMessage(declined, appVersion, MANUAL_DOWNLOAD)");
+  });
+
+  it("shows a notice from the six-hourly timer the same way", () => {
+    expect(fn("onUpdateCheckEvent")).toContain("paintHandInstall(ev.detail)");
+    const paint = fn("paintHandInstall");
+    expect(paint).toContain("handInstallNotice(");
+    expect(paint).toContain("showUpdateBanner(");
+    expect(paint).toContain("setUpdateResult(");
+  });
+
+  it("calls only commands the backend registers", () => {
+    for (const name of [
+      "record_update_check",
+      "remember_failed_update",
+      "forget_failed_update",
+      "peek_update_refusal",
+    ]) {
+      expect(main, name).toMatch(new RegExp(`invoke(<[^>]*>)?\\("${name}"`));
+      expect(lib, name).toContain(`commands::${name},`);
+    }
+  });
+});
