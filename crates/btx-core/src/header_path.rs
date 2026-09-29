@@ -166,10 +166,14 @@ impl HeaderPath {
             .collect()
     }
 
-    /// Drop what lies below the tip. A tip that fell below everything read (a
-    /// rollback) resumes the walk from the lowest header still held, or, if
-    /// none is held (an earlier rollback already emptied the path), starts
-    /// it again from the target.
+    /// Drop what lies below the tip, and a pending `down` or `up` cursor the
+    /// tip has passed (left alone, either would dangle below everything the
+    /// trim below just kept, and a later rollback would wrongly resume from
+    /// it). A tip that then falls below the lowest header still held
+    /// resumes the walk from there, or, if nothing is held at all — the tip
+    /// having risen to or past everything held emptied the path via that
+    /// same trim, not a rollback by itself — starts it again from the
+    /// target.
     fn forget_below(&mut self, tip: u64) {
         let lowest = self.hashes.iter().next().map(|(h, s)| (*h, s.clone()));
         let below_everything = match &lowest {
@@ -195,6 +199,9 @@ impl HeaderPath {
         self.hashes.retain(|h, _| *h >= tip);
         if self.down.as_ref().is_some_and(|(h, _)| *h < tip) {
             self.down = None;
+        }
+        if self.up.as_ref().is_some_and(|(h, _)| *h < tip) {
+            self.up = None;
         }
     }
 }
@@ -392,7 +399,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rollback_below_the_walk_starts_it_again() {
+    async fn a_rollback_below_the_walk_resumes_it() {
         let node = Headers::new(500, None);
         let mut p = HeaderPath::new();
         p.retarget(500, &main_hash(500));
@@ -507,10 +514,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_rollback_after_the_tip_passed_the_target_restarts_the_walk() {
-        // Reproduces a bug: once a rollback emptied `hashes` entirely (the
-        // tip having moved above the target and then back below it),
-        // `forget_below` bailed out on the empty map instead of restarting
-        // the walk, leaving it stuck reporting `Walking` forever.
+        // Reproduces a bug: the tip rising to or past everything held empties
+        // `hashes` via the trim, not a rollback by itself; when the tip then
+        // falls back below the target again, `forget_below` bailed out on
+        // the empty map instead of restarting the walk, leaving it stuck
+        // reporting `Walking` forever.
         let node = Headers::new(500, None);
         let mut p = HeaderPath::new();
         p.retarget(500, &main_hash(500));
@@ -524,5 +532,29 @@ mod tests {
         assert_eq!(p.walk(&node, 400, usize::MAX).await.unwrap(), 0);
         assert_eq!(p.status(400, &main_hash(400)), PathStatus::Ready);
         assert_eq!(p.next(400, 1), vec![(401, main_hash(401))]);
+    }
+
+    #[tokio::test]
+    async fn a_rollback_after_the_tip_passes_a_pending_up_cursor_does_not_leave_a_gap() {
+        // Reproduces a bug: forget_below dropped a pending `down` cursor the
+        // tip had passed, but not a pending `up` one. A tip that rose past
+        // it let the up-walk's "below everything read before" branch treat
+        // it as a stray restart point, stranded below whatever the trim had
+        // kept above the new tip; a later rollback resumed from that stray,
+        // leaving a gap between it and the rest of the path.
+        let node = Headers::new(500, Some((300, 520)));
+        let mut p = HeaderPath::new();
+        p.retarget(500, &main_hash(500));
+        p.walk(&node, 100, usize::MAX).await.unwrap();
+        p.retarget(520, &side_hash(520));
+        assert_eq!(
+            p.walk(&node, 100, 120).await.unwrap(),
+            120,
+            "reads 520 down to 401, leaving the up cursor at 400"
+        );
+        p.walk(&node, 450, usize::MAX).await.unwrap();
+        p.walk(&node, 390, usize::MAX).await.unwrap();
+        assert_eq!(p.status(390, &side_hash(390)), PathStatus::Ready);
+        assert_walked_chain(&p, &node, 390, 520);
     }
 }
