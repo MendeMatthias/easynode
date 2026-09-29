@@ -19,6 +19,7 @@
 pub mod attested_snapshot;
 pub mod backend;
 pub mod checkin;
+pub mod console_policy;
 pub mod datadir;
 pub mod disk;
 pub mod engine_warnings;
