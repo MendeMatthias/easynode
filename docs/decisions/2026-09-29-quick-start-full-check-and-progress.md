@@ -47,14 +47,22 @@ Above "Set up my node", two choices:
 - **Quick start**: follows signatures, ready in minutes.
 - **Full check**: validates every block, takes longer the first time.
 
-One line under them says what the choice means, in these words or close to
-them: "Both start from a snapshot confirmed by two node operators. Full check
-then checks every new block on this computer's graphics card and checks the
-older history in the background. You can switch later in Settings."
+One line under them says what the choice means. As the owner worded it on
+30 September: "Both start from a recent signed snapshot and check the older
+history in the background. Full check also checks every new block on this
+computer's graphics card. You can switch later in Settings." The last sentence
+shows only where Full check can be picked. (Proposed first as "Both start from
+a snapshot confirmed by two node operators. ..."; changed because that is true
+only once a second operator confirms, and because every node, Quick start
+too, checks the older history.)
 
-- **Which is selected first.** Full check, where the machine may be able to
-  check blocks (an NVIDIA GPU, or a Mac). That keeps today's default and the
-  decision that a capable node validates and signs. Quick start where it cannot.
+- **Which is selected first** (the owner's decision of 29 September). Full
+  check on a machine with an NVIDIA card the bundled engine can use; Quick
+  start on a Mac, where Full check can still be picked, because 0.34.9 does not
+  move a Mac whose chip fails the engine's check to Quick start by itself;
+  Quick start where the machine cannot check blocks. (Proposed first as "Full
+  check where the machine may be able to check blocks, an NVIDIA GPU or a
+  Mac".)
 - **A machine that cannot check blocks** (no usable GPU) shows Full check
   greyed out, with the reason: "This computer has no graphics card the BTX
   engine can check blocks with."
