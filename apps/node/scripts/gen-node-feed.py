@@ -246,10 +246,13 @@ def feed_problem(path, feed):
     node-deb.json lists exactly the .deb's key. Every other feed never lists
     it: easyNode 0.6.32 refuses a whole release that lists a key it does not
     know, so the key in latest-node.json would stop every 0.6.32 install from
-    updating, on every platform."""
+    updating, on every platform.
+
+    The name is compared without case: on APFS and NTFS `Node-Deb.json` IS
+    node-deb.json, and the main feed written there replaced the .deb's."""
     keys = sorted(feed.get("platforms") or {})
     name = os.path.basename(path)
-    if name == DEB_FEED_NAME:
+    if name.lower() == DEB_FEED_NAME:
         if keys != [DEB_KEY]:
             return f"{DEB_FEED_NAME} must list exactly {DEB_KEY}, not {keys}"
     elif DEB_KEY in keys:
@@ -258,6 +261,15 @@ def feed_problem(path, feed):
                 f"every 0.6.32 install would stop updating. It belongs in "
                 f"{DEB_FEED_NAME} only.")
     return None
+
+
+def same_file(a, b):
+    """Whether `a` and `b` name one file: the same file when both exist, else
+    the same path once links are resolved and case is ignored, which is how
+    APFS and NTFS see it. Erring towards "the same" only ever refuses a write."""
+    if os.path.exists(a) and os.path.exists(b):
+        return os.path.samefile(a, b)
+    return os.path.realpath(a).lower() == os.path.realpath(b).lower()
 
 
 def write_feed(path, feed):
@@ -517,6 +529,33 @@ def _self_test_main(d, pub):
     with open(deb_out) as f:
         assert sorted(json.load(f)["platforms"]) == [DEB_KEY]
 
+    # The .deb's feed name in other case. On APFS that IS node-deb.json, and
+    # writing the main feed there silently replaced the .deb's.
+    for name in ("Node-Deb.json", "NODE-DEB.JSON"):
+        out = os.path.join(feeds, name)
+        refused(["--linux-sig", good_linux, "--deb-sig", good_deb, "--out", out],
+                f"--out {name} with --deb-sig")
+        refused(["--linux-sig", good_linux, "--out", out], f"--out {name}")
+
+    # An --out that is the .deb's feed under a second name is the same file.
+    link = os.path.join(feeds, "main.json")
+    os.link(deb_out, link)
+    refused(["--linux-sig", good_linux, "--deb-sig", good_deb, "--out", link],
+            "--out a hard link to node-deb.json")
+    os.remove(link)
+
+    # And one that resolves to it before it exists.
+    fresh = folder("fresh")
+    dangling = os.path.join(fresh, "main.json")
+    try:
+        os.symlink(DEB_FEED_NAME, dangling)
+    except (OSError, NotImplementedError):
+        dangling = None  # Windows without the symlink privilege
+    if dangling:
+        refused(["--linux-sig", good_linux, "--deb-sig", good_deb, "--out", dangling],
+                "--out a link to a node-deb.json not written yet")
+        assert os.listdir(fresh) == ["main.json"], os.listdir(fresh)
+
 
 def _read(path):
     with open(path) as f:
@@ -569,6 +608,9 @@ def main():
         problem = f and feed_problem(path, f)
         if problem:
             raise ValueError(problem)
+    if deb and feed and same_file(deb_out, a.out):
+        raise ValueError(f"--out {a.out} is {deb_out}, where the .deb's feed goes. "
+                         f"Pass --out .../{MAIN_FEED_NAME}.")
     if deb:
         write_feed(deb_out, deb)
         print(f"wrote {deb_out}: version {deb['version']}, platform {DEB_KEY}")
