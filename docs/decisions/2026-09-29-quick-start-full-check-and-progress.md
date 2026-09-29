@@ -103,6 +103,14 @@ trend and from what the node knows:
 The fork and "behind the signers" messages keep their place after the stale
 sentence, as today.
 
+As built, three rules sit under the table. A node that is still syncing is
+judged by the blocks it adds, read over the last 20 minutes, not by the gap,
+because its headers can run far ahead of its blocks: amber only when it adds
+fewer than the chain's 40 an hour. The header fetch (height 0) always shows
+the calm line, so a fresh install is never amber while it counts headers. And
+"behind" means two or more headers beyond the tip, as on the role card: one
+is a block in flight.
+
 ### 4. What stays
 
 The window stays 560x780. The status screen stays home. No new top-level
