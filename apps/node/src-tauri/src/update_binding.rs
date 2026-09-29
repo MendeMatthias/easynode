@@ -924,6 +924,45 @@ mod tests {
         );
     }
 
+    /// The typed feed first, then the one every install has always read. The
+    /// plugin puts the install type where `{{bundle_type}}` is (`deb`,
+    /// `appimage`, `app`, `nsis`, `msi`, `rpm` or `unknown`); only
+    /// `node-deb.json` exists, every other name answers 404, and on a
+    /// non-success status the plugin tries the next endpoint
+    /// (tauri-plugin-updater 2.11.0, `Updater::check`). The endpoints are
+    /// compiled in, so a change here strands the installs already out there,
+    /// and the Linux and Windows overrides must not carry endpoints of their
+    /// own (they once did, and those installs never updated).
+    #[test]
+    fn the_app_reads_its_install_types_feed_then_the_common_one() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(
+            conf["plugins"]["updater"]["endpoints"],
+            serde_json::json!([
+                "https://easybtx.com/updater/node-{{bundle_type}}.json",
+                "https://easybtx.com/updater/latest-node.json"
+            ])
+        );
+        // The config parses each endpoint as a URL, which escapes the braces;
+        // the plugin substitutes the escaped form (`Updater::check`), so the
+        // .deb copy asks for exactly node-deb.json.
+        let typed: tauri::Url = "https://easybtx.com/updater/node-{{bundle_type}}.json"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            typed.to_string().replace("%7B%7Bbundle_type%7D%7D", "deb"),
+            "https://easybtx.com/updater/node-deb.json"
+        );
+        for overlay in [
+            include_str!("../tauri.linux.conf.json"),
+            include_str!("../tauri.windows.conf.json"),
+        ] {
+            let v: serde_json::Value = serde_json::from_str(overlay).unwrap();
+            assert!(v.get("plugins").is_none(), "{overlay}");
+        }
+    }
+
     /// `gen-node-feed.py` mints the names this module expects. If the two
     /// tables drift, every release stops updating, so they are compared.
     #[test]
