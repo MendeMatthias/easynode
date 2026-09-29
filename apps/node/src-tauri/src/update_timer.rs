@@ -30,22 +30,92 @@
 //! at once. The launch check covers the common case of a machine that was off.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_updater::UpdaterExt;
 
-use crate::state::node_datadir;
+use crate::state::{node_datadir, NodeAppSettings};
 use crate::update_binding;
 use crate::update_log;
 
 /// The first check waits this long after the timer is armed at launch. The
 /// front end checks at launch already (`main.ts`, boot); a second check at
-/// once would race it, and two minutes is enough for a launch check that found
-/// something to have downloaded, recorded, and restarted the process, in which
-/// case this timer never reaches its first tick at all.
+/// once would race it, and two minutes is usually enough for a launch check
+/// that found something to have downloaded, recorded, and restarted the
+/// process, in which case this timer never reaches its first tick at all.
+/// Not always: a .deb copy's install waits in the password prompt for as long
+/// as nobody answers it, so a tick also leaves alone a check that is still
+/// downloading or installing ([`skip_reason`]).
 pub const FIRST_CHECK_DELAY: Duration = Duration::from_secs(2 * 60);
+
+/// How long a `found` record keeps a tick away. The launch check and "Check
+/// now" record `found` before they download (`main.ts`), and follow it with
+/// `installed` or `install-failed`, so a `found` younger than this is a check
+/// still downloading, or still waiting in a .deb's password prompt; checking
+/// then would download the package again and open a second prompt. A `found`
+/// that has stood an hour is taken as a check that will not finish (the
+/// webview reloaded mid-download, or nobody is there to answer the prompt),
+/// and the tick checks rather than wait on it for good.
+const FOUND_HOLDS_FOR: Duration = Duration::from_secs(60 * 60);
+
+/// Up while this timer's own check downloads and installs. The ticks run one
+/// after another today, so a tick never finds it up; it keeps it that way if
+/// that ever changes.
+static OWN_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Holds [`OWN_CHECK_RUNNING`] up, and puts it down however the check ends.
+struct OwnCheckRunning;
+
+impl OwnCheckRunning {
+    fn set() -> Self {
+        OWN_CHECK_RUNNING.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for OwnCheckRunning {
+    fn drop(&mut self) {
+        OWN_CHECK_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Why this tick leaves the update alone, or `None` to check. `last_outcome`
+/// and `last_at` are the last record's (`NodeAppSettings`), as written by
+/// either side. A tick that skips writes no record: the outcome vocabulary is
+/// closed and has no word for it, and the `found` it skipped for is already
+/// the last line of the log.
+fn skip_reason(
+    own_check_running: bool,
+    last_outcome: Option<&str>,
+    last_at: Option<&str>,
+    now_secs: u64,
+) -> Option<&'static str> {
+    if own_check_running {
+        return Some("this timer's own check is still downloading or installing");
+    }
+    if last_outcome != Some("found") {
+        return None;
+    }
+    // A time it cannot read is no reason to wait. Either side of now, so a
+    // clock stepped back a little after the record still counts as recent.
+    let at = last_at.and_then(update_log::parse_rfc3339_utc)?;
+    (now_secs.abs_diff(at) < FOUND_HOLDS_FOR.as_secs())
+        .then_some("another check found an update and is still downloading or installing it")
+}
+
+/// [`skip_reason`] for this tick, from the settings file and the flag.
+fn skip_this_tick() -> Option<&'static str> {
+    let last = NodeAppSettings::load(&node_datadir());
+    skip_reason(
+        OWN_CHECK_RUNNING.load(Ordering::SeqCst),
+        last.last_update_check_outcome.as_deref(),
+        last.last_update_check_at.as_deref(),
+        update_log::now_secs(),
+    )
+}
 
 /// Six hours: the period the webview's `setInterval` used until this module
 /// took the job, and the period the Settings pane's copy promises ("Checks
@@ -121,6 +191,10 @@ pub fn spawn(app: AppHandle) {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
+            if let Some(why) = skip_this_tick() {
+                eprintln!("[update-timer] skipped this check: {why}");
+                continue;
+            }
             check_once(&app).await;
         }
     });
@@ -177,6 +251,8 @@ async fn check_once(app: &AppHandle) {
         Ok(Some(update)) => update,
     };
 
+    // Up until this check has installed or failed, so no tick starts another.
+    let _running = OwnCheckRunning::set();
     let version = update.version.clone();
     let detail = format!("automatic: v{version} offered, downloading");
     settle(app, &datadir, "found", &version, &detail);
@@ -360,6 +436,102 @@ mod tests {
             .expect("the failure is remembered");
         assert!(download < install && install < remember);
         assert_eq!(body.matches("remember_failed_install(").count(), 1);
+    }
+
+    /// 2026-09-15T14:03:22Z, and a record written `ago` seconds before it.
+    const NOW: u64 = 1_789_481_002;
+    fn recorded(ago: i64) -> String {
+        update_log::rfc3339_utc(NOW.checked_add_signed(-ago).unwrap())
+    }
+    const MINUTE: i64 = 60;
+
+    /// A .deb copy's install waits in the password prompt. A launch check
+    /// or a press can still be sitting there when this timer's first tick
+    /// comes round, two minutes in, and checking then would download the
+    /// package again and open a second prompt. Both record `found` before
+    /// they download (`main.ts`), so a `found` this young means "leave it".
+    #[test]
+    fn a_check_that_found_an_update_within_the_hour_is_left_alone() {
+        assert!(update_log::UPDATE_CHECK_OUTCOMES.contains(&"found"));
+        let five = recorded(5 * MINUTE);
+        assert!(skip_reason(false, Some("found"), Some(&five), NOW).is_some());
+        let fifty_nine = recorded(59 * MINUTE);
+        assert!(skip_reason(false, Some("found"), Some(&fifty_nine), NOW).is_some());
+        // A found that has stood an hour belongs to a check that died.
+        let sixty_one = recorded(61 * MINUTE);
+        assert_eq!(
+            skip_reason(false, Some("found"), Some(&sixty_one), NOW),
+            None
+        );
+        let hour = recorded(60 * MINUTE);
+        assert_eq!(skip_reason(false, Some("found"), Some(&hour), NOW), None);
+    }
+
+    #[test]
+    fn every_other_record_is_checked_as_before() {
+        let five = recorded(5 * MINUTE);
+        for other in ["installed", "install-failed", "no-update", "check-failed"] {
+            assert_eq!(
+                skip_reason(false, Some(other), Some(&five), NOW),
+                None,
+                "{other}"
+            );
+        }
+        // No record yet, a word this build does not know, or a found with no
+        // time it can read: the check goes ahead rather than waiting on it.
+        assert_eq!(skip_reason(false, None, None, NOW), None);
+        assert_eq!(skip_reason(false, Some("skipped"), Some(&five), NOW), None);
+        assert_eq!(skip_reason(false, Some("found"), None, NOW), None);
+        assert_eq!(
+            skip_reason(false, Some("found"), Some("yesterday"), NOW),
+            None
+        );
+    }
+
+    /// A clock stepped back a little after the record still reads as within
+    /// the hour; one stepped back further is checked, not waited on.
+    #[test]
+    fn a_clock_that_moved_back_neither_skips_for_good_nor_races() {
+        let ahead = recorded(-5 * MINUTE);
+        assert!(skip_reason(false, Some("found"), Some(&ahead), NOW).is_some());
+        let far_ahead = recorded(-120 * MINUTE);
+        assert_eq!(
+            skip_reason(false, Some("found"), Some(&far_ahead), NOW),
+            None
+        );
+    }
+
+    /// The timer never runs two of its own checks at once, whatever the
+    /// settings file says.
+    #[test]
+    fn the_timer_leaves_its_own_running_check_alone() {
+        assert!(skip_reason(true, None, None, NOW).is_some());
+        let old = recorded(7 * 60 * MINUTE);
+        assert!(skip_reason(true, Some("installed"), Some(&old), NOW).is_some());
+    }
+
+    /// Every tick asks the rule before it checks, a skip writes no record
+    /// (the vocabulary is closed and has no word for it), and the timer's own
+    /// flag is up before its `found` record and its download.
+    #[test]
+    fn every_tick_asks_before_it_checks_and_a_skip_records_nothing() {
+        let src = include_str!("update_timer.rs");
+        let spawn =
+            &src[src.find("pub fn spawn(").unwrap()..src.find("\nasync fn check_once(").unwrap()];
+        let ask = spawn.find("skip_this_tick()").expect("the tick asks");
+        let check = spawn
+            .find("check_once(&app).await")
+            .expect("the tick checks");
+        assert!(ask < check);
+        assert!(spawn[ask..check].contains("continue;"));
+        assert!(!spawn.contains("settle("));
+        let body =
+            &src[src.find("async fn check_once(").unwrap()..src.find("\nfn settle(").unwrap()];
+        let flag = body
+            .find("OwnCheckRunning::set()")
+            .expect("the flag is set");
+        assert!(flag < body.find("\"found\"").unwrap());
+        assert!(flag < body.find("update.download(").unwrap());
     }
 
     #[test]

@@ -583,6 +583,17 @@ describe("updateCheck() keeps a failed install from downloading again, and a pre
     expect(body.slice(install, remember)).toMatch(/if \(downloaded\) \{\s*void $/);
   });
 
+  it("records what it found before it downloads, which keeps the six-hourly timer away", () => {
+    // update_timer.rs skips a tick while the last record is a `found` under
+    // an hour old, so a launch check or a press waiting in a .deb's password
+    // prompt is not raced by a second download and a second prompt.
+    const found = body.indexOf('branch: "found"');
+    expect(found).toBeGreaterThan(-1);
+    expect(found).toBeLessThan(body.indexOf("await update.download()"));
+    const timer = read("../src-tauri/src/update_timer.rs");
+    expect(timer).toContain('if last_outcome != Some("found")');
+  });
+
   it("frees the downloaded package when the download or the install fails", () => {
     // The plugin frees the package (150-470 MB) only after an install that
     // succeeded. Without the close, every failed launch check or press holds

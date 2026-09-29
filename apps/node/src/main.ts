@@ -2289,7 +2289,10 @@ async function updateCheck(manual = false): Promise<void> {
 
   paintUpdateProgress("found", update.version, "");
   // Recorded before the download, so a check that found something and then
-  // died mid-download still left the finding behind.
+  // died mid-download still left the finding behind. The six-hourly timer
+  // reads it too: while the last record is a `found` under an hour old it
+  // leaves this check alone (update_timer.rs), so a .deb copy waiting in its
+  // password prompt is not sent a second download and a second prompt.
   void recordUpdateCheck({ branch: "found", version: update.version }, manual);
 
   // Downloaded and verified first, then installed, so a failure knows which
