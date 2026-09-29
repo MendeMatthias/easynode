@@ -1798,7 +1798,8 @@ pub fn clear_matmul_consensus_refused(datadir: &Path) {
 /// reach the tip (catchup-trend.ts; the owner's decision of 2026-09-26), or
 /// when the machine's graphics chip failed the engine's check and the node
 /// does not move at all (validation.ts `stalledFollowOffer`). It sets it only
-/// on the owner's click.
+/// on the owner's click, or when the owner picks Quick start on the setup
+/// screen ([`apply_start_choice`]).
 ///
 /// A file for the same reason as the refusal marker above: every path that
 /// decides the launch reads it through [`launches_as_mirror`], with nothing to
@@ -1821,8 +1822,8 @@ pub fn set_follows_signatures_by_choice(datadir: &Path, on: bool) -> std::io::Re
         std::fs::write(
             &path,
             "The owner chose, in the app, to follow signatures instead of checking\n\
-             blocks on this machine, which was adding fewer blocks an hour than\n\
-             the chain makes. Settings switches it back.\n",
+             blocks on this machine: Quick start at setup, or the offer on the\n\
+             status screen. Settings switches it back.\n",
         )
     } else {
         match std::fs::remove_file(&path) {
@@ -1830,6 +1831,39 @@ pub fn set_follows_signatures_by_choice(datadir: &Path, on: bool) -> std::io::Re
             _ => Ok(()),
         }
     }
+}
+
+/// What the owner picked on the setup screen
+/// (docs/decisions/2026-09-29-quick-start-full-check-and-progress.md). The
+/// window sends `"quick_start"` or `"full_check"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartChoice {
+    /// Follows signatures, ready in minutes.
+    QuickStart,
+    /// Validates every block, takes longer the first time.
+    FullCheck,
+}
+
+/// Record the setup choice before the node's first start, where
+/// [`launches_as_mirror`] reads it.
+///
+/// Quick start writes the follow-signatures marker on a machine that may check
+/// blocks (`Backend::may_check_blocks`), so Settings can take it back later.
+/// That includes a Mac, where Quick start is selected first: without the
+/// marker, [`launches_as_mirror`] would try the chip at the first start.
+/// Full check removes it. A machine that cannot check blocks gets no marker
+/// either way: it follows signatures anyway, and a marker there would show a
+/// Settings switch that changes nothing.
+pub fn apply_start_choice(
+    datadir: &Path,
+    choice: StartChoice,
+    may_check_blocks: bool,
+) -> std::io::Result<()> {
+    set_follows_signatures_by_choice(
+        datadir,
+        choice == StartChoice::QuickStart && may_check_blocks,
+    )
 }
 
 /// Whether THIS launch should run as a trusted mirror.
@@ -4605,6 +4639,57 @@ consensus-validator service.";
         assert!(!launches_as_mirror(btxd, dir, Backend::Metal));
         // Withdrawing twice is not an error.
         set_follows_signatures_by_choice(dir, false).unwrap();
+    }
+
+    /// The setup screen's choice decides the first start: Quick start writes
+    /// the marker, Full check removes it, and a machine that cannot check
+    /// blocks gets no marker at all, since it follows signatures anyway and a
+    /// marker would put a Settings switch on screen that changes nothing.
+    #[test]
+    fn the_setup_choice_writes_or_removes_the_marker() {
+        let tmp = tempfile::tempdir().expect("temp datadir");
+        let dir = tmp.path();
+        let btxd = Path::new("/x/btx/v0.34.9/mac/btxd");
+
+        // A Mac that keeps the preselected Quick start: Metal may check
+        // blocks, so the marker is written and the node follows signatures
+        // from its first start instead of trying the chip. An NVIDIA machine
+        // that picks Quick start is the same.
+        let mac = Backend::Metal.may_check_blocks();
+        apply_start_choice(dir, StartChoice::QuickStart, mac).unwrap();
+        assert!(follows_signatures_by_choice(dir));
+        assert!(launches_as_mirror(btxd, dir, Backend::Metal));
+        assert!(launches_as_mirror(btxd, dir, Backend::Cuda));
+
+        // A Mac that picks Full check: no marker, the chip is tried.
+        apply_start_choice(dir, StartChoice::FullCheck, mac).unwrap();
+        assert!(!follows_signatures_by_choice(dir));
+        assert!(!launches_as_mirror(btxd, dir, Backend::Metal));
+
+        // No usable GPU: Quick start writes nothing, and the node follows
+        // signatures anyway.
+        let no_gpu = Backend::Cpu.may_check_blocks();
+        apply_start_choice(dir, StartChoice::QuickStart, no_gpu).unwrap();
+        assert!(!follows_signatures_by_choice(dir));
+        assert!(launches_as_mirror(btxd, dir, Backend::Cpu));
+
+        // Full check on a fresh folder is not an error.
+        let fresh = tempfile::tempdir().expect("temp datadir");
+        apply_start_choice(fresh.path(), StartChoice::FullCheck, true).unwrap();
+        assert!(!follows_signatures_by_choice(fresh.path()));
+    }
+
+    /// The window sends the choice by name, and an older window sends none,
+    /// which is setup as it was.
+    #[test]
+    fn the_window_names_the_choice() {
+        let quick: StartChoice = serde_json::from_value(serde_json::json!("quick_start")).unwrap();
+        let full: StartChoice = serde_json::from_value(serde_json::json!("full_check")).unwrap();
+        assert_eq!(quick, StartChoice::QuickStart);
+        assert_eq!(full, StartChoice::FullCheck);
+        assert!(serde_json::from_value::<StartChoice>(serde_json::json!("fast")).is_err());
+        let none: Option<StartChoice> = serde_json::from_value(serde_json::Value::Null).unwrap();
+        assert_eq!(none, None);
     }
 
     /// A non-Metal host is a mirror on the static rule alone, with or without
