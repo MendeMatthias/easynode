@@ -2,87 +2,154 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Every node the app starts begins from a snapshot that two different operators confirmed, checked by the app before the engine sees anything, with the pinned pair (225,927) and then the engine's compiled start point as fallbacks; a validating node loads it in one mirror launch and restarts as a validating node under the pin rule.
+> **Amended 2026-09-29 (night).** Rebased on `origin/main` and brought in line with the amended decision (jpp's review and the owner's decisions the same night). What changed, and why:
+> - **Base.** Tools is on main (#154, squash-merged as `aed8755`), and so is the role-card fix (#160, `b330e3d`, merged while this plan was being amended). The branch starts from `origin/main`, and every file:line and find-this-text anchor was re-read there. Where #160 moved one (the `role.rs` test helper, the snapshot call in `commands.rs`, the changelog's `[Unreleased]` list), the pre-#160 anchor (`aed8755`) is given beside it.
+> - **Task 1.** The operator list is one published file, `crates/btx-core/snapshot-operators.json` (Mende; Aleksander with three keys; jpp; and the four keys every node pins), compiled in by `operators.rs` with `include_str!`. It is the only place the list is written; the website keeps a byte-identical copy. Tests: it parses, every key is a valid compressed key, no key sits under two operators, `mirror_pins` equals `BTX_TRUSTED_ATTESTATION_PUBKEYS` as a set, and the file has one canonical layout. The PR must not merge until the owner confirms Aleksander agreed.
+> - **Task 2.** Grid 100 (`SNAPSHOT_GRID`, was 200) and depth 144 (`SNAPSHOT_DEPTH`, replaces "10 confirmations"). The shielded commitment is compiled beside chain id and replay context, and a statement carrying another one is refused. A dissent (all four file fields zero) is never loaded, but its signatures still verify. New: `check_chain_fields`, `check_shape`, `check_dissent_shape`, `is_dissent`, `ChainFacts` (with `dissent`), `Statement::chain_facts`, `dissent_statement` (tested byte for byte).
+> - **Task 2a (new).** The validated gate, `node_api::chainstates_validated`: one pure function over a `getchainstates` answer, for the diary, the producers and both confirmers. Loading does not use it.
+> - **Task 2b (new).** The start record, `<datadir>/snapshot-start.json` (`snapshot_start.rs`), with a pure reader and the sentences the history-check line and Fast-forward show.
+> - **Task 3.** `latest` may answer `{"disputed": [...]}`. `parse_latest` reads it as its own variant, nothing is downloaded, and the start path takes the fallbacks (section 9).
+> - **Task 4.** The loader writes the start record at section 7 step 4, before trimming, with only the operators whose signatures it verified, and puts the previous record back when the load does not happen. `load` gains a `datadir` argument.
+> - **Task 5.** A compiled-snapshot load writes the start record with source `engine`.
+> - **Task 10.** The rehearsal also proves refused: a wrong file hash, a disputed `latest`, a dissent offered for loading, and a statement with no pinned signature. It proves the engine signs a dissent and that a fresh regtest chain carries the compiled shielded commitment.
+> - **Task 11.** The engine-bump check also compares the shielded commitment (a text check, so it runs in CI too). The changelog names the three operators and says what a disagreement does.
+> - **Copy.** No new or touched string has an em-dash. Existing comments quoted verbatim as find-this-text anchors keep theirs.
 
-**Architecture:** `operators.rs` holds the per-chain operator list and groups keys by operator. `confirmed_snapshot.rs` reads a v2 manifest strictly, hashes the statement, verifies strict-DER low-S ECDSA with k256, counts distinct operators, checks the pinned signature and trims to pinned signatures. `attested_snapshot.rs` reads the website pointer (contract defined here) and downloads a confirmed pair, else the pinned pair. `confirmed_load.rs` is the one loading path (re-check against the live node, refuse held blocks, trimmed manifest, `loadtxoutsetattested`, post-load held check). `node.rs` gains the pin rule of section 8, the one-time mirror-load marker and the "pins only grow" guard. The app's start path chooses the load and restarts a validating node after its mirror launch. An opt-in regtest test runs all of it against the real engine, and `scripts/check-engine-tag.sh` runs that test before any engine bump.
+**Goal:** Every node the app starts begins from a snapshot that two different operators confirmed, one of them with a key every node pins, checked by the app before the engine sees anything, with the pinned pair (225,927) and then the engine's compiled start point as fallbacks; a validating node loads it in one mirror launch and restarts as a validating node under the pin rule; the node remembers who confirmed its start point.
+
+**Architecture:** `snapshot-operators.json` is the published operator list; `operators.rs` compiles it in and groups keys by operator. `confirmed_snapshot.rs` reads a v2 manifest strictly, hashes the statement, checks its chain fields (chain id, replay context, shielded commitment) against the compiled ones, verifies strict-DER low-S ECDSA with k256, counts distinct operators, checks the pinned signature, refuses a dissent for loading, builds a dissent, and trims to pinned signatures. `node_api::chainstates_validated` says whether a node's chain is one it checked itself. `attested_snapshot.rs` reads the website's `latest` (a pointer or a dispute, contract defined here) and downloads a confirmed pair, else the pinned pair. `snapshot_start.rs` keeps where the node started and who confirmed it. `confirmed_load.rs` is the one loading path (re-check against the live node, refuse held blocks, the start record, trimmed manifest, `loadtxoutsetattested`, post-load held check). `node.rs` gains the pin rule of section 8, the one-time mirror-load marker and the "pins only grow" guard. The app's start path chooses the load and restarts a validating node after its mirror launch. An opt-in regtest test runs all of it against the real engine, and `scripts/check-engine-tag.sh` runs that test before any engine bump and compares the shielded commitment on every run.
 
 **Tech Stack:** Rust (btx-core, Tauri 2 shell), k256 0.13.4 with `ecdsa`, sha2, reqwest, mockito (tests), serde_json; btxd v0.34.9 (regtest) for the opt-in test.
 
-**This is plan 1 of 2.** Plan 2, `2026-09-29-confirmed-snapshots-fast-forward.md` (same folder), builds Fast-forward (section 10) on the interfaces this plan produces. Sections 3 to 6 (diary, producers, confirmers, the website) and 11 (catch-up help) are separate plans; the interfaces they build on are listed under "Interfaces for the other plans" at the end.
+**This is plan 1 of 2.** Plan 2, `2026-09-29-confirmed-snapshots-fast-forward.md` (same folder), builds Fast-forward (section 10) on the interfaces this plan produces. Sections 3 to 6a on the producing side (diary, producers, confirmers, `btx-confirmer`, the website, the dispute rule) and 11 (catch-up help) are separate plans; the interfaces they build on are listed under "Interfaces for the other plans" at the end.
 
 ## Global Constraints
 
-- Design: `docs/decisions/2026-09-29-every-node-starts-near-the-tip.md` on `origin/claude/cosigned-snapshots` (read it with `git -C /Users/m2promende/repos/easynode show origin/claude/cosigned-snapshots:docs/decisions/2026-09-29-every-node-starts-near-the-tip.md`), approved 2026-09-29 with its choices as proposed. Sections implemented here: 1, 7, 8, 9, 12. Section 10 is plan 2.
-- Branch: `claude/confirmed-snapshots`, created from `claude/tools-command-window` at `72304d9` ("changelog: Tools") or any later commit of that branch. The Tools overlay (`apps/node/src/tools.ts`, `apps/node/src-tauri/src/tools.rs`, `#tools-overlay` in `apps/node/index.html`) exists only on that branch; `origin/claude/tools-command-window` may lag the local branch, so base on the local branch if it is ahead.
-- Operator list, mainnet, compiled: **Mende only**, key `02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675`. Aleksander (`03047189023913e1922c80c895ee2a9e2eff6df05438654749e1a4f95019578a24`, `02c9cfb77d7e4dce0cd6b7968fee1dd53d31ef06c764185e120c825fab8c0572a0`, one operator) and jpp are NOT added until the owner confirms they agreed. Adding one is one line in `MAINNET_OPERATORS`, guarded by `every_mainnet_line_is_well_formed`. With one operator nothing is confirmed and every node uses the fallbacks.
+- Design: `docs/decisions/2026-09-29-every-node-starts-near-the-tip.md`, as amended the night of 2026-09-29 (commit `12e44c3` on `claude/cosigned-snapshots`; read it with `git -C /Users/m2promende/repos/easynode show claude/cosigned-snapshots:docs/decisions/2026-09-29-every-node-starts-near-the-tip.md`, or with `origin/claude/cosigned-snapshots:` once that is pushed). Sections implemented here: 1, 7, 8, 9, 12, and the loading side of 6a (a dispute and a dissent). Section 10 is plan 2.
+- Branch: `claude/confirmed-snapshots`, created from `origin/main` at `b330e3d` ("role: "At the tip" only when the clock and the signed frontier agree (#160)") or any later commit. The Tools overlay (`apps/node/src/tools.ts`, `apps/node/src-tauri/src/tools.rs`, `#tools-overlay` in `apps/node/index.html`) is on main since `aed8755` (#154).
+- Operator list, mainnet: the file `crates/btx-core/snapshot-operators.json` and nothing else (Task 1). Mende (`02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675`, the 3060); Aleksander, one operator with three keys (`026da4e3…bbf1` zbtx1, `03047189…8a24` zbtx2, `02c9cfb7…72a0` zbtx3); jpp (`02e0a965…adb5`). **The PR that adds the file must not merge until the owner confirms Aleksander agreed.** Of the listed keys only the 3060's is among the keys every node pins, so every snapshot that counts carries Mende's signature and one other operator's. jpp counts only once his node's `getchainstates` shows every chainstate validated (the producer and confirmer plans enforce that with Task 2a's gate).
 - Test chains: the list comes from `EASYNODE_REGTEST_OPERATORS` (format `name=key[,key];name=key`) and only for a statement whose chain id is regtest's genesis hash `521ad0951ed299e9c56aeb7db8188972772067560351b8e55adf71dbed532360`. A mainnet statement (chain id `75a998a39d2d6e25a9ca7de2cc659309c4105839c06cd435ba2b1aabf0fa4601`) never reads it.
-- Statement: 229 bytes, version 2; hash = double SHA-256 of `0x28 || "BTX_TRUSTED_UTXO_SNAPSHOT_ATTESTATION_V2" || statement`; 32-byte fields little-endian, shown reversed. File hash = double SHA-256 of the file. Manifest cap 64 KB (65,536 bytes). Signatures: strict DER (the engine's `IsStrictDERSignature`, at most 72 bytes), low S, compressed key on the curve.
-- Compiled replay contexts (v0.34.9): mainnet `32ad5c2e148149752a312561dc0b6879c9cc41fdf4bc09edcdd5e2bd09af7188`, regtest `9ed2add89d64a66015d6c4b2a746115c00c78503088fdde49e15ddcafed8a577` (both measured from the running engine by the regtest test during this plan's dry run).
-- Grid: mainnet multiples of **200**; regtest multiples of **100** (regtest's ExactReplay starts at 101, so a test chain stops at 100).
-- Confirmed = every signature valid; no key twice; at least **2 different operators**; at least one signature from a key the node pins; version 2; chain and replay context as compiled and as the running node reports; height on the grid and above the node's fallback start (`max(compiled anchor, 225,927)`); file size 1..=64 MiB (67,108,864 bytes) with the engine's chunk geometry.
-- Fallback order for every node: confirmed snapshot, else `attested_snapshot::pinned_pair()` (225,927), else the engine's compiled start point (219,000).
+- Statement: 229 bytes, version 2; hash = double SHA-256 of `0x28 || "BTX_TRUSTED_UTXO_SNAPSHOT_ATTESTATION_V2" || statement`; 32-byte fields little-endian, shown reversed. File hash = double SHA-256 of the file. Manifest cap 64 KB (65,536 bytes). Signatures: strict DER (the engine's `IsStrictDERSignature`, at most 72 bytes), low S, compressed key on the curve. A **dissent** is a statement whose four file fields are all zero (file size 0, file hash 32 zero bytes, chunk size 0, chunk count 0); it is parsed and its signatures verify, but it is never loaded.
+- Compiled per engine (v0.34.9), beside each other: chain id (the genesis hash, in `operators.rs`), replay context and shielded commitment (in `confirmed_snapshot.rs`). Replay context: mainnet `32ad5c2e148149752a312561dc0b6879c9cc41fdf4bc09edcdd5e2bd09af7188`, regtest `9ed2add89d64a66015d6c4b2a746115c00c78503088fdde49e15ddcafed8a577` (both measured from the running engine by the spike and by the regtest test). Shielded commitment: mainnet `94343b766b39c0ea2d92d83323f77b5ccc5e775d99b34b01f5fa6400f2354541` (v0.34.9 `src/kernel/chainparams.cpp:1278`, the 219,000 entry, and the value the published 225,927 statement carries), regtest `e802781d9b88ba12d8c0f41777405bc015755603d6fcbaa9fc089eae53011d5e` (the empty-tree pin that `validation.cpp:19051`'s comment names, read from the spike's regtest statements).
+- Grid: multiples of **100** on both chains (`SNAPSHOT_GRID`; 219,000 and 228,000 are on it; regtest's ExactReplay starts at 101, so a test chain stops at 100). Depth: **144** blocks (`SNAPSHOT_DEPTH`), defined here for the producer and confirmer plans; nothing in this plan waits on it.
+- Confirmed = every signature valid; no key twice; at least **2 different operators**, counted only from signatures the app verified itself; at least one signature from a key the node pins; version 2; chain id, replay context and shielded commitment as compiled, and chain id and replay context as the running node reports; not a dissent; height on the grid and above the node's fallback start (`max(compiled anchor, 225,927)`); file size 1..=64 MiB (67,108,864 bytes) with the engine's chunk geometry.
+- Fallback order for every node: confirmed snapshot, else `attested_snapshot::pinned_pair()` (225,927), else the engine's compiled start point (219,000). A disputed `latest`, a 404 and every refusal go straight to the next fallback.
+- Start record: `<datadir>/snapshot-start.json`, exactly `{"height": u64, "block_hash": "<hex>", "source": "confirmed" | "pinned" | "engine", "operators": ["Mende", "jpp"]}`. `operators` holds only the names whose signatures the app verified, in the list's order, and is empty unless `source` is `confirmed`. Written at section 7 step 4, before trimming, for a confirmed and a pinned pair; for the engine's compiled snapshot as soon as the engine reports the snapshot chainstate (Task 5, which says why).
 - Loading on a validating node: one launch in mirror mode via the marker `<datadir>/.load-snapshot-as-mirror` (JSON `{"height":u64,"written_at":u64}`, honoured for 6 hours), then the marker is cleared and the node restarts validating. Same order as the header bootstrap: stop, clear marker, start.
-- Pin rule (section 8): while `<datadir>/chainstate_snapshot/attested_assumeutxo` exists, the validating arm of `build_node_command` also passes every key in `BTX_TRUSTED_ATTESTATION_PUBKEYS` not already pinned (by the conf or the node's own self-pin) and `-matmultrustedthreshold=1`. The mirror arm is unchanged.
+- Pin rule (section 8): while `<datadir>/chainstate_snapshot/attested_assumeutxo` exists, the validating arm of `build_node_command` also passes every key in `BTX_TRUSTED_ATTESTATION_PUBKEYS` not already pinned (by the conf or the node's own self-pin) and `-matmultrustedthreshold=1`. The mirror arm is unchanged. (The diary, producers and confirmers do NOT use this file; they use Task 2a's gate.)
 - Pins only grow; the mirrors' threshold never rises above 1. Checked-in list: `crates/btx-core/src/pins_ever_shipped.txt`.
-- Website pointer: `GET https://easybtx.com/api/snapshots/latest`, contract in `attested_snapshot::ConfirmedPointer` (Task 3). Download hosts: `easybtx.com` and `*.public.blob.vercel-storage.com`, HTTPS, no port, no user info.
+- Website: `GET https://easybtx.com/api/snapshots/latest` answers a pointer (`attested_snapshot::ConfirmedPointer`, Task 3), `{"disputed": [<height>, ...]}` while any dispute stands, or HTTP 404 `{"version":1,"confirmed":null}` when nothing is confirmed. Download hosts: `easybtx.com` and `*.public.blob.vercel-storage.com`, HTTPS, no port, no user info. The pointer's `operators` field is never shown; the app names only the operators it verified.
 - Dependencies: enable only the `ecdsa` feature of `k256` (adds `rfc6979 0.4.0` and `hmac 0.12.1`). Update each lock with `cargo update -p k256 --precise 0.13.4` in `crates/btx-core` and in `apps/node/src-tauri`, never a bare `cargo update`; then `cargo metadata --locked --format-version 1 >/dev/null` must succeed in both.
 - CI gates, all must pass before each commit that touches them: in `crates/btx-core` and `apps/node/src-tauri`: `cargo fmt --all --check` and `cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious`, `cargo test --locked`; in `apps/node`: `npx tsc --noEmit`, `npm test`, `npx vite build`.
 - Commits end with a blank line and `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
-- User-facing copy: friendly, simple, no hype, no guarantees, no em-dashes.
-- Known flake, not caused by this plan: `node::tests::launch_watch_detects_an_immediate_child_death` fails now and then on macOS when the suite runs in parallel (seen at `72304d9` on a clean tree). If it fails, rerun it alone: `cargo test --locked --lib -- --exact node::tests::launch_watch_detects_an_immediate_child_death`.
+- User-facing copy: friendly, simple, no hype, no guarantees, no em-dashes in any new or touched string.
+- Known flake, not caused by this plan: `node::tests::launch_watch_detects_an_immediate_child_death` fails now and then on macOS when the suite runs in parallel (seen at `72304d9`, the Tools branch before it merged). If it fails, rerun it alone: `cargo test --locked --lib -- --exact node::tests::launch_watch_detects_an_immediate_child_death`.
 - The Tauri crate needs `apps/node/src-tauri/resources/node-pkg/` to hold at least one file for `cargo check`/`test` (CI writes `CI-PLACEHOLDER`). If it is empty locally: `mkdir -p apps/node/src-tauri/resources/node-pkg && echo placeholder > apps/node/src-tauri/resources/node-pkg/CI-PLACEHOLDER` (the folder is gitignored).
+- Test counts marked "derived, not run" were counted from the code in this plan while amending it, not from a run. Every other expected output was measured when the plan was first written, or is exact by construction (a hash computed from the fixture bytes, a sentence the code writes).
 
 ## File Structure
 
 | File | Status | Responsibility |
 |---|---|---|
 | `crates/btx-core/Cargo.toml`, `crates/btx-core/Cargo.lock`, `apps/node/src-tauri/Cargo.lock` | modify | `k256` gains `ecdsa` |
-| `crates/btx-core/src/operators.rs` | create | The per-chain operator list, key parsing, grouping keys by operator |
-| `crates/btx-core/src/confirmed_snapshot.rs` | create | Strict manifest parse, statement hash, file hash, strict-DER low-S verify, operator count, pinned check, trim |
+| `crates/btx-core/snapshot-operators.json` | create | The published operator list and the mirrors' pins, the only place the list is written |
+| `crates/btx-core/src/operators.rs` | create | Compiles the file in, parses and checks it, groups keys by operator, the regtest list |
+| `crates/btx-core/src/confirmed_snapshot.rs` | create | Strict manifest parse, statement hash, file hash, chain fields (with the shielded commitment), strict-DER low-S verify, operator count, pinned check, dissent (detect, refuse, build), trim, grid and depth |
 | `crates/btx-core/tests/fixtures/confirmed_snapshot/*` | create | The real 225,927 manifest, the spike's regtest manifests and file, the pointer contract fixture |
-| `crates/btx-core/src/attested_snapshot.rs` | modify | Pointer contract, confirmed download, pinned fallback, `prepare_start`; the GitHub single-signed pointer is no longer read |
-| `crates/btx-core/src/node_api.rs`, `crates/btx-core/src/role.rs` | modify | `replay_authority_context` on `MatmulTrustedStatus` |
-| `crates/btx-core/src/confirmed_load.rs` | create | The one loading path (section 7, steps 3 to 6) |
-| `crates/btx-core/src/snapshot.rs` | modify | `LoadOutcome` public, `run_cli_load`, `SignedLoad`, `SnapshotOutcome`, the start-path loader |
+| `crates/btx-core/src/node_api.rs` | modify | `chainstates_validated`, `read_chainstates_validated`; `replay_authority_context` on `MatmulTrustedStatus` |
+| `crates/btx-core/src/snapshot_start.rs` | create | `<datadir>/snapshot-start.json`: write, replace, put back, the pure reader, the sentences |
+| `crates/btx-core/src/attested_snapshot.rs` | modify | `latest` contract (pointer or dispute), confirmed download, pinned fallback, `prepare_start`; the GitHub single-signed pointer is no longer read |
+| `crates/btx-core/src/role.rs` | modify | Test literal for the new `MatmulTrustedStatus` field |
+| `crates/btx-core/src/confirmed_load.rs` | create | The one loading path (section 7, steps 3 to 6, with the start record at step 4) |
+| `crates/btx-core/src/snapshot.rs` | modify | `LoadOutcome` public, `run_cli_load`, `SignedLoad`, `SnapshotOutcome`, the start-path loader, the engine's start record |
 | `crates/btx-core/src/node.rs` | modify | Pin rule, mirror-load marker, `host_follows_signatures`, threshold const, pins-only-grow test |
 | `crates/btx-core/src/pins_ever_shipped.txt` | create | Every pinned key ever shipped, and the highest threshold |
 | `crates/btx-core/src/lib.rs` | modify | Register the new modules |
 | `apps/node/src-tauri/src/commands.rs` | modify | Start path: the mirror launch, which load a launch makes, the restart after it |
 | `crates/btx-core/tests/confirmed_snapshot_regtest.rs` | create | Opt-in real-engine rehearsal (`EASYNODE_TEST_BTXD`) |
-| `scripts/check-engine-tag.sh`, `docs/node-release-recipe.md` | modify | The regtest check before an engine bump |
+| `scripts/check-engine-tag.sh`, `docs/node-release-recipe.md` | modify | The shielded-commitment check on every run; the regtest check before an engine bump |
 | `apps/node/CHANGELOG.md` | modify | One entry |
-
 ## Tasks
 
-### Task 1: The operator list (`operators.rs`)
+### Task 1: The operator list, published (`snapshot-operators.json`, `operators.rs`)
 
 **Files:**
+- Create: `crates/btx-core/snapshot-operators.json`
 - Create: `crates/btx-core/src/operators.rs`
 - Modify: `crates/btx-core/src/lib.rs` (module list)
 
 **Interfaces:**
 - Consumes: `crate::node::BTX_TRUSTED_ATTESTATION_PUBKEYS` (test only).
-- Produces (used by Tasks 2, 3, 4, 10 and by the diary/producer/confirmer/website plans):
-  - `pub struct Operator { pub name: String, pub keys: Vec<[u8; 33]> }`
-  - `pub struct OperatorList` with `new(Vec<Operator>) -> Result<Self, String>`, `operator_of(&self, &[u8; 33]) -> Option<&str>`, `distinct_operators(&self, &[[u8; 33]]) -> Vec<String>`, `len`, `is_empty`, `names`
-  - `pub enum Chain { Main, Regtest }`, `Chain::from_genesis_hex(&str) -> Option<Chain>`, `MAINNET_GENESIS`, `REGTEST_GENESIS`
-  - `pub const MAINNET_OPERATORS: &[(&str, &[&str])]`, `pub fn mainnet() -> OperatorList`
-  - `pub const REGTEST_OPERATORS_ENV: &str = "EASYNODE_REGTEST_OPERATORS"`, `parse_env_list(&str) -> Result<OperatorList, String>`, `for_chain(Chain, Option<&str>) -> OperatorList`, `regtest_env() -> Option<String>`
-  - helpers `parse_key(&str) -> Option<[u8; 33]>`, `hex(&[u8]) -> String`, `hex_decode(&str) -> Option<Vec<u8>>`
+- Produces (used by Tasks 2, 3, 4, 10 and by the diary, producer, confirmer and website plans; the network-app plan reuses this file instead of publishing its own):
+  - the file `crates/btx-core/snapshot-operators.json`, the only place the operator list is written; the website keeps a byte-identical copy at `site/src/lib/snapshot-operators.json` and its CI compares the two
+  - `pub const OPERATORS_JSON: &str` (the file, through `include_str!`), `pub const OPERATORS_SCHEMA: u32 = 1`
+  - `pub struct OperatorFile { pub schema: u32, pub operators: Vec<OperatorEntry>, pub mirror_pins: Vec<String> }`, `pub struct OperatorEntry { pub name: String, pub keys: Vec<String> }` (serde, the file's own shape, unknown fields refused)
+  - `pub struct Published { pub operators: OperatorList, pub mirror_pins: Vec<[u8; 33]> }` (`Default`), `pub fn parse_operator_file(&str) -> Result<Published, String>`, `pub fn published() -> &'static Published`, `pub fn mainnet_mirror_pins() -> Vec<[u8; 33]>`
+  - unchanged from the first version of this plan: `pub struct Operator { pub name: String, pub keys: Vec<[u8; 33]> }`; `pub struct OperatorList` with `new(Vec<Operator>) -> Result<Self, String>`, `operator_of(&self, &[u8; 33]) -> Option<&str>`, `distinct_operators(&self, &[[u8; 33]]) -> Vec<String>` (list order), `len`, `is_empty`, `names`; `pub enum Chain { Main, Regtest }`, `Chain::from_genesis_hex(&str) -> Option<Chain>`, `MAINNET_GENESIS`, `REGTEST_GENESIS`; `pub fn mainnet() -> OperatorList`; `pub const REGTEST_OPERATORS_ENV: &str = "EASYNODE_REGTEST_OPERATORS"`, `parse_env_list(&str) -> Result<OperatorList, String>`, `for_chain(Chain, Option<&str>) -> OperatorList`, `regtest_env() -> Option<String>`; helpers `parse_key(&str) -> Option<[u8; 33]>`, `hex(&[u8]) -> String`, `hex_decode(&str) -> Option<Vec<u8>>`
+  - removed: `MAINNET_OPERATORS` (the file replaces it)
 
 - [ ] **Step 1: Create the branch**
 
 ````bash
 cd /Users/m2promende/repos/easynode
 git fetch origin
-git worktree add ../easynode-confirmed-snapshots -b claude/confirmed-snapshots claude/tools-command-window
+git worktree add ../easynode-confirmed-snapshots -b claude/confirmed-snapshots origin/main
 cd ../easynode-confirmed-snapshots
-git log --oneline -1   # 72304d9 changelog: Tools, or later
+git log --oneline -1   # b330e3d role: "At the tip" only when the clock and the signed frontier agree (#160), or later
 ````
 
 All paths below are relative to this worktree.
 
-- [ ] **Step 2: Write the failing tests**
+- [ ] **Step 2: Add the list**
+
+Create `crates/btx-core/snapshot-operators.json` with exactly this content (two-space indent, keys in this order, one trailing newline, no carriage returns):
+
+````json
+{
+  "schema": 1,
+  "operators": [
+    {
+      "name": "Mende",
+      "keys": [
+        "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675"
+      ]
+    },
+    {
+      "name": "Aleksander",
+      "keys": [
+        "026da4e3a07676cada5488123033fb1057faeb7fe6a7d50b2ae3921431e0f4bbf1",
+        "03047189023913e1922c80c895ee2a9e2eff6df05438654749e1a4f95019578a24",
+        "02c9cfb77d7e4dce0cd6b7968fee1dd53d31ef06c764185e120c825fab8c0572a0"
+      ]
+    },
+    {
+      "name": "jpp",
+      "keys": [
+        "02e0a9653b49ad74900dec86b86770735579e8e64859028a76129c71a70e1cadb5"
+      ]
+    }
+  ],
+  "mirror_pins": [
+    "0224e80df33697385b54b3c69bae1f097f533c0c43e93c29f73ee97319d4a5e04c",
+    "028995b25c887ee03eb53a41312d33c8eccf48f261ecf9e91fe2b1e8e50373258a",
+    "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675",
+    "03d90c148db37da28ce47ce15bade88a177728d663da4bc9ba765943b7d4e4f0aa"
+  ]
+}
+````
+
+Check it byte for byte:
+
+````bash
+wc -c crates/btx-core/snapshot-operators.json
+shasum -a 256 crates/btx-core/snapshot-operators.json
+````
+
+Expected: `928`, and `f91529f31dde7311d7970088187b3d39838cc8722b97a8bd3dda894e519fdf3d` (computed from this block while the plan was amended). The website plan copies this file to `site/src/lib/snapshot-operators.json` and compares against it at the pinned app commit.
+
+What it says: Mende (the 3060), Aleksander (zbtx1, zbtx2, zbtx3: three keys, one operator) and jpp, each counting once; and in `mirror_pins` the four keys every node pins (`BTX_TRUSTED_ATTESTATION_PUBKEYS` in `node.rs`), sorted. Every key was checked to be a point on secp256k1 while the plan was amended.
+
+- [ ] **Step 3: Write the failing tests**
 
 Create `crates/btx-core/src/operators.rs` with only the test module:
 
@@ -92,8 +159,10 @@ mod tests {
     use super::*;
 
     const MENDE: &str = "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675";
+    const ALEKS_1: &str = "026da4e3a07676cada5488123033fb1057faeb7fe6a7d50b2ae3921431e0f4bbf1";
     const ALEKS_2: &str = "03047189023913e1922c80c895ee2a9e2eff6df05438654749e1a4f95019578a24";
     const ALEKS_3: &str = "02c9cfb77d7e4dce0cd6b7968fee1dd53d31ef06c764185e120c825fab8c0572a0";
+    const JPP: &str = "02e0a9653b49ad74900dec86b86770735579e8e64859028a76129c71a70e1cadb5";
     // Throwaway regtest keys from the spike (P, C, D). Never used anywhere else.
     pub(crate) const P: &str = "0343faebbc3a28f2e452132477192cb5455f0c0f2cfdab01c9217c43c2cbc3e464";
     pub(crate) const C: &str = "02c05d68daeabe9e5f0556fcdca6c5a4011eca1d46ee34826d444d1d95b15e6c0f";
@@ -103,55 +172,138 @@ mod tests {
         parse_key(h).unwrap()
     }
 
-    /// The guard on adding an operator: every line parses into a checked list
-    /// with as many operators as lines, and none is lost to a typo.
+    fn file() -> OperatorFile {
+        serde_json::from_str(OPERATORS_JSON).unwrap()
+    }
+
+    /// The published list (section 1): three operators, in this order, each
+    /// key under the person it belongs to.
     #[test]
-    fn every_mainnet_line_is_well_formed() {
+    fn the_published_file_lists_mende_aleksander_and_jpp() {
         let list = mainnet();
-        assert_eq!(list.len(), MAINNET_OPERATORS.len(), "a line was refused");
-        for (name, keys) in MAINNET_OPERATORS {
-            for k in *keys {
-                assert_eq!(k.len(), 66, "{name}: {k}");
-                assert_eq!(*k, k.to_ascii_lowercase(), "{name}: lowercase hex");
-                assert_eq!(list.operator_of(&key(k)), Some(*name), "{name}: {k}");
+        assert_eq!(list.names(), vec!["Mende", "Aleksander", "jpp"]);
+        assert_eq!(list.operator_of(&key(MENDE)), Some("Mende"));
+        for k in [ALEKS_1, ALEKS_2, ALEKS_3] {
+            assert_eq!(list.operator_of(&key(k)), Some("Aleksander"), "{k}");
+        }
+        assert_eq!(list.operator_of(&key(JPP)), Some("jpp"));
+        assert_eq!(list.operator_of(&key(P)), None);
+    }
+
+    #[test]
+    fn every_key_in_the_file_is_a_valid_compressed_key() {
+        let f = file();
+        let mut n = 0;
+        for k in f
+            .operators
+            .iter()
+            .flat_map(|o| o.keys.iter())
+            .chain(f.mirror_pins.iter())
+        {
+            assert_eq!(k.len(), 66, "{k}");
+            assert_eq!(*k, k.to_ascii_lowercase(), "lowercase hex: {k}");
+            assert!(matches!(&k[..2], "02" | "03"), "compressed: {k}");
+            assert!(parse_key(k).is_some(), "on the curve: {k}");
+            n += 1;
+        }
+        assert_eq!(n, 5 + 4, "five operator keys and four pins");
+    }
+
+    #[test]
+    fn no_key_sits_under_two_operators() {
+        let mut seen = std::collections::HashSet::new();
+        for op in file().operators {
+            for k in op.keys {
+                assert!(seen.insert(k.clone()), "{k} is listed twice");
             }
         }
+        // Sabotage: jpp's key replaced by Mende's is refused whole.
+        let shared = OPERATORS_JSON.replace(JPP, MENDE);
+        let err = parse_operator_file(&shared).unwrap_err();
+        assert!(err.contains("listed twice"), "{err}");
     }
 
-    /// The first list: Mende alone, with the 3060's key, which every mirror
-    /// pins. Aleksander and jpp are not on it until the owner says they agreed.
+    /// The file cannot drift from what the nodes pin (section 1): the
+    /// website serves only a snapshot with a signature from one of these.
     #[test]
-    fn the_first_mainnet_list_is_mende_with_the_3060() {
-        let list = mainnet();
-        assert_eq!(list.operator_of(&key(MENDE)), Some("Mende"));
-        assert!(crate::node::BTX_TRUSTED_ATTESTATION_PUBKEYS.contains(&MENDE));
-        assert_eq!(list.operator_of(&key(ALEKS_2)), None);
-        assert_eq!(list.operator_of(&key(ALEKS_3)), None);
-    }
-
-    /// Aleksander's waiting line is ready to paste: both keys are valid, and
-    /// with it the list checks and counts him once.
-    #[test]
-    fn aleksanders_waiting_line_is_ready() {
-        let list = OperatorList::new(vec![
-            Operator {
-                name: "Mende".into(),
-                keys: vec![key(MENDE)],
-            },
-            Operator {
-                name: "Aleksander".into(),
-                keys: vec![key(ALEKS_2), key(ALEKS_3)],
-            },
-        ])
-        .unwrap();
+    fn mirror_pins_are_the_keys_every_node_pins() {
+        use std::collections::BTreeSet;
+        let shipped: BTreeSet<String> = crate::node::BTX_TRUSTED_ATTESTATION_PUBKEYS
+            .iter()
+            .map(|k| k.to_ascii_lowercase())
+            .collect();
+        let mut f = file();
+        let pins: BTreeSet<String> = f.mirror_pins.iter().cloned().collect();
+        assert_eq!(pins, shipped);
         assert_eq!(
-            list.distinct_operators(&[key(ALEKS_2), key(ALEKS_3)]),
+            mainnet_mirror_pins().len(),
+            crate::node::BTX_TRUSTED_ATTESTATION_PUBKEYS.len()
+        );
+        // The one operator key every node pins today is the 3060's.
+        let list = mainnet();
+        let pinned_operators: Vec<&str> = mainnet_mirror_pins()
+            .iter()
+            .filter_map(|k| list.operator_of(k))
+            .collect();
+        assert_eq!(pinned_operators, vec!["Mende"]);
+        // Sabotage: a file that lost a pin no longer matches.
+        f.mirror_pins.pop();
+        let fewer: BTreeSet<String> = f.mirror_pins.into_iter().collect();
+        assert_ne!(fewer, shipped);
+    }
+
+    /// The website compares its copy byte for byte, so the file has one
+    /// layout: two-space indent, keys in this order, one trailing newline.
+    /// A hand edit in another layout fails here, not on the website.
+    #[test]
+    fn the_file_is_written_the_one_canonical_way() {
+        let canonical = serde_json::to_string_pretty(&file()).unwrap() + "\n";
+        assert_eq!(OPERATORS_JSON, canonical);
+        assert!(!OPERATORS_JSON.contains('\r'));
+    }
+
+    /// Aleksander's three machines (zbtx1, zbtx2, zbtx3) are one operator.
+    #[test]
+    fn aleksanders_three_keys_count_once() {
+        let list = mainnet();
+        assert_eq!(
+            list.distinct_operators(&[key(ALEKS_1), key(ALEKS_2), key(ALEKS_3)]),
             vec!["Aleksander".to_string()]
         );
         assert_eq!(
-            list.distinct_operators(&[key(ALEKS_3), key(MENDE)]),
-            vec!["Mende".to_string(), "Aleksander".to_string()]
+            list.distinct_operators(&[key(JPP), key(ALEKS_3), key(MENDE)]),
+            vec![
+                "Mende".to_string(),
+                "Aleksander".to_string(),
+                "jpp".to_string()
+            ],
+            "list order, not signing order"
         );
+    }
+
+    #[test]
+    fn a_malformed_file_is_refused() {
+        assert!(parse_operator_file(OPERATORS_JSON).is_ok());
+        let schema2 = OPERATORS_JSON.replace("\"schema\": 1", "\"schema\": 2");
+        assert!(parse_operator_file(&schema2).unwrap_err().contains("schema"));
+        let upper = OPERATORS_JSON.replace(JPP, &JPP.to_ascii_uppercase());
+        assert!(
+            parse_operator_file(&upper).is_err(),
+            "the file writes keys in lowercase"
+        );
+        let extra =
+            OPERATORS_JSON.replacen("\"schema\": 1,", "\"schema\": 1,\n  \"threshold\": 1,", 1);
+        assert!(
+            parse_operator_file(&extra).is_err(),
+            "no field the app does not know"
+        );
+        let off_curve = OPERATORS_JSON.replace(JPP, &format!("02{}", "0".repeat(64)));
+        assert!(parse_operator_file(&off_curve).is_err());
+        let no_pins = format!(
+            r#"{{"schema": 1, "operators": [{{"name": "a", "keys": ["{MENDE}"]}}], "mirror_pins": []}}"#
+        );
+        assert!(parse_operator_file(&no_pins).is_err());
+        assert!(parse_operator_file("not json").is_err());
     }
 
     #[test]
@@ -263,12 +415,12 @@ pub mod node_api;
 pub mod operators;
 ````
 
-- [ ] **Step 3: Run the tests to see them fail**
+- [ ] **Step 4: Run the tests to see them fail**
 
 Run: `cd crates/btx-core && cargo test --locked --lib -- operators`
-Expected: compile errors such as `cannot find function \`mainnet\` in this scope` and `cannot find type \`OperatorList\``.
+Expected: compile errors such as `cannot find function \`mainnet\` in this scope` and `cannot find type \`OperatorFile\` in this scope`.
 
-- [ ] **Step 4: Write the implementation**
+- [ ] **Step 5: Write the implementation**
 
 Insert above `#[cfg(test)]` in `crates/btx-core/src/operators.rs`:
 
@@ -278,16 +430,31 @@ Insert above `#[cfg(test)]` in `crates/btx-core/src/operators.rs`:
 //! A snapshot counts as confirmed only when two different operators on this
 //! list signed its statement (`crate::confirmed_snapshot`). An operator is a
 //! person, and all of one person's keys together count once, so one machine
-//! with two keys can never confirm a snapshot alone.
+//! with two keys, or one person with three machines, never confirms a
+//! snapshot alone.
 //!
-//! The mainnet list is compiled in and changes only with a signed app update.
+//! THE LIST IS ONE FILE. `crates/btx-core/snapshot-operators.json`, compiled
+//! in below with `include_str!`, is the only place it is written. The website
+//! keeps a byte-identical copy (`site/src/lib/snapshot-operators.json`) that
+//! its CI compares, so anyone can read who counts and with which keys. It
+//! changes only with a signed app update; a statement carries nothing an
+//! operator could use to change who counts. The file also lists the keys
+//! every node pins (`mirror_pins`), held equal to
+//! `crate::node::BTX_TRUSTED_ATTESTATION_PUBKEYS` by a test, so the website
+//! can serve only a snapshot a node can load. They are not a second
+//! authority.
+//!
 //! Test chains get their list from the environment, and only test chains: a
 //! statement names its chain by the chain's genesis hash, and a mainnet
 //! statement is always checked against the compiled list, whatever the
 //! environment says. docs/decisions/2026-09-29-every-node-starts-near-the-tip.md,
 //! section 1.
 
-/// One operator: a name for the log and every key they sign with.
+use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
+
+/// One operator: a name for the log and the screen, and every key they sign
+/// with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Operator {
     pub name: String,
@@ -394,18 +561,117 @@ impl Chain {
     }
 }
 
-/// The mainnet list, one line per operator. Adding an operator is adding one
-/// line; `every_mainnet_line_is_well_formed` guards it.
-///
-/// Waiting for the owner's word that they agreed (2026-09-29), and not to be
-/// added before it: Aleksander, one operator with two keys,
-/// `("Aleksander", &["03047189023913e1922c80c895ee2a9e2eff6df05438654749e1a4f95019578a24", "02c9cfb77d7e4dce0cd6b7968fee1dd53d31ef06c764185e120c825fab8c0572a0"]),`
-/// and jpp, once he has sent a key. While Mende is alone here nothing counts
-/// as confirmed and every node uses the fallbacks.
-pub const MAINNET_OPERATORS: &[(&str, &[&str])] = &[(
-    "Mende",
-    &["02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675"],
-)];
+// ── The published file ──────────────────────────────────────────────────────
+
+/// The published list, byte for byte.
+pub const OPERATORS_JSON: &str = include_str!("../snapshot-operators.json");
+
+/// The file format this app reads. A file with another is refused whole.
+pub const OPERATORS_SCHEMA: u32 = 1;
+
+/// One operator as the file writes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorEntry {
+    pub name: String,
+    pub keys: Vec<String>,
+}
+
+/// The file's shape. The field order is the file's own:
+/// `the_file_is_written_the_one_canonical_way` holds the two together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorFile {
+    pub schema: u32,
+    pub operators: Vec<OperatorEntry>,
+    pub mirror_pins: Vec<String>,
+}
+
+/// The file, checked: the operator list and the pins, every key parsed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Published {
+    pub operators: OperatorList,
+    pub mirror_pins: Vec<[u8; 33]>,
+}
+
+/// A key as the file must write it: 66 lowercase hex characters of a
+/// compressed point.
+fn file_key(k: &str) -> Option<[u8; 33]> {
+    if k.len() != 66 || k != k.to_ascii_lowercase() {
+        return None;
+    }
+    parse_key(k)
+}
+
+/// Read and check an operator file: the schema, every key, no key twice
+/// (on two operators, or among the pins), and at least one pin.
+pub fn parse_operator_file(text: &str) -> Result<Published, String> {
+    let file: OperatorFile =
+        serde_json::from_str(text).map_err(|e| format!("unreadable operator file: {e}"))?;
+    if file.schema != OPERATORS_SCHEMA {
+        return Err(format!(
+            "operator file schema {}, not {OPERATORS_SCHEMA}",
+            file.schema
+        ));
+    }
+    let mut ops = Vec::new();
+    for entry in &file.operators {
+        let mut keys = Vec::new();
+        for k in &entry.keys {
+            keys.push(file_key(k).ok_or_else(|| {
+                format!(
+                    "operator {}: {k:?} is not a compressed key in lowercase hex",
+                    entry.name
+                )
+            })?);
+        }
+        ops.push(Operator {
+            name: entry.name.clone(),
+            keys,
+        });
+    }
+    let operators = OperatorList::new(ops)?;
+    let mut mirror_pins: Vec<[u8; 33]> = Vec::new();
+    for k in &file.mirror_pins {
+        let key = file_key(k)
+            .ok_or_else(|| format!("mirror pin {k:?} is not a compressed key in lowercase hex"))?;
+        if mirror_pins.contains(&key) {
+            return Err(format!("mirror pin {k} is listed twice"));
+        }
+        mirror_pins.push(key);
+    }
+    if mirror_pins.is_empty() {
+        return Err("the operator file lists no mirror pins".into());
+    }
+    Ok(Published {
+        operators,
+        mirror_pins,
+    })
+}
+
+/// The compiled file, checked once. A malformed file (the tests make that
+/// impossible to ship) gives an empty list, which confirms nothing.
+pub fn published() -> &'static Published {
+    static PUBLISHED: OnceLock<Published> = OnceLock::new();
+    PUBLISHED.get_or_init(|| {
+        parse_operator_file(OPERATORS_JSON).unwrap_or_else(|e| {
+            eprintln!("[operators] {e}; no operator counts");
+            Published::default()
+        })
+    })
+}
+
+/// The compiled mainnet list.
+pub fn mainnet() -> OperatorList {
+    published().operators.clone()
+}
+
+/// The keys every node pins, as the file lists them.
+pub fn mainnet_mirror_pins() -> Vec<[u8; 33]> {
+    published().mirror_pins.clone()
+}
+
+// ── Test chains ─────────────────────────────────────────────────────────────
 
 /// Where a test chain's list comes from. Format, operators separated by `;`,
 /// each `name=key[,key...]` with keys as 66 hex characters:
@@ -416,32 +682,6 @@ pub const MAINNET_OPERATORS: &[(&str, &[&str])] = &[(
 ///
 /// Read only for a regtest statement. A mainnet statement never consults it.
 pub const REGTEST_OPERATORS_ENV: &str = "EASYNODE_REGTEST_OPERATORS";
-
-/// The compiled mainnet list. Empty, which confirms nothing, if a line is
-/// malformed; the test above makes that impossible to ship.
-pub fn mainnet() -> OperatorList {
-    let mut ops = Vec::new();
-    for (name, keys) in MAINNET_OPERATORS {
-        let mut parsed = Vec::new();
-        for k in *keys {
-            match parse_key(k) {
-                Some(key) => parsed.push(key),
-                None => {
-                    eprintln!("[operators] mainnet key {k} is malformed; no operator counts");
-                    return OperatorList::default();
-                }
-            }
-        }
-        ops.push(Operator {
-            name: name.to_string(),
-            keys: parsed,
-        });
-    }
-    OperatorList::new(ops).unwrap_or_else(|e| {
-        eprintln!("[operators] the mainnet list is malformed ({e}); no operator counts");
-        OperatorList::default()
-    })
-}
 
 /// Parse [`REGTEST_OPERATORS_ENV`]'s value.
 pub fn parse_env_list(raw: &str) -> Result<OperatorList, String> {
@@ -485,7 +725,9 @@ pub fn regtest_env() -> Option<String> {
     std::env::var(REGTEST_OPERATORS_ENV).ok()
 }
 
-/// A 66-hex compressed key, or `None`.
+// ── Keys and hex ────────────────────────────────────────────────────────────
+
+/// A 66-hex compressed key (either case), or `None`.
 pub fn parse_key(hex_key: &str) -> Option<[u8; 33]> {
     let bytes = hex_decode(hex_key.trim())?;
     let key: [u8; 33] = bytes.try_into().ok()?;
@@ -513,12 +755,12 @@ pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
 }
 ````
 
-- [ ] **Step 5: Run the tests to see them pass**
+- [ ] **Step 6: Run the tests to see them pass**
 
 Run: `cd crates/btx-core && cargo test --locked --lib -- operators`
-Expected: `test result: ok. 8 passed; 0 failed`.
+Expected: `test result: ok. 12 passed; 0 failed` (derived, not run: the twelve tests above).
 
-- [ ] **Step 6: Format, lint, commit**
+- [ ] **Step 7: Format, lint, commit**
 
 ````bash
 cd crates/btx-core
@@ -528,10 +770,11 @@ cd ../..
 ````
 
 ````bash
-git add crates/btx-core/src/operators.rs crates/btx-core/src/lib.rs
-git commit -m "core: the operator list, Mende alone until another operator agrees" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git add crates/btx-core/snapshot-operators.json crates/btx-core/src/operators.rs crates/btx-core/src/lib.rs
+git commit -m "core: the operator list, one published file: Mende, Aleksander and jpp" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ````
 
+When this branch goes up as a PR, its description says, in these words or close to them: "Do not merge until the owner confirms Aleksander agreed to be on the operator list." The owner's go is what lets it merge, not a review.
 ### Task 2: Read, verify, count and trim a manifest (`confirmed_snapshot.rs`)
 
 **Files:**
@@ -542,17 +785,20 @@ git commit -m "core: the operator list, Mende alone until another operator agree
 
 **Interfaces:**
 - Consumes: Task 1 (`operators::{self, Chain, OperatorList, Operator}`), `crate::attested_snapshot::MAX_SNAPSHOT_BYTES` (exists), `crate::node::BTX_TRUSTED_ATTESTATION_PUBKEYS` (test only).
-- Produces (Tasks 3, 4, 10; the producer, confirmer and website plans):
-  - consts `STATEMENT_VERSION`, `STATEMENT_LEN` (229), `MAX_MANIFEST_BYTES` (65,536), `MAX_SIGNATURES` (64), `MAX_DER_LEN` (72), `MAINNET_REPLAY_CONTEXT`, `REGTEST_REPLAY_CONTEXT`, `MAINNET_GRID` (200), `REGTEST_GRID` (100)
+- Produces (Tasks 3, 4, 10; the producer, confirmer, `btx-confirmer` and website plans):
+  - consts `STATEMENT_VERSION`, `STATEMENT_LEN` (229), `MAX_MANIFEST_BYTES` (65,536), `MAX_SIGNATURES` (64), `MAX_DER_LEN` (72), `MAINNET_REPLAY_CONTEXT`, `REGTEST_REPLAY_CONTEXT`, `MAINNET_SHIELDED_COMMITMENT`, `REGTEST_SHIELDED_COMMITMENT`, `SNAPSHOT_GRID: u32 = 100` (both chains; replaces the first version's `MAINNET_GRID` 200 and `REGTEST_GRID` 100), `SNAPSHOT_DEPTH: u32 = 144`
   - `pub struct Hash32(pub [u8; 32])` with `display_hex`, `from_display_hex`, `is_null`
-  - `pub enum Refusal` (every reason, `Display` = one log line)
-  - `pub struct Statement` (`from_raw`, `raw`, `version`, `chain_id`, `block_hash`, `height`, `hash_serialized`, `coins`, `chain_tx`, `shielded`, `replay_context`, `file_size`, `file_hash`, `chunk_size`, `chunk_count`, `hash`)
+  - `pub enum Refusal` (every reason, `Display` = one log line); `WrongShieldedCommitment` replaces `MissingShieldedCommitment`, new `Dissent` and `NotADissent`
+  - `pub struct Statement` (`from_raw`, `raw`, `version`, `chain_id`, `block_hash`, `height`, `hash_serialized`, `coins`, `chain_tx`, `shielded`, `replay_context`, `file_size`, `file_hash`, `chunk_size`, `chunk_count`, `hash`, `chain_facts`)
+  - `pub struct ChainFacts { pub height: i32, pub block_hash: Hash32, pub hash_serialized: Hash32, pub coins: u64, pub chain_tx: u64, pub chain_id: Hash32, pub replay_context: Hash32, pub shielded: Hash32 }` (`Copy`, `Eq`)
+  - `pub fn is_dissent(&Statement) -> bool`; `pub fn dissent_statement(height: u64, block_hash: &Hash32, hash_serialized: &Hash32, coins: u64, chain_tx: u64, chain_id: &Hash32, replay_context: &Hash32, shielded: &Hash32) -> [u8; STATEMENT_LEN]` (the 229 bytes, version 2, all four file fields zero; wrap with `Statement::from_raw`); `ChainFacts::dissent(&self) -> Statement`
   - `pub struct Signed { key: [u8; 33], der: Vec<u8> }`, `pub struct Manifest { statement, signatures }` with `to_bytes()`
-  - `pub fn parse(&[u8]) -> Result<Manifest, Refusal>`
+  - `pub fn parse(&[u8]) -> Result<Manifest, Refusal>` (reads a dissent like any manifest)
   - `pub fn is_strict_der(&[u8]) -> bool`, `pub fn signature_is_valid(&Hash32, &[u8; 33], &[u8]) -> bool`
-  - `pub fn confirming_operators(&Manifest, &OperatorList) -> Result<Vec<String>, Refusal>`
-  - `pub struct ChainRules` + `ChainRules::for_statement(&Statement, Option<&str>)`; `pub struct NodeView { genesis: Option<String>, replay_context: Option<String>, start_height: u64, pinned: Vec<[u8; 33]> }` (`Default`)
-  - `pub struct Confirmed { manifest, chain, height: u64, statement_hash: Hash32, operators: Vec<String> }`
+  - `pub fn confirming_operators(&Manifest, &OperatorList) -> Result<Vec<String>, Refusal>` (verifies a dissent's signatures too)
+  - `pub struct ChainRules { chain, genesis, replay_context, shielded, grid, operators }` + `ChainRules::for_statement(&Statement, Option<&str>)`; `pub struct NodeView { genesis: Option<String>, replay_context: Option<String>, start_height: u64, pinned: Vec<[u8; 33]> }` (`Default`)
+  - `pub fn check_chain_fields(&Statement, &ChainRules) -> Result<(), Refusal>` (version, chain id, replay context, shielded commitment), `pub fn check_shape(&Statement, &ChainRules) -> Result<u64, Refusal>` (chain fields, not a dissent, file geometry and size, grid; the height), `pub fn check_dissent_shape(&Statement, &ChainRules) -> Result<u64, Refusal>` (chain fields, a dissent, grid; the height)
+  - `pub struct Confirmed { manifest, chain, height: u64, statement_hash: Hash32, operators: Vec<String> }` (`operators`: verified signers grouped by operator, in the list's order)
   - `pub fn check(&Manifest, &NodeView, Option<&str>) -> Result<Confirmed, Refusal>`, `pub fn check_with(&Manifest, &NodeView, &ChainRules)`, `pub fn node_agrees(&Statement, &NodeView) -> Result<(), Refusal>`
   - `pub fn trim_to_pinned(&Manifest, &[[u8; 33]]) -> Manifest`
   - `pub struct FileHasher` (`update`, `finish() -> (u64, String plain_sha256_hex, Hash32 double)`), `pub fn file_matches(&Statement, u64, &Hash32) -> bool`, `pub fn pinned_keys(&[&str]) -> Vec<[u8; 33]>`
@@ -581,7 +827,7 @@ Expected: each `cargo update` prints `Adding hmac v0.12.1` and `Adding rfc6979 v
 
 ````bash
 D=crates/btx-core/tests/fixtures/confirmed_snapshot
-S=/private/tmp/claude-501/-Users-m2promende-repos-easynode--claude-worktrees-easynode-0-7-0-release-65b687/ccaaa761-fc6e-4fe3-ad52-eb25130739ea/scratchpad
+S=/private/tmp/claude-501/-Users-m2promende-repos-easynode--claude-worktrees-easynode-0-7-0-finalize-cb1eff/cd1fd30a-0502-4812-b3c0-a6c3c374ea50/scratchpad/spike-fixtures
 mkdir -p $D
 cp $S/mainnet/pair/snapshot-manifest-225927.json $D/mainnet-225927.manifest
 for m in P PC PCD CD C CP; do cp $S/spike/m/$m.manifest $D/regtest-$m.manifest; done
@@ -602,7 +848,9 @@ e8fa06d2f700feb488d7f494a532cd0e44799d20613b80532b2eca5cffaa746e  regtest-PC.man
 649ce13ffb22f57358253530d187a6d3dc3679d4bc5649acb77dc6a6d22e5b09  regtest-PCD.manifest
 ````
 
-What they are: the manifest published with the 225,927 pair (signed by `02d5efca`, the 3060); and the spike's regtest export at height 100 (producer P, then confirmers C and D, throwaway keys P `0343faeb…e464`, C `02c05d68…6c0f`, D `034694ab…6d0e`), with its 8,055-byte snapshot file. `regtest-P.manifest` is also what trimming PCD to P gives, byte for byte.
+What they are: the manifest published with the 225,927 pair (signed by `02d5efca`, the 3060); and the spike's regtest export at height 100 (producer P, then confirmers C and D, throwaway keys P `0343faeb…e464`, C `02c05d68…6c0f`, D `034694ab…6d0e`), with its 8,055-byte snapshot file. `regtest-P.manifest` is also what trimming PCD to P gives, byte for byte. Read from the files while this plan was amended: the 225,927 statement carries the shielded commitment `94343b76…4541` (mainnet's compiled one) and the regtest statements carry `e802781d…1d5e` (regtest's); the regtest base block is `bd23c642be34c3a1f1a637d6352b8cfb390c801f2b873605b64986a1bc962c46`.
+
+No dissent vector file is added: a dissent is exact by construction (`dissent_statement`, `ChainFacts::dissent`), and the tests below hold it byte for byte to these statements with their file fields zeroed. Its statement hashes, computed with Python from the fixture bytes the way the independent check computed `d3ee9312…0482`, are the shared vectors for the website: regtest `a4874ae5ef9cc72abc74890f4e8e612ad4cd5c75fb97d3bda6f650605ad2e786`, mainnet (225,927's facts) `44ba673dbeb964d0e9e89d21597ccc5e590a216001f1fe69afbd863c6db0676b`.
 
 - [ ] **Step 3: Write the failing tests**
 
@@ -669,6 +917,8 @@ mod tests {
         );
         assert_eq!((st.coins(), st.chain_tx()), (140_731, 328_195));
         assert_eq!(st.replay_context().display_hex(), MAINNET_REPLAY_CONTEXT);
+        assert_eq!(st.shielded().display_hex(), MAINNET_SHIELDED_COMMITMENT);
+        assert!(!is_dissent(st));
         assert_eq!(
             (st.file_size(), st.chunk_size(), st.chunk_count()),
             (9_045_522, 1_048_576, 9)
@@ -709,7 +959,7 @@ mod tests {
             check(&m, &view, None).unwrap_err(),
             Refusal::OffGrid {
                 height: 225_927,
-                grid: 200
+                grid: SNAPSHOT_GRID
             }
         );
     }
@@ -726,6 +976,10 @@ mod tests {
             assert_eq!(
                 m.statement.replay_context().display_hex(),
                 REGTEST_REPLAY_CONTEXT
+            );
+            assert_eq!(
+                m.statement.shielded().display_hex(),
+                REGTEST_SHIELDED_COMMITMENT
             );
             for s in &m.signatures {
                 assert!(signature_is_valid(&m.statement.hash(), &s.key, &s.der));
@@ -1040,12 +1294,12 @@ mod tests {
     #[test]
     fn each_rule_refuses_on_its_own() {
         let t = Mainnetish::new();
-        let off = t.manifest(232_100, |_| {});
+        let off = t.manifest(232_150, |_| {});
         assert_eq!(
             t.check(&off),
             Err(Refusal::OffGrid {
-                height: 232_100,
-                grid: 200
+                height: 232_150,
+                grid: SNAPSHOT_GRID
             })
         );
         let low = t.manifest(225_800, |_| {});
@@ -1063,7 +1317,7 @@ mod tests {
         let replay = t.manifest(232_000, |r| r[149] ^= 1);
         assert_eq!(t.check(&replay), Err(Refusal::WrongReplayContext));
         let shielded = t.manifest(232_000, |r| r[117..149].fill(0));
-        assert_eq!(t.check(&shielded), Err(Refusal::MissingShieldedCommitment));
+        assert_eq!(t.check(&shielded), Err(Refusal::WrongShieldedCommitment));
         let chunks = t.manifest(232_000, |r| {
             r[225..229].copy_from_slice(&8u32.to_le_bytes())
         });
@@ -1114,6 +1368,142 @@ mod tests {
         bad.der = m.signatures[0].der.clone();
         m.signatures.push(bad);
         assert!(matches!(t.check(&m), Err(Refusal::InvalidSignature(_))));
+    }
+
+    // ── the grid, the shielded commitment, the dissent ──────────────────
+
+    /// Section 2: a grid of 100 and a depth of 144 keep the newest confirmed
+    /// snapshot 144 to 243 blocks behind the tip. Upstream's compiled
+    /// heights are on it.
+    #[test]
+    fn the_grid_is_100_and_the_depth_144() {
+        assert_eq!((SNAPSHOT_GRID, SNAPSHOT_DEPTH), (100, 144));
+        for h in [219_000u32, 228_000, 233_800] {
+            assert_eq!(h % SNAPSHOT_GRID, 0, "{h} is on the grid");
+        }
+        let t = Mainnetish::new();
+        assert_eq!(
+            check_shape(&t.manifest(233_800, |_| {}).statement, &t.rules),
+            Ok(233_800)
+        );
+        assert_eq!(
+            check_shape(&t.manifest(233_850, |_| {}).statement, &t.rules),
+            Err(Refusal::OffGrid {
+                height: 233_850,
+                grid: 100
+            })
+        );
+    }
+
+    /// The shielded commitment is compiled per engine beside the chain id
+    /// and the replay context (section 7, step 1); another one is refused.
+    #[test]
+    fn a_statement_with_another_shielded_commitment_is_refused() {
+        let t = Mainnetish::new();
+        let flipped = t.manifest(233_800, |r| r[117] ^= 1);
+        assert_eq!(t.check(&flipped), Err(Refusal::WrongShieldedCommitment));
+        assert_eq!(
+            check_chain_fields(&flipped.statement, &t.rules),
+            Err(Refusal::WrongShieldedCommitment)
+        );
+        assert_eq!(
+            check_chain_fields(&t.manifest(233_800, |_| {}).statement, &t.rules),
+            Ok(())
+        );
+        let regtest = parse(R_P).unwrap().statement;
+        let rules = ChainRules::for_statement(&regtest, None).unwrap();
+        assert_eq!(rules.shielded.display_hex(), REGTEST_SHIELDED_COMMITMENT);
+        assert_eq!(check_chain_fields(&regtest, &rules), Ok(()));
+    }
+
+    /// The dissent a confirmer sends (section 6a): its diary's chain facts,
+    /// its node's chain id and replay context, the compiled shielded
+    /// commitment, and all four file fields zero. Built from a statement's
+    /// own facts it is that statement with bytes 181 to 228 zeroed, byte for
+    /// byte. The two hashes were computed with Python from the fixture bytes
+    /// while this plan was amended; they are the website's dissent vectors.
+    #[test]
+    fn a_dissent_is_the_statement_with_its_file_fields_zeroed_byte_for_byte() {
+        for (bytes, dissent_hash) in [
+            (
+                R_P,
+                "a4874ae5ef9cc72abc74890f4e8e612ad4cd5c75fb97d3bda6f650605ad2e786",
+            ),
+            (
+                MAINNET,
+                "44ba673dbeb964d0e9e89d21597ccc5e590a216001f1fe69afbd863c6db0676b",
+            ),
+        ] {
+            let st = parse(bytes).unwrap().statement;
+            let facts = st.chain_facts();
+            let d = facts.dissent();
+            let mut want = *st.raw();
+            want[181..].fill(0);
+            assert_eq!(d.raw(), &want);
+            // The builder itself, as a confirmer calls it with its diary's facts.
+            assert_eq!(
+                dissent_statement(
+                    st.height() as u64,
+                    &st.block_hash(),
+                    &st.hash_serialized(),
+                    st.coins(),
+                    st.chain_tx(),
+                    &st.chain_id(),
+                    &st.replay_context(),
+                    &st.shielded(),
+                ),
+                want
+            );
+            assert_eq!(d.hash().display_hex(), dissent_hash);
+            assert!(is_dissent(&d));
+            assert!(!is_dissent(&st));
+            assert_eq!(d.chain_facts(), facts);
+            assert_eq!((d.file_size(), d.chunk_size(), d.chunk_count()), (0, 0, 0));
+            assert!(d.file_hash().is_null());
+        }
+        // The facts by name, as a diary entry and the node hold them.
+        let facts = parse(R_P).unwrap().statement.chain_facts();
+        assert_eq!(facts.height, 100);
+        assert_eq!(
+            facts.block_hash.display_hex(),
+            "bd23c642be34c3a1f1a637d6352b8cfb390c801f2b873605b64986a1bc962c46"
+        );
+        assert_eq!(
+            facts.hash_serialized.display_hex(),
+            "e611efee5d8466160be26e4ed23d2868d391d9fa7202b60312c5d04216c8d527"
+        );
+        assert_eq!((facts.coins, facts.chain_tx), (101, 101));
+        assert_eq!(facts.chain_id.display_hex(), operators::REGTEST_GENESIS);
+    }
+
+    /// A dissent is never loaded, however many operators sign it, and its
+    /// signatures still verify: the website and the confirmers count who
+    /// dissented with the same code.
+    #[test]
+    fn a_dissent_verifies_but_is_never_loaded() {
+        let t = Mainnetish::new();
+        let good = t.manifest(233_800, |_| {});
+        let d = good.statement.chain_facts().dissent();
+        let m = Manifest {
+            signatures: vec![sign(&t.a, &d), sign(&t.b, &d)],
+            statement: d,
+        };
+        assert_eq!(
+            confirming_operators(&m, &t.rules.operators),
+            Ok(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(check_dissent_shape(&m.statement, &t.rules), Ok(233_800));
+        assert_eq!(parse(&m.to_bytes()), Ok(m.clone()), "the parser reads it");
+        assert_eq!(t.check(&m), Err(Refusal::Dissent));
+        assert_eq!(check_shape(&m.statement, &t.rules), Err(Refusal::Dissent));
+        // Only all four zero is a dissent; one zero field is a broken statement.
+        let half = t.manifest(233_800, |r| r[181..189].fill(0));
+        assert!(!is_dissent(&half.statement));
+        assert_eq!(t.check(&half), Err(Refusal::BadGeometry));
+        assert_eq!(
+            check_dissent_shape(&good.statement, &t.rules),
+            Err(Refusal::NotADissent)
+        );
     }
 
     // ── trimming ────────────────────────────────────────────────────────
@@ -1175,11 +1565,18 @@ Insert above `#[cfg(test)]` in `crates/btx-core/src/confirmed_snapshot.rs`:
 //!
 //! WHAT CONFIRMED MEANS. Every signature is strict DER, low-S and valid over
 //! the statement; signers grouped by operator (`crate::operators`) number at
-//! least two; at least one signature is from a key this node pins; and the
-//! statement names this chain, this engine's replay context, a height on the
-//! grid and above where the node would start anyway, and a file this app will
-//! download. docs/decisions/2026-09-29-every-node-starts-near-the-tip.md,
+//! least two, counted only from signatures verified here; at least one
+//! signature is from a key this node pins; and the statement names this
+//! chain, this engine's replay context and shielded commitment, a height on
+//! the grid and above where the node would start anyway, and a file this app
+//! will download. docs/decisions/2026-09-29-every-node-starts-near-the-tip.md,
 //! sections 1, 7 and 8.
+//!
+//! A DISSENT is a statement whose four file fields are all zero (section
+//! 6a): a confirmer's own chain facts, signed to say "not this". It parses
+//! and its signatures verify like any statement's, so the website and the
+//! confirmers can count who dissented, but [`check`] refuses it: there is no
+//! file to load, and the engine refuses a zero file size or hash anyway.
 //!
 //! WHY TRIM. The engine refuses the whole manifest when any signature is from
 //! a key it does not pin (`untrusted-signer`, measured 2026-09-29), and a
@@ -1209,10 +1606,28 @@ pub const MAINNET_REPLAY_CONTEXT: &str =
 /// Regtest's on v0.34.9, from the spike's statements of 2026-09-29.
 pub const REGTEST_REPLAY_CONTEXT: &str =
     "9ed2add89d64a66015d6c4b2a746115c00c78503088fdde49e15ddcafed8a577";
-/// Snapshots are taken at multiples of this (section 2).
-pub const MAINNET_GRID: u32 = 200;
-/// Regtest's ExactReplay starts at 101, so a test chain stops at 100.
-pub const REGTEST_GRID: u32 = 100;
+/// Mainnet's shielded state commitment on v0.34.9, display order. The pool
+/// closed at 199,300, and every compiled snapshot since carries this pin
+/// (`src/kernel/chainparams.cpp:1278`, the 219,000 entry); the published
+/// 225,927 statement carries it too. `scripts/check-engine-tag.sh` compares
+/// it with the candidate engine's newest mainnet entry before a bump.
+pub const MAINNET_SHIELDED_COMMITMENT: &str =
+    "94343b766b39c0ea2d92d83323f77b5ccc5e775d99b34b01f5fa6400f2354541";
+/// Regtest's: the empty-tree pin that `validation.cpp:19051`'s comment
+/// names, read from the spike's regtest statements. The regtest rehearsal
+/// checks a fresh chain still carries it.
+pub const REGTEST_SHIELDED_COMMITMENT: &str =
+    "e802781d9b88ba12d8c0f41777405bc015755603d6fcbaa9fc089eae53011d5e";
+/// Snapshots are taken at multiples of this, on every chain (section 2):
+/// with [`SNAPSHOT_DEPTH`] the newest confirmed one is 144 to 243 blocks
+/// behind the tip, inside the 288 that limited peers serve. 219,000 and
+/// 228,000 are on it. Regtest's ExactReplay starts at 101, so a test chain
+/// stops at 100.
+pub const SNAPSHOT_GRID: u32 = 100;
+/// How deep a block must be on a node's own active chain before a producer
+/// sends its snapshot or a confirmer signs it (sections 4 and 5). Nothing in
+/// the loading path waits on it; the producer and confirmer plans do.
+pub const SNAPSHOT_DEPTH: u32 = 144;
 
 /// A 32-byte value in the engine's serialized order.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1258,7 +1673,11 @@ pub enum Refusal {
     NodeOnAnotherChain,
     WrongReplayContext,
     NodeReplayContextDiffers,
-    MissingShieldedCommitment,
+    WrongShieldedCommitment,
+    /// All four file fields zero: a dissent, never loaded.
+    Dissent,
+    /// Offered as a dissent, but its file fields are not all zero.
+    NotADissent,
     BadGeometry,
     FileTooLarge(u64),
     OffGrid { height: i64, grid: u32 },
@@ -1288,7 +1707,14 @@ impl std::fmt::Display for Refusal {
             Refusal::NodeReplayContextDiffers => {
                 write!(f, "the replay context is not the running node's")
             }
-            Refusal::MissingShieldedCommitment => write!(f, "the shielded commitment is empty"),
+            Refusal::WrongShieldedCommitment => {
+                write!(f, "the shielded commitment is not this engine's")
+            }
+            Refusal::Dissent => write!(
+                f,
+                "it is a dissent: its file fields are zero, so there is nothing to load"
+            ),
+            Refusal::NotADissent => write!(f, "its file fields are not all zero, so it is not a dissent"),
             Refusal::BadGeometry => write!(f, "the file size and chunks do not add up"),
             Refusal::FileTooLarge(n) => {
                 write!(f, "a {n}-byte file is more than this app downloads")
@@ -1391,6 +1817,94 @@ impl Statement {
         first.update(HASH_DOMAIN);
         first.update(self.raw);
         Hash32(Sha256::digest(first.finalize()).into())
+    }
+    /// Everything but the file fields.
+    pub fn chain_facts(&self) -> ChainFacts {
+        ChainFacts {
+            height: self.height(),
+            block_hash: self.block_hash(),
+            hash_serialized: self.hash_serialized(),
+            coins: self.coins(),
+            chain_tx: self.chain_tx(),
+            chain_id: self.chain_id(),
+            replay_context: self.replay_context(),
+            shielded: self.shielded(),
+        }
+    }
+}
+
+/// A statement's chain facts: what a diary entry and the node know, and what
+/// a dissent carries (section 6a). Height, block hash, `hash_serialized_3`,
+/// coin count and chain transaction count are the ones two statements can
+/// disagree on; chain id, replay context and shielded commitment are the
+/// node's and the engine's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainFacts {
+    pub height: i32,
+    pub block_hash: Hash32,
+    pub hash_serialized: Hash32,
+    pub coins: u64,
+    pub chain_tx: u64,
+    pub chain_id: Hash32,
+    pub replay_context: Hash32,
+    pub shielded: Hash32,
+}
+
+/// A statement whose four file fields are all zero: a dissent.
+pub fn is_dissent(st: &Statement) -> bool {
+    st.file_size() == 0
+        && st.file_hash().is_null()
+        && st.chunk_size() == 0
+        && st.chunk_count() == 0
+}
+
+/// The 229 bytes of the version-2 statement a dissent signs: the chain
+/// facts given, and file size 0, file hash 32 zero bytes, chunk size 0,
+/// chunk count 0. Pure; wrap it with [`Statement::from_raw`]. The confirmer
+/// passes its own diary entry, its node's chain id and replay context and
+/// the compiled shielded commitment, and signs the result with its node's
+/// `signutxosnapshotmanifest`, which checks only the chain id, the replay
+/// context and its own key (v0.34.9
+/// `trusted_exact_replay_attestation.cpp:1387-1403`), never the file fields.
+/// Heights fit the engine's `int32` (the statement's own field).
+#[allow(clippy::too_many_arguments)]
+pub fn dissent_statement(
+    height: u64,
+    block_hash: &Hash32,
+    hash_serialized: &Hash32,
+    coins: u64,
+    chain_tx: u64,
+    chain_id: &Hash32,
+    replay_context: &Hash32,
+    shielded: &Hash32,
+) -> [u8; STATEMENT_LEN] {
+    let mut raw = [0u8; STATEMENT_LEN];
+    raw[0] = STATEMENT_VERSION;
+    raw[1..33].copy_from_slice(&chain_id.0);
+    raw[33..65].copy_from_slice(&block_hash.0);
+    raw[65..69].copy_from_slice(&(height as i32).to_le_bytes());
+    raw[69..101].copy_from_slice(&hash_serialized.0);
+    raw[101..109].copy_from_slice(&coins.to_le_bytes());
+    raw[109..117].copy_from_slice(&chain_tx.to_le_bytes());
+    raw[117..149].copy_from_slice(&shielded.0);
+    raw[149..181].copy_from_slice(&replay_context.0);
+    // 181..229: file size, file hash, chunk size and chunk count stay zero.
+    raw
+}
+
+impl ChainFacts {
+    /// The dissent carrying these facts, as a [`Statement`].
+    pub fn dissent(&self) -> Statement {
+        Statement::from_raw(dissent_statement(
+            self.height as u64,
+            &self.block_hash,
+            &self.hash_serialized,
+            self.coins,
+            self.chain_tx,
+            &self.chain_id,
+            &self.replay_context,
+            &self.shielded,
+        ))
     }
 }
 
@@ -1586,12 +2100,13 @@ pub fn confirming_operators(
     Ok(operators.distinct_operators(&keys))
 }
 
-/// What a chain's statements must say.
+/// What a chain's statements must say, as this engine compiles it.
 #[derive(Debug, Clone)]
 pub struct ChainRules {
     pub chain: Chain,
     pub genesis: Hash32,
     pub replay_context: Hash32,
+    pub shielded: Hash32,
     pub grid: u32,
     pub operators: OperatorList,
 }
@@ -1606,23 +2121,24 @@ impl ChainRules {
     ) -> Result<Self, Refusal> {
         let id = statement.chain_id().display_hex();
         let chain = Chain::from_genesis_hex(&id).ok_or(Refusal::UnknownChain(id))?;
-        let (genesis, context, grid) = match chain {
+        let (genesis, context, shielded) = match chain {
             Chain::Main => (
                 operators::MAINNET_GENESIS,
                 MAINNET_REPLAY_CONTEXT,
-                MAINNET_GRID,
+                MAINNET_SHIELDED_COMMITMENT,
             ),
             Chain::Regtest => (
                 operators::REGTEST_GENESIS,
                 REGTEST_REPLAY_CONTEXT,
-                REGTEST_GRID,
+                REGTEST_SHIELDED_COMMITMENT,
             ),
         };
         Ok(Self {
             chain,
             genesis: Hash32::from_display_hex(genesis).expect("compiled genesis"),
             replay_context: Hash32::from_display_hex(context).expect("compiled context"),
-            grid,
+            shielded: Hash32::from_display_hex(shielded).expect("compiled commitment"),
+            grid: SNAPSHOT_GRID,
             operators: operators::for_chain(chain, regtest_env),
         })
     }
@@ -1650,6 +2166,8 @@ pub struct Confirmed {
     pub chain: Chain,
     pub height: u64,
     pub statement_hash: Hash32,
+    /// The operators whose signatures were verified here, each once, in the
+    /// list's order. The only names the app ever shows (section 7).
     pub operators: Vec<String>,
 }
 
@@ -1680,13 +2198,11 @@ pub fn node_agrees(st: &Statement, node: &NodeView) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// Every rule of section 7, step 1.
-pub fn check_with(
-    manifest: &Manifest,
-    node: &NodeView,
-    rules: &ChainRules,
-) -> Result<Confirmed, Refusal> {
-    let st = &manifest.statement;
+/// Version, chain id, replay context and shielded commitment: the fields a
+/// statement and a dissent share, as this engine compiles them. A confirmer
+/// that finds any of them wrong neither signs nor dissents (section 5, check
+/// 3), and the website refuses the statement at intake.
+pub fn check_chain_fields(st: &Statement, rules: &ChainRules) -> Result<(), Refusal> {
     if st.version() != STATEMENT_VERSION {
         return Err(Refusal::UnsupportedVersion(st.version()));
     }
@@ -1696,9 +2212,31 @@ pub fn check_with(
     if st.replay_context() != rules.replay_context {
         return Err(Refusal::WrongReplayContext);
     }
-    node_agrees(st, node)?;
-    if st.shielded().is_null() {
-        return Err(Refusal::MissingShieldedCommitment);
+    if st.shielded() != rules.shielded {
+        return Err(Refusal::WrongShieldedCommitment);
+    }
+    Ok(())
+}
+
+fn on_grid(st: &Statement, rules: &ChainRules) -> Result<u64, Refusal> {
+    let height = st.height() as i64;
+    if height <= 0 || height % rules.grid as i64 != 0 {
+        return Err(Refusal::OffGrid {
+            height,
+            grid: rules.grid,
+        });
+    }
+    Ok(height as u64)
+}
+
+/// What a statement's bytes must say before anyone loads it or signs it:
+/// [`check_chain_fields`], not a dissent, the engine's file geometry, a file
+/// this app downloads, and a height on the grid. The height, when they do.
+/// The loader, the confirmers and the website's intake all use it.
+pub fn check_shape(st: &Statement, rules: &ChainRules) -> Result<u64, Refusal> {
+    check_chain_fields(st, rules)?;
+    if is_dissent(st) {
+        return Err(Refusal::Dissent);
     }
     let size = st.file_size();
     let chunk = st.chunk_size();
@@ -1712,16 +2250,32 @@ pub fn check_with(
     if size > crate::attested_snapshot::MAX_SNAPSHOT_BYTES {
         return Err(Refusal::FileTooLarge(size));
     }
-    let height = st.height() as i64;
-    if height <= 0 || height % rules.grid as i64 != 0 {
-        return Err(Refusal::OffGrid {
-            height,
-            grid: rules.grid,
-        });
+    on_grid(st, rules)
+}
+
+/// A dissent's shape: [`check_chain_fields`], all four file fields zero, and
+/// a height on the grid. The height, when it is one. For the website and the
+/// confirmers; the loader never takes a dissent.
+pub fn check_dissent_shape(st: &Statement, rules: &ChainRules) -> Result<u64, Refusal> {
+    check_chain_fields(st, rules)?;
+    if !is_dissent(st) {
+        return Err(Refusal::NotADissent);
     }
-    if height as u64 <= node.start_height {
+    on_grid(st, rules)
+}
+
+/// Every rule of section 7, step 1.
+pub fn check_with(
+    manifest: &Manifest,
+    node: &NodeView,
+    rules: &ChainRules,
+) -> Result<Confirmed, Refusal> {
+    let st = &manifest.statement;
+    let height = check_shape(st, rules)?;
+    node_agrees(st, node)?;
+    if height <= node.start_height {
         return Err(Refusal::NotAboveStart {
-            height,
+            height: height as i64,
             start: node.start_height,
         });
     }
@@ -1799,7 +2353,7 @@ pub fn pinned_keys(hexes: &[&str]) -> Vec<[u8; 33]> {
 - [ ] **Step 6: Run the tests to see them pass**
 
 Run: `cd crates/btx-core && cargo test --locked --lib -- confirmed_snapshot operators`
-Expected: `test result: ok. 28 passed; 0 failed` (20 here, 8 from Task 1). These reproduce the independent Python check: statement hash `d3ee93122fb062baa00bfe5d8c586f03c619427e8a9253f8fae0c980c9aa0482`, file hash `f234192d…eb2c`, the 3060's signature valid, and the regtest statement hash `11c5406e…f194`.
+Expected: `test result: ok. 36 passed; 0 failed` (24 here, 12 from Task 1; derived, not run: the first version passed 20 + 8, this one adds four tests here and four in Task 1). These reproduce the independent Python check: statement hash `d3ee93122fb062baa00bfe5d8c586f03c619427e8a9253f8fae0c980c9aa0482`, file hash `f234192d…eb2c`, the 3060's signature valid, and the regtest statement hash `11c5406e…f194`; and the dissent hashes `a4874ae5…e786` (regtest) and `44ba673d…676b` (mainnet) computed the same way.
 
 - [ ] **Step 7: Format, lint, commit**
 
@@ -1810,7 +2364,511 @@ for c in crates/btx-core apps/node/src-tauri; do (cd $c && cargo fmt --all --che
 
 ````bash
 git add crates/btx-core/Cargo.toml crates/btx-core/Cargo.lock apps/node/src-tauri/Cargo.lock crates/btx-core/src/confirmed_snapshot.rs crates/btx-core/src/lib.rs crates/btx-core/tests/fixtures/confirmed_snapshot
-git commit -m "core: read, verify, count and trim a signed snapshot manifest" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "core: read, verify, count and trim a signed snapshot manifest, and know a dissent" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+````
+
+### Task 2a: The validated gate (`node_api.rs`, section 3)
+
+**Files:**
+- Modify: `crates/btx-core/src/node_api.rs` (two functions after `get_chainstates`; tests)
+
+**Interfaces:**
+- Consumes: `crate::rpc::Rpc` (exists).
+- Produces (not used by loading; for the diary, producer, confirmer and `btx-confirmer` plans):
+  - `pub fn chainstates_validated(answer: Option<&serde_json::Value>) -> bool`: pure, over a raw `getchainstates` answer (`None` = the call failed)
+  - `pub async fn read_chainstates_validated(rpc: &dyn Rpc) -> bool`: asks the node and applies it
+
+Why here and not in the loader: nothing a node loads depends on it. It decides whether a node may record a diary entry, export, send or sign, and it replaces the first design's test of the engine's `attested_assumeutxo` file for those purposes. Section 8's pin rule (Task 6) still keys on that file.
+
+Why over the raw answer and not `ChainStates`: `ChainstateEntry::validated` is `#[serde(default)]`, so a typed read cannot tell a missing field from `false`. The gate needs to count both as closed, and the engine writes an empty object for a chainstate with no tip yet (`src/rpc/blockchain.cpp`, `make_chain_data`, v0.34.9).
+
+- [ ] **Step 1: Write the failing tests**
+
+In `crates/btx-core/src/node_api.rs`, inside `mod tests`, directly after the test `fully_validated_single_chainstate_has_no_snapshot` (it ends with `assert!(cs.active().unwrap().validated);` and `}`), add:
+
+````rust
+    // ── the validated gate (every-node-starts-near-the-tip, section 3) ──────
+
+    /// `getchainstates` as v0.34.9 writes it (`src/rpc/blockchain.cpp`,
+    /// `make_chain_data`): a background chainstate from genesis, then the
+    /// snapshot chainstate on `base`, still `validated: false`.
+    fn chainstates_on_a_snapshot(base: &str) -> Value {
+        json!({
+            "headers": 233_950,
+            "background_activation_yields": 0,
+            "chainstates": [
+                {
+                    "blocks": 131_200, "bestblockhash": "11".repeat(32),
+                    "verificationprogress": 0.56, "validated": true,
+                    "blocks_in_flight": 4
+                },
+                {
+                    "blocks": 233_949, "bestblockhash": "22".repeat(32),
+                    "verificationprogress": 0.99, "snapshot_blockhash": base,
+                    "validated": false, "blocks_in_flight": 1
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn chainstates_validated_opens_only_when_every_chainstate_is_validated() {
+        // A node that checked its whole chain: one chainstate, validated.
+        let checked = json!({"headers": 233_950, "chainstates": [
+            {"blocks": 233_949, "bestblockhash": "33".repeat(32), "validated": true}
+        ]});
+        assert!(chainstates_validated(Some(&checked)));
+        // After the background check: one chainstate left, still carrying
+        // its snapshot base, and validated.
+        let retired = json!({"headers": 233_950, "chainstates": [
+            {"blocks": 233_949, "snapshot_blockhash": "44".repeat(32), "validated": true}
+        ]});
+        assert!(chainstates_validated(Some(&retired)));
+    }
+
+    /// Upstream's plain assumeutxo snapshot (`loadtxoutset`, 219,000 on
+    /// 0.34.9, 228,000 on 0.34.12) writes no `attested_assumeutxo` file, so
+    /// the first design's file test would have let this node record and sign.
+    /// The gate never looks at the file: it takes no datadir at all.
+    #[test]
+    fn chainstates_validated_stays_closed_on_a_plain_assumeutxo_snapshot() {
+        let plain = chainstates_on_a_snapshot(
+            "dc51220bc7e5db96e29df9d817ae6179245d33eb8adcaaff765cfec83fdb87c3",
+        );
+        assert!(!chainstates_validated(Some(&plain)));
+    }
+
+    /// A signed snapshot (`loadtxoutsetattested`, 225,927) looks the same.
+    #[test]
+    fn chainstates_validated_stays_closed_on_a_signed_snapshot() {
+        let signed = chainstates_on_a_snapshot(
+            "06780445dae193010e099e6425c5430f121416b067b8d68a8a5c3b52e8a4b932",
+        );
+        assert!(!chainstates_validated(Some(&signed)));
+    }
+
+    #[test]
+    fn chainstates_validated_is_closed_when_the_answer_is_not_one() {
+        assert!(!chainstates_validated(None), "the call failed");
+        assert!(!chainstates_validated(Some(&Value::Null)));
+        assert!(!chainstates_validated(Some(&json!({"headers": 1}))));
+        assert!(!chainstates_validated(Some(&json!({"chainstates": []}))));
+        assert!(
+            !chainstates_validated(Some(&json!({"chainstates": [{}]}))),
+            "a chainstate with no tip yet writes an empty object"
+        );
+        assert!(!chainstates_validated(Some(
+            &json!({"chainstates": [{"validated": "true"}]})
+        )));
+        assert!(!chainstates_validated(Some(&json!({"chainstates": [
+            {"validated": true}, {"blocks": 5}
+        ]}))));
+    }
+
+    #[tokio::test]
+    async fn chainstates_validated_reads_the_node() {
+        let checked = json!({"chainstates": [{"blocks": 9, "validated": true}]});
+        assert!(read_chainstates_validated(&FakeRpc::new(&[("getchainstates", checked)])).await);
+        let on_snapshot = chainstates_on_a_snapshot(&"55".repeat(32));
+        assert!(!read_chainstates_validated(&FakeRpc::new(&[("getchainstates", on_snapshot)])).await);
+        // FakeRpc answers null for a method it does not know.
+        assert!(!read_chainstates_validated(&FakeRpc::new(&[])).await);
+    }
+````
+
+- [ ] **Step 2: Run the tests to see them fail**
+
+Run: `cd crates/btx-core && cargo test --locked --lib -- chainstates_validated`
+Expected: compile errors `cannot find function \`chainstates_validated\` in this scope` and `cannot find function \`read_chainstates_validated\` in this scope`.
+
+- [ ] **Step 3: Write the implementation**
+
+In `crates/btx-core/src/node_api.rs`, directly after the whole `pub async fn get_chainstates(rpc: &dyn Rpc) -> AppResult<ChainStates> { ... }`, add:
+
+````rust
+/// The validated gate (docs/decisions/2026-09-29-every-node-starts-near-the-tip.md,
+/// section 3): is this node's chain one it checked itself? Open only when
+/// `answer` is a `getchainstates` answer whose `chainstates` array is not
+/// empty and every entry in it says `"validated": true`. Closed for a failed
+/// call (`None`), anything that is not such an answer, and any entry whose
+/// `validated` is false, missing or not a boolean.
+///
+/// WHY NOT THE `attested_assumeutxo` FILE. Only a signed load writes it
+/// (v0.34.9 `validation.cpp:17791` and `:17818`). Upstream's plain assumeutxo
+/// snapshot does not, although its history below the base is just as
+/// unchecked; `validated` is false for both until the background check has
+/// finished (`src/rpc/blockchain.cpp:5219`).
+///
+/// The diary, the producer and both confirmers ask this before every entry,
+/// export, send and signature. Section 8's pin rule still keys on the file.
+pub fn chainstates_validated(answer: Option<&serde_json::Value>) -> bool {
+    let Some(entries) = answer
+        .and_then(|v| v.get("chainstates"))
+        .and_then(|c| c.as_array())
+    else {
+        return false;
+    };
+    !entries.is_empty()
+        && entries
+            .iter()
+            .all(|e| e.get("validated").and_then(|v| v.as_bool()) == Some(true))
+}
+
+/// [`chainstates_validated`] on the node's answer now. A failed call is closed.
+pub async fn read_chainstates_validated(rpc: &dyn Rpc) -> bool {
+    let answer = rpc.call("getchainstates", json!([])).await.ok();
+    chainstates_validated(answer.as_ref())
+}
+````
+
+- [ ] **Step 4: Run the tests to see them pass**
+
+Run: `cd crates/btx-core && cargo test --locked --lib -- chainstates_validated`
+Expected: `test result: ok. 5 passed; 0 failed` (derived, not run).
+
+- [ ] **Step 5: Format, lint, commit**
+
+````bash
+cd crates/btx-core
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious
+cd ../..
+````
+
+````bash
+git add crates/btx-core/src/node_api.rs
+git commit -m "core: the validated gate: nothing recorded, produced or signed on an unchecked chain" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+````
+
+### Task 2b: Where the node started, and who confirmed it (`snapshot_start.rs`)
+
+**Files:**
+- Create: `crates/btx-core/src/snapshot_start.rs`
+- Modify: `crates/btx-core/src/lib.rs`
+
+**Interfaces:**
+- Consumes: `crate::fsx::atomic_write` (exists), `crate::node_api::ChainStates` (exists).
+- Produces (Tasks 3, 4, 5, 10; plan 2; the UI plan's history-check line (decision C) and Copy diagnostics):
+  - `pub const START_RECORD_FILE: &str = "snapshot-start.json"`, `pub fn path(datadir: &Path) -> PathBuf`
+  - `pub enum StartSource { Confirmed, Pinned, Engine }` (serde `snake_case`), `pub struct StartRecord { pub height: u64, pub block_hash: String, pub source: StartSource, pub operators: Vec<String> }`
+  - the pure reader `pub fn parse(bytes: &[u8]) -> Option<StartRecord>`, and `pub fn read(datadir: &Path) -> Option<StartRecord>`
+  - `pub fn write(&Path, &StartRecord) -> std::io::Result<()>` (atomic), `pub fn replace(&Path, &StartRecord) -> std::io::Result<Option<Vec<u8>>>` (returns the bytes it replaced), `pub fn put_back(&Path, Option<Vec<u8>>)`
+  - `pub fn is_current(&StartRecord, &ChainStates) -> bool` (the record describes the snapshot chainstate the node runs on now)
+  - `pub fn join_names(&[String]) -> String` ("Mende and jpp", "Mende, Aleksander and jpp"), `pub fn block_number(u64) -> String` ("233,800"), `pub fn started_from(&StartRecord) -> String` (the history-check line's second sentence)
+
+The trimmed manifest the engine keeps carries only the pinned signatures, so the confirmers' names are gone once it is written. This record, written first, is where they survive (section 7, step 4). The UI never shows the names the website sends.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `crates/btx-core/src/snapshot_start.rs` with only the test module:
+
+````rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const BASE: &str = "bd23c642be34c3a1f1a637d6352b8cfb390c801f2b873605b64986a1bc962c46";
+
+    fn confirmed(names: &[&str]) -> StartRecord {
+        StartRecord {
+            height: 233_800,
+            block_hash: BASE.into(),
+            source: StartSource::Confirmed,
+            operators: names.iter().map(|n| n.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_record_is_the_shape_the_decision_names() {
+        let r = confirmed(&["Mende", "jpp"]);
+        assert_eq!(
+            serde_json::to_value(&r).unwrap(),
+            json!({"height": 233800, "block_hash": BASE, "source": "confirmed", "operators": ["Mende", "jpp"]})
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(read(tmp.path()), None);
+        write(tmp.path(), &r).unwrap();
+        assert!(tmp.path().join(START_RECORD_FILE).is_file());
+        assert_eq!(read(tmp.path()), Some(r));
+    }
+
+    #[test]
+    fn a_record_is_read_strictly() {
+        let one = |v: serde_json::Value| parse(&serde_json::to_vec(&v).unwrap());
+        assert!(one(json!({"height": 225927, "block_hash": BASE, "source": "pinned", "operators": []})).is_some());
+        assert!(one(json!({"height": 228000, "block_hash": BASE, "source": "engine", "operators": []})).is_some());
+        assert!(
+            one(json!({"height": 225927, "block_hash": BASE, "source": "pinned", "operators": ["Mende"]})).is_none(),
+            "names only for a confirmed start"
+        );
+        assert!(
+            one(json!({"height": 233800, "block_hash": BASE, "source": "confirmed", "operators": ["Mende"]})).is_none(),
+            "one operator confirms nothing"
+        );
+        assert!(one(json!({"height": 233800, "block_hash": "ab", "source": "confirmed", "operators": ["Mende", "jpp"]})).is_none());
+        assert!(one(json!({"height": 233800, "block_hash": BASE, "source": "website", "operators": []})).is_none());
+        assert!(one(json!({"height": 0, "block_hash": BASE, "source": "engine", "operators": []})).is_none());
+        assert!(parse(b"not json").is_none());
+    }
+
+    /// A load that does not happen leaves the record as it found it.
+    #[test]
+    fn a_replaced_record_can_be_put_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let before = replace(d, &confirmed(&["Mende", "jpp"])).unwrap();
+        assert_eq!(before, None);
+        put_back(d, before);
+        assert_eq!(read(d), None, "no record before, none after");
+        write(d, &confirmed(&["Mende", "jpp"])).unwrap();
+        let newer = StartRecord {
+            height: 233_900,
+            ..confirmed(&["Mende", "Aleksander"])
+        };
+        let before = replace(d, &newer).unwrap();
+        assert_eq!(read(d), Some(newer));
+        put_back(d, before);
+        assert_eq!(read(d), Some(confirmed(&["Mende", "jpp"])));
+    }
+
+    #[test]
+    fn a_record_is_current_only_beside_its_own_snapshot_chainstate() {
+        let r = confirmed(&["Mende", "jpp"]);
+        let states = |hash: Option<&str>| crate::node_api::ChainStates {
+            headers: 233_900,
+            chainstates: vec![crate::node_api::ChainstateEntry {
+                blocks: 233_900,
+                snapshot_blockhash: hash.map(str::to_string),
+                ..Default::default()
+            }],
+        };
+        assert!(is_current(&r, &states(Some(BASE))));
+        assert!(is_current(&r, &states(Some(&BASE.to_ascii_uppercase()))));
+        assert!(!is_current(&r, &states(Some(&"00".repeat(32)))));
+        assert!(!is_current(&r, &states(None)));
+    }
+
+    #[test]
+    fn names_are_joined_the_way_people_say_them() {
+        let j = |n: &[&str]| join_names(&n.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(j(&[]), "");
+        assert_eq!(j(&["Mende"]), "Mende");
+        assert_eq!(j(&["Mende", "jpp"]), "Mende and jpp");
+        assert_eq!(j(&["Mende", "Aleksander", "jpp"]), "Mende, Aleksander and jpp");
+    }
+
+    #[test]
+    fn the_second_sentence_names_where_the_node_started() {
+        assert_eq!(block_number(233_800), "233,800");
+        assert_eq!(block_number(999), "999");
+        assert_eq!(block_number(1_234_567), "1,234,567");
+        let pinned = StartRecord {
+            height: 225_927,
+            block_hash: BASE.into(),
+            source: StartSource::Pinned,
+            operators: vec![],
+        };
+        let engine = StartRecord {
+            height: 228_000,
+            source: StartSource::Engine,
+            ..pinned.clone()
+        };
+        for (got, want) in [
+            (
+                started_from(&confirmed(&["Mende", "jpp"])),
+                "Started from block 233,800, confirmed by Mende and jpp.",
+            ),
+            (
+                started_from(&pinned),
+                "Started from block 225,927, built into this app.",
+            ),
+            (
+                started_from(&engine),
+                "Started from block 228,000, built into the BTX engine.",
+            ),
+        ] {
+            assert_eq!(got, want);
+            assert!(!got.contains('\u{2014}'), "no em-dash: {got}");
+        }
+    }
+}
+````
+
+In `crates/btx-core/src/lib.rs`, after `pub mod snapshot_serve;`:
+
+````rust
+pub mod snapshot_serve;
+pub mod snapshot_start;
+````
+
+- [ ] **Step 2: Run the tests to see them fail**
+
+Run: `cd crates/btx-core && cargo test --locked --lib -- snapshot_start`
+Expected: compile errors, among them `cannot find type \`StartRecord\` in this scope` and `cannot find function \`started_from\` in this scope`.
+
+- [ ] **Step 3: Write the implementation**
+
+Insert above `#[cfg(test)]` in `crates/btx-core/src/snapshot_start.rs`:
+
+````rust
+//! Where this node's chain started, and who confirmed it
+//! (docs/decisions/2026-09-29-every-node-starts-near-the-tip.md, section 7,
+//! step 4, and "Who confirmed the start point, on screen").
+//!
+//! The loader hands the engine a manifest that keeps only the signatures
+//! this node pins, so the confirmers' names are gone once it is written.
+//! They are written here first: `<datadir>/snapshot-start.json`. Only names
+//! whose signatures the app verified itself are in it, in the list's order;
+//! the names the website sends are never used. A start from a fallback
+//! records where it came from and no names.
+//!
+//! The history-check line and Fast-forward's last message read it through
+//! [`read`] and [`started_from`]. The record says what the last load did; a
+//! reader that shows it beside the running chain checks [`is_current`].
+
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+pub const START_RECORD_FILE: &str = "snapshot-start.json";
+
+/// Where the start point came from (section 9's order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartSource {
+    /// A snapshot two operators confirmed.
+    Confirmed,
+    /// The pair compiled into this app (225,927).
+    Pinned,
+    /// The snapshot compiled into the BTX engine.
+    Engine,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartRecord {
+    pub height: u64,
+    /// The base block, display order.
+    pub block_hash: String,
+    pub source: StartSource,
+    /// The operators whose signatures the app verified, in the list's order.
+    /// Empty unless `source` is `Confirmed`.
+    pub operators: Vec<String>,
+}
+
+pub fn path(datadir: &Path) -> PathBuf {
+    datadir.join(START_RECORD_FILE)
+}
+
+/// Pure: the record in `bytes`, if they hold one. Strict: a height above 0,
+/// a block hash of 64 hex characters, and names only for a confirmed start,
+/// then at least two.
+pub fn parse(bytes: &[u8]) -> Option<StartRecord> {
+    let r: StartRecord = serde_json::from_slice(bytes).ok()?;
+    let hash_ok = r.block_hash.len() == 64 && r.block_hash.bytes().all(|b| b.is_ascii_hexdigit());
+    let names_ok = match r.source {
+        StartSource::Confirmed => {
+            r.operators.len() >= 2 && r.operators.iter().all(|n| !n.trim().is_empty())
+        }
+        StartSource::Pinned | StartSource::Engine => r.operators.is_empty(),
+    };
+    (r.height > 0 && hash_ok && names_ok).then_some(r)
+}
+
+pub fn read(datadir: &Path) -> Option<StartRecord> {
+    parse(&std::fs::read(path(datadir)).ok()?)
+}
+
+/// Write the record, atomically.
+pub fn write(datadir: &Path, record: &StartRecord) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(record).map_err(std::io::Error::other)?;
+    crate::fsx::atomic_write(&path(datadir), &bytes)
+}
+
+/// Write `record` and hand back the bytes it replaced, for [`put_back`]
+/// when the load it describes does not happen.
+pub fn replace(datadir: &Path, record: &StartRecord) -> std::io::Result<Option<Vec<u8>>> {
+    let previous = std::fs::read(path(datadir)).ok();
+    write(datadir, record)?;
+    Ok(previous)
+}
+
+/// Undo [`replace`]: the previous bytes back, or no record if there was none.
+pub fn put_back(datadir: &Path, previous: Option<Vec<u8>>) {
+    let p = path(datadir);
+    let result = match previous {
+        Some(bytes) => crate::fsx::atomic_write(&p, &bytes),
+        None => match std::fs::remove_file(&p) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
+    };
+    if let Err(e) = result {
+        eprintln!("[snapshot-start] could not put {} back: {e}", p.display());
+    }
+}
+
+/// Whether `record` describes the snapshot chainstate the node runs on now.
+/// A record outlives a removed chain; this is how a reader tells.
+pub fn is_current(record: &StartRecord, chainstates: &crate::node_api::ChainStates) -> bool {
+    chainstates
+        .snapshot()
+        .and_then(|c| c.snapshot_blockhash.as_deref())
+        .is_some_and(|h| h.eq_ignore_ascii_case(&record.block_hash))
+}
+
+/// "Mende", "Mende and jpp", "Mende, Aleksander and jpp".
+pub fn join_names(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
+/// "233,800".
+pub fn block_number(h: u64) -> String {
+    let s = h.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The history-check line's second sentence (the UI decision, section 2).
+pub fn started_from(record: &StartRecord) -> String {
+    let at = block_number(record.height);
+    match record.source {
+        StartSource::Confirmed => format!(
+            "Started from block {at}, confirmed by {}.",
+            join_names(&record.operators)
+        ),
+        StartSource::Pinned => format!("Started from block {at}, built into this app."),
+        StartSource::Engine => format!("Started from block {at}, built into the BTX engine."),
+    }
+}
+````
+
+- [ ] **Step 4: Run the tests to see them pass**
+
+Run: `cd crates/btx-core && cargo test --locked --lib -- snapshot_start`
+Expected: `test result: ok. 6 passed; 0 failed` (derived, not run).
+
+- [ ] **Step 5: Format, lint, commit**
+
+````bash
+cd crates/btx-core
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious
+cd ../..
+````
+
+````bash
+git add crates/btx-core/src/snapshot_start.rs crates/btx-core/src/lib.rs
+git commit -m "core: remember where the node started and who confirmed it" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ````
 
 ### Task 3: The pointer contract and the start pair (`attested_snapshot.rs`)
@@ -1818,22 +2876,23 @@ git commit -m "core: read, verify, count and trim a signed snapshot manifest" -m
 **Files:**
 - Modify: `crates/btx-core/src/attested_snapshot.rs` (rewritten: the GitHub single-signed pointer is no longer read; the confirmed pointer, the confirmed download and `prepare_start` are added)
 - Create: `crates/btx-core/tests/fixtures/confirmed_snapshot/latest.json` (the pointer contract, shared with the website plan)
-- Modify: `crates/btx-core/src/snapshot.rs:647-651` (interim call, replaced in Task 5)
+- Modify: `crates/btx-core/src/snapshot.rs:647-651` on `origin/main` (`b330e3d`; the same lines on `aed8755`, #160 did not touch this file) (interim call, replaced in Task 5)
 
 **Interfaces:**
-- Consumes: Task 2 (`confirmed_snapshot as cs`: `parse`, `check`, `Confirmed`, `NodeView`, `FileHasher`, `file_matches`, `Hash32`, `STATEMENT_LEN`, `MAX_MANIFEST_BYTES`, `REGTEST_REPLAY_CONTEXT`, `pinned_keys`), Task 1 (`operators::{Chain, REGTEST_GENESIS, regtest_env, hex}`).
+- Consumes: Task 2 (`confirmed_snapshot as cs`: `parse`, `check`, `Confirmed`, `NodeView`, `FileHasher`, `file_matches`, `Hash32`, `STATEMENT_LEN`, `MAX_MANIFEST_BYTES`, `REGTEST_REPLAY_CONTEXT`, `SNAPSHOT_GRID`, `pinned_keys`), Task 2b (`snapshot_start::block_number`), Task 1 (`operators::{Chain, REGTEST_GENESIS, regtest_env, hex}`).
 - Produces (Tasks 4, 5, 9; plan 2; the website plan):
   - `pub const CONFIRMED_POINTER_URL: &str = "https://easybtx.com/api/snapshots/latest"`
   - `pub struct ConfirmedPointer { version: u32, chain: String, height: u64, block_hash: String, statement_hash: String, manifest_url: String, manifest_size: u64, manifest_sha256: String, file_url: String, file_size: u64, file_sha256: String, file_hash: String, operators: Vec<String>, confirmed_at: String }` (Serialize + Deserialize; the doc comment is the website contract)
   - `pub fn confirmed_url_allowed(&str) -> bool`, `pub fn check_pointer(&ConfirmedPointer, fn(&str) -> bool) -> Result<(), String>`, `pub fn parse_confirmed_pointer(&[u8]) -> Result<ConfirmedPointer, String>`, `pub fn pointer_matches(&ConfirmedPointer, &cs::Confirmed) -> Result<(), String>`
+  - `pub enum Latest { Confirmed(ConfirmedPointer), Disputed(Vec<u64>) }` with `newest_disputed(&self) -> Option<u64>`, `pub fn parse_latest(&[u8]) -> Result<Latest, String>` (what `latest` answered with HTTP 200: a pointer, or the dispute shape and nothing else)
   - `pub enum PairKind { Confirmed, Pinned }`, `pub struct ReadyPair { kind: PairKind, height: u64, file: PathBuf, manifest: PathBuf }`
-  - `pub async fn prepare_confirmed(&reqwest::Client, pointer_url: &str, datadir: &Path, &NodeView, regtest_env: Option<&str>, url_ok: fn(&str) -> bool) -> Result<ReadyPair, String>`
+  - `pub async fn prepare_confirmed(&reqwest::Client, pointer_url: &str, datadir: &Path, &NodeView, regtest_env: Option<&str>, url_ok: fn(&str) -> bool) -> Result<ReadyPair, String>` (a disputed `latest` is an `Err` naming the newest disputed height, before anything is downloaded)
   - `pub async fn prepare_start(datadir: &Path, &NodeView, compiled_anchor: u64) -> Option<ReadyPair>` (confirmed, else pinned, else `None`)
   - `pub fn fallback_start(compiled_anchor: u64) -> u64` (= `max(compiled_anchor, 225_927)`), `pub fn http_client() -> Result<reqwest::Client, String>`
   - kept: `pinned_pair`, `check`, `file_url`, `manifest_url`, `release_tag`, `pair_dir`, `pair_paths`, `on_disk`, `pair_height_on_disk`, `prune_others`, `MAX_SNAPSHOT_BYTES`, `MAX_MANIFEST_BYTES`, `MAX_POINTER_BYTES`
   - removed: `POINTER_TAG`, `POINTER_ASSET`, `pointer_url`, `parse_pointer`, `fetch_pointer`, `candidates`, `prepare` (nothing else in the repository used them except `snapshot.rs`, changed below; `scripts/publish-attested-snapshot.sh` keeps serving 0.6.32 mirrors, and section 13 of the design is the owner's call).
 
-**The pointer contract, for the website plan** (also in the `ConfirmedPointer` doc comment): `GET https://easybtx.com/api/snapshots/latest` answers HTTP 200 with `Content-Type: application/json`, at most 16 KB, the object below; HTTP 404 with `{"version":1,"confirmed":null}` when nothing is confirmed; `Cache-Control: public, max-age=60`. `manifest_url` and `file_url` are HTTPS on `easybtx.com` or `<store>.public.blob.vercel-storage.com`, no port. The manifest served is the merged one (every accepted signature). Every field that repeats the statement must match it.
+**The pointer contract, for the website plan** (also in the `ConfirmedPointer` doc comment): `GET https://easybtx.com/api/snapshots/latest` answers HTTP 200 with `Content-Type: application/json`, at most 16 KB, the object below; while any dispute stands (section 6a), HTTP 200 with exactly `{"disputed": [<height>, ...]}` (ascending, at least one height) and nothing else; HTTP 404 with `{"version":1,"confirmed":null}` when nothing is confirmed; `Cache-Control: public, max-age=60`. `manifest_url` and `file_url` are HTTPS on `easybtx.com` or `<store>.public.blob.vercel-storage.com`, no port. The manifest served is the merged one (every accepted signature). Every field that repeats the statement must match it. The pointer's `operators` is for people reading the endpoint; the app never shows it, only the operators whose signatures it verified.
 
 - [ ] **Step 1: Add the contract fixture**
 
@@ -1980,7 +3039,7 @@ mod tests {
         let p = parse_confirmed_pointer(POINTER.as_bytes()).unwrap();
         assert_eq!(p.version, 1);
         assert_eq!(p.chain, "main");
-        assert_eq!(p.height % 200, 0);
+        assert_eq!(p.height % cs::SNAPSHOT_GRID as u64, 0);
         assert!(check_pointer(&p, confirmed_url_allowed).is_ok(), "{p:?}");
     }
 
@@ -2009,6 +3068,35 @@ mod tests {
         assert!(parse_confirmed_pointer(b"<html>Not Found</html>").is_err());
         assert!(parse_confirmed_pointer(br#"{"version":1,"confirmed":null}"#).is_err());
         assert!(parse_confirmed_pointer(&vec![b' '; MAX_POINTER_BYTES + 1]).is_err());
+    }
+
+    /// Section 6a: while any dispute stands, `latest` answers only the
+    /// disputed heights. Its own shape, read strictly: a body that mixes it
+    /// with a pointer is neither.
+    #[test]
+    fn a_dispute_answer_is_its_own_shape() {
+        let d = parse_latest(br#"{"disputed": [233700, 233800]}"#).unwrap();
+        assert_eq!(d, Latest::Disputed(vec![233_700, 233_800]));
+        assert_eq!(d.newest_disputed(), Some(233_800));
+        assert!(matches!(
+            parse_latest(POINTER.as_bytes()),
+            Ok(Latest::Confirmed(_))
+        ));
+        assert_eq!(
+            parse_latest(POINTER.as_bytes()).unwrap().newest_disputed(),
+            None
+        );
+        for bad in [
+            &br#"{"disputed": []}"#[..],
+            br#"{"disputed": "233800"}"#,
+            br#"{"disputed": [233800], "version": 1}"#,
+            br#"{"disputed": [-5]}"#,
+        ] {
+            assert!(parse_latest(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+        }
+        let mut mixed: serde_json::Value = serde_json::from_str(POINTER).unwrap();
+        mixed["disputed"] = serde_json::json!([232000]);
+        assert!(parse_latest(mixed.to_string().as_bytes()).is_err());
     }
 
     #[test]
@@ -2224,6 +3312,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_disputed_latest_downloads_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/latest")
+            .with_body(r#"{"disputed":[100]}"#)
+            .create_async()
+            .await;
+        let manifest = server.mock("GET", "/m").expect(0).create_async().await;
+        let err = prepare_confirmed(
+            &reqwest::Client::new(),
+            &format!("{}/latest", server.url()),
+            tmp.path(),
+            &view(),
+            None,
+            any_url,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("disagree about block 100"), "{err}");
+        manifest.assert_async().await;
+        assert!(!pair_dir(tmp.path()).exists(), "nothing written");
+    }
+
+    #[tokio::test]
     async fn no_confirmed_snapshot_is_a_plain_404() {
         let tmp = tempfile::tempdir().unwrap();
         let mut server = mockito::Server::new_async().await;
@@ -2406,6 +3519,8 @@ pub fn check(pair: &AttestedPair, compiled_anchor: u64) -> Result<(), String> {
 /// plan implements it; this is the contract.
 ///
 /// * HTTP 200, `Content-Type: application/json`, at most 16 KB, this object.
+/// * HTTP 200 with exactly `{"disputed": [<height>, ...]}` while any dispute
+///   stands (section 6a); [`Latest::Disputed`]. The app then falls back.
 /// * HTTP 404 when no snapshot is confirmed, body `{"version":1,"confirmed":null}`.
 ///   The app treats every status other than 200 as "none" and falls back.
 /// * `Cache-Control: public, max-age=60`.
@@ -2432,7 +3547,8 @@ pub fn check(pair: &AttestedPair, compiled_anchor: u64) -> Result<(), String> {
 /// The manifest served is the merged one, every signature the website
 /// accepted; the app checks it and keeps only what its node pins. Nothing
 /// here is trusted: the statement's signatures decide, and every field that
-/// repeats the statement must match it or the pair is refused.
+/// repeats the statement must match it or the pair is refused. `operators`
+/// is never shown: the app names only the operators it verified.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfirmedPointer {
     pub version: u32,
@@ -2512,6 +3628,46 @@ pub fn parse_confirmed_pointer(body: &[u8]) -> Result<ConfirmedPointer, String> 
         return Err(format!("pointer is {} bytes, not a pointer", body.len()));
     }
     serde_json::from_slice(body).map_err(|e| format!("unreadable pointer: {e}"))
+}
+
+/// What `latest` answered with HTTP 200.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Latest {
+    Confirmed(ConfirmedPointer),
+    /// The operators disagree about these grid heights (section 6a). Nothing
+    /// is confirmed at any height while this stands.
+    Disputed(Vec<u64>),
+}
+
+impl Latest {
+    /// The height the one sentence names (section 6a).
+    pub fn newest_disputed(&self) -> Option<u64> {
+        match self {
+            Latest::Disputed(heights) => heights.iter().copied().max(),
+            Latest::Confirmed(_) => None,
+        }
+    }
+}
+
+/// Read `latest`'s answer: the dispute shape (an object whose only key is
+/// `disputed`, a non-empty array of heights), else a pointer. A body that
+/// carries `disputed` beside anything else is neither.
+pub fn parse_latest(body: &[u8]) -> Result<Latest, String> {
+    if body.len() > MAX_POINTER_BYTES {
+        return Err(format!("{} bytes is not an answer from latest", body.len()));
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("unreadable answer: {e}"))?;
+    if let Some(obj) = v.as_object().filter(|o| o.contains_key("disputed")) {
+        let heights: Option<Vec<u64>> = obj["disputed"]
+            .as_array()
+            .and_then(|a| a.iter().map(|h| h.as_u64()).collect());
+        return match heights {
+            Some(h) if obj.len() == 1 && !h.is_empty() => Ok(Latest::Disputed(h)),
+            _ => Err("a dispute answer that is not only a list of heights".into()),
+        };
+    }
+    parse_confirmed_pointer(body).map(Latest::Confirmed)
 }
 
 /// Every field the pointer repeats from the statement must be the
@@ -2725,10 +3881,12 @@ pub struct ReadyPair {
     pub manifest: PathBuf,
 }
 
-/// Read the pointer at `pointer_url`, then download and check the pair it
+/// Read `latest` at `pointer_url`, then download and check the pair it
 /// names (section 7, steps 1 and 2): the manifest first, checked in full by
 /// [`cs::check`], then the file, whose size and double SHA-256 must be the
-/// statement's. `url_ok` is [`confirmed_url_allowed`] everywhere but tests.
+/// statement's. A disputed `latest` stops here, before any download, and the
+/// caller takes the fallbacks (section 9). `url_ok` is
+/// [`confirmed_url_allowed`] everywhere but tests.
 pub async fn prepare_confirmed(
     client: &reqwest::Client,
     pointer_url: &str,
@@ -2752,7 +3910,15 @@ pub async fn prepare_confirmed(
         .bytes()
         .await
         .map_err(|e| format!("pointer read: {e}"))?;
-    let p = parse_confirmed_pointer(&body)?;
+    let p = match parse_latest(&body)? {
+        Latest::Confirmed(p) => p,
+        disputed @ Latest::Disputed(_) => {
+            return Err(format!(
+                "the snapshot operators disagree about block {}",
+                crate::snapshot_start::block_number(disputed.newest_disputed().unwrap_or(0))
+            ))
+        }
+    };
     check_pointer(&p, url_ok)?;
 
     let (file, manifest) = pair_paths(datadir, p.height);
@@ -2840,6 +4006,7 @@ pub async fn prepare_start(
             eprintln!("[attested] confirmed snapshot {} ready", pair.height);
             return Some(pair);
         }
+        // A disputed `latest`, a 404 and every refusal alike (section 9).
         Err(e) => eprintln!("[attested] {e}; trying the pinned pair"),
     }
     let pinned = pinned_pair();
@@ -2901,7 +4068,7 @@ The rest of that block is unchanged (it reads `pair.height`, `file` and `manifes
 - [ ] **Step 5: Run the tests to see them pass**
 
 Run: `cd crates/btx-core && cargo test --locked --lib -- attested_snapshot snapshot::`
-Expected: every test passes; `attested_snapshot` shows `13 passed; 0 failed; 1 ignored` within the total (the ignored one downloads the pinned pair from GitHub).
+Expected: every test passes; `attested_snapshot` shows `15 passed; 0 failed; 1 ignored` within the total (the first version's 13, plus `a_dispute_answer_is_its_own_shape` and `a_disputed_latest_downloads_nothing`; derived, not run; the ignored one downloads the pinned pair from GitHub).
 
 Optional, before a release: `cargo test --locked --lib -- --ignored the_pinned_pair_is_still_published` (downloads 9 MB).
 
@@ -2924,11 +4091,11 @@ git commit -m "core: the confirmed pointer, the confirmed download, and the pinn
 **Files:**
 - Create: `crates/btx-core/src/confirmed_load.rs`
 - Modify: `crates/btx-core/src/snapshot.rs` (`LoadOutcome` public and `Clone`; `run_cli_load`)
-- Modify: `crates/btx-core/src/node_api.rs:417-429` (`replay_authority_context`), `crates/btx-core/src/role.rs:655-660` (test literal)
+- Modify: `crates/btx-core/src/node_api.rs:417-429` (`replay_authority_context`; the same lines on `aed8755` and `b330e3d`), `crates/btx-core/src/role.rs:746-752` on `origin/main` `b330e3d` (test literal; `role.rs:654-660` on `aed8755`, before #160 grew the file)
 - Modify: `crates/btx-core/src/lib.rs`
 
 **Interfaces:**
-- Consumes: Task 2 (`cs::{parse, check, node_agrees, trim_to_pinned, FileHasher, file_matches, pinned_keys, NodeView, REGTEST_REPLAY_CONTEXT}`), Task 3 (`attested_snapshot::{ReadyPair, PairKind, pinned_pair, pair_paths, pair_dir}`), `known_invalid::{refuse, refuse_held_in_order, HeldBranch, KnownInvalidBlock, Refusal, KNOWN_INVALID_BLOCKS, HELD_BRANCHES, refusal_enabled}` (exist).
+- Consumes: Task 2 (`cs::{parse, check, node_agrees, trim_to_pinned, FileHasher, file_matches, pinned_keys, NodeView, REGTEST_REPLAY_CONTEXT, dissent_statement, Signed, Manifest}`), Task 2b (`snapshot_start::{replace, put_back, read, write, StartRecord, StartSource}`), Task 3 (`attested_snapshot::{ReadyPair, PairKind, pinned_pair, pair_paths, pair_dir}`), `known_invalid::{refuse, refuse_held_in_order, HeldBranch, KnownInvalidBlock, Refusal, KNOWN_INVALID_BLOCKS, HELD_BRANCHES, refusal_enabled}` (exist).
 - Produces (Tasks 5, 9, 10; plan 2):
   - `pub trait LoadRunner { async fn load_attested(&self, file: &Path, manifest: &Path) -> LoadOutcome; }` and `pub struct CliRunner { btx_cli: PathBuf, args: Vec<String> }` with `CliRunner::for_datadir(&Path, &Path)`
   - `pub struct Holds<'a> { invalid: &'a [KnownInvalidBlock], held: &'a [HeldBranch] }`, `Holds::compiled()`, `Holds::none()`
@@ -2936,7 +4103,7 @@ git commit -m "core: the confirmed pointer, the confirmed download, and the pinn
   - `pub struct Loaded { height: u64, signatures: usize, superseded: bool }`
   - `pub async fn node_view(&dyn Rpc, pinned: &[&str], start_height: u64) -> NodeView`
   - `pub fn trimmed_manifest_path(&ReadyPair) -> PathBuf`
-  - `pub async fn load(&dyn Rpc, &dyn LoadRunner, &ReadyPair, &NodeView, &Holds<'_>, regtest_env: Option<&str>) -> Result<Loaded, LoadError>`
+  - `pub async fn load(&dyn Rpc, &dyn LoadRunner, &ReadyPair, &NodeView, &Holds<'_>, regtest_env: Option<&str>, datadir: &Path) -> Result<Loaded, LoadError>` (writes `<datadir>/snapshot-start.json` at step 4, before trimming, and puts the previous record back when the load does not happen; a dissent is `NotConfirmed`)
   - `pub fn set_aside_snapshot_chainstate(network_dir: &Path, now_unix: u64) -> std::io::Result<Option<PathBuf>>`
   - `snapshot::LoadOutcome` (now `pub`, `Clone`, `Eq`), `pub async fn snapshot::run_cli_load(btx_cli: &Path, args: &[String], method: &str, files: &[&Path]) -> LoadOutcome`
   - `node_api::MatmulTrustedStatus::replay_authority_context: Option<String>`
@@ -2961,6 +4128,8 @@ mod tests {
     const R_DAT: &[u8] = include_bytes!("../tests/fixtures/confirmed_snapshot/regtest-100.dat");
     const P: &str = "0343faebbc3a28f2e452132477192cb5455f0c0f2cfdab01c9217c43c2cbc3e464";
     const C: &str = "02c05d68daeabe9e5f0556fcdca6c5a4011eca1d46ee34826d444d1d95b15e6c0f";
+    /// The regtest statements' base block, display order.
+    const BASE_100: &str = "bd23c642be34c3a1f1a637d6352b8cfb390c801f2b873605b64986a1bc962c46";
     const ROOT: &str = "8240c62e62b47fc675610908c03045c244de1dfc06246209830ba9d98468952c";
     const HELD: &[HeldBranch] = &[HeldBranch {
         height: 50,
@@ -3091,6 +4260,7 @@ mod tests {
                 held: HELD,
             },
             Some(&env()),
+            tmp.path(),
         )
         .await
         .unwrap();
@@ -3113,6 +4283,18 @@ mod tests {
             invalidate < calls.len() - 1,
             "refused before the load: {calls:?}"
         );
+        // Section 7, step 4: the names survive the trim. Only verified
+        // signers on the list count (D signed too and is on no list), in the
+        // list's order.
+        assert_eq!(
+            snapshot_start::read(tmp.path()),
+            Some(StartRecord {
+                height: 100,
+                block_hash: BASE_100.into(),
+                source: StartSource::Confirmed,
+                operators: vec!["producer".into(), "confirmer".into()],
+            })
+        );
     }
 
     #[tokio::test]
@@ -3132,6 +4314,7 @@ mod tests {
                 held: HELD,
             },
             Some(&env()),
+            tmp.path(),
         )
         .await
         .unwrap_err();
@@ -3140,6 +4323,7 @@ mod tests {
             runner.seen.lock().unwrap().is_none(),
             "the engine was never asked"
         );
+        assert_eq!(snapshot_start::read(tmp.path()), None, "nothing recorded");
     }
 
     /// A node that never heard of the root cannot follow it: the load goes on.
@@ -3159,7 +4343,8 @@ mod tests {
                 invalid: &[],
                 held: HELD
             },
-            Some(&env())
+            Some(&env()),
+            tmp.path(),
         )
         .await
         .is_ok());
@@ -3182,6 +4367,7 @@ mod tests {
                 held: HELD,
             },
             Some(&env()),
+            tmp.path(),
         )
         .await
         .unwrap_err();
@@ -3191,6 +4377,11 @@ mod tests {
                 height: 50,
                 root: ROOT.into()
             }
+        );
+        assert_eq!(
+            snapshot_start::read(tmp.path()),
+            None,
+            "a load the app discards leaves no record"
         );
     }
 
@@ -3208,10 +4399,42 @@ mod tests {
             &view(&node).await,
             &Holds::none(),
             Some(&env()),
+            tmp.path(),
         )
         .await
         .unwrap_err();
         assert_eq!(err, LoadError::Engine(why.into()));
+    }
+
+    /// The record is written before the engine is asked, and put back as it
+    /// was when the engine refuses.
+    #[tokio::test]
+    async fn the_start_record_is_put_back_when_the_engine_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pair = pair_on_disk(tmp.path(), R_PC, R_DAT);
+        let earlier = StartRecord {
+            height: 225_927,
+            block_hash: "06780445dae193010e099e6425c5430f121416b067b8d68a8a5c3b52e8a4b932".into(),
+            source: StartSource::Pinned,
+            operators: vec![],
+        };
+        snapshot_start::write(tmp.path(), &earlier).unwrap();
+        let node = Node::regtest();
+        let runner = Runner::new(LoadOutcome::Failed("no".into()));
+        let err = load(
+            &node,
+            &runner,
+            &pair,
+            &view(&node).await,
+            &Holds::none(),
+            Some(&env()),
+            tmp.path(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, LoadError::Engine("no".into()));
+        assert!(runner.seen.lock().unwrap().is_some(), "the engine was asked");
+        assert_eq!(snapshot_start::read(tmp.path()), Some(earlier));
     }
 
     #[tokio::test]
@@ -3222,18 +4445,34 @@ mod tests {
         // One operator.
         let tmp = tempfile::tempdir().unwrap();
         let pair = pair_on_disk(tmp.path(), R_P, R_DAT);
-        let err = load(&node, &runner, &pair, &v, &Holds::none(), Some(&env()))
-            .await
-            .unwrap_err();
+        let err = load(
+            &node,
+            &runner,
+            &pair,
+            &v,
+            &Holds::none(),
+            Some(&env()),
+            tmp.path(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, LoadError::NotConfirmed(_)), "{err}");
         // A file changed on disk since it was downloaded.
         let tmp = tempfile::tempdir().unwrap();
         let mut changed = R_DAT.to_vec();
         changed[7] ^= 1;
         let pair = pair_on_disk(tmp.path(), R_PC, &changed);
-        let err = load(&node, &runner, &pair, &v, &Holds::none(), Some(&env()))
-            .await
-            .unwrap_err();
+        let err = load(
+            &node,
+            &runner,
+            &pair,
+            &v,
+            &Holds::none(),
+            Some(&env()),
+            tmp.path(),
+        )
+        .await
+        .unwrap_err();
         assert!(
             err.to_string().contains("not the one the statement signs"),
             "{err}"
@@ -3244,11 +4483,74 @@ mod tests {
         let v = view(&mainnet).await;
         let tmp = tempfile::tempdir().unwrap();
         let pair = pair_on_disk(tmp.path(), R_PC, R_DAT);
-        let err = load(&mainnet, &runner, &pair, &v, &Holds::none(), Some(&env()))
-            .await
-            .unwrap_err();
+        let err = load(
+            &mainnet,
+            &runner,
+            &pair,
+            &v,
+            &Holds::none(),
+            Some(&env()),
+            tmp.path(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, LoadError::NotConfirmed(_)), "{err}");
         assert!(runner.seen.lock().unwrap().is_none());
+        assert_eq!(snapshot_start::read(tmp.path()), None);
+    }
+
+    /// A dissent never reaches the engine, however many operators signed it
+    /// and whichever keys the node pins (section 6a).
+    #[tokio::test]
+    async fn a_dissent_offered_for_loading_is_refused() {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        use k256::ecdsa::{Signature, SigningKey};
+        let (a, b) = (
+            SigningKey::from_slice(&[7; 32]).unwrap(),
+            SigningKey::from_slice(&[8; 32]).unwrap(),
+        );
+        let pubkey = |sk: &SigningKey| -> [u8; 33] {
+            sk.verifying_key()
+                .to_encoded_point(true)
+                .as_bytes()
+                .try_into()
+                .unwrap()
+        };
+        let d = cs::parse(R_PC).unwrap().statement.chain_facts().dissent();
+        let sign = |sk: &SigningKey| {
+            let s: Signature = sk.sign_prehash(&d.hash().0).unwrap();
+            cs::Signed {
+                key: pubkey(sk),
+                der: s.to_der().as_bytes().to_vec(),
+            }
+        };
+        let m = cs::Manifest {
+            signatures: vec![sign(&a), sign(&b)],
+            statement: d.clone(),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let pair = pair_on_disk(tmp.path(), &m.to_bytes(), R_DAT);
+        let env = format!(
+            "a={};b={}",
+            crate::operators::hex(&pubkey(&a)),
+            crate::operators::hex(&pubkey(&b))
+        );
+        let node = Node::regtest();
+        let mut v = view(&node).await;
+        v.pinned = vec![pubkey(&a)];
+        let runner = Runner::new(LoadOutcome::Loaded);
+        let err = load(&node, &runner, &pair, &v, &Holds::none(), Some(&env), tmp.path())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, LoadError::NotConfirmed(e) if e.contains("dissent")),
+            "{err}"
+        );
+        assert!(
+            runner.seen.lock().unwrap().is_none(),
+            "the engine was never asked"
+        );
+        assert_eq!(snapshot_start::read(tmp.path()), None, "nothing recorded");
     }
 
     #[tokio::test]
@@ -3265,6 +4567,7 @@ mod tests {
             &view(&node).await,
             &Holds::none(),
             None,
+            tmp.path(),
         )
         .await
         .unwrap_err();
@@ -3390,7 +4693,7 @@ In `crates/btx-core/src/node_api.rs`, in `pub struct MatmulTrustedStatus`, after
 }
 ````
 
-In `crates/btx-core/src/role.rs`, the test helper `fn status(mode: &str, key: bool)` builds the struct literally; add the field:
+In `crates/btx-core/src/role.rs`, the test helper `fn status(mode: &str, key: bool)` builds the struct literally (line 746 on `origin/main`, 654 on `aed8755`; #160 left the helper itself alone); add the field:
 
 ````rust
             trusted_mirror: mode == "trusted",
@@ -3420,11 +4723,15 @@ Insert above `#[cfg(test)]` in `crates/btx-core/src/confirmed_load.rs`:
 //!    refuses a snapshot whose base sits above any of them ("part of an
 //!    invalid chain", proven on regtest by `tests/confirmed_snapshot_regtest.rs`).
 //!    If one cannot be refused, nothing is loaded.
-//! 3. A trimmed manifest with every signature from a key this node pins, in
+//! 3. The start record (`crate::snapshot_start`): the height, the base and
+//!    the operators whose signatures step 1 verified, written before the
+//!    trim drops their signatures. If the load then does not happen, the
+//!    record that was there before goes back.
+//! 4. A trimmed manifest with every signature from a key this node pins, in
 //!    order, and no other: the engine refuses a manifest carrying any key it
 //!    does not pin.
-//! 4. `loadtxoutsetattested`, which the engine allows only in mirror mode.
-//! 5. After the load, the block at each refused height must not be the
+//! 5. `loadtxoutsetattested`, which the engine allows only in mirror mode.
+//! 6. After the load, the block at each refused height must not be the
 //!    refused block. If it ever were, the caller stops the node and discards
 //!    the snapshot ([`set_aside_snapshot_chainstate`]).
 
@@ -3433,6 +4740,7 @@ use crate::confirmed_snapshot::{self as cs, NodeView};
 use crate::known_invalid::{self, HeldBranch, KnownInvalidBlock, Refusal};
 use crate::rpc::Rpc;
 use crate::snapshot::LoadOutcome;
+use crate::snapshot_start::{self, StartRecord, StartSource};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -3582,11 +4890,13 @@ pub fn trimmed_manifest_path(pair: &ReadyPair) -> PathBuf {
         .with_file_name(format!("loaded-{}.manifest", pair.height))
 }
 
+/// Section 7, step 1 again, against the node about to load: the manifest
+/// and what the start record will say about it.
 fn recheck(
     pair: &ReadyPair,
     view: &NodeView,
     regtest_env: Option<&str>,
-) -> Result<cs::Manifest, LoadError> {
+) -> Result<(cs::Manifest, StartRecord), LoadError> {
     let bytes =
         std::fs::read(&pair.manifest).map_err(|e| LoadError::Io(format!("manifest: {e}")))?;
     let m = cs::parse(&bytes).map_err(|e| LoadError::NotConfirmed(e.to_string()))?;
@@ -3595,9 +4905,11 @@ fn recheck(
             "the node did not say which chain it is on".into(),
         ));
     }
-    match pair.kind {
+    let block_hash = m.statement.block_hash().display_hex();
+    let start = match pair.kind {
         PairKind::Confirmed => {
-            cs::check(&m, view, regtest_env).map_err(|e| LoadError::NotConfirmed(e.to_string()))?;
+            let confirmed = cs::check(&m, view, regtest_env)
+                .map_err(|e| LoadError::NotConfirmed(e.to_string()))?;
             let file =
                 std::fs::read(&pair.file).map_err(|e| LoadError::Io(format!("snapshot: {e}")))?;
             let mut h = cs::FileHasher::default();
@@ -3607,6 +4919,13 @@ fn recheck(
                 return Err(LoadError::NotConfirmed(
                     "the file is not the one the statement signs".into(),
                 ));
+            }
+            StartRecord {
+                height: confirmed.height,
+                block_hash,
+                source: StartSource::Confirmed,
+                // Verified here, grouped by operator, in the list's order.
+                operators: confirmed.operators,
             }
         }
         PairKind::Pinned => {
@@ -3624,12 +4943,19 @@ fn recheck(
             }
             cs::node_agrees(&m.statement, view)
                 .map_err(|e| LoadError::NotConfirmed(e.to_string()))?;
+            StartRecord {
+                height: pair.height,
+                block_hash,
+                source: StartSource::Pinned,
+                operators: Vec::new(),
+            }
         }
-    }
-    Ok(m)
+    };
+    Ok((m, start))
 }
 
-/// Section 7, steps 3 to 6. See the module doc.
+/// Section 7, steps 3 to 6. See the module doc. `datadir` is where the start
+/// record goes: the datadir on mainnet, the network folder on regtest.
 pub async fn load(
     rpc: &dyn Rpc,
     runner: &dyn LoadRunner,
@@ -3637,8 +4963,9 @@ pub async fn load(
     view: &NodeView,
     holds: &Holds<'_>,
     regtest_env: Option<&str>,
+    datadir: &Path,
 ) -> Result<Loaded, LoadError> {
-    let m = recheck(pair, view, regtest_env)?;
+    let (m, start) = recheck(pair, view, regtest_env)?;
 
     for block in holds.invalid {
         match known_invalid::refuse(rpc, block).await {
@@ -3660,7 +4987,31 @@ pub async fn load(
         }
     }
 
-    let trimmed = cs::trim_to_pinned(&m, &view.pinned);
+    // Step 4: who confirmed it, before the trimmed manifest drops their
+    // signatures. Put back as it was if the load does not happen.
+    let previous = snapshot_start::replace(datadir, &start).map_err(|e| {
+        LoadError::Io(format!(
+            "write {}: {e}",
+            snapshot_start::path(datadir).display()
+        ))
+    })?;
+    let result = trim_and_load(rpc, runner, pair, view, holds, &m).await;
+    if !matches!(result, Ok(Loaded { superseded: false, .. })) {
+        snapshot_start::put_back(datadir, previous);
+    }
+    result
+}
+
+/// Steps 4 to 6 after the record: trim, load, and look for a refused block.
+async fn trim_and_load(
+    rpc: &dyn Rpc,
+    runner: &dyn LoadRunner,
+    pair: &ReadyPair,
+    view: &NodeView,
+    holds: &Holds<'_>,
+    m: &cs::Manifest,
+) -> Result<Loaded, LoadError> {
+    let trimmed = cs::trim_to_pinned(m, &view.pinned);
     if trimmed.signatures.is_empty() {
         return Err(LoadError::NotConfirmed(
             "no signature is from a key this node pins".into(),
@@ -3719,7 +5070,7 @@ pub fn set_aside_snapshot_chainstate(
 - [ ] **Step 6: Run the tests to see them pass**
 
 Run: `cd crates/btx-core && cargo test --locked --lib -- confirmed_load role:: snapshot::`
-Expected: all pass; `confirmed_load` shows `8 passed`. `a_confirmed_pair_is_trimmed_to_the_pins_and_loaded` proves the engine is handed the producer's own 335-byte file after trimming PCD to P.
+Expected: all pass; `confirmed_load` shows `10 passed` (derived, not run: the first version's 8, plus `the_start_record_is_put_back_when_the_engine_refuses` and `a_dissent_offered_for_loading_is_refused`). `a_confirmed_pair_is_trimmed_to_the_pins_and_loaded` proves the engine is handed the producer's own 335-byte file after trimming PCD to P, and that the start record names the two verified operators and not D.
 
 - [ ] **Step 7: Format, lint, commit**
 
@@ -3732,22 +5083,25 @@ cd ../..
 ````
 ````bash
 git add crates/btx-core/src/confirmed_load.rs crates/btx-core/src/snapshot.rs crates/btx-core/src/node_api.rs crates/btx-core/src/role.rs crates/btx-core/src/lib.rs
-git commit -m "core: one loading path for a signed snapshot, refused blocks first, pinned signatures only" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "core: one loading path for a signed snapshot, refused blocks first, the start record, pinned signatures only" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ````
 
 ### Task 5: The start-path loader chooses and reports (`snapshot.rs`)
 
 **Files:**
-- Modify: `crates/btx-core/src/snapshot.rs` (`ensure_snapshot_loaded`, `ensure_snapshot_loaded_with`, new `SignedLoad`, `SnapshotOutcome`, private `Signed`, `load_signed`; tests)
-- Modify: `apps/node/src-tauri/src/commands.rs:1247-1256` (interim call site, replaced in Task 9)
+- Modify: `crates/btx-core/src/snapshot.rs` (`ensure_snapshot_loaded`, `ensure_snapshot_loaded_with`, new `SignedLoad`, `SnapshotOutcome`, private `Signed`, `load_signed`, `record_engine_start`; tests)
+- Modify: `apps/node/src-tauri/src/commands.rs:1248-1257` on `origin/main` `b330e3d` (`:1247-1256` on `aed8755`; #160 added one line above it, in `start_node_inner`) (interim call site, replaced in Task 9)
 
 **Interfaces:**
-- Consumes: Task 3 (`attested_snapshot::{prepare_start, fallback_start}`), Task 4 (`confirmed_load::{node_view, load, CliRunner, Holds, LoadError}`), `operators::regtest_env`, `node::BTX_TRUSTED_ATTESTATION_PUBKEYS`.
+- Consumes: Task 3 (`attested_snapshot::{prepare_start, fallback_start}`), Task 4 (`confirmed_load::{node_view, load, CliRunner, Holds, LoadError}`), Task 2b (`snapshot_start::{write, StartRecord, StartSource}`), `operators::regtest_env`, `node::BTX_TRUSTED_ATTESTATION_PUBKEYS`.
 - Produces (Task 9, plan 2):
   - `pub enum SignedLoad { None, Mirror, SignedOnly }` (`Debug, Clone, Copy, PartialEq, Eq`)
   - `pub enum SnapshotOutcome { AlreadyLoaded, SignedLoaded { height: u64 }, CompiledLoaded, NotLoaded(String), HeldRootOnChain(String) }`
   - `pub fn ensure_snapshot_loaded_with(rpc: RpcClient, btx_cli: PathBuf, datadir: PathBuf, anchor_height: u64, flags: Arc<dyn SnapshotFlags>, signed: SignedLoad) -> tokio::task::JoinHandle<SnapshotOutcome>` (was `prefer_attested: bool` and `()`)
   - `ensure_snapshot_loaded(...)` keeps its signature (drops the handle).
+  - a compiled load that succeeds writes `<datadir>/snapshot-start.json` with source `engine`, from the base the engine reports (`record_engine_start`, private)
+
+Why the engine's record comes after its load, not before like the signed ones: there is no manifest to trim, so nothing is lost by waiting, and the app does not compile the engine's base block hash. Before the load, `getblockhash` cannot name it either: the active chain is still below the base. The engine names it in `getchainstates` (`snapshot_blockhash`) the moment the load succeeds.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3766,6 +5120,42 @@ In `crates/btx-core/src/snapshot.rs`, inside `mod tests`, immediately before `#[
     }
 
     const CHAINSTATES_WITH_SNAPSHOT: &str = r#"{"result":{"headers":100,"chainstates":[{"blocks":99,"validated":true},{"blocks":100,"snapshot_blockhash":"ab"}]},"error":null,"id":"easybtx"}"#;
+
+    /// Just after a compiled load at 219,000: the engine names the base.
+    const CHAINSTATES_AT_219000: &str = r#"{"result":{"headers":219500,"chainstates":[{"blocks":0,"validated":true},{"blocks":219000,"snapshot_blockhash":"dc51220bc7e5db96e29df9d817ae6179245d33eb8adcaaff765cfec83fdb87c3","validated":false}]},"error":null,"id":"easybtx"}"#;
+
+    /// Section 7, "From a fallback": a compiled load is recorded as the
+    /// engine's, with the base the engine reports and no names.
+    #[tokio::test]
+    async fn a_compiled_load_is_recorded_as_the_engines() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", mockito::Matcher::Any)
+            .with_body(CHAINSTATES_AT_219000)
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        record_engine_start(
+            &RpcClient::new(server.url(), "u", "p"),
+            dir.path(),
+            219_000,
+        )
+        .await;
+        assert_eq!(
+            crate::snapshot_start::read(dir.path()),
+            Some(crate::snapshot_start::StartRecord {
+                height: 219_000,
+                block_hash: "dc51220bc7e5db96e29df9d817ae6179245d33eb8adcaaff765cfec83fdb87c3"
+                    .into(),
+                source: crate::snapshot_start::StartSource::Engine,
+                operators: vec![],
+            })
+        );
+        assert_eq!(
+            crate::snapshot_start::started_from(&crate::snapshot_start::read(dir.path()).unwrap()),
+            "Started from block 219,000, built into the BTX engine."
+        );
+    }
 
     /// A signed-only load (a validating node's mirror launch, Fast-forward)
     /// does not take the flag's word that a snapshot is loaded: Fast-forward
@@ -3967,6 +5357,7 @@ async fn load_signed(
         &view,
         &Holds::compiled(),
         env.as_deref(),
+        datadir,
     )
     .await
     {
@@ -3979,6 +5370,33 @@ async fn load_signed(
         }
         Err(e @ LoadError::HeldRootOnChain { .. }) => Signed::HeldRootOnChain(e.to_string()),
         Err(e) => Signed::NotLoaded(e.to_string()),
+    }
+}
+
+/// The start record for the engine's compiled snapshot (section 7, "From a
+/// fallback"), written once the engine reports the snapshot chainstate: the
+/// app does not compile the engine's base hash, and there is no manifest to
+/// trim. Best effort: a node without the record just shows no second
+/// sentence on its history-check line.
+async fn record_engine_start(rpc: &RpcClient, datadir: &Path, anchor_height: u64) {
+    let base = match get_chainstates(rpc).await {
+        Ok(cs) => cs.snapshot().and_then(|c| c.snapshot_blockhash.clone()),
+        Err(e) => {
+            eprintln!("[snapshot] getchainstates after the load failed ({e}); no start record");
+            None
+        }
+    };
+    let Some(block_hash) = base else {
+        return;
+    };
+    let record = crate::snapshot_start::StartRecord {
+        height: anchor_height,
+        block_hash,
+        source: crate::snapshot_start::StartSource::Engine,
+        operators: Vec::new(),
+    };
+    if let Err(e) = crate::snapshot_start::write(datadir, &record) {
+        eprintln!("[snapshot] could not write the start record: {e}");
     }
 }
 
@@ -4085,6 +5503,8 @@ pub fn ensure_snapshot_loaded_with(
                 // on this flag AND the shared cross-process marker.
                 flags.mark_loaded();
                 mark_snapshot_marker(&datadir);
+                // Where this node started: the engine's compiled snapshot.
+                record_engine_start(&rpc, &datadir, anchor_height).await;
                 SnapshotOutcome::CompiledLoaded
             }
             LoadOutcome::Superseded => {
@@ -4105,7 +5525,7 @@ pub fn ensure_snapshot_loaded_with(
 }
 ````
 
-In `apps/node/src-tauri/src/commands.rs` (inside `start_node_inner`, the `else` branch after the header-bootstrap check) the call still passes a bool. Replace:
+In `apps/node/src-tauri/src/commands.rs` (inside `start_node_inner`, the `else` branch after the header-bootstrap check, lines 1248-1257 on `origin/main`) the call still passes a bool. Replace:
 
 ````rust
         btx_core::snapshot::ensure_snapshot_loaded_with(
@@ -4143,7 +5563,7 @@ with (interim, Task 9 replaces it):
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cd crates/btx-core && cargo test --locked --lib -- snapshot::` then `cd ../../apps/node/src-tauri && cargo check --locked --all-targets`
-Expected: `snapshot::` all pass, including the three new ones; the app compiles.
+Expected: `snapshot::` all pass, including the four new ones (derived, not run); the app compiles.
 
 - [ ] **Step 5: Format, lint, commit**
 
@@ -4153,7 +5573,7 @@ for c in crates/btx-core apps/node/src-tauri; do (cd $c && cargo fmt --all --che
 ````
 ````bash
 git add crates/btx-core/src/snapshot.rs apps/node/src-tauri/src/commands.rs
-git commit -m "core: the start-path loader tries a confirmed pair, then the pinned one, and says what it did" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "core: the start-path loader tries a confirmed pair, then the pinned one, says what it did and records where it started" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ````
 
 ### Task 6: The pin rule for a validating node on a signed snapshot (`node.rs`, section 8)
@@ -4163,7 +5583,7 @@ git commit -m "core: the start-path loader tries a confirmed pair, then the pinn
 
 **Interfaces:**
 - Consumes: `signing_key_self_pin`, `BTX_TRUSTED_ATTESTATION_PUBKEYS` (exist).
-- Produces (Tasks 7, 8, 10; plan 2; the diary plan, which records nothing while `attested_snapshot_record` exists):
+- Produces (Tasks 7, 8, 10; plan 2). The diary, producer and confirmer plans do not use `attested_snapshot_record` any more; they use Task 2a's `chainstates_validated`, which also closes on upstream's plain assumeutxo snapshot:
   - `pub const BTX_TRUSTED_ATTESTATION_THRESHOLD: u32 = 1`
   - `pub fn conf_pins(conf: &Path) -> Vec<String>`
   - `pub fn attested_snapshot_record(network_dir: &Path) -> PathBuf` (`<network_dir>/chainstate_snapshot/attested_assumeutxo`)
@@ -5180,10 +6600,10 @@ git commit -m "node: a validating node loads a signed snapshot in one mirror lau
 - Create: `crates/btx-core/tests/confirmed_snapshot_regtest.rs`
 
 **Interfaces:**
-- Consumes: everything above through the public API: `confirmed_snapshot::{parse, REGTEST_REPLAY_CONTEXT, MAINNET_REPLAY_CONTEXT}`, `confirmed_load::{node_view, load, CliRunner, Holds, LoadError, trimmed_manifest_path}`, `attested_snapshot::{ReadyPair, PairKind}`, `known_invalid::HeldBranch`, `node::{validating_snapshot_pin_args, BTX_TRUSTED_ATTESTATION_PUBKEYS}`, `operators::REGTEST_GENESIS`.
+- Consumes: everything above through the public API: `confirmed_snapshot::{parse, is_dissent, dissent_statement, confirming_operators, Manifest, Signed, REGTEST_REPLAY_CONTEXT, REGTEST_SHIELDED_COMMITMENT, MAINNET_REPLAY_CONTEXT}`, `confirmed_load::{node_view, load, CliRunner, Holds, LoadError, trimmed_manifest_path}`, `attested_snapshot::{ReadyPair, PairKind, prepare_confirmed}`, `snapshot_start::{read, StartRecord, StartSource}`, `known_invalid::HeldBranch`, `node::{validating_snapshot_pin_args, BTX_TRUSTED_ATTESTATION_PUBKEYS}`, `operators::{REGTEST_GENESIS, parse_env_list, hex}`; `mockito` (a dev-dependency, so available to integration tests) for the disputed `latest`.
 - Produces: `a_two_operator_snapshot_loads_on_a_mirror_and_a_validating_node_restarts_on_it` and `the_engine_reports_the_compiled_mainnet_replay_context`, both `#[ignore]`, run by Task 11's engine check.
 
-What it proves, each step against btxd v0.34.9 (it passed 5 runs in a row while this plan was written, about 25 s each): a producer (validating, key P) exports at 100; a confirmer (key C) co-signs; the operator list comes from the regtest variable format (`producer=P;confirmer=C`); the node reports the compiled regtest genesis and replay context; a one-operator statement is refused before the engine sees it; the two-operator statement loads on a mirror that pins only P, through `confirmed_load::load`, and the trimmed manifest is the producer's file byte for byte; the node restarted validating WITHOUT the pins refuses to start ("failed verification under the current authority configuration"); WITH `validating_snapshot_pin_args` it starts in consensus mode on the snapshot; the mirror launch leaves no `matmulvalidation` in the node's settings file; a base above a held block is refused by the engine after the loader refuses the block. The second test starts btxd with mainnet parameters, no peers, and checks `replay_authority_context` equals `MAINNET_REPLAY_CONTEXT`.
+What it proves, each step against btxd v0.34.9 (the first version passed 5 runs in a row while this plan was written, about 25 s each; the cases this amendment adds are derived, not run): a producer (validating, key P) exports at 100, and a fresh regtest chain carries the compiled shielded commitment (section 12 on regtest); a confirmer (key C) co-signs; both sign a dissent built from the producer's chain facts with `signutxosnapshotmanifest`, which never looks at the file fields; the operator list comes from the regtest variable format (`producer=P;confirmer=C`); the node reports the compiled regtest genesis and replay context. **Proven refused**, each before the engine sees anything, on a mirror that pins only P (the owner's list for the loading side): a statement signed by one operator; a wrong file hash; a dissent offered for loading, although both operators and the pinned key signed it and its signatures verify; a statement signed by two operators with no pinned signature; a disputed `latest`, which downloads nothing. After them the mirror holds no snapshot and no start record. **Proven working**: the two-operator statement loads through `confirmed_load::load`, the trimmed manifest is the producer's file byte for byte, and the start record names the two operators; the node restarted validating WITHOUT the pins refuses to start ("failed verification under the current authority configuration"); WITH `validating_snapshot_pin_args` it starts in consensus mode on the snapshot; the mirror launch leaves no `matmulvalidation` in the node's settings file. **Proven refused by the engine**: a base above a held block, after the loader refuses the block (a held-branch statement). The second test starts btxd with mainnet parameters, no peers, and checks `replay_authority_context` equals `MAINNET_REPLAY_CONTEXT`. A diary mismatch and the creation of a dispute belong to the network-app plan's rehearsal; the owner's clear to the website plan's.
 
 Two engine facts this test works around, both measured while writing it:
 - `submitheader` is refused on MatMul chains, so mirrors get headers (and blocks to 99) from the producer over P2P, and the producer serves no attestations (`-matmulattestationserve=0`) so a mirror cannot connect block 100 itself.
@@ -5209,13 +6629,15 @@ Create `crates/btx-core/tests/confirmed_snapshot_regtest.rs`:
 //! btx-cli is taken from beside btxd, or from `EASYNODE_TEST_BTX_CLI`. The
 //! keys are made fresh for each run and never written outside the scratch
 //! folders. Regtest's ExactReplay starts at 101, so the chain stops at 100,
-//! which is regtest's grid (`confirmed_snapshot::REGTEST_GRID`).
+//! which is on the grid (`confirmed_snapshot::SNAPSHOT_GRID`).
 
 use btx_core::attested_snapshot::{PairKind, ReadyPair};
 use btx_core::confirmed_load::{self, CliRunner, Holds, LoadError};
 use btx_core::confirmed_snapshot as cs;
 use btx_core::known_invalid::HeldBranch;
 use btx_core::rpc::{Rpc, RpcClient};
+use btx_core::snapshot_start::{self, StartRecord, StartSource};
+use k256::ecdsa::signature::hazmat::PrehashSigner;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -5476,6 +6898,13 @@ async fn a_two_operator_snapshot_loads_on_a_mirror_and_a_validating_node_restart
     assert_eq!(dump["base_height"], json!(100), "{dump}");
     let base = dump["base_hash"].as_str().unwrap().to_string();
     let produced = std::fs::read(a.net().join("snap.manifest")).unwrap();
+    let produced_st = cs::parse(&produced).unwrap().statement;
+    // Section 12 on regtest: a fresh chain carries the shielded commitment
+    // the app compiles.
+    assert_eq!(
+        produced_st.shielded().display_hex(),
+        cs::REGTEST_SHIELDED_COMMITMENT
+    );
 
     // The confirmer co-signs a copy with C.
     let mut c = Node::new(&btxd, root.path().join("c"), 29472);
@@ -5484,6 +6913,24 @@ async fn a_two_operator_snapshot_loads_on_a_mirror_and_a_validating_node_restart
     std::fs::write(c.net().join("work.manifest"), &produced).unwrap();
     call(&rc, "signutxosnapshotmanifest", json!(["work.manifest"])).await;
     let cosigned = std::fs::read(c.net().join("work.manifest")).unwrap();
+
+    // A dissent (section 6a): the producer's chain facts, all four file
+    // fields zero. Both nodes sign it with signutxosnapshotmanifest, which
+    // checks the chain id and replay context and never the file fields.
+    let unsigned = cs::Manifest {
+        statement: produced_st.chain_facts().dissent(),
+        signatures: vec![],
+    }
+    .to_bytes();
+    std::fs::write(a.net().join("dissent.manifest"), &unsigned).unwrap();
+    call(&ra, "signutxosnapshotmanifest", json!(["dissent.manifest"])).await;
+    std::fs::copy(
+        a.net().join("dissent.manifest"),
+        c.net().join("dissent.manifest"),
+    )
+    .unwrap();
+    call(&rc, "signutxosnapshotmanifest", json!(["dissent.manifest"])).await;
+    let dissent = std::fs::read(c.net().join("dissent.manifest")).unwrap();
     c.stop(&rc).await;
     let m = cs::parse(&cosigned).unwrap();
     assert_eq!(m.signatures.len(), 2);
@@ -5505,7 +6952,9 @@ async fn a_two_operator_snapshot_loads_on_a_mirror_and_a_validating_node_restart
         Some(cs::REGTEST_REPLAY_CONTEXT)
     );
 
-    // One operator is refused before the engine sees anything.
+    // Refused before the engine sees anything (section 7, step 1), each on
+    // its own, on the mirror that pins only P.
+    // 1. A statement signed by one operator.
     let one = copy_pair(
         &mirror.net().join("one"),
         &a.net().join("snap.dat"),
@@ -5518,14 +6967,143 @@ async fn a_two_operator_snapshot_loads_on_a_mirror_and_a_validating_node_restart
         &view,
         &Holds::none(),
         Some(&env),
+        &mirror.net(),
     )
     .await
     .unwrap_err();
     assert!(matches!(err, LoadError::NotConfirmed(_)), "{err}");
+
+    // 2. A wrong file hash: the two-operator manifest, one byte of the file
+    //    changed.
+    let mut tampered = std::fs::read(a.net().join("snap.dat")).unwrap();
+    tampered[100] ^= 1;
+    std::fs::write(root.path().join("tampered.dat"), &tampered).unwrap();
+    let wrong_file = copy_pair(
+        &mirror.net().join("wrong-file"),
+        &root.path().join("tampered.dat"),
+        &cosigned,
+    );
+    let err = confirmed_load::load(
+        &rm,
+        &runner(&cli, &mirror),
+        &wrong_file,
+        &view,
+        &Holds::none(),
+        Some(&env),
+        &mirror.net(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("not the one the statement signs"),
+        "{err}"
+    );
+
+    // 3. A dissent: signed by both operators, one of them the pinned key,
+    //    and its signatures verify. It is never loaded.
+    let dm = cs::parse(&dissent).unwrap();
+    assert!(cs::is_dissent(&dm.statement));
+    let list = btx_core::operators::parse_env_list(&env).unwrap();
+    assert_eq!(
+        cs::confirming_operators(&dm, &list),
+        Ok(vec!["producer".to_string(), "confirmer".to_string()])
+    );
+    let dissent_pair = copy_pair(
+        &mirror.net().join("dissent"),
+        &a.net().join("snap.dat"),
+        &dissent,
+    );
+    let err = confirmed_load::load(
+        &rm,
+        &runner(&cli, &mirror),
+        &dissent_pair,
+        &view,
+        &Holds::none(),
+        Some(&env),
+        &mirror.net(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, LoadError::NotConfirmed(e) if e.contains("dissent")),
+        "{err}"
+    );
+
+    // 4. Two operators, neither with a key the mirror pins: C's signature
+    //    and one by a third key made here.
+    let third = k256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
+    let third_pub: [u8; 33] = third
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .try_into()
+        .unwrap();
+    let cm = cs::parse(&cosigned).unwrap();
+    let third_sig: k256::ecdsa::Signature = third.sign_prehash(&cm.statement.hash().0).unwrap();
+    let unpinned = cs::Manifest {
+        statement: cm.statement.clone(),
+        signatures: vec![
+            cm.signatures[1].clone(),
+            cs::Signed {
+                key: third_pub,
+                der: third_sig.to_der().as_bytes().to_vec(),
+            },
+        ],
+    };
+    let env3 = format!("{env};third={}", btx_core::operators::hex(&third_pub));
+    let unpinned_pair = copy_pair(
+        &mirror.net().join("unpinned"),
+        &a.net().join("snap.dat"),
+        &unpinned.to_bytes(),
+    );
+    let err = confirmed_load::load(
+        &rm,
+        &runner(&cli, &mirror),
+        &unpinned_pair,
+        &view,
+        &Holds::none(),
+        Some(&env3),
+        &mirror.net(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("no signature is from a key this node pins"),
+        "{err}"
+    );
+
+    // 5. A disputed `latest` (section 6a): nothing is downloaded, and the
+    //    start path takes the fallbacks.
+    let mut site = mockito::Server::new_async().await;
+    site.mock("GET", "/latest")
+        .with_body(r#"{"disputed":[100]}"#)
+        .create_async()
+        .await;
+    let fetched = site
+        .mock("GET", mockito::Matcher::Regex("^/(m|f)".into()))
+        .expect(0)
+        .create_async()
+        .await;
+    let err = btx_core::attested_snapshot::prepare_confirmed(
+        &reqwest::Client::new(),
+        &format!("{}/latest", site.url()),
+        &mirror.net(),
+        &view,
+        Some(&env),
+        |_| true,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("disagree about block 100"), "{err}");
+    fetched.assert_async().await;
+
+    // None of them reached the engine or left a start record.
     assert_eq!(
         snapshot_base(&call(&rm, "getchainstates", json!([])).await),
         None
     );
+    assert_eq!(snapshot_start::read(&mirror.net()), None);
 
     // Two operators load, trimmed to the one key the mirror pins.
     let pair = copy_pair(
@@ -5540,12 +7118,23 @@ async fn a_two_operator_snapshot_loads_on_a_mirror_and_a_validating_node_restart
         &view,
         &Holds::none(),
         Some(&env),
+        &mirror.net(),
     )
     .await
     .unwrap();
     assert_eq!(
         (loaded.height, loaded.signatures, loaded.superseded),
         (100, 1, false)
+    );
+    // Section 7, step 4: the confirmers' names survive the trim.
+    assert_eq!(
+        snapshot_start::read(&mirror.net()),
+        Some(StartRecord {
+            height: 100,
+            block_hash: base.clone(),
+            source: StartSource::Confirmed,
+            operators: vec!["producer".into(), "confirmer".into()],
+        })
     );
     assert_eq!(
         std::fs::read(confirmed_load::trimmed_manifest_path(&pair)).unwrap(),
@@ -5631,6 +7220,7 @@ async fn a_two_operator_snapshot_loads_on_a_mirror_and_a_validating_node_restart
             held: &branch,
         },
         Some(&env),
+        &held.net(),
     )
     .await
     .unwrap_err();
@@ -5641,6 +7231,11 @@ async fn a_two_operator_snapshot_loads_on_a_mirror_and_a_validating_node_restart
     assert_eq!(
         snapshot_base(&call(&rh, "getchainstates", json!([])).await),
         None
+    );
+    assert_eq!(
+        snapshot_start::read(&held.net()),
+        None,
+        "a refused load leaves no start record"
     );
     // The hold was the reason: the mirror above loaded this same pair from
     // the same producer's headers. (Lifting the hold with reconsiderblock on
@@ -5714,10 +7309,10 @@ Expected: `2 passed` with `EASYNODE_TEST_BTXD unset; nothing to test against` pr
 
 - [ ] **Step 3: Run it against the shipped engine**
 
-The v0.34.9 btxd and btx-cli used for this plan are at `/private/tmp/claude-501/-Users-m2promende-repos-easynode--claude-worktrees-easynode-0-7-0-release-65b687/ccaaa761-fc6e-4fe3-ad52-eb25130739ea/scratchpad/spike/bin/`; otherwise use the staged package's (`apps/node/src-tauri/resources/node-pkg/.../btxd`, after `apps/node/scripts/stage-node-pkg.sh`). Ports 29471 to 29479 and 29571 to 29574 must be free.
+The v0.34.9 btxd and btx-cli used for this plan are at `/Users/m2promende/repos/easynode/apps/node/src-tauri/target/release/resources/node-pkg/bin/`; otherwise use the staged package's (`apps/node/src-tauri/resources/node-pkg/.../btxd`, after `apps/node/scripts/stage-node-pkg.sh`). Ports 29471 to 29479 and 29571 to 29574 must be free.
 
 Run: `cd crates/btx-core && EASYNODE_TEST_BTXD=/path/to/btxd cargo test --locked --test confirmed_snapshot_regtest -- --ignored --test-threads=1`
-Expected: `test result: ok. 2 passed` in about 30 s. No btxd is left running afterwards (`pgrep -fl btxd` shows none started by the test).
+Expected: `test result: ok. 2 passed`, in a little more than the first version's 30 s (two more signatures; the five refusals never reach the engine; derived, not run). No btxd is left running afterwards (`pgrep -fl btxd` shows none started by the test).
 
 - [ ] **Step 4: Format, lint, commit**
 
@@ -5729,19 +7324,19 @@ cd ../..
 ````
 ````bash
 git add crates/btx-core/tests/confirmed_snapshot_regtest.rs
-git commit -m "core: rehearse confirmed snapshots against the real engine on regtest (opt-in)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "core: rehearse confirmed snapshots against the real engine on regtest, refusals included (opt-in)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ````
 
 ### Task 11: The engine-bump check, the recipe and the changelog (section 12, second rule)
 
 **Files:**
-- Modify: `scripts/check-engine-tag.sh` (a `regtest_check` function, called in the OK branch)
+- Modify: `scripts/check-engine-tag.sh` (a `shielded_check` and a `regtest_check` function, both called in the OK branch)
 - Modify: `docs/node-release-recipe.md` (one paragraph)
 - Modify: `apps/node/CHANGELOG.md` (one entry under `[Unreleased]`)
 
 **Interfaces:**
-- Consumes: Task 10's test. Environment: `EASYNODE_TEST_BTXD` (path to the candidate btxd, btx-cli beside it), `ENGINE_TAG_GUARD_REGTEST=1` (makes the check required).
-- Produces: `scripts/check-engine-tag.sh <tag>` runs the rehearsal when it can, says how when it cannot, and fails when told it must run and cannot.
+- Consumes: Task 10's test; `MAINNET_SHIELDED_COMMITMENT` in `confirmed_snapshot.rs` (Task 2); the `chainparams.cpp` the script already fetches (`$FILE`). Environment: `EASYNODE_TEST_BTXD` (path to the candidate btxd, btx-cli beside it), `ENGINE_TAG_GUARD_REGTEST=1` (makes the regtest check required).
+- Produces: `scripts/check-engine-tag.sh <tag>` compares the candidate engine's newest mainnet shielded commitment with the compiled one on every run (a text check, so CI runs it too), runs the rehearsal when it can, says how when it cannot, and fails when told it must run and cannot.
 
 - [ ] **Step 1: See the current script pass without the new check**
 
@@ -5750,10 +7345,38 @@ Expected: exit 0, ending with `No mainnet stall-recovery height. This engine fol
 
 - [ ] **Step 2: Add the check**
 
-In `scripts/check-engine-tag.sh`, directly before the line `# --- 1. which tag ----------------------------------------------------------`, add:
+In `scripts/check-engine-tag.sh`, directly before the line `# --- 1. which tag ----------------------------------------------------------` (line 125 on `origin/main`, after `die()`), add:
 
 ````bash
-# --- 5, defined here: the confirmed-snapshot rehearsal on regtest -----------
+# --- 5, defined here: the compiled shielded commitment ----------------------
+# Section 12 of docs/decisions/2026-09-29-every-node-starts-near-the-tip.md:
+# every confirmed statement must carry the shielded commitment that
+# confirmed_snapshot.rs compiles (MAINNET_SHIELDED_COMMITMENT). An engine whose
+# newest mainnet snapshot pins another one would have every node refuse every
+# confirmed snapshot, so the bump fails here first. It reads the chainparams.cpp
+# fetched below, so it runs wherever this script runs, CI included.
+CONFIRMED_RS="$ROOT/crates/btx-core/src/confirmed_snapshot.rs"
+shielded_check() {
+  local compiled newest
+  compiled="$(grep -A1 '^pub const MAINNET_SHIELDED_COMMITMENT' "$CONFIRMED_RS" 2>/dev/null \
+    | grep -oE '[0-9a-f]{64}' | head -1 || true)"
+  [ -n "$compiled" ] || die "could not read MAINNET_SHIELDED_COMMITMENT from $CONFIRMED_RS" \
+    "Its shape changed. FIX THIS GUARD, do not delete it and do not skip it."
+  newest="$(awk '/^class CMainParams/{m=1} m && /^};/{exit} m' "$FILE" \
+    | grep -oE 'shielded_state_commitment = uint256\{"[0-9a-f]{64}"\}' \
+    | tail -1 | grep -oE '[0-9a-f]{64}' || true)"
+  [ -n "$newest" ] || die "found no mainnet shielded_state_commitment in $CHAINPARAMS for $TAG" \
+    "Either CMainParams moved or its assumeutxo entries changed shape. Read the file by hand."
+  if [ "$compiled" != "$newest" ]; then
+    die "the newest mainnet snapshot in $TAG pins shielded commitment $newest" \
+      "confirmed_snapshot.rs compiles $compiled. Every node would refuse every" \
+      "confirmed snapshot. Do not ship this engine until the two agree."
+  fi
+  echo "OK: the newest mainnet snapshot in $TAG pins the shielded commitment"
+  echo "    confirmed_snapshot.rs compiles (${compiled:0:8}...${compiled:60:4})."
+}
+
+# --- 6, defined here: the confirmed-snapshot rehearsal on regtest -----------
 # Section 12 of docs/decisions/2026-09-29-every-node-starts-near-the-tip.md,
 # before any engine bump: the replay contexts the engine reports are the ones
 # the app compiles (confirmed_snapshot.rs), and a node on a signed snapshot
@@ -5788,11 +7411,14 @@ regtest_check() {
 }
 ````
 
-In the OK branch of step 4, after the line `  echo "    No mainnet stall-recovery height. This engine follows the majority chain."`, add the line:
+In the OK branch of step 4, after the line `  echo "    No mainnet stall-recovery height. This engine follows the majority chain."` (line 273 on `origin/main`), add the lines:
 
 ````bash
+  shielded_check
   regtest_check
 ````
+
+The mainnet class runs from `class CMainParams` to its first `};` (lines 708 to 1294 of v0.34.9's `chainparams.cpp`), and its last `shielded_state_commitment` is the 219,000 entry's at line 1278, `94343b76…4541`. An older tag that still compiles the withdrawn 199,299 and 199,300 bases may end on another pin and fail here, which is right: those engines are unshippable for other reasons too.
 
 - [ ] **Step 3: Run it three ways**
 
@@ -5802,70 +7428,82 @@ BTX_CLONE=/Users/m2promende/repos/btx bash scripts/check-engine-tag.sh; echo "ex
 BTX_CLONE=/Users/m2promende/repos/btx ENGINE_TAG_GUARD_REGTEST=1 bash scripts/check-engine-tag.sh; echo "exit=$?"
 BTX_CLONE=/Users/m2promende/repos/btx EASYNODE_TEST_BTXD=/path/to/btxd ENGINE_TAG_GUARD_REGTEST=1 bash scripts/check-engine-tag.sh; echo "exit=$?"
 ````
-Expected, in order: `syntax-ok`; `regtest check: skipped. Before an engine bump run it with` and `exit=0`; `FAIL: ENGINE_TAG_GUARD_REGTEST is set but EASYNODE_TEST_BTXD is not` and `exit=1`; `test result: ok. 2 passed`, `OK: the engine's replay contexts are the compiled ones, and a validating` and `exit=0`. CI (`engine-tag-guard.yml`) has no btxd and sees the "skipped" line, so it stays green.
+Expected, in order: `syntax-ok`; `OK: the newest mainnet snapshot in v0.34.9 pins the shielded commitment` and `    confirmed_snapshot.rs compiles (94343b76...4541).`, then `regtest check: skipped. Before an engine bump run it with` and `exit=0`; the same two OK lines, then `FAIL: ENGINE_TAG_GUARD_REGTEST is set but EASYNODE_TEST_BTXD is not` and `exit=1`; the same two OK lines, then `test result: ok. 2 passed`, `OK: the engine's replay contexts are the compiled ones, and a validating` and `exit=0`. (The shielded check's two pipelines were dry-run against v0.34.9's `chainparams.cpp` while amending and printed exactly those two lines; the whole script was not run.) CI (`engine-tag-guard.yml`) has no btxd: it runs the shielded check and sees the "skipped" line, so it stays green.
 
-- [ ] **Step 3b: Sabotage the check once**
+- [ ] **Step 3b: Sabotage both checks once**
 
-Change one hex digit of `REGTEST_REPLAY_CONTEXT` in `crates/btx-core/src/confirmed_snapshot.rs`, run the third command again, expect `FAIL: the confirmed-snapshot rehearsal failed` and `exit=1`, and undo the change (`git diff crates/btx-core/src/confirmed_snapshot.rs` must be empty afterwards).
+Change one hex digit of `REGTEST_REPLAY_CONTEXT` in `crates/btx-core/src/confirmed_snapshot.rs`, run the third command again, expect `FAIL: the confirmed-snapshot rehearsal failed` and `exit=1`, and undo the change. Then change one hex digit of `MAINNET_SHIELDED_COMMITMENT`, run the second command (no btxd needed), expect `FAIL: the newest mainnet snapshot in v0.34.9 pins shielded commitment 94343b766b39c0ea2d92d83323f77b5ccc5e775d99b34b01f5fa6400f2354541` and `exit=1`, and undo it. `git diff crates/btx-core/src/confirmed_snapshot.rs` must be empty afterwards.
 
 - [ ] **Step 4: The recipe**
 
 In `docs/node-release-recipe.md`, after the paragraph ending "Run it rather than retyping the grep. It does **not** run the assumeutxo check below. Run that one by hand.", add:
 
 ````markdown
-Before any engine bump, also run it with the candidate engine's btxd:
+It also checks, on every run, that the newest mainnet snapshot the tag compiles
+pins the shielded commitment `confirmed_snapshot.rs` compiles. If the two
+differ, every node would refuse every confirmed snapshot. Before any engine
+bump, also run it with the candidate engine's btxd:
 `EASYNODE_TEST_BTXD=/path/to/btxd ENGINE_TAG_GUARD_REGTEST=1 scripts/check-engine-tag.sh <tag>`.
 That runs `crates/btx-core/tests/confirmed_snapshot_regtest.rs`: the replay
 contexts the engine reports must be the ones `confirmed_snapshot.rs` compiles,
-and a validating node on a signed snapshot must still restart. A context that
-moves would stop every node on a signed snapshot from starting, because the
-engine re-checks the stored manifest at every start
+a fresh regtest chain must carry the compiled shielded commitment, and a
+validating node on a signed snapshot must still restart. A context that moves
+would stop every node on a signed snapshot from starting, because the engine
+re-checks the stored manifest at every start
 (docs/decisions/2026-09-29-every-node-starts-near-the-tip.md, section 12).
 ````
 
 - [ ] **Step 5: The changelog**
 
-In `apps/node/CHANGELOG.md`, under `## [Unreleased]`, after the Tools entry, add:
+In `apps/node/CHANGELOG.md`, under `## [Unreleased]`, add this as the last entry of that section: on `origin/main` `b330e3d` that is after the role-card entry ("**The role card no longer says "At the tip" on a node that is not there.**"); on a base without #160, after the Tools entry.
 
 ````markdown
 **New nodes start closer to the tip, from a snapshot two operators confirmed.**
-When you set up a node, easyNode looks for the newest chain snapshot that two
-different people running this network have both signed, checks every signature
-itself, and starts your node there instead of thousands of blocks back. A node
-that checks blocks itself loads it in one short extra start, then goes back to
-checking every new block. If there is no such snapshot yet, your node starts
-from the one easyNode already ships, as before. Today only one operator is on
-the list, so for now every node takes that second path.
+When you set up a node, easyNode looks for the newest chain snapshot that at
+least two of the people on its operator list have signed (today Mende,
+Aleksander and jpp), checks every signature itself, and starts your node there
+instead of thousands of blocks back. A node that checks blocks itself loads it
+in one short extra start, then goes back to checking every new block, and it
+still checks its older history in the background. The node remembers who
+confirmed its start point. If there is no such snapshot yet, or the operators
+disagree about one, your node starts from the snapshot easyNode already ships,
+as before.
 ````
 
 - [ ] **Step 6: Commit**
 
 ````bash
 git add scripts/check-engine-tag.sh docs/node-release-recipe.md apps/node/CHANGELOG.md
-git commit -m "engine check: rehearse confirmed snapshots on regtest before an engine bump; changelog" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "engine check: the shielded commitment on every run, the regtest rehearsal before an engine bump; changelog" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ````
 
 ## Interfaces for the other plans
 
-- **Diary, producers, confirmers (sections 3 to 5):** `operators::{mainnet, for_chain, regtest_env, OperatorList::operator_of}` tell a node whether its key is on the list; `confirmed_snapshot::{parse, Statement accessors, check_with, ChainRules, trim_to_pinned, Manifest::to_bytes}` read and compare a statement field by field against a diary entry (`block_hash`, `hash_serialized`, `coins`, `chain_tx`, `chain_id`, `replay_context`); `node::attested_snapshot_record(datadir).exists()` is the "runs on a signed snapshot whose background check has not finished" test after which the diary records nothing and a node confirms nothing; the grid is `confirmed_snapshot::MAINNET_GRID` (200).
-- **Website (section 6):** the pointer contract is `attested_snapshot::ConfirmedPointer` (fields, statuses and hosts in Task 3), and `crates/btx-core/tests/fixtures/confirmed_snapshot/latest.json` is its fixture. The verification the website mirrors in TypeScript is `confirmed_snapshot::{parse, is_strict_der, signature_is_valid, confirming_operators, check_with}`; the shared vectors are the fixture files of Task 2 (statement hash `d3ee93122fb062baa00bfe5d8c586f03c619427e8a9253f8fae0c980c9aa0482`, file hash `f234192dba8bb29875778620259fc870fa1e245175c61c89ed82cd0c1feceb2c`, regtest statement hash `11c5406e51423d5817e3fd62b2a8c5e18b4f7ba079fdce1087cf732453bbf194`). The website's copy of the operator list must equal `operators::MAINNET_OPERATORS`.
+- **Operator list (all plans; the network-app plan drops its own publishing step):** the file `crates/btx-core/snapshot-operators.json` (928 bytes, SHA-256 `f91529f3…fdf3d`), `operators::{OPERATORS_JSON, OPERATORS_SCHEMA, OperatorFile, OperatorEntry, Published, parse_operator_file, published, mainnet, mainnet_mirror_pins, Operator, OperatorList, Chain, MAINNET_GENESIS, REGTEST_GENESIS, REGTEST_OPERATORS_ENV, parse_env_list, for_chain, regtest_env, parse_key, hex, hex_decode}`. `MAINNET_OPERATORS` is gone. `OperatorList::distinct_operators` returns names in the list's order.
+- **The validated gate (diary, producers, both confirmers, `btx-confirmer`):** `node_api::chainstates_validated(Option<&serde_json::Value>) -> bool` (pure, over a raw `getchainstates` answer) and `node_api::read_chainstates_validated(&dyn Rpc) -> bool`. It replaces every use of `node::attested_snapshot_record(datadir).exists()` for recording, producing and signing; that file stays only in section 8's pin rule.
+- **Diary, producers, confirmers (sections 3 to 5a):** `confirmed_snapshot::{SNAPSHOT_GRID (100), SNAPSHOT_DEPTH (144), parse, Statement accessors, Statement::from_raw, Statement::chain_facts, ChainFacts, ChainFacts::dissent, check_chain_fields, check_shape, check_dissent_shape, is_dissent, dissent_statement, confirming_operators, ChainRules, Manifest, Signed, Manifest::to_bytes, Refusal}`. Check 3 of section 5 is `check_chain_fields` (version, chain id, replay context, shielded commitment, as compiled); check 4 compares `Statement::chain_facts()` with the diary entry field by field (height, `block_hash`, `hash_serialized`, `coins`, `chain_tx`). A dissent is `Statement::from_raw(dissent_statement(height, &block_hash, &hash_serialized, coins, chain_tx, &rules.genesis, &rules.replay_context, &rules.shielded))` with the confirmer's diary facts (or `ChainFacts::dissent`), wrapped in `Manifest { statement, signatures: vec![] }.to_bytes()` and signed by `signutxosnapshotmanifest`. `check_shape` returns the height for a statement; `check_dissent_shape` for a dissent. The network-app plan's own `check_shape` split is no longer needed; its `EXPORT_GRID` is `SNAPSHOT_GRID`.
+- **Website (sections 6 and 6a):** `latest`'s contract is `attested_snapshot::ConfirmedPointer` plus the dispute shape `{"disputed": [<height>, ...]}` (`Latest`, `parse_latest`; statuses and hosts in Task 3), and `crates/btx-core/tests/fixtures/confirmed_snapshot/latest.json` is the pointer's fixture. The verification the website mirrors in TypeScript is `confirmed_snapshot::{parse, is_strict_der, signature_is_valid, confirming_operators, check_chain_fields, check_shape, check_dissent_shape, is_dissent}`; the shared vectors are the fixture files of Task 2 (statement hash `d3ee93122fb062baa00bfe5d8c586f03c619427e8a9253f8fae0c980c9aa0482`, file hash `f234192dba8bb29875778620259fc870fa1e245175c61c89ed82cd0c1feceb2c`, regtest statement hash `11c5406e51423d5817e3fd62b2a8c5e18b4f7ba079fdce1087cf732453bbf194`, the shielded commitment `94343b76…4541`) and the two dissent statements (the fixtures' statements with bytes 181 to 228 zeroed; hashes `a4874ae5ef9cc72abc74890f4e8e612ad4cd5c75fb97d3bda6f650605ad2e786` regtest, `44ba673dbeb964d0e9e89d21597ccc5e590a216001f1fe69afbd863c6db0676b` mainnet). The website's `site/src/lib/snapshot-operators.json` is byte for byte `crates/btx-core/snapshot-operators.json`.
+- **The start record (UI decision C's history-check line, Copy diagnostics, plan 2):** `snapshot_start::{START_RECORD_FILE, path, StartSource, StartRecord, parse, read, write, replace, put_back, is_current, join_names, block_number, started_from}`. `started_from` gives the second sentence exactly: "Started from block 233,800, confirmed by Mende and jpp.", "Started from block 225,927, built into this app.", "Started from block 228,000, built into the BTX engine." A reader showing it beside the running chain checks `is_current` against `getchainstates` first; `disk::remove_node_data` leaves the file, and the next load replaces it.
 - **Catch-up help (section 11):** nothing here; it reads `getmatmulattestedtip` and the watchdog as before.
-- **Fast-forward (plan 2):** `attested_snapshot::{prepare_confirmed, confirmed_url_allowed, CONFIRMED_POINTER_URL, http_client, prune_others, fallback_start}`, `confirmed_load::node_view`, `snapshot::{SignedLoad::SignedOnly, SnapshotOutcome}`, `node::{mirror_load_marker_exists, header_bootstrap_pending, end_mirror_load, end_header_bootstrap}`, and the app's `SIGNED_LOAD_FAILED`, `signed_load_for`, `spawn_load_watch`, `after_snapshot_load`, `set_phase` (plan 2 widens the last to `pub(crate)`).
+- **Fast-forward (plan 2):** `attested_snapshot::{prepare_confirmed, parse_latest, Latest, confirmed_url_allowed, CONFIRMED_POINTER_URL, http_client, prune_others, fallback_start}`, `confirmed_load::node_view`, `snapshot::{SignedLoad::SignedOnly, SnapshotOutcome}`, `snapshot_start::{read, StartSource, join_names, block_number}`, `node::{mirror_load_marker_exists, header_bootstrap_pending, end_mirror_load, end_header_bootstrap}`, and the app's `SIGNED_LOAD_FAILED`, `signed_load_for`, `spawn_load_watch`, `after_snapshot_load`, `set_phase` (plan 2 widens the last to `pub(crate)`).
 
 ## Risks and open points (for the owner)
 
-1. **Nothing is confirmed until a second operator is on the list.** With Mende alone every new node takes the pinned pair (225,927), which today is about 7,500 blocks back; a fresh validating install now takes it too (the owner's choice 3), in one mirror launch. That is a real change for validating nodes before anyone is added: a new Mac or NVIDIA node that used to start at 219,000 starts at 225,927 on the 3060's single signature, with the pins the rule adds. Nodes that already hold a chain are not touched (only Fast-forward moves them).
-2. **`shielded_state` is chain data** the design's Fast-forward list leaves out; plan 2 sets it aside too.
-3. **A refused load can leave v0.34.9 unresponsive.** In the rehearsal, after the engine refused a base above a held block, a `reconsiderblock` on that node went unanswered in 2 of 6 runs. The loader never calls `reconsiderblock`, but a node whose load the engine refused may stop answering; the start path's restart (validating node) and the refresher's error phase (mirror) are what recover it. Worth an upstream note beside the others the design lists.
-4. **The engine's refusal text differs from the design's.** A base above a held block is refused with "Attested snapshot base is incompatible with the current best-header chain", not "part of an invalid chain"; both are engine refusals, and the loader treats any refusal the same.
-5. **Extra restarts.** A fresh validating install now goes bootstrap launch, mirror launch, validating launch: one more MatMul canary on a Mac (80 to 125 s). A failed signed load does not retry until the app restarts (`SIGNED_LOAD_FAILED`).
-6. **Pins after the background check.** The design leaves open whether the pins may go once `attested_assumeutxo` disappears. This plan keys the pins on the file, so they go with it, which is what the design's measurement plan asks to confirm on a real data folder before 0.7.0 ships.
-7. **Two measurements this plan did not repeat:** a validating node checking new blocks on a signed snapshot (needs a card the engine qualifies) and the mainnet validating restart with the pins (measured by the spike on this Mac on 2026-09-29, not repeated here).
-8. **Threshold on the validating arm:** the rule passes `-matmultrustedthreshold=1` with the pins, as the measured mainnet run did (`phase2-args.txt`); the design names only the keys.
+1. **Every confirmed snapshot needs Mende's signature.** The 3060's key is the only listed key every node pins, and a node can load only a manifest with a pinned signature (section 7, step 1), so a snapshot counts only when the 3060 and one of Aleksander or jpp signed it. Until that happens, every new node takes the pinned pair (225,927, today about 7,500 blocks back); a fresh validating install takes it too (the owner's choice 3), in one mirror launch. A new Mac or NVIDIA node that used to start at 219,000 then starts at 225,927 on the 3060's single signature, with the pins the rule adds. Nodes that already hold a chain are not touched (only Fast-forward moves them).
+2. **The list merges only with the owner's word on Aleksander.** Task 1's PR carries his three keys; it waits for that confirmation. jpp's confirmer counts only once his node's background check below 228,000 has finished (Task 2a's gate, in the confirmer plans).
+3. **`shielded_state` is chain data** the design's Fast-forward list leaves out; plan 2 sets it aside too, with `snapshot-start.json`.
+4. **The engine's start record is written after its load.** The decision puts the record at section 7 step 4, before trimming. That holds for a confirmed and a pinned pair. The engine's compiled snapshot has no manifest to trim, and the app does not compile the engine's base hash, so Task 5 writes that record once the engine reports the snapshot chainstate. An app that dies between the two leaves a node without the second sentence on its history-check line, nothing worse.
+5. **A refused load can leave v0.34.9 unresponsive.** In the rehearsal, after the engine refused a base above a held block, a `reconsiderblock` on that node went unanswered in 2 of 6 runs. The loader never calls `reconsiderblock`, but a node whose load the engine refused may stop answering; the start path's restart (validating node) and the refresher's error phase (mirror) are what recover it. Worth an upstream note beside the others the design lists.
+6. **The engine's refusal text differs from the design's.** A base above a held block is refused with "Attested snapshot base is incompatible with the current best-header chain", not "part of an invalid chain"; both are engine refusals, and the loader treats any refusal the same.
+7. **Extra restarts.** A fresh validating install now goes bootstrap launch, mirror launch, validating launch: one more MatMul canary on a Mac (80 to 125 s). A failed signed load does not retry until the app restarts (`SIGNED_LOAD_FAILED`).
+8. **Pins after the background check.** The design leaves open whether the pins may go once `attested_assumeutxo` disappears. This plan keys the pins on the file, so they go with it, which is what the design's measurement plan asks to confirm on a real data folder before 0.7.0 ships.
+9. **Measurements this plan did not repeat:** a validating node checking new blocks on a signed snapshot (needs a card the engine qualifies) and the mainnet validating restart with the pins (measured by the spike on this Mac on 2026-09-29, not repeated here). The rehearsal cases this amendment adds, and the new test counts, are derived, not run.
+10. **Threshold on the validating arm:** the rule passes `-matmultrustedthreshold=1` with the pins, as the measured mainnet run did (`phase2-args.txt`); the design names only the keys.
+11. **The gate is stricter than its one-line definition.** "Open only if no entry has `validated: false`" is read as "every entry says `validated: true`": a missing or non-boolean field, an empty list and an unparsable answer all count as closed. The engine writes `{}` for a chainstate with no tip yet, which the literal reading would have let through.
 
 ## Self-review
 
-- Spec coverage: section 1 (Task 1: list per chain, Mende only, one-line addition guarded, env list for regtest only, proven never to reach mainnet); section 7 steps 1 and 2 (Tasks 2, 3), steps 3 to 6 (Task 4), step 5's mirror launch and step 7's restart (Tasks 7, 9); section 8 (Task 6, and Task 10 proves it against the engine); section 9 (Tasks 3, 5, 9: confirmed, pinned, compiled, for every node); section 12 first rule (Task 8) and second rule (Tasks 10, 11). Section 10 is plan 2. Sections 3 to 6 and 11 are other plans; their interfaces are listed above.
-- Sabotage tests, one per rule: one operator only (`two_regtest_operators_confirm_and_one_does_not`, `each_rule_refuses_on_its_own`, `the_published_pair_is_one_operator_and_is_not_confirmed`, regtest rehearsal); two keys of one operator (`two_keys_of_one_operator_count_once`); an unknown key (`an_unknown_key_counts_for_nobody`, `an_invalid_signature_from_an_unlisted_key_still_refuses_the_whole_manifest`); high S (`a_high_s_signature_is_refused`); non-strict DER (`a_signature_that_is_not_strict_der_is_refused`); wrong chain id (`each_rule_refuses_on_its_own`, `the_running_node_must_agree_on_chain_and_replay_context`, `a_regtest_list_never_validates_a_mainnet_statement`); wrong replay context (same two, plus Task 11 step 3b); off-grid height (`each_rule_refuses_on_its_own`, `the_published_pair_is_one_operator_and_is_not_confirmed`); trailing bytes (`a_manifest_is_read_strictly`); a file whose hash does not match (`the_regtest_vectors_verify_and_the_file_matches`, `a_file_whose_hash_does_not_match_the_statement_is_refused_and_removed`, `a_pair_that_no_longer_checks_out_is_not_loaded`); a held-branch base (`a_hold_that_cannot_be_refused_stops_the_load`, `a_refused_block_on_the_chain_after_the_load_is_reported`, regtest rehearsal); a removed pinned key (`pins_only_grow_and_the_threshold_stays`).
-- Placeholders: none; every code step carries the code, every run step the command and the expected result.
-- Consistency: names checked across tasks (`SignedLoad::SignedOnly`, `ReadyPair`, `PairKind`, `NodeView`, `Holds`, `mirror_load_pending`, `validating_snapshot_pin_args`, `BTX_TRUSTED_ATTESTATION_THRESHOLD`). The whole plan was replayed on a clean worktree of `72304d9` while it was written: after Tasks 2, 3, 4, 5 and 11 every gate passed (btx-core 633 tests, app 90 tests, fmt, clippy correctness and suspicious), and `scripts/check-engine-tag.sh` with the rehearsal passed against v0.34.9.
+- Spec coverage: section 1 (Task 1: one published file, three operators, Aleksander's three keys as one, the mirrors' pins held to `BTX_TRUSTED_ATTESTATION_PUBKEYS`, the merge held for the owner's word, the env list for regtest only and proven never to reach mainnet); section 2 (Task 2: grid 100, depth 144); section 3's `validated` rule (Task 2a, for the other plans); section 6a, the loading side (Task 2: a dissent parses, verifies and is never loaded, built byte for byte; Task 3: a disputed `latest` sends every node to the fallbacks); section 7 steps 1 and 2 (Tasks 2, 3, with the shielded commitment), steps 3 to 6 (Task 4, the start record at step 4), step 5's mirror launch and step 7's restart (Tasks 7, 9), "who confirmed the start point" (Task 2b's record and sentences; Task 5 for the engine's snapshot); section 8 (Task 6, and Task 10 proves it against the engine); section 9 (Tasks 3, 5, 9: confirmed, pinned, compiled, for every node); section 12 first rule (Task 8) and second rule (Tasks 10, 11, the shielded commitment included). Section 10 is plan 2. Sections 3 to 6a on the producing side and 11 are other plans; their interfaces are listed above.
+- Sabotage tests, one per rule: one operator only (`two_regtest_operators_confirm_and_one_does_not`, `each_rule_refuses_on_its_own`, `the_published_pair_is_one_operator_and_is_not_confirmed`, regtest rehearsal); two keys of one operator (`two_keys_of_one_operator_count_once`, `aleksanders_three_keys_count_once`); an unknown key (`an_unknown_key_counts_for_nobody`, `an_invalid_signature_from_an_unlisted_key_still_refuses_the_whole_manifest`); no pinned signature (`two_regtest_operators_confirm_and_one_does_not`, `each_rule_refuses_on_its_own`, regtest rehearsal); high S (`a_high_s_signature_is_refused`); non-strict DER (`a_signature_that_is_not_strict_der_is_refused`); wrong chain id (`each_rule_refuses_on_its_own`, `the_running_node_must_agree_on_chain_and_replay_context`, `a_regtest_list_never_validates_a_mainnet_statement`); wrong replay context (same two, plus Task 11 step 3b); wrong shielded commitment (`a_statement_with_another_shielded_commitment_is_refused`, `each_rule_refuses_on_its_own`, Task 11 step 3b); a dissent offered for loading (`a_dissent_verifies_but_is_never_loaded`, `a_dissent_offered_for_loading_is_refused`, regtest rehearsal); a disputed `latest` (`a_dispute_answer_is_its_own_shape`, `a_disputed_latest_downloads_nothing`, regtest rehearsal); off-grid height (`each_rule_refuses_on_its_own`, `the_grid_is_100_and_the_depth_144`, `the_published_pair_is_one_operator_and_is_not_confirmed`); trailing bytes (`a_manifest_is_read_strictly`); a file whose hash does not match (`the_regtest_vectors_verify_and_the_file_matches`, `a_file_whose_hash_does_not_match_the_statement_is_refused_and_removed`, `a_pair_that_no_longer_checks_out_is_not_loaded`, regtest rehearsal); a held-branch base (`a_hold_that_cannot_be_refused_stops_the_load`, `a_refused_block_on_the_chain_after_the_load_is_reported`, regtest rehearsal); a removed pinned key (`pins_only_grow_and_the_threshold_stays`); a list that drifts from the pins or shares a key (`mirror_pins_are_the_keys_every_node_pins`, `no_key_sits_under_two_operators`); an unvalidated chainstate (`chainstates_validated_stays_closed_on_a_plain_assumeutxo_snapshot`, `chainstates_validated_stays_closed_on_a_signed_snapshot`).
+- Placeholders: none; every code step carries the code, every run step the command and the expected result. Counts this amendment changed are marked "derived, not run".
+- Consistency: names checked across tasks (`SignedLoad::SignedOnly`, `ReadyPair`, `PairKind`, `NodeView`, `Holds`, `mirror_load_pending`, `validating_snapshot_pin_args`, `BTX_TRUSTED_ATTESTATION_THRESHOLD`, `SNAPSHOT_GRID`, `ChainFacts`, `StartRecord`, `Latest`), and against the amending round's shared contracts (the file's content, the constants, the dispute shape, the start record's shape and sentences). The first version was replayed on a clean worktree of `72304d9` while it was written: after Tasks 2, 3, 4, 5 and 11 every gate passed (btx-core 633 tests, app 90 tests, fmt, clippy correctness and suspicious), and `scripts/check-engine-tag.sh` with the rehearsal passed against v0.34.9. This amendment was not replayed: no cargo or npm ran while it was written. Its anchors were re-read on `origin/main` `b330e3d`, and its computed values (the file's SHA-256, the dissent hashes, the shielded commitments, the regtest base) were taken from the fixture bytes and the engine source.
