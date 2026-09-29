@@ -429,6 +429,17 @@ body {
   min-height: 20px;
   text-align: center;
 }
+/* The history check under the status line: one line and a thin bar. The bar
+   is capped, not the line: at 12px the line needs about 346px, and a cap on
+   both would push "(58%)" onto a second line. */
+.history-check {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.history-line { font-size: 12px; color: var(--color-muted); text-align: center; }
+.history-track { width: 100%; max-width: 340px; height: 4px; margin-top: var(--space-xs); }
 
 /* The frequency line — the node's calm heartbeat under the orb. */
 .ambient-canvas {
@@ -571,6 +582,14 @@ body {
 .fork-card { border-color: rgba(251, 191, 36, 0.5); font-size: 13px; }
 .fork-card p { color: var(--color-amber); margin: 0; line-height: 1.45; }
 .follow-card button { margin-top: var(--space-s); }
+/* The stale card before the catch-up trend is measured: "Checking whether
+   your node is catching up...", said quietly, never as an alarm. */
+#fork-card.is-calm { border-color: var(--color-border); }
+#fork-card.is-calm p { color: var(--color-muted); }
+/* The one-time note after the engine turned this Mac's chip down. */
+.chip-card { font-size: 13px; }
+.chip-card p { margin: 0; line-height: 1.45; }
+.chip-card button { margin-top: var(--space-s); }
 /* Engine notes: amber lines ask something of the person, quiet lines only
    explain. A card holding only quiet lines drops the amber border too, so an
    explanation never dresses as an alarm. */

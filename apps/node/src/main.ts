@@ -17,8 +17,16 @@ import {
   cannotCatchUp,
   catchupLine,
   pushSample,
+  staleCard,
 } from "./catchup-trend";
-import { NO_GPU_REASON, type StartChoice, setupArgs, startChoiceView } from "./start-choice";
+import { type HistoryCheck, historyCheckView } from "./history-check";
+import {
+  NO_GPU_REASON,
+  type StartChoice,
+  chipNoticeVisible,
+  setupArgs,
+  startChoiceView,
+} from "./start-choice";
 import {
   classifyCheckFailure,
   checkFailureMessage,
@@ -215,6 +223,12 @@ interface NodeStatusInfo {
   /** The setup screen selects Full check first: an NVIDIA machine. False on a
    *  Mac, where Quick start comes first and Full check can still be picked. */
   full_check_first: boolean;
+  /** The engine refused this Mac's graphics chip, so the node follows
+   *  signatures. The status screen says so once per engine. */
+  chip_refused: boolean;
+  /** How far the background check of the snapshot's older history has got;
+   *  null when there is none running. */
+  history_check: HistoryCheck | null;
   /**
    * Bytes uploaded to peers this run. Null when stopped or when the node did
    * not answer `getnettotals` — the UI drops the claim rather than showing a
@@ -975,8 +989,9 @@ function renderStatus(status: NodeStatusInfo) {
   const errCard = $("status-error");
 
   reflectPeerNames(status);
-  reflectFork(status);
   reflectEngineNotes(status);
+  reflectChipNotice(status);
+  reflectHistoryCheck(status);
   renderRole(status);
   reflectSignerRow(status);
   // The close dialog's warning follows the wire on every tick, so a dialog
@@ -1015,6 +1030,8 @@ function renderStatus(status: NodeStatusInfo) {
     catchupSamples = [];
   }
 
+  // After the sample above, so the stale card judges the trend as it is now.
+  reflectFork(status);
   reflectFollowOffer(status);
 
   let height = 0;
@@ -1722,24 +1739,87 @@ function reflectArchiveService(status: NodeStatusInfo): void {
  */
 function reflectFork(status: NodeStatusInfo): void {
   const card = $("fork-card");
-  const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
-  // A stale tip outranks a fork verdict. A fork says "there is a better chain
-  // we cannot reach"; a stale tip says "the newest block we have is hours old
-  // however healthy everything else reads", which is the condition every
-  // peer-derived signal in this app is blind to by construction.
+  const p = status.phase;
+  const running = p.phase === "ready" || p.phase === "syncing";
+  // How many blocks the node knows of beyond its tip: the stale card's
+  // "is behind".
+  const behind =
+    p.phase === "ready"
+      ? p.blocks_behind
+      : p.phase === "syncing"
+        ? Math.max(0, p.headers - p.height)
+        : null;
+  // The stale sentence, judged with the catch-up trend (catchup-trend.ts
+  // `staleCard`): nothing while the gap closes, a neutral line before the
+  // trend is measured, amber with the pace when the gap is not closing, and
+  // Rust's sentence unchanged when the node knows of no newer block.
+  const stale = staleCard(status.tip_stale_message, behind, catchupSamples, Date.now());
+  const amber = stale?.tone === "amber" ? stale.message : null;
+  const neutral = stale?.tone === "neutral" ? stale.message : null;
+  // An amber stale tip outranks a fork verdict. A fork says "there is a better
+  // chain we cannot reach"; a stale tip says "the newest block we have is
+  // hours old however healthy everything else reads", which is the condition
+  // every peer-derived signal in this app is blind to by construction.
   //
-  // Behind the signers comes last because it is the earliest and the least
-  // specific: it fires minutes into a split the node cannot see, before the
-  // tip is old enough to be stale, and says less than either once they do.
-  const message =
-    status.tip_stale_message ?? status.fork_message ?? status.behind_signers_message;
+  // Behind the signers comes after both because it is the earliest and the
+  // least specific: it fires minutes into a split the node cannot see, before
+  // the tip is old enough to be stale, and says less than either once they do.
+  //
+  // The neutral line comes last: it is not a verdict, and both of those are.
+  const message = amber ?? status.fork_message ?? status.behind_signers_message ?? neutral;
   if (!running || !message) {
     card.hidden = true;
     return;
   }
   card.hidden = false;
+  card.classList.toggle("is-calm", message === neutral);
   $("fork-msg").textContent = message;
 }
+
+/** The background check of the snapshot's older history: one line and a thin
+ *  bar under the status line while it runs (history-check.ts). Hidden on a
+ *  node that is not running, and the moment the engine reports it done. */
+function reflectHistoryCheck(status: NodeStatusInfo): void {
+  const wrap = $("history-check");
+  const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
+  const view = running ? historyCheckView(status.history_check) : null;
+  if (!view) {
+    wrap.hidden = true;
+    return;
+  }
+  wrap.hidden = false;
+  $("history-line").textContent = view.line;
+  $("history-fill").style.width = `${view.pct}%`;
+  $("history-bar").setAttribute("aria-valuenow", String(view.pct));
+}
+
+/** The note after the engine turned this Mac's chip down, once per engine
+ *  (start-choice.ts `chipNoticeVisible`). Remembered in localStorage by engine
+ *  tag; where storage is unavailable it still closes for this run. */
+const CHIP_NOTICE_KEY = "ebtx-node.chip-notice-seen";
+let chipNoticeClosed = false;
+
+function reflectChipNotice(status: NodeStatusInfo): void {
+  let seen: string | null = null;
+  try {
+    seen = localStorage.getItem(CHIP_NOTICE_KEY);
+  } catch {
+    // No storage: show it until OK is pressed in this run.
+  }
+  $("chip-card").hidden =
+    chipNoticeClosed ||
+    !chipNoticeVisible(status.chip_refused, status.rc_trusted_mirror, seen, status.node_tag);
+}
+
+$("chip-ok").addEventListener("click", () => {
+  chipNoticeClosed = true;
+  try {
+    if (lastStatus) localStorage.setItem(CHIP_NOTICE_KEY, lastStatus.node_tag);
+  } catch {
+    // Closed for this run; it may show again on the next.
+  }
+  $("chip-card").hidden = true;
+});
 
 /**
  * What btxd itself is warning about, beyond what the Block checking and chain
