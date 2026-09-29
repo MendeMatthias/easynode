@@ -29,6 +29,7 @@ import {
   chipNoticeVisible,
   setupArgs,
   startChoiceView,
+  switchLaterShown,
 } from "./start-choice";
 import {
   classifyCheckFailure,
@@ -561,6 +562,7 @@ function reflectStartChoice(status: NodeStatusInfo, inProgress: boolean): void {
   const reason = $("choice-full-reason");
   reason.hidden = !view.fullCheckDisabled;
   reason.textContent = view.fullCheckDisabled ? NO_GPU_REASON : "";
+  $("start-choice-switch").hidden = !switchLaterShown(status.full_check_possible);
 }
 
 /** What the setup button sends: the owner's pick, or the default for this

@@ -29,6 +29,15 @@ export function startChoiceView(
   return { selected: picked ?? first, fullCheckDisabled: false };
 }
 
+/** Whether the line under the choices ends "You can switch later in
+ *  Settings.": only where Full check is possible. Settings shows the switch
+ *  only where it is a choice (validation.ts `followRowVisible`), and a machine
+ *  that cannot check blocks follows signatures with no marker and no switch,
+ *  so there the sentence would not be true. */
+export function switchLaterShown(fullCheckPossible: boolean): boolean {
+  return fullCheckPossible;
+}
+
 /** The arguments `begin_setup` takes. */
 export function setupArgs(choice: StartChoice): { choice: StartChoice } {
   return { choice };
