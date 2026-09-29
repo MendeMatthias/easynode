@@ -56,9 +56,12 @@ Usage:
 import argparse
 import base64
 import binascii
+import contextlib
+import io
 import json
 import os
 import re
+import sys
 import tempfile
 
 REPO = "https://github.com/MendeMatthias/EasyBTX-releases/releases/download"
@@ -418,11 +421,101 @@ def self_test():
         with open(os.path.join(d, DEB_FEED_NAME)) as f:
             assert json.load(f) == deb
 
+    # main() itself, the way build-node-feed.sh runs it: every destination is
+    # checked before anything is written, so a refused write never leaves the
+    # other feed published beside it, and "wrote" is printed only for a file
+    # that was written.
+    with tempfile.TemporaryDirectory() as d:
+        _self_test_main(d, pub)
+
     # The REAL embedded pubkey must parse, so a conf change cannot silently
     # disable key-id verification.
     real = pubkey_key_id(load_pubkey_from_conf())
     assert len(real) == 8, real
     print(f"gen-node-feed self-test OK (app trusts key id {real[::-1].hex().upper()})")
+
+
+def _run_main(argv):
+    """main() as the command line runs it: what it printed, and what it raised."""
+    out = io.StringIO()
+    saved = sys.argv
+    sys.argv = ["gen-node-feed.py"] + argv
+    try:
+        with contextlib.redirect_stdout(out):
+            main()
+        return out.getvalue(), None
+    except (ValueError, OSError) as e:
+        return out.getvalue(), e
+    finally:
+        sys.argv = saved
+
+
+def _self_test_main(d, pub):
+    """The --self-test cases that run main(), in the empty directory `d`."""
+    v = "0.7.0"
+    conf = os.path.join(d, "tauri.conf.json")
+    with open(conf, "w") as f:
+        json.dump({"plugins": {"updater": {"pubkey": pub}}}, f)
+
+    def sig_file(name, sig):
+        path = os.path.join(d, name)
+        with open(path, "w") as f:
+            f.write(sig)
+        return path
+
+    good_linux = sig_file("linux.sig", _named("linux-x86_64", v))
+    bad_linux = sig_file("linux-bad.sig", _named("linux-x86_64", "0.6.32"))
+    good_deb = sig_file("deb.sig", _named(DEB_KEY, v))
+    base = ["--version", v, "--tag", f"node-v{v}", "--pubkey-conf", conf]
+
+    def folder(name):
+        path = os.path.join(d, name)
+        os.makedirs(path)
+        return path
+
+    def contents(dirpath):
+        """Every regular file in `dirpath`, by name, with what it holds."""
+        out = {}
+        for n in sorted(os.listdir(dirpath)):
+            p = os.path.join(dirpath, n)
+            if os.path.isfile(p):
+                with open(p) as f:
+                    out[n] = f.read()
+        return out
+
+    def refused(argv, why):
+        """main() refuses `argv`, writes nothing, and never says it wrote."""
+        out_dir = os.path.dirname(argv[argv.index("--out") + 1])
+        before = contents(out_dir)
+        printed, err = _run_main(base + argv)
+        assert err is not None, f"{why}: main() accepted {argv}"
+        assert "wrote" not in printed, f"{why}: printed {printed!r}"
+        assert contents(out_dir) == before, f"{why}: {sorted(contents(out_dir))}"
+        return err
+
+    feeds = folder("feeds")
+    main_out = os.path.join(feeds, MAIN_FEED_NAME)
+    deb_out = os.path.join(feeds, DEB_FEED_NAME)
+
+    # A bad AppImage signature beside a good .deb one: neither feed is written.
+    refused(["--linux-sig", bad_linux, "--deb-sig", good_deb, "--out", main_out],
+            "a bad --linux-sig")
+    # --out mistyped as the .deb's feed: refused before the .deb's is written.
+    refused(["--linux-sig", good_linux, "--deb-sig", good_deb, "--out", deb_out],
+            "--out node-deb.json with --deb-sig")
+    refused(["--linux-sig", good_linux, "--out", deb_out], "--out node-deb.json")
+    assert os.listdir(feeds) == [], os.listdir(feeds)
+
+    # Both feeds, written once and read back.
+    printed, err = _run_main(base + ["--linux-sig", good_linux, "--deb-sig", good_deb,
+                                     "--out", main_out])
+    assert err is None, err
+    assert sorted(os.listdir(feeds)) == sorted([DEB_FEED_NAME, MAIN_FEED_NAME]), os.listdir(feeds)
+    assert f"wrote {deb_out}" in printed and f"wrote {main_out}" in printed, printed
+    with open(main_out) as f:
+        assert sorted(json.load(f)["platforms"]) == ["linux-x86_64"]
+    with open(deb_out) as f:
+        assert sorted(json.load(f)["platforms"]) == [DEB_KEY]
 
 
 def _read(path):
@@ -468,8 +561,15 @@ def main():
             _read(a.win_sig) if a.win_sig else None,
             pubkey=pubkey,
         )
+    # And so is every destination: a refused write must not leave the other
+    # feed written beside it (a mistyped `--out .../node-deb.json` used to
+    # write the .deb's feed and then refuse the main one).
+    deb_out = os.path.join(os.path.dirname(os.path.abspath(a.out)), DEB_FEED_NAME)
+    for path, f in ((deb_out, deb), (a.out, feed)):
+        problem = f and feed_problem(path, f)
+        if problem:
+            raise ValueError(problem)
     if deb:
-        deb_out = os.path.join(os.path.dirname(os.path.abspath(a.out)), DEB_FEED_NAME)
         write_feed(deb_out, deb)
         print(f"wrote {deb_out}: version {deb['version']}, platform {DEB_KEY}")
     if not feed:
