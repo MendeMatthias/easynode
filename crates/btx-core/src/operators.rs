@@ -43,17 +43,23 @@ pub struct OperatorList {
 
 impl OperatorList {
     pub fn new(operators: Vec<Operator>) -> Result<Self, String> {
-        let mut seen_names: Vec<&str> = Vec::new();
+        let mut seen_names: Vec<String> = Vec::new();
         let mut seen_keys: Vec<&[u8; 33]> = Vec::new();
         for op in &operators {
-            let name = op.name.trim();
-            if name.is_empty() {
+            let name = op.name.as_str();
+            if name.trim().is_empty() {
                 return Err("an operator has no name".into());
             }
-            if seen_names.contains(&name) {
+            if name.trim() != name {
+                return Err(format!("operator name {name:?} has surrounding whitespace"));
+            }
+            // Case-insensitive: "Mende" and "mende" would be indistinguishable
+            // on screen and in a log line, so they are the same operator.
+            let lower = name.to_ascii_lowercase();
+            if seen_names.contains(&lower) {
                 return Err(format!("operator {name} is listed twice"));
             }
-            seen_names.push(name);
+            seen_names.push(lower);
             if op.keys.is_empty() {
                 return Err(format!("operator {name} has no key"));
             }
@@ -316,9 +322,13 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Hex (either case) to bytes; `None` on an odd length or a non-hex character.
+/// Hex (either case) to bytes; `None` on an odd length or a non-hex
+/// character. Checked explicitly, character by character: `u8::from_str_radix`
+/// alone also accepts a leading `+` or `-` (so "+9" would parse the same as
+/// "09"), which would let a string that is not actually hex reach the same
+/// bytes as a real key.
 pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     (0..s.len())
@@ -374,7 +384,11 @@ mod tests {
             .chain(f.mirror_pins.iter())
         {
             assert_eq!(k.len(), 66, "{k}");
-            assert_eq!(*k, k.to_ascii_lowercase(), "lowercase hex: {k}");
+            assert!(
+                k.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "every character is 0-9 or a-f: {k}"
+            );
             assert!(matches!(&k[..2], "02" | "03"), "compressed: {k}");
             assert!(parse_key(k).is_some(), "on the curve: {k}");
             n += 1;
@@ -452,6 +466,15 @@ mod tests {
             ],
             "list order, not signing order"
         );
+        assert_eq!(
+            list.distinct_operators(&[key(P), key(MENDE)]),
+            vec!["Mende".to_string()],
+            "an unlisted key is ignored, the listed one still counts"
+        );
+        assert!(
+            list.distinct_operators(&[key(P)]).is_empty(),
+            "no listed key at all gives no operator"
+        );
     }
 
     #[test]
@@ -472,8 +495,26 @@ mod tests {
             parse_operator_file(&extra).is_err(),
             "no field the app does not know"
         );
+        let extra_in_entry = OPERATORS_JSON.replacen(
+            "\"name\": \"jpp\",",
+            "\"name\": \"jpp\",\n      \"weight\": 1,",
+            1,
+        );
+        assert!(
+            parse_operator_file(&extra_in_entry).is_err(),
+            "no field an operator entry does not know either"
+        );
         let off_curve = OPERATORS_JSON.replace(JPP, &format!("02{}", "0".repeat(64)));
         assert!(parse_operator_file(&off_curve).is_err());
+        // Sabotage: a '+' reads the same as a leading zero to
+        // u8::from_str_radix ("+9" and "09" are both 9), so a key using one
+        // must not quietly decode to the same bytes as the real key.
+        let sneaky_mende = MENDE.replacen("09", "+9", 1);
+        let plus_masquerade = OPERATORS_JSON.replacen(MENDE, &sneaky_mende, 1);
+        assert!(
+            parse_operator_file(&plus_masquerade).is_err(),
+            "a '+' must not masquerade as lowercase hex"
+        );
         let no_pins = format!(
             r#"{{"schema": 1, "operators": [{{"name": "a", "keys": ["{MENDE}"]}}], "mirror_pins": []}}"#
         );
@@ -498,6 +539,15 @@ mod tests {
         assert!(two("a", "b").is_ok());
         assert!(two("a", "a").is_err(), "a name twice");
         assert!(two("a", " ").is_err(), "an empty name");
+        assert!(
+            two("Mende", "mende").is_err(),
+            "a name twice, differing only in case"
+        );
+        let padded = OperatorList::new(vec![Operator {
+            name: "a ".into(),
+            keys: vec![key(P)],
+        }]);
+        assert!(padded.is_err(), "a name must equal its own trim");
         let shared = OperatorList::new(vec![
             Operator {
                 name: "a".into(),
@@ -536,6 +586,10 @@ mod tests {
         assert!(
             parse_key(&format!("{}zz", &MENDE[..64])).is_none(),
             "not hex"
+        );
+        assert!(
+            parse_key(&MENDE.replacen("09", "+9", 1)).is_none(),
+            "a leading sign is not a hex digit, whatever from_str_radix thinks"
         );
     }
 
