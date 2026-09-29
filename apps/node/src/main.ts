@@ -2299,6 +2299,13 @@ async function updateCheck(manual = false): Promise<void> {
     downloaded = true;
     await update.install();
   } catch (e) {
+    // The plugin frees the downloaded package only after an install that
+    // succeeded, so a failed one would hold it (150-470 MB) until the app
+    // quits. Freed here, fire-and-forget: a failure to free is a console
+    // warning and changes nothing else.
+    void update.close().catch((err) =>
+      console.warn("update-check: could not free the downloaded package", err),
+    );
     if (downloaded) {
       void invoke("remember_failed_update", { version: update.version }).catch((err) =>
         console.warn("update-check: could not remember the failed version", err),

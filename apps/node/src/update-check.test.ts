@@ -572,6 +572,24 @@ describe("updateCheck() keeps a failed install from downloading again, and a pre
     expect(body.slice(install, remember)).toMatch(/if \(downloaded\) \{\s*void $/);
   });
 
+  it("frees the downloaded package when the download or the install fails", () => {
+    // The plugin frees the package (150-470 MB) only after an install that
+    // succeeded. Without the close, every failed launch check or press holds
+    // it in memory until the app quits.
+    const install = body.indexOf("await update.install()");
+    const caught = body.indexOf("} catch (e) {", install);
+    expect(caught).toBeGreaterThan(install);
+    const failed = body.slice(caught, body.indexOf("return;", caught));
+    expect(failed).toMatch(/void update\.close\(\)\.catch\(/);
+    // And the calls around it keep their order: remember, paint, record.
+    const remember = failed.indexOf('invoke("remember_failed_update"');
+    const paint = failed.indexOf('paintUpdateProgress("install-failed"');
+    const record = failed.indexOf('branch: "install-failed"');
+    expect(remember, "remember inside the catch").toBeGreaterThan(-1);
+    expect(remember, "remember before paint").toBeLessThan(paint);
+    expect(paint, "paint before record").toBeLessThan(record);
+  });
+
   it("reads why an offer was declined before the record takes it, and shows it", () => {
     const peek = body.indexOf("await peekUpdateRefusal()");
     expect(peek).toBeGreaterThan(-1);
