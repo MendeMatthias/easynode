@@ -1131,8 +1131,10 @@ anything is signed, published or flipped live:
 - `curl -s https://easybtx.com/updater/latest-node.json | jq .version`
 - On a Linux release: `curl -s https://easybtx.com/updater/node-deb.json | jq '.version, (.platforms | keys)'`
   prints the new version and `["linux-x86_64-deb"]`, nothing else.
-- `curl -s -o /dev/null -w '%{http_code}\n' https://easybtx.com/updater/node-appimage.json`
-  prints `404`. Anything in 2xx or 3xx stops every 0.7.0+ AppImage from updating.
+- `for t in appimage app nsis; do curl -s -o /dev/null -w "node-$t.json %{http_code}\n" https://easybtx.com/updater/node-$t.json; done`
+  prints `404` for each: the AppImage's, the Mac app's and the Windows
+  installer's typed feeds. Anything in 2xx or 3xx for one of them stops every
+  0.7.0+ copy of that kind from updating.
 - Confirm the released asset bytes match what was signed (sha256 the downloaded
   file against the local build).
 - Observe a real upgrade: quit and reopen an older app — the check fires on
