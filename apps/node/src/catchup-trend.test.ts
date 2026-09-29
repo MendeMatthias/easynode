@@ -10,11 +10,14 @@ import {
   TREND_WINDOW_MS,
   type CatchupSample,
   TOO_SLOW_FOR_THE_CHAIN_PER_HOUR,
+  CHECKING_CATCHUP,
   cannotCatchUp,
   catchupLine,
   catchupPace,
   catchupTrend,
+  paceSentence,
   pushSample,
+  staleCard,
   timeToGo,
 } from "./catchup-trend";
 
@@ -346,5 +349,95 @@ describe("cannotCatchUp", () => {
       { at: T0 + min(20), behind: 5_004, height: 220_009 },
     ];
     expect(cannotCatchUp(s, T0 + min(20))).toBe(27);
+  });
+});
+
+// The chain card's stale sentence (docs/decisions/2026-09-29-quick-start-full-
+// check-and-progress.md, section 3). btx2 and btx3 on 28 September read "The
+// node is not following the chain" under "about 5 days to go".
+const STALE =
+  "The newest block this node has is 200 hours old. That is measured against the clock, not " +
+  "against what its peers report, so it holds even when every peer agrees with it. The node is " +
+  "not following the chain.";
+
+// A node from 219,000 closing its gap at about 94 blocks an hour.
+const closingNode = (): CatchupSample[] => [
+  { at: T0, behind: 10_800, height: 219_000 },
+  { at: T0 + min(10), behind: 10_769, height: 219_038 },
+  { at: T0 + min(20), behind: 10_737, height: 219_076 },
+];
+
+describe("staleCard", () => {
+  it("says nothing when the tip is not stale", () => {
+    expect(staleCard(null, 10_812, slowNode(), T0 + min(30))).toBeNull();
+  });
+
+  it("row 1: behind and closing, no stale sentence at all", () => {
+    expect(staleCard(STALE, 10_737, closingNode(), T0 + min(20))).toBeNull();
+  });
+
+  it("row 2: behind before the trend is measured, neutral and not amber", () => {
+    expect(staleCard(STALE, 7_500, [], T0)).toEqual({ message: CHECKING_CATCHUP, tone: "neutral" });
+    const firstMinutes = [
+      { at: T0, behind: 7_500, height: 225_927 },
+      { at: T0 + min(3), behind: 7_420, height: 226_010 },
+    ];
+    expect(staleCard(STALE, 7_420, firstMinutes, T0 + min(3))).toEqual({
+      message: "Checking whether your node is catching up...",
+      tone: "neutral",
+    });
+  });
+
+  it("row 3: behind and not closing, amber with the pace", () => {
+    expect(staleCard(STALE, 10_812, slowNode(), T0 + min(30))).toEqual({
+      message: `${STALE} It adds about 8 blocks an hour while the network adds about ${CHAIN_BLOCKS_PER_HOUR}.`,
+      tone: "amber",
+    });
+  });
+
+  it("row 4: no newer block known and the newest is old, today's sentence unchanged", () => {
+    expect(staleCard(STALE, 0, [], T0)).toEqual({ message: STALE, tone: "amber" });
+    // A closing history does not soften it: with nothing newer known, an old
+    // tip is the real "not following the chain".
+    expect(staleCard(STALE, 0, closingNode(), T0 + min(20))).toEqual({ message: STALE, tone: "amber" });
+    expect(staleCard(STALE, null, [], T0)).toEqual({ message: STALE, tone: "amber" });
+  });
+
+  it("turns amber when a closing gap stops closing", () => {
+    const s = closingNode();
+    expect(staleCard(STALE, 10_737, s, T0 + min(20))).toBeNull();
+    s.push({ at: T0 + min(26), behind: 10_738, height: 219_081 });
+    s.push({ at: T0 + min(31), behind: 10_739, height: 219_086 });
+    // The last ten minutes closed nothing. Over the hour it still added more
+    // than the chain, so the pace is left out rather than contradict the card.
+    expect(staleCard(STALE, 10_739, s, T0 + min(31))).toEqual({ message: STALE, tone: "amber" });
+  });
+
+  it("starts over after a restart", () => {
+    expect(staleCard(STALE, 10_812, slowNode(), T0 + min(30))?.tone).toBe("amber");
+    // The window clears its samples on a stop or a start; the first reading
+    // after it cannot judge anything yet.
+    const after = pushSample([], { at: T0 + min(33), behind: 10_815, height: 219_005 }, T0 + min(33));
+    expect(staleCard(STALE, 10_815, after, T0 + min(33))).toEqual({
+      message: CHECKING_CATCHUP,
+      tone: "neutral",
+    });
+  });
+});
+
+describe("paceSentence", () => {
+  it("is what the catch-up line and the stale card both say", () => {
+    const pace = catchupPace(slowNode(), T0 + min(30));
+    expect(paceSentence(pace)).toBe(
+      `It adds about 8 blocks an hour while the network adds about ${CHAIN_BLOCKS_PER_HOUR}.`,
+    );
+    expect(catchupLine(10_812, slowNode(), T0 + min(30))).toBe(
+      `Your node is live but not catching up: 10,812 blocks behind. ${paceSentence(pace)}`,
+    );
+    expect(paceSentence(null)).toBeNull();
+    expect(paceSentence({ addedPerHour: 50, closingPerHour: 0, spanMs: min(60) })).toBeNull();
+    expect(paceSentence({ addedPerHour: 0, closingPerHour: -40, spanMs: min(20) })).toBe(
+      "It has added no blocks in the last 20 minutes.",
+    );
   });
 });

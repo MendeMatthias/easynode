@@ -163,27 +163,74 @@ export const cannotCatchUp = (samples: CatchupSample[], now: number): number | n
   return added < TOO_SLOW_FOR_THE_CHAIN_PER_HOUR ? added : null;
 };
 
+/** The pace of a node that is not catching up, in one sentence: what it adds
+ *  an hour against what the chain adds, or that it added nothing. Null before
+ *  the pace is measured, and when the hour's pace is faster than the chain's,
+ *  which under "not catching up" would read as a bug. The catch-up line and
+ *  the stale card both say it, so they can never disagree. */
+export const paceSentence = (pace: CatchupPace | null): string | null => {
+  if (!pace) return null;
+  const added = Math.round(pace.addedPerHour);
+  if (added > CHAIN_BLOCKS_PER_HOUR) return null;
+  if (added < 1) return `It has added no blocks in the last ${Math.round(pace.spanMs / 60_000)} minutes.`;
+  return (
+    `It adds about ${added} block${added === 1 ? "" : "s"} an hour ` +
+    `while the network adds about ${CHAIN_BLOCKS_PER_HOUR}.`
+  );
+};
+
 export const catchupLine = (behind: number, samples: CatchupSample[], now: number): string => {
   const n = behind.toLocaleString("en-US");
   const { trend, pace } = judge(samples, now);
   if (trend === "stalled") {
-    const plain = `Your node is live but not catching up. It is ${n} blocks behind and the gap is not closing.`;
-    if (!pace) return plain;
-    const added = Math.round(pace.addedPerHour);
-    if (added > CHAIN_BLOCKS_PER_HOUR) return plain;
-    const head = `Your node is live but not catching up: ${n} blocks behind.`;
-    if (added < 1) {
-      return `${head} It has added no blocks in the last ${Math.round(pace.spanMs / 60_000)} minutes.`;
-    }
-    return (
-      `${head} It adds about ${added} block${added === 1 ? "" : "s"} an hour ` +
-      `while the network adds about ${CHAIN_BLOCKS_PER_HOUR}.`
-    );
+    const said = paceSentence(pace);
+    return said
+      ? `Your node is live but not catching up: ${n} blocks behind. ${said}`
+      : `Your node is live but not catching up. It is ${n} blocks behind and the gap is not closing.`;
   }
   const eta = trend === "converging" && pace ? timeToGo(behind, pace.closingPerHour) : null;
   return eta
     ? `Your node is live, still catching up — ${n} blocks behind, ${eta} to go at this pace`
     : `Your node is live, still catching up — ${n} blocks behind`;
+};
+
+/** The neutral line for a node that is behind before its trend is measured. */
+export const CHECKING_CATCHUP = "Checking whether your node is catching up...";
+
+/** What the chain card says about an old tip. `amber` is a warning; `neutral`
+ *  is said in the card's quiet colours. */
+export type StaleCard = { message: string; tone: "amber" | "neutral" };
+
+/** The chain card's stale sentence, from the trend and from what the node
+ *  knows (docs/decisions/2026-09-29-quick-start-full-check-and-progress.md,
+ *  section 3).
+ *
+ *  `tipStaleMessage` is Rust's sentence, present only when the newest block is
+ *  more than 2 hours old by the clock. `behind` is how many blocks the node
+ *  knows of beyond its tip (headers minus blocks), or null when the phase
+ *  carries no height. On 28 September btx2 and btx3 read "The node is not
+ *  following the chain" under "about 5 days to go": a node closing a gap of
+ *  days has an old tip by construction, and that sentence is for a node that
+ *  knows of nothing newer.
+ *
+ *  - behind, gap closing: no stale sentence; the catch-up line says it all.
+ *  - behind, trend not measured yet: neutral, "Checking whether your node is
+ *    catching up...".
+ *  - behind, gap not closing: amber, Rust's sentence and the pace.
+ *  - no newer block known: amber, Rust's sentence unchanged. */
+export const staleCard = (
+  tipStaleMessage: string | null,
+  behind: number | null,
+  samples: CatchupSample[],
+  now: number,
+): StaleCard | null => {
+  if (!tipStaleMessage) return null;
+  if (behind === null || !(behind > 0)) return { message: tipStaleMessage, tone: "amber" };
+  const { trend, pace } = judge(samples, now);
+  if (trend === "converging") return null;
+  if (trend === "unknown") return { message: CHECKING_CATCHUP, tone: "neutral" };
+  const said = paceSentence(pace);
+  return { message: said ? `${tipStaleMessage} ${said}` : tipStaleMessage, tone: "amber" };
 };
 
 /** Keep the sample list bounded and in order. The caller holds it across
