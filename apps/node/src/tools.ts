@@ -3,7 +3,7 @@
 // is set as text, never HTML.
 
 import { invoke } from "@tauri-apps/api/core";
-import { History, RestartArm, capForDisplay } from "./tools-history";
+import { History, ReportCopy, RestartArm, capForDisplay } from "./tools-history";
 
 type ConsoleAnswer =
   | { kind: "output"; text: string }
@@ -44,14 +44,17 @@ function windowLines(): string[] {
   return text ? [text] : [];
 }
 
-async function copy(text: string, btn: HTMLButtonElement, label: string): Promise<void> {
+/** Call at the top of a click handler, before any await: WebKit allows the
+ * clipboard write only inside the click itself. `label` is read when the
+ * button goes back, so a label that changed meanwhile is the one shown. */
+async function copy(text: string, btn: HTMLButtonElement, label: string | (() => string)): Promise<void> {
   try {
     await navigator.clipboard.writeText(text);
     btn.textContent = "Copied";
   } catch {
     btn.textContent = "Couldn't copy";
   }
-  setTimeout(() => (btn.textContent = label), 1500);
+  setTimeout(() => (btn.textContent = typeof label === "function" ? label() : label), 1500);
 }
 
 function say(text: string): void {
@@ -64,6 +67,9 @@ export function initTools(): void {
   const overlay = $("tools-overlay");
   const history = new History(50);
   const restartArm = new RestartArm();
+  const reportCopy = new ReportCopy();
+  /** Bumped when Tools closes, so a report still being built then is dropped. */
+  let reportRun = 0;
   let pendingToken: string | null = null;
   let restartArmTimer: ReturnType<typeof setTimeout> | undefined;
   /** A restart this window started is still running. Rust refuses a second
@@ -78,13 +84,28 @@ export function initTools(): void {
     if (!restartInFlight) $<HTMLButtonElement>("tools-restart").textContent = "Restart node";
   };
 
+  /** Back to "Copy diagnostics": the next open builds a fresh report, and the
+   * old one is not left on screen under a button that no longer copies it. */
+  const resetReport = () => {
+    reportRun += 1;
+    reportCopy.reset();
+    const btn = $<HTMLButtonElement>("tools-diag-btn");
+    btn.textContent = reportCopy.label;
+    btn.disabled = false;
+    const pre = $("tools-diag");
+    pre.textContent = "";
+    pre.hidden = true;
+  };
+
   /** The single close path for every way the overlay can close, so nothing
-   * (an armed restart, a pending confirm) survives to the next open. */
+   * (an armed restart, a pending confirm, a built report) survives to the
+   * next open. */
   const closeTools = () => {
     overlay.hidden = true;
     resetRestartArm();
     pendingToken = null;
     $("tools-confirm").hidden = true;
+    resetReport();
   };
 
   const open = async () => {
@@ -184,20 +205,32 @@ export function initTools(): void {
     btn.setAttribute("aria-expanded", "true");
   });
 
-  $("tools-diag-btn").addEventListener("click", async () => {
-    const btn = $<HTMLButtonElement>("tools-diag-btn");
-    const pre = $("tools-diag");
+  // Copy diagnostics: the first click builds the report and shows it, the
+  // second copies it. See ReportCopy for why it takes two.
+  const buildReport = async (btn: HTMLButtonElement) => {
+    const run = reportRun;
     btn.disabled = true;
     try {
       const text = await invoke<string>("tools_diagnostics", { statusLine: statusLine(), windowLines: windowLines() });
+      if (run !== reportRun) return; // Tools closed meanwhile
+      const pre = $("tools-diag");
       pre.textContent = text;
       pre.hidden = false;
-      await copy(text, btn, "Copy diagnostics");
+      reportCopy.ready(text);
     } catch (e) {
-      say(String(e));
+      if (run === reportRun) say(String(e));
     } finally {
-      btn.disabled = false;
+      if (run === reportRun) {
+        btn.disabled = false;
+        btn.textContent = reportCopy.label;
+      }
     }
+  };
+  $("tools-diag-btn").addEventListener("click", () => {
+    const btn = $<HTMLButtonElement>("tools-diag-btn");
+    const text = reportCopy.text;
+    if (text !== null) void copy(text, btn, () => reportCopy.label);
+    else void buildReport(btn);
   });
 
   // The command window.

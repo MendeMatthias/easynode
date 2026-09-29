@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { History, RestartArm, capForDisplay, DISPLAY_LIMIT } from "./tools-history";
+import { History, ReportCopy, RestartArm, capForDisplay, DISPLAY_LIMIT } from "./tools-history";
 
 describe("History", () => {
   it("keeps the last 50 and recalls them with up and down", () => {
@@ -49,6 +49,29 @@ describe("RestartArm", () => {
     arm.disarm(); // the overlay closed
     expect(arm.armed).toBe(false);
     expect(arm.click()).toBe(false);
+  });
+});
+
+describe("ReportCopy", () => {
+  it("builds on the first click and says so on the button", () => {
+    const r = new ReportCopy();
+    expect(r.label).toBe("Copy diagnostics");
+    expect(r.text).toBeNull(); // nothing to copy yet: this click builds
+  });
+  it("copies the report already built on the second click", () => {
+    const r = new ReportCopy();
+    r.ready("easyNode diagnostics, 2026-09-29 14:05 UTC");
+    expect(r.label).toBe("Copy report");
+    expect(r.text).toBe("easyNode diagnostics, 2026-09-29 14:05 UTC");
+    expect(r.text).toBe("easyNode diagnostics, 2026-09-29 14:05 UTC"); // and again
+  });
+  it("starts over when Tools closes", () => {
+    const r = new ReportCopy();
+    r.ready("an old report");
+    expect(r.text).toBe("an old report");
+    r.reset();
+    expect(r.label).toBe("Copy diagnostics");
+    expect(r.text).toBeNull();
   });
 });
 

@@ -74,6 +74,37 @@ export class RestartArm {
   }
 }
 
+/**
+ * Copy diagnostics, in two clicks. Building the report takes seconds, and
+ * WebKit (the webview on macOS and Linux) only lets a page write the
+ * clipboard inside the click that asked for it, not seconds later. So the
+ * first click builds the report and shows it, and the second click copies
+ * the text already built, inside its own click.
+ */
+export class ReportCopy {
+  private built: string | null = null;
+
+  /** The button's label: what the next click does. */
+  get label(): string {
+    return this.built === null ? "Copy diagnostics" : "Copy report";
+  }
+
+  /** The report to copy on this click, or null when this click builds it. */
+  get text(): string | null {
+    return this.built;
+  }
+
+  /** The report is built and shown. */
+  ready(text: string): void {
+    this.built = text;
+  }
+
+  /** Tools closed: the next click builds a fresh report. */
+  reset(): void {
+    this.built = null;
+  }
+}
+
 // The note counts against DISPLAY_LIMIT itself, so the shown text (content
 // plus note) never exceeds the cap and is always shorter than the original.
 const TRUNCATION_NOTE = "\n\n(The answer is longer than this window shows. Copy takes the whole answer.)";
