@@ -18,6 +18,7 @@
 
 pub mod attested_snapshot;
 pub mod backend;
+pub mod catchup_assist;
 pub mod checkin;
 pub mod console_policy;
 pub mod datadir;
