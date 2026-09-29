@@ -9,16 +9,21 @@ import {
   TREND_MIN_SPAN_MS,
   TREND_WINDOW_MS,
   type CatchupSample,
+  type TrendPhase,
+  type TrendReading,
   TOO_SLOW_FOR_THE_CHAIN_PER_HOUR,
   CHECKING_CATCHUP,
   cannotCatchUp,
   catchupLine,
   catchupPace,
   catchupTrend,
+  chainCardMessage,
   paceSentence,
   pushSample,
+  recordReading,
   staleCard,
   timeToGo,
+  trendReading,
 } from "./catchup-trend";
 
 const T0 = 1_789_500_000_000;
@@ -367,61 +372,266 @@ const closingNode = (): CatchupSample[] => [
   { at: T0 + min(20), behind: 10_737, height: 219_076 },
 ];
 
+// What the stale card is told about the phase: a live node this many blocks
+// behind, a node syncing blocks, one fetching headers only, one not running.
+const live = (behind: number): TrendReading =>
+  trendReading({ phase: "ready", height: 219_076, blocks_behind: behind }, T0);
+const syncingAt = (height: number, headers: number): TrendReading =>
+  trendReading({ phase: "syncing", height, headers }, T0);
+const HEADERS_ONLY = trendReading({ phase: "syncing", height: 0, headers: 180_000 }, T0);
+const STOPPED = trendReading({ phase: "stopped" }, T0);
+
+/** Feed the phases through the poll's own path, one reading per entry. */
+const feed = (readings: [number, TrendPhase][]): CatchupSample[] =>
+  readings.reduce<CatchupSample[]>((s, [at, phase]) => recordReading(s, trendReading(phase, at), at), []);
+
+describe("trendReading", () => {
+  it("records a live node's gap, as the catch-up line has always read it", () => {
+    expect(trendReading({ phase: "ready", height: 226_000, blocks_behind: 7_400 }, T0)).toEqual({
+      kind: "live",
+      behind: 7_400,
+      sample: { at: T0, behind: 7_400, height: 226_000 },
+    });
+  });
+
+  it("records a syncing node too, marked, with its headers beyond its blocks as the gap", () => {
+    expect(trendReading({ phase: "syncing", height: 130_000, headers: 226_000 }, T0)).toEqual({
+      kind: "syncing",
+      behind: 96_000,
+      sample: { at: T0, behind: 96_000, height: 130_000, syncing: true },
+    });
+  });
+
+  it("records nothing while only headers are fetched, and keeps what there is", () => {
+    // Headers grow while the height stays 0: as a gap that reads as stalled.
+    expect(HEADERS_ONLY).toEqual({ kind: "headers" });
+    expect(trendReading({ phase: "syncing", height: 0, headers: 0 }, T0)).toEqual({ kind: "headers" });
+    const kept = closingNode();
+    expect(recordReading(kept, HEADERS_ONLY, T0 + min(21))).toBe(kept);
+  });
+
+  it("starts over on a stop, an error or a fresh start", () => {
+    for (const phase of ["stopped", "error", "starting", "loading_snapshot", "warming"] as const) {
+      expect(trendReading({ phase }, T0)).toEqual({ kind: "stopped" });
+    }
+    expect(recordReading(closingNode(), STOPPED, T0 + min(21))).toEqual([]);
+  });
+
+  it("pushes a reading's sample like any other", () => {
+    const at = T0 + min(21);
+    const reading = trendReading({ phase: "syncing", height: 130_000, headers: 226_000 }, at);
+    expect(recordReading([], reading, at)).toEqual([{ at, behind: 96_000, height: 130_000, syncing: true }]);
+  });
+});
+
 describe("staleCard", () => {
   it("says nothing when the tip is not stale", () => {
-    expect(staleCard(null, 10_812, slowNode(), T0 + min(30))).toBeNull();
+    expect(staleCard(null, live(10_812), slowNode(), T0 + min(30))).toBeNull();
   });
 
   it("row 1: behind and closing, no stale sentence at all", () => {
-    expect(staleCard(STALE, 10_737, closingNode(), T0 + min(20))).toBeNull();
+    expect(staleCard(STALE, live(10_737), closingNode(), T0 + min(20))).toBeNull();
   });
 
   it("row 2: behind before the trend is measured, neutral and not amber", () => {
-    expect(staleCard(STALE, 7_500, [], T0)).toEqual({ message: CHECKING_CATCHUP, tone: "neutral" });
+    expect(staleCard(STALE, live(7_500), [], T0)).toEqual({ message: CHECKING_CATCHUP, tone: "neutral" });
     const firstMinutes = [
       { at: T0, behind: 7_500, height: 225_927 },
       { at: T0 + min(3), behind: 7_420, height: 226_010 },
     ];
-    expect(staleCard(STALE, 7_420, firstMinutes, T0 + min(3))).toEqual({
+    expect(staleCard(STALE, live(7_420), firstMinutes, T0 + min(3))).toEqual({
       message: "Checking whether your node is catching up...",
       tone: "neutral",
     });
   });
 
   it("row 3: behind and not closing, amber with the pace", () => {
-    expect(staleCard(STALE, 10_812, slowNode(), T0 + min(30))).toEqual({
+    expect(staleCard(STALE, live(10_812), slowNode(), T0 + min(30))).toEqual({
       message: `${STALE} It adds about 8 blocks an hour while the network adds about ${CHAIN_BLOCKS_PER_HOUR}.`,
       tone: "amber",
     });
   });
 
+  it("row 3 before the pace is measured: amber with today's sentence alone", () => {
+    // The trend reads stalled from four minutes on; the pace needs fifteen,
+    // and a height at both ends. Until then the card says only what it knows.
+    const noHeights = [
+      { at: T0, behind: 90 },
+      { at: T0 + min(8), behind: 92 },
+    ];
+    expect(staleCard(STALE, live(92), noHeights, T0 + min(8))).toEqual({ message: STALE, tone: "amber" });
+    const eightMinutes = [
+      { at: T0, behind: 400, height: 227_312 },
+      { at: T0 + min(8), behind: 405, height: 227_312 },
+    ];
+    expect(catchupPace(eightMinutes, T0 + min(8))).toBeNull();
+    expect(staleCard(STALE, live(405), eightMinutes, T0 + min(8))).toEqual({ message: STALE, tone: "amber" });
+  });
+
   it("row 4: no newer block known and the newest is old, today's sentence unchanged", () => {
-    expect(staleCard(STALE, 0, [], T0)).toEqual({ message: STALE, tone: "amber" });
+    expect(staleCard(STALE, live(0), [], T0)).toEqual({ message: STALE, tone: "amber" });
     // A closing history does not soften it: with nothing newer known, an old
     // tip is the real "not following the chain".
-    expect(staleCard(STALE, 0, closingNode(), T0 + min(20))).toEqual({ message: STALE, tone: "amber" });
-    expect(staleCard(STALE, null, [], T0)).toEqual({ message: STALE, tone: "amber" });
+    expect(staleCard(STALE, live(0), closingNode(), T0 + min(20))).toEqual({ message: STALE, tone: "amber" });
+    expect(staleCard(STALE, STOPPED, [], T0)).toEqual({ message: STALE, tone: "amber" });
   });
 
   it("turns amber when a closing gap stops closing", () => {
     const s = closingNode();
-    expect(staleCard(STALE, 10_737, s, T0 + min(20))).toBeNull();
+    expect(staleCard(STALE, live(10_737), s, T0 + min(20))).toBeNull();
     s.push({ at: T0 + min(26), behind: 10_738, height: 219_081 });
     s.push({ at: T0 + min(31), behind: 10_739, height: 219_086 });
     // The last ten minutes closed nothing. Over the hour it still added more
     // than the chain, so the pace is left out rather than contradict the card.
-    expect(staleCard(STALE, 10_739, s, T0 + min(31))).toEqual({ message: STALE, tone: "amber" });
+    expect(staleCard(STALE, live(10_739), s, T0 + min(31))).toEqual({ message: STALE, tone: "amber" });
   });
 
   it("starts over after a restart", () => {
-    expect(staleCard(STALE, 10_812, slowNode(), T0 + min(30))?.tone).toBe("amber");
+    expect(staleCard(STALE, live(10_812), slowNode(), T0 + min(30))?.tone).toBe("amber");
     // The window clears its samples on a stop or a start; the first reading
     // after it cannot judge anything yet.
     const after = pushSample([], { at: T0 + min(33), behind: 10_815, height: 219_005 }, T0 + min(33));
-    expect(staleCard(STALE, 10_815, after, T0 + min(33))).toEqual({
+    expect(staleCard(STALE, live(10_815), after, T0 + min(33))).toEqual({
       message: CHECKING_CATCHUP,
       tone: "neutral",
     });
+  });
+});
+
+// A syncing node's headers can run far ahead of its blocks on a sync from far
+// back, and keep growing while they do, so its gap can widen while it adds
+// blocks quickly. The card judges it by the blocks it adds: amber only below
+// the chain's 40 an hour, the pace logic a live node already uses.
+describe("staleCard on a syncing node", () => {
+  it("does not turn amber while blocks arrive quickly, however fast the headers grow", () => {
+    // 1,500 blocks in 20 minutes while the headers grew by 6,000.
+    const s = feed(
+      [0, 5, 10, 15, 20].map((m): [number, TrendPhase] => [
+        T0 + min(m),
+        { phase: "syncing", height: 120_000 + 75 * m, headers: 150_000 + 300 * m },
+      ]),
+    );
+    // As a gap it widened by 4,500, which a live node's rule calls stalled.
+    expect(catchupTrend(s, T0 + min(20))).toBe("stalled");
+    expect(staleCard(STALE, syncingAt(121_500, 156_000), s, T0 + min(20))).toBeNull();
+  });
+
+  it("stays neutral until the blocks it adds are measured", () => {
+    const s = feed([
+      [T0, { phase: "syncing", height: 130_000, headers: 226_000 }],
+      [T0 + min(10), { phase: "syncing", height: 130_000, headers: 226_000 }],
+    ]);
+    expect(staleCard(STALE, syncingAt(130_000, 226_000), s, T0 + min(10))).toEqual({
+      message: CHECKING_CATCHUP,
+      tone: "neutral",
+    });
+  });
+
+  it("turns amber when its height stops, once the measuring window has passed", () => {
+    const s = feed(
+      [0, 5, 10, 15, 20].map((m): [number, TrendPhase] => [
+        T0 + min(m),
+        { phase: "syncing", height: 130_000, headers: 226_000 },
+      ]),
+    );
+    expect(staleCard(STALE, syncingAt(130_000, 226_000), s, T0 + min(20))).toEqual({
+      message: `${STALE} It has added no blocks in the last 20 minutes.`,
+      tone: "amber",
+    });
+  });
+
+  it("turns amber on a node adding fewer blocks than the chain, with both rates", () => {
+    // 8 an hour, the node of 2026-09-26, still syncing.
+    const s = feed(
+      [0, 10, 20, 30].map((m, i): [number, TrendPhase] => [
+        T0 + min(m),
+        { phase: "syncing", height: 130_000 + [0, 1, 3, 4][i], headers: 226_000 + [0, 7, 13, 20][i] },
+      ]),
+    );
+    expect(staleCard(STALE, syncingAt(130_004, 226_020), s, T0 + min(30))).toEqual({
+      message: `${STALE} It adds about 8 blocks an hour while the network adds about ${CHAIN_BLOCKS_PER_HOUR}.`,
+      tone: "amber",
+    });
+  });
+
+  it("never turns the header fetch amber", () => {
+    // Every fresh install: the tip is the genesis block, days old by the
+    // clock, while headers are counted and the height stays 0.
+    const s = feed(
+      [0, 10, 20, 40].map((m): [number, TrendPhase] => [
+        T0 + min(m),
+        { phase: "syncing", height: 0, headers: 1_000 * m },
+      ]),
+    );
+    expect(s).toEqual([]);
+    expect(staleCard(STALE, HEADERS_ONLY, s, T0 + min(40))).toEqual({ message: CHECKING_CATCHUP, tone: "neutral" });
+    const noHeadersYet = trendReading({ phase: "syncing", height: 0, headers: 0 }, T0);
+    expect(staleCard(STALE, noHeadersYet, [], T0)).toEqual({ message: CHECKING_CATCHUP, tone: "neutral" });
+  });
+
+  it("leaves a live node's judgement as it was", () => {
+    // Readings taken while syncing sit at both ends of a live node's history
+    // (a run of lost getchainstates reads as syncing, with the background
+    // chainstate's height). They are not part of its gap.
+    const syncing = (at: number): CatchupSample => ({ at, behind: 98_612, height: 131_200, syncing: true });
+    const mixed = [syncing(T0 - min(5)), ...slowNode(), syncing(T0 + min(31))];
+    const now = T0 + min(31);
+    expect(staleCard(STALE, live(10_812), mixed, now)).toEqual({
+      message: `${STALE} It adds about 8 blocks an hour while the network adds about ${CHAIN_BLOCKS_PER_HOUR}.`,
+      tone: "amber",
+    });
+    expect(staleCard(STALE, live(10_812), mixed, now)).toEqual(staleCard(STALE, live(10_812), slowNode(), now));
+    expect(catchupLine(10_812, mixed, now)).toBe(catchupLine(10_812, slowNode(), now));
+    expect(cannotCatchUp(mixed, now)).toBe(8);
+  });
+
+  it("starts a live node's trend afresh when it leaves syncing", () => {
+    // Synced 1,500 blocks from genesis, then the snapshot loaded at 219,000:
+    // read as one gap, that is 217,000 blocks closed in minutes.
+    const s = feed([
+      [T0, { phase: "syncing", height: 1_500, headers: 233_000 }],
+      [T0 + min(10), { phase: "syncing", height: 1_600, headers: 233_007 }],
+      [T0 + min(12), { phase: "ready", height: 219_000, blocks_behind: 14_010 }],
+      [T0 + min(14), { phase: "ready", height: 219_010, blocks_behind: 14_001 }],
+    ]);
+    expect(staleCard(STALE, live(14_001), s, T0 + min(14))).toEqual({ message: CHECKING_CATCHUP, tone: "neutral" });
+    // And no time to go read off that jump.
+    const later = feed([[T0 + min(16), { phase: "ready", height: 219_020, blocks_behind: 13_993 }]]);
+    expect(catchupLine(13_993, [...s, ...later], T0 + min(16))).toBe(
+      "Your node is live, still catching up — 13,993 blocks behind",
+    );
+  });
+});
+
+// Plan decision 1: an amber stale sentence outranks a fork and "behind the
+// signers"; the neutral line is not a verdict, so it yields to both.
+describe("chainCardMessage", () => {
+  const FORK = "A longer chain exists that this node cannot obtain blocks for.";
+  const SIGNERS = "Other nodes have signed blocks this one does not have yet.";
+  const amber = { message: STALE, tone: "amber" as const };
+  const neutral = { message: CHECKING_CATCHUP, tone: "neutral" as const };
+
+  it("puts an amber stale tip first", () => {
+    expect(chainCardMessage(amber, FORK, SIGNERS)).toEqual({ message: STALE, calm: false });
+    expect(chainCardMessage(amber, null, SIGNERS)).toEqual({ message: STALE, calm: false });
+  });
+
+  it("puts a fork before behind the signers", () => {
+    expect(chainCardMessage(null, FORK, SIGNERS)).toEqual({ message: FORK, calm: false });
+    expect(chainCardMessage(null, null, SIGNERS)).toEqual({ message: SIGNERS, calm: false });
+  });
+
+  it("lets the neutral line yield to a fork or behind the signers", () => {
+    expect(chainCardMessage(neutral, FORK, SIGNERS)).toEqual({ message: FORK, calm: false });
+    expect(chainCardMessage(neutral, null, SIGNERS)).toEqual({ message: SIGNERS, calm: false });
+  });
+
+  it("says the neutral line quietly when nothing else is wrong", () => {
+    expect(chainCardMessage(neutral, null, null)).toEqual({ message: CHECKING_CATCHUP, calm: true });
+  });
+
+  it("hides the card when there is nothing to say", () => {
+    expect(chainCardMessage(null, null, null)).toBeNull();
   });
 });
 

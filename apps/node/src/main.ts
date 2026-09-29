@@ -14,10 +14,13 @@ import { followRowVisible, stalledFollowOffer, validationView } from "./validati
 import {
   CHAIN_BLOCKS_PER_HOUR,
   type CatchupSample,
+  type TrendReading,
   cannotCatchUp,
   catchupLine,
-  pushSample,
+  chainCardMessage,
+  recordReading,
   staleCard,
+  trendReading,
 } from "./catchup-trend";
 import { type HistoryCheck, historyCheckView } from "./history-check";
 import {
@@ -1015,23 +1018,16 @@ function renderStatus(status: NodeStatusInfo) {
   lastActive = mode === "ready" || mode === "syncing";
   core?.setActive(lastActive);
 
-  // Record the gap on every poll while the node claims to be ready, so the
-  // wording below can tell a closing gap from a pinned one. Cheap, bounded,
-  // and the only place the sample is available.
-  if (p.phase === "ready") {
-    catchupSamples = pushSample(
-      catchupSamples,
-      { at: Date.now(), behind: p.blocks_behind, height: p.height },
-      Date.now(),
-    );
-  } else if (p.phase !== "syncing") {
-    // A stop, an error or a fresh start invalidates the history: a gap
-    // measured before a restart says nothing about the one after it.
-    catchupSamples = [];
-  }
+  // Record the gap on every poll while the node runs, so the wording below
+  // can tell a closing gap from a pinned one, and a syncing node that adds
+  // blocks from one that has stopped. Cheap, bounded, and the only place the
+  // sample is available. Which phases feed it, with what gap, and which start
+  // it over is catchup-trend.ts `trendReading`.
+  const reading = trendReading(p, Date.now());
+  catchupSamples = recordReading(catchupSamples, reading, Date.now());
 
   // After the sample above, so the stale card judges the trend as it is now.
-  reflectFork(status);
+  reflectFork(status, reading);
   reflectFollowOffer(status);
 
   let height = 0;
@@ -1730,50 +1726,29 @@ function reflectArchiveService(status: NodeStatusInfo): void {
 }
 
 /**
- * A longer chain exists that this node cannot obtain blocks for. Shown in
- * amber beside the height and never guessed: the sentence is btx_core::fork's,
- * the facts are btxd's own getchaintips. Hidden the moment the verdict
- * clears, so a stale alarm never outlives the condition, and hidden on any
- * phase that is not running: a stopped node has no view of the chain to be
- * behind with.
+ * The chain card, one sentence about whether this node follows the chain:
+ * its newest block is hours old by the clock, a longer chain exists that it
+ * cannot obtain blocks for, or it is behind the signers. Amber, and never
+ * guessed: the sentences are Rust's (btx_core::fork, engine_warnings), the
+ * facts btxd's own. Before the catch-up trend is measured it can instead say
+ * "Checking whether your node is catching up..." in the quiet colours, which
+ * is not a verdict and yields to both of the others (catchup-trend.ts
+ * `staleCard` and `chainCardMessage`). Hidden the moment the verdict clears,
+ * so a stale alarm never outlives the condition, and hidden on any phase that
+ * is not running: a stopped node has no view of the chain to be behind with.
  */
-function reflectFork(status: NodeStatusInfo): void {
+function reflectFork(status: NodeStatusInfo, reading: TrendReading): void {
   const card = $("fork-card");
-  const p = status.phase;
-  const running = p.phase === "ready" || p.phase === "syncing";
-  // How many blocks the node knows of beyond its tip: the stale card's
-  // "is behind".
-  const behind =
-    p.phase === "ready"
-      ? p.blocks_behind
-      : p.phase === "syncing"
-        ? Math.max(0, p.headers - p.height)
-        : null;
-  // The stale sentence, judged with the catch-up trend (catchup-trend.ts
-  // `staleCard`): nothing while the gap closes, a neutral line before the
-  // trend is measured, amber with the pace when the gap is not closing, and
-  // Rust's sentence unchanged when the node knows of no newer block.
-  const stale = staleCard(status.tip_stale_message, behind, catchupSamples, Date.now());
-  const amber = stale?.tone === "amber" ? stale.message : null;
-  const neutral = stale?.tone === "neutral" ? stale.message : null;
-  // An amber stale tip outranks a fork verdict. A fork says "there is a better
-  // chain we cannot reach"; a stale tip says "the newest block we have is
-  // hours old however healthy everything else reads", which is the condition
-  // every peer-derived signal in this app is blind to by construction.
-  //
-  // Behind the signers comes after both because it is the earliest and the
-  // least specific: it fires minutes into a split the node cannot see, before
-  // the tip is old enough to be stale, and says less than either once they do.
-  //
-  // The neutral line comes last: it is not a verdict, and both of those are.
-  const message = amber ?? status.fork_message ?? status.behind_signers_message ?? neutral;
-  if (!running || !message) {
+  const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
+  const stale = staleCard(status.tip_stale_message, reading, catchupSamples, Date.now());
+  const shown = chainCardMessage(stale, status.fork_message, status.behind_signers_message);
+  if (!running || !shown) {
     card.hidden = true;
     return;
   }
   card.hidden = false;
-  card.classList.toggle("is-calm", message === neutral);
-  $("fork-msg").textContent = message;
+  card.classList.toggle("is-calm", shown.calm);
+  $("fork-msg").textContent = shown.message;
 }
 
 /** The background check of the snapshot's older history: one line and a thin
