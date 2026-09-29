@@ -46,6 +46,11 @@ Usage:
   gen-node-feed.py --version 0.5.1 --tag node-v0.5.1 \
      --mac-sig <file> --linux-sig <file> --win-sig <file> ... --out latest-node.json
 
+  # A Linux release also passes the .deb's signature. It goes into its own
+  # feed, node-deb.json, written beside --out, and never into latest-node.json:
+  gen-node-feed.py --version 0.6.33 --tag node-v0.6.33 \
+     --linux-sig <file> --deb-sig <file> ... --out latest-node.json
+
   gen-node-feed.py --self-test
 """
 import argparse
@@ -76,6 +81,8 @@ ASSET = {
 DEB_KEY = "linux-x86_64-deb"
 # The keys latest-node.json may carry: every one but the .deb's.
 MAIN_KEYS = tuple(k for k in ASSET if k != DEB_KEY)
+MAIN_FEED_NAME = "latest-node.json"
+DEB_FEED_NAME = "node-deb.json"
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 TAURI_CONF = os.path.join(_HERE, "..", "src-tauri", "tauri.conf.json")
@@ -184,12 +191,16 @@ def _check_sig(target, sig, want_key_id=None, want_name=None):
         )
 
 
-def build_feed(version, tag, notes, pub_date, mac_sig=None, linux_sig=None,
-               win_sig=None, pubkey=None):
+def _check_version_tag(version, tag):
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError(f"version must be X.Y.Z, got {version!r}")
     if version not in tag:
         raise ValueError(f"tag {tag!r} does not contain version {version!r}")
+
+
+def build_feed(version, tag, notes, pub_date, mac_sig=None, linux_sig=None,
+               win_sig=None, pubkey=None):
+    _check_version_tag(version, tag)
     want = pubkey_key_id(pubkey) if pubkey else None
     sigs = {
         "darwin-aarch64": mac_sig,
@@ -210,6 +221,48 @@ def build_feed(version, tag, notes, pub_date, mac_sig=None, linux_sig=None,
         url = f"{REPO}/{tag}/{ASSET[target].format(v=version)}"
         platforms[target] = {"signature": sig.strip(), "url": url}
     return {"version": version, "notes": notes, "pub_date": pub_date, "platforms": platforms}
+
+
+def build_deb_feed(version, tag, notes, pub_date, deb_sig, pubkey=None):
+    """node-deb.json: the feed only a .deb install reads, with exactly one key.
+
+    Its entry is checked like every other: the app's key, and signed under the
+    release name BTX-Node_<version>_amd64.deb, or easyNode refuses it."""
+    _check_version_tag(version, tag)
+    want = pubkey_key_id(pubkey) if pubkey else None
+    name = ASSET[DEB_KEY].format(v=version)
+    _check_sig(DEB_KEY, deb_sig, want, name)
+    return {"version": version, "notes": notes, "pub_date": pub_date,
+            "platforms": {DEB_KEY: {"signature": deb_sig.strip(),
+                                    "url": f"{REPO}/{tag}/{name}"}}}
+
+
+def feed_problem(path, feed):
+    """Why `feed` must not be written to `path`, or None.
+
+    node-deb.json lists exactly the .deb's key. Every other feed never lists
+    it: easyNode 0.6.32 refuses a whole release that lists a key it does not
+    know, so the key in latest-node.json would stop every 0.6.32 install from
+    updating, on every platform."""
+    keys = sorted(feed.get("platforms") or {})
+    name = os.path.basename(path)
+    if name == DEB_FEED_NAME:
+        if keys != [DEB_KEY]:
+            return f"{DEB_FEED_NAME} must list exactly {DEB_KEY}, not {keys}"
+    elif DEB_KEY in keys:
+        return (f"{DEB_KEY} must never be written to {name}: easyNode 0.6.32 "
+                f"refuses a whole release that lists a key it does not know, so "
+                f"every 0.6.32 install would stop updating. It belongs in "
+                f"{DEB_FEED_NAME} only.")
+    return None
+
+
+def write_feed(path, feed):
+    """write_atomic, after feed_problem has found nothing wrong."""
+    problem = feed_problem(path, feed)
+    if problem:
+        raise ValueError(problem)
+    write_atomic(path, feed)
 
 
 def write_atomic(path, data):
@@ -326,6 +379,45 @@ def self_test():
     except ValueError:
         pass
 
+    # The .deb has a feed of its own, node-deb.json, with exactly one key.
+    deb = build_deb_feed("0.6.33", "node-v0.6.33", "n", "d",
+                         _named(DEB_KEY, "0.6.33"), pubkey=pub)
+    assert set(deb["platforms"]) == {DEB_KEY}, deb
+    assert deb["platforms"][DEB_KEY]["url"] == (
+        f"{REPO}/node-v0.6.33/BTX-Node_0.6.33_amd64.deb"), deb
+    assert deb["version"] == "0.6.33", deb
+    # Its build is bound like every other: the AppImage's signature under the
+    # .deb's key, an older .deb, or the wrong key are all refused.
+    for bad_sig in (_named("linux-x86_64", "0.6.33"), _named(DEB_KEY, "0.6.32"),
+                    _named(DEB_KEY, "0.6.33", b"\x09" * 8)):
+        try:
+            build_deb_feed("0.6.33", "node-v0.6.33", "", "", bad_sig, pubkey=pub)
+            raise AssertionError("accepted an unbound .deb signature")
+        except ValueError:
+            pass
+
+    # And the .deb key goes into node-deb.json and nowhere else: easyNode
+    # 0.6.32 refuses a whole release that lists a key it does not know, so the
+    # key in latest-node.json would stop every 0.6.32 install from updating.
+    main = build_feed("0.6.33", "node-v0.6.33", "n", "d",
+                      linux_sig=_named("linux-x86_64", "0.6.33"), pubkey=pub)
+    poisoned = json.loads(json.dumps(main))
+    poisoned["platforms"][DEB_KEY] = deb["platforms"][DEB_KEY]
+    with tempfile.TemporaryDirectory() as d:
+        for name, feed in ((MAIN_FEED_NAME, poisoned), ("feed.json", poisoned),
+                           (DEB_FEED_NAME, main), (DEB_FEED_NAME, poisoned)):
+            path = os.path.join(d, name)
+            try:
+                write_feed(path, feed)
+                raise AssertionError(f"wrote {sorted(feed['platforms'])} to {name}")
+            except ValueError:
+                pass
+            assert not os.path.exists(path), f"{name} was written anyway"
+        write_feed(os.path.join(d, MAIN_FEED_NAME), main)
+        write_feed(os.path.join(d, DEB_FEED_NAME), deb)
+        with open(os.path.join(d, DEB_FEED_NAME)) as f:
+            assert json.load(f) == deb
+
     # The REAL embedded pubkey must parse, so a conf change cannot silently
     # disable key-id verification.
     real = pubkey_key_id(load_pubkey_from_conf())
@@ -346,6 +438,8 @@ def main():
     p.add_argument("--mac-sig")
     p.add_argument("--linux-sig")
     p.add_argument("--win-sig")
+    p.add_argument("--deb-sig",
+                   help=f"the .deb's .sig; writes {DEB_FEED_NAME} beside --out")
     p.add_argument("--notes", default="")
     p.add_argument("--pub-date", default="")
     p.add_argument("--out")
@@ -356,15 +450,30 @@ def main():
         return self_test()
     if not (a.version and a.tag and a.out):
         p.error("need --version --tag --out")
-    if not (a.mac_sig or a.linux_sig or a.win_sig):
-        p.error("need at least one of --mac-sig / --linux-sig / --win-sig")
-    feed = build_feed(
-        a.version, a.tag, a.notes, a.pub_date,
-        _read(a.mac_sig) if a.mac_sig else None,
-        _read(a.linux_sig) if a.linux_sig else None,
-        _read(a.win_sig) if a.win_sig else None,
-        pubkey=load_pubkey_from_conf(a.pubkey_conf),
-    )
+    if not (a.mac_sig or a.linux_sig or a.win_sig or a.deb_sig):
+        p.error("need at least one of --mac-sig / --linux-sig / --win-sig / --deb-sig")
+    pubkey = load_pubkey_from_conf(a.pubkey_conf)
+    # Both feeds are built, and so checked, before either is written: a bad
+    # signature on one must not leave the other half-published beside it.
+    deb = None
+    if a.deb_sig:
+        deb = build_deb_feed(a.version, a.tag, a.notes, a.pub_date,
+                             _read(a.deb_sig), pubkey=pubkey)
+    feed = None
+    if a.mac_sig or a.linux_sig or a.win_sig:
+        feed = build_feed(
+            a.version, a.tag, a.notes, a.pub_date,
+            _read(a.mac_sig) if a.mac_sig else None,
+            _read(a.linux_sig) if a.linux_sig else None,
+            _read(a.win_sig) if a.win_sig else None,
+            pubkey=pubkey,
+        )
+    if deb:
+        deb_out = os.path.join(os.path.dirname(os.path.abspath(a.out)), DEB_FEED_NAME)
+        write_feed(deb_out, deb)
+        print(f"wrote {deb_out}: version {deb['version']}, platform {DEB_KEY}")
+    if not feed:
+        return
     names = ", ".join(sorted(feed["platforms"]))
     print(f"wrote {a.out} — version {feed['version']}, platforms: {names}")
     missing = sorted(set(MAIN_KEYS) - set(feed["platforms"]))
@@ -376,7 +485,7 @@ def main():
               "only surfaces check errors on a MANUAL check, so the automatic "
               "one is silent. Expect 'Check now' on those platforms to say "
               "\"Couldn't check right now — are you online?\" — harmless.)")
-    write_atomic(a.out, feed)
+    write_feed(a.out, feed)
 
 
 if __name__ == "__main__":
