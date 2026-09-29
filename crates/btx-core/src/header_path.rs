@@ -69,6 +69,14 @@ impl HeaderPath {
         if self.target() == Some((height, hash)) {
             return;
         }
+        // A partway `up` walk has read headers above `u` that are not yet
+        // connected to the rest of the path (it was still walking down to
+        // find where they meet, or to find they are the walk now). Keeping
+        // them would let a new target treat one as "known" without it ever
+        // having been connected, or leave a gap between it and the base.
+        if let Some((u, _)) = &self.up {
+            self.hashes.retain(|h, _| *h <= *u);
+        }
         let known = self.hash_at(height) == Some(hash);
         self.hashes.retain(|h, _| *h <= height);
         self.top = Some((height, hash.to_string()));
@@ -159,16 +167,28 @@ impl HeaderPath {
     }
 
     /// Drop what lies below the tip. A tip that fell below everything read (a
-    /// rollback) starts the walk again from the target.
+    /// rollback) resumes the walk from the lowest header still held, or, if
+    /// none is held (an earlier rollback already emptied the path), starts
+    /// it again from the target.
     fn forget_below(&mut self, tip: u64) {
-        let Some(&low) = self.hashes.keys().next() else {
-            return;
+        let lowest = self.hashes.iter().next().map(|(h, s)| (*h, s.clone()));
+        let below_everything = match &lowest {
+            Some((low, _)) => tip < *low,
+            None => true,
         };
-        if tip < low && self.up.is_none() && self.down.is_none() {
-            let top = self.top.take();
-            *self = Self::default();
-            if let Some((h, s)) = top {
-                self.retarget(h, &s);
+        if below_everything && self.up.is_none() && self.down.is_none() {
+            match lowest {
+                // The kept headers are still the target's own ancestors and
+                // cannot go stale: resume there instead of re-reading them.
+                Some((low, hash)) => self.down = Some((low, hash)),
+                // Nothing is held at all; the only way back is the target.
+                None => {
+                    let top = self.top.take();
+                    *self = Self::default();
+                    if let Some((h, s)) = top {
+                        self.retarget(h, &s);
+                    }
+                }
             }
             return;
         }
@@ -241,6 +261,31 @@ mod tests {
         }
         fn reads(&self) -> usize {
             *self.reads.lock().unwrap()
+        }
+    }
+
+    /// Every height in `low..=high` is present in `p`, and each one above
+    /// `low` is the true parent (per `node`'s own chain) of the one below
+    /// it: catches both a gap (a missing height) and two branches mixed (a
+    /// height whose stored hash is not the child of the height below it).
+    fn assert_walked_chain(p: &HeaderPath, node: &Headers, low: u64, high: u64) {
+        for h in low..=high {
+            let hash = p
+                .hash_at(h)
+                .unwrap_or_else(|| panic!("height {h} is missing from the path"));
+            if h > low {
+                let (height, prev) = node.by_hash.get(hash).unwrap_or_else(|| {
+                    panic!("height {h}'s hash is not one of the node's headers")
+                });
+                assert_eq!(*height, h, "height {h} holds a header from another height");
+                let want = p.hash_at(h - 1).unwrap();
+                assert_eq!(
+                    prev,
+                    want,
+                    "height {h}'s parent does not match what height {} holds",
+                    h - 1
+                );
+            }
         }
     }
 
@@ -351,10 +396,16 @@ mod tests {
         let node = Headers::new(500, None);
         let mut p = HeaderPath::new();
         p.retarget(500, &main_hash(500));
-        p.walk(&node, 300, usize::MAX).await.unwrap();
-        p.walk(&node, 50, usize::MAX).await.unwrap();
+        assert_eq!(p.walk(&node, 300, usize::MAX).await.unwrap(), 200);
+        assert_eq!(
+            p.walk(&node, 50, usize::MAX).await.unwrap(),
+            250,
+            "headers read once are kept: the walk resumes from the lowest \
+             one held (300) instead of the target (500)"
+        );
         assert_eq!(p.status(50, &main_hash(50)), PathStatus::Ready);
         assert_eq!(p.next(50, 1), vec![(51, main_hash(51))]);
+        assert_eq!(node.reads(), 450, "no header is read twice");
     }
 
     #[tokio::test]
@@ -368,5 +419,110 @@ mod tests {
         p.walk(&node, 100, usize::MAX).await.unwrap();
         assert_eq!(p.status(100, &main_hash(100)), PathStatus::Ready);
         assert_eq!(node.reads(), 400);
+    }
+
+    #[tokio::test]
+    async fn an_error_on_the_up_cursor_leaves_the_walk_where_it_was() {
+        let node = Headers::new(510, None);
+        let mut p = HeaderPath::new();
+        p.retarget(500, &main_hash(500));
+        p.walk(&node, 100, usize::MAX).await.unwrap();
+        p.retarget(510, &main_hash(510));
+        *node.fail_on.lock().unwrap() = Some(main_hash(505));
+        assert!(p.walk(&node, 100, usize::MAX).await.is_err());
+        assert_eq!(p.status(100, &main_hash(100)), PathStatus::Walking);
+        *node.fail_on.lock().unwrap() = None;
+        assert_eq!(
+            p.walk(&node, 100, usize::MAX).await.unwrap(),
+            5,
+            "resumes at the header that failed; the rest was already read"
+        );
+        assert_eq!(p.status(100, &main_hash(100)), PathStatus::Ready);
+        assert_eq!(
+            node.reads(),
+            410,
+            "every header read once, including the retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_the_node_does_not_know_errors_every_call_and_changes_nothing() {
+        let node = Headers::new(500, None);
+        let mut p = HeaderPath::new();
+        let unknown = format!("c{:063x}", 999u64);
+        p.retarget(999, &unknown);
+        assert!(p.walk(&node, 100, usize::MAX).await.is_err());
+        assert_eq!(p.status(100, &main_hash(100)), PathStatus::Walking);
+        assert_eq!(p.target(), Some((999, unknown.as_str())));
+        // Calling again keeps failing the same way; nothing about the walk moved.
+        assert!(p.walk(&node, 100, usize::MAX).await.is_err());
+        assert_eq!(p.status(100, &main_hash(100)), PathStatus::Walking);
+        assert_eq!(p.target(), Some((999, unknown.as_str())));
+    }
+
+    #[tokio::test]
+    async fn a_retarget_while_up_is_mid_walk_does_not_leave_a_gap() {
+        // Reproduces a bug: retargeting while a previous `up` walk was still
+        // partway down (having read some headers above the base but not yet
+        // reached it) used to keep those un-connected headers and simply
+        // overwrite the `up` cursor, leaving a gap between the base and them.
+        let node = Headers::new(2500, None);
+        let mut p = HeaderPath::new();
+        p.retarget(500, &main_hash(500));
+        p.walk(&node, 500, usize::MAX).await.unwrap();
+        p.retarget(2000, &main_hash(2000));
+        assert_eq!(
+            p.walk(&node, 500, 500).await.unwrap(),
+            500,
+            "reads 2000 down to 1501, leaving the walk mid-way"
+        );
+        p.retarget(2500, &main_hash(2500));
+        p.walk(&node, 500, usize::MAX).await.unwrap();
+        assert_eq!(p.status(500, &main_hash(500)), PathStatus::Ready);
+        assert_walked_chain(&p, &node, 500, 2500);
+    }
+
+    #[tokio::test]
+    async fn a_retarget_to_an_already_read_hash_while_up_is_mid_walk_does_not_mix_branches() {
+        // Reproduces a bug: retargeting to a hash that a previous, unfinished
+        // `up` walk had already read (but not yet connected to the base)
+        // used to treat it as "known" and clear the walk outright, leaving
+        // the base chain and the unconnected branch both in `hashes` with no
+        // link between them.
+        let node = Headers::new(1500, Some((300, 2000)));
+        let mut p = HeaderPath::new();
+        p.retarget(1500, &main_hash(1500));
+        p.walk(&node, 100, usize::MAX).await.unwrap();
+        p.retarget(2000, &side_hash(2000));
+        assert_eq!(
+            p.walk(&node, 100, 1000).await.unwrap(),
+            1000,
+            "reads 2000 down to 1001, leaving the walk mid-way"
+        );
+        p.retarget(1800, &side_hash(1800));
+        p.walk(&node, 100, usize::MAX).await.unwrap();
+        assert_eq!(p.status(100, &main_hash(100)), PathStatus::Ready);
+        assert_walked_chain(&p, &node, 100, 1800);
+    }
+
+    #[tokio::test]
+    async fn a_rollback_after_the_tip_passed_the_target_restarts_the_walk() {
+        // Reproduces a bug: once a rollback emptied `hashes` entirely (the
+        // tip having moved above the target and then back below it),
+        // `forget_below` bailed out on the empty map instead of restarting
+        // the walk, leaving it stuck reporting `Walking` forever.
+        let node = Headers::new(500, None);
+        let mut p = HeaderPath::new();
+        p.retarget(500, &main_hash(500));
+        p.walk(&node, 500, usize::MAX).await.unwrap();
+        p.walk(&node, 550, usize::MAX).await.unwrap();
+        assert_eq!(
+            p.walk(&node, 400, usize::MAX).await.unwrap(),
+            100,
+            "restarts from the target and walks down to the tip"
+        );
+        assert_eq!(p.walk(&node, 400, usize::MAX).await.unwrap(), 0);
+        assert_eq!(p.status(400, &main_hash(400)), PathStatus::Ready);
+        assert_eq!(p.next(400, 1), vec![(401, main_hash(401))]);
     }
 }
