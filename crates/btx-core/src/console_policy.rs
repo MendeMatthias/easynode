@@ -320,6 +320,43 @@ fn engine_category(name: &str) -> Option<&'static str> {
     None
 }
 
+/// How long a confirm click stays valid.
+pub const CONFIRM_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The one pending confirm-class call. The window gets only the token; the
+/// second click sends it back, and the call it runs is the one kept here, so
+/// no bug in the window can turn a confirm-class call into a free one.
+#[derive(Debug, Default)]
+pub struct ConfirmBook {
+    pending: Option<(String, Call, std::time::Instant)>,
+}
+
+impl ConfirmBook {
+    pub const fn new() -> Self {
+        Self { pending: None }
+    }
+
+    /// Keep `call` behind `token`. A newer call replaces an older one.
+    pub fn issue(&mut self, token: String, call: Call, now: std::time::Instant) {
+        self.pending = Some((token, call, now));
+    }
+
+    /// The call behind `token`, once, while it is fresh. Any redeem empties
+    /// the book, so a wrong or stale token cancels the pending call.
+    pub fn redeem(&mut self, token: &str, now: std::time::Instant) -> Option<Call> {
+        let (t, call, at) = self.pending.take()?;
+        (t == token && now.saturating_duration_since(at) <= CONFIRM_TTL).then_some(call)
+    }
+}
+
+/// 16 random bytes as lowercase hex.
+pub fn new_token() -> String {
+    use rand_core::{OsRng, RngCore};
+    let mut b = [0u8; 16];
+    OsRng.fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,5 +528,46 @@ mod tests {
                 assert!(names.contains(n) || HIDDEN_ENGINE_COMMANDS.contains(n), "{n} is not an engine command");
             }
         }
+    }
+
+    fn a_call() -> Call {
+        Call { method: "addnode".into(), params: vec![json!("1.2.3.4"), json!("onetry")] }
+    }
+
+    #[test]
+    fn a_token_redeems_once_and_returns_the_stored_call_unchanged() {
+        let t0 = std::time::Instant::now();
+        let mut book = ConfirmBook::new();
+        book.issue("abc".into(), a_call(), t0);
+        assert_eq!(book.redeem("abc", t0 + std::time::Duration::from_secs(5)), Some(a_call()));
+        assert_eq!(book.redeem("abc", t0 + std::time::Duration::from_secs(6)), None, "used twice");
+    }
+
+    #[test]
+    fn an_expired_or_wrong_token_is_refused_and_clears_the_book() {
+        let t0 = std::time::Instant::now();
+        let mut book = ConfirmBook::new();
+        book.issue("abc".into(), a_call(), t0);
+        assert_eq!(book.redeem("abc", t0 + CONFIRM_TTL + std::time::Duration::from_millis(1)), None);
+        book.issue("abc".into(), a_call(), t0);
+        assert_eq!(book.redeem("xyz", t0), None);
+        assert_eq!(book.redeem("abc", t0), None, "a wrong token cancels the pending call");
+    }
+
+    #[test]
+    fn a_newer_confirm_replaces_the_older_one() {
+        let t0 = std::time::Instant::now();
+        let mut book = ConfirmBook::new();
+        book.issue("one".into(), a_call(), t0);
+        book.issue("two".into(), a_call(), t0);
+        assert_eq!(book.redeem("one", t0), None);
+    }
+
+    #[test]
+    fn tokens_are_random_hex() {
+        let (a, b) = (new_token(), new_token());
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
     }
 }
