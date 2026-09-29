@@ -1866,6 +1866,17 @@ pub fn apply_start_choice(
     )
 }
 
+/// Does this node run on a signed snapshot? The engine stores the snapshot's
+/// signed manifest as `chainstate_snapshot/attested_assumeutxo` and removes it
+/// when the background check of the older history retires the snapshot
+/// (docs/decisions/2026-09-29-every-node-starts-near-the-tip.md, section 8).
+pub fn on_signed_snapshot(datadir: &Path) -> bool {
+    datadir
+        .join("chainstate_snapshot")
+        .join("attested_assumeutxo")
+        .exists()
+}
+
 /// Whether THIS launch should run as a trusted mirror.
 ///
 /// `trusted_mirror_enabled` answers the static question ("is this a host class
@@ -4690,6 +4701,23 @@ consensus-validator service.";
         assert!(serde_json::from_value::<StartChoice>(serde_json::json!("fast")).is_err());
         let none: Option<StartChoice> = serde_json::from_value(serde_json::Value::Null).unwrap();
         assert_eq!(none, None);
+    }
+
+    /// The engine keeps a signed snapshot's manifest beside the snapshot's
+    /// chain state until the background check retires it.
+    #[test]
+    fn a_signed_snapshot_is_read_from_the_engines_own_file() {
+        let tmp = tempfile::tempdir().expect("temp datadir");
+        let dir = tmp.path();
+        assert!(!on_signed_snapshot(dir));
+        std::fs::create_dir_all(dir.join("chainstate_snapshot")).unwrap();
+        assert!(!on_signed_snapshot(dir), "an unsigned snapshot is not one");
+        std::fs::write(
+            dir.join("chainstate_snapshot").join("attested_assumeutxo"),
+            b"x",
+        )
+        .unwrap();
+        assert!(on_signed_snapshot(dir));
     }
 
     /// A non-Metal host is a mirror on the static rule alone, with or without
