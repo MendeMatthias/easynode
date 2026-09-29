@@ -1183,6 +1183,12 @@ body.compact .stars { display: none; }
 .welcome-actions { justify-content: flex-end; margin-top: 16px; }
 
 /* ── Tools overlay ─────────────────────────────────────────────────────── */
+/* .overlay-panel is flex-column with overflow-y: auto so IT scrolls; without
+   this its children default to shrinking instead, which squashes the
+   diagnostics report and the command window down to one line. Scoped to
+   Tools only, since other overlays share .overlay-panel and rely on the
+   default shrink behavior. */
+#tools-overlay .overlay-panel > * { flex-shrink: 0; }
 .tools-now { color: var(--color-muted); font-size: 12.5px; margin: 0 0 var(--space-m); }
 .tools-h { font-size: 13px; margin: var(--space-m) 0 var(--space-s); }
 .tools-actions { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-s); }
@@ -1219,4 +1225,6 @@ body.compact .stars { display: none; }
 .tools-console-row input::placeholder { color: var(--color-muted); opacity: 0.6; }
 .tools-entry { margin-top: var(--space-s); }
 .tools-entry-head { display: flex; justify-content: space-between; align-items: center; gap: var(--space-s); }
+.tools-entry-head code { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.tools-entry-head button { flex-shrink: 0; }
 .tools-confirm { margin-top: var(--space-s); }

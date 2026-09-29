@@ -170,6 +170,7 @@ export function initTools(): void {
       say(String(e));
     } finally {
       btn.disabled = false;
+      if (!overlay.hidden) btn.focus();
     }
   });
 
@@ -232,6 +233,9 @@ export function initTools(): void {
       if (run === reportRun) {
         btn.disabled = false;
         btn.textContent = reportCopy.label;
+        // Disabling the button while it built the report blurred it; a
+        // keyboard user's next Enter would otherwise hit nothing.
+        if (!overlay.hidden) btn.focus();
       }
     }
   };
@@ -251,6 +255,9 @@ export function initTools(): void {
   const setConsoleBusy = (busy: boolean) => {
     input.disabled = busy;
     runBtn.disabled = busy;
+    // Disabling the input blurs it; a keyboard user's next keystroke should
+    // land back in the input, not nowhere, once the overlay is still open.
+    if (!busy && !overlay.hidden) input.focus();
   };
   const render = (line: string, answer: string) => {
     history.push({ line, answer });
