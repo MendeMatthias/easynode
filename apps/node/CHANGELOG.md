@@ -24,6 +24,19 @@ from everyone, or left on a branch the others have moved on from, knows of no
 newer blocks either. Now a newest block more than two hours old, or signed
 blocks the node does not have, overrule it, and the line says which one it is.
 
+**New nodes start closer to the tip, from a snapshot two operators confirmed.**
+When you set up a node, easyNode looks for the newest chain snapshot that at
+least two of the people on its operator list have signed (today Mende,
+Aleksander and jpp), checks every signature itself, and starts your node there
+instead of thousands of blocks back. A node that checks blocks itself loads it
+in one short extra start, then goes back to checking every new block, and it
+still checks its older history in the background. The node remembers who
+confirmed its start point. If there is no such snapshot yet, or the operators
+disagree about one, your node starts from the snapshot easyNode already ships,
+as before. A node that checks blocks itself also trusts the same signing keys
+mirrors do, only so it can keep starting from that snapshot; it still checks
+every block itself.
+
 ## [0.6.32] - 2026-09-28
 
 **Every node is held off two branches until BTX's developers rule on them.**
