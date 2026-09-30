@@ -12,10 +12,15 @@
 //! * the watch: every five seconds, `ff::judge`. Done keeps the new chain
 //!   once its base block is checked ([`confirmed_start`]), then `ff::finish`;
 //!   anything else rolls it back ([`undo`]).
-//! * [`before_start`]: at every start while no driver is at work, the sweep,
-//!   then the run a previous start left, by its phase. The node is launched
-//!   only once any undo it needs returned `Ok`.
+//! * [`before_start`]: at every start, the gate ([`start_gate`]); with no
+//!   driver at work, the sweep, then the run a previous start left, by its
+//!   phase. The node is launched only once any undo it needs returned `Ok`,
+//!   and never while this app's driver moves chain data.
 //! * [`resume_if_needed`]: a run the app was closed on is watched again.
+//!
+//! A roll-back is decided for good when its reason is written: a run clears
+//! the outcome before it sets anything aside, so a Running record beside a
+//! roll-back's outcome is always one to roll back ([`verdict`]).
 //!
 //! One serialisation point, [`with_disk`], for every step that moves or
 //! removes chain data or writes the run's files: set aside, restore, finish,
@@ -26,6 +31,11 @@
 //!
 //! Every sentence here can reach the window, so none carries an error's own
 //! text: that goes to the log.
+//!
+//! Residual risk, left as it is: another app sharing the datadir (the easyBTX
+//! miner) takes neither the lock nor the start guard. The driver checks that
+//! nothing holds the datadir right before it moves chain data, but a btxd the
+//! other app launches in the moment after that check would start on it.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,7 +49,7 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::commands::{
     destructive_allowed, node_ownership, rpc_already_answering, set_phase, setup_log,
-    snapshot_spec, start_node_projected, stop_node_inner, SET_ASIDE_PENDING_FILE,
+    snapshot_spec, start_node_inner, stop_node_inner, ALREADY_STARTING, SET_ASIDE_PENDING_FILE,
     SIGNED_LOAD_FAILED,
 };
 use crate::state::{node_datadir, AppState, NodeAppSettings, NodePhase};
@@ -63,8 +73,8 @@ const HOLD_STARTS_TRIES: u32 = 600;
 // no full stop.
 
 pub(crate) const ALREADY_RUNNING: &str = "Fast-forward is already running.";
-pub(crate) const NOT_FINISHED: &str =
-    "A Fast-forward has not finished yet. easyNode carries it on when it next starts the node.";
+pub(crate) const NOT_FINISHED: &str = "A Fast-forward has not finished yet. The next time \
+     easyNode starts the node, it first finishes that run or puts the old chain data back.";
 pub(crate) const NOTE_WAITS: &str = "easyNode still has to move a snapshot it did not accept out \
      of the way, which it does the next time it starts the node. Restart the node, then try \
      Fast-forward again.";
@@ -75,11 +85,17 @@ const NODE_IN_THE_WAY: &str = "easyNode has to finish putting the old chain data
      Fast-forward, but a node it did not start is using the data folder. Stop that node, then \
      start the node again.";
 const NOT_STOPPED: &str = "Fast-forward could not stop the node to put the old chain data back, \
-     so it left everything as it is. It carries on the next time easyNode starts the node.";
+     so it has not changed anything yet. If another app uses the node's data folder, stop it. \
+     Then start the node again, and easyNode puts the old chain data back.";
 const UNDO_FAILED: &str = "Fast-forward could not put the old chain data back, so easyNode has \
      not started the node. Start the node again to try once more.";
 const MOVE_CUT_OFF: &str = "Fast-forward stopped unexpectedly while it was moving the chain \
-     data. Start the node again, and easyNode sorts it out first.";
+     data. When you start the node again, easyNode first reads what the run had got to, and \
+     either carries it on or puts the old chain data back.";
+/// A start while this app's driver moves chain data, or is about to move it
+/// back.
+const MOVING: &str = "Fast-forward is moving the chain data, so easyNode is not starting the \
+     node now. It starts the node itself once it has finished, or shows what went wrong.";
 
 const WHY_NOT_OURS: &str = "another app is running the node in this data folder";
 const WHY_NOT_RUNNING: &str = "the node was not running";
@@ -87,6 +103,9 @@ const WHY_NOT_CHECKED: &str = "the confirmed snapshot could not be downloaded an
 const WHY_STARTING: &str = "the node was starting or restarting";
 const WHY_NOT_STOPPED: &str = "the node did not stop";
 const WHY_NOT_SET_ASIDE: &str = "the chain data could not be set aside";
+const WHY_NOTE_APPEARED: &str =
+    "a snapshot the node did not accept was waiting to be moved out of the way";
+const WHY_NOT_CLEARED: &str = "the result of the last Fast-forward could not be cleared";
 const WHY_NOT_STARTED: &str = "the node did not start on the new chain data";
 /// A load during a run that loaded nothing (`commands::run_failure_reason`).
 pub(crate) const WHY_NOT_LOADED: &str = "the node could not load the confirmed snapshot";
@@ -111,7 +130,8 @@ fn stranded_sentence(folder: &Path, nothing_removed: bool) -> String {
     if nothing_removed {
         format!(
             "Fast-forward could not put the old chain data back because part of it is missing \
-             from {}, so easyNode leaves the node stopped until it is opened again.",
+             from {}, so easyNode leaves the node stopped. When you quit easyNode and open it \
+             again, it starts the node on the new chain data and carries Fast-forward on.",
             folder.display()
         )
     } else {
@@ -199,7 +219,7 @@ pub(crate) fn active() -> bool {
     active_in(&node_datadir())
 }
 
-fn active_in(datadir: &Path) -> bool {
+pub(crate) fn active_in(datadir: &Path) -> bool {
     DRIVING.load(Ordering::SeqCst) || !matches!(ff::read_record(datadir), Ok(None))
 }
 
@@ -279,24 +299,98 @@ async fn node_is_down(datadir: &Path) -> bool {
         && btx_core::node::datadir_holder(datadir).await == btx_core::node::DatadirHolder::Free
 }
 
-/// At a start, before anything reads the chain data. While this app's
-/// driver is at work it has done what a start needs, and it holds starts
-/// while chain data moves, so nothing then. Otherwise: the sweep, then the
-/// run a previous start left, by its phase ([`at_start`]). An `Err` is a
-/// plain sentence, and the node is not started.
-pub(crate) async fn before_start(datadir: &Path) -> Result<(), String> {
-    if DRIVING.load(Ordering::SeqCst) {
-        return Ok(());
+/// What the run's record says, for [`start_gate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnRecord {
+    Nothing,
+    Unreadable,
+    At(Phase),
+}
+
+fn on_record(datadir: &Path) -> OnRecord {
+    match ff::read_record(datadir) {
+        Ok(None) => OnRecord::Nothing,
+        Ok(Some(r)) => OnRecord::At(r.phase),
+        Err(_) => OnRecord::Unreadable,
     }
-    let stuck = STUCK.lock().unwrap_or_else(|e| e.into_inner()).clone();
+}
+
+/// The last outcome is a roll-back's: beside a Running record, the roll-back
+/// was decided and its restore never began.
+fn rolled_back(datadir: &Path) -> bool {
+    matches!(ff::read_outcome(datadir), Some(Outcome::RolledBack { .. }))
+}
+
+/// What a start may do, from [`start_gate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Gate {
+    /// Launch: this app's driver is at work and the chain data is not
+    /// moving, so it has done what a start needs.
+    Start,
+    /// No driver at work: the sweep and the recorded run come first
+    /// ([`at_start`]).
+    AtStart,
+    /// Not now, and the plain sentence why.
+    Refuse(String),
+}
+
+/// Pure: may a start go ahead? `stuck` ([`STUCK`]) keeps every start off.
+/// While this app's driver is at work (`driving`), only on chain data that
+/// is not moving: no run, a run under way (not being rolled back:
+/// `rolling_back`, [`rolled_back`]) or one that is done. A run being set
+/// aside or put back is the driver's, and a record nobody can read is no
+/// one's to start over. With no driver, [`at_start`] decides.
+fn start_gate(
+    driving: bool,
+    stuck: Option<&str>,
+    record: OnRecord,
+    rolling_back: bool,
+    datadir: &Path,
+) -> Gate {
     if let Some(said) = stuck {
-        return Err(said);
+        return Gate::Refuse(said.into());
     }
-    let undoes = matches!(
-        ff::read_record(datadir),
-        Ok(Some(r)) if matches!(r.phase, Phase::SettingAside | Phase::Undoing | Phase::Restoring)
+    if !driving {
+        return Gate::AtStart;
+    }
+    match record {
+        OnRecord::Nothing | OnRecord::At(Phase::Done) => Gate::Start,
+        OnRecord::At(Phase::Running) if !rolling_back => Gate::Start,
+        OnRecord::Unreadable => Gate::Refuse(unreadable_sentence(datadir)),
+        OnRecord::At(_) => Gate::Refuse(MOVING.into()),
+    }
+}
+
+/// At a start, before anything reads the chain data or the settings: the
+/// gate ([`start_gate`]), then, with no driver at work, the sweep and the run
+/// a previous start left ([`at_start`]). An undo needs the node down: a
+/// record cut off while its chain data moved refuses the start while a node
+/// is using the datadir, and a roll-back decided before the app stopped is
+/// left to the watch then, which can stop the node. An `Err` is a plain
+/// sentence, and the node is not started. A roll-back whose restore cannot
+/// begin keeps the node from starting in this run of the app.
+pub(crate) async fn before_start(datadir: &Path) -> Result<(), String> {
+    let stuck = STUCK.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let record = on_record(datadir);
+    let rolling_back = rolled_back(datadir);
+    match start_gate(
+        DRIVING.load(Ordering::SeqCst),
+        stuck.as_deref(),
+        record,
+        rolling_back,
+        datadir,
+    ) {
+        Gate::Start => return Ok(()),
+        Gate::Refuse(said) => return Err(said),
+        Gate::AtStart => {}
+    }
+    let moved = matches!(
+        record,
+        OnRecord::At(Phase::SettingAside | Phase::Undoing | Phase::Restoring)
     );
-    if undoes && !node_is_down(datadir).await {
+    let decided = record == OnRecord::At(Phase::Running) && rolling_back;
+    let node_down = (moved || decided) && node_is_down(datadir).await;
+    if moved && !node_down {
         log(
             datadir,
             "a run is being undone, and a node this app did not start is using the data folder; \
@@ -305,18 +399,26 @@ pub(crate) async fn before_start(datadir: &Path) -> Result<(), String> {
         return Err(NODE_IN_THE_WAY.into());
     }
     let dd = datadir.to_path_buf();
-    on_disk(move || at_start(&dd, now()))
+    let result = on_disk(move || at_start(&dd, now(), node_down))
         .await
-        .unwrap_or_else(|| Err(MOVE_CUT_OFF.into()))
+        .unwrap_or_else(|| Err(MOVE_CUT_OFF.into()));
+    if let Err(said) = &result {
+        if underway(datadir) {
+            *STUCK.lock().unwrap_or_else(|e| e.into_inner()) = Some(said.clone());
+        }
+    }
+    result
 }
 
-/// [`before_start`]'s part on disk, with the node stopped. The sweep first;
-/// then a run at [`Phase::Running`] gets a fresh watch window and carries on,
-/// one at [`Phase::Done`] is finished, and one cut off while its chain data
-/// moved ([`Phase::SettingAside`], [`Phase::Undoing`], [`Phase::Restoring`])
-/// is rolled back here, before any launch. A record nobody can read stops
-/// the start and nothing is touched.
-fn at_start(datadir: &Path, now_unix: u64) -> Result<(), String> {
+/// [`before_start`]'s part on disk. The sweep first; then a run at
+/// [`Phase::Running`] gets a fresh watch window and carries on, unless its
+/// roll-back was decided before the app stopped ([`rolled_back`]): then,
+/// with the node down (`node_down`), it is rolled back here. One at
+/// [`Phase::Done`] is finished, and one cut off while its chain data moved
+/// ([`Phase::SettingAside`], [`Phase::Undoing`], [`Phase::Restoring`]) is
+/// rolled back here, before any launch; call with the node down then. A
+/// record nobody can read stops the start and nothing is touched.
+fn at_start(datadir: &Path, now_unix: u64, node_down: bool) -> Result<(), String> {
     for gone in ff::sweep(datadir) {
         log(
             datadir,
@@ -335,6 +437,21 @@ fn at_start(datadir: &Path, now_unix: u64) -> Result<(), String> {
         }
     };
     match record.phase {
+        Phase::Running if node_down && rolled_back(datadir) => {
+            log(
+                datadir,
+                "the roll-back decided before the app stopped is done before the launch",
+            );
+            undo(datadir)
+        }
+        Phase::Running if rolled_back(datadir) => {
+            log(
+                datadir,
+                "a node is using the data folder, so the roll-back decided before the app \
+                 stopped is left to the watch, which stops it first",
+            );
+            Ok(())
+        }
         Phase::Running => {
             log(
                 datadir,
@@ -378,6 +495,18 @@ fn at_start(datadir: &Path, now_unix: u64) -> Result<(), String> {
     }
 }
 
+/// What the watch makes of one look: a roll-back decided before the app
+/// stopped (its outcome beside the Running record) is carried out, however
+/// the node looks; otherwise `ff::judge`.
+fn verdict(record: &Record, look: &Look, outcome: Option<Outcome>, now_unix: u64) -> Verdict {
+    match outcome {
+        Some(Outcome::RolledBack { reason }) if record.phase == Phase::Running => {
+            Verdict::RollBack(reason)
+        }
+        _ => ff::judge(record, look, now_unix),
+    }
+}
+
 // ── On disk, each under `with_disk` ─────────────────────────────────────────
 
 /// The two settings a run changes, as they are now.
@@ -415,11 +544,69 @@ fn settings_before(record: &Record) -> Before {
 /// it (`ff::set_aside`). Then "snapshot loaded" is reset, so the loaders load
 /// again, and "first load still to come" too: a run is no first load
 /// (controller note 1 (a)), and the start path keeps it so while the run is
-/// under way.
+/// under way. A set-aside note written since the run's own check (a load
+/// refused meanwhile) stops it here, with the datadir to itself: the note's
+/// chainstate would go aside with the rest, and a roll-back would bring it
+/// back without its note (controller note 1 (d)).
 fn set_aside_for_run(datadir: &Path, height: u64, now_unix: u64) -> Result<Record, MoveError> {
+    if datadir.join(SET_ASIDE_PENDING_FILE).exists() {
+        return Err(MoveError::Untouched(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "a set-aside note is waiting for the next launch",
+        )));
+    }
     let record = ff::set_aside(datadir, height, run_settings(datadir), now_unix)?;
     put_settings(datadir, Before::default());
     Ok(record)
+}
+
+/// Why the chain data was not set aside, for the Tools status.
+fn why_not_set_aside(datadir: &Path) -> &'static str {
+    if datadir.join(SET_ASIDE_PENDING_FILE).exists() {
+        WHY_NOTE_APPEARED
+    } else {
+        WHY_NOT_SET_ASIDE
+    }
+}
+
+/// Remove the snapshot chainstates the attempt's loads were refused and set
+/// aside (`commands::set_aside_refused_snapshot`): those named after a time
+/// at or after the run began (`since`). Older ones, and anything else by
+/// that name (a file, a link, a name without a time), are left to the
+/// weekly sweep (`btx_core::disk`).
+fn remove_attempts_refused(datadir: &Path, since: u64) {
+    let prefix = btx_core::confirmed_load::REFUSED_CHAINSTATE_PREFIX;
+    let Ok(entries) = std::fs::read_dir(datadir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let made_by_the_attempt = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(prefix))
+            .and_then(|t| t.parse::<u64>().ok())
+            .is_some_and(|t| t >= since);
+        // `file_type` does not follow a link.
+        if !made_by_the_attempt || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => log(
+                datadir,
+                &format!(
+                    "removed {}, which the attempt set aside",
+                    entry.path().display()
+                ),
+            ),
+            Err(e) => log(
+                datadir,
+                &format!(
+                    "could not remove {} (non-fatal): {e}",
+                    entry.path().display()
+                ),
+            ),
+        }
+    }
 }
 
 /// Put the old chain data back, with the node stopped. The settings from
@@ -428,8 +615,12 @@ fn set_aside_for_run(datadir: &Path, height: u64, now_unix: u64) -> Result<Recor
 /// 2c). Then the markers of the attempt's launches go (a mirror launch or a
 /// header bootstrap on the old chain would be wrong), and so does a
 /// set-aside note the attempt wrote: a run never starts while one waits, so
-/// it names the attempt's chainstate. `Err` is a plain sentence: the old
-/// chain data is not all back, and the node must not start.
+/// it names the attempt's chainstate; and so do the chainstates its loads
+/// were refused and set aside ([`remove_attempts_refused`]). `Err` is a
+/// plain sentence: the old chain data is not all back, and the node must not
+/// start. A restore that could not begin changed nothing, and the decision
+/// to roll back goes with it: the run stands, and is watched again from the
+/// next opening of the app (controller note 2b).
 fn undo(datadir: &Path) -> Result<(), String> {
     let record = match ff::read_record(datadir) {
         Ok(Some(r)) => r,
@@ -454,6 +645,7 @@ fn undo(datadir: &Path) -> Result<(), String> {
                 ),
                 _ => {}
             }
+            remove_attempts_refused(datadir, record.started_at);
             log(datadir, "the old chain data is back");
             Ok(())
         }
@@ -468,6 +660,7 @@ fn undo(datadir: &Path) -> Result<(), String> {
                 matches!(ff::read_record(datadir), Ok(Some(r)) if r.phase == Phase::Running);
             if nothing_removed {
                 put_settings(datadir, during);
+                ff::clear_outcome(datadir);
             } else {
                 btx_core::node::end_mirror_load(datadir);
                 btx_core::node::end_header_bootstrap(datadir);
@@ -552,6 +745,36 @@ pub(crate) fn sweep_measured(datadir: &Path) -> u64 {
 
 // ── The run ─────────────────────────────────────────────────────────────────
 
+/// Pure: did the driver's own start meet a start someone else began the
+/// moment the driver let the start guard go? That one launches the same
+/// node through the same gate, so it counts as the driver's.
+fn started_elsewhere(error: &str) -> bool {
+    error == ALREADY_STARTING
+}
+
+/// The driver's start: `start_node_inner`, with a failure projected into the
+/// phase as `commands::start_node_projected` does, and a start already under
+/// way ([`started_elsewhere`]) counted as this one.
+async fn start_node(app: &AppHandle, state: &State<'_, AppState>) -> Result<(), String> {
+    match start_node_inner(app, state).await {
+        Err(e) if started_elsewhere(&e) => {
+            log(
+                &node_datadir(),
+                "a start already under way launches the node",
+            );
+            Ok(())
+        }
+        Err(message) => {
+            let shown = NodePhase::Error {
+                message: message.clone(),
+            };
+            set_phase(app, state, shown).await;
+            Err(message)
+        }
+        Ok(()) => Ok(()),
+    }
+}
+
 /// A run that ended before anything moved: why, for the Tools status.
 async fn not_started(datadir: &Path, why: &str) {
     log(datadir, &format!("not started: {why}"));
@@ -593,14 +816,21 @@ async fn prepare(
 async fn run(app: &AppHandle, state: &State<'_, AppState>) {
     let datadir = node_datadir();
     let dd = datadir.clone();
-    on_disk(move || ff::clear_outcome(&dd)).await;
+    // The watch reads a roll-back's outcome beside a Running record as a
+    // roll-back decided ([`verdict`]), so none may be left from before.
+    let cleared = on_disk(move || {
+        ff::clear_outcome(&dd);
+        ff::read_outcome(&dd).is_none()
+    })
+    .await;
+    if cleared != Some(true) {
+        log(
+            &datadir,
+            "the last run's outcome could not be removed; not starting",
+        );
+        return not_started(&datadir, WHY_NOT_CLEARED).await;
+    }
     take_failure();
-    // A person asked for this: a load that failed or was refused earlier in
-    // this run of the app does not stand in its way (a validating node's
-    // mirror launch waits on both). During the run a failure goes to the
-    // driver, not to the start path's restarts, so these still bound them.
-    SIGNED_LOAD_FAILED.store(false, Ordering::SeqCst);
-    state.load_failure_restarted.store(false, Ordering::SeqCst);
 
     if let Err(e) = destructive_allowed(node_ownership(state, &datadir).await) {
         log(
@@ -651,7 +881,7 @@ async fn run(app: &AppHandle, state: &State<'_, AppState>) {
     if !node_is_down(&datadir).await {
         drop(no_starts);
         not_started(&datadir, WHY_NOT_STOPPED).await;
-        let _ = start_node_projected(app, state).await;
+        let _ = start_node(app, state).await;
         return;
     }
     let (dd, height, at) = (datadir.clone(), pair.height, now());
@@ -669,8 +899,8 @@ async fn run(app: &AppHandle, state: &State<'_, AppState>) {
                 &format!("the chain data could not be set aside: {e}"),
             );
             drop(no_starts);
-            not_started(&datadir, WHY_NOT_SET_ASIDE).await;
-            let _ = start_node_projected(app, state).await;
+            not_started(&datadir, why_not_set_aside(&datadir)).await;
+            let _ = start_node(app, state).await;
             return;
         }
         Some(Err(MoveError::Stranded { folder, error })) => {
@@ -692,13 +922,19 @@ async fn run(app: &AppHandle, state: &State<'_, AppState>) {
             return;
         }
     }
+    // A person asked for this: a load that failed or was refused earlier in
+    // this run of the app does not stand in its way (a validating node's
+    // mirror launch waits on both). During the run a failure goes to the
+    // driver, not to the start path's restarts, so these still bound them.
+    SIGNED_LOAD_FAILED.store(false, Ordering::SeqCst);
+    state.load_failure_restarted.store(false, Ordering::SeqCst);
     drop(no_starts);
 
     // Step 3: start. The start path does the rest: the header bootstrap of
     // the empty datadir, a validating node's one mirror launch, the load
     // with every check (signed-only during a run), the restart as a
     // validating node, and a failed load handed to this driver.
-    if let Err(e) = start_node_projected(app, state).await {
+    if let Err(e) = start_node(app, state).await {
         log(&datadir, &format!("the node did not start: {e}"));
         roll_back(app, state, WHY_NOT_STARTED.into()).await;
         return;
@@ -752,7 +988,7 @@ async fn watch(app: &AppHandle, state: &State<'_, AppState>) {
             }
         };
         let (look, base) = look(state, &datadir).await;
-        match ff::judge(&record, &look, now()) {
+        match verdict(&record, &look, ff::read_outcome(&datadir), now()) {
             Verdict::Continue => {}
             Verdict::Done => return finish_run(app, state, &record, base).await,
             Verdict::RollBack(why) => return roll_back(app, state, why).await,
@@ -803,9 +1039,10 @@ async fn finish_run(
 
 /// Stop, put the old chain data back, start as before, and say why. The
 /// reason is written first, so a restore cut off by a crash keeps it
-/// (controller note 2). The node starts again only once [`undo`] returned
-/// `Ok`; before that the window says, in plain words, where the old chain
-/// data is.
+/// (controller note 2). Starts are held off from before the second stop
+/// until the old chain data is back; the node starts again only once
+/// [`undo`] returned `Ok`, and otherwise the window says, in plain words,
+/// where the old chain data is, and [`start_gate`] keeps starts off.
 async fn roll_back(app: &AppHandle, state: &State<'_, AppState>, why: String) {
     let datadir = node_datadir();
     log(&datadir, &format!("rolling back: {why}"));
@@ -840,31 +1077,35 @@ async fn roll_back(app: &AppHandle, state: &State<'_, AppState>, why: String) {
     stop_node_inner(state).await;
     set_phase(app, state, NodePhase::Stopped).await;
     if !node_is_down(&datadir).await {
-        drop(no_starts);
         log(
             &datadir,
             "the node did not stop, so the old chain data was not put back",
         );
         let message = NOT_STOPPED.to_string();
         set_phase(app, state, NodePhase::Error { message }).await;
+        drop(no_starts);
         return;
     }
     let dd = datadir.clone();
     let undone = on_disk(move || undo(&dd))
         .await
         .unwrap_or_else(|| Err(MOVE_CUT_OFF.into()));
-    drop(no_starts);
     match undone {
         Ok(()) => {
+            // The old chain data is back: starts may run again.
+            drop(no_starts);
             if !state.quitting.load(Ordering::SeqCst) {
-                let _ = start_node_projected(app, state).await;
+                let _ = start_node(app, state).await;
             }
         }
         Err(message) => {
+            // Starts stay off while the window is told; after that the
+            // gate keeps them off (STUCK, or the record's phase).
             if underway(&datadir) {
                 *STUCK.lock().unwrap_or_else(|e| e.into_inner()) = Some(message.clone());
             }
             set_phase(app, state, NodePhase::Error { message }).await;
+            drop(no_starts);
         }
     }
 }
@@ -990,7 +1231,7 @@ mod tests {
         std::fs::write(d.join("fast-forward-5/blocks/old"), b"old").unwrap();
         std::fs::write(d.join(".fast-forward.json"), b"{\"height\":").unwrap();
 
-        let said = at_start(d, 1_000).unwrap_err();
+        let said = at_start(d, 1_000, true).unwrap_err();
         assert_eq!(said, unreadable_sentence(d));
         assert!(said.contains(".fast-forward.json"), "{said}");
         assert!(said.contains(&d.display().to_string()), "{said}");
@@ -1051,7 +1292,7 @@ mod tests {
             }
             record_at(d, phase);
             let when = format!("{phase:?}");
-            assert_eq!(at_start(d, 50_000), Ok(()), "{when}");
+            assert_eq!(at_start(d, 50_000, true), Ok(()), "{when}");
             assert_old_chain_back(d, &when);
             assert_eq!(run_settings(d), before, "{when}");
             assert!(snapshot_marker_present(d), "{when}");
@@ -1077,14 +1318,14 @@ mod tests {
         };
         ff::write_outcome(d, &real);
         record_at(d, Phase::Undoing);
-        assert_eq!(at_start(d, 50_000), Ok(()));
+        assert_eq!(at_start(d, 50_000, true), Ok(()));
         assert_eq!(ff::read_outcome(d), Some(real));
 
         let tmp = datadir_with_chain(Before::default());
         let d = tmp.path();
         set_aside_for_run(d, 232_000, 100).unwrap();
         record_at(d, Phase::SettingAside);
-        assert_eq!(at_start(d, 50_000), Ok(()));
+        assert_eq!(at_start(d, 50_000, true), Ok(()));
         match ff::read_outcome(d) {
             Some(Outcome::RolledBack { reason }) => {
                 assert!(reason.contains("setting the chain data aside"), "{reason}")
@@ -1102,7 +1343,7 @@ mod tests {
         let d = tmp.path();
         set_aside_for_run(d, 232_000, 100).unwrap();
         attempt(d);
-        assert_eq!(at_start(d, 50_000), Ok(()));
+        assert_eq!(at_start(d, 50_000, true), Ok(()));
         let r = ff::read_record(d).unwrap().unwrap();
         assert_eq!(r.phase, Phase::Running);
         assert_eq!(r.watch_started_at, 50_000);
@@ -1125,7 +1366,7 @@ mod tests {
         set_aside_for_run(d, 232_000, 100).unwrap();
         attempt(d);
         record_at(d, Phase::Done);
-        assert_eq!(at_start(d, 50_000), Ok(()));
+        assert_eq!(at_start(d, 50_000, true), Ok(()));
         assert!(ff::read_record(d).unwrap().is_none());
         assert!(entries_named(d, "fast-forward-").is_empty());
         assert!(d.join("blocks/new").exists());
@@ -1147,7 +1388,7 @@ mod tests {
         ] {
             std::fs::create_dir_all(d.join(dir)).unwrap();
         }
-        assert_eq!(at_start(d, 50_000), Ok(()));
+        assert_eq!(at_start(d, 50_000, true), Ok(()));
         assert!(entries_named(d, "fast-forward-").is_empty());
         assert!(d.join("chainstate_snapshot.refused-9/x").exists());
         assert!(d.join("blocks").exists());
@@ -1207,8 +1448,20 @@ mod tests {
         attempt(d);
         NodeAppSettings::update(d, |s| s.snapshot_loaded = true);
         std::fs::remove_dir_all(folder.join("indexes")).unwrap();
+        ff::write_outcome(
+            d,
+            &Outcome::RolledBack {
+                reason: WHY_NOT_LOADED.into(),
+            },
+        );
         let said = undo(d).unwrap_err();
         assert_eq!(said, stranded_sentence(&folder, true));
+        assert_eq!(
+            ff::read_outcome(d),
+            None,
+            "the decision goes with the undo that cannot happen: the next opening watches the \
+             run again (controller note 2b)"
+        );
         assert!(said.contains(&folder.display().to_string()), "{said}");
         assert_eq!(
             ff::read_record(d).unwrap().unwrap().phase,
@@ -1238,7 +1491,11 @@ mod tests {
         assert_eq!(said, stranded_sentence(&folder, false));
         assert_eq!(run_settings(d), before, "put back before the restore");
         assert_eq!(ff::read_record(d).unwrap().unwrap().phase, Phase::Restoring);
-        assert_eq!(at_start(d, 50_000), Err(said), "and the start stops too");
+        assert_eq!(
+            at_start(d, 50_000, true),
+            Err(said),
+            "and the start stops too"
+        );
     }
 
     /// Controller note 2c and `judge`'s follow-up: a run is kept only when
@@ -1340,6 +1597,229 @@ mod tests {
         assert!(!d.join(crate::commands::SET_ASIDE_PENDING_FILE).exists());
     }
 
+    /// Review, IMPORTANT: which start may launch btxd, for every combination.
+    /// A roll-back that could not begin keeps every start off. While this
+    /// app's driver is at work a start goes ahead only on chain data that is
+    /// not moving: no run, a run under way, or one that is done; never while
+    /// the chain data moves or is to be moved back, nor over a record nobody
+    /// can read. With no driver the start carries the recorded run on first.
+    #[test]
+    fn the_start_gate_decides_every_combination() {
+        let d = Path::new("/Users/someone/.easybtx");
+        let records = [
+            OnRecord::Nothing,
+            OnRecord::Unreadable,
+            OnRecord::At(Phase::SettingAside),
+            OnRecord::At(Phase::Running),
+            OnRecord::At(Phase::Undoing),
+            OnRecord::At(Phase::Restoring),
+            OnRecord::At(Phase::Done),
+        ];
+        let stuck = "the roll-back could not begin.";
+        let mut seen = 0;
+        for driving in [false, true] {
+            for stuck in [None, Some(stuck)] {
+                for record in records {
+                    for rolling_back in [false, true] {
+                        seen += 1;
+                        let gate = start_gate(driving, stuck, record, rolling_back, d);
+                        let want = if let Some(said) = stuck {
+                            Gate::Refuse(said.into())
+                        } else if !driving {
+                            Gate::AtStart
+                        } else {
+                            match record {
+                                OnRecord::Nothing | OnRecord::At(Phase::Done) => Gate::Start,
+                                OnRecord::At(Phase::Running) if !rolling_back => Gate::Start,
+                                OnRecord::Unreadable => Gate::Refuse(unreadable_sentence(d)),
+                                _ => Gate::Refuse(MOVING.into()),
+                            }
+                        };
+                        assert_eq!(
+                            gate, want,
+                            "driving {driving}, stuck {stuck:?}, {record:?}, rolling back \
+                             {rolling_back}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(seen, 56);
+        // The ones the review named.
+        for phase in [Phase::SettingAside, Phase::Undoing, Phase::Restoring] {
+            assert_eq!(
+                start_gate(true, None, OnRecord::At(phase), false, d),
+                Gate::Refuse(MOVING.into()),
+                "{phase:?}"
+            );
+        }
+        assert_eq!(
+            start_gate(true, Some(stuck), OnRecord::At(Phase::Running), false, d),
+            Gate::Refuse(stuck.into())
+        );
+    }
+
+    /// Review, minor 2: a roll-back is decided for good when its reason is
+    /// written, since a run clears the outcome before it sets anything
+    /// aside. A Running record beside a roll-back's outcome (the app was cut
+    /// off, or could not stop the node, before the restore began) is rolled
+    /// back at the next start, before the launch when the node is down, and
+    /// by the watch's first look when a node is up. Never watched as if
+    /// nothing had been decided.
+    #[test]
+    fn a_roll_back_decided_before_a_crash_is_carried_out_at_the_next_start() {
+        let before = Before {
+            snapshot_loaded: true,
+            first_load_pending: false,
+        };
+        let decided = Outcome::RolledBack {
+            reason: WHY_NOT_LOADED.into(),
+        };
+        let tmp = datadir_with_chain(before);
+        let d = tmp.path();
+        set_aside_for_run(d, 232_000, 100).unwrap();
+        attempt(d);
+        ff::write_outcome(d, &decided);
+        assert_eq!(at_start(d, 50_000, true), Ok(()));
+        assert_old_chain_back(d, "node down");
+        assert_eq!(run_settings(d), before);
+        assert_eq!(
+            ff::read_outcome(d),
+            Some(decided.clone()),
+            "the real reason"
+        );
+
+        let tmp = datadir_with_chain(before);
+        let d = tmp.path();
+        set_aside_for_run(d, 232_000, 100).unwrap();
+        attempt(d);
+        ff::write_outcome(d, &decided);
+        assert_eq!(at_start(d, 50_000, false), Ok(()), "a node is up");
+        assert!(underway(d), "left for the watch, which can stop the node");
+        let record = ff::read_record(d).unwrap().unwrap();
+        let on_the_snapshot = Look {
+            snapshot_base_height: Some(232_000),
+            running: true,
+            ..Look::default()
+        };
+        assert_eq!(
+            verdict(&record, &on_the_snapshot, ff::read_outcome(d), 50_005),
+            Verdict::RollBack(WHY_NOT_LOADED.into()),
+            "however the node looks"
+        );
+        // Without that outcome the watch judges as always; a run judged
+        // done whose finish was cut off is judged done again.
+        assert_eq!(
+            verdict(&record, &on_the_snapshot, None, 50_005),
+            Verdict::Done
+        );
+        let done = Outcome::Done {
+            height: 232_000,
+            operators: vec![],
+        };
+        assert_eq!(
+            verdict(&record, &on_the_snapshot, Some(done), 50_005),
+            Verdict::Done
+        );
+    }
+
+    /// Controller note 2b with the decision on disk: a roll-back whose
+    /// restore cannot begin at the start keeps the node from starting in
+    /// this run of the app, and drops the decision, so the next opening
+    /// watches the intact new chain again rather than failing the same way.
+    #[tokio::test]
+    async fn a_roll_back_that_cannot_begin_keeps_the_node_stopped_until_the_next_opening() {
+        let tmp = datadir_with_chain(Before::default());
+        let d = tmp.path();
+        let record = set_aside_for_run(d, 232_000, 100).unwrap();
+        let folder = d.join(&record.aside);
+        attempt(d);
+        ff::write_outcome(
+            d,
+            &Outcome::RolledBack {
+                reason: WHY_NOT_LOADED.into(),
+            },
+        );
+        std::fs::remove_dir_all(folder.join("indexes")).unwrap();
+        let said = stranded_sentence(&folder, true);
+        assert_eq!(before_start(d).await, Err(said.clone()));
+        assert_eq!(ff::read_outcome(d), None);
+        assert!(underway(d));
+        // Put the missing part back: this run of the app still does not
+        // start the node.
+        std::fs::create_dir_all(folder.join("indexes")).unwrap();
+        assert_eq!(before_start(d).await, Err(said));
+        *STUCK.lock().unwrap() = None;
+        assert_eq!(before_start(d).await, Ok(()), "the next opening");
+        assert!(underway(d), "watched again");
+    }
+
+    /// Review, minor 3: a set-aside note written between the run's check
+    /// and the move (a load refused meanwhile) stops the move, with the node
+    /// stopped and the datadir to itself, and nothing changes.
+    #[test]
+    fn a_set_aside_note_that_appears_before_the_move_stops_it() {
+        let before = Before {
+            snapshot_loaded: true,
+            first_load_pending: false,
+        };
+        let tmp = datadir_with_chain(before);
+        let d = tmp.path();
+        std::fs::write(d.join(crate::commands::SET_ASIDE_PENDING_FILE), b"{}").unwrap();
+        assert!(matches!(
+            set_aside_for_run(d, 232_000, 100),
+            Err(MoveError::Untouched(_))
+        ));
+        assert!(ff::read_record(d).unwrap().is_none());
+        assert!(d.join("blocks/old").exists());
+        assert!(entries_named(d, "fast-forward-").is_empty());
+        assert_eq!(run_settings(d), before);
+        assert!(snapshot_marker_present(d));
+        assert_eq!(why_not_set_aside(d), WHY_NOTE_APPEARED);
+        std::fs::remove_file(d.join(crate::commands::SET_ASIDE_PENDING_FILE)).unwrap();
+        assert_eq!(why_not_set_aside(d), WHY_NOT_SET_ASIDE);
+    }
+
+    /// Review, minor 4: "remove what the attempt made" includes the
+    /// snapshot chainstates the attempt's loads were refused and set aside
+    /// (named after the time, at or after the run began). Older ones, and
+    /// anything else, are left to the weekly sweep.
+    #[test]
+    fn a_roll_back_removes_the_refused_chainstates_the_attempt_made() {
+        let tmp = datadir_with_chain(Before::default());
+        let d = tmp.path();
+        let prefix = btx_core::confirmed_load::REFUSED_CHAINSTATE_PREFIX;
+        std::fs::create_dir_all(d.join(format!("{prefix}99/x"))).unwrap();
+        set_aside_for_run(d, 232_000, 100).unwrap();
+        attempt(d);
+        for t in ["100", "5000"] {
+            std::fs::create_dir_all(d.join(format!("{prefix}{t}/x"))).unwrap();
+        }
+        std::fs::create_dir_all(d.join(format!("{prefix}later/x"))).unwrap();
+        std::fs::write(d.join(format!("{prefix}6000")), b"a file").unwrap();
+        assert_eq!(undo(d), Ok(()));
+        assert_eq!(
+            entries_named(d, prefix),
+            [
+                format!("{prefix}6000"),
+                format!("{prefix}99"),
+                format!("{prefix}later"),
+            ]
+        );
+        assert_old_chain_back(d, "after the refused chainstates");
+    }
+
+    /// Review, minor 1: the driver's own start, made just after it lets the
+    /// start guard go, can meet a start someone else began that moment. That
+    /// one is as good (it launches the same node), so it is not a failure to
+    /// roll back on; any other error is.
+    #[test]
+    fn a_start_already_under_way_counts_as_the_drivers_own() {
+        assert!(started_elsewhere(crate::commands::ALREADY_STARTING));
+        assert!(!started_elsewhere("couldn't start the node: no btxd"));
+        assert!(!started_elsewhere(MOVING));
+    }
+
     /// Everything the driver says: plain, no em-dash; the sentences end in
     /// a full stop, the reasons fit `copy::rolled_back`, and a folder the
     /// old chain data is in is named.
@@ -1365,6 +1845,7 @@ mod tests {
             NOT_STOPPED.to_string(),
             UNDO_FAILED.to_string(),
             MOVE_CUT_OFF.to_string(),
+            MOVING.to_string(),
             unreadable_sentence(Path::new("/Users/someone/.easybtx")),
         ];
         for s in sentences.iter().chain(&stranded) {
@@ -1381,6 +1862,8 @@ mod tests {
             WHY_NOT_STARTED,
             WHY_NOT_LOADED,
             WHY_REFUSED,
+            WHY_NOTE_APPEARED,
+            WHY_NOT_CLEARED,
         ] {
             assert!(!why.contains('\u{2014}') && !why.ends_with('.'), "{why}");
             assert!(why.starts_with(|c: char| c.is_lowercase()), "{why}");

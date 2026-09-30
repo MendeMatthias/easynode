@@ -595,6 +595,10 @@ pub(crate) fn pre_launch_plan(
     }
 }
 
+/// What a start says when another start holds `AppState::start_in_flight`.
+/// Fast-forward's driver reads it as a start already under way.
+pub(crate) const ALREADY_STARTING: &str = "the node is already starting, give it a moment";
+
 /// Spawn (or attach to) the node and bring the app to a running state:
 /// RPC client armed, snapshot-load guaranteed in the background, keep-awake
 /// held, and the status refresher loop driving the phase.
@@ -611,7 +615,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return Err("the node is already starting, give it a moment".to_string());
+        return Err(ALREADY_STARTING.to_string());
     }
     struct InFlight<'a>(&'a std::sync::atomic::AtomicBool);
     impl Drop for InFlight<'_> {
@@ -6904,7 +6908,7 @@ pub async fn remove_node_data_now(
 /// Fast-forward run is under way or recorded; otherwise the chain data, the
 /// node's sidecars, and the old chain data a finished or undone run left.
 fn remove_node_files(dd: &Path) -> Result<btx_core::disk::ReclaimReport, String> {
-    if crate::fast_forward::active() {
+    if crate::fast_forward::active_in(dd) {
         return Err(crate::fast_forward::REMOVE_WAITS.to_string());
     }
     let mut report = btx_core::disk::remove_node_data(dd);
@@ -7041,6 +7045,44 @@ mod signed_start_tests {
         ] {
             assert!(!fails_the_run(true, &loaded, false), "{loaded:?}");
         }
+    }
+
+    /// Controller note 2c and review minor 5: Remove node data asks the
+    /// datadir it removes from whether a Fast-forward run is recorded there,
+    /// and waits while one is; otherwise it also takes the old chain data a
+    /// finished run left.
+    #[test]
+    fn remove_node_data_waits_for_a_recorded_run_in_its_own_datadir() {
+        let dir = synced_validating_datadir();
+        let d = dir.path();
+        btx_core::fast_forward::set_aside(
+            d,
+            232_000,
+            btx_core::fast_forward::Before::default(),
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            super::remove_node_files(d).unwrap_err(),
+            crate::fast_forward::REMOVE_WAITS
+        );
+        assert!(
+            d.join("fast-forward-100/blocks").exists(),
+            "nothing removed"
+        );
+
+        let dir = synced_validating_datadir();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("fast-forward-7/blocks")).unwrap();
+        std::fs::write(d.join("fast-forward-7/blocks/old"), vec![0u8; 4096]).unwrap();
+        let report = super::remove_node_files(d).unwrap();
+        assert!(!d.join("blocks").exists());
+        assert!(!d.join("fast-forward-7").exists());
+        assert!(
+            report.items.iter().any(|i| i.contains("Fast-forward")),
+            "{:?}",
+            report.items
+        );
     }
 
     /// Controller note 1 (a): Fast-forward sets `blocks/` aside, and the
