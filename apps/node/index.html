@@ -126,11 +126,15 @@
                 <span class="choice-reason" id="choice-full-reason" hidden></span>
               </span>
             </label>
-            <!-- The owner's wording of 2026-09-30, "recent signed snapshot"
-                 until a second operator is on the list; then "confirmed by
-                 two node operators". The last sentence shows only where Full
-                 check is possible (start-choice.ts switchLaterShown): on a
-                 machine that cannot check blocks, Settings has no switch. -->
+            <!-- The owner's wording of 2026-09-30. "Confirmed by two node
+                 operators" is true only of a snapshot a second operator has
+                 confirmed (docs/decisions/2026-09-29-quick-start-full-check-
+                 and-progress.md, section 1), and a node that finds none starts
+                 from the pinned snapshot, which carries one signature. So
+                 "recent signed snapshot" stays the honest wording for as long
+                 as that fallback is there. The last sentence shows only where
+                 Full check is possible (start-choice.ts switchLaterShown): on
+                 a machine that cannot check blocks, Settings has no switch. -->
             <p class="wizard-note start-choice-note" id="start-choice-note">
               Both start from a recent signed snapshot and check the older
               history in the background. Full check also checks every new
