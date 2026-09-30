@@ -88,24 +88,8 @@ impl Node {
     async fn start(&mut self, extra: &[String]) -> Result<RpcClient, String> {
         self.kill();
         let _ = std::fs::remove_file(self.net().join(".cookie"));
-        let child = std::process::Command::new(&self.btxd)
-            .arg("-regtest")
-            .arg(format!("-datadir={}", self.dir.display()))
-            .arg(format!("-rpcport={}", self.rpc_port))
-            .arg(format!("-port={}", self.p2p_port))
-            .args([
-                "-server=1",
-                "-bind=127.0.0.1",
-                "-listen=1",
-                "-discover=0",
-                "-dnsseed=0",
-                "-fixedseeds=0",
-                "-upnp=0",
-                "-natpmp=0",
-                "-printtoconsole=0",
-                "-daemon=0",
-            ])
-            .args(extra)
+        let child = self
+            .command(extra)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -126,6 +110,29 @@ impl Node {
         }
         self.kill();
         Err(format!("no RPC within 120 s:\n{}", self.log_tail()))
+    }
+
+    /// The engine's command line for this node, with `extra`.
+    fn command(&self, extra: &[String]) -> std::process::Command {
+        let mut cmd = std::process::Command::new(&self.btxd);
+        cmd.arg("-regtest")
+            .arg(format!("-datadir={}", self.dir.display()))
+            .arg(format!("-rpcport={}", self.rpc_port))
+            .arg(format!("-port={}", self.p2p_port))
+            .args([
+                "-server=1",
+                "-bind=127.0.0.1",
+                "-listen=1",
+                "-discover=0",
+                "-dnsseed=0",
+                "-fixedseeds=0",
+                "-upnp=0",
+                "-natpmp=0",
+                "-printtoconsole=0",
+                "-daemon=0",
+            ])
+            .args(extra);
+        cmd
     }
 
     async fn stop(&mut self, rpc: &RpcClient) {
@@ -868,5 +875,56 @@ async fn fast_forward_finish_keeps_a_real_new_chain() {
     let r = n.start(&validating).await.unwrap();
     assert_eq!(call(&r, "getblockcount", json!([])).await, json!(5));
     assert_eq!(call(&r, "getbestblockhash", json!([])).await, new_best);
+    n.stop(&r).await;
+}
+
+/// Review I5 on a real engine: while the app holds the engine's own lock on
+/// the folder (`fsx::EngineLock`, as every Fast-forward move does), a btxd
+/// started on it refuses to start, whichever app launches it; once the lock
+/// is let go, it starts on the chain as it was.
+#[tokio::test]
+#[ignore]
+async fn the_engines_lock_keeps_a_btxd_off_the_folder() {
+    let Some(btxd) = std::env::var_os("EASYNODE_TEST_BTXD").map(PathBuf::from) else {
+        eprintln!("EASYNODE_TEST_BTXD unset; nothing to test against");
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut n = Node::new(&btxd, root.path().join("l"), 29477);
+    let validating = args(&["-matmulvalidation=consensus", "-connect=0"]);
+    let r = n.start(&validating).await.unwrap();
+    mine_to(&r, 5).await;
+    n.stop(&r).await;
+
+    let lock = btx_core::fsx::EngineLock::take(&n.net()).unwrap();
+    let mut refused = n
+        .command(&validating)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut status = None;
+    for _ in 0..240 {
+        if let Some(s) = refused.try_wait().unwrap() {
+            status = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if status.is_none() {
+        let _ = refused.kill();
+        let _ = refused.wait();
+    }
+    let mut said = String::new();
+    use std::io::Read as _;
+    let _ = refused.stderr.take().unwrap().read_to_string(&mut said);
+    said.push_str(&n.log_tail());
+    let status = status.unwrap_or_else(|| panic!("btxd started with the lock held:\n{said}"));
+    assert!(!status.success(), "{said}");
+    assert!(said.contains("Cannot obtain a lock"), "{said}");
+
+    drop(lock);
+    let r = n.start(&validating).await.unwrap();
+    assert_eq!(call(&r, "getblockcount", json!([])).await, json!(5));
     n.stop(&r).await;
 }
