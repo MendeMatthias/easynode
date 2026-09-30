@@ -564,6 +564,22 @@ fn rpc_timeout_error(
     )
 }
 
+/// The RPC wait's "is the child gone?" probe over the node slot: an empty
+/// slot (a stop or a quit took it) or a child that exited is gone.
+///
+/// `try_lock`, not `lock().await`: the probe is a plain closure asked once
+/// per poll. A slot held elsewhere at that instant (the warmup watcher looks
+/// at it every 2 s) reads as "still there", the safe direction, and the next
+/// poll looks again.
+fn slot_child_gone(slot: &tokio::sync::Mutex<Option<NodeController>>) -> bool {
+    match slot.try_lock() {
+        Ok(mut guard) => guard
+            .as_mut()
+            .is_none_or(|c| c.child_has_exited() == Some(true)),
+        Err(_) => false,
+    }
+}
+
 /// What the launch loop does after it stopped a btxd that never opened its
 /// RPC (0.7.1).
 #[derive(Debug, PartialEq, Eq)]
@@ -1730,17 +1746,10 @@ async fn spawn_node_with_lock_retry(
         let mut exited_after_watch = false;
         if survived {
             spawn_warmup_watcher(app.clone(), state, datadir.to_path_buf());
-            // `try_lock`, not `lock().await`: the probe is a plain closure
-            // asked once per poll. A slot held elsewhere at that instant (the
-            // warmup watcher looks at it every 2 s) reads as "still there",
-            // the safe direction, and the next poll looks again.
+            // Asked once per poll; see `slot_child_gone` for why a held slot
+            // reads as still there.
             let node_slot = state.node.clone();
-            let child_gone = move || match node_slot.try_lock() {
-                Ok(mut guard) => guard
-                    .as_mut()
-                    .is_none_or(|c| c.child_has_exited() == Some(true)),
-                Err(_) => false,
-            };
+            let child_gone = move || slot_child_gone(&node_slot);
             let wait = wait_for_node_rpc_watching(
                 datadir,
                 &rpc_url(),
@@ -9293,5 +9302,69 @@ mod launch_wait_tests {
             .and_then(|s| s.split("\n}\n").next())
             .unwrap();
         assert!(settings_fn.contains("apply_follow_signatures_choice(&node_datadir(), on)"));
+    }
+}
+
+/// The probe the RPC wait asks once per poll (Task A review, TESTS): a child
+/// that exits is gone, an empty slot is gone, and a slot someone else holds
+/// at that instant reads as still there, the safe direction.
+#[cfg(all(test, unix))]
+mod slot_probe_tests {
+    use super::slot_child_gone;
+    use btx_core::backend::Backend;
+    use btx_core::node::NodeController;
+    use tokio::sync::Mutex;
+
+    /// A shell script standing in for btxd. Retries the ETXTBSY race a
+    /// freshly written executable can lose (errno 26 on Linux and macOS),
+    /// as btx-core's own shim does.
+    async fn start_shim(dir: &std::path::Path, body: &str) -> NodeController {
+        use std::os::unix::fs::PermissionsExt;
+        let shim = dir.join("btxd");
+        std::fs::write(&shim, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let conf = dir.join("faststart.conf");
+        std::fs::write(&conf, "").unwrap();
+        for attempt in 1..=20 {
+            let mut controller = NodeController::new();
+            match controller
+                .start(&shim, dir, &conf, Backend::Cpu, &shim)
+                .await
+            {
+                Ok(()) => return controller,
+                Err(e) if attempt < 20 && e.to_string().contains("os error 26") => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(e) => panic!("shim spawn: {e}"),
+            }
+        }
+        unreachable!()
+    }
+
+    #[tokio::test]
+    async fn a_child_that_exits_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = Mutex::new(Some(start_shim(tmp.path(), "sleep 0.3; exit 3").await));
+        assert!(!slot_child_gone(&slot), "alive at first");
+        let started = std::time::Instant::now();
+        while !slot_child_gone(&slot) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the exit was never seen"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[test]
+    fn an_empty_slot_is_gone() {
+        assert!(slot_child_gone(&Mutex::new(None)));
+    }
+
+    #[tokio::test]
+    async fn a_held_slot_reads_as_still_there() {
+        let slot: Mutex<Option<NodeController>> = Mutex::new(None);
+        let _held = slot.lock().await;
+        assert!(!slot_child_gone(&slot));
     }
 }
