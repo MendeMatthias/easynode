@@ -19,7 +19,7 @@ use btx_core::node_api::{get_blockchain_info, get_chainstates};
 use btx_core::rpc::RpcClient;
 use btx_core::setup::{
     enough_free_disk, ensure_addnodes_in_conf, free_disk_bytes, remove_addnodes_in_conf, rpc_url,
-    wait_for_node_rpc,
+    wait_for_node_rpc_watching, RpcWait,
 };
 use btx_core::snapshot::SnapshotSpec;
 use btx_core::snapshot_serve as snap;
@@ -483,8 +483,9 @@ pub fn nominal_btxd_path() -> PathBuf {
 
 /// Wait budget for a freshly-spawned node's RPC: 360 × 500 ms = 3 min covers a
 /// cold start / slow disk; a node that is ALIVE but warming (RPC_IN_WARMUP)
-/// keeps the wait going inside wait_for_node_rpc's poll loop, and a healthy
-/// node proceeds in 1–3 s.
+/// keeps the wait going inside wait_for_node_rpc_watching's poll loop, and a
+/// healthy node proceeds in 1–3 s. A child that exits ends the wait at the
+/// next poll (since 0.7.1), so this budget is only ever spent on a live one.
 const RPC_WAIT_POLLS: u32 = 360;
 const RPC_WAIT_POLL_MS: u64 = 500;
 /// Warmup budget: a node answering RPC_IN_WARMUP is ALIVE (an unclean
@@ -495,6 +496,60 @@ const RPC_WAIT_POLL_MS: u64 = 500;
 /// surfaces the calm Warming phase the whole time, so the long budget never
 /// leaves the user staring at a silent "Starting".
 const RPC_WAIT_WARMUP_POLLS: u32 = 57_600; // × 500 ms = 8 h
+
+/// SIGTERM-to-kill grace for a btxd that never opened its RPC in the whole
+/// wait. Short on purpose: before RPC there is no chainstate loaded to flush
+/// (it loads after the cookie, init.cpp:3414 at v0.34.12), and a process that
+/// ignored three minutes of polling is not about to finish in the next ten
+/// seconds. See `NodeController::stop_without_rpc`.
+const NO_RPC_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the launch loop does once a watched RPC wait ends.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterRpcWait {
+    /// The node answered: the start succeeded.
+    Ready,
+    /// A stop or a quit took the node out of the slot while it was starting.
+    /// Nothing to retry and nothing to stop.
+    StoppedMeanwhile,
+    /// The child exited: read its log and take the next attempt, exactly as
+    /// for an exit inside the launch watch.
+    Exited,
+    /// The child is still alive at the end of the budget. It is stopped
+    /// before the error is returned; `graceful` when its RPC is up (it
+    /// answered warmup), so `btx-cli stop` can reach it.
+    StopAlive { graceful: bool },
+}
+
+/// Pure so the launch loop's choice is pinned by a test. `slot_empty` is
+/// whether `state.node` was emptied under the wait, which only a stop or a
+/// quit does.
+fn after_rpc_wait(wait: &RpcWait, slot_empty: bool) -> AfterRpcWait {
+    match wait {
+        RpcWait::Ready(_) => AfterRpcWait::Ready,
+        _ if slot_empty => AfterRpcWait::StoppedMeanwhile,
+        RpcWait::Exited { .. } => AfterRpcWait::Exited,
+        RpcWait::TimedOut { warming, .. } => AfterRpcWait::StopAlive { graceful: *warming },
+    }
+}
+
+/// The error for a start whose btxd was alive but never became ready, after
+/// the app stopped it. `doing` is the last line this launch wrote to
+/// debug.log; `None` when it wrote nothing, which is expected for a btxd
+/// stuck before `StartLogging` (init.cpp:2924 at v0.34.12, every line before
+/// it is held in memory).
+fn rpc_timeout_error(last: &str, doing: Option<&str>, datadir: &Path) -> String {
+    let doing = match doing {
+        Some(line) => format!("The app stopped it; its last log line was \"{line}\"."),
+        None => {
+            "The app stopped it; the engine had not written anything to its log yet.".to_string()
+        }
+    };
+    format!(
+        "the node didn't become ready: {last}. {doing} See easybtx-node.log in {} for details.",
+        datadir.display()
+    )
+}
 
 /// Post-stop wait for an unmanaged btxd to actually free the datadir lock
 /// before we spawn (force-kill fallback only after this): btxd's flush after
@@ -1541,6 +1596,9 @@ async fn spawn_node_with_lock_retry(
         // A marked mirror launch counts as failed only from here on
         // (`mirror_launch_failed`): btxd is being started.
         launched.store(true, Ordering::SeqCst);
+        // debug.log is appended across runs; its length now marks where this
+        // launch's own lines begin, for the timeout's "last doing" sentence.
+        let log_offset = btx_core::node::debug_log_len(datadir);
         let mut controller = NodeController::new();
         controller
             .start(
@@ -1583,23 +1641,76 @@ async fn spawn_node_with_lock_retry(
                 None => return Err("the node was stopped while it was starting".to_string()),
             }
         };
+        // Surviving the watch is not the same as starting. Engine v0.34.12
+        // runs its GPU readiness (init.cpp:2928) and opens the attestation
+        // archive (init.cpp:2888-2900) before it binds RPC (init.cpp:3102),
+        // which on a CUDA consensus host takes well over the 5 s watch. So
+        // the RPC wait watches the child too, and a btxd that dies inside it
+        // goes down the same path as one that died inside the watch: its log
+        // read, the chip-refusal fallback, the next attempt. Before
+        // 2026-10-01 the wait never looked, and Zan's two Linux nodes sat
+        // three minutes on a dead process each start and then said only "no
+        // .cookie yet".
+        let mut exited_after_watch = false;
         if survived {
             spawn_warmup_watcher(app.clone(), state, datadir.to_path_buf());
-            return wait_for_node_rpc(
+            // `try_lock`, not `lock().await`: the probe is a plain closure
+            // asked once per poll. A slot held elsewhere at that instant (the
+            // warmup watcher looks at it every 2 s) reads as "still there",
+            // the safe direction, and the next poll looks again.
+            let node_slot = state.node.clone();
+            let child_gone = move || match node_slot.try_lock() {
+                Ok(mut guard) => guard
+                    .as_mut()
+                    .is_none_or(|c| c.child_has_exited() == Some(true)),
+                Err(_) => false,
+            };
+            let wait = wait_for_node_rpc_watching(
                 datadir,
                 &rpc_url(),
                 RPC_WAIT_POLLS,
                 RPC_WAIT_POLL_MS,
                 RPC_WAIT_WARMUP_POLLS,
+                child_gone,
             )
-            .await
-            .map_err(|e| {
-                format!(
-                    "the node didn't become ready: {e}. \
-                     See easybtx-node.log in {} for details.",
-                    datadir.display()
-                )
-            });
+            .await;
+            let slot_empty = state.node.lock().await.is_none();
+            match (after_rpc_wait(&wait, slot_empty), wait) {
+                (AfterRpcWait::Ready, RpcWait::Ready(client)) => return Ok(client),
+                (AfterRpcWait::StoppedMeanwhile, _) => {
+                    return Err("the node was stopped while it was starting".to_string())
+                }
+                (AfterRpcWait::StopAlive { graceful }, RpcWait::TimedOut { last, .. }) => {
+                    // Never leave a live btxd behind the error, and never
+                    // leave the slot holding a start that did not happen.
+                    let taken = state.node.lock().await.take();
+                    if let Some(mut c) = taken {
+                        if graceful {
+                            // It answered warmup, so its RPC is up and the
+                            // graceful stop (btx-cli, flush grace) reaches it.
+                            let _ = c.stop(&paths.btx_cli, datadir).await;
+                        } else {
+                            let clean = c.stop_without_rpc(NO_RPC_STOP_GRACE).await;
+                            eprintln!(
+                                "[node-app] btxd never opened its RPC in {}s; stopped it \
+                                 ({})",
+                                RPC_WAIT_POLLS as u64 * RPC_WAIT_POLL_MS / 1000,
+                                if clean {
+                                    "it exited on SIGTERM"
+                                } else {
+                                    "it had to be killed"
+                                },
+                            );
+                        }
+                    }
+                    let since = btx_core::node::debug_log_since(datadir, log_offset);
+                    let doing = btx_core::node::last_log_line(&since);
+                    return Err(rpc_timeout_error(&last, doing.as_deref(), datadir));
+                }
+                // `after_rpc_wait` maps each outcome to exactly one of these,
+                // so what is left is an exit: fall through to the exit path.
+                _ => exited_after_watch = true,
+            }
         }
         *state.node.lock().await = None;
 
@@ -1639,11 +1750,16 @@ async fn spawn_node_with_lock_retry(
             continue;
         }
 
+        let when = if exited_after_watch {
+            "before its RPC came up".to_string()
+        } else {
+            format!("within {}s of spawning", LAUNCH_SURVIVAL_WATCH.as_secs())
+        };
         eprintln!(
-            "[node-app] btxd exited within {}s of spawning, attempt \
-             {attempt}/{LAUNCH_ATTEMPTS}. Cause read from its log: {}",
-            LAUNCH_SURVIVAL_WATCH.as_secs(),
-            btx_core::node::launch_failure_hint(&tail).unwrap_or("not recognised"),
+            "[node-app] btxd exited {when}, attempt {attempt}/{LAUNCH_ATTEMPTS}. \
+             Cause read from its log: {}",
+            btx_core::node::launch_failure_cause(&tail)
+                .unwrap_or_else(|| "not recognised, and it printed no error line".to_string()),
         );
     }
     // Report what btxd's own log says, not a guess.
@@ -1657,9 +1773,13 @@ async fn spawn_node_with_lock_retry(
     //
     // Re-read the tail here because the one inside the loop is scoped to the
     // attempt that produced it, and the last attempt is the one worth quoting.
+    //
+    // Nothing recognised no longer means nothing said: the engine's own last
+    // error line is quoted (`launch_failure_cause`), and only a tail with
+    // neither gets the sentence below.
     let tail = btx_core::node::node_log_tail(datadir, 64 * 1024);
-    let cause = btx_core::node::launch_failure_hint(&tail)
-        .unwrap_or("its log does not say why in a way this app recognises.");
+    let cause = btx_core::node::launch_failure_cause(&tail)
+        .unwrap_or_else(|| "its log does not say why in a way this app recognises.".to_string());
     Err(format!(
         "the node kept exiting right after launch: {cause} \
          See easybtx-node.log in {} for details.",
@@ -8748,5 +8868,112 @@ mod signed_start_tests {
         assert!(!mirror_load_wanted_here(&btxd, d, Backend::Metal));
         assert_eq!(honour_pending_set_aside_at(d, 1000), Ok(false));
         assert!(snap.exists());
+    }
+}
+
+#[cfg(test)]
+mod launch_wait_tests {
+    use super::{after_rpc_wait, rpc_timeout_error, AfterRpcWait};
+    use btx_core::setup::RpcWait;
+    use std::path::Path;
+
+    fn exited() -> RpcWait {
+        RpcWait::Exited {
+            last: "the node's RPC never became reachable (no .cookie yet)".into(),
+        }
+    }
+
+    fn timed_out(warming: bool) -> RpcWait {
+        RpcWait::TimedOut {
+            last: "the node's RPC never became reachable (no .cookie yet)".into(),
+            warming,
+        }
+    }
+
+    /// ZAN'S NODES, 2026-10-01. A btxd that died during the RPC wait is
+    /// handled exactly like one that died inside the 5 s watch: read its log,
+    /// take the chip-refusal fallback if it applies, try again.
+    #[test]
+    fn an_exit_during_the_rpc_wait_goes_back_round_the_launch_loop() {
+        assert_eq!(after_rpc_wait(&exited(), false), AfterRpcWait::Exited);
+    }
+
+    /// A stop or a quit that took the node while it was starting is not an
+    /// exit to retry, whichever way the wait ended.
+    #[test]
+    fn a_node_taken_by_a_stop_during_the_wait_is_not_retried() {
+        assert_eq!(
+            after_rpc_wait(&exited(), true),
+            AfterRpcWait::StoppedMeanwhile
+        );
+        assert_eq!(
+            after_rpc_wait(&timed_out(false), true),
+            AfterRpcWait::StoppedMeanwhile
+        );
+    }
+
+    /// Still alive at the end: it is stopped, never left running behind the
+    /// error. One that never answered has no RPC, so it gets SIGTERM and a
+    /// kill; one that answered warmup has RPC, so it gets the graceful stop.
+    #[test]
+    fn a_live_node_at_the_timeout_is_stopped_the_way_it_can_be() {
+        assert_eq!(
+            after_rpc_wait(&timed_out(false), false),
+            AfterRpcWait::StopAlive { graceful: false }
+        );
+        assert_eq!(
+            after_rpc_wait(&timed_out(true), false),
+            AfterRpcWait::StopAlive { graceful: true }
+        );
+    }
+
+    /// The timeout error says what the engine was last doing, in one short
+    /// sentence, or that it had printed nothing yet (the engine buffers its
+    /// log until StartLogging, init.cpp:2924 at v0.34.12).
+    #[test]
+    fn the_timeout_error_says_what_the_engine_was_last_doing() {
+        let dir = Path::new("/home/zan/.easybtx");
+        let last = "the node's RPC never became reachable (no .cookie yet)";
+        let with = rpc_timeout_error(last, Some("MatMul RC production canary: begin"), dir);
+        assert!(with.starts_with("the node didn't become ready: "), "{with}");
+        assert!(
+            with.contains("\"MatMul RC production canary: begin\""),
+            "{with}"
+        );
+        assert!(with.contains("stopped it"), "{with}");
+        assert!(
+            with.contains("easybtx-node.log in /home/zan/.easybtx"),
+            "{with}"
+        );
+
+        let without = rpc_timeout_error(last, None, dir);
+        assert!(
+            without.contains("had not written anything to its log yet"),
+            "{without}"
+        );
+        for s in [&with, &without] {
+            assert!(!s.contains('\u{2014}'), "em-dash in: {s}");
+        }
+    }
+
+    /// The wiring, in the code: the launch loop waits with the watching form,
+    /// records debug.log's length before the spawn, and stops a live node
+    /// before it returns the timeout.
+    #[test]
+    fn the_launch_loop_watches_the_child_and_stops_a_live_one() {
+        let src = include_str!("commands.rs");
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(spawn_fn.contains("wait_for_node_rpc_watching("));
+        assert!(!spawn_fn.contains("wait_for_node_rpc("));
+        let offset = spawn_fn.find("debug_log_len(datadir)").unwrap();
+        assert!(offset < spawn_fn.find(".start(").unwrap());
+        let stop = spawn_fn.find(".stop_without_rpc(").unwrap();
+        let timeout = spawn_fn.find("rpc_timeout_error(").unwrap();
+        assert!(stop < timeout, "stop first, then report");
+        assert!(spawn_fn.contains("launch_failure_cause(&tail)"));
     }
 }
