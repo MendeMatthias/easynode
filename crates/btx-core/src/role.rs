@@ -1557,6 +1557,7 @@ mod tests {
             height: Some(233_470),
             blocks_behind: Some(behind),
             on_active_chain,
+            hash: None,
         }
     }
 
@@ -1644,6 +1645,7 @@ mod tests {
                     height: None,
                     blocks_behind: None,
                     on_active_chain: None,
+                    hash: None,
                 },
             )),
         );
@@ -1713,6 +1715,7 @@ mod tests {
                                 height: Some(233_470),
                                 blocks_behind: Some(n),
                                 on_active_chain: on,
+                                hash: None,
                             });
                             let lines =
                                 node_role(s.as_ref(), b, &[], inbound, up, behind, v.as_ref())

@@ -18,6 +18,7 @@
 
 pub mod attested_snapshot;
 pub mod backend;
+pub mod catchup_assist;
 pub mod checkin;
 pub mod console_policy;
 pub mod datadir;
@@ -31,6 +32,7 @@ pub mod esplora_sidecar;
 pub mod fork;
 pub mod frontier;
 pub mod fsx;
+pub mod header_path;
 pub mod health;
 pub mod installer;
 pub mod known_invalid;
