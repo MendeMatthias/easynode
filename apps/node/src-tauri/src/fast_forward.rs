@@ -611,10 +611,13 @@ fn settings_before(record: &Record) -> Before {
 
 /// Section 10, step 2, with the node stopped: the chain data and the start
 /// record go aside and the run is recorded, the settings as they were with
-/// it (`ff::set_aside`). Then "snapshot loaded" is reset, so the loaders load
-/// again, and "first load still to come" too: a run is no first load
-/// (controller note 1 (a)), and the start path keeps it so while the run is
-/// under way. A set-aside note written since the run's own check (a load
+/// it (`ff::set_aside`). Before anything moves, "snapshot loaded" is reset,
+/// so the loaders load again and the watch waits for the loader's own word
+/// ([`loaded_by_the_loader`]), and "first load still to come" too: a run is
+/// no first load (controller note 1 (a)), and the start path keeps it so
+/// while the run is under way. When nothing moved after all, both go back;
+/// when what moved could not all go back, the record keeps them for the
+/// restore. A set-aside note written since the run's own check (a load
 /// refused meanwhile) stops it here, with the datadir to itself: the note's
 /// chainstate would go aside with the rest, and a roll-back would bring it
 /// back without its note (controller note 1 (d)).
@@ -625,9 +628,13 @@ fn set_aside_for_run(datadir: &Path, height: u64, now_unix: u64) -> Result<Recor
             "a set-aside note is waiting for the next launch",
         )));
     }
-    let record = ff::set_aside(datadir, height, run_settings(datadir), now_unix)?;
+    let before = run_settings(datadir);
     put_settings(datadir, Before::default());
-    Ok(record)
+    let set = ff::set_aside(datadir, height, before, now_unix);
+    if matches!(set, Err(MoveError::Untouched(_))) {
+        put_settings(datadir, before);
+    }
+    set
 }
 
 /// Why the chain data was not set aside, for the Tools status.
@@ -1062,8 +1069,20 @@ async fn look(state: &AppState, datadir: &Path) -> (Look, Option<String>) {
         header_bootstrap_pending: btx_core::node::header_bootstrap_pending(datadir),
         running: rpc.is_some(),
         load_failed: take_failure(),
+        loaded: loaded_by_the_loader(datadir),
     };
     (look, base)
+}
+
+/// Has the loader said this run's snapshot is loaded? The app's "a snapshot
+/// was loaded" setting: the run resets it before anything moves
+/// ([`set_aside_for_run`]), and only the loader sets it again, once its own
+/// check after the load has passed (`btx_core::snapshot`'s
+/// `after_signed_load`), on a validating node's mirror launch before the
+/// relaunch. The engine shows the snapshot chainstate before that check
+/// ends, so the watch waits for this too (`ff::judge`).
+fn loaded_by_the_loader(datadir: &Path) -> bool {
+    NodeAppSettings::load(datadir).snapshot_loaded
 }
 
 /// Step 4: look until the run is done or has to be undone. A quit leaves
@@ -1862,6 +1881,7 @@ mod tests {
         let on_the_snapshot = Look {
             snapshot_base_height: Some(232_000),
             running: true,
+            loaded: true,
             ..Look::default()
         };
         assert_eq!(
@@ -1956,6 +1976,43 @@ mod tests {
         assert_eq!(before_start(d).await, Ok(()), "the next opening");
         assert!(underway(d), "watched again");
         assert_eq!(tools_status_phase(d), ToolsPhase::Running, "watched again");
+    }
+
+    /// Review I2: the watch reads the one fact the loader sets once its
+    /// check after the load has passed. The run resets it before anything
+    /// moves, and puts it back when nothing moved after all; the loader's
+    /// mark sets it; a roll-back puts back what it was before the run.
+    #[test]
+    fn the_watch_waits_for_the_loaders_own_word() {
+        use btx_core::snapshot::SnapshotFlags as _;
+        let before = Before {
+            snapshot_loaded: true,
+            first_load_pending: false,
+        };
+        let tmp = datadir_with_chain(before);
+        let d = tmp.path();
+        assert!(loaded_by_the_loader(d), "loaded before the run");
+        // A dated folder in the way: nothing moves, and nothing changes.
+        std::fs::write(d.join(ff::aside_name(100)), b"in the way").unwrap();
+        assert!(matches!(
+            set_aside_for_run(d, 232_000, 100),
+            Err(MoveError::Untouched(_))
+        ));
+        assert_eq!(run_settings(d), before);
+        assert!(snapshot_marker_present(d));
+        std::fs::remove_file(d.join(ff::aside_name(100))).unwrap();
+
+        set_aside_for_run(d, 232_000, 100).unwrap();
+        assert!(!loaded_by_the_loader(d), "reset by the run");
+        attempt(d);
+        crate::state::NodeAppSnapshotFlags {
+            datadir: d.to_path_buf(),
+            run: None,
+        }
+        .mark_loaded();
+        assert!(loaded_by_the_loader(d), "the loader's word");
+        assert_eq!(undo(d), Ok(()));
+        assert!(loaded_by_the_loader(d), "as before the run");
     }
 
     /// Review, minor 3: a set-aside note written between the run's check
