@@ -91,10 +91,20 @@ env:
   # move together. VERSION and TAG are equal again: the binary reports v0.34.9
   # and the install key is plain v0.34.9, because no install ever used that
   # key. Still two fields, for the next time they diverge.
-  PROVEN_BTXD_RUN_ID: "35867391955"
-  PROVEN_BTXD_ARTIFACT: "btxd-windows-84b998b4f3272775aaf8c241ac11dc683f4c4e23"
-  PROVEN_BTXD_VERSION: "v0.34.9"
-  PROVEN_BTXD_TAG: "v0.34.9"
+  #
+  # MOVED 2026-09-30 to upstream's TAG v0.34.12 = 5f32c4c4, built with
+  # -DWITH_MODELNET=OFF (commands.rs has why 0.34.12 runs in legacy reorg
+  # mode). Run 36723745858, dispatched on main with btxchain_ref=5f32c4c4...:
+  # both jobs green, the mingw cross-compile (the `near` patch rewrote 2 sites,
+  # the Ascend stub added, `native model network ... OFF`) and "regtest smoke on
+  # real Windows" (`BTX daemon version v0.34.12`), artifact
+  # btxd-windows-5f32c4c4... (19524914 bytes). All four pins move together.
+  # VERSION and TAG are equal: the binary reports v0.34.12 and the install key
+  # is plain v0.34.12.
+  PROVEN_BTXD_RUN_ID: "36723745858"
+  PROVEN_BTXD_ARTIFACT: "btxd-windows-5f32c4c4d1cb033180bcd40a461deae2c1bc1ee1"
+  PROVEN_BTXD_VERSION: "v0.34.12"
+  PROVEN_BTXD_TAG: "v0.34.12"
 
 permissions:
   contents: read
