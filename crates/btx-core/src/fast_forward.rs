@@ -50,6 +50,12 @@ pub const MIN_LEAD: u64 = 1_000;
 /// minutes; the header sync before it, on a slow link, can take an hour.
 pub const MAX_RUN_SECS: u64 = 3 * 60 * 60;
 
+/// However often a run is resumed with a fresh watch window, it is rolled
+/// back this long after it began ([`Record::started_at`]), so a crash loop,
+/// or an app never kept open for [`MAX_RUN_SECS`] in a row, does not keep it
+/// (and a node with no usable chain) going for ever.
+pub const MAX_TOTAL_SECS: u64 = 24 * 60 * 60;
+
 /// Everything that describes the chain. `shielded_state` is not in the
 /// decision's list but is chain data as much as `chainstate` is: left in
 /// place it would describe the old chain to the new one. The start record
@@ -126,6 +132,8 @@ pub struct Record {
     /// value back.
     #[serde(default)]
     pub first_load_pending_before: bool,
+    /// When the run began. [`MAX_TOTAL_SECS`] counts from here, however
+    /// often the run is resumed.
     pub started_at: u64,
     /// When the current watch began: the run's start, or the start of the
     /// app that resumed it ([`resume`]). [`MAX_RUN_SECS`] counts from here.
@@ -797,14 +805,16 @@ pub enum Verdict {
 /// Pure: is the run done, still going, or to be rolled back? A record at
 /// [`Phase::Done`] is done; one left between two steps of a move
 /// ([`Phase::SettingAside`], [`Phase::Restoring`]) is rolled back, whatever
-/// the node shows. The limit counts from `watch_started_at`. Done means a
-/// snapshot at or above the run's is loaded (the start path may have found a
-/// newer confirmed one), the loader's own check after the load has passed
-/// ([`Look::loaded`]), and the node runs its ordinary launch again: no
-/// mirror launch and no header bootstrap pending. A snapshot below the run's
-/// on that ordinary launch means the start path took a fallback (the
-/// operators began to disagree after the check, or the pair was refused):
-/// rolled back at once.
+/// the node shows. The limit counts from `watch_started_at`, and the total
+/// one ([`MAX_TOTAL_SECS`]) from `started_at`: a clock that jumps forward
+/// only rolls a run back early, and one set back only delays both limits
+/// until it catches up. Done means a snapshot at or above the run's is
+/// loaded (the start path may have found a newer confirmed one), the
+/// loader's own check after the load has passed ([`Look::loaded`]), and the
+/// node runs its ordinary launch again: no mirror launch and no header
+/// bootstrap pending. A snapshot below the run's on that ordinary launch
+/// means the start path took a fallback (the operators began to disagree
+/// after the check, or the pair was refused): rolled back at once.
 ///
 /// Follow-up, not done here: done compares heights only. The base block's
 /// hash (the confirmed snapshot's, or the start record's for a newer one)
@@ -846,6 +856,12 @@ pub fn judge(record: &Record, look: &Look, now_unix: u64) -> Verdict {
         return Verdict::RollBack(format!(
             "it did not finish within {} hours",
             MAX_RUN_SECS / 3600
+        ));
+    }
+    if now_unix.saturating_sub(record.started_at) >= MAX_TOTAL_SECS {
+        return Verdict::RollBack(format!(
+            "it had not finished {} hours after it started",
+            MAX_TOTAL_SECS / 3600
         ));
     }
     Verdict::Continue
@@ -1816,6 +1832,47 @@ mod tests {
         assert_eq!(left.as_ref().map(|r| r.phase), Some(Phase::Undoing));
         assert_eq!(resume(d, 99_999).unwrap(), left);
         assert_eq!(read_record(d).unwrap(), left, "nothing written");
+    }
+
+    /// Review M7: the fresh watch window at every start has a total bound,
+    /// counted from the run's own start. A crash loop, or an app never kept
+    /// open three hours in a row, does not keep a run (and a node with no
+    /// usable chain) going for ever: a day after it began, it is rolled
+    /// back, however recently it was resumed. On the snapshot it is still
+    /// done, however long it took. A clock that jumps forward only rolls
+    /// back early; one set back before the start is no reason either way.
+    #[test]
+    fn a_run_is_rolled_back_a_day_after_it_began_however_often_it_resumed() {
+        let started = 1_000;
+        let resumed = Record {
+            watch_started_at: started + MAX_TOTAL_SECS - 60 * 60,
+            ..running_record(started)
+        };
+        assert_eq!(
+            judge(&resumed, &Look::default(), started + MAX_TOTAL_SECS - 1),
+            Verdict::Continue,
+            "a second short of a day"
+        );
+        assert_eq!(
+            judge(&resumed, &Look::default(), started + MAX_TOTAL_SECS),
+            Verdict::RollBack("it had not finished 24 hours after it started".into()),
+            "an hour into a fresh window"
+        );
+        assert_eq!(
+            judge(&resumed, &on_the_snapshot(), started + 2 * MAX_TOTAL_SECS),
+            Verdict::Done
+        );
+        let fresh = running_record(started);
+        assert!(matches!(
+            judge(&fresh, &Look::default(), started + 10 * MAX_TOTAL_SECS),
+            Verdict::RollBack(_)
+        ));
+        assert_eq!(
+            judge(&fresh, &Look::default(), started - 500),
+            Verdict::Continue,
+            "a clock set back"
+        );
+        assert!(MAX_TOTAL_SECS > MAX_RUN_SECS);
     }
 
     #[test]
