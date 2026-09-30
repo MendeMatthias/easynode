@@ -27,7 +27,8 @@
 //! the outcome, the sweep, and Remove node data. It is only ever taken inside
 //! `spawn_blocking`, never across an await. And while chain data moves the
 //! driver holds the start path's own guard (`AppState::start_in_flight`), so
-//! no start launches btxd on a half-moved datadir.
+//! no start launches btxd on a half-moved datadir, and it keeps holding it
+//! through its own start after the move, so no other start comes between.
 //!
 //! Every sentence here can reach the window, so none carries an error's own
 //! text: that goes to the log.
@@ -53,8 +54,8 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::commands::{
     destructive_allowed, node_ownership, nominal_btxd_path, rpc_already_answering, set_phase,
-    setup_log, snapshot_spec, start_node_inner, stop_node_inner, ALREADY_STARTING,
-    SET_ASIDE_PENDING_FILE, SIGNED_LOAD_FAILED,
+    setup_log, snapshot_spec, start_node_held, stop_node_inner, SET_ASIDE_PENDING_FILE,
+    SIGNED_LOAD_FAILED,
 };
 use crate::state::{node_datadir, AppState, NodeAppSettings, NodePhase};
 
@@ -931,25 +932,19 @@ pub(crate) fn sweep_measured(datadir: &Path) -> u64 {
 
 // ── The run ─────────────────────────────────────────────────────────────────
 
-/// Pure: did the driver's own start meet a start someone else began the
-/// moment the driver let the start guard go? That one launches the same
-/// node through the same gate, so it counts as the driver's.
-fn started_elsewhere(error: &str) -> bool {
-    error == ALREADY_STARTING
-}
-
-/// The driver's start: `start_node_inner`, with a failure projected into the
-/// phase as `commands::start_node_projected` does, and a start already under
-/// way ([`started_elsewhere`]) counted as this one.
-async fn start_node(app: &AppHandle, state: &State<'_, AppState>) -> Result<(), String> {
-    match start_node_inner(app, state).await {
-        Err(e) if started_elsewhere(&e) => {
-            log(
-                &node_datadir(),
-                "a start already under way launches the node",
-            );
-            Ok(())
-        }
+/// The driver's start, made with the start guard it holds (`held`, let go
+/// when the start ends), so no other start comes between its move of the
+/// chain data and this one (review M10): `commands::start_node_held`, with a
+/// failure projected into the phase as `commands::start_node_projected`
+/// does.
+async fn start_node(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    held: NoStarts<'_>,
+) -> Result<(), String> {
+    let started = start_node_held(app, state).await;
+    drop(held);
+    match started {
         Err(message) => {
             let shown = NodePhase::Error {
                 message: message.clone(),
@@ -1118,9 +1113,8 @@ async fn run(app: &AppHandle, state: &State<'_, AppState>) {
     stop_node_inner(state).await;
     set_phase(app, state, NodePhase::Stopped).await;
     if !node_is_down(&datadir).await {
-        drop(no_starts);
         not_started(&datadir, WHY_NOT_STOPPED).await;
-        let _ = start_node(app, state).await;
+        let _ = start_node(app, state, no_starts).await;
         return;
     }
     let (dd, height, at) = (datadir.clone(), pair.height, now());
@@ -1137,9 +1131,8 @@ async fn run(app: &AppHandle, state: &State<'_, AppState>) {
                 &datadir,
                 &format!("the chain data could not be set aside: {e}"),
             );
-            drop(no_starts);
             not_started(&datadir, why_not_set_aside(&datadir, &e)).await;
-            let _ = start_node(app, state).await;
+            let _ = start_node(app, state, no_starts).await;
             return;
         }
         Some(Err(MoveError::Stranded { folder, error })) => {
@@ -1167,13 +1160,13 @@ async fn run(app: &AppHandle, state: &State<'_, AppState>) {
     // driver, not to the start path's restarts, so these still bound them.
     SIGNED_LOAD_FAILED.store(false, Ordering::SeqCst);
     state.load_failure_restarted.store(false, Ordering::SeqCst);
-    drop(no_starts);
 
-    // Step 3: start. The start path does the rest: the header bootstrap of
+    // Step 3: start, still holding the start guard, so this start is the
+    // driver's own. The start path does the rest: the header bootstrap of
     // the empty datadir, a validating node's one mirror launch, the load
     // with every check (signed-only during a run), the restart as a
     // validating node, and a failed load handed to this driver.
-    if let Err(e) = start_node(app, state).await {
+    if let Err(e) = start_node(app, state, no_starts).await {
         log(&datadir, &format!("the node did not start: {e}"));
         roll_back(app, state, WHY_NOT_STARTED.into()).await;
         return;
@@ -1291,9 +1284,10 @@ async fn finish_run(
 /// Stop, put the old chain data back, start as before, and say why. The
 /// reason is written first, so a restore cut off by a crash keeps it
 /// (controller note 2). Starts are held off from before the second stop
-/// until the old chain data is back; the node starts again only once
-/// [`undo`] returned `Ok`, and otherwise the window says, in plain words,
-/// where the old chain data is, and [`start_gate`] keeps starts off.
+/// until the old chain data is back and the driver's own start after it has
+/// ended; the node starts again only once [`undo`] returned `Ok`, and
+/// otherwise the window says, in plain words, where the old chain data is,
+/// and [`start_gate`] keeps starts off.
 async fn roll_back(app: &AppHandle, state: &State<'_, AppState>, why: String) {
     let datadir = node_datadir();
     log(&datadir, &format!("rolling back: {why}"));
@@ -1343,10 +1337,10 @@ async fn roll_back(app: &AppHandle, state: &State<'_, AppState>, why: String) {
         .unwrap_or_else(|| Err(NotBack::plain(MOVE_CUT_OFF)));
     match undone {
         Ok(()) => {
-            // The old chain data is back: starts may run again.
-            drop(no_starts);
+            // The old chain data is back: the driver starts the node as
+            // before, with the guard it holds, and then starts may run again.
             if !state.quitting.load(Ordering::SeqCst) {
-                let _ = start_node(app, state).await;
+                let _ = start_node(app, state, no_starts).await;
             }
         }
         Err(not_back) => {
@@ -2462,15 +2456,40 @@ mod tests {
         assert_eq!(still_ahead(233_800, None), Err(WHY_NO_TIP));
     }
 
-    /// Review, minor 1: the driver's own start, made just after it lets the
-    /// start guard go, can meet a start someone else began that moment. That
-    /// one is as good (it launches the same node), so it is not a failure to
-    /// roll back on; any other error is.
+    /// Review M10: the driver keeps the start guard from the move of the
+    /// chain data through its own start, so no start someone else begins in
+    /// between is taken for the driver's (a failed one left the watch
+    /// looking at no node until the limit). Its starts hand over the guard
+    /// it holds (`start_node` takes a [`NoStarts`]) and go through
+    /// `start_node_held`, never `start_node_inner`, which takes the guard
+    /// itself and would meet that other start; `start_node_inner` is the
+    /// guard around `start_node_held` and nothing else.
     #[test]
-    fn a_start_already_under_way_counts_as_the_drivers_own() {
-        assert!(started_elsewhere(crate::commands::ALREADY_STARTING));
-        assert!(!started_elsewhere("couldn't start the node: no btxd"));
-        assert!(!started_elsewhere(MOVING));
+    fn the_driver_starts_the_node_with_the_start_guard_it_holds() {
+        let driver = include_str!("fast_forward.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        assert!(!driver.contains("start_node_inner("));
+        assert!(driver.contains("start_node_held(app, state)"));
+        let starts = driver.matches("start_node(app, state").count();
+        assert!(starts >= 4, "{starts}");
+        assert_eq!(
+            driver.matches("start_node(app, state, no_starts)").count(),
+            starts
+        );
+        let inner = include_str!("commands.rs")
+            .split("pub(crate) async fn start_node_inner(")
+            .nth(1)
+            .and_then(|s| s.split("\npub(crate) async fn start_node_held(").next())
+            .unwrap();
+        let guard = inner.find(".start_in_flight").unwrap();
+        let body = inner.find("start_node_held(app, state).await").unwrap();
+        assert!(guard < body);
+        assert!(
+            !inner.contains("before_start("),
+            "the body is start_node_held's"
+        );
     }
 
     /// Review I1, in the code: Tools' check and step 1 judge the confirmed

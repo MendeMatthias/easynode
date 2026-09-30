@@ -619,7 +619,6 @@ pub(crate) fn pre_launch_plan(
 }
 
 /// What a start says when another start holds `AppState::start_in_flight`.
-/// Fast-forward's driver reads it as a start already under way.
 pub(crate) const ALREADY_STARTING: &str = "the node is already starting, give it a moment";
 
 /// Spawn (or attach to) the node and bring the app to a running state:
@@ -647,7 +646,14 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
         }
     }
     let _in_flight = InFlight(&state.start_in_flight);
+    start_node_held(app, state).await
+}
 
+/// [`start_node_inner`] for a caller that already holds
+/// `AppState::start_in_flight`: Fast-forward's driver, which keeps it from
+/// the move of the chain data through its own start, so no other start
+/// comes between them (review M10).
+pub(crate) async fn start_node_held(app: &AppHandle, state: &AppState) -> Result<(), String> {
     let datadir = node_datadir();
     // Before anything reads the chain data or the settings: a Fast-forward
     // run a previous start left is carried on from its record, and one cut
