@@ -1728,6 +1728,11 @@ function reflectArchiveService(status: NodeStatusInfo): void {
   el.classList.toggle("needs-attention", status.archive_service_needs_attention);
 }
 
+/** Whether the stale sentence was amber on a syncing node at the last poll.
+ *  A syncing node's card keeps amber until its hour's pace is back at the
+ *  chain's (catchup-trend.ts `staleCard`, `wasAmber`), so it does not blink. */
+let syncingStaleAmber = false;
+
 /**
  * The chain card, one sentence about whether this node follows the chain:
  * its newest block is hours old by the clock, a longer chain exists that it
@@ -1740,11 +1745,6 @@ function reflectArchiveService(status: NodeStatusInfo): void {
  * so a stale alarm never outlives the condition, and hidden on any phase that
  * is not running: a stopped node has no view of the chain to be behind with.
  */
-/** Whether the stale sentence was amber on a syncing node at the last poll.
- *  A syncing node's card keeps amber until its hour's pace is back at the
- *  chain's (catchup-trend.ts `staleCard`, `wasAmber`), so it does not blink. */
-let syncingStaleAmber = false;
-
 function reflectFork(status: NodeStatusInfo, reading: TrendReading): void {
   const card = $("fork-card");
   const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
