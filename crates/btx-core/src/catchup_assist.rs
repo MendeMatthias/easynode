@@ -347,9 +347,12 @@ impl Helper {
         self.ask(s)
     }
 
-    /// What came of a [`Decision::Ask`]: how many requests the node took, and
-    /// how many named a block it had already downloaded.
-    pub fn sent(&mut self, d: &Decision, now: Instant, accepted: usize, already_have: usize) {
+    /// What came of a [`Decision::Ask`] the node answered: the height of the
+    /// last block it took (sent, already downloaded, or already asked of
+    /// that peer), `None` when it took none. The batch runs up to there, so
+    /// it does not wait for blocks never asked for. Not called when the node
+    /// did not answer before taking any: that is the node, not the peer.
+    pub fn sent(&mut self, d: &Decision, now: Instant, last_taken: Option<u64>) {
         let Decision::Ask {
             peer_id,
             addr,
@@ -359,20 +362,20 @@ impl Helper {
         else {
             return;
         };
-        let (Some(first), Some(last)) = (blocks.first(), blocks.last()) else {
+        let Some(first) = blocks.first() else {
             return;
         };
-        if accepted + already_have == 0 {
+        let Some(to) = last_taken else {
             // The peer took none: the next one, after another quiet wait.
             self.rotate_from(addr.clone());
             self.quiet_since = Some((first.0.saturating_sub(1), now));
             return;
-        }
+        };
         self.batch = Some(Batch {
             peer_id: *peer_id,
             addr: addr.clone(),
             from: first.0,
-            to: last.0,
+            to,
             deep: *deep,
             asked_at: now,
         });
@@ -775,7 +778,9 @@ pub async fn tick(rpc: &dyn Rpc, cu: &mut CatchUp, t: &Tick<'_>, now: Instant) -
     // are RPC_MISC_ERROR texts (rpc/blockchain.cpp getblockfrompeer and
     // net_processing.cpp FetchBlock, at 84b998b4).
     let (mut accepted, mut have) = (0, 0);
-    for (_, hash) in blocks {
+    let mut last_taken = None;
+    let mut unanswered = false;
+    for (height, hash) in blocks {
         match rpc.call("getblockfrompeer", json!([hash, peer_id])).await {
             Ok(_) => accepted += 1,
             Err(AppError::Rpc { message, .. }) if message.contains("already downloaded") => {
@@ -789,24 +794,42 @@ pub async fn tick(rpc: &dyn Rpc, cu: &mut CatchUp, t: &Tick<'_>, now: Instant) -
             {
                 accepted += 1
             }
-            Err(_) => {}
+            // The engine refused this one; the rest may still go out.
+            Err(AppError::Rpc { .. }) => continue,
+            // No answer at all (a timeout, a lost connection): that is the
+            // node, not the peer. Nothing more this tick; each of the rest
+            // could wait the RPC client's whole timeout.
+            Err(_) => {
+                unanswered = true;
+                break;
+            }
         }
+        last_taken = Some(*height);
     }
-    cu.helper.sent(&d, now, accepted, have);
     let mut lines = said(cu, false, &d);
-    if let (Some(first), Some(last)) = (blocks.first(), blocks.last()) {
-        let (first, last) = (first.0, last.0);
-        lines.push(if accepted + have == 0 {
+    let Some(first) = blocks.first().map(|b| b.0) else {
+        return lines;
+    };
+    if unanswered && last_taken.is_none() {
+        // No rotation, no new quiet wait: the next tick asks the same peer.
+        lines.push(format!(
+            "the node did not answer while asking {addr}; asking again later"
+        ));
+        return lines;
+    }
+    cu.helper.sent(&d, now, last_taken);
+    lines.push(match last_taken {
+        None => {
+            let last = blocks.last().map_or(first, |b| b.0);
             format!(
                 "{addr} took none of blocks {first} to {last}; the next archive peer is asked \
                  later"
             )
-        } else {
-            format!(
-                "asked {addr} for blocks {first} to {last} ({accepted} sent, {have} already here)"
-            )
-        });
-    }
+        }
+        Some(last) => format!(
+            "asked {addr} for blocks {first} to {last} ({accepted} sent, {have} already here)"
+        ),
+    });
     lines
 }
 
@@ -933,7 +956,7 @@ mod tests {
     fn step(h: &mut Helper, s: &Seen) -> Decision {
         let d = h.decide(s);
         if let Decision::Ask { blocks, .. } = &d {
-            h.sent(&d, s.now, blocks.len(), 0);
+            h.sent(&d, s.now, blocks.last().map(|b| b.0));
         }
         d
     }
@@ -1176,7 +1199,7 @@ mod tests {
         let mut h = helper();
         h.decide(&seen(t0, 1_000, &next, &peers));
         let d = h.decide(&seen(t0 + QUIET, 1_000, &next, &peers));
-        h.sent(&d, t0 + QUIET, 0, 0);
+        h.sent(&d, t0 + QUIET, None);
         assert!(!h.helping());
         assert_eq!(
             h.decide(&seen(t0 + secs(33), 1_000, &next, &peers)),
@@ -1186,17 +1209,27 @@ mod tests {
         assert_eq!(asked_of(&d).0, 9);
     }
 
-    #[test]
-    fn blocks_already_downloaded_count_as_taken() {
+    #[tokio::test]
+    async fn blocks_already_downloaded_count_as_taken() {
+        // A node that has the bodies and is still checking them is not moved
+        // from peer to peer: the batch is out.
+        let mut node = FakeNode::new(300, 100, None);
+        node.answers = (101..=200)
+            .map(|h| (h, "Block already downloaded"))
+            .collect();
+        let (tips, peers) = ([tip(300, "headers-only")], [peer(7, A, 300)]);
+        let t = tick_of(100, 300, &tips, &peers);
+        let mut cu = CatchUp::for_this_app();
         let t0 = Instant::now();
-        let (next, peers) = (next_from(1_000), [peer(7, A, 8_000)]);
-        let mut h = helper();
-        h.decide(&seen(t0, 1_000, &next, &peers));
-        let d = h.decide(&seen(t0 + QUIET, 1_000, &next, &peers));
-        h.sent(&d, t0 + QUIET, 0, 100);
+        tick(&node, &mut cu, &t, t0).await;
         assert_eq!(
-            h.decide(&seen(t0 + secs(40), 1_000, &next, &peers)),
-            Decision::Wait(Why::BatchOut)
+            tick(&node, &mut cu, &t, t0 + QUIET).await,
+            ["asked 109.199.124.187:19335 for blocks 101 to 200 (0 sent, 100 already here)"]
+        );
+        assert!(tick(&node, &mut cu, &t, t0 + secs(40)).await.is_empty());
+        assert_eq!(
+            cu.diagnostics(),
+            ["asking 109.199.124.187:19335 for blocks 101 to 200"]
         );
     }
 
@@ -1695,7 +1728,7 @@ mod tests {
         let mut h = helper();
         h.decide(&seen(t0, 225_927, &next, &only_a));
         let d = h.decide(&seen(t0 + QUIET, 225_927, &next, &only_a));
-        h.sent(&d, t0 + QUIET, 0, 0);
+        h.sent(&d, t0 + QUIET, None);
         let all = [
             recorded(4, A, LIMITED, 233_481),
             recorded(9, B, LIMITED, 233_481),
@@ -1865,6 +1898,9 @@ mod tests {
         answers: Vec<(u64, &'static str)>,
         /// Methods that fail the way a lost connection or a timeout does.
         failing: Vec<&'static str>,
+        /// `getblockfrompeer` fails that way from this height up: the node
+        /// stops answering partway through a batch.
+        unreachable_from: Option<u64>,
         calls: Mutex<Vec<(String, Value)>>,
     }
 
@@ -1883,6 +1919,7 @@ mod tests {
                 branch: None,
                 answers: Vec::new(),
                 failing: Vec::new(),
+                unreachable_from: None,
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -1970,6 +2007,9 @@ mod tests {
                 "getblockhash" => Ok(json!(self.hash(params[0].as_u64().unwrap()))),
                 "getblockfrompeer" => {
                     let h = self.height_of(params[0].as_str().unwrap());
+                    if h.zip(self.unreachable_from).is_some_and(|(h, u)| h >= u) {
+                        return Err(AppError::Http("operation timed out".into()));
+                    }
                     match self.answers.iter().find(|(x, _)| Some(*x) == h) {
                         Some((_, message)) => Err(AppError::Rpc {
                             code: -1,
@@ -2293,6 +2333,72 @@ mod tests {
         }
         assert!(cu.no_archive_serves_old_blocks());
         now
+    }
+
+    #[tokio::test]
+    async fn a_node_that_does_not_answer_while_asked_is_not_read_as_the_peer_refusing() {
+        // The node stops answering RPC (a long ConnectBlock, a hang): the
+        // first request fails the way a timeout does. That is the node, not
+        // the peer: no more requests this tick, no rotation, no new quiet
+        // wait, one plain line, and the same peer is asked on the next tick.
+        let mut node = FakeNode::new(300, 100, None);
+        node.failing = vec!["getblockfrompeer"];
+        let tips = [tip(300, "headers-only")];
+        let peers = [peer(7, A, 300), peer(9, B, 300)];
+        let t = tick_of(100, 300, &tips, &peers);
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        tick(&node, &mut cu, &t, t0).await;
+        assert_eq!(
+            tick(&node, &mut cu, &t, t0 + QUIET).await,
+            ["the node did not answer while asking 109.199.124.187:19335; asking again later"]
+        );
+        assert_eq!(node.count("getblockfrompeer"), 1, "stops at the first");
+        assert_eq!(
+            cu.diagnostics(),
+            ["not asking any peer for blocks right now"]
+        );
+        node.failing.clear();
+        assert_eq!(
+            tick(&node, &mut cu, &t, t0 + QUIET + secs(3)).await,
+            [ASKED_101_TO_200]
+        );
+        assert!(node.asked().iter().all(|(_, id)| *id == 7));
+    }
+
+    #[tokio::test]
+    async fn a_node_that_stops_answering_partway_keeps_the_batch_it_took() {
+        // It answered for 101 to 140 and not after: the batch is 101 to 140,
+        // so it does not wait three minutes for blocks never asked for.
+        let mut node = FakeNode::new(300, 100, None);
+        node.unreachable_from = Some(141);
+        let tips = [tip(300, "headers-only")];
+        let peers = [peer(7, A, 300)];
+        let t = tick_of(100, 300, &tips, &peers);
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        tick(&node, &mut cu, &t, t0).await;
+        assert_eq!(
+            tick(&node, &mut cu, &t, t0 + QUIET).await,
+            ["asked 109.199.124.187:19335 for blocks 101 to 140 (40 sent, 0 already here)"]
+        );
+        assert_eq!(
+            node.count("getblockfrompeer"),
+            41,
+            "stops at the first unanswered"
+        );
+        assert_eq!(
+            cu.diagnostics(),
+            ["asking 109.199.124.187:19335 for blocks 101 to 140"]
+        );
+        // They connect: the rest goes out at once.
+        node.unreachable_from = None;
+        node.tip = 140;
+        let t = tick_of(140, 300, &tips, &peers);
+        assert_eq!(
+            tick(&node, &mut cu, &t, t0 + QUIET + secs(3)).await,
+            ["asked 109.199.124.187:19335 for blocks 141 to 240 (100 sent, 0 already here)"]
+        );
     }
 
     #[tokio::test]
