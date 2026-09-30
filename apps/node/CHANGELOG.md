@@ -65,6 +65,14 @@ hour your node adds against the network's 40. A node that is still syncing is
 judged by the blocks it adds, and a fresh install that is still counting the
 chain's headers stays calm.
 
+**A slow node no longer leaves the dead branch before Branch B is refused.**
+Before a node leaves the dead branch it first refuses Branch B, so B cannot
+become the chain it follows. Until now, a node that took too long to say
+whether it had seen B's first block was treated as one that had never seen it,
+and the dead branch could be left with B still open. Now only the node saying
+it has never seen that block counts. No answer, or any other error, keeps the
+dead branch waiting and the app asks again.
+
 **A node that starts far behind no longer waits on peers that cannot send
 blocks.** The app kept a steady connection to three introducer nodes that only
 know other nodes' addresses, and the node engine kept asking them for its next
