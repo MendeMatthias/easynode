@@ -737,8 +737,24 @@ fn settings_before(record: &Record) -> Before {
 /// restore. A set-aside note written since the run's own check (a load
 /// refused meanwhile) stops it here, with the datadir to itself: the note's
 /// chainstate would go aside with the rest, and a roll-back would bring it
-/// back without its note (controller note 1 (d)).
+/// back without its note (controller note 1 (d)). The reset is read back
+/// before the run is recorded: one that did not land (a settings write
+/// `NodeAppSettings::update` only logs) would leave "snapshot loaded" set
+/// from before the run, and the watch could say Done before the loader's
+/// check (review N3), so the move is refused and the settings go back.
 fn set_aside_for_run(datadir: &Path, height: u64, now_unix: u64) -> Result<Record, MoveError> {
+    set_aside_for_run_with(datadir, height, now_unix, &mut |d| {
+        put_settings(d, Before::default())
+    })
+}
+
+/// [`set_aside_for_run`], given how to reset the two settings.
+fn set_aside_for_run_with(
+    datadir: &Path,
+    height: u64,
+    now_unix: u64,
+    reset: &mut dyn FnMut(&Path),
+) -> Result<Record, MoveError> {
     if datadir.join(SET_ASIDE_PENDING_FILE).exists() {
         return Err(MoveError::Untouched(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -747,7 +763,13 @@ fn set_aside_for_run(datadir: &Path, height: u64, now_unix: u64) -> Result<Recor
     }
     let _engine = engine_lock(datadir).map_err(MoveError::Untouched)?;
     let before = run_settings(datadir);
-    put_settings(datadir, Before::default());
+    reset(datadir);
+    if run_settings(datadir) != Before::default() {
+        put_settings(datadir, before);
+        return Err(MoveError::Untouched(std::io::Error::other(
+            "the app's settings could not be reset for the run",
+        )));
+    }
     let set = ff::set_aside(datadir, height, before, now_unix);
     if matches!(set, Err(MoveError::Untouched(_))) {
         put_settings(datadir, before);
@@ -2320,6 +2342,47 @@ mod tests {
         assert!(loaded_by_the_loader(d), "the loader's word");
         assert_eq!(undo(d), Ok(()));
         assert!(loaded_by_the_loader(d), "as before the run");
+    }
+
+    /// Review N3: the settings reset is read back before the run is
+    /// recorded. One that did not land (a settings file that could not be
+    /// written, whose write `NodeAppSettings::update` only logs) would leave
+    /// "snapshot loaded" set from before the run, and the watch could say
+    /// Done before the loader's own check (review I2): the move is refused,
+    /// nothing moves, and the settings are as they were.
+    #[test]
+    fn a_settings_reset_that_did_not_land_stops_the_move() {
+        let before = Before {
+            snapshot_loaded: true,
+            first_load_pending: false,
+        };
+        let tmp = datadir_with_chain(before);
+        let d = tmp.path();
+        let got = set_aside_for_run_with(d, 232_000, 100, &mut |_| {});
+        assert!(matches!(got, Err(MoveError::Untouched(_))), "{got:?}");
+        assert!(ff::read_record(d).unwrap().is_none(), "nothing recorded");
+        assert!(d.join("blocks/old").exists(), "nothing moved");
+        assert!(entries_named(d, "fast-forward-").is_empty());
+        assert_eq!(run_settings(d), before);
+        assert!(snapshot_marker_present(d));
+        let record = set_aside_for_run(d, 232_000, 100).unwrap();
+        assert_eq!(settings_before(&record), before);
+        assert_eq!(run_settings(d), Before::default());
+
+        // Half of it landed: still refused, and both are as they were.
+        let both = Before {
+            snapshot_loaded: true,
+            first_load_pending: true,
+        };
+        let tmp = datadir_with_chain(both);
+        let d = tmp.path();
+        let got = set_aside_for_run_with(d, 232_000, 100, &mut |d| {
+            NodeAppSettings::update(d, |s| s.snapshot_loaded = false)
+        });
+        assert!(matches!(got, Err(MoveError::Untouched(_))), "{got:?}");
+        assert!(ff::read_record(d).unwrap().is_none());
+        assert_eq!(run_settings(d), both);
+        assert!(snapshot_marker_present(d));
     }
 
     /// Review, minor 3: a set-aside note written between the run's check
