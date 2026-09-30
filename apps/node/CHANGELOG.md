@@ -35,6 +35,36 @@ failed to install is not downloaded again by the automatic checks; Check now
 still tries. A .deb copy on 0.6.32 or older moves to this version by hand one
 last time, with the command on easybtx.com/node.
 
+**Setup asks one question: Quick start or Full check.** Both start from a
+recent signed snapshot and check the older history in the background. Quick
+start follows signatures and is ready in minutes. Full check also checks every
+new block on this computer's graphics card, and takes longer the first time.
+On Linux with an NVIDIA graphics card, Full check is selected first. On a Mac,
+Quick start is selected first, because some Mac graphics chips don't pass the
+engine's check; you can still pick Full check. A computer without a graphics
+card the engine can use gets Quick start, and the screen says why. For now
+that includes every Windows PC: the Windows engine can't use a graphics card.
+Where Full check is possible, you can switch later in Settings. If the engine
+turns down a Mac's graphics chip and the app moves the node to following
+signatures, the status screen says so once.
+
+**The status screen shows the check of older history.** A node that starts
+from a snapshot, with either choice, checks the history below the snapshot in
+the background. One line and a thin bar under the status now show how far
+that has got, for example "Checking older history: 131,200 of 225,927 (58%)",
+and go away when it is done. There is no time estimate, because the engine
+sets the pace. A node that checks blocks on a signed snapshot says so on its
+role card.
+
+**A node that is catching up is no longer told it is not following the
+chain.** That sentence is kept for a node whose newest block is over two hours
+old and that knows of nothing newer. While the gap is closing, the card stays
+hidden. In the first minutes it says "Checking whether your node is catching
+up...". If the gap is not closing, it turns amber and says how many blocks an
+hour your node adds against the network's 40. A node that is still syncing is
+judged by the blocks it adds, and a fresh install that is still counting the
+chain's headers stays calm.
+
 **A slow node no longer leaves the dead branch before Branch B is refused.**
 Before a node leaves the dead branch it first refuses Branch B, so B cannot
 become the chain it follows. Until now, a node that took too long to say

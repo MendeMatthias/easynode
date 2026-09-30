@@ -29,6 +29,25 @@ impl Backend {
             _ => Backend::Cpu,
         }
     }
+
+    /// Whether a node on this backend may check blocks itself, as far as the
+    /// app can tell before the engine's first start: an Apple Silicon Mac, or
+    /// an NVIDIA card the bundled engine can use. `Cpu` cannot. Whether the
+    /// chip then passes is the engine's verdict after start
+    /// (`node::node_rc_status`); this is only what the setup screen can offer.
+    pub fn may_check_blocks(&self) -> bool {
+        !matches!(self, Backend::Cpu)
+    }
+
+    /// Whether the setup screen selects Full check first on this backend: only
+    /// on an NVIDIA card. A Mac may check blocks and can still pick Full
+    /// check, but engine 0.34.9 does not move a Mac whose chip fails its check
+    /// to Quick start by itself (a `local_accelerator_failure` is not recorded
+    /// as a refusal), so a Mac starts on Quick start (the owner's decision of
+    /// 2026-09-29).
+    pub fn full_check_first(&self) -> bool {
+        matches!(self, Backend::Cuda)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -663,5 +682,26 @@ mod host_backend_tests {
         assert_eq!(pc_host_backend(true, false), Backend::Cpu);
         assert_eq!(pc_host_backend(false, true), Backend::Cpu);
         assert_eq!(pc_host_backend(false, false), Backend::Cpu);
+    }
+
+    /// The setup screen offers Full check on a machine with a graphics chip
+    /// the engine could use, and greys it out on one without.
+    #[test]
+    fn only_a_graphics_backend_may_check_blocks() {
+        assert!(Backend::Metal.may_check_blocks());
+        assert!(Backend::Cuda.may_check_blocks());
+        assert!(!Backend::Cpu.may_check_blocks());
+    }
+
+    /// Full check is selected first only on an NVIDIA card. A Mac may still
+    /// pick it, but starts on Quick start, because engine 0.34.9 leaves a Mac
+    /// whose chip fails its check degraded rather than moving it (the owner's
+    /// decision of 2026-09-29).
+    #[test]
+    fn only_an_nvidia_card_has_full_check_selected_first() {
+        assert!(Backend::Cuda.full_check_first());
+        assert!(!Backend::Metal.full_check_first());
+        assert!(Backend::Metal.may_check_blocks(), "a Mac can still pick it");
+        assert!(!Backend::Cpu.full_check_first());
     }
 }

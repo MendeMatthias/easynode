@@ -53,8 +53,13 @@ export const SAMPLE_SPACING_MS = 15 * 1000;
 export const MAX_SAMPLES = HISTORY_WINDOW_MS / SAMPLE_SPACING_MS + 1;
 
 /** `height` is optional so a reading without one still feeds the trend; the
- *  pace needs it at both ends of its window. */
-export type CatchupSample = { at: number; behind: number; height?: number };
+ *  pace needs it at both ends of its window.
+ *
+ *  `syncing` marks a reading taken while the node was syncing blocks
+ *  (`trendReading`). Its headers can run far ahead of its blocks, so its gap
+ *  is not the gap a live node closes: a live node's trend, pace and line read
+ *  only unmarked samples, and a syncing node is judged by its height alone. */
+export type CatchupSample = { at: number; behind: number; height?: number; syncing?: boolean };
 
 /** `converging` the gap is closing, `stalled` it is not, `unknown` not enough
  *  history yet. `unknown` must render as the old wording, never as an alarm. */
@@ -135,8 +140,10 @@ const judge = (
   samples: CatchupSample[],
   now: number,
 ): { trend: CatchupTrend; pace: CatchupPace | null } => {
-  const pace = catchupPace(samples, now);
-  let trend = catchupTrend(samples, now);
+  // A live node's gap only: readings from a sync are a different measurement.
+  const live = samples.filter((s) => !s.syncing);
+  const pace = catchupPace(live, now);
+  let trend = catchupTrend(live, now);
   if (trend === "unknown" && pace) {
     const closed = (pace.closingPerHour * pace.spanMs) / 3_600_000;
     trend = closed >= TREND_MIN_CLOSED ? "converging" : "stalled";
@@ -163,27 +170,220 @@ export const cannotCatchUp = (samples: CatchupSample[], now: number): number | n
   return added < TOO_SLOW_FOR_THE_CHAIN_PER_HOUR ? added : null;
 };
 
+/** The pace of a node that is not catching up, in one sentence: what it adds
+ *  an hour against what the chain adds, or that it added nothing. Null before
+ *  the pace is measured, and when the hour's pace is faster than the chain's,
+ *  which under "not catching up" would read as a bug. The catch-up line and
+ *  the stale card both say it, so they can never disagree. */
+export const paceSentence = (pace: CatchupPace | null): string | null => {
+  if (!pace) return null;
+  const added = Math.round(pace.addedPerHour);
+  if (added > CHAIN_BLOCKS_PER_HOUR) return null;
+  if (added < 1) return `It has added no blocks in the last ${Math.round(pace.spanMs / 60_000)} minutes.`;
+  return (
+    `It adds about ${added} block${added === 1 ? "" : "s"} an hour ` +
+    `while the network adds about ${CHAIN_BLOCKS_PER_HOUR}.`
+  );
+};
+
 export const catchupLine = (behind: number, samples: CatchupSample[], now: number): string => {
   const n = behind.toLocaleString("en-US");
   const { trend, pace } = judge(samples, now);
   if (trend === "stalled") {
-    const plain = `Your node is live but not catching up. It is ${n} blocks behind and the gap is not closing.`;
-    if (!pace) return plain;
-    const added = Math.round(pace.addedPerHour);
-    if (added > CHAIN_BLOCKS_PER_HOUR) return plain;
-    const head = `Your node is live but not catching up: ${n} blocks behind.`;
-    if (added < 1) {
-      return `${head} It has added no blocks in the last ${Math.round(pace.spanMs / 60_000)} minutes.`;
-    }
-    return (
-      `${head} It adds about ${added} block${added === 1 ? "" : "s"} an hour ` +
-      `while the network adds about ${CHAIN_BLOCKS_PER_HOUR}.`
-    );
+    const said = paceSentence(pace);
+    return said
+      ? `Your node is live but not catching up: ${n} blocks behind. ${said}`
+      : `Your node is live but not catching up. It is ${n} blocks behind and the gap is not closing.`;
   }
   const eta = trend === "converging" && pace ? timeToGo(behind, pace.closingPerHour) : null;
   return eta
     ? `Your node is live, still catching up — ${n} blocks behind, ${eta} to go at this pace`
     : `Your node is live, still catching up — ${n} blocks behind`;
+};
+
+/** Headers beyond blocks at which the stale card calls a node behind: two,
+ *  the role card's `HEADERS_AHEAD_IS_BEHIND` (crates/btx-core/src/role.rs),
+ *  so the two cards agree. One header ahead is a block in flight, its body a
+ *  few seconds behind its header. */
+export const HEADERS_AHEAD_IS_BEHIND = 2;
+
+/** A syncing node that added no blocks over this long is stalled, whatever
+ *  its hour reads: a sync that ran at 1,000 blocks an hour and then stopped
+ *  would average above the chain's 40 for most of an hour after it stopped.
+ *  Only "none at all" is judged this short: twenty minutes is about 13 blocks
+ *  of chain, so a pace read off it swings by 3 an hour per block. */
+export const SYNCING_STOP_WINDOW_MS = 20 * 60 * 1000;
+
+/** The neutral line for a node that is behind before its trend is measured. */
+export const CHECKING_CATCHUP = "Checking whether your node is catching up...";
+
+/** What the chain card says about an old tip. `amber` is a warning; `neutral`
+ *  is said in the card's quiet colours. */
+export type StaleCard = { message: string; tone: "amber" | "neutral" };
+
+/** The parts of a status phase the trend reads (main.ts `NodePhase`). Every
+ *  phase is named, so a new one does not compile until it is decided here. */
+export type TrendPhase =
+  | { phase: "ready"; height: number; blocks_behind: number }
+  | { phase: "syncing"; height: number; headers: number }
+  | {
+      phase:
+        | "welcome"
+        | "downloading"
+        | "preparing"
+        | "starting"
+        | "warming"
+        | "loading_snapshot"
+        | "stopped"
+        | "error";
+    };
+
+/** What one status reading gives the trend and the stale card.
+ *
+ *  - `live`: a ready node. Its gap is the trend, as the catch-up line reads it.
+ *  - `syncing`: a node syncing blocks. On a sync from far back its headers run
+ *    ahead of its blocks and keep growing, so its gap can widen while blocks
+ *    arrive quickly. The sample is marked, and the card judges it by the
+ *    blocks it adds.
+ *  - `headers`: fetching headers, no blocks yet (height 0). Headers grow while
+ *    the height stays 0, which as a gap reads as stalled on every fresh
+ *    install. Nothing is recorded, what there is is kept, and the card stays
+ *    neutral.
+ *  - `stopped`: any other phase. A gap measured before a stop, an error or a
+ *    restart says nothing about the one after it, so the samples start over.
+ *
+ *  `behind` is how many blocks the node knows of beyond its tip (headers
+ *  minus blocks). The stale card calls it behind from
+ *  `HEADERS_AHEAD_IS_BEHIND` on. */
+export type TrendReading =
+  | { kind: "live" | "syncing"; behind: number; sample: CatchupSample }
+  | { kind: "headers" }
+  | { kind: "stopped" };
+
+export const trendReading = (phase: TrendPhase, now: number): TrendReading => {
+  switch (phase.phase) {
+    case "ready":
+      return {
+        kind: "live",
+        behind: phase.blocks_behind,
+        sample: { at: now, behind: phase.blocks_behind, height: phase.height },
+      };
+    case "syncing": {
+      if (!(phase.height > 0)) return { kind: "headers" };
+      const behind = Math.max(0, phase.headers - phase.height);
+      return { kind: "syncing", behind, sample: { at: now, behind, height: phase.height, syncing: true } };
+    }
+    default:
+      return { kind: "stopped" };
+  }
+};
+
+/** The samples after one reading: its sample pushed, kept as they were, or
+ *  started over (`TrendReading`). */
+export const recordReading = (
+  samples: CatchupSample[],
+  reading: TrendReading,
+  now: number,
+): CatchupSample[] => {
+  if (reading.kind === "stopped") return [];
+  if (reading.kind === "headers") return samples;
+  return pushSample(samples, reading.sample, now);
+};
+
+/** The chain card's stale sentence, from the trend and from what the node
+ *  knows (docs/decisions/2026-09-29-quick-start-full-check-and-progress.md,
+ *  section 3).
+ *
+ *  `tipStaleMessage` is Rust's sentence, present only when the newest block is
+ *  more than 2 hours old by the clock. On 28 September btx2 and btx3 read "The
+ *  node is not following the chain" under "about 5 days to go": a node
+ *  closing a gap of days has an old tip by construction, and that sentence is
+ *  for a node that knows of nothing newer.
+ *
+ *  - behind, gap closing: no stale sentence; the catch-up line says it all.
+ *  - behind, trend not measured yet: neutral, "Checking whether your node is
+ *    catching up...".
+ *  - behind, gap not closing: amber, Rust's sentence and the pace.
+ *  - no newer block known, or one header ahead (a block in flight, as the
+ *    role card reads it): amber, Rust's sentence unchanged.
+ *
+ *  A syncing node is judged by the blocks it adds, not by the gap (its
+ *  headers can outrun them), and neutral until that is measured:
+ *  - amber when it added no blocks over the last twenty minutes
+ *    (`SYNCING_STOP_WINDOW_MS`);
+ *  - amber when, over the last hour, it added fewer blocks than the chain
+ *    made by more than one. One block in or out of the window moves a pace
+ *    read off an hour or less by a block's worth, so without the margin a
+ *    node at about the chain's own rate blinks amber on every block;
+ *  - once amber (`wasAmber`, the card at the last poll), amber until the
+ *    hour's pace is back at 40 or more, so a node a little slower than the
+ *    chain does not blink either;
+ *  - otherwise no stale sentence.
+ *  Fetching headers only, it stays neutral: there is nothing to measure yet,
+ *  and the design's calm card "does not hide a real stall" only once there
+ *  is. */
+export const staleCard = (
+  tipStaleMessage: string | null,
+  reading: TrendReading,
+  samples: CatchupSample[],
+  now: number,
+  wasAmber = false,
+): StaleCard | null => {
+  if (!tipStaleMessage) return null;
+  const checking: StaleCard = { message: CHECKING_CATCHUP, tone: "neutral" };
+  if (reading.kind === "headers") return checking;
+  if (reading.kind === "stopped" || !(reading.behind >= HEADERS_AHEAD_IS_BEHIND)) {
+    return { message: tipStaleMessage, tone: "amber" };
+  }
+  const withPace = (pace: CatchupPace | null): StaleCard => {
+    const said = paceSentence(pace);
+    return { message: said ? `${tipStaleMessage} ${said}` : tipStaleMessage, tone: "amber" };
+  };
+  if (reading.kind === "syncing") {
+    const syncing = samples.filter((s) => s.syncing);
+    const recent = catchupPace(
+      syncing.filter((s) => now - s.at <= SYNCING_STOP_WINDOW_MS),
+      now,
+    );
+    if (recent && !(recent.addedPerHour > 0)) return withPace(recent);
+    const hour = catchupPace(syncing, now);
+    if (!hour) return checking;
+    const hours = hour.spanMs / 3_600_000;
+    const clearlyBelow = hour.addedPerHour * hours + 1 < CHAIN_BLOCKS_PER_HOUR * hours;
+    const stillBelow = wasAmber && hour.addedPerHour < CHAIN_BLOCKS_PER_HOUR;
+    return clearlyBelow || stillBelow ? withPace(hour) : null;
+  }
+  const { trend, pace } = judge(samples, now);
+  if (trend === "converging") return null;
+  if (trend === "unknown") return checking;
+  return withPace(pace);
+};
+
+/** What the chain card shows, `calm` for the quiet colours. One card carries
+ *  the stale sentence, a fork verdict and "behind the signers":
+ *
+ *  - An amber stale tip outranks a fork verdict. A fork says "there is a
+ *    better chain we cannot reach"; a stale tip says "the newest block we have
+ *    is hours old however healthy everything else reads", which is the
+ *    condition every peer-derived signal in this app is blind to by
+ *    construction.
+ *  - Behind the signers comes after both because it is the earliest and the
+ *    least specific: it fires minutes into a split the node cannot see,
+ *    before the tip is old enough to be stale, and says less than either once
+ *    they do.
+ *  - The neutral "Checking whether..." comes last (plan decision 1): it is not
+ *    a verdict, and both of those are. */
+export type ChainCard = { message: string; calm: boolean };
+
+export const chainCardMessage = (
+  stale: StaleCard | null,
+  fork: string | null,
+  signers: string | null,
+): ChainCard | null => {
+  if (stale?.tone === "amber") return { message: stale.message, calm: false };
+  const verdict = fork ?? signers;
+  if (verdict) return { message: verdict, calm: false };
+  return stale ? { message: stale.message, calm: true } : null;
 };
 
 /** Keep the sample list bounded and in order. The caller holds it across

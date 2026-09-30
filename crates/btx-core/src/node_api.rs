@@ -222,6 +222,140 @@ impl ChainStates {
             .map(|c| c.blocks >= min_snapshot_height)
             .unwrap_or(false)
     }
+
+    /// The snapshot block's hash while the history below it is still being
+    /// checked, or `None` once the check is done or on a node that never
+    /// loaded a snapshot. The engine keeps `validated` false on the snapshot
+    /// chainstate until its background chainstate reaches the base; then it
+    /// drops the background one, and after a restart the snapshot chainstate
+    /// is an ordinary one with no snapshot hash at all.
+    pub fn unchecked_snapshot_base(&self) -> Option<&str> {
+        self.snapshot()
+            .filter(|s| !s.validated)
+            .and_then(|s| s.snapshot_blockhash.as_deref())
+    }
+}
+
+/// How far a node that started from a snapshot has got checking the history
+/// below it. The engine re-checks every block from 0 up to the snapshot's own
+/// height in a background chainstate; until it gets there, that older history
+/// rests on the snapshot. The status screen shows this as one line and a thin
+/// bar (`NodeStatusInfo.history_check`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct HistoryCheck {
+    /// The highest block the background check has reached.
+    pub checked: u64,
+    /// The snapshot's own height, where the check ends. Read from the
+    /// snapshot block's header ([`get_block_height`]), never the compiled
+    /// start point: a node on the 225,927 snapshot checks up to 225,927, not
+    /// 219,000.
+    pub base: u64,
+}
+
+/// The history check from one `getchainstates` answer and the snapshot's own
+/// height (`base_height`, read once per snapshot with [`get_block_height`]).
+///
+/// `None` when there is nothing to show: no snapshot, a finished check, no
+/// background chainstate in the answer, or a base not read yet. The line then
+/// stays hidden rather than guessing a base, because a wrong base is how a bar
+/// reaches 100% on a check that is not done.
+pub fn history_check(chainstates: &ChainStates, base_height: Option<u64>) -> Option<HistoryCheck> {
+    chainstates.unchecked_snapshot_base()?;
+    let background = chainstates.chainstates.iter().find(|c| !c.is_snapshot())?;
+    let base = base_height.filter(|b| *b > 0)?;
+    Some(HistoryCheck {
+        checked: background.blocks.min(base),
+        base,
+    })
+}
+
+/// A block's height, from its header. The history check reads the snapshot
+/// block's height this way, once per snapshot.
+pub async fn get_block_height(rpc: &dyn Rpc, hash: &str) -> AppResult<u64> {
+    let v = rpc.call("getblockheader", json!([hash, true])).await?;
+    v.get("height")
+        .and_then(|h| h.as_u64())
+        .ok_or_else(|| crate::error::AppError::Decode(format!("getblockheader: no height in {v}")))
+}
+
+/// The history check as the refresher keeps it between ticks and the status
+/// reads it (`NodeStatusInfo.history_check` and the role sentence).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HistoryProgress {
+    /// The last `getchainstates` answer carried a snapshot whose older history
+    /// is still being checked ([`ChainStates::unchecked_snapshot_base`]).
+    /// Known from the first answer, before the snapshot's own height has been
+    /// read: the role sentence needs only this.
+    pub unchecked: bool,
+    /// How far the check has got, once the snapshot's own height is known
+    /// ([`history_check`]). The line and the bar need this.
+    pub check: Option<HistoryCheck>,
+}
+
+/// What the refresher remembers about the snapshot's own height between
+/// ticks ([`refresh_history_check`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistoryBase {
+    /// The snapshot block's hash and its height, once read from its header.
+    read: Option<(String, u64)>,
+    /// The snapshot whose failed header read has been logged. The read is
+    /// tried again every tick, and a failure that keeps happening is one line
+    /// in the log per snapshot, not one every three seconds.
+    failure_logged: Option<String>,
+}
+
+impl HistoryBase {
+    /// Whether a failed read of `hash`'s header is worth a log line: true the
+    /// first time for each snapshot, false after.
+    fn first_failure(&mut self, hash: &str) -> bool {
+        if self.failure_logged.as_deref() == Some(hash) {
+            return false;
+        }
+        self.failure_logged = Some(hash.to_string());
+        true
+    }
+}
+
+/// One refresher tick of the history check, from this tick's `getchainstates`
+/// answer and the last tick's result.
+///
+/// A failed `getchainstates` keeps `previous`: one lost call is not the check
+/// finishing. Otherwise the snapshot block's height is read from its header
+/// the first time a snapshot is seen and kept in `base`, so every later tick
+/// costs no extra call, and a different snapshot is read afresh. A failed
+/// header read leaves the height unknown and the line hidden, is tried again
+/// on the next tick, and is logged once per snapshot. `unchecked` does not
+/// wait for the height.
+pub async fn refresh_history_check(
+    rpc: &dyn Rpc,
+    chainstates: &AppResult<ChainStates>,
+    base: &mut HistoryBase,
+    previous: HistoryProgress,
+) -> HistoryProgress {
+    let Ok(chainstates) = chainstates else {
+        return previous;
+    };
+    let Some(hash) = chainstates.unchecked_snapshot_base() else {
+        return HistoryProgress::default();
+    };
+    if base.read.as_ref().map(|(h, _)| h.as_str()) != Some(hash) {
+        base.read = match get_block_height(rpc, hash).await {
+            Ok(height) => Some((hash.to_string(), height)),
+            Err(e) => {
+                if base.first_failure(hash) {
+                    eprintln!(
+                        "[history-check] couldn't read the height of snapshot block {hash}: {e}. \
+                         The history line stays hidden until it can; trying again every tick."
+                    );
+                }
+                None
+            }
+        };
+    }
+    HistoryProgress {
+        unchecked: true,
+        check: history_check(chainstates, base.read.as_ref().map(|(_, height)| *height)),
+    }
 }
 
 pub async fn get_blockchain_info(rpc: &dyn Rpc) -> AppResult<BlockchainInfo> {
@@ -1498,6 +1632,274 @@ mod tests {
         // No snapshot chainstate, but it IS at tip via the normal chainstate.
         assert_eq!(cs.best_height(), 120000);
         assert!(cs.active().unwrap().validated);
+    }
+
+    // ── the history check (docs/decisions/2026-09-29-quick-start-full-check-and-progress.md) ──
+
+    /// A node on a snapshot whose base is 225,927, the pinned pair's height,
+    /// with the background check at 131,200: the numbers in the decision.
+    fn signed_snapshot_being_checked() -> ChainStates {
+        serde_json::from_value(json!({
+            "headers": 233453,
+            "chainstates": [
+                { "blocks": 131200, "bestblockhash": "bg", "verificationprogress": 0.41, "validated": true },
+                {
+                    "blocks": 233400,
+                    "bestblockhash": "tip",
+                    "verificationprogress": 0.9999,
+                    "snapshot_blockhash": "b225927",
+                    "validated": false
+                }
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn history_check_is_nothing_without_a_snapshot() {
+        let only_background: ChainStates = serde_json::from_value(json!({
+            "headers": 0,
+            "chainstates": [
+                { "blocks": 0, "bestblockhash": "75a9", "verificationprogress": 7.5e-6, "validated": true }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(only_background.unchecked_snapshot_base(), None);
+        assert_eq!(history_check(&only_background, Some(225_927)), None);
+        assert_eq!(history_check(&ChainStates::default(), Some(225_927)), None);
+    }
+
+    #[tokio::test]
+    async fn history_check_reports_a_snapshot_being_checked() {
+        let rpc = FakeRpc::new(&[("getchainstates", snapshot_chainstates_json())]);
+        let cs = get_chainstates(&rpc).await.unwrap();
+        assert_eq!(
+            cs.unchecked_snapshot_base(),
+            Some("88a7b534ff66a863d45813668d9e53010a257af18b2d73154ec31a873bd36534")
+        );
+        assert_eq!(
+            history_check(&cs, Some(106_875)),
+            Some(HistoryCheck {
+                checked: 1_200,
+                base: 106_875
+            })
+        );
+        // No base read yet: say nothing rather than guess one.
+        assert_eq!(history_check(&cs, None), None);
+        assert_eq!(history_check(&cs, Some(0)), None);
+    }
+
+    #[test]
+    fn history_check_is_nothing_once_the_check_is_done() {
+        // In the same run: the engine drops the background chainstate, and
+        // the snapshot chainstate, alone, reads validated.
+        let same_run: ChainStates = serde_json::from_value(json!({
+            "headers": 233500,
+            "chainstates": [
+                {
+                    "blocks": 233500,
+                    "bestblockhash": "tip",
+                    "verificationprogress": 1.0,
+                    "snapshot_blockhash": "b225927",
+                    "validated": true
+                }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(same_run.unchecked_snapshot_base(), None);
+        assert_eq!(history_check(&same_run, Some(225_927)), None);
+        // After a restart: one ordinary chainstate, no snapshot hash.
+        let restarted: ChainStates = serde_json::from_value(json!({
+            "headers": 233500,
+            "chainstates": [
+                { "blocks": 233500, "bestblockhash": "tip", "verificationprogress": 1.0, "validated": true }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(history_check(&restarted, Some(225_927)), None);
+    }
+
+    #[test]
+    fn history_check_counts_to_the_snapshots_own_base() {
+        let cs = signed_snapshot_being_checked();
+        assert_eq!(cs.unchecked_snapshot_base(), Some("b225927"));
+        let h = history_check(&cs, Some(225_927)).expect("a check is running");
+        assert_eq!(
+            h,
+            HistoryCheck {
+                checked: 131_200,
+                base: 225_927
+            }
+        );
+        // Not the compiled start point, which would put the bar at 60% of the
+        // wrong total.
+        assert_ne!(h.base, 219_000);
+        // The count never passes the base, whatever the engine reports.
+        let mut past = cs.clone();
+        past.chainstates[0].blocks = 230_000;
+        assert_eq!(
+            history_check(&past, Some(225_927)).unwrap().checked,
+            225_927
+        );
+        // The window reads these names.
+        assert_eq!(
+            serde_json::to_value(h).unwrap(),
+            json!({ "checked": 131200, "base": 225927 })
+        );
+    }
+
+    #[tokio::test]
+    async fn block_height_is_read_from_the_header() {
+        let rpc = FakeRpc::new(&[(
+            "getblockheader",
+            json!({ "hash": "b225927", "height": 225927, "confirmations": 7500 }),
+        )]);
+        assert_eq!(get_block_height(&rpc, "b225927").await.unwrap(), 225_927);
+        let no_height = FakeRpc::new(&[("getblockheader", json!({ "hash": "b225927" }))]);
+        assert!(get_block_height(&no_height, "b225927").await.is_err());
+    }
+
+    /// One tick of the refresher, with nothing carried over from the last.
+    async fn tick(rpc: &dyn Rpc, cs: &ChainStates, base: &mut HistoryBase) -> HistoryProgress {
+        refresh_history_check(rpc, &Ok(cs.clone()), base, HistoryProgress::default()).await
+    }
+
+    #[tokio::test]
+    async fn the_snapshots_height_is_read_once_per_snapshot() {
+        let cs = signed_snapshot_being_checked();
+        let rpc = FakeRpc::new(&[("getblockheader", json!({ "height": 225927 }))]);
+        let mut base = HistoryBase::default();
+        assert_eq!(
+            tick(&rpc, &cs, &mut base).await,
+            HistoryProgress {
+                unchecked: true,
+                check: Some(HistoryCheck {
+                    checked: 131_200,
+                    base: 225_927
+                })
+            }
+        );
+        assert_eq!(base.read, Some(("b225927".to_string(), 225_927)));
+
+        // The next tick does not ask again: with the header gone, the
+        // remembered height still answers.
+        rpc.responses.lock().unwrap().remove("getblockheader");
+        assert_eq!(
+            tick(&rpc, &cs, &mut base).await.check.map(|h| h.base),
+            Some(225_927)
+        );
+
+        // A different snapshot is read afresh, never given the old height.
+        let mut other = cs.clone();
+        other.chainstates[1].snapshot_blockhash = Some("b226000".to_string());
+        assert_eq!(
+            tick(&rpc, &other, &mut base).await,
+            HistoryProgress {
+                unchecked: true,
+                check: None
+            }
+        );
+        assert_eq!(base.read, None);
+
+        // A finished check shows nothing and asks nothing.
+        let mut done = cs.clone();
+        done.chainstates.remove(0);
+        done.chainstates[0].validated = true;
+        assert_eq!(
+            tick(&rpc, &done, &mut base).await,
+            HistoryProgress::default()
+        );
+    }
+
+    /// One lost getchainstates is not the check finishing, and not a new
+    /// snapshot either: the last answer stands, the line and the role
+    /// sentence with it.
+    #[tokio::test]
+    async fn a_failed_getchainstates_keeps_the_last_answer() {
+        let rpc = FakeRpc::new(&[("getblockheader", json!({ "height": 225927 }))]);
+        let mut base = HistoryBase::default();
+        let running = tick(&rpc, &signed_snapshot_being_checked(), &mut base).await;
+        assert!(running.unchecked && running.check.is_some());
+
+        let lost: AppResult<ChainStates> = Err(crate::error::AppError::Http("timed out".into()));
+        assert_eq!(
+            refresh_history_check(&rpc, &lost, &mut base, running).await,
+            running
+        );
+        // Nothing carried over, nothing to keep.
+        assert_eq!(
+            refresh_history_check(&rpc, &lost, &mut base, HistoryProgress::default()).await,
+            HistoryProgress::default()
+        );
+        // The next answer that arrives is taken as it is, a finished check
+        // included.
+        let mut done = signed_snapshot_being_checked();
+        done.chainstates.remove(0);
+        done.chainstates[0].validated = true;
+        assert_eq!(
+            refresh_history_check(&rpc, &Ok(done), &mut base, running).await,
+            HistoryProgress::default()
+        );
+    }
+
+    /// The role sentence needs only "a snapshot's history is unchecked", which
+    /// the first getchainstates answer says. It does not wait for the
+    /// snapshot's own height, which the line needs and a failing
+    /// getblockheader can hold back for good.
+    #[tokio::test]
+    async fn an_unchecked_snapshot_is_known_before_its_height_is_read() {
+        let no_header = FakeRpc::new(&[]);
+        let mut base = HistoryBase::default();
+        let first = tick(&no_header, &signed_snapshot_being_checked(), &mut base).await;
+        assert_eq!(
+            first,
+            HistoryProgress {
+                unchecked: true,
+                check: None
+            }
+        );
+        // The read is tried again on the next tick, and the line appears then.
+        no_header
+            .responses
+            .lock()
+            .unwrap()
+            .insert("getblockheader".into(), json!({ "height": 225927 }));
+        assert_eq!(
+            tick(&no_header, &signed_snapshot_being_checked(), &mut base)
+                .await
+                .check
+                .map(|h| h.base),
+            Some(225_927)
+        );
+        // No snapshot at all: nothing unchecked.
+        let plain: ChainStates = serde_json::from_value(json!({
+            "headers": 233500,
+            "chainstates": [
+                { "blocks": 233500, "bestblockhash": "tip", "verificationprogress": 1.0, "validated": true }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            tick(&no_header, &plain, &mut base).await,
+            HistoryProgress::default()
+        );
+    }
+
+    /// A getblockheader that keeps failing is tried every tick, every three
+    /// seconds, and logged once per snapshot rather than on every try.
+    #[tokio::test]
+    async fn a_failing_header_read_is_logged_once_per_snapshot() {
+        let no_header = FakeRpc::new(&[]);
+        let mut base = HistoryBase::default();
+        let cs = signed_snapshot_being_checked();
+        tick(&no_header, &cs, &mut base).await;
+        assert_eq!(base.failure_logged.as_deref(), Some("b225927"));
+        assert!(!base.first_failure("b225927"), "the same snapshot again");
+        tick(&no_header, &cs, &mut base).await;
+        assert_eq!(base.failure_logged.as_deref(), Some("b225927"));
+        // A different snapshot is news.
+        assert!(base.first_failure("b226000"));
+        assert!(!base.first_failure("b226000"));
     }
 
     #[tokio::test]
