@@ -107,6 +107,9 @@ const WHY_NOTE_APPEARED: &str =
     "a snapshot the node did not accept was waiting to be moved out of the way";
 const WHY_NOT_CLEARED: &str = "the result of the last Fast-forward could not be cleared";
 const WHY_NOT_STARTED: &str = "the node did not start on the new chain data";
+const WHY_CAUGHT_UP: &str =
+    "the node had caught up with the confirmed snapshot by the time it was ready";
+const WHY_NO_TIP: &str = "the node did not say which block it had reached";
 /// A load during a run that loaded nothing (`commands::run_failure_reason`).
 pub(crate) const WHY_NOT_LOADED: &str = "the node could not load the confirmed snapshot";
 /// A load during a run that the app refuses.
@@ -916,6 +919,20 @@ async fn prepare(
     .map_err(|_| "the check and download took more than 30 minutes".to_string())?
 }
 
+/// Pure: after step 1, is the confirmed snapshot still above the node's tip
+/// (`tip`, `None` when the node did not say)? The button's rule is applied
+/// when Tools opens, the second click can come any time later, and the node
+/// keeps syncing through a download that may take half an hour: a node that
+/// passed the snapshot meanwhile must not have its further, checked chain
+/// set aside for an older one. Otherwise the reason, and nothing moves.
+fn still_ahead(pair_height: u64, tip: Option<u64>) -> Result<(), &'static str> {
+    match tip {
+        Some(tip) if pair_height > tip => Ok(()),
+        Some(_) => Err(WHY_CAUGHT_UP),
+        None => Err(WHY_NO_TIP),
+    }
+}
+
 async fn run(app: &AppHandle, state: &State<'_, AppState>) {
     let datadir = node_datadir();
     let dd = datadir.clone();
@@ -958,6 +975,22 @@ async fn run(app: &AppHandle, state: &State<'_, AppState>) {
             return not_started(&datadir, WHY_NOT_CHECKED).await;
         }
     };
+    // The node kept syncing through step 1: still behind the snapshot?
+    let tip = btx_core::node_api::get_blockchain_info(&rpc)
+        .await
+        .ok()
+        .map(|info| info.blocks);
+    if let Err(why) = still_ahead(pair.height, tip) {
+        log(
+            &datadir,
+            &format!(
+                "the confirmed snapshot {} is no longer above the node's tip ({tip:?}); nothing \
+                 moved",
+                pair.height
+            ),
+        );
+        return not_started(&datadir, why).await;
+    }
     btx_core::attested_snapshot::prune_others(&datadir, pair.height);
     log(
         &datadir,
@@ -2070,6 +2103,18 @@ mod tests {
         assert_old_chain_back(d, "after the refused chainstates");
     }
 
+    /// Review I3: the snapshot must still be above the node's tip once step
+    /// 1 is over, or nothing moves; a node that does not say is not moved
+    /// either.
+    #[test]
+    fn a_node_that_caught_up_meanwhile_is_not_moved() {
+        assert_eq!(still_ahead(233_800, Some(232_000)), Ok(()));
+        assert_eq!(still_ahead(233_800, Some(233_799)), Ok(()), "one block");
+        assert_eq!(still_ahead(233_800, Some(233_800)), Err(WHY_CAUGHT_UP));
+        assert_eq!(still_ahead(233_800, Some(240_000)), Err(WHY_CAUGHT_UP));
+        assert_eq!(still_ahead(233_800, None), Err(WHY_NO_TIP));
+    }
+
     /// Review, minor 1: the driver's own start, made just after it lets the
     /// start guard go, can meet a start someone else began that moment. That
     /// one is as good (it launches the same node), so it is not a failure to
@@ -2159,6 +2204,8 @@ mod tests {
             WHY_NOT_STOPPED,
             WHY_NOT_SET_ASIDE,
             WHY_NOT_STARTED,
+            WHY_CAUGHT_UP,
+            WHY_NO_TIP,
             WHY_NOT_LOADED,
             WHY_REFUSED,
             WHY_NOTE_APPEARED,
