@@ -74,7 +74,7 @@ const HOLD_STARTS_TRIES: u32 = 600;
 
 pub(crate) const ALREADY_RUNNING: &str = "Fast-forward is already running.";
 pub(crate) const NOT_FINISHED: &str = "A Fast-forward has not finished yet. The next time \
-     easyNode starts the node, it first finishes that run or puts the old chain data back.";
+     easyNode starts the node, it first carries that run on or puts the old chain data back.";
 pub(crate) const NOTE_WAITS: &str = "easyNode still has to move a snapshot it did not accept out \
      of the way, which it does the next time it starts the node. Restart the node, then try \
      Fast-forward again.";
@@ -124,14 +124,16 @@ fn unreadable_sentence(datadir: &Path) -> String {
 
 /// Where the old chain data is, when a roll-back could not put it all back.
 /// `nothing_removed`: the restore could not begin (an original is missing
-/// from the dated folder), so the run stands as it was, and the node is not
-/// started again in this run of the app (controller note 2b).
+/// from the dated folder, or could not be checked), so the run stands as it
+/// was, and the node is not started again in this run of the app: one plain
+/// sentence (controller note 2b).
 fn stranded_sentence(folder: &Path, nothing_removed: bool) -> String {
     if nothing_removed {
         format!(
-            "Fast-forward could not put the old chain data back because part of it is missing \
-             from {}, so easyNode leaves the node stopped. When you quit easyNode and open it \
-             again, it starts the node on the new chain data and carries Fast-forward on.",
+            "Fast-forward could not put the old chain data back, because part of it is missing \
+             from {} or could not be checked, so easyNode leaves the node stopped until you quit \
+             and reopen it, then starts the node on the new chain data and carries Fast-forward \
+             on.",
             folder.display()
         )
     } else {
@@ -299,6 +301,27 @@ async fn node_is_down(datadir: &Path) -> bool {
         && btx_core::node::datadir_holder(datadir).await == btx_core::node::DatadirHolder::Free
 }
 
+/// Why [`undo`] (or [`at_start`]) did not put the old chain data back or let
+/// the start go on: the plain sentence for the window, and whether the
+/// restore could not even begin (an original missing from the dated folder,
+/// or one that could not be checked). Only that one keeps every start off
+/// for the rest of this run of the app ([`STUCK`], controller note 2b);
+/// after any other, starting again tries once more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NotBack {
+    said: String,
+    could_not_begin: bool,
+}
+
+impl NotBack {
+    fn plain(said: impl Into<String>) -> Self {
+        NotBack {
+            said: said.into(),
+            could_not_begin: false,
+        }
+    }
+}
+
 /// What the run's record says, for [`start_gate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnRecord {
@@ -399,15 +422,18 @@ pub(crate) async fn before_start(datadir: &Path) -> Result<(), String> {
         return Err(NODE_IN_THE_WAY.into());
     }
     let dd = datadir.to_path_buf();
-    let result = on_disk(move || at_start(&dd, now(), node_down))
-        .await
-        .unwrap_or_else(|| Err(MOVE_CUT_OFF.into()));
-    if let Err(said) = &result {
-        if underway(datadir) {
-            *STUCK.lock().unwrap_or_else(|e| e.into_inner()) = Some(said.clone());
+    match on_disk(move || at_start(&dd, now(), node_down)).await {
+        Some(Ok(())) => Ok(()),
+        Some(Err(not_back)) => {
+            if not_back.could_not_begin {
+                *STUCK.lock().unwrap_or_else(|e| e.into_inner()) = Some(not_back.said.clone());
+            }
+            Err(not_back.said)
         }
+        // The task stopped unexpectedly: what the run had got to is on disk,
+        // and starting again reads it.
+        None => Err(MOVE_CUT_OFF.into()),
     }
-    result
 }
 
 /// [`before_start`]'s part on disk. The sweep first; then a run at
@@ -418,7 +444,7 @@ pub(crate) async fn before_start(datadir: &Path) -> Result<(), String> {
 /// ([`Phase::SettingAside`], [`Phase::Undoing`], [`Phase::Restoring`]) is
 /// rolled back here, before any launch; call with the node down then. A
 /// record nobody can read stops the start and nothing is touched.
-fn at_start(datadir: &Path, now_unix: u64, node_down: bool) -> Result<(), String> {
+fn at_start(datadir: &Path, now_unix: u64, node_down: bool) -> Result<(), NotBack> {
     for gone in ff::sweep(datadir) {
         log(
             datadir,
@@ -433,7 +459,7 @@ fn at_start(datadir: &Path, now_unix: u64, node_down: bool) -> Result<(), String
                 datadir,
                 &format!("the run's record cannot be read ({e}); not starting the node"),
             );
-            return Err(unreadable_sentence(datadir));
+            return Err(NotBack::plain(unreadable_sentence(datadir)));
         }
     };
     match record.phase {
@@ -621,13 +647,13 @@ fn remove_attempts_refused(datadir: &Path, since: u64) {
 /// start. A restore that could not begin changed nothing, and the decision
 /// to roll back goes with it: the run stands, and is watched again from the
 /// next opening of the app (controller note 2b).
-fn undo(datadir: &Path) -> Result<(), String> {
+fn undo(datadir: &Path) -> Result<(), NotBack> {
     let record = match ff::read_record(datadir) {
         Ok(Some(r)) => r,
         Ok(None) => return Ok(()),
         Err(e) => {
             log(datadir, &format!("the run's record cannot be read ({e})"));
-            return Err(unreadable_sentence(datadir));
+            return Err(NotBack::plain(unreadable_sentence(datadir)));
         }
     };
     let during = run_settings(datadir);
@@ -666,8 +692,11 @@ fn undo(datadir: &Path) -> Result<(), String> {
                 btx_core::node::end_header_bootstrap(datadir);
             }
             Err(match e {
-                MoveError::Stranded { folder, .. } => stranded_sentence(&folder, nothing_removed),
-                MoveError::Untouched(_) => UNDO_FAILED.into(),
+                MoveError::Stranded { folder, .. } => NotBack {
+                    said: stranded_sentence(&folder, nothing_removed),
+                    could_not_begin: nothing_removed,
+                },
+                MoveError::Untouched(_) => NotBack::plain(UNDO_FAILED),
             })
         }
     }
@@ -1089,7 +1118,7 @@ async fn roll_back(app: &AppHandle, state: &State<'_, AppState>, why: String) {
     let dd = datadir.clone();
     let undone = on_disk(move || undo(&dd))
         .await
-        .unwrap_or_else(|| Err(MOVE_CUT_OFF.into()));
+        .unwrap_or_else(|| Err(NotBack::plain(MOVE_CUT_OFF)));
     match undone {
         Ok(()) => {
             // The old chain data is back: starts may run again.
@@ -1098,12 +1127,13 @@ async fn roll_back(app: &AppHandle, state: &State<'_, AppState>, why: String) {
                 let _ = start_node(app, state).await;
             }
         }
-        Err(message) => {
+        Err(not_back) => {
             // Starts stay off while the window is told; after that the
             // gate keeps them off (STUCK, or the record's phase).
-            if underway(&datadir) {
-                *STUCK.lock().unwrap_or_else(|e| e.into_inner()) = Some(message.clone());
+            if not_back.could_not_begin {
+                *STUCK.lock().unwrap_or_else(|e| e.into_inner()) = Some(not_back.said.clone());
             }
+            let message = not_back.said;
             set_phase(app, state, NodePhase::Error { message }).await;
             drop(no_starts);
         }
@@ -1231,7 +1261,9 @@ mod tests {
         std::fs::write(d.join("fast-forward-5/blocks/old"), b"old").unwrap();
         std::fs::write(d.join(".fast-forward.json"), b"{\"height\":").unwrap();
 
-        let said = at_start(d, 1_000, true).unwrap_err();
+        let not_back = at_start(d, 1_000, true).unwrap_err();
+        assert!(!not_back.could_not_begin);
+        let said = not_back.said;
         assert_eq!(said, unreadable_sentence(d));
         assert!(said.contains(".fast-forward.json"), "{said}");
         assert!(said.contains(&d.display().to_string()), "{said}");
@@ -1454,7 +1486,12 @@ mod tests {
                 reason: WHY_NOT_LOADED.into(),
             },
         );
-        let said = undo(d).unwrap_err();
+        let not_back = undo(d).unwrap_err();
+        assert!(
+            not_back.could_not_begin,
+            "the one that keeps the node stopped"
+        );
+        let said = not_back.said;
         assert_eq!(said, stranded_sentence(&folder, true));
         assert_eq!(
             ff::read_outcome(d),
@@ -1484,15 +1521,18 @@ mod tests {
         let record = set_aside_for_run(d, 232_000, 100).unwrap();
         let folder = d.join(&record.aside);
         attempt(d);
-        // Stopped part-way through the put-back, with `blocks` in its
-        // place and in the dated folder: it cannot go back.
+        // Stopped part-way through the put-back, with the attempt's
+        // `blocks`, `chainstate`, `chainstate_snapshot` and start record
+        // still in the places the old ones go back to: those cannot go back.
         record_at(d, Phase::Restoring);
-        let said = undo(d).unwrap_err();
+        let not_back = undo(d).unwrap_err();
+        assert!(!not_back.could_not_begin, "starting again tries once more");
+        let said = not_back.said;
         assert_eq!(said, stranded_sentence(&folder, false));
         assert_eq!(run_settings(d), before, "put back before the restore");
         assert_eq!(ff::read_record(d).unwrap().unwrap().phase, Phase::Restoring);
         assert_eq!(
-            at_start(d, 50_000, true),
+            at_start(d, 50_000, true).map_err(|e| e.said),
             Err(said),
             "and the start stops too"
         );
@@ -1727,8 +1767,36 @@ mod tests {
     /// restore cannot begin at the start keeps the node from starting in
     /// this run of the app, and drops the decision, so the next opening
     /// watches the intact new chain again rather than failing the same way.
+    ///
+    /// This test sets and clears the global [`STUCK`], which every
+    /// [`before_start`] reads: it must stay the only test that calls
+    /// `before_start`, or tests running beside it would see its value.
     #[tokio::test]
     async fn a_roll_back_that_cannot_begin_keeps_the_node_stopped_until_the_next_opening() {
+        // Review minor 1: a put-back that began and stopped keeps this start
+        // off, but not the next: starting again tries once more.
+        let tmp = datadir_with_chain(Before::default());
+        let d = tmp.path();
+        let record = set_aside_for_run(d, 232_000, 100).unwrap();
+        let folder = d.join(&record.aside);
+        attempt(d);
+        record_at(d, Phase::Restoring);
+        let said = stranded_sentence(&folder, false);
+        assert_eq!(before_start(d).await, Err(said));
+        assert_eq!(
+            *STUCK.lock().unwrap(),
+            None,
+            "not the one that could not begin"
+        );
+        // Clear what stood in the way: the attempt's entries in the places
+        // the old ones go back to.
+        for name in ["blocks", "chainstate", "chainstate_snapshot"] {
+            std::fs::remove_dir_all(d.join(name)).unwrap();
+        }
+        std::fs::remove_file(d.join("snapshot-start.json")).unwrap();
+        assert_eq!(before_start(d).await, Ok(()), "tried once more");
+        assert_old_chain_back(d, "tried once more");
+
         let tmp = datadir_with_chain(Before::default());
         let d = tmp.path();
         let record = set_aside_for_run(d, 232_000, 100).unwrap();
@@ -1835,6 +1903,13 @@ mod tests {
                 s.contains("/Users/someone/.easybtx/fast-forward-100"),
                 "{s}"
             );
+        }
+        // Controller note 2b: one plain sentence, like the unreadable one.
+        for s in [
+            &stranded[0],
+            &unreadable_sentence(Path::new("/Users/someone/.easybtx")),
+        ] {
+            assert_eq!(s.matches(". ").count(), 0, "one sentence: {s}");
         }
         let sentences = [
             ALREADY_RUNNING.to_string(),
