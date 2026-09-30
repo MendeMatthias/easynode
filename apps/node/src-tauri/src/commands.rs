@@ -1757,33 +1757,41 @@ async fn spawn_node_with_lock_retry(
                     return Err("the node was stopped while it was starting".to_string())
                 }
                 (AfterRpcWait::StopAlive { graceful }, RpcWait::TimedOut { last, .. }) => {
+                    // What the engine was doing, read BEFORE it is stopped:
+                    // afterwards the last line is its own "Shutdown: done"
+                    // (Task A review I1).
+                    let since = btx_core::node::debug_log_since(datadir, log_offset);
                     // Never leave a live btxd behind the error, and never
                     // leave the slot holding a start that did not happen.
-                    let taken = state.node.lock().await.take();
-                    let mut stopped = None;
-                    if let Some(mut c) = taken {
-                        if graceful {
-                            // It answered warmup, so its RPC is up and the
-                            // graceful stop (btx-cli, flush grace) reaches it.
-                            let _ = c.stop(&paths.btx_cli, datadir).await;
-                        } else {
-                            let outcome = c.stop_without_rpc_outcome(NO_RPC_STOP_GRACE).await;
-                            eprintln!(
-                                "[node-app] btxd never opened its RPC in {}s; stopped it \
-                                 ({})",
-                                RPC_WAIT_POLLS as u64 * RPC_WAIT_POLL_MS / 1000,
-                                match outcome {
-                                    btx_core::node::NoRpcStop::OnSigterm => "it exited on SIGTERM",
-                                    btx_core::node::NoRpcStop::Killed => "it had to be killed",
-                                    btx_core::node::NoRpcStop::StillRunning => {
-                                        "it is still there after the kill"
-                                    }
-                                },
-                            );
-                            stopped = Some(outcome);
-                        }
-                    }
-                    let since = btx_core::node::debug_log_since(datadir, log_offset);
+                    // Stopped while the slot is held (review M2): a Quit
+                    // meanwhile waits for this stop instead of finding the
+                    // slot empty and leaving the process behind.
+                    let mut slot = state.node.lock().await;
+                    let Some(c) = slot.as_mut() else {
+                        return Err("the node was stopped while it was starting".to_string());
+                    };
+                    let stopped = if graceful {
+                        // It answered warmup, so its RPC is up and the
+                        // graceful stop (btx-cli, flush grace) reaches it.
+                        let _ = c.stop(&paths.btx_cli, datadir).await;
+                        None
+                    } else {
+                        let outcome = c.stop_without_rpc_outcome(NO_RPC_STOP_GRACE).await;
+                        eprintln!(
+                            "[node-app] btxd never opened its RPC in {}s; stopped it ({})",
+                            RPC_WAIT_POLLS as u64 * RPC_WAIT_POLL_MS / 1000,
+                            match outcome {
+                                btx_core::node::NoRpcStop::OnSigterm => "it exited on SIGTERM",
+                                btx_core::node::NoRpcStop::Killed => "it had to be killed",
+                                btx_core::node::NoRpcStop::StillRunning => {
+                                    "it is still there after the kill"
+                                }
+                            },
+                        );
+                        Some(outcome)
+                    };
+                    *slot = None;
+                    drop(slot);
                     // A validating start stuck in the engine's GPU check
                     // (0.7.1, the leading reading of Zan's two NVIDIA nodes):
                     // the step has no timeout, and a card that hung once can
@@ -9131,6 +9139,16 @@ mod launch_wait_tests {
         let stop = spawn_fn.find(".stop_without_rpc_outcome(").unwrap();
         let timeout = spawn_fn.find("rpc_timeout_error(").unwrap();
         assert!(stop < timeout, "stop first, then report");
+        // Task A review I1: the launch's log is read BEFORE the stop, or the
+        // "last log line" is the engine's own shutdown ("Shutdown: done").
+        let since = spawn_fn
+            .find("debug_log_since(datadir, log_offset)")
+            .unwrap();
+        assert!(since < stop, "read what it was doing, then stop it");
+        // Task A review M2: stopped while the slot is held, so a Quit in the
+        // meantime waits for it instead of finding an empty slot and leaving.
+        assert!(!spawn_fn.contains("let taken = state.node.lock().await.take();"));
+        assert!(spawn_fn.contains("let mut slot = state.node.lock().await;"));
         assert!(spawn_fn.contains("launch_failure_cause(&tail)"));
     }
 
