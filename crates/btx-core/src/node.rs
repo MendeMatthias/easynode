@@ -1183,7 +1183,9 @@ pub fn build_node_command(
             for pubkey in BTX_TRUSTED_ATTESTATION_PUBKEYS {
                 args.push(format!("-matmultrustedpubkey={pubkey}"));
             }
-            args.push("-matmultrustedthreshold=1".to_string());
+            args.push(format!(
+                "-matmultrustedthreshold={BTX_TRUSTED_ATTESTATION_THRESHOLD}"
+            ));
             if degraded_start {
                 // 0.34.5 and newer refuse a mainnet mirror at M<2 without this.
                 args.push("-allowsinglekeytrustedmirror=1".to_string());
@@ -1219,6 +1221,19 @@ pub fn build_node_command(
             if let Some(pubkey) = signing_key_self_pin(conf, datadir) {
                 args.push(format!("-matmultrustedpubkey={pubkey}"));
             }
+        }
+        // A validating node on a signed snapshot pins the mirrors' keys too,
+        // or the engine's start-up check of the stored manifest refuses to
+        // start it (section 8 of the confirmed-snapshot decision). In
+        // consensus mode they are telemetry: they skip no check.
+        if !mirror_here {
+            let mut already = conf_pins(conf);
+            already.extend(signing_key_self_pin(conf, datadir));
+            args.extend(validating_snapshot_pin_args(
+                datadir,
+                &BTX_TRUSTED_ATTESTATION_PUBKEYS,
+                &already,
+            ));
         }
     }
     // On Metal we set ONLY `BTX_MATMUL_BACKEND` and deliberately do NOT touch the matmul
@@ -1576,6 +1591,11 @@ pub const BTX_TRUSTED_ATTESTATION_PUBKEYS: [&str; 4] = [
     "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675",
 ];
 
+/// The mirrors' threshold. It never rises: a mirror on a snapshot stored
+/// with fewer pinned signatures than this does not start
+/// (`pins_only_grow_and_the_threshold_stays` holds it).
+pub const BTX_TRUSTED_ATTESTATION_THRESHOLD: u32 = 1;
+
 /// Whether this host should follow the chain past the MatMul v4.7 fork via an
 /// operator-attested quorum instead of local proof replay.
 ///
@@ -1930,6 +1950,61 @@ pub fn signing_key_self_pin(conf: &Path, datadir: &Path) -> Option<String> {
         })
     });
     (!already_pinned).then_some(pubkey)
+}
+
+/// Every key the conf already pins (`matmultrustedpubkey=`), lowercase. The
+/// engine refuses a duplicate pin, so the command line never repeats one.
+pub fn conf_pins(conf: &Path) -> Vec<String> {
+    std::fs::read_to_string(conf)
+        .map(|text| {
+            text.lines()
+                .filter_map(|l| l.trim().strip_prefix("matmultrustedpubkey="))
+                .map(|v| v.trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The engine's record that this node runs on a signed snapshot whose
+/// background check has not finished (`SNAPSHOT_ATTESTED_ASSUMEUTXO_FILENAME`,
+/// v0.34.9 `src/node/utxo_snapshot.h:254`). It goes away when the engine
+/// retires the snapshot. `network_dir` is the datadir on mainnet.
+pub fn attested_snapshot_record(network_dir: &Path) -> PathBuf {
+    network_dir
+        .join("chainstate_snapshot")
+        .join("attested_assumeutxo")
+}
+
+/// The pins a validating node must carry while it runs on a signed snapshot
+/// (the confirmed-snapshot decision, section 8): every key in `mirror_pins`
+/// not already in `already` (the conf's pins and the node's own), and the
+/// threshold the stored manifest was loaded under. Empty otherwise.
+///
+/// WHY. The engine re-checks the stored manifest at every start against the
+/// pins and threshold of that moment, and refuses to start when the check
+/// fails ("Attested snapshot manifest is present but failed verification
+/// under the current authority configuration", `validation.cpp:22330`).
+/// Measured on 2026-09-29, regtest and mainnet: a validating restart on a
+/// signed snapshot starts with the signer pinned and not without it. In
+/// consensus mode the pins are telemetry, never a reason to skip a check.
+pub fn validating_snapshot_pin_args(
+    network_dir: &Path,
+    mirror_pins: &[&str],
+    already: &[String],
+) -> Vec<String> {
+    if !attested_snapshot_record(network_dir).exists() {
+        return Vec::new();
+    }
+    let mut args: Vec<String> = mirror_pins
+        .iter()
+        .filter(|k| !already.iter().any(|a| a.eq_ignore_ascii_case(k)))
+        .map(|k| format!("-matmultrustedpubkey={k}"))
+        .collect();
+    args.push(format!(
+        "-matmultrustedthreshold={BTX_TRUSTED_ATTESTATION_THRESHOLD}"
+    ));
+    args
 }
 
 /// macOS SIGKILLs a downloaded binary with "Code Signature Invalid" at exec when
@@ -6139,5 +6214,127 @@ matmul: metal runtime_probe_ok, selecting metal\n\
         );
         assert!(hosts.contains(&"node.btx.dev".to_string()));
         assert!(hosts.iter().all(|h| !h.contains(':')), "no ports");
+    }
+
+    // ── Confirmed snapshots: the pin rule, the mirror launch, pins only grow ──
+
+    fn signed_snapshot_datadir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("easynode-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("chainstate_snapshot")).unwrap();
+        dir
+    }
+
+    fn pin_args(args: &[String]) -> Vec<String> {
+        args.iter()
+            .filter(|a| {
+                a.starts_with("-matmultrustedpubkey=") || a.starts_with("-matmultrustedthreshold=")
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Section 8: while the engine's attested record exists, a validating
+    /// node pins every mirror key and threshold 1, in consensus mode still.
+    /// Without the record it pins nothing it did not pin before.
+    #[test]
+    fn a_validating_node_on_a_signed_snapshot_pins_the_mirrors_keys() {
+        let dir = signed_snapshot_datadir("pin-rule");
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        let btxd = Path::new("/x/btx/v0.34.9/lin/btxd");
+
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Cuda);
+        assert!(pin_args(&args).is_empty(), "no record, no pins: {args:?}");
+
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        let mut want: Vec<String> = BTX_TRUSTED_ATTESTATION_PUBKEYS
+            .iter()
+            .map(|k| format!("-matmultrustedpubkey={k}"))
+            .collect();
+        want.push("-matmultrustedthreshold=1".into());
+        for backend in [Backend::Cuda, Backend::Metal] {
+            let (_, args, _) = build_node_command(btxd, &dir, &conf, backend);
+            assert_eq!(pin_args(&args), want, "{backend:?}: {args:?}");
+            assert!(!validation_modes(&args).contains(&"trusted"), "{args:?}");
+        }
+        // The engine retires the snapshot, the record goes, and so do the pins.
+        std::fs::remove_file(attested_snapshot_record(&dir)).unwrap();
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Cuda);
+        assert!(pin_args(&args).is_empty(), "{args:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The engine refuses a duplicate pin: a key the conf pins, or the
+    /// node's own, is never passed twice.
+    #[test]
+    fn the_pin_rule_never_repeats_a_pin() {
+        let dir = signed_snapshot_datadir("pin-dupes");
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        let wif = crate::signer::generate_wif();
+        let own = crate::signer::wif_to_pubkey_hex(&wif).unwrap();
+        std::fs::write(dir.join(crate::signer::SIGNER_KEY_FILE), format!("{wif}\n")).unwrap();
+        let the_3060 = BTX_TRUSTED_ATTESTATION_PUBKEYS[3];
+        let conf = dir.join("signing.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "server=1\nmatmulattestationsignerkeyfile=attestation-signer.key\n\
+                 matmultrustedpubkey={}\n",
+                the_3060.to_ascii_uppercase()
+            ),
+        )
+        .unwrap();
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.9/lin/btxd"),
+            &dir,
+            &conf,
+            Backend::Cuda,
+        );
+        let pins: Vec<&String> = args
+            .iter()
+            .filter(|a| a.starts_with("-matmultrustedpubkey="))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        for p in &pins {
+            assert!(
+                seen.insert(p.to_ascii_lowercase()),
+                "pinned twice: {args:?}"
+            );
+        }
+        assert!(
+            pins.iter().any(|p| p.ends_with(&own)),
+            "its own key: {args:?}"
+        );
+        assert!(
+            !pins.iter().any(|p| p.ends_with(the_3060)),
+            "the conf already pins the 3060: {args:?}"
+        );
+        assert_eq!(pins.len(), 1 + BTX_TRUSTED_ATTESTATION_PUBKEYS.len() - 1);
+        // The pure rule, case-blind.
+        let got = validating_snapshot_pin_args(&dir, &[the_3060], &[the_3060.to_ascii_uppercase()]);
+        assert_eq!(got, vec!["-matmultrustedthreshold=1".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mirror_arm_is_the_same_on_a_signed_snapshot() {
+        let dir = signed_snapshot_datadir("pin-mirror");
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        let btxd = Path::new("/x/btx/v0.34.9/lin/btxd");
+        let (_, before, _) = build_node_command(btxd, &dir, &conf, Backend::Cpu);
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        let (_, after, _) = build_node_command(btxd, &dir, &conf, Backend::Cpu);
+        assert_eq!(before, after);
+        assert_eq!(validation_modes(&after), vec!["trusted"]);
+        assert_eq!(
+            after
+                .iter()
+                .filter(|a| a.starts_with("-matmultrustedthreshold="))
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
