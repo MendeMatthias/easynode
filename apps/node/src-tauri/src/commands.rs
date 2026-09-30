@@ -1509,6 +1509,18 @@ async fn spawn_node_with_lock_retry(
             && !btx_core::node::matmul_consensus_was_refused(datadir)
         {
             btx_core::node::record_matmul_consensus_refused(datadir);
+            // The retry is a mirror, and a mirror holds no key: without this
+            // the key line written for the consensus launch stays in the conf
+            // and attempts 2 and 3 exit too (`signer_after_chip_refusal`).
+            let (applies_here, pubkey) = signer_after_chip_refusal(
+                &paths.btxd,
+                datadir,
+                &paths.faststart_conf,
+                node_backend(),
+                NodeAppSettings::load(datadir).signer_enabled,
+            );
+            *state.signer_applies_here.lock().await = Some(applies_here);
+            *state.signer_pubkey.lock().await = pubkey;
             eprintln!(
                 "[node-app] this Mac has no reviewed ExactReplay golden in the bundled \
                  engine, so btxd refused to start as an independent consensus validator. \
@@ -3866,6 +3878,32 @@ fn write_signer_key_line(
             None
         }
     }
+}
+
+/// The signer decision again, after the engine refused this Mac's chip
+/// inside the start loop, as `(applies_here, public key)` for
+/// `AppState.signer_applies_here` and `AppState.signer_pubkey`.
+///
+/// The refusal marker is on disk now, so the host follows signatures and the
+/// retry is a mirror ([`signer_for_launch`], from the same two rules). A
+/// mirror holds no key: the engine refuses a signing key off consensus mode
+/// (btx 84b998b4 `init.cpp:1729-1731`), so a key line left from the consensus
+/// launch would end the retries the same way. The line comes out as it does
+/// for a mirror launch.
+fn signer_after_chip_refusal(
+    btxd: &Path,
+    datadir: &Path,
+    conf: &Path,
+    backend: Backend,
+    signer_enabled: bool,
+) -> (bool, Option<String>) {
+    let (applies_here, signs_here) = signer_for_launch(
+        signer_enabled,
+        btx_core::node::host_follows_signatures(btxd, datadir, backend),
+        btx_core::node::launches_as_mirror(btxd, datadir, backend),
+    );
+    let pubkey = write_signer_key_line(datadir, conf, signs_here, &mut Vec::new());
+    (applies_here, pubkey)
 }
 
 /// Does the key line go back in once the launch plan is known? When this
@@ -6666,8 +6704,8 @@ mod signed_start_tests {
         mirror_load_wanted_here, nominal_btxd_path, prepared_within, refused_load_message,
         runs_mirror_load, set_aside_pending, set_aside_refused_snapshot_at, set_aside_waits,
         set_aside_will_move, settle_first_load, signed_load_failed, signed_load_for,
-        signer_for_launch, signing_key_the_app_does_not_manage, snapshot_base,
-        write_signer_key_line, AfterLoad, AfterRefusal, AttachedTo, MirrorLoadStep,
+        signer_after_chip_refusal, signer_for_launch, signing_key_the_app_does_not_manage,
+        snapshot_base, write_signer_key_line, AfterLoad, AfterRefusal, AttachedTo, MirrorLoadStep,
         MIRROR_LOAD_ENABLED, PREPARE_START_DEADLINE, SET_ASIDE_STUCK,
     };
     use crate::state::NodeAppSettings;
@@ -7357,6 +7395,55 @@ mod signed_start_tests {
         assert!(key(&text), "{text}");
         assert!(text.contains("prune=10000"), "{text}");
         assert!(!ips.is_empty(), "the mirrors it feeds are whitelisted");
+    }
+
+    /// Integration review M6: Full check on a Mac whose chip the engine
+    /// refuses. The consensus launch had the key line; once the refusal is
+    /// on disk the retry is a mirror, and the engine refuses a key off
+    /// consensus mode, so the line comes out and the host no longer counts
+    /// as a signer.
+    #[test]
+    fn a_mac_refused_in_the_start_loop_retries_without_the_signing_key() {
+        let dir = fresh_validating_datadir();
+        let conf = dir.path().join("faststart").join("faststart.conf");
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        std::fs::write(&conf, "prune=10000\n").unwrap();
+        let btxd = nominal_btxd_path();
+        assert!(write_signer_key_line(dir.path(), &conf, true, &mut Vec::new()).is_some());
+        assert!(node::signs_here(&conf), "the consensus launch had the key");
+
+        node::record_matmul_consensus_refused(dir.path());
+        assert_eq!(
+            signer_after_chip_refusal(&btxd, dir.path(), &conf, Backend::Metal, true),
+            (false, None)
+        );
+        assert!(!node::signs_here(&conf), "the retry holds no key");
+        let text = std::fs::read_to_string(&conf).unwrap();
+        assert!(text.contains("prune=10000"), "{text}");
+    }
+
+    /// Integration review M6, in the code: the loop takes the key line out
+    /// and tells the window, between recording the refusal and the retry.
+    #[test]
+    fn the_chip_refusal_retry_takes_the_key_line_out_first() {
+        let src = include_str!("commands.rs");
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let refused = spawn_fn
+            .find("node::record_matmul_consensus_refused(datadir);")
+            .unwrap();
+        let retry = refused + spawn_fn[refused..].find("continue;").unwrap();
+        let between = &spawn_fn[refused..retry];
+        for step in [
+            "signer_after_chip_refusal(",
+            "*state.signer_applies_here.lock().await = Some(",
+            "*state.signer_pubkey.lock().await =",
+        ] {
+            assert!(between.contains(step), "missing before the retry: {step}");
+        }
     }
 
     /// Minor 7: after a stop or another restart got there first, the log
