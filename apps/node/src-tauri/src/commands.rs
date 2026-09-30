@@ -1599,10 +1599,11 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         let mut bootstrap_headers: Option<u64> = None;
         let mut bootstrap_moved_at = std::time::Instant::now();
         // Catch-up help (btx_core::catchup_assist, decision 2026-09-29 §11):
-        // while the node is behind and the engine asks nobody for the next
-        // blocks, ask this app's archive peers for them by name. Its memory
-        // (the walked headers, the batch out, the peers that dropped us over
-        // old blocks) lasts for this run only.
+        // while the node is behind and its newest block has stood still for
+        // 30 seconds, whatever requests the engine has out, ask this app's
+        // archive peers for the next blocks by name. Its memory (the walked
+        // headers, the batch out, the peers that dropped us over old blocks)
+        // lasts for this run only.
         let mut catch_up = btx_core::catchup_assist::CatchUp::for_this_app();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;

@@ -1,5 +1,6 @@
-//! Catch-up help: while the node is behind and the engine asks nobody for the
-//! next blocks, ask the app's own archive peers for them by name.
+//! Catch-up help: while the node is behind and its newest block has stood
+//! still for 30 seconds, whatever requests the engine has out, ask the app's
+//! own archive peers for the next blocks by name.
 //!
 //! Decision: docs/decisions/2026-09-29-every-node-starts-near-the-tip.md,
 //! section 11. Measured on mainnet on 2026-09-29 with engine v0.34.9: a mirror
@@ -47,10 +48,13 @@ pub const ROTATE_AFTER: Duration = Duration::from_secs(180);
 /// Headers read per tick while walking down to the tip (`crate::header_path`).
 pub const WALK_PER_TICK: usize = 1_000;
 /// About how long one tick may keep asking the node, checked between two
-/// calls, so a tick ends at most one call past it. Every `getblockheader`
-/// takes the engine's `cs_main`, which a busy engine holds for a while, and
-/// the refresher (status card, watchdog, "stopped responding") waits for the
-/// tick.
+/// header reads and between two block requests, so a tick can still run a
+/// little past it: the reads before the walk are not checked against it, the
+/// own-chain read after the walk can add up to three more, and a batch's
+/// first request always goes out even if the deadline has already passed.
+/// Every `getblockheader` takes the engine's `cs_main`, which a busy engine
+/// holds for a while, and the refresher (status card, watchdog, "stopped
+/// responding") waits for the tick.
 pub const TICK_BUDGET: Duration = Duration::from_millis(1_500);
 /// A tick slower than this says so in the log, once until one is quick again.
 pub const SLOW_TICK: Duration = Duration::from_secs(1);
