@@ -482,7 +482,7 @@ const QUIT_GRACE: std::time::Duration = std::time::Duration::from_secs(95);
 /// Single writer for the phase: also mirrors it onto the tray, so tray text
 /// can never go stale (reflecting at call sites proved easy to forget — the
 /// setup pipeline's Downloading/Preparing phases never reached the tray).
-async fn set_phase(app: &AppHandle, state: &AppState, phase: NodePhase) {
+pub(crate) async fn set_phase(app: &AppHandle, state: &AppState, phase: NodePhase) {
     *state.phase.lock().await = phase.clone();
     crate::tray::reflect_phase(app, &phase);
 }
@@ -490,7 +490,7 @@ async fn set_phase(app: &AppHandle, state: &AppState, phase: NodePhase) {
 /// One quick probe: does a node already answer RPC against this datadir?
 /// (Shared-datadir reality: a previous run of this app, or any btxd someone
 /// started by hand, may already be serving — attaching beats churning it.)
-async fn rpc_already_answering(datadir: &Path) -> Option<RpcClient> {
+pub(crate) async fn rpc_already_answering(datadir: &Path) -> Option<RpcClient> {
     let cookie = datadir.join(".cookie");
     let client = RpcClient::from_cookie(&rpc_url(), &cookie).ok()?;
     get_blockchain_info(&client).await.ok()?;
@@ -618,6 +618,9 @@ pub(crate) fn pre_launch_plan(
     }
 }
 
+/// What a start says when another start holds `AppState::start_in_flight`.
+pub(crate) const ALREADY_STARTING: &str = "the node is already starting, give it a moment";
+
 /// Spawn (or attach to) the node and bring the app to a running state:
 /// RPC client armed, snapshot-load guaranteed in the background, keep-awake
 /// held, and the status refresher loop driving the phase.
@@ -634,7 +637,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return Err("the node is already starting, give it a moment".to_string());
+        return Err(ALREADY_STARTING.to_string());
     }
     struct InFlight<'a>(&'a std::sync::atomic::AtomicBool);
     impl Drop for InFlight<'_> {
@@ -643,8 +646,20 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
         }
     }
     let _in_flight = InFlight(&state.start_in_flight);
+    start_node_held(app, state).await
+}
 
+/// [`start_node_inner`] for a caller that already holds
+/// `AppState::start_in_flight`: Fast-forward's driver, which keeps it from
+/// the move of the chain data through its own start, so no other start
+/// comes between them (review M10).
+pub(crate) async fn start_node_held(app: &AppHandle, state: &AppState) -> Result<(), String> {
     let datadir = node_datadir();
+    // Before anything reads the chain data or the settings: a Fast-forward
+    // run a previous start left is carried on from its record, and one cut
+    // off while its chain data moved is put back first. The node is not
+    // started while that cannot be done (`crate::fast_forward`).
+    crate::fast_forward::before_start(&datadir).await?;
     let settings = NodeAppSettings::load(&datadir);
     let mut tag = settings
         .btx_release_tag
@@ -1330,12 +1345,27 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
             let _ =
                 btx_core::setup::set_managed_whitelist_block(&paths.faststart_conf, &whitelist_ips);
         }
+        let fast_forward = crate::fast_forward::underway(&datadir);
         let signed = signed_load_for(
             mirror_load_launch,
             !signer_applies_here,
             SIGNED_LOAD_FAILED.load(Ordering::SeqCst),
+            fast_forward,
         );
-        load_watch = Some((signed, mirror_load_launch));
+        if run_load_missed(
+            fast_forward,
+            !signer_applies_here,
+            mirror_load_launch,
+            NodeAppSettings::load(&datadir).snapshot_loaded,
+        ) {
+            let msg = "Fast-forward: this node checks blocks and its one mirror launch did not \
+                       run, so nothing loads the run's snapshot; the driver undoes the run";
+            eprintln!("[node-app] {msg}");
+            setup_log(&datadir, msg);
+            crate::fast_forward::report_failure(crate::fast_forward::WHY_NOT_LOADED.into());
+        } else {
+            load_watch = Some((signed, mirror_load_launch));
+        }
     }
 
     set_phase(app, state, NodePhase::LoadingSnapshot).await;
@@ -1367,6 +1397,9 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     // node is at the tip (the offer never survives a restart), and refreshes
     // it every 500 blocks. Gated against the LIVE node on every tick.
     maybe_start_snapshot_serve(state, &datadir).await;
+    // A Fast-forward the app was closed in the middle of is watched to its
+    // end, now that the node is up.
+    crate::fast_forward::resume_if_needed(app);
     Ok(())
 }
 
@@ -3721,7 +3754,7 @@ pub async fn begin_setup(
 /// setup used to leave ZERO trace on the machine. This file is the durable
 /// answer to "it's stuck, what happened?": every step and every error lands
 /// here. Best-effort by design; logging must never break setup itself.
-fn setup_log(datadir: &Path, msg: &str) {
+pub(crate) fn setup_log(datadir: &Path, msg: &str) {
     use std::io::Write;
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3989,23 +4022,50 @@ fn header_bootstrap_end_message(
 /// Set when a signed load failed on this node in this run of the app: no
 /// further mirror launch and no further signed load until the app restarts,
 /// so a pair that fails cannot restart the node in a loop.
-static SIGNED_LOAD_FAILED: std::sync::atomic::AtomicBool =
+pub(crate) static SIGNED_LOAD_FAILED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Which signed load a launch makes. Pure, so every case has a test.
+/// Which signed load a launch makes. Pure, so every case has a test. During
+/// Fast-forward (`fast_forward`, `crate::fast_forward::underway`) a node
+/// that follows signatures loads the signed pair or nothing: the driver
+/// rolls back on nothing, and the compiled snapshot is below the run's. A
+/// node that checks blocks loads the run's pair in its mirror launch, and
+/// its ordinary launch after one that was skipped loads nothing at all
+/// ([`run_load_missed`]).
 fn signed_load_for(
     mirror_load_launch: bool,
     follows_signatures: bool,
     failed_this_run: bool,
+    fast_forward: bool,
 ) -> btx_core::snapshot::SignedLoad {
     use btx_core::snapshot::SignedLoad;
-    if mirror_load_launch {
+    if mirror_load_launch || (fast_forward && follows_signatures) {
         SignedLoad::SignedOnly
     } else if follows_signatures && !failed_this_run {
         SignedLoad::Mirror
     } else {
         SignedLoad::None
     }
+}
+
+/// Pure: during a Fast-forward run (`fast_forward`), has this ordinary
+/// launch of a node that checks blocks (not `follows_signatures`) nothing to
+/// load the run's snapshot with? Such a node loads a run's snapshot only in
+/// its one mirror launch, signed-only as a node that follows signatures
+/// loads it. When that launch was skipped (no signed pair was ready within
+/// five minutes, say) and nothing is loaded (`loaded`, the setting the run
+/// resets and only the loader sets), the launch would load the compiled
+/// snapshot, far below the run's, for minutes, only to be rolled back: it
+/// loads nothing, and the driver is told at once (review M5). The launch
+/// after a mirror launch that loaded finds `loaded` set, and goes on as
+/// before: the snapshot is there.
+fn run_load_missed(
+    fast_forward: bool,
+    follows_signatures: bool,
+    mirror_load_launch: bool,
+    loaded: bool,
+) -> bool {
+    fast_forward && !follows_signatures && !mirror_load_launch && !loaded
 }
 
 /// The signer decision for one launch, as `(applies_here, key_in_conf)`.
@@ -4190,12 +4250,15 @@ const MIRROR_LOAD_ENABLED: bool = true;
 /// chainstate (`chainstate_snapshot/`, not the `chainstate/` every node has;
 /// one a set-aside note moves before the launch, [`set_aside_will_move`],
 /// counts as gone), and the operator has not said "never a mirror". Never
-/// while [`MIRROR_LOAD_ENABLED`] is off.
+/// while [`MIRROR_LOAD_ENABLED`] is off. A Fast-forward under way counts as
+/// a load to come too (`crate::fast_forward::underway`): it is no first
+/// load, so the setting stays off, but it loads the run's snapshot the way a
+/// fresh chain loads its first (section 10, step 3).
 fn mirror_load_wanted_here(btxd: &Path, datadir: &Path, backend: Backend) -> bool {
     use btx_core::node;
     let settings = NodeAppSettings::load(datadir);
     MIRROR_LOAD_ENABLED
-        && settings.first_load_pending
+        && (settings.first_load_pending || crate::fast_forward::underway(datadir))
         && node::mirror_load_wanted(
             !node::host_follows_signatures(btxd, datadir, backend),
             node::header_bootstrap_pending(datadir) || node::header_bootstrap_wanted(datadir),
@@ -4208,9 +4271,14 @@ fn mirror_load_wanted_here(btxd: &Path, datadir: &Path, backend: Backend) -> boo
 /// A start on a datadir that has never held a block (the header
 /// bootstrap's own test, whether or not the bootstrap is switched on) marks
 /// its first load as still to come. Nothing else ever sets it, so a datadir
-/// that already holds a chain never gets the mirror launch.
+/// that already holds a chain never gets the mirror launch. Not during
+/// Fast-forward, whose `blocks/` is set aside: a run is no first load, and a
+/// roll-back puts back what the setting was before it.
 fn mark_first_load_if_fresh(datadir: &Path) {
-    if !datadir.join("blocks").exists() && !NodeAppSettings::load(datadir).first_load_pending {
+    if !datadir.join("blocks").exists()
+        && !crate::fast_forward::underway(datadir)
+        && !NodeAppSettings::load(datadir).first_load_pending
+    {
         NodeAppSettings::update(datadir, |s| s.first_load_pending = true);
     }
 }
@@ -4289,6 +4357,21 @@ fn signing_key_the_app_does_not_manage(datadir: &Path) -> bool {
         || conf_key_lines(&conf, &SIGNING_KEY_OPTIONS)
             .iter()
             .any(|l| !l.trim().starts_with(&removed))
+}
+
+/// Would a validating node's one mirror launch even be tried here, apart
+/// from whether one is wanted right now? Off while [`MIRROR_LOAD_ENABLED`]
+/// is off, the operator has said `EASYBTX_NODE_TRUSTED_MIRROR=0`
+/// (`btx_core::node::trusted_mirror_override`), or
+/// [`signing_key_the_app_does_not_manage`]: the same three switches
+/// [`mirror_load_step`]'s `KeyElsewhere` arm and a real start's plain skip
+/// read. Tools asks this of a validating node before it offers
+/// Fast-forward, because such a launch is always refused and the run it
+/// starts always rolls back (controller note 3).
+pub(crate) fn mirror_launch_available(datadir: &Path) -> bool {
+    MIRROR_LOAD_ENABLED
+        && btx_core::node::trusted_mirror_override() != Some(false)
+        && !signing_key_the_app_does_not_manage(datadir)
 }
 
 /// The lines of `conf` that set any of `names` to a value: a line is cut at
@@ -4643,7 +4726,7 @@ fn set_aside_refused_snapshot_at(datadir: &Path, now_unix: u64) -> bool {
 /// left alone. JSON: the base block of the chainstate it is about
 /// ([`snapshot_base`], `null` when there was none to read) and a sentence
 /// for whoever finds it.
-const SET_ASIDE_PENDING_FILE: &str = ".set-aside-snapshot";
+pub(crate) const SET_ASIDE_PENDING_FILE: &str = ".set-aside-snapshot";
 
 /// What [`SET_ASIDE_PENDING_FILE`] holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -4872,6 +4955,41 @@ fn signed_load_failed(
             && !matches!(outcome, O::SignedLoaded { .. } | O::AlreadyLoaded))
 }
 
+/// Does this outcome end a Fast-forward run (`underway`,
+/// `crate::fast_forward::underway`)? Any load that came to nothing, or to a
+/// snapshot the app refuses, on any launch of the run: the driver undoes the
+/// run, and the restarts below would only fight it. A signed-only load
+/// makes no compiled one to fall back on, and a validating node whose
+/// launch loads the compiled snapshot during a run has no mirror launch to
+/// come. Not one a stop or another start got to first (`superseded`): the
+/// stop ended it, and the next start loads again.
+fn fails_the_run(
+    underway: bool,
+    outcome: &btx_core::snapshot::SnapshotOutcome,
+    superseded: bool,
+) -> bool {
+    use btx_core::snapshot::SnapshotOutcome as O;
+    underway
+        && !superseded
+        && matches!(
+            outcome,
+            O::NotLoaded(_) | O::HeldRootOnChain(_) | O::CompiledHeldRootOnChain(_)
+        )
+}
+
+/// What the window says a run's failed load was ([`fails_the_run`]). The
+/// outcome's own text is for the log only: it can carry the website's or
+/// the engine's words.
+fn run_failure_reason(outcome: &btx_core::snapshot::SnapshotOutcome) -> String {
+    use btx_core::snapshot::SnapshotOutcome as O;
+    match outcome {
+        O::HeldRootOnChain(_) | O::CompiledHeldRootOnChain(_) => {
+            crate::fast_forward::WHY_REFUSED.into()
+        }
+        _ => crate::fast_forward::WHY_NOT_LOADED.into(),
+    }
+}
+
 /// Wait for a background load and act on it ([`after_snapshot_load`]). A
 /// plain function, as `spawn_status_refresher` is, so the task it spawns can
 /// restart the node without the start path's future containing itself.
@@ -4900,7 +5018,9 @@ fn spawn_load_watch(
 /// nothing is restarted: the mirror-load marker waits for the next start,
 /// which clears it or resumes the load, and a snapshot the app refuses is
 /// set aside before the next launch ([`mark_set_aside_pending`]), as after
-/// a second refusal in one run, when the node keeps running.
+/// a second refusal in one run, when the node keeps running. During
+/// Fast-forward a load that failed goes to the driver instead
+/// ([`fails_the_run`]), which stops the node and puts the old chain back.
 ///
 /// The ORDER is the header bootstrap's: stop, then clear the marker, then
 /// start. An app that dies in between leaves the marker, and the next start
@@ -4918,6 +5038,22 @@ async fn after_snapshot_load(
         || state.quitting.load(Ordering::SeqCst);
     if signed_load_failed(mirror_load_launch, &outcome, superseded) {
         SIGNED_LOAD_FAILED.store(true, Ordering::SeqCst);
+    }
+    // During Fast-forward a load that failed is the driver's to undo
+    // (`crate::fast_forward`), not a reason for the restarts below. A signed
+    // one still ends signed loads for this run of the app (above), so the
+    // chain that comes back does not try the same pair again.
+    if fails_the_run(
+        crate::fast_forward::underway(&datadir),
+        &outcome,
+        superseded,
+    ) {
+        let msg =
+            format!("a load during Fast-forward failed, for the driver to undo ({outcome:?})");
+        eprintln!("[node-app] {msg}");
+        setup_log(&datadir, &msg);
+        crate::fast_forward::report_failure(run_failure_reason(&outcome));
+        return Ok(());
     }
     settle_first_load(&datadir, mirror_load_launch, &outcome, superseded);
     if !mirror_load_launch
@@ -6129,8 +6265,11 @@ pub async fn reclaim_disk_now(
     let snapshot_loaded = NodeAppSettings::load(&datadir).snapshot_loaded;
     let report = {
         let dd = datadir.clone();
+        // Never beside a Fast-forward move of the chain data.
         tauri::async_runtime::spawn_blocking(move || {
-            btx_core::disk::reclaim_disk(&dd, &conf_path, snapshot_loaded)
+            crate::fast_forward::with_disk(|| {
+                btx_core::disk::reclaim_disk(&dd, &conf_path, snapshot_loaded)
+            })
         })
         .await
         .map_err(|e| format!("reclaim task panicked: {e}"))?
@@ -6998,46 +7137,30 @@ pub async fn remove_node_data_now(
     // a no-op, it gracefully stops and then force-kills the attached node, so
     // the order here is what keeps another app's btxd out of the delete.
     destructive_allowed(node_ownership(&state, &datadir).await)?;
+    // Not while a Fast-forward run is under way or recorded: this removes
+    // chain data in place, and the run's record says what is where
+    // (controller note 2c). The one exception is a run whose old chain
+    // cannot come back (review M6). Asked again below, with the datadir to
+    // itself.
+    if crate::fast_forward::removal_waits() {
+        return Err(crate::fast_forward::REMOVE_WAITS.to_string());
+    }
     stop_node_inner(&state).await;
 
-    let report = {
+    let removed = {
         let dd = datadir.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            let mut report = btx_core::disk::remove_node_data(&dd);
-            // Node sidecars btx-core's helper leaves behind (it serves the
-            // miner's lite-pool too): snapshot-era dirs + p2p/mempool state +
-            // this app's node logs. All rebuilt by a fresh setup.
-            for name in ["chainstate_snapshot", "shielded_state"] {
-                let dir = dd.join(name);
-                if dir.is_dir() {
-                    let bytes = btx_core::disk::dir_size_bytes(&dir);
-                    if std::fs::remove_dir_all(&dir).is_ok() {
-                        report.freed_mb += bytes / (1024 * 1024);
-                        report.items.push(name.to_string());
-                    }
-                }
-            }
-            for name in [
-                "mempool.dat",
-                "peers.dat",
-                "banlist.json",
-                "fee_estimates.dat",
-                "easybtx-node.log",
-                "easybtx-node.log.prev",
-                "btxd.pid",
-            ] {
-                let f = dd.join(name);
-                if let Ok(meta) = std::fs::metadata(&f) {
-                    let bytes = meta.len();
-                    if std::fs::remove_file(&f).is_ok() {
-                        report.freed_mb += bytes / (1024 * 1024);
-                    }
-                }
-            }
-            report
+            crate::fast_forward::with_disk(|| remove_node_files(&dd))
         })
         .await
         .map_err(|e| format!("removal task panicked: {e}"))?
+    };
+    let report = match removed {
+        Ok(report) => report,
+        Err(e) => {
+            set_phase(&app, &state, NodePhase::Stopped).await;
+            return Err(e);
+        }
     };
 
     // Back to factory: the wizard owns the next setup. Explorer mode's
@@ -7055,6 +7178,59 @@ pub async fn remove_node_data_now(
     Ok(report)
 }
 
+/// [`remove_node_data_now`]'s part on disk, with the node stopped and the
+/// datadir to itself (`crate::fast_forward::with_disk`). Refused while a
+/// Fast-forward run is under way or recorded, except one whose old chain
+/// cannot come back, which is given up first
+/// (`crate::fast_forward::clear_for_removal`); otherwise the chain data, the
+/// node's sidecars, and the old chain data a finished, undone or given-up
+/// run left.
+fn remove_node_files(dd: &Path) -> Result<btx_core::disk::ReclaimReport, String> {
+    crate::fast_forward::clear_for_removal(dd)?;
+    let mut report = btx_core::disk::remove_node_data(dd);
+    // Node sidecars btx-core's helper leaves behind (it serves the
+    // miner's lite-pool too): snapshot-era dirs + p2p/mempool state +
+    // this app's node logs. All rebuilt by a fresh setup.
+    for name in ["chainstate_snapshot", "shielded_state"] {
+        let dir = dd.join(name);
+        if dir.is_dir() {
+            let bytes = btx_core::disk::dir_size_bytes(&dir);
+            if std::fs::remove_dir_all(&dir).is_ok() {
+                report.freed_mb += bytes / (1024 * 1024);
+                report.items.push(name.to_string());
+            }
+        }
+    }
+    for name in [
+        "mempool.dat",
+        "peers.dat",
+        "banlist.json",
+        "fee_estimates.dat",
+        "easybtx-node.log",
+        "easybtx-node.log.prev",
+        "btxd.pid",
+    ] {
+        let f = dd.join(name);
+        if let Ok(meta) = std::fs::metadata(&f) {
+            let bytes = meta.len();
+            if std::fs::remove_file(&f).is_ok() {
+                report.freed_mb += bytes / (1024 * 1024);
+            }
+        }
+    }
+    // Old chain data a Fast-forward set aside, when no run needs it (a
+    // finish or a sweep that was cut off, or a run given up above).
+    let bytes = crate::fast_forward::sweep_measured(dd);
+    if bytes > 0 {
+        report.freed_mb += bytes / (1024 * 1024);
+        report.items.push(format!(
+            "chain data set aside by Fast-forward ({} MB)",
+            bytes / (1024 * 1024)
+        ));
+    }
+    Ok(report)
+}
+
 /// Open the network-wide stats page (btxprice.com/stats) in the default
 /// browser. Fixed URL on purpose: the webview never chooses what to open,
 /// so there is no arbitrary-URL surface.
@@ -7068,10 +7244,11 @@ pub async fn open_global_stats() -> Result<(), String> {
 mod signed_start_tests {
     use super::{
         abandon_mirror_load, after_load_plan, chain_outgrew_first_load, clear_mirror_marker,
-        ends_orphaned_mirror_launch, first_load_settled, honour_pending_set_aside,
+        ends_orphaned_mirror_launch, fails_the_run, first_load_settled, honour_pending_set_aside,
         honour_pending_set_aside_at, key_line_goes_back, mark_first_load_if_fresh,
-        mark_set_aside_pending, mirror_launch_failed, mirror_load_end_message, mirror_load_step,
-        mirror_load_wanted_here, nominal_btxd_path, prepared_within, refused_load_message,
+        mark_set_aside_pending, mirror_launch_available, mirror_launch_failed,
+        mirror_load_end_message, mirror_load_step, mirror_load_wanted_here, nominal_btxd_path,
+        prepared_within, refused_load_message, run_failure_reason, run_load_missed,
         runs_mirror_load, set_aside_pending, set_aside_refused_snapshot_at, set_aside_waits,
         set_aside_will_move, settle_first_load, signed_load_failed, signed_load_for,
         signer_after_chip_refusal, signer_for_launch, signing_key_the_app_does_not_manage,
@@ -7088,15 +7265,186 @@ mod signed_start_tests {
 
     #[test]
     fn each_launch_makes_the_signed_load_its_node_can_make() {
-        assert_eq!(signed_load_for(true, false, false), SignedLoad::SignedOnly);
-        assert_eq!(signed_load_for(true, true, true), SignedLoad::SignedOnly);
-        assert_eq!(signed_load_for(false, true, false), SignedLoad::Mirror);
         assert_eq!(
-            signed_load_for(false, true, true),
+            signed_load_for(true, false, false, false),
+            SignedLoad::SignedOnly
+        );
+        assert_eq!(
+            signed_load_for(true, true, true, false),
+            SignedLoad::SignedOnly
+        );
+        assert_eq!(
+            signed_load_for(false, true, false, false),
+            SignedLoad::Mirror
+        );
+        assert_eq!(
+            signed_load_for(false, true, true, false),
             SignedLoad::None,
             "a mirror whose signed load failed this run takes the compiled one"
         );
-        assert_eq!(signed_load_for(false, false, false), SignedLoad::None);
+        assert_eq!(
+            signed_load_for(false, false, false, false),
+            SignedLoad::None
+        );
+        // Fast-forward: a mirror loads the signed pair or nothing, and the
+        // driver rolls back on nothing; a validating node's ordinary launch
+        // loads nothing signed (its mirror launch does).
+        assert_eq!(
+            signed_load_for(false, true, true, true),
+            SignedLoad::SignedOnly
+        );
+        assert_eq!(signed_load_for(false, false, false, true), SignedLoad::None);
+    }
+
+    /// Review M5: a run's loads are signed-only for both host kinds. The
+    /// ordinary launch of a node that checks blocks, during a run whose
+    /// mirror launch was skipped and with nothing loaded, loads nothing (not
+    /// the compiled snapshot) and hands the driver the failure at once. The
+    /// launch after a mirror launch that loaded, a mirror launch itself, a
+    /// node that follows signatures (its signed-only load decides), and any
+    /// launch outside a run go on as before.
+    #[test]
+    fn a_run_whose_mirror_launch_was_skipped_fails_at_once() {
+        assert!(run_load_missed(true, false, false, false));
+        assert!(
+            !run_load_missed(true, false, false, true),
+            "after the mirror launch"
+        );
+        assert!(
+            !run_load_missed(true, false, true, false),
+            "the mirror launch"
+        );
+        assert!(
+            !run_load_missed(true, true, false, false),
+            "follows signatures"
+        );
+        for (follows, mirror, loaded) in [
+            (false, false, false),
+            (false, false, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            assert!(
+                !run_load_missed(false, follows, mirror, loaded),
+                "no run: {follows} {mirror} {loaded}"
+            );
+        }
+    }
+
+    /// During Fast-forward every load that comes to nothing, or to a
+    /// snapshot the app refuses, is the driver's to undo, on any launch;
+    /// one a stop or another start got to first is not (the stop ended it,
+    /// not the pair). What the window then says is plain: the load's own
+    /// text stays in the log.
+    #[test]
+    fn a_load_that_fails_during_a_run_goes_to_the_driver() {
+        let none = SnapshotOutcome::NotLoaded("HTTP 404 from https://x".into());
+        for failed in [none.clone(), held(), compiled_held()] {
+            assert!(fails_the_run(true, &failed, false), "{failed:?}");
+            assert!(
+                !fails_the_run(true, &failed, true),
+                "superseded: {failed:?}"
+            );
+            assert!(!fails_the_run(false, &failed, false), "no run: {failed:?}");
+            let why = run_failure_reason(&failed);
+            assert!(!why.contains("404") && !why.contains("227313"), "{why}");
+            assert!(!why.contains('\u{2014}') && !why.ends_with('.'), "{why}");
+        }
+        for loaded in [
+            SnapshotOutcome::SignedLoaded { height: 232_000 },
+            SnapshotOutcome::AlreadyLoaded,
+            SnapshotOutcome::CompiledLoaded,
+        ] {
+            assert!(!fails_the_run(true, &loaded, false), "{loaded:?}");
+        }
+    }
+
+    /// Controller note 2c and review minor 5: Remove node data asks the
+    /// datadir it removes from whether a Fast-forward run is recorded there,
+    /// and waits while one is; otherwise it also takes the old chain data a
+    /// finished run left.
+    #[test]
+    fn remove_node_data_waits_for_a_recorded_run_in_its_own_datadir() {
+        let dir = synced_validating_datadir();
+        let d = dir.path();
+        btx_core::fast_forward::set_aside(
+            d,
+            232_000,
+            btx_core::fast_forward::Before::default(),
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            super::remove_node_files(d).unwrap_err(),
+            crate::fast_forward::REMOVE_WAITS
+        );
+        assert!(
+            d.join("fast-forward-100/blocks").exists(),
+            "nothing removed"
+        );
+
+        let dir = synced_validating_datadir();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("fast-forward-7/blocks")).unwrap();
+        std::fs::write(d.join("fast-forward-7/blocks/old"), vec![0u8; 4096]).unwrap();
+        let report = super::remove_node_files(d).unwrap();
+        assert!(!d.join("blocks").exists());
+        assert!(!d.join("fast-forward-7").exists());
+        assert!(
+            report.items.iter().any(|i| i.contains("Fast-forward")),
+            "{:?}",
+            report.items
+        );
+
+        // Review M6: a run whose old chain cannot come back, once given up
+        // (`crate::fast_forward::clear_for_removal`), leaves its dated
+        // folder to this removal, with the new chain.
+        let dir = synced_validating_datadir();
+        let d = dir.path();
+        let r = btx_core::fast_forward::set_aside(
+            d,
+            232_000,
+            btx_core::fast_forward::Before::default(),
+            100,
+        )
+        .unwrap();
+        std::fs::create_dir_all(d.join("blocks")).unwrap();
+        std::fs::write(d.join(&r.aside).join("blocks/old"), vec![0u8; 4096]).unwrap();
+        std::fs::remove_dir_all(d.join(&r.aside).join("chainstate")).unwrap();
+        btx_core::fast_forward::abandon(d).unwrap();
+        let report = super::remove_node_files(d).unwrap();
+        assert!(!d.join("blocks").exists());
+        assert!(!d.join(&r.aside).exists());
+        assert!(
+            report.items.iter().any(|i| i.contains("Fast-forward")),
+            "{:?}",
+            report.items
+        );
+    }
+
+    /// Controller note 1 (a): Fast-forward sets `blocks/` aside, and the
+    /// start path must not read that as a fresh chain: a run is no first
+    /// load. A validating node still gets the one mirror launch that loads
+    /// the run's snapshot, once its header bootstrap made `blocks/` again.
+    #[test]
+    fn a_run_is_no_first_load_but_still_gets_its_mirror_launch() {
+        let btxd = nominal_btxd_path();
+        let dir = synced_validating_datadir();
+        let d = dir.path();
+        btx_core::fast_forward::set_aside(
+            d,
+            232_000,
+            btx_core::fast_forward::Before::default(),
+            100,
+        )
+        .unwrap();
+        assert!(!d.join("blocks").exists());
+        mark_first_load_if_fresh(d);
+        assert!(!NodeAppSettings::load(d).first_load_pending);
+        std::fs::create_dir_all(d.join("blocks")).unwrap();
+        assert!(mirror_load_wanted_here(&btxd, d, Backend::Metal));
+        btx_core::fast_forward::restore(d).unwrap();
+        assert!(!mirror_load_wanted_here(&btxd, d, Backend::Metal));
     }
     #[test]
     fn the_end_of_a_mirror_launch_says_what_happens_next() {
@@ -7479,6 +7827,26 @@ mod signed_start_tests {
         assert_eq!(
             mirror_load_step(true, false, true, true),
             MirrorLoadStep::KeyElsewhere
+        );
+    }
+
+    /// Controller note 3: Task 4's Fast-forward offer asks this before it
+    /// shows the button on a validating node, so it must read the same
+    /// switches a real start does. `MIRROR_LOAD_ENABLED` and the operator's
+    /// `EASYBTX_NODE_TRUSTED_MIRROR` are covered elsewhere (the const is
+    /// asserted on above; the env var is never touched by a test, the same
+    /// as `mirror_load_wanted_here`'s own read of it); this covers the
+    /// signing-key switch, the one that changes with the datadir.
+    #[test]
+    fn mirror_launch_available_reads_the_signing_key_switch() {
+        let dir = fresh_validating_datadir();
+        assert!(mirror_launch_available(dir.path()));
+        let rw = dir.path().join("btx_rw.conf");
+        std::fs::write(&rw, "matmulattestationsignerkeyfile=k.key\n").unwrap();
+        assert!(!mirror_launch_available(dir.path()));
+        assert_eq!(
+            mirror_launch_available(dir.path()),
+            !signing_key_the_app_does_not_manage(dir.path())
         );
     }
 
@@ -8192,7 +8560,7 @@ mod signed_start_tests {
         let runs = ends_orphaned_mirror_launch(attached, applies, Some(true), false);
         assert!(runs);
         assert_eq!(
-            signed_load_for(runs, !applies, false),
+            signed_load_for(runs, !applies, false, false),
             SignedLoad::SignedOnly
         );
         assert_eq!(

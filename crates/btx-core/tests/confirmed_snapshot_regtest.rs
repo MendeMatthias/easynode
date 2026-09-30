@@ -88,24 +88,8 @@ impl Node {
     async fn start(&mut self, extra: &[String]) -> Result<RpcClient, String> {
         self.kill();
         let _ = std::fs::remove_file(self.net().join(".cookie"));
-        let child = std::process::Command::new(&self.btxd)
-            .arg("-regtest")
-            .arg(format!("-datadir={}", self.dir.display()))
-            .arg(format!("-rpcport={}", self.rpc_port))
-            .arg(format!("-port={}", self.p2p_port))
-            .args([
-                "-server=1",
-                "-bind=127.0.0.1",
-                "-listen=1",
-                "-discover=0",
-                "-dnsseed=0",
-                "-fixedseeds=0",
-                "-upnp=0",
-                "-natpmp=0",
-                "-printtoconsole=0",
-                "-daemon=0",
-            ])
-            .args(extra)
+        let child = self
+            .command(extra)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -126,6 +110,29 @@ impl Node {
         }
         self.kill();
         Err(format!("no RPC within 120 s:\n{}", self.log_tail()))
+    }
+
+    /// The engine's command line for this node, with `extra`.
+    fn command(&self, extra: &[String]) -> std::process::Command {
+        let mut cmd = std::process::Command::new(&self.btxd);
+        cmd.arg("-regtest")
+            .arg(format!("-datadir={}", self.dir.display()))
+            .arg(format!("-rpcport={}", self.rpc_port))
+            .arg(format!("-port={}", self.p2p_port))
+            .args([
+                "-server=1",
+                "-bind=127.0.0.1",
+                "-listen=1",
+                "-discover=0",
+                "-dnsseed=0",
+                "-fixedseeds=0",
+                "-upnp=0",
+                "-natpmp=0",
+                "-printtoconsole=0",
+                "-daemon=0",
+            ])
+            .args(extra);
+        cmd
     }
 
     async fn stop(&mut self, rpc: &RpcClient) {
@@ -763,4 +770,161 @@ async fn the_engine_reports_the_compiled_mainnet_replay_context() {
         Some(cs::MAINNET_REPLAY_CONTEXT),
         "{v}"
     );
+}
+
+/// Fast-forward's roll-back on a real engine's folder: set the chain aside,
+/// start on nothing, put it back, and the node is where it was.
+#[tokio::test]
+#[ignore]
+async fn fast_forward_puts_a_real_chain_back() {
+    let Some(btxd) = std::env::var_os("EASYNODE_TEST_BTXD").map(PathBuf::from) else {
+        eprintln!("EASYNODE_TEST_BTXD unset; nothing to test against");
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut n = Node::new(&btxd, root.path().join("f"), 29475);
+    let validating = args(&["-matmulvalidation=consensus", "-connect=0"]);
+    let r = n.start(&validating).await.unwrap();
+    mine_to(&r, 50).await;
+    let best = call(&r, "getbestblockhash", json!([])).await;
+    n.stop(&r).await;
+
+    let record = btx_core::fast_forward::set_aside(
+        &n.net(),
+        50,
+        btx_core::fast_forward::Before::default(),
+        1,
+    )
+    .unwrap();
+    assert!(record.moved.contains(&"blocks".to_string()), "{record:?}");
+    let r = n.start(&validating).await.unwrap();
+    assert_eq!(
+        call(&r, "getblockcount", json!([])).await,
+        json!(0),
+        "a fresh chain"
+    );
+    n.stop(&r).await;
+
+    btx_core::fast_forward::restore(&n.net()).unwrap();
+    let r = n.start(&validating).await.unwrap();
+    assert_eq!(call(&r, "getblockcount", json!([])).await, json!(50));
+    assert_eq!(call(&r, "getbestblockhash", json!([])).await, best);
+    n.stop(&r).await;
+}
+
+/// Fast-forward's other end on a real engine's folder: set the old chain
+/// aside, start fresh on a new one, and `finish` keeps the new chain and
+/// leaves no dated folder or record behind.
+#[tokio::test]
+#[ignore]
+async fn fast_forward_finish_keeps_a_real_new_chain() {
+    let Some(btxd) = std::env::var_os("EASYNODE_TEST_BTXD").map(PathBuf::from) else {
+        eprintln!("EASYNODE_TEST_BTXD unset; nothing to test against");
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut n = Node::new(&btxd, root.path().join("g"), 29476);
+    let validating = args(&["-matmulvalidation=consensus", "-connect=0"]);
+    let r = n.start(&validating).await.unwrap();
+    mine_to(&r, 20).await;
+    n.stop(&r).await;
+
+    let record = btx_core::fast_forward::set_aside(
+        &n.net(),
+        20,
+        btx_core::fast_forward::Before::default(),
+        2,
+    )
+    .unwrap();
+    let aside_dir = n.net().join(&record.aside);
+    assert!(aside_dir.is_dir(), "{}", aside_dir.display());
+
+    let r = n.start(&validating).await.unwrap();
+    assert_eq!(
+        call(&r, "getblockcount", json!([])).await,
+        json!(0),
+        "a fresh chain"
+    );
+    mine_to(&r, 5).await;
+    let new_best = call(&r, "getbestblockhash", json!([])).await;
+    n.stop(&r).await;
+
+    btx_core::fast_forward::finish(&n.net()).unwrap();
+    assert!(
+        !aside_dir.exists(),
+        "the dated folder should be gone: {}",
+        aside_dir.display()
+    );
+    // finish renames the folder to *.discard before it deletes it, and only
+    // warns if that last delete fails: check the renamed folder is gone too.
+    let discard = aside_dir.with_file_name(format!(
+        "{}.discard",
+        aside_dir.file_name().unwrap().to_string_lossy()
+    ));
+    assert!(
+        !discard.exists(),
+        "the renamed folder should be gone: {}",
+        discard.display()
+    );
+    assert_eq!(
+        btx_core::fast_forward::read_record(&n.net()).unwrap(),
+        None,
+        "no run should be recorded once finish is done"
+    );
+
+    let r = n.start(&validating).await.unwrap();
+    assert_eq!(call(&r, "getblockcount", json!([])).await, json!(5));
+    assert_eq!(call(&r, "getbestblockhash", json!([])).await, new_best);
+    n.stop(&r).await;
+}
+
+/// Review I5 on a real engine: while the app holds the engine's own lock on
+/// the folder (`fsx::EngineLock`, as every Fast-forward move does), a btxd
+/// started on it refuses to start, whichever app launches it; once the lock
+/// is let go, it starts on the chain as it was.
+#[tokio::test]
+#[ignore]
+async fn the_engines_lock_keeps_a_btxd_off_the_folder() {
+    let Some(btxd) = std::env::var_os("EASYNODE_TEST_BTXD").map(PathBuf::from) else {
+        eprintln!("EASYNODE_TEST_BTXD unset; nothing to test against");
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut n = Node::new(&btxd, root.path().join("l"), 29477);
+    let validating = args(&["-matmulvalidation=consensus", "-connect=0"]);
+    let r = n.start(&validating).await.unwrap();
+    mine_to(&r, 5).await;
+    n.stop(&r).await;
+
+    let lock = btx_core::fsx::EngineLock::take(&n.net()).unwrap();
+    let mut refused = n
+        .command(&validating)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut status = None;
+    for _ in 0..240 {
+        if let Some(s) = refused.try_wait().unwrap() {
+            status = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if status.is_none() {
+        let _ = refused.kill();
+        let _ = refused.wait();
+    }
+    let mut said = String::new();
+    use std::io::Read as _;
+    let _ = refused.stderr.take().unwrap().read_to_string(&mut said);
+    said.push_str(&n.log_tail());
+    let status = status.unwrap_or_else(|| panic!("btxd started with the lock held:\n{said}"));
+    assert!(!status.success(), "{said}");
+    assert!(said.contains("Cannot obtain a lock"), "{said}");
+
+    drop(lock);
+    let r = n.start(&validating).await.unwrap();
+    assert_eq!(call(&r, "getblockcount", json!([])).await, json!(5));
+    n.stop(&r).await;
 }

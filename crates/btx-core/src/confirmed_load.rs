@@ -267,6 +267,30 @@ pub async fn node_view(rpc: &dyn Rpc, pinned: &[&str], start_height: u64) -> Nod
     }
 }
 
+/// The view a load at this node's next launch will have, for a check made
+/// now on the running node: Fast-forward's offer, and its step 1, which
+/// judge the confirmed snapshot before any launch. Genesis and replay
+/// context are the running node's ([`node_view`]). The pins are the keys
+/// that launch's engine will list: on a node that follows signatures
+/// (`follows_signatures`), the running engine's own, since it loads in
+/// place; on a node that checks blocks, every one of `compiled`, which its
+/// one mirror launch pins (`crate::node`'s mirror arm), whatever the
+/// running engine pins now. A node that checks blocks and pins nothing (the
+/// shipped conf) lists no key at all, and judged by that it would refuse
+/// every manifest.
+pub async fn launch_view(
+    rpc: &dyn Rpc,
+    compiled: &[&str],
+    start_height: u64,
+    follows_signatures: bool,
+) -> NodeView {
+    let mut view = node_view(rpc, compiled, start_height).await;
+    if !follows_signatures {
+        view.pinned = cs::pinned_keys(compiled);
+    }
+    view
+}
+
 /// The compressed keys in a `getmatmultrustedstatus` answer's
 /// `trusted_signer_pubkeys`: the keys the engine verifies a snapshot
 /// manifest against. Empty when the answer has no such list.
@@ -1291,6 +1315,47 @@ mod tests {
             node_view(&node, &[P], 0).await.pinned,
             cs::pinned_keys(&[P])
         );
+    }
+
+    /// Fast-forward judges the confirmed snapshot before the launch that
+    /// loads it, so with the pins that launch will have. A node that checks
+    /// blocks and pins nothing (a consensus node lists no key, and reports
+    /// no replay context) is judged with every compiled key, which its one
+    /// mirror launch pins: the snapshot passes. Judged by what the running
+    /// engine lists, it would not. A node that follows signatures loads in
+    /// place, so its own engine's pins decide, both ways.
+    #[tokio::test]
+    async fn a_run_judges_the_snapshot_with_the_pins_its_launch_will_have() {
+        let manifest = cs::parse(R_PC).unwrap();
+        let env = env();
+        let confirmed = |v: &NodeView| cs::check(&manifest, v, Some(&env)).map(|c| c.operators);
+        let names = || vec!["producer".to_string(), "confirmer".to_string()];
+
+        let mut consensus = Node::regtest();
+        consensus.trusted = vec![];
+        consensus.reports_context = false;
+        let running = node_view(&consensus, &[P, C], 0).await;
+        assert!(running.pinned.is_empty(), "the engine lists none");
+        assert_eq!(confirmed(&running), Err(cs::Refusal::NoPinnedSigner));
+        let v = launch_view(&consensus, &[P, C], 7, false).await;
+        assert_eq!(v.pinned, cs::pinned_keys(&[P, C]), "every compiled key");
+        assert_eq!(
+            v.genesis.as_deref(),
+            Some(crate::operators::REGTEST_GENESIS),
+            "still the running node's chain"
+        );
+        assert_eq!(v.replay_context, None);
+        assert_eq!(v.start_height, 7);
+        assert_eq!(confirmed(&v), Ok(names()), "a node that checks blocks");
+
+        let mut mirror = Node::regtest();
+        mirror.trusted = vec![P, C];
+        let v = launch_view(&mirror, &[P, C], 0, true).await;
+        assert_eq!(v.pinned, cs::pinned_keys(&[P, C]));
+        assert_eq!(confirmed(&v), Ok(names()), "a node that follows signatures");
+        let v = launch_view(&consensus, &[P, C], 0, true).await;
+        assert!(v.pinned.is_empty(), "its own engine's pins, none");
+        assert_eq!(confirmed(&v), Err(cs::Refusal::NoPinnedSigner));
     }
 
     /// The app pins P and C, the engine was started with P alone: the engine

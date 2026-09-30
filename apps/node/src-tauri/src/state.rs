@@ -645,7 +645,9 @@ pub struct AppState {
     /// Once per run of the app, so a load that keeps failing cannot restart
     /// the node in a loop: a second refused load in the same run is logged
     /// and the node keeps running as it is, and no mirror launch begins after
-    /// one. Never reset; the next run of the app starts with a new state.
+    /// one. Reset only by a Fast-forward someone starts (`crate::fast_forward`),
+    /// whose failed loads go to its driver rather than to a restart; else the
+    /// next run of the app starts with a new state.
     pub load_failure_restarted: Arc<AtomicBool>,
     /// btxd's MatMul RC execution verdict for the CURRENT node run, remembered
     /// once observed: `(policy, stalled)`.

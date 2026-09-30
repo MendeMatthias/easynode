@@ -1,5 +1,16 @@
-import { describe, expect, it } from "vitest";
-import { History, ReportCopy, RestartArm, capForDisplay, DISPLAY_LIMIT } from "./tools-history";
+import { describe, expect, it, vi } from "vitest";
+import {
+  History,
+  ReportCopy,
+  RestartArm,
+  ARM_DOUBLE_CLICK_GUARD_MS,
+  capForDisplay,
+  DISPLAY_LIMIT,
+  FAST_FORWARD_ARM_MS,
+  FF_NOTE,
+  fastForwardRun,
+  fastForwardView,
+} from "./tools-history";
 
 describe("History", () => {
   it("keeps the last 50 and recalls them with up and down", () => {
@@ -29,12 +40,18 @@ describe("History", () => {
 
 describe("RestartArm", () => {
   it("arms on the first click and restarts on the second", () => {
-    const arm = new RestartArm();
-    expect(arm.armed).toBe(false);
-    expect(arm.click()).toBe(false);
-    expect(arm.armed).toBe(true);
-    expect(arm.click()).toBe(true);
-    expect(arm.armed).toBe(false);
+    vi.useFakeTimers();
+    try {
+      const arm = new RestartArm();
+      expect(arm.armed).toBe(false);
+      expect(arm.click()).toBe(false);
+      expect(arm.armed).toBe(true);
+      vi.advanceTimersByTime(ARM_DOUBLE_CLICK_GUARD_MS);
+      expect(arm.click()).toBe(true);
+      expect(arm.armed).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
   it("disarms by timeout, so the next click only arms again", () => {
     const arm = new RestartArm();
@@ -42,6 +59,20 @@ describe("RestartArm", () => {
     arm.disarm(); // the 5s timer fired
     expect(arm.armed).toBe(false);
     expect(arm.click()).toBe(false);
+  });
+  it("ignores a second click inside the double-click guard, so a double-click cannot both arm and run it", () => {
+    vi.useFakeTimers();
+    try {
+      const arm = new RestartArm();
+      expect(arm.click()).toBe(false); // arms
+      vi.advanceTimersByTime(ARM_DOUBLE_CLICK_GUARD_MS - 1);
+      expect(arm.click()).toBe(false); // still inside the guard: ignored, still armed
+      expect(arm.armed).toBe(true);
+      vi.advanceTimersByTime(1);
+      expect(arm.click()).toBe(true); // a real second click now runs it
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -77,5 +108,93 @@ describe("capForDisplay", () => {
     expect(shown.startsWith("x".repeat(100))).toBe(true);
     expect(shown).toContain("Copy takes the whole answer");
     expect(shown.length).toBeLessThan(long.length);
+  });
+});
+
+describe("Fast-forward arm", () => {
+  it("gives ten seconds for the second click", () => {
+    expect(FAST_FORWARD_ARM_MS).toBe(10_000);
+  });
+  it("runs only on the second click, and a disarm starts over", () => {
+    vi.useFakeTimers();
+    try {
+      const arm = new RestartArm();
+      expect(arm.click()).toBe(false); // shows what will happen
+      arm.disarm(); // ten seconds passed
+      expect(arm.click()).toBe(false);
+      vi.advanceTimersByTime(ARM_DOUBLE_CLICK_GUARD_MS);
+      expect(arm.click()).toBe(true); // runs
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("Fast-forward section", () => {
+  const offer = {
+    kind: "offer" as const,
+    height: 233800,
+    button: "Fast-forward to block 233,800",
+    confirm: "Fast-forward to block 233,800, confirmed by Mende and jpp? ...",
+    note: FF_NOTE,
+  };
+  it("offers the button with the note Rust sent", () => {
+    expect(fastForwardView(offer, { running: false, message: null })).toEqual({
+      section: true,
+      button: "Fast-forward to block 233,800",
+      note: FF_NOTE,
+    });
+    const early =
+      "Your node's peers are not sending the older blocks it needs, so Fast-forward is offered sooner than usual. It works the same way as always.";
+    expect(fastForwardView({ ...offer, note: early }, null).note).toBe(early);
+  });
+  it("says it is off, with no button, while the operators disagree", () => {
+    const sentence = "Fast-forward is off while the snapshot operators disagree about block 233,800.";
+    expect(fastForwardView({ kind: "off", height: 233800, sentence }, null)).toEqual({
+      section: true,
+      button: null,
+      note: sentence,
+    });
+  });
+  it("shows no button during a run, and nothing when there is nothing to say", () => {
+    expect(fastForwardView(offer, { running: true, message: "Fast-forward is running." }).button).toBeNull();
+    expect(fastForwardView({ kind: "none" }, { running: false, message: null }).section).toBe(false);
+    expect(fastForwardView(null, { running: false, message: "Done." }).section).toBe(true);
+  });
+  it("has no note beside a run or a last outcome, only beside an offer or a dispute", () => {
+    const done = "Done. Your node now starts from block 233,800, confirmed by Mende and jpp.";
+    expect(fastForwardView({ kind: "none" }, { running: false, message: done })).toEqual({
+      section: true,
+      button: null,
+      note: "",
+    });
+    expect(fastForwardView(null, { running: false, message: done }).note).toBe("");
+    expect(fastForwardView(offer, { running: true, message: "Fast-forward is running." }).note).toBe("");
+    expect(fastForwardView(null, null).note).toBe("");
+  });
+  it("drops the note when a run starts and when it ends, with Tools open throughout", () => {
+    // What the overlay asks at each step: the second click that started a
+    // run, a reopen during it, and the poll that sees it end.
+    const running = { running: true, message: "Fast-forward is running. Your node restarts a few times on the way." };
+    expect(fastForwardView(offer, running)).toEqual({ section: true, button: null, note: "" });
+    expect(fastForwardView(null, running)).toEqual({ section: true, button: null, note: "" });
+    const ended = { running: false, message: "Done. Your node now starts from block 233,800, confirmed by Mende and jpp." };
+    expect(fastForwardView(null, ended)).toEqual({ section: true, button: null, note: "" });
+  });
+});
+
+describe("Fast-forward second click", () => {
+  it("polls only a run that started", async () => {
+    expect(await fastForwardRun(() => Promise.resolve("Fast-forward is running."))).toEqual({
+      message: "Fast-forward is running.",
+      started: true,
+    });
+  });
+  it("shows a refusal as it is, with nothing to poll", async () => {
+    const refused = "A Fast-forward has not finished yet.";
+    expect(await fastForwardRun(() => Promise.reject(refused))).toEqual({
+      message: refused,
+      started: false,
+    });
   });
 });
