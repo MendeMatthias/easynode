@@ -1048,7 +1048,9 @@ async fn wait_for_headers(rpc: &RpcClient, datadir: &Path, target: u64) -> bool 
 pub enum LoadOutcome {
     Loaded,
     /// "Work does not exceed active chainstate": a peer already advanced the
-    /// chain past the snapshot — that's success, not error.
+    /// chain past the snapshot — that's success, not error. The engine says
+    /// it before the load and again, in lowercase, after the snapshot is
+    /// populated (v0.34.9 `validation.cpp:17704`); both are this.
     Superseded,
     /// Nothing was loaded: the engine refused the call (btx-cli's
     /// `error code:` reply), or btx-cli could not be started.
@@ -1063,7 +1065,10 @@ pub enum LoadOutcome {
 fn load_outcome(success: bool, stderr: &str) -> LoadOutcome {
     if success {
         LoadOutcome::Loaded
-    } else if stderr.contains("Work does not exceed active chainstate") {
+    } else if stderr
+        .to_ascii_lowercase()
+        .contains("work does not exceed active chainstate")
+    {
         LoadOutcome::Superseded
     } else if stderr.lines().any(|l| l.starts_with("error code: ")) {
         // The engine's own answer: btx-cli prints a JSON-RPC error as
@@ -1161,6 +1166,17 @@ mod tests {
             load_outcome(
                 false,
                 "error code: -32603\nWork does not exceed active chainstate"
+            ),
+            LoadOutcome::Superseded
+        );
+        // Final review M12: the engine checks the work twice. The late check,
+        // after the snapshot is populated (v0.34.9 `validation.cpp:17704`),
+        // says it in lowercase, and it is the same answer.
+        assert_eq!(
+            load_outcome(
+                false,
+                "error code: -32603\nerror message:\nUnable to load attested UTXO snapshot: work \
+                 does not exceed active chainstate. (/d/faststart/attested/utxo-btx-main-232000.dat)\n"
             ),
             LoadOutcome::Superseded
         );
