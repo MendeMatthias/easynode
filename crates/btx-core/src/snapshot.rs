@@ -678,7 +678,7 @@ pub fn ensure_snapshot_loaded_with(
                             mark_snapshot_marker(&datadir);
                             return;
                         }
-                        LoadOutcome::Failed(e) => eprintln!(
+                        LoadOutcome::Failed(e) | LoadOutcome::NoAnswer(e) => eprintln!(
                             "[snapshot] signed snapshot {} not loaded ({e}); loading the compiled one",
                             pair.height
                         ),
@@ -732,7 +732,9 @@ pub fn ensure_snapshot_loaded_with(
                 flags.mark_loaded();
                 mark_snapshot_marker(&datadir);
             }
-            LoadOutcome::Failed(e) => eprintln!("[snapshot] loadtxoutset failed (non-fatal): {e}"),
+            LoadOutcome::Failed(e) | LoadOutcome::NoAnswer(e) => {
+                eprintln!("[snapshot] loadtxoutset failed (non-fatal): {e}")
+            }
         }
     });
 }
@@ -791,7 +793,14 @@ pub enum LoadOutcome {
     /// "Work does not exceed active chainstate": a peer already advanced the
     /// chain past the snapshot — that's success, not error.
     Superseded,
+    /// Nothing was loaded: the engine refused the call (btx-cli's
+    /// `error code:` reply), or btx-cli could not be started.
     Failed(String),
+    /// btx-cli ran but brought back no answer from the engine: it could not
+    /// reach the node or lost the connection partway (libevent reports both
+    /// as "Could not connect to the server"), or it was killed. The engine
+    /// may have loaded the snapshot anyway.
+    NoAnswer(String),
 }
 
 fn load_outcome(success: bool, stderr: &str) -> LoadOutcome {
@@ -799,8 +808,14 @@ fn load_outcome(success: bool, stderr: &str) -> LoadOutcome {
         LoadOutcome::Loaded
     } else if stderr.contains("Work does not exceed active chainstate") {
         LoadOutcome::Superseded
-    } else {
+    } else if stderr.lines().any(|l| l.starts_with("error code: ")) {
+        // The engine's own answer: btx-cli prints a JSON-RPC error as
+        // "error code: <n>\nerror message:\n<text>" (v0.34.9
+        // `src/bitcoin-cli.cpp` ParseError), maybe after a warning line. A
+        // failed connection reads "error: Could not connect ...".
         LoadOutcome::Failed(stderr.trim().to_string())
+    } else {
+        LoadOutcome::NoAnswer(stderr.trim().to_string())
     }
 }
 
@@ -848,7 +863,8 @@ pub async fn run_cli_load(
     match result {
         Ok(Ok(out)) => load_outcome(out.status.success(), &String::from_utf8_lossy(&out.stderr)),
         Ok(Err(e)) => LoadOutcome::Failed(format!("could not spawn {}: {e}", btx_cli.display())),
-        Err(e) => LoadOutcome::Failed(format!("load task panicked: {e}")),
+        // The process may have run: nobody knows what the engine did.
+        Err(e) => LoadOutcome::NoAnswer(format!("load task panicked: {e}")),
     }
 }
 
@@ -891,14 +907,27 @@ mod tests {
             ),
             LoadOutcome::Superseded
         );
+        let refused = "error code: -8\nerror message:\nAttested UTXO snapshot manifest rejected: untrusted-signer\n";
         assert_eq!(
-            load_outcome(
-                false,
-                "Attested UTXO snapshot manifest rejected: untrusted-signer\n"
-            ),
-            LoadOutcome::Failed(
-                "Attested UTXO snapshot manifest rejected: untrusted-signer".into()
-            )
+            load_outcome(false, refused),
+            LoadOutcome::Failed(refused.trim().into())
+        );
+        let warned = format!("Warning: Config file not found\n{refused}");
+        assert!(matches!(
+            load_outcome(false, &warned),
+            LoadOutcome::Failed(_)
+        ));
+        // No answer from the engine: btx-cli could not reach it, or lost the
+        // connection partway (libevent reports both the same way), or was
+        // killed. The engine may have loaded it anyway.
+        let lost = "error: Could not connect to the server 127.0.0.1:19334 (error code 1 - \"EOF reached\")\n\nMake sure the btxd server is running";
+        assert_eq!(
+            load_outcome(false, lost),
+            LoadOutcome::NoAnswer(lost.trim().into())
+        );
+        assert_eq!(
+            load_outcome(false, ""),
+            LoadOutcome::NoAnswer(String::new())
         );
     }
 

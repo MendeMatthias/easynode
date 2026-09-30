@@ -8,8 +8,11 @@
 //! checks only what it pins and nothing else:
 //!
 //! 1. The pair on disk passes every check again: a confirmed pair
-//!    [`crate::confirmed_snapshot::check`] and its file's double SHA-256,
-//!    the pinned pair its compiled SHA-256s.
+//!    [`crate::confirmed_snapshot::check`], its height and its file's double
+//!    SHA-256, the pinned pair its compiled SHA-256s; and at least one of its
+//!    signatures is from a key the engine trusts (step 4's trim, worked out
+//!    here). Every refusal that needs no engine happens here, before any
+//!    side effect.
 //! 2. Every block the app refuses (`crate::known_invalid`) is refused now,
 //!    in order, as the fork check does every 30 seconds. The engine then
 //!    refuses a snapshot whose base sits above any of them (proven on regtest
@@ -27,13 +30,25 @@
 //!    reports trusting ([`node_view`]), not the keys it was meant to start
 //!    with.
 //! 5. `loadtxoutsetattested`, which the engine allows only in mirror mode.
+//!    The engine's own refusal (btx-cli's `error code:` reply) leaves the
+//!    chainstate untouched ([`LoadError::Engine`]). No answer at all (btx-cli
+//!    could not reach the node, lost the connection partway, was killed)
+//!    may still have loaded it: it counts only when the node then shows this
+//!    snapshot active, and goes on to step 6; otherwise
+//!    [`LoadError::EngineUnanswered`].
 //! 6. After the load, the block at each refused height must not be the
 //!    refused block. If it ever were, the caller stops the node and discards
 //!    the snapshot ([`set_aside_snapshot_chainstate`]). Fails closed: only a
 //!    block hash or the engine's "Block height out of range" is an answer;
-//!    anything else, or no answer, is [`LoadError::PostLoadCheckUnavailable`],
-//!    which callers treat exactly like [`LoadError::HeldRootOnChain`] (see
-//!    [`LoadError::restore_chain_data`]).
+//!    a question left unanswered is asked again a few times, then it is
+//!    [`LoadError::PostLoadCheckUnavailable`].
+//!
+//! [`LoadError::HeldRootOnChain`], [`LoadError::PostLoadCheckUnavailable`]
+//! and [`LoadError::EngineUnanswered`] all mean the engine may hold a
+//! snapshot the app refuses: callers treat the last two exactly like the
+//! first, stop the node and restore the chain data
+//! ([`LoadError::restore_chain_data`]). On every error after step 4 the
+//! previous start record goes back and the trimmed manifest is removed.
 //!
 //! Every [`LoadError`] is for the log: it can carry text from the manifest
 //! the website served or from the engine, so no caller shows it as is.
@@ -47,6 +62,7 @@ use crate::snapshot::LoadOutcome;
 use crate::snapshot_start::{self, StartRecord, StartSource};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Runs `loadtxoutsetattested`. The app's is [`CliRunner`]; tests script one.
 #[async_trait::async_trait]
@@ -152,19 +168,29 @@ pub enum LoadError {
         root: String,
         why: String,
     },
+    /// btx-cli brought back no answer to the load (it could not reach the
+    /// node, lost the connection partway or was killed), and the node does
+    /// not show the snapshot active afterwards: the engine may have loaded
+    /// it, or may still be loading it. Callers treat this exactly like
+    /// [`LoadError::HeldRootOnChain`]: stop the node and restore the chain
+    /// data ([`LoadError::restore_chain_data`]).
+    EngineUnanswered(String),
     Io(String),
 }
 
 impl LoadError {
     /// The engine loaded the snapshot and the app refuses the result: the
     /// caller stops the node and sets the snapshot chainstate aside
-    /// ([`set_aside_snapshot_chainstate`]). [`LoadError::HeldRootOnChain`]
-    /// and [`LoadError::PostLoadCheckUnavailable`], and nothing else: every
-    /// other error leaves the chainstate as it was.
+    /// ([`set_aside_snapshot_chainstate`]). [`LoadError::HeldRootOnChain`],
+    /// [`LoadError::PostLoadCheckUnavailable`] and
+    /// [`LoadError::EngineUnanswered`], and nothing else: every other error
+    /// leaves the chainstate as it was.
     pub fn restore_chain_data(&self) -> bool {
         matches!(
             self,
-            LoadError::HeldRootOnChain { .. } | LoadError::PostLoadCheckUnavailable { .. }
+            LoadError::HeldRootOnChain { .. }
+                | LoadError::PostLoadCheckUnavailable { .. }
+                | LoadError::EngineUnanswered(_)
         )
     }
 }
@@ -182,6 +208,10 @@ impl std::fmt::Display for LoadError {
             LoadError::PostLoadCheckUnavailable { height, root, why } => write!(
                 f,
                 "after the load, the node did not say which block it has at {height}, so the app cannot tell whether {root} is on its chain: {why}"
+            ),
+            LoadError::EngineUnanswered(e) => write!(
+                f,
+                "the engine gave no answer to the load and the node does not show the snapshot active, so the app cannot tell whether it loaded: {e}"
             ),
             LoadError::Io(e) => write!(f, "{e}"),
         }
@@ -255,8 +285,9 @@ pub fn trimmed_manifest_path(pair: &ReadyPair) -> PathBuf {
         .with_file_name(format!("loaded-{}.manifest", pair.height))
 }
 
-/// Section 7, step 1 again, against the node about to load: the manifest
-/// and what the start record will say about it.
+/// Section 7, step 1 again, against the node about to load: the trimmed
+/// manifest the engine will read, and what the start record will say. Every
+/// refusal that needs no engine happens here, before any side effect.
 fn recheck(
     pair: &ReadyPair,
     view: &NodeView,
@@ -276,11 +307,25 @@ fn recheck(
             "the node did not say which replay context it runs with".into(),
         ));
     }
+    // Section 7, step 4's trim, worked out now: a manifest with no signature
+    // the engine trusts is refused before anything is touched.
+    let trimmed = cs::trim_to_pinned(&m, &view.pinned);
+    if trimmed.signatures.is_empty() {
+        return Err(LoadError::NotConfirmed(
+            "no signature is from a key this node pins".into(),
+        ));
+    }
     let block_hash = m.statement.block_hash().display_hex();
     let start = match pair.kind {
         PairKind::Confirmed => {
             let confirmed = cs::check(&m, view, regtest_env)
                 .map_err(|e| LoadError::NotConfirmed(e.to_string()))?;
+            if confirmed.height != pair.height {
+                return Err(LoadError::NotConfirmed(format!(
+                    "the pair is kept as height {} but its statement is for height {}",
+                    pair.height, confirmed.height
+                )));
+            }
             let file =
                 std::fs::read(&pair.file).map_err(|e| LoadError::Io(format!("snapshot: {e}")))?;
             let mut h = cs::FileHasher::default();
@@ -322,7 +367,7 @@ fn recheck(
             }
         }
     };
-    Ok((m, start))
+    Ok((trimmed, start))
 }
 
 /// Section 7, steps 3 to 6. See the module doc. `datadir` is where the start
@@ -336,7 +381,7 @@ pub async fn load(
     regtest_env: Option<&str>,
     datadir: &Path,
 ) -> Result<Loaded, LoadError> {
-    let (m, start) = recheck(pair, view, regtest_env)?;
+    let (trimmed, start) = recheck(pair, view, regtest_env)?;
     refuse_holds(rpc, holds).await?;
 
     // Step 4: who confirmed it, before the trimmed manifest drops their
@@ -347,7 +392,7 @@ pub async fn load(
             snapshot_start::path(datadir).display()
         ))
     })?;
-    let result = trim_and_load(rpc, runner, pair, view, holds, &m).await;
+    let result = write_and_load(rpc, runner, pair, holds, &trimmed).await;
     if !matches!(
         result,
         Ok(Loaded {
@@ -360,57 +405,130 @@ pub async fn load(
     result
 }
 
-/// Steps 4 to 6 after the record: trim, load, and look for a refused block.
-async fn trim_and_load(
+/// Steps 4 to 6 after the record: write the trimmed manifest, load, and look
+/// for a refused block. The trimmed manifest goes again on any error.
+async fn write_and_load(
     rpc: &dyn Rpc,
     runner: &dyn LoadRunner,
     pair: &ReadyPair,
-    view: &NodeView,
     holds: &Holds<'_>,
-    m: &cs::Manifest,
+    trimmed: &cs::Manifest,
 ) -> Result<Loaded, LoadError> {
-    let trimmed = cs::trim_to_pinned(m, &view.pinned);
-    if trimmed.signatures.is_empty() {
-        return Err(LoadError::NotConfirmed(
-            "no signature is from a key this node pins".into(),
-        ));
-    }
     let path = trimmed_manifest_path(pair);
     crate::fsx::atomic_write(&path, &trimmed.to_bytes())
         .map_err(|e| LoadError::Io(format!("write {}: {e}", path.display())))?;
+    let result = load_and_check(rpc, runner, pair, holds, trimmed, &path).await;
+    if result.is_err() {
+        let _ = std::fs::remove_file(&path);
+    }
+    result
+}
 
-    let superseded = match runner.load_attested(&pair.file, &path).await {
+async fn load_and_check(
+    rpc: &dyn Rpc,
+    runner: &dyn LoadRunner,
+    pair: &ReadyPair,
+    holds: &Holds<'_>,
+    trimmed: &cs::Manifest,
+    path: &Path,
+) -> Result<Loaded, LoadError> {
+    let superseded = match runner.load_attested(&pair.file, path).await {
         LoadOutcome::Loaded => false,
         LoadOutcome::Superseded => true,
         LoadOutcome::Failed(e) => return Err(LoadError::Engine(e)),
-    };
-
-    for (height, root) in holds.roots() {
-        let unavailable = |why: String| LoadError::PostLoadCheckUnavailable {
-            height,
-            root: root.to_string(),
-            why,
-        };
-        match rpc.call("getblockhash", json!([height])).await {
-            Ok(v) => match v.as_str() {
-                Some(at) if at.eq_ignore_ascii_case(root) => {
-                    return Err(LoadError::HeldRootOnChain {
-                        height,
-                        root: root.to_string(),
-                    })
-                }
-                Some(at) if at.len() == 64 && at.bytes().all(|b| b.is_ascii_hexdigit()) => {}
-                _ => return Err(unavailable(format!("the answer {v} is not a block hash"))),
-            },
-            Err(e) if is_height_out_of_range(&e) => {}
-            Err(e) => return Err(unavailable(e.to_string())),
+        // The engine may have loaded it anyway. It counts only if the node
+        // shows this very snapshot active, and then goes through step 6.
+        LoadOutcome::NoAnswer(e) => {
+            let base = trimmed.statement.block_hash().display_hex();
+            if !snapshot_active(rpc, &base).await {
+                return Err(LoadError::EngineUnanswered(e));
+            }
+            false
         }
-    }
+    };
+    check_holds_after_load(rpc, holds).await?;
     Ok(Loaded {
         height: pair.height,
         signatures: trimmed.signatures.len(),
         superseded,
     })
+}
+
+/// How many times a question after the load is asked before the app gives
+/// up on an answer, and the pause between: one RPC error right after a good
+/// load must not discard it.
+const POST_LOAD_ATTEMPTS: u32 = 3;
+const POST_LOAD_PAUSE: Duration = if cfg!(test) {
+    Duration::from_millis(1)
+} else {
+    Duration::from_secs(2)
+};
+
+/// Section 7, step 6: the block at each refused height is not the refused
+/// block. A question the node leaves unanswered is asked again, up to
+/// [`POST_LOAD_ATTEMPTS`] times; then [`LoadError::PostLoadCheckUnavailable`].
+async fn check_holds_after_load(rpc: &dyn Rpc, holds: &Holds<'_>) -> Result<(), LoadError> {
+    for (height, root) in holds.roots() {
+        let mut attempt = 1;
+        loop {
+            match block_at(rpc, height).await {
+                Ok(Some(at)) if at.eq_ignore_ascii_case(root) => {
+                    return Err(LoadError::HeldRootOnChain {
+                        height,
+                        root: root.to_string(),
+                    })
+                }
+                Ok(_) => break,
+                Err(_) if attempt < POST_LOAD_ATTEMPTS => {
+                    attempt += 1;
+                    tokio::time::sleep(POST_LOAD_PAUSE).await;
+                }
+                Err(why) => {
+                    return Err(LoadError::PostLoadCheckUnavailable {
+                        height,
+                        root: root.to_string(),
+                        why,
+                    })
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The block the node's active chain has at `height`: `Some(hash)`, `None`
+/// when the chain does not reach it (the engine's "Block height out of
+/// range"), or why the node did not say.
+async fn block_at(rpc: &dyn Rpc, height: u64) -> Result<Option<String>, String> {
+    match rpc.call("getblockhash", json!([height])).await {
+        Ok(Value::String(at)) if at.len() == 64 && at.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            Ok(Some(at))
+        }
+        Ok(v) => Err(format!("the answer {v} is not a block hash")),
+        Err(e) if is_height_out_of_range(&e) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// After a load btx-cli brought back no answer for: whether the node shows
+/// the snapshot based on `base` as one of its chainstates. Asked up to
+/// [`POST_LOAD_ATTEMPTS`] times, since the load may still be finishing.
+async fn snapshot_active(rpc: &dyn Rpc, base: &str) -> bool {
+    for attempt in 1..=POST_LOAD_ATTEMPTS {
+        if let Ok(states) = crate::node_api::get_chainstates(rpc).await {
+            let active = states
+                .snapshot()
+                .and_then(|c| c.snapshot_blockhash.as_deref())
+                .is_some_and(|h| h.eq_ignore_ascii_case(base));
+            if active {
+                return true;
+            }
+        }
+        if attempt < POST_LOAD_ATTEMPTS {
+            tokio::time::sleep(POST_LOAD_PAUSE).await;
+        }
+    }
+    false
 }
 
 /// Section 7, step 3: refuse every block the app refuses, invalid blocks
@@ -478,13 +596,17 @@ mod tests {
     use crate::error::{AppError, AppResult};
     use serde_json::Value;
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     const R_PC: &[u8] = include_bytes!("../tests/fixtures/confirmed_snapshot/regtest-PC.manifest");
     const R_PCD: &[u8] =
         include_bytes!("../tests/fixtures/confirmed_snapshot/regtest-PCD.manifest");
     const R_P: &[u8] = include_bytes!("../tests/fixtures/confirmed_snapshot/regtest-P.manifest");
     const R_DAT: &[u8] = include_bytes!("../tests/fixtures/confirmed_snapshot/regtest-100.dat");
+    /// The published 225,927 manifest: the pinned pair's, signed by the 3060.
+    const PINNED_MANIFEST: &[u8] =
+        include_bytes!("../tests/fixtures/confirmed_snapshot/mainnet-225927.manifest");
+    const THE_3060: &str = "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675";
     const P: &str = "0343faebbc3a28f2e452132477192cb5455f0c0f2cfdab01c9217c43c2cbc3e464";
     const C: &str = "02c05d68daeabe9e5f0556fcdca6c5a4011eca1d46ee34826d444d1d95b15e6c0f";
     /// The regtest statements' base block, display order.
@@ -513,7 +635,12 @@ mod tests {
         off_chain: Option<(i64, &'static str)>,
         /// An error getblockheader answers instead of the usual.
         header_error: Option<(i64, &'static str)>,
-        calls: Mutex<Vec<String>>,
+        /// The `snapshot_blockhash` getchainstates reports, if any.
+        snapshot_base: Option<&'static str>,
+        /// getblockhash above 0 goes unanswered this many times first.
+        hash_failures: Mutex<u32>,
+        /// Every call, shared with the [`Runner`] so the load is in sequence.
+        calls: Arc<Mutex<Vec<String>>>,
     }
 
     impl Node {
@@ -528,11 +655,16 @@ mod tests {
                 silent: Vec::new(),
                 off_chain: Some((-8, "Block height out of range")),
                 header_error: None,
-                calls: Mutex::new(Vec::new()),
+                snapshot_base: None,
+                hash_failures: Mutex::new(0),
+                calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
         fn methods(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+        fn count(&self, method: &str) -> usize {
+            self.methods().iter().filter(|m| *m == method).count()
         }
     }
 
@@ -552,6 +684,13 @@ mod tests {
                     let h = params[0].as_u64().unwrap_or(u64::MAX);
                     if h == 0 {
                         return Ok(json!(self.genesis));
+                    }
+                    {
+                        let mut left = self.hash_failures.lock().unwrap();
+                        if *left > 0 {
+                            *left -= 1;
+                            return Err(AppError::Http("connection reset".into()));
+                        }
                     }
                     match (self.chain.get(&h), self.off_chain) {
                         (Some(s), _) => Ok(json!(s)),
@@ -587,15 +726,31 @@ mod tests {
                     message: "request timed out".into(),
                 }),
                 "invalidateblock" => Ok(Value::Null),
+                "getchainstates" => {
+                    let mut states = vec![json!({"blocks": 40, "validated": true})];
+                    if let Some(base) = self.snapshot_base {
+                        states.push(json!({
+                            "blocks": 100,
+                            "snapshot_blockhash": base,
+                            "validated": false,
+                        }));
+                    }
+                    Ok(json!({"headers": 100, "chainstates": states}))
+                }
                 other => panic!("the loader must never call {other}"),
             }
         }
     }
 
-    /// Records the manifest it was handed and answers as told.
+    /// Records the manifest it was handed and answers as told. Built
+    /// [`Runner::watching`] a node and a datadir, it also puts the load in
+    /// the node's call log and notes the start record on disk at that moment.
     struct Runner {
         answer: LoadOutcome,
         seen: Mutex<Option<Vec<u8>>>,
+        dir: Option<PathBuf>,
+        record_then: Mutex<Option<Option<StartRecord>>>,
+        log: Option<Arc<Mutex<Vec<String>>>>,
     }
 
     impl Runner {
@@ -603,15 +758,48 @@ mod tests {
             Self {
                 answer,
                 seen: Mutex::new(None),
+                dir: None,
+                record_then: Mutex::new(None),
+                log: None,
             }
+        }
+        fn watching(answer: LoadOutcome, node: &Node, dir: &Path) -> Self {
+            Self {
+                dir: Some(dir.to_path_buf()),
+                log: Some(node.calls.clone()),
+                ..Self::new(answer)
+            }
+        }
+        /// The start record as it stood when the engine was asked.
+        fn record_then(&self) -> Option<StartRecord> {
+            self.record_then
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the engine was asked")
         }
     }
 
     #[async_trait::async_trait]
     impl LoadRunner for Runner {
         async fn load_attested(&self, _file: &Path, manifest: &Path) -> LoadOutcome {
+            if let Some(log) = &self.log {
+                log.lock().unwrap().push("loadtxoutsetattested".into());
+            }
+            if let Some(dir) = &self.dir {
+                *self.record_then.lock().unwrap() = Some(snapshot_start::read(dir));
+            }
             *self.seen.lock().unwrap() = Some(std::fs::read(manifest).unwrap());
             self.answer.clone()
+        }
+    }
+
+    fn confirmed_record(operators: &[&str]) -> StartRecord {
+        StartRecord {
+            height: 100,
+            block_hash: BASE_100.into(),
+            source: StartSource::Confirmed,
+            operators: operators.iter().map(|n| n.to_string()).collect(),
         }
     }
 
@@ -641,7 +829,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let pair = pair_on_disk(tmp.path(), R_PCD, R_DAT);
         let node = Node::regtest();
-        let runner = Runner::new(LoadOutcome::Loaded);
+        let runner = Runner::watching(LoadOutcome::Loaded, &node, tmp.path());
         let got = load(
             &node,
             &runner,
@@ -669,24 +857,23 @@ mod tests {
             Some(R_P),
             "the engine saw the producer's own file, byte for byte"
         );
+        // Refused before the load, checked after it.
         let calls = node.methods();
-        let invalidate = calls.iter().position(|m| m == "invalidateblock").unwrap();
+        let at = |m: &str| calls.iter().position(|c| c == m).unwrap();
+        let checked = calls.iter().rposition(|c| c == "getblockhash").unwrap();
         assert!(
-            invalidate < calls.len() - 1,
-            "refused before the load: {calls:?}"
+            at("getblockheader") < at("invalidateblock")
+                && at("invalidateblock") < at("loadtxoutsetattested")
+                && at("loadtxoutsetattested") < checked,
+            "{calls:?}"
         );
         // Section 7, step 4: the names survive the trim. Only verified
         // signers on the list count (D signed too and is on no list), in the
-        // list's order.
-        assert_eq!(
-            snapshot_start::read(tmp.path()),
-            Some(StartRecord {
-                height: 100,
-                block_hash: BASE_100.into(),
-                source: StartSource::Confirmed,
-                operators: vec!["producer".into(), "confirmer".into()],
-            })
-        );
+        // list's order. On disk before the engine is asked, and after.
+        let record = confirmed_record(&["producer", "confirmer"]);
+        assert_eq!(runner.record_then(), Some(record.clone()));
+        assert_eq!(snapshot_start::read(tmp.path()), Some(record));
+        assert!(trimmed_manifest_path(&pair).is_file(), "kept for the sweep");
     }
 
     #[tokio::test]
@@ -814,7 +1001,7 @@ mod tests {
         };
         snapshot_start::write(tmp.path(), &earlier).unwrap();
         let node = Node::regtest();
-        let runner = Runner::new(LoadOutcome::Failed("no".into()));
+        let runner = Runner::watching(LoadOutcome::Failed("no".into()), &node, tmp.path());
         let err = load(
             &node,
             &runner,
@@ -827,9 +1014,10 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err, LoadError::Engine("no".into()));
-        assert!(
-            runner.seen.lock().unwrap().is_some(),
-            "the engine was asked"
+        assert_eq!(
+            runner.record_then(),
+            Some(confirmed_record(&["producer", "confirmer"])),
+            "written before the engine was asked"
         );
         assert_eq!(snapshot_start::read(tmp.path()), Some(earlier));
     }
@@ -1179,6 +1367,275 @@ mod tests {
                 "{what}"
             );
         }
+    }
+
+    fn held() -> Holds<'static> {
+        Holds {
+            invalid: &[],
+            held: HELD,
+        }
+    }
+
+    fn no_answer() -> LoadOutcome {
+        LoadOutcome::NoAnswer("error: Could not connect to the server 127.0.0.1:19443".into())
+    }
+
+    /// btx-cli brought back no answer, so the engine may have loaded it
+    /// anyway. It counts only when the node shows this very snapshot active
+    /// and the check after the load passes; a refused block on the chain, or
+    /// a check with no answer, restores the chain data as after any load.
+    #[tokio::test]
+    async fn a_load_with_no_answer_counts_only_when_the_node_shows_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pair = pair_on_disk(tmp.path(), R_PC, R_DAT);
+        let mut node = Node::regtest();
+        node.snapshot_base = Some(BASE_100);
+        let v = view(&node).await;
+        let runner = Runner::new(no_answer());
+        let got = load(&node, &runner, &pair, &v, &held(), Some(&env()), tmp.path()).await;
+        assert_eq!(
+            got,
+            Ok(Loaded {
+                height: 100,
+                signatures: 1,
+                superseded: false
+            })
+        );
+        assert!(node.count("getchainstates") >= 1, "asked the node");
+        assert_eq!(
+            snapshot_start::read(tmp.path()),
+            Some(confirmed_record(&["producer", "confirmer"]))
+        );
+
+        let mut on_chain = Node::regtest();
+        on_chain.snapshot_base = Some(BASE_100);
+        on_chain.chain.insert(50, ROOT.into());
+        let mut unanswered = Node::regtest();
+        unanswered.snapshot_base = Some(BASE_100);
+        unanswered.off_chain = Some((-1, "request timed out"));
+        for (what, node) in [("on the chain", on_chain), ("unanswered", unanswered)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let pair = pair_on_disk(tmp.path(), R_PC, R_DAT);
+            let v = view(&node).await;
+            let runner = Runner::new(no_answer());
+            let err = load(&node, &runner, &pair, &v, &held(), Some(&env()), tmp.path())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    LoadError::HeldRootOnChain { .. } | LoadError::PostLoadCheckUnavailable { .. }
+                ),
+                "{what}: {err}"
+            );
+            assert!(err.restore_chain_data(), "{what}");
+            assert_eq!(snapshot_start::read(tmp.path()), None, "{what}");
+        }
+    }
+
+    /// No answer from the load, and the node does not show this snapshot
+    /// active (or does not answer): nobody can say whether it loaded, so the
+    /// chain data is restored.
+    #[tokio::test]
+    async fn a_load_nobody_can_account_for_restores_the_chain_data() {
+        let mut not_active = Node::regtest();
+        not_active.snapshot_base = None;
+        let mut another = Node::regtest();
+        another.snapshot_base = Some(ROOT);
+        let mut quiet = Node::regtest();
+        quiet.silent = vec!["getchainstates"];
+        for (what, node) in [
+            ("not active", not_active),
+            ("another base", another),
+            ("no answer", quiet),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let pair = pair_on_disk(tmp.path(), R_PC, R_DAT);
+            let earlier = StartRecord {
+                source: StartSource::Pinned,
+                operators: vec![],
+                ..confirmed_record(&[])
+            };
+            snapshot_start::write(tmp.path(), &earlier).unwrap();
+            let v = view(&node).await;
+            let runner = Runner::new(no_answer());
+            let err = load(&node, &runner, &pair, &v, &held(), Some(&env()), tmp.path())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, LoadError::EngineUnanswered(_)),
+                "{what}: {err}"
+            );
+            assert!(err.restore_chain_data(), "{what}");
+            assert_eq!(snapshot_start::read(tmp.path()), Some(earlier), "{what}");
+            assert!(!trimmed_manifest_path(&pair).exists(), "{what}");
+        }
+    }
+
+    /// One RPC error right after a good load does not discard it: the check
+    /// is asked again, up to [`POST_LOAD_ATTEMPTS`] times, then fails closed.
+    #[tokio::test]
+    async fn an_unanswered_check_after_a_good_load_is_asked_again() {
+        // (unanswered first, loaded, times the height was asked)
+        for (failures, loads, asked) in [(1, true, 2), (2, true, 3), (3, false, 3)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let pair = pair_on_disk(tmp.path(), R_PC, R_DAT);
+            let node = Node::regtest();
+            let v = view(&node).await;
+            *node.hash_failures.lock().unwrap() = failures;
+            let runner = Runner::new(LoadOutcome::Loaded);
+            let got = load(&node, &runner, &pair, &v, &held(), Some(&env()), tmp.path()).await;
+            // Less the view's getblockhash 0.
+            assert_eq!(node.count("getblockhash") - 1, asked, "{failures}");
+            if loads {
+                assert!(got.is_ok(), "{failures}: {got:?}");
+            } else {
+                assert!(
+                    matches!(got, Err(LoadError::PostLoadCheckUnavailable { .. })),
+                    "{failures}: then it fails closed: {got:?}"
+                );
+            }
+        }
+    }
+
+    /// `loaded-<h>.manifest` stays only beside a load that counts.
+    #[tokio::test]
+    async fn the_trimmed_manifest_goes_when_the_load_does_not_count() {
+        let refused = (
+            Node::regtest(),
+            LoadOutcome::Failed("error code: -32603".into()),
+        );
+        let mut on_chain = Node::regtest();
+        on_chain.chain.insert(50, ROOT.into());
+        let mut unanswered = Node::regtest();
+        unanswered.off_chain = None;
+        for (what, (node, answer)) in [
+            ("refused", refused),
+            ("held root", (on_chain, LoadOutcome::Loaded)),
+            ("check unanswered", (unanswered, LoadOutcome::Loaded)),
+            ("load unanswered", (Node::regtest(), no_answer())),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let pair = pair_on_disk(tmp.path(), R_PC, R_DAT);
+            let v = view(&node).await;
+            let runner = Runner::new(answer);
+            let got = load(&node, &runner, &pair, &v, &held(), Some(&env()), tmp.path()).await;
+            assert!(got.is_err(), "{what}: {got:?}");
+            assert!(
+                runner.seen.lock().unwrap().is_some(),
+                "{what}: it was written"
+            );
+            assert!(!trimmed_manifest_path(&pair).exists(), "{what}");
+        }
+    }
+
+    /// Every refusal that needs no engine comes before any side effect: a
+    /// pinned pair none of whose signers the engine trusts touches no hold,
+    /// writes no record and no trimmed manifest.
+    #[tokio::test]
+    async fn a_pinned_pair_with_no_pin_the_engine_trusts_is_refused_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pin = attested_snapshot::pinned_pair();
+        let (file, manifest) = attested_snapshot::pair_paths(tmp.path(), pin.height);
+        std::fs::create_dir_all(attested_snapshot::pair_dir(tmp.path())).unwrap();
+        std::fs::write(&file, b"not the pinned file").unwrap();
+        std::fs::write(&manifest, PINNED_MANIFEST).unwrap();
+        let pair = ReadyPair {
+            kind: PairKind::Pinned,
+            height: pin.height,
+            file,
+            manifest,
+        };
+        let mut node = Node::regtest();
+        node.trusted = vec![];
+        let v = node_view(&node, &[THE_3060], 0).await;
+        let runner = Runner::new(LoadOutcome::Loaded);
+        let err = load(&node, &runner, &pair, &v, &held(), None, tmp.path())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, LoadError::NotConfirmed(e) if e.contains("pins")),
+            "{err}"
+        );
+        assert_eq!(node.count("getblockheader"), 0, "no hold was touched");
+        assert!(runner.seen.lock().unwrap().is_none());
+        assert_eq!(snapshot_start::read(tmp.path()), None);
+        assert!(!trimmed_manifest_path(&pair).exists());
+        // With the 3060 trusted, the same pair gets as far as its file.
+        node.trusted = vec![THE_3060];
+        let v = node_view(&node, &[THE_3060], 0).await;
+        let err = load(&node, &runner, &pair, &v, &held(), None, tmp.path())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("compiled into the app"), "{err}");
+    }
+
+    /// "Work does not exceed active chainstate": counted as loaded, and the
+    /// record goes back to what it was, since this snapshot is not where the
+    /// node's chain started.
+    #[tokio::test]
+    async fn a_superseded_load_counts_and_puts_the_record_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pair = pair_on_disk(tmp.path(), R_PC, R_DAT);
+        let earlier = StartRecord {
+            height: 228_000,
+            block_hash: ROOT.into(),
+            source: StartSource::Engine,
+            operators: vec![],
+        };
+        snapshot_start::write(tmp.path(), &earlier).unwrap();
+        let node = Node::regtest();
+        let runner = Runner::watching(LoadOutcome::Superseded, &node, tmp.path());
+        let got = load(
+            &node,
+            &runner,
+            &pair,
+            &view(&node).await,
+            &held(),
+            Some(&env()),
+            tmp.path(),
+        )
+        .await;
+        assert_eq!(
+            got,
+            Ok(Loaded {
+                height: 100,
+                signatures: 1,
+                superseded: true
+            })
+        );
+        assert_eq!(
+            runner.record_then(),
+            Some(confirmed_record(&["producer", "confirmer"]))
+        );
+        assert_eq!(snapshot_start::read(tmp.path()), Some(earlier));
+    }
+
+    #[tokio::test]
+    async fn a_pair_whose_height_is_not_its_statements_is_not_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut pair = pair_on_disk(tmp.path(), R_PC, R_DAT);
+        pair.height = 200;
+        let node = Node::regtest();
+        let runner = Runner::new(LoadOutcome::Loaded);
+        let err = load(
+            &node,
+            &runner,
+            &pair,
+            &view(&node).await,
+            &held(),
+            Some(&env()),
+            tmp.path(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, LoadError::NotConfirmed(e) if e.contains("height")),
+            "{err}"
+        );
+        assert!(runner.seen.lock().unwrap().is_none());
+        assert_eq!(node.count("getblockheader"), 0);
+        assert_eq!(snapshot_start::read(tmp.path()), None);
     }
 
     #[test]
