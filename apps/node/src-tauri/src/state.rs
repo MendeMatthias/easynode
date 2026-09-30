@@ -489,6 +489,12 @@ impl NodeAppSettings {
 /// `btx_core::snapshot::SnapshotFlags` backed by this app's settings file.
 pub struct NodeAppSnapshotFlags {
     pub datadir: PathBuf,
+    /// The run a start's load task belongs to: the app's run generation
+    /// (`AppState::refresher_gen`) and its value for that start. A Stop or
+    /// another Start moves it, and the task then loads nothing
+    /// (`btx_core::snapshot::SnapshotFlags::current`). `None`: no run to
+    /// outlive.
+    pub run: Option<(Arc<AtomicU64>, u64)>,
 }
 
 impl btx_core::snapshot::SnapshotFlags for NodeAppSnapshotFlags {
@@ -497,6 +503,11 @@ impl btx_core::snapshot::SnapshotFlags for NodeAppSnapshotFlags {
     }
     fn mark_loaded(&self) {
         NodeAppSettings::update(&self.datadir, |s| s.snapshot_loaded = true);
+    }
+    fn current(&self) -> bool {
+        self.run.as_ref().is_none_or(|(gen, this_run)| {
+            gen.load(std::sync::atomic::Ordering::SeqCst) == *this_run
+        })
     }
 }
 
@@ -1134,13 +1145,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let flags = NodeAppSnapshotFlags {
             datadir: dir.path().to_path_buf(),
+            run: None,
         };
+        assert!(flags.current(), "no run to outlive");
         assert!(!flags.loaded());
         flags.mark_loaded();
         assert!(flags.loaded());
         // And it landed in THIS app's file, not the miner's easybtx-state.json.
         assert!(dir.path().join(SETTINGS_FILE_NAME).exists());
         assert!(!dir.path().join("easybtx-state.json").exists());
+    }
+
+    /// Final review M9: the flags a start hands its load task say whether
+    /// that start's run is still the current one: a Stop or another Start
+    /// moves the run's generation, and the task then loads nothing.
+    #[test]
+    fn snapshot_flags_know_whether_their_run_is_current() {
+        use btx_core::snapshot::SnapshotFlags;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let gen = Arc::new(AtomicU64::new(7));
+        let flags = NodeAppSnapshotFlags {
+            datadir: dir.path().to_path_buf(),
+            run: Some((gen.clone(), 7)),
+        };
+        assert!(flags.current());
+        gen.fetch_add(1, Ordering::SeqCst);
+        assert!(!flags.current());
     }
 
     #[test]

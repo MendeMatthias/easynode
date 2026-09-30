@@ -1288,6 +1288,16 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
             !signer_applies_here,
             SIGNED_LOAD_FAILED.load(Ordering::SeqCst),
         );
+        load_watch = Some((signed, mirror_load_launch));
+    }
+
+    set_phase(app, state, NodePhase::LoadingSnapshot).await;
+    spawn_status_refresher(app.clone(), state, bootstrap_launch);
+    if let Some((signed, mirror_load_launch)) = load_watch {
+        // This run's generation: a stop or restart moves it, and then the
+        // outcome is no longer this run's to act on, and a load the task has
+        // not yet begun is not made at all.
+        let gen = state.refresher_gen.load(Ordering::SeqCst);
         let handle = btx_core::snapshot::ensure_snapshot_loaded_with(
             rpc.clone(),
             paths.btx_cli.clone(),
@@ -1295,18 +1305,10 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
             spec.anchor_height,
             Arc::new(NodeAppSnapshotFlags {
                 datadir: datadir.clone(),
+                run: Some((state.refresher_gen.clone(), gen)),
             }),
             signed,
         );
-        load_watch = Some((handle, mirror_load_launch));
-    }
-
-    set_phase(app, state, NodePhase::LoadingSnapshot).await;
-    spawn_status_refresher(app.clone(), state, bootstrap_launch);
-    if let Some((handle, mirror_load_launch)) = load_watch {
-        // This run's generation: a stop or restart moves it, and then the
-        // outcome is no longer this run's to act on.
-        let gen = state.refresher_gen.load(Ordering::SeqCst);
         spawn_load_watch(app.clone(), handle, gen, mirror_load_launch);
     }
     // Esplora mode, if chosen: electrs and the front start beside the node.
@@ -4476,13 +4478,19 @@ fn set_aside_waits(plan: AfterLoad, superseded: bool) -> bool {
 /// Does this outcome end signed loads for this run ([`SIGNED_LOAD_FAILED`])?
 /// A mirror launch that loaded nothing, and a signed load the app refuses on
 /// any launch. Not a compiled load the app refuses: that was no signed load.
+/// Not a mirror launch that a stop or another start got to first
+/// (`superseded`) and that loaded nothing: the stop ended it, not the pair,
+/// and the next start resumes it.
 fn signed_load_failed(
     mirror_load_launch: bool,
     outcome: &btx_core::snapshot::SnapshotOutcome,
+    superseded: bool,
 ) -> bool {
     use btx_core::snapshot::SnapshotOutcome as O;
     matches!(outcome, O::HeldRootOnChain(_))
-        || (mirror_load_launch && !matches!(outcome, O::SignedLoaded { .. } | O::AlreadyLoaded))
+        || (mirror_load_launch
+            && !superseded
+            && !matches!(outcome, O::SignedLoaded { .. } | O::AlreadyLoaded))
 }
 
 /// Wait for a background load and act on it ([`after_snapshot_load`]). A
@@ -4526,12 +4534,12 @@ async fn after_snapshot_load(
     outcome: btx_core::snapshot::SnapshotOutcome,
 ) -> Result<(), String> {
     let datadir = node_datadir();
-    if signed_load_failed(mirror_load_launch, &outcome) {
-        SIGNED_LOAD_FAILED.store(true, Ordering::SeqCst);
-    }
     let superseded = state.refresher_gen.load(Ordering::SeqCst) != gen
         || state.rpc.lock().await.is_none()
         || state.quitting.load(Ordering::SeqCst);
+    if signed_load_failed(mirror_load_launch, &outcome, superseded) {
+        SIGNED_LOAD_FAILED.store(true, Ordering::SeqCst);
+    }
     settle_first_load(&datadir, mirror_load_launch, &outcome, superseded);
     if !mirror_load_launch
         && !superseded
@@ -6612,8 +6620,8 @@ mod signed_start_tests {
             after_load_plan(false, &compiled_held(), false, true),
             after_load_plan(false, &held(), false, true)
         );
-        assert!(signed_load_failed(false, &held()));
-        assert!(!signed_load_failed(false, &compiled_held()));
+        assert!(signed_load_failed(false, &held(), false));
+        assert!(!signed_load_failed(false, &compiled_held(), false));
         for next in [
             AfterRefusal::RestartNow,
             AfterRefusal::KeepRunning,
@@ -6657,8 +6665,8 @@ mod signed_start_tests {
                 AfterLoad::Restart { set_aside: true }
             );
             assert_eq!(
-                signed_load_failed(mirror_load_launch, &unavailable),
-                signed_load_failed(mirror_load_launch, &held())
+                signed_load_failed(mirror_load_launch, &unavailable, false),
+                signed_load_failed(mirror_load_launch, &held(), false)
             );
         }
         let dir = fresh_validating_datadir();
@@ -6707,7 +6715,11 @@ mod signed_start_tests {
                     "{outcome:?}"
                 );
             }
-            assert_eq!(signed_load_failed(true, &outcome), failed, "{outcome:?}");
+            assert_eq!(
+                signed_load_failed(true, &outcome, false),
+                failed,
+                "{outcome:?}"
+            );
         }
         // An ordinary launch acts only on what it must set aside.
         for outcome in [
@@ -6720,7 +6732,7 @@ mod signed_start_tests {
                 after_load_plan(false, &outcome, false, true),
                 AfterLoad::Nothing
             );
-            assert!(!signed_load_failed(false, &outcome), "{outcome:?}");
+            assert!(!signed_load_failed(false, &outcome, false), "{outcome:?}");
         }
     }
 
@@ -7384,6 +7396,20 @@ mod signed_start_tests {
         ] {
             assert!(after.find(call).unwrap() < stop, "{call}");
         }
+    }
+
+    /// Final review M9: a load task from a stopped run (a Stop and a Start
+    /// inside its header wait) that loaded nothing does not end signed loads
+    /// for the run: the stop ended it, not the pair. A refused signed load
+    /// still does, stopped or not.
+    #[test]
+    fn a_stopped_runs_empty_load_does_not_end_signed_loads() {
+        let none = SnapshotOutcome::NotLoaded("the run that began this load has stopped".into());
+        assert!(signed_load_failed(true, &none, false));
+        assert!(!signed_load_failed(true, &none, true));
+        assert!(signed_load_failed(true, &held(), true));
+        assert!(signed_load_failed(false, &held(), true));
+        assert!(!signed_load_failed(false, &none, false));
     }
 
     /// Final review M2: a fresh chain whose ordinary launches loaded

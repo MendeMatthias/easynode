@@ -568,7 +568,19 @@ pub fn track_header_progress(progress: u64, last_seen: u64, stalled_polls: u32) 
 pub trait SnapshotFlags: Send + Sync + 'static {
     fn loaded(&self) -> bool;
     fn mark_loaded(&self);
+    /// Is the run that began this load still the one the node runs under? A
+    /// load task outlives a Stop and a Start (its header wait can run ten
+    /// minutes), and one from a stopped run must not load beside the new
+    /// run's. Asked just before each load; `false` loads nothing
+    /// ([`STALE_RUN`]). A caller with no run to outlive keeps the default.
+    fn current(&self) -> bool {
+        true
+    }
 }
+
+/// Why a load task loaded nothing when its run had stopped
+/// ([`SnapshotFlags::current`]). For the log.
+pub const STALE_RUN: &str = "the run that began this load has stopped";
 
 /// Guarantee the assumeutxo snapshot actually gets loaded — on ANY startup path.
 ///
@@ -672,6 +684,7 @@ async fn load_signed(
     btx_cli: &Path,
     datadir: &Path,
     anchor_height: u64,
+    flags: &dyn SnapshotFlags,
 ) -> Signed {
     use crate::confirmed_load::{self, CliRunner, Holds};
     let start = crate::attested_snapshot::fallback_start(anchor_height);
@@ -695,6 +708,9 @@ async fn load_signed(
     if matches!(get_chainstates(rpc).await, Ok(cs) if cs.snapshot().is_some()) {
         return Signed::AlreadyLoaded;
     }
+    if !flags.current() {
+        return Signed::NotLoaded(STALE_RUN.into());
+    }
     eprintln!(
         "[snapshot] headers at {}; loading the signed snapshot (loadtxoutsetattested)",
         pair.height
@@ -707,8 +723,14 @@ async fn load_signed(
         confirmed_load::load(rpc, runner, &pair, view, holds, env, datadir).await
     };
     // The pinned pair's base is below the confirmed one's, so the headers
-    // waited for above already reach it.
-    let pinned = || crate::attested_snapshot::prepare_pinned(datadir, anchor_height);
+    // waited for above already reach it. Not for a run that has stopped.
+    let pinned = || async move {
+        if flags.current() {
+            crate::attested_snapshot::prepare_pinned(datadir, anchor_height).await
+        } else {
+            None
+        }
+    };
     signed_from(load_in_order(pair, load, pinned).await)
 }
 
@@ -995,7 +1017,7 @@ pub fn ensure_snapshot_loaded_with(
         }
 
         if signed != SignedLoad::None {
-            let mut got = load_signed(&rpc, &btx_cli, &datadir, anchor_height).await;
+            let mut got = load_signed(&rpc, &btx_cli, &datadir, anchor_height, &*flags).await;
             if signed == SignedLoad::SignedOnly && matches!(got, Signed::AlreadyLoaded) {
                 got = vouch_for_found(&rpc, &crate::confirmed_load::Holds::compiled()).await;
             }
@@ -1025,6 +1047,9 @@ pub fn ensure_snapshot_loaded_with(
             return SnapshotOutcome::AlreadyLoaded;
         }
 
+        if !flags.current() {
+            return SnapshotOutcome::NotLoaded(STALE_RUN.into());
+        }
         eprintln!("[snapshot] headers at anchor, no snapshot chainstate yet; running loadtxoutset");
         let outcome = run_load(&btx_cli, &datadir, "loadtxoutset", &[&snapshot_path]).await;
         after_compiled_load(
@@ -1526,6 +1551,58 @@ mod tests {
             crate::snapshot_start::started_from(&crate::snapshot_start::read(dir.path()).unwrap()),
             "Started from block 219,000, built into the BTX engine."
         );
+    }
+
+    /// Final review M9: a load task outlives a Stop and a Start (its header
+    /// wait can run ten minutes), and one from a stopped run must not load
+    /// beside the new run's. It asks its flags whether its run is still the
+    /// current one just before it loads, and loads nothing when it is not.
+    #[tokio::test]
+    async fn a_load_task_from_a_stopped_run_loads_nothing() {
+        struct Stale;
+        impl SnapshotFlags for Stale {
+            fn loaded(&self) -> bool {
+                false
+            }
+            fn mark_loaded(&self) {
+                panic!("nothing was loaded");
+            }
+            fn current(&self) -> bool {
+                false
+            }
+        }
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .match_body(method("getchainstates"))
+            .with_body(
+                r#"{"result":{"headers":219500,"chainstates":[{"blocks":219400,"validated":true}]},"error":null,"id":"easybtx"}"#,
+            )
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/")
+            .match_body(method("getblockchaininfo"))
+            .with_body(
+                r#"{"result":{"blocks":219400,"headers":219500,"initialblockdownload":true},"error":null,"id":"easybtx"}"#,
+            )
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let faststart = dir.path().join("faststart");
+        std::fs::create_dir_all(&faststart).unwrap();
+        std::fs::write(faststart.join("snapshot.dat"), b"pretend snapshot").unwrap();
+        let outcome = ensure_snapshot_loaded_with(
+            RpcClient::new(server.url(), "u", "p"),
+            PathBuf::from("/nonexistent/btx-cli"),
+            dir.path().to_path_buf(),
+            219_000,
+            Arc::new(Stale),
+            SignedLoad::None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, SnapshotOutcome::NotLoaded(STALE_RUN.into()));
     }
 
     /// A mock node's answer to one method, matched on the JSON-RPC body.
