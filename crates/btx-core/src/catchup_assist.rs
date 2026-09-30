@@ -77,6 +77,15 @@ pub const DROPS_TO_MARK: u32 = 2;
 pub const NO_ARCHIVE_SERVES_OLD_BLOCKS: &str =
     "stopped asking for old blocks: none of the archive peers connected now serves them to \
      this node";
+/// Consecutive ticks in a row whose read of the node's chain skipped the tick
+/// ([`CatchUp::note_failed_read`]) before the log says so once.
+pub const FAILED_READS_TO_LOG: u32 = 20;
+/// The one plain line for the log when a read has failed
+/// [`FAILED_READS_TO_LOG`] ticks in a row: nothing else marks a help that
+/// silently cannot read the node's chain, and from outside that looks like a
+/// help that froze.
+pub const FAILED_TO_READ_THE_CHAIN: &str =
+    "Catch-up help: could not read the node's chain for 20 checks in a row. It keeps trying.";
 
 /// Why a tick asked for nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -727,6 +736,11 @@ pub struct CatchUp {
     /// not answer" line is said once for a spell of these, like
     /// [`SLOW_TICK`]'s, not on every tick it lasts.
     unanswered: bool,
+    /// Ticks in a row whose read of the node's chain (the tip, the headers
+    /// walk, or the node's own chain) failed and so skipped the tick. Reset
+    /// by the next such read that succeeds; [`Self::note_failed_read`] logs
+    /// once at [`FAILED_READS_TO_LOG`].
+    failed_reads: u32,
 }
 
 /// What the shell keeps of the help between ticks (`AppState::catch_up_help`,
@@ -748,7 +762,29 @@ impl CatchUp {
             target: None,
             slow: false,
             unanswered: false,
+            failed_reads: 0,
         }
+    }
+
+    /// A tick's read of the node's chain (the tip, the headers walk, or the
+    /// node's own chain) failed, so the tick returns without doing anything
+    /// else. Counts the spell and, at exactly [`FAILED_READS_TO_LOG`], logs
+    /// [`FAILED_TO_READ_THE_CHAIN`] once; call sites just return what this
+    /// gives back.
+    fn note_failed_read(&mut self) -> Vec<String> {
+        self.failed_reads = self.failed_reads.saturating_add(1);
+        if self.failed_reads == FAILED_READS_TO_LOG {
+            vec![FAILED_TO_READ_THE_CHAIN.to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// A read of the node's chain succeeded: the spell [`Self::failed_reads`]
+    /// was counting is over, and a later one of [`FAILED_READS_TO_LOG`] gets
+    /// the line again.
+    fn note_read_ok(&mut self) {
+        self.failed_reads = 0;
     }
 
     /// For this app's nodes: the peers it dials that can serve a block
@@ -817,7 +853,10 @@ impl CatchUp {
 /// A failed read is no answer, so it neither stops the help nor asks for
 /// anything: an unread frontier header keeps the chain the last good read
 /// chose, and an unread tip, walk or own chain lets the tick pass without a
-/// decision.
+/// decision. [`FAILED_READS_TO_LOG`] of those in a row (the tip, the walk or
+/// the own chain, not the frontier header) does say so once
+/// ([`CatchUp::note_failed_read`]), so a help that cannot read the node does
+/// not just look frozen.
 pub async fn tick(rpc: &dyn Rpc, cu: &mut CatchUp, t: &Tick<'_>, now: Instant) -> Vec<String> {
     tick_timed(rpc, cu, t, now, &Instant::now).await
 }
@@ -886,19 +925,21 @@ async fn tick_until(
         // By height, so the hash is the one at the height this tick uses
         // even when a block connected since the refresher read it.
         let Ok(tip_hash) = rpc.call("getblockhash", json!([t.blocks])).await else {
-            return Vec::new();
+            return cu.note_failed_read();
         };
         let Some(tip_hash) = tip_hash.as_str().map(str::to_string) else {
-            return Vec::new();
+            return cu.note_failed_read();
         };
+        cu.note_read_ok();
         if cu
             .path
             .walk_until(rpc, t.blocks, WALK_PER_TICK, enough)
             .await
             .is_err()
         {
-            return Vec::new();
+            return cu.note_failed_read();
         }
+        cu.note_read_ok();
         // Only a walk that sits on the tip names the next blocks. One that
         // reached the tip's height on another block names blocks from
         // `tip + 1` too, but they are not the tip's children.
@@ -910,8 +951,11 @@ async fn tick_until(
         // own chain already holds is read from that chain.
         if seen.refused.is_none() {
             match refused_on_own_chain(rpc, t.blocks).await {
-                Ok(r) => seen.refused = r,
-                Err(_) => return Vec::new(),
+                Ok(r) => {
+                    seen.refused = r;
+                    cu.note_read_ok();
+                }
+                Err(_) => return cu.note_failed_read(),
             }
         }
     }
@@ -2861,6 +2905,53 @@ mod tests {
         assert!(lines.is_empty(), "{lines:?}");
         assert!(cu.no_archive_serves_old_blocks());
         assert_eq!(node.asked().len(), 200);
+    }
+
+    #[tokio::test]
+    async fn a_help_that_cannot_read_the_chain_says_so_once_per_twenty_ticks() {
+        // The node never answers `getblockhash`, the tip read every tick in
+        // this shape takes first (before the headers walk or the node's own
+        // chain), so every tick here skips on a failed read.
+        let mut node = FakeNode::new(300, 100, None);
+        node.failing = vec!["getblockhash"];
+        let tips = [tip(300, "headers-only")];
+        let peers = [peer(7, A, 300)];
+        let t = tick_of(100, 300, &tips, &peers);
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+
+        // 19 failed-read ticks: nothing said.
+        for n in 0..19 {
+            let lines = tick(&node, &mut cu, &t, t0 + secs(3 * n)).await;
+            assert!(lines.is_empty(), "tick {n}: {lines:?}");
+        }
+        // The 20th in a row: said once.
+        assert_eq!(
+            tick(&node, &mut cu, &t, t0 + secs(3 * 19)).await,
+            [FAILED_TO_READ_THE_CHAIN]
+        );
+        // The 21st: not said again.
+        assert!(tick(&node, &mut cu, &t, t0 + secs(3 * 20)).await.is_empty());
+
+        // A read that succeeds resets the spell.
+        node.failing.clear();
+        let after_success = tick(&node, &mut cu, &t, t0 + secs(3 * 21)).await;
+        assert!(
+            !after_success.contains(&FAILED_TO_READ_THE_CHAIN.to_string()),
+            "{after_success:?}"
+        );
+
+        // 19 more failed-read ticks: nothing said.
+        node.failing = vec!["getblockhash"];
+        for n in 22..41 {
+            let lines = tick(&node, &mut cu, &t, t0 + secs(3 * n)).await;
+            assert!(lines.is_empty(), "tick {n}: {lines:?}");
+        }
+        // The 20th of the new spell: said again.
+        assert_eq!(
+            tick(&node, &mut cu, &t, t0 + secs(3 * 41)).await,
+            [FAILED_TO_READ_THE_CHAIN]
+        );
     }
 
     #[tokio::test]
