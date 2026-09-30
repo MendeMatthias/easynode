@@ -325,15 +325,19 @@ pub fn prune_retired_addnodes_in_conf(conf_path: &Path, keep: &[&str]) -> usize 
 /// bare `\n`. That is fine for that function's job (converging the conf on
 /// exactly the current shipped census) but wrong for this one: migrating an
 /// old conf off a few specific, named lines (the discovery relays' old
-/// `addnode=` entries) must leave every other line exactly as it was,
-/// CRLF included, whether or not that line happens to be one this build
-/// ships. So this walks the raw text keeping each line's own terminator, and
-/// only drops the ones that match `remove`.
+/// `addnode=` entries) should touch only those lines, leaving every other
+/// line exactly as it was, whether or not that line happens to be one this
+/// build ships. That is not a CRLF guarantee for the file as a whole:
+/// `prune_retired_addnodes_in_conf` and `set_managed_whitelist_block` both
+/// still run later in the same start and rewrite the whole file to LF
+/// regardless, the same way `prune_retired_addnodes_str` does. So this walks
+/// the raw text keeping each line's own terminator, and only drops the ones
+/// that match `remove`.
 pub fn remove_addnodes_str(conf: &str, remove: &[&str]) -> String {
     // Split `conf` into raw chunks, each ending right after its own `\n` (with
     // any preceding `\r` still attached, i.e. whatever terminator the line
     // actually had), and the last chunk terminator-less if the file did not
-    // end in a newline. `.trim()` below strips that terminator for the
+    // end in a newline. The trim below strips that terminator for the
     // comparison without touching the chunk itself.
     let mut chunks: Vec<&str> = Vec::new();
     let mut start = 0;
@@ -347,17 +351,34 @@ pub fn remove_addnodes_str(conf: &str, remove: &[&str]) -> String {
         chunks.push(&conf[start..]);
     }
 
+    // Mirror the engine's own line parsing (`GetConfigOptions`,
+    // src/common/config.cpp:35-78 at 84b998b4) rather than matching only the
+    // exact byte form this app itself writes: cut at the first `#`
+    // (config.cpp:41-44), trim (config.cpp:45, pattern " \t\r\n"), then split
+    // on the first `=` and trim both sides (config.cpp:56-58). That is what
+    // lets the engine (and so an operator's hand edit) read `addnode =
+    // <host>` or a trailing `# comment` the same as the plain form this app
+    // writes, and this cleanup has to recognise the same lines the engine
+    // does to actually retire them.
+    const PATTERN: &[char] = &[' ', '\t', '\r', '\n'];
     chunks
         .into_iter()
         .filter(|raw| {
-            let t = raw.trim();
-            match t.strip_prefix("addnode=") {
-                // Not an addnode line: never our business.
-                None => true,
-                // An addnode line survives unless it names a peer we were
-                // told to remove.
-                Some(peer) => !remove.iter().any(|r| *r == peer.trim()),
+            let before_hash = raw.split_once('#').map_or(*raw, |(before, _)| before);
+            let trimmed = before_hash.trim_matches(PATTERN);
+            let Some(eq) = trimmed.find('=') else {
+                // No section handling here, unlike the engine (which would
+                // read a `[main]`-scoped line as `main.addnode`, a different
+                // key from the top-level `addnode`): a line with no `=`,
+                // sections included, is never an addnode line.
+                return true;
+            };
+            let name = trimmed[..eq].trim_matches(PATTERN);
+            if name != "addnode" {
+                return true;
             }
+            let value = trimmed[eq + 1..].trim_matches(PATTERN);
+            !remove.contains(&value)
         })
         .collect::<String>()
 }
@@ -900,6 +921,57 @@ mod tests {
     }
 
     #[test]
+    fn remove_addnodes_str_matches_the_engines_spaced_form() {
+        // The engine reads `name = value` with spaces around `=` the same as
+        // `name=value` (GetConfigOptions, src/common/config.cpp:57-59 at
+        // 84b998b4: split on the first `=`, then `TrimString` both sides).
+        let conf = "server=1\naddnode = node.btx.dev:19335\n";
+        assert_eq!(
+            super::remove_addnodes_str(conf, &["node.btx.dev:19335"]),
+            "server=1\n",
+            "a spaced addnode line for a named relay must still be removed"
+        );
+    }
+
+    #[test]
+    fn remove_addnodes_str_matches_leading_whitespace_and_a_trailing_comment() {
+        // Same engine read: leading/trailing whitespace on the line is
+        // trimmed, and a `#` cuts the value before it is compared
+        // (GetConfigOptions, src/common/config.cpp:41-44 at 84b998b4).
+        let conf = "server=1\n  addnode=node.btx.dev:19335  # note\n";
+        assert_eq!(
+            super::remove_addnodes_str(conf, &["node.btx.dev:19335"]),
+            "server=1\n",
+            "leading/trailing whitespace and a trailing comment must not save the line"
+        );
+    }
+
+    #[test]
+    fn remove_addnodes_str_keeps_a_spaced_non_relay_addnode() {
+        let conf = "server=1\naddnode = 1.2.3.4\n";
+        assert_eq!(
+            super::remove_addnodes_str(conf, &["node.btx.dev:19335"]),
+            conf,
+            "an operator's own addnode, spaced or not, is never a relay's business"
+        );
+    }
+
+    #[test]
+    fn remove_addnodes_str_removes_a_relay_line_under_a_section_header_too() {
+        // No section handling here (unlike the engine's `GetConfigOptions`,
+        // which would read this as `main.addnode` and treat it as a
+        // different key from the top-level `addnode`): matching only the
+        // existing behaviour, a `[main]` line has no `=` and is never an
+        // addnode line, so it is always kept.
+        let conf = "[main]\naddnode=node.btx.dev:19335\n";
+        assert_eq!(
+            super::remove_addnodes_str(conf, &["node.btx.dev:19335"]),
+            "[main]\n",
+            "the section header itself is never touched"
+        );
+    }
+
+    #[test]
     fn remove_addnodes_in_conf_does_not_rewrite_when_nothing_matches() {
         let dir =
             std::env::temp_dir().join(format!("ebtx-relay-removal-noop-{}", std::process::id()));
@@ -908,6 +980,18 @@ mod tests {
         let original = "server=1\naddnode=207.56.229.99:19335\n";
         std::fs::write(&conf, original).unwrap();
 
+        // A content-only comparison still passes with the no-rewrite guard
+        // (`rewritten == original`, in `remove_addnodes_in_conf`) deleted,
+        // since `atomic_write` would just write the same bytes back under a
+        // new inode. On unix, also prove the file itself was left alone: same
+        // inode, same mtime.
+        #[cfg(unix)]
+        let before = {
+            use std::os::unix::fs::MetadataExt as _;
+            let m = std::fs::metadata(&conf).unwrap();
+            (m.ino(), m.mtime(), m.mtime_nsec())
+        };
+
         let removed = super::remove_addnodes_in_conf(&conf, &["node.btx.dev:19335"]);
         assert_eq!(removed, 0);
         assert_eq!(
@@ -915,6 +999,16 @@ mod tests {
             original,
             "a conf without the named lines must not be rewritten"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let m = std::fs::metadata(&conf).unwrap();
+            let after = (m.ino(), m.mtime(), m.mtime_nsec());
+            assert_eq!(
+                before, after,
+                "the file itself must not be rewritten: inode and mtime must be unchanged"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -5,10 +5,12 @@
 > **Amended 2026-09-29 (night).** The plan was written at `origin/main` `b008f98`. Three things changed:
 >
 > 1. **Owner decision A (29 September): "preselect Quick start on Macs, Full check on NVIDIA machines".** Engine 0.34.9 does not move a refused Mac to Quick start by itself, and a `local_accelerator_failure` is not recorded as a refusal. So `Backend::may_check_blocks` (Metal and Cuda) still decides whether Full check *can* be picked, and a new `Backend::full_check_first` (Cuda only), shipped as the status field `full_check_first`, decides which choice is selected first. Cpu: Quick start, Full check greyed out with the reason, as before. Changed: Global Constraints, Decisions 5 and 6 and a new Decision 10, Tasks 2, 5, 8, 9, 11 and 12 (and one type anchor in Task 10), the coverage table, and the third bullet of "Where the design does not match the code", which this resolves. Checked: a Mac that keeps the preselected Quick start gets the `.follow-signatures` marker (`may_check_blocks` is true on Metal), so it follows signatures from its first start instead of trying the chip; Task 2's test now shows the Mac case by name.
-> 2. **Owner decision B (29 September): "Wizard copy says 'from a recent signed snapshot' until a second operator is on the list."** The line under the choices is now "Both start from a recent signed snapshot. Full check then checks every new block on this computer's graphics card and checks the older history in the background. You can switch later in Settings." Changed: Global Constraints, Task 9's markup, Task 12's screen check, and the second bullet of "Where the design does not match the code". The changelog and the tests never quoted the line.
+> 2. **Owner decision B (29 September): "Wizard copy says 'from a recent signed snapshot' until a second operator is on the list."** The line under the choices is now "Both start from a recent signed snapshot and check the older history in the background. Full check also checks every new block on this computer's graphics card. You can switch later in Settings." Changed: Global Constraints, Task 9's markup, Task 12's screen check, and the second bullet of "Where the design does not match the code". The changelog and the tests never quoted the line.
 > 3. **Rebased onto `origin/main` `aed8755` (Tools, #154).** Every line citation and find-this-text anchor was re-checked there. Tools moved `main.ts` down by one line after its imports, `index.html` by six after the header, `lib.rs` by eight, the `node.rs` tests by 29 and the `node_api.rs` tests by 22; `commands.rs`, `state.rs`, `role.rs`, `backend.rs`, `catchup-trend.ts` and `styles.css` anchors did not move. The expected test counts now include the tests Tools added. Tasks 3 and 4 say which anchor to use if #160 (`claude/role-card-not-at-tip`, not merged yet) lands first. Task 10 notes that Tools reads the chain card.
 >
 > The amended code blocks and counts were not run; see "Dry run" at the end.
+
+> **Amended 2026-09-30.** The owner reworded the line under the choices once more before it shipped (`docs/decisions/2026-09-29-quick-start-full-check-and-progress.md:51`); this plan's quotes are updated to that shipped wording, word for word from `apps/node/index.html`: "Both start from a recent signed snapshot and check the older history in the background. Full check also checks every new block on this computer's graphics card. You can switch later in Settings."
 
 **Goal:** Build spec C of easyNode 0.7.0 as approved on 2026-09-29: the setup screen asks Quick start or Full check and hands the answer to `begin_setup`; the status screen shows the background check of the snapshot's older history as one line and a thin bar; a validating node on a signed snapshot says its older history is still being checked; the stale-tip card stays calm while the gap closes; and a Mac whose chip the engine refused is told so once.
 
@@ -32,7 +34,7 @@
 - Copy, verbatim from the design, except the line under the choices, which is the owner's (decision B):
   - Choice 1: "Quick start", with "Follows signatures, ready in minutes."
   - Choice 2: "Full check", with "Validates every block, takes longer the first time."
-  - The line under them: "Both start from a recent signed snapshot. Full check then checks every new block on this computer's graphics card and checks the older history in the background. You can switch later in Settings." (The design's "confirmed by two node operators" comes back once a second operator is on the list.)
+  - The line under them: "Both start from a recent signed snapshot and check the older history in the background. Full check also checks every new block on this computer's graphics card. You can switch later in Settings." (The design's "confirmed by two node operators" comes back once a second operator is on the list.)
   - Full check greyed out: "This computer has no graphics card the BTX engine can check blocks with."
   - Refused Mac, once: "This Mac's graphics chip didn't pass the engine's check, so your node follows signatures. Nothing for you to do."
   - History line: "Checking older history: 131,200 of 225,927 (58%)" (numbers from the node). No time estimate.
@@ -2005,9 +2007,9 @@ Replace with:
             <!-- The owner's wording until a second operator is on the list
                  (2026-09-29); then "confirmed by two node operators". -->
             <p class="wizard-note start-choice-note">
-              Both start from a recent signed snapshot. Full check then checks
-              every new block on this computer's graphics card and checks the
-              older history in the background. You can switch later in
+              Both start from a recent signed snapshot and check the older
+              history in the background. Full check also checks every new
+              block on this computer's graphics card. You can switch later in
               Settings.
             </p>
           </fieldset>
@@ -2671,7 +2673,7 @@ and temporarily put this line directly above it:
 
 Run (in `apps/node`): `npx vite --port 1530 --strictPort`, open it in a browser sized to 560x780, and check:
 
-- `http://localhost:1530/#wizard-nvidia`: Full check selected; the setup button is on screen without scrolling (the dry run measured its bottom at 649 px of 780 on `b008f98`; Tools' button sits in the existing header row, so expect the same); the line under the choices reads "Both start from a recent signed snapshot. Full check then checks every new block on this computer's graphics card and checks the older history in the background. You can switch later in Settings." Click Quick start, wait for a poll (1.5 s): Quick start stays selected. Click Set up my node; in the console, `window.__calls.filter(c => c[0] === "begin_setup")` is `[["begin_setup", {"choice": "quick_start"}]]`.
+- `http://localhost:1530/#wizard-nvidia`: Full check selected; the setup button is on screen without scrolling (the dry run measured its bottom at 649 px of 780 on `b008f98`; Tools' button sits in the existing header row, so expect the same); the line under the choices reads "Both start from a recent signed snapshot and check the older history in the background. Full check also checks every new block on this computer's graphics card. You can switch later in Settings." Click Quick start, wait for a poll (1.5 s): Quick start stays selected. Click Set up my node; in the console, `window.__calls.filter(c => c[0] === "begin_setup")` is `[["begin_setup", {"choice": "quick_start"}]]`.
 - `http://localhost:1530/#wizard-mac` (reload after changing the hash): Quick start selected, Full check not greyed out and no reason line under it. Click Full check, wait for a poll: Full check stays selected. Click Set up my node: the call is `[["begin_setup", {"choice": "full_check"}]]`.
 - `http://localhost:1530/#wizard-cpu` (reload after changing the hash): Quick start selected, Full check greyed out and not clickable, with "This computer has no graphics card the BTX engine can check blocks with." under it.
 - `http://localhost:1530/#status`: "Checking older history: 131,200 of 225,927 (58%)" with a bar at 58% under the status line; the chain card reads "Checking whether your node is catching up..." in the quiet colours; the role card's note reads "Checks every new block itself. Its older history is still being checked."; the chip notice shows, OK hides it and `localStorage.getItem("ebtx-node.chip-notice-seen")` is `"v0.34.9"`.

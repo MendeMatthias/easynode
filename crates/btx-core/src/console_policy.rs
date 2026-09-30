@@ -132,10 +132,6 @@ const PEERS: &str = "The app manages this node's peers.";
 const FILES: &str = "This window does not read or write files.";
 const WALLET: &str = "Wallet keys and payments stay in the Wallet panel.";
 
-/// Real engine commands that `help` does not list (Bitcoin Core's hidden
-/// category). The app itself calls `invalidateblock` to hold branches.
-pub(crate) const HIDDEN_ENGINE_COMMANDS: &[&str] = &["invalidateblock", "reconsiderblock"];
-
 pub(crate) const REFUSALS: &[(&[&str], &str)] = &[
     (&["stop"], "Use Stop node, which shuts down in the right order."),
     (
@@ -409,6 +405,10 @@ mod tests {
     use serde_json::json;
 
     const H: &str = "8240c62e62b47fc675610908c03045c244de1dfc06246209830ba9d98468952c";
+
+    /// Real engine commands that `help` does not list (Bitcoin Core's hidden
+    /// category). The app itself calls `invalidateblock` to hold branches.
+    const HIDDEN_ENGINE_COMMANDS: &[&str] = &["invalidateblock", "reconsiderblock"];
 
     fn run(line: &str) -> Call {
         match decide(line) {

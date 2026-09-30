@@ -59,7 +59,7 @@ pub const REGTEST_REPLAY_CONTEXT: &str =
 /// it with the candidate engine's newest mainnet entry before a bump.
 pub const MAINNET_SHIELDED_COMMITMENT: &str =
     "94343b766b39c0ea2d92d83323f77b5ccc5e775d99b34b01f5fa6400f2354541";
-/// Regtest's: the empty-tree pin that `validation.cpp:19051`'s comment
+/// Regtest's: the empty-tree pin that `validation.cpp:19056-19058`'s comment
 /// names, read from the spike's regtest statements. The regtest rehearsal
 /// checks a fresh chain still carries it.
 pub const REGTEST_SHIELDED_COMMITMENT: &str =
@@ -310,18 +310,12 @@ pub fn is_dissent(st: &Statement) -> bool {
     st.file_size() == 0 && st.file_hash().is_null() && st.chunk_size() == 0 && st.chunk_count() == 0
 }
 
-/// The 229 bytes of the version-2 statement a dissent signs: the chain
-/// facts given, and file size 0, file hash 32 zero bytes, chunk size 0,
-/// chunk count 0. Pure; wrap it with [`Statement::from_raw`]. The confirmer
-/// passes its own diary entry, its node's chain id and replay context and
-/// the compiled shielded commitment, and signs the result with its node's
-/// `signutxosnapshotmanifest`, which checks only the chain id, the replay
-/// context and its own key (v0.34.9
-/// `trusted_exact_replay_attestation.cpp:1387-1403`), never the file fields.
-/// Heights fit the engine's `int32` (the statement's own field).
+/// [`dissent_statement`]'s 229 bytes, `height` already the engine's
+/// `int32`: no fallible conversion, so this never fails. The one place the
+/// byte layout is written.
 #[allow(clippy::too_many_arguments)]
-pub fn dissent_statement(
-    height: u64,
+fn dissent_raw(
+    height: i32,
     block_hash: &Hash32,
     hash_serialized: &Hash32,
     coins: u64,
@@ -334,7 +328,7 @@ pub fn dissent_statement(
     raw[0] = STATEMENT_VERSION;
     raw[1..33].copy_from_slice(&chain_id.0);
     raw[33..65].copy_from_slice(&block_hash.0);
-    raw[65..69].copy_from_slice(&(height as i32).to_le_bytes());
+    raw[65..69].copy_from_slice(&height.to_le_bytes());
     raw[69..101].copy_from_slice(&hash_serialized.0);
     raw[101..109].copy_from_slice(&coins.to_le_bytes());
     raw[109..117].copy_from_slice(&chain_tx.to_le_bytes());
@@ -344,11 +338,51 @@ pub fn dissent_statement(
     raw
 }
 
+/// The 229 bytes of the version-2 statement a dissent signs: the chain
+/// facts given, and file size 0, file hash 32 zero bytes, chunk size 0,
+/// chunk count 0. Pure; wrap it with [`Statement::from_raw`]. The confirmer
+/// passes its own diary entry, its node's chain id and replay context and
+/// the compiled shielded commitment, and signs the result with its node's
+/// `signutxosnapshotmanifest`, which checks only the chain id, the replay
+/// context and its own key (v0.34.9
+/// `trusted_exact_replay_attestation.cpp:1387-1403`), never the file fields.
+/// `None` when `height` does not fit the statement's own height field (the
+/// engine's `int32`), rather than silently wrapping it.
+#[allow(clippy::too_many_arguments)]
+pub fn dissent_statement(
+    height: u64,
+    block_hash: &Hash32,
+    hash_serialized: &Hash32,
+    coins: u64,
+    chain_tx: u64,
+    chain_id: &Hash32,
+    replay_context: &Hash32,
+    shielded: &Hash32,
+) -> Option<[u8; STATEMENT_LEN]> {
+    i32::try_from(height).ok().map(|height| {
+        dissent_raw(
+            height,
+            block_hash,
+            hash_serialized,
+            coins,
+            chain_tx,
+            chain_id,
+            replay_context,
+            shielded,
+        )
+    })
+}
+
 impl ChainFacts {
-    /// The dissent carrying these facts, as a [`Statement`].
+    /// The dissent carrying these facts, as a [`Statement`]. `self.height`
+    /// is already the engine's `int32` (however it got there: read
+    /// straight from statement bytes, it can be negative or any other
+    /// value that field allows), so this calls [`dissent_raw`] directly
+    /// rather than going through `dissent_statement`'s `u64` parameter and
+    /// its `i32::try_from`, which a negative height would fail.
     pub fn dissent(&self) -> Statement {
-        Statement::from_raw(dissent_statement(
-            self.height as u64,
+        Statement::from_raw(dissent_raw(
+            self.height,
             &self.block_hash,
             &self.hash_serialized,
             self.coins,
@@ -397,12 +431,21 @@ fn read_compact(bytes: &[u8], pos: &mut usize) -> Result<u64, Refusal> {
     Ok(n)
 }
 
+/// The engine's `WriteCompactSize` (`serialize.h:309-331` at 84b998b4): the
+/// shortest of the four canonical widths, matching [`read_compact`].
 fn write_compact(out: &mut Vec<u8>, n: usize) {
+    let n = n as u64;
     if n < 253 {
         out.push(n as u8);
-    } else {
+    } else if n <= u16::MAX as u64 {
         out.push(253);
         out.extend_from_slice(&(n as u16).to_le_bytes());
+    } else if n <= u32::MAX as u64 {
+        out.push(254);
+        out.extend_from_slice(&(n as u32).to_le_bytes());
+    } else {
+        out.push(255);
+        out.extend_from_slice(&n.to_le_bytes());
     }
 }
 
@@ -635,7 +678,12 @@ pub fn check(
 
 /// The running node is on the statement's chain and, when it reports one,
 /// has the statement's replay context. A node with no pin and no key
-/// reports no context; the compiled one then decides alone.
+/// reports no context; the compiled one then decides alone. A missing
+/// genesis here means nobody asked a running node yet, as in the
+/// pre-launch check (`attested_snapshot::prepare_start`, called before the
+/// node exists to ask); the loader refuses a running node that did not
+/// answer (`confirmed_load::recheck`, "the node did not say which chain it
+/// is on").
 pub fn node_agrees(st: &Statement, node: &NodeView) -> Result<(), Refusal> {
     if let Some(g) = &node.genesis {
         if Hash32::from_display_hex(g) != Some(st.chain_id()) {
@@ -672,7 +720,7 @@ pub fn check_chain_fields(st: &Statement, rules: &ChainRules) -> Result<(), Refu
 
 fn on_grid(st: &Statement, rules: &ChainRules) -> Result<u64, Refusal> {
     let height = st.height() as i64;
-    if height <= 0 || height % rules.grid as i64 != 0 {
+    if rules.grid == 0 || height <= 0 || height % rules.grid as i64 != 0 {
         return Err(Refusal::OffGrid {
             height,
             grid: rules.grid,
@@ -996,6 +1044,22 @@ mod tests {
         long_sig.push(73);
         long_sig.extend_from_slice(&[0x30; 73]);
         assert!(matches!(parse(&long_sig), Err(Refusal::Malformed(_))));
+    }
+
+    /// The engine's full compact size (`serialize.h:309-331` at 84b998b4):
+    /// one byte under 253, else 253 plus a u16, 254 plus a u32 or 255 plus a
+    /// u64, whichever is the shortest canonical form. `write_compact` must
+    /// reach for the wider forms instead of truncating, and `read_compact`
+    /// must read back the same number.
+    #[test]
+    fn write_compact_round_trips_every_width() {
+        for n in [252usize, 253, 65_535, 65_536, 0x1_0000_0000] {
+            let mut out = Vec::new();
+            write_compact(&mut out, n);
+            let mut pos = 0;
+            assert_eq!(read_compact(&out, &mut pos).unwrap(), n as u64, "n = {n}");
+            assert_eq!(pos, out.len(), "n = {n}: no trailing bytes");
+        }
     }
 
     // ── signatures ──────────────────────────────────────────────────────
@@ -1339,6 +1403,22 @@ mod tests {
         );
     }
 
+    /// `ChainRules::grid` is a `pub` field, so a bad compile-time value or a
+    /// caller building rules by hand can make it 0; that must refuse, not
+    /// divide by it.
+    #[test]
+    fn a_grid_of_zero_is_refused_not_divided_by() {
+        let mut t = Mainnetish::new();
+        t.rules.grid = 0;
+        assert_eq!(
+            check_shape(&t.manifest(233_800, |_| {}).statement, &t.rules),
+            Err(Refusal::OffGrid {
+                height: 233_800,
+                grid: 0
+            })
+        );
+    }
+
     /// The shielded commitment is compiled per engine beside the chain id
     /// and the replay context (section 7, step 1); another one is refused.
     #[test]
@@ -1396,7 +1476,7 @@ mod tests {
                     &st.replay_context(),
                     &st.shielded(),
                 ),
-                want
+                Some(want)
             );
             assert_eq!(d.hash().display_hex(), dissent_hash);
             assert!(is_dissent(&d));
@@ -1418,6 +1498,43 @@ mod tests {
         );
         assert_eq!((facts.coins, facts.chain_tx), (101, 101));
         assert_eq!(facts.chain_id.display_hex(), operators::REGTEST_GENESIS);
+    }
+
+    /// A height above `i32::MAX` cannot fit the statement's own height field
+    /// (a 4-byte little-endian `int32`); `dissent_statement` must say so
+    /// with `None` rather than silently wrap it with `as i32`.
+    #[test]
+    fn dissent_statement_refuses_a_height_that_does_not_fit_i32() {
+        let facts = parse(R_P).unwrap().statement.chain_facts();
+        let args = |height: u64| {
+            dissent_statement(
+                height,
+                &facts.block_hash,
+                &facts.hash_serialized,
+                facts.coins,
+                facts.chain_tx,
+                &facts.chain_id,
+                &facts.replay_context,
+                &facts.shielded,
+            )
+        };
+        assert!(args(i32::MAX as u64).is_some());
+        assert_eq!(args(i32::MAX as u64 + 1), None);
+    }
+
+    /// `ChainFacts::height` is an `i32` read straight from statement bytes
+    /// (`Statement::height`), so it can be negative on crafted bytes, not
+    /// only on real chain data. `ChainFacts::dissent` must still produce
+    /// the dissent, not panic: it never goes through a `u64` round trip.
+    #[test]
+    fn a_dissent_with_a_negative_height_does_not_panic() {
+        let facts = ChainFacts {
+            height: -1,
+            ..parse(R_P).unwrap().statement.chain_facts()
+        };
+        let d = facts.dissent();
+        assert_eq!(d.height(), -1);
+        assert!(is_dissent(&d));
     }
 
     /// A dissent is never loaded, however many operators sign it, and its

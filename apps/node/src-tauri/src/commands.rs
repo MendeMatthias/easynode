@@ -309,16 +309,69 @@ use crate::state::{
 // in apps/node/scripts/lib/engine-pin.sh strips the qualifier. node.rs
 // `parse_tag_version` stops at the first non-digit, so every version gate reads
 // 0.34.9 from either shape.
-pub const NODE_RELEASE_TAG: &str = "v0.34.9";
+//
+// ── 2026-09-30: v0.34.12, IN LEGACY REORG MODE ──────────────────────────────
+//
+// Tag `v0.34.12` = `5f32c4c4d1cb033180bcd40a461deae2c1bc1ee1` (annotated tag
+// object ef04751, tagged 2026-09-29 09:13Z), decided by the owner on
+// 2026-09-30 for 0.7.0. Why: 0.34.10 to 0.34.12 fix what the app cannot fix
+// from outside the engine. A body the engine rejects now retires its whole
+// branch of headers (c74c9456; on 0.34.9 the false 227313 tower showed as a
+// longer headers-only tip). The acquisition escape admits one frontier body at
+// a time instead of failing retryable forever. A trusted mirror follows a
+// signed frontier across a header-only hole and pages authority headers past
+// a lower-work prefix (dc2d4d7c, 433abc30, ab8116da).
+//
+// ⚠ LEGACY REORG MODE, NOT THE ENGINE'S DEFAULT. 0.34.12 added
+// `-reorgpolicy=bounded|observe|legacy` with bounded as the default, and
+// bounded refuses the -parkdeepreorg=0 every launch passes, as an InitError
+// (node/chainstatemanager_args.cpp:182-186). Bounded on a trusted mirror can
+// also spin at 100% CPU holding cs_main when a signed competing prefix is
+// deeper than 6; upstream PR 211 (0.34.13rc1, not merged on 2026-09-30) fixes
+// that. So crates/btx-core/src/node.rs passes `-reorgpolicy=legacy` beside
+// -parkdeepreorg=0 to every engine at 0.34.12 or newer, gated on the tag in
+// the install path because 0.34.9 refuses the argument, and nodes keep
+// following the most-work chain as they did on 0.34.9.
+// `the_pinned_engine_launches_in_legacy_reorg_mode` holds it. The next step is
+// 0.34.13 once PR 211 is merged and tagged; whether any role moves to bounded
+// then is a separate decision.
+//
+// ⚠ A QUALIFIED DEVICE NOW DECIDES A DIGEST MISMATCH ALONE. The reason for the
+// 0.34.9 pin above was its CPU ExactReplay second opinion when a GPU's digest
+// disagreed with a header. fa878338 took that away for a qualified device: on
+// 0.34.12 a qualified, fully accelerated device's mismatch is a final
+// InvalidConsensus with no CPU replay (matmul/matmul_v4_rc_gkr.cpp:5085-5097),
+// and -matmulrcconfirmcpu (default 0, init.cpp:666) is diagnostic only and is
+// never sent that case. A qualified GPU that computes a digest wrong therefore
+// rejects a valid block, and nothing on the machine overrules it. No CUDA or
+// Metal source changed between the two tags; a check on the 3060 (sm_86) and
+// on an M-series Mac with this build is still owed.
+//
+// Verified at the SHA, 2026-09-30. chainparams.cpp keeps 219000
+// byte-identical and adds a 228000 checkpoint and assumeutxo base (:1063,
+// :1286-1295). snapshot_spec() STAYS on 219000 for 0.7.0: no mirror of the
+// 228000 file is published, and 228000 is above the refused block at 227313,
+// which `the_pinned_compiled_base_is_below_every_refused_block` forbids until a
+// compiled load checks for refused blocks after loading. No option was
+// removed, and every one this app passes is still registered. Both guards pass
+// on the tag (check-engine-tag.sh: 5 of 5 assignments on the sentinel,
+// shielded commitment 94343b76; check-engine-fleet-ready.sh: degraded
+// consensus start, 1-of-1 mirror refused, signer self-pin present, manifest
+// rows cuda/sm_120 and metal/m4_class).
+//
+// THE INSTALL KEY IS `v0.34.12`, bare, equal to what btxd reports. No release
+// ever used it, so every install re-provisions on update and fetches the
+// engine once, as the move to `v0.34.9` did.
+pub const NODE_RELEASE_TAG: &str = "v0.34.12";
 
 /// The exact upstream commit NODE_RELEASE_TAG names: the commit upstream's
-/// annotated tag `v0.34.9` points at. Kept set although the key is now itself
+/// annotated tag `v0.34.12` points at. Kept set although the key is itself
 /// an upstream tag, so the guards, `engine_pin_ref` and the engine build
 /// workflows check out a SHA that cannot move under us, and the CI artifacts
 /// are named for the commit (`btxd-<os>-<sha>`), which is what the installer
 /// workflows' identity checks compare. If upstream ever re-tags, this does not
 /// move by itself; re-run both guards on the new commit and choose a new key.
-pub const NODE_RELEASE_COMMIT: &str = "84b998b4f3272775aaf8c241ac11dc683f4c4e23";
+pub const NODE_RELEASE_COMMIT: &str = "5f32c4c4d1cb033180bcd40a461deae2c1bc1ee1";
 
 /// The pinned assumeutxo snapshot this app bootstraps from: height 219000,
 /// [`btx_core::snapshot::v0_34_9_spec`], pinned from upstream's manifest and
@@ -6981,6 +7034,37 @@ mod tests {
         }
     }
 
+    /// The pinned engine must start in legacy reorg mode on every host. From
+    /// v0.34.12 the engine defaults to `-reorgpolicy=bounded`, which refuses
+    /// the `-parkdeepreorg=0` every launch passes, and on a trusted mirror can
+    /// spin holding cs_main (upstream PR 211). The launch gates the flag on
+    /// the tag in the install path, so this asks the launch itself, with this
+    /// build's tag in that path, rather than trusting the gate's arithmetic.
+    #[test]
+    fn the_pinned_engine_launches_in_legacy_reorg_mode() {
+        let btxd = super::nominal_btxd_path();
+        for backend in [
+            btx_core::backend::Backend::Metal,
+            btx_core::backend::Backend::Cuda,
+            btx_core::backend::Backend::Cpu,
+        ] {
+            let (_, args, _) = btx_core::node::build_node_command(
+                &btxd,
+                std::path::Path::new("/dd"),
+                std::path::Path::new("/dd/btx.conf"),
+                backend,
+            );
+            assert!(
+                args.iter().any(|a| a == "-reorgpolicy=legacy"),
+                "{NODE_RELEASE_TAG} on {backend:?} launches without -reorgpolicy=legacy: {args:?}"
+            );
+            assert!(
+                args.iter().any(|a| a == "-parkdeepreorg=0"),
+                "{NODE_RELEASE_TAG} on {backend:?}: {args:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_shipped_pin_makes_a_deliberate_keeper_decision() {
         assert!(
@@ -7006,8 +7090,9 @@ mod tests {
     ///
     /// Each row is read from that tag's `src/kernel/chainparams.cpp`
     /// (mainnet `m_assumeutxo_data`): the newest base it carries that upstream
-    /// also publishes a file for. An engine with no row fails on purpose: read
-    /// its table, add the row, and move the spec with it.
+    /// also publishes a file for, unless the row says why the pin stays lower.
+    /// An engine with no row fails on purpose: read its table, add the row,
+    /// and move the spec with it.
     #[test]
     fn the_snapshot_pin_is_the_newest_base_the_pinned_engine_carries() {
         let version = NODE_RELEASE_TAG
@@ -7019,6 +7104,14 @@ mod tests {
             // Adds 219000 beside a byte-identical 203000; upstream publishes its
             // file on the `assumeutxo-219000` pre-release only, and we mirror it.
             "v0.34.9" => 219_000,
+            // Keeps 219000 byte-identical and adds 228000 (chainparams.cpp:1063,
+            // :1286-1295), published on upstream's `assumeutxo-228000`
+            // pre-release. The pin stays on 219000 for 0.7.0 on purpose: there
+            // is no mirror of the 228000 file yet, and 228000 sits above the
+            // refused block at 227313, which
+            // the_pinned_compiled_base_is_below_every_refused_block forbids
+            // until a compiled load checks for refused blocks after loading.
+            "v0.34.12" => 219_000,
             other => panic!(
                 "no record of the assumeutxo bases {other} carries: read `git show \
                  {other}:src/kernel/chainparams.cpp` (m_assumeutxo_data), add its row \

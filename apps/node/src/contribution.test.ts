@@ -170,7 +170,7 @@ describe("attestation service in the contribution card", () => {
 
   it("singularizes one served node", () => {
     const v = contributionView({ ...base, attestationsServedPeers: 1 });
-    expect(v.detail).toContain("confirmations to 1 node —");
+    expect(v.detail).toContain("confirmations to 1 node,");
   });
 
   it("stays silent on null (unreported) and on zero — no unearned claims", () => {

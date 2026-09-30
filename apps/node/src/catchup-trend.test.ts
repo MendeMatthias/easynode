@@ -239,7 +239,7 @@ describe("catchupLine", () => {
       { at: T0 + min(20), behind: 10_737, height: 219_076 },
     ];
     expect(catchupLine(10_737, s, T0 + min(20))).toBe(
-      "Your node is live, still catching up — 10,737 blocks behind, about 2 days to go at this pace",
+      "Your node is live, still catching up: 10,737 blocks behind, about 2 days to go at this pace",
     );
   });
 
@@ -250,7 +250,7 @@ describe("catchupLine", () => {
       { at: T0 + min(16), behind: 5_600, height: 224_210 },
     ];
     expect(catchupLine(5_600, s, T0 + min(16))).toBe(
-      "Your node is live, still catching up — 5,600 blocks behind, less than an hour to go at this pace",
+      "Your node is live, still catching up: 5,600 blocks behind, less than an hour to go at this pace",
     );
   });
 
@@ -264,9 +264,9 @@ describe("catchupLine", () => {
       { at: T0 + min(5), behind: 10_784, height: 219_019 },
     ];
     expect(catchupLine(10_784, closing, T0 + min(5))).toBe(
-      "Your node is live, still catching up — 10,784 blocks behind",
+      "Your node is live, still catching up: 10,784 blocks behind",
     );
-    expect(catchupLine(95, [], T0)).toBe("Your node is live, still catching up — 95 blocks behind");
+    expect(catchupLine(95, [], T0)).toBe("Your node is live, still catching up: 95 blocks behind");
   });
 
   it("never shows a pace that contradicts 'not catching up'", () => {
@@ -707,7 +707,7 @@ describe("staleCard on a syncing node", () => {
     // And no time to go read off that jump.
     const later = feed([[T0 + min(16), { phase: "ready", height: 219_020, blocks_behind: 13_993 }]]);
     expect(catchupLine(13_993, [...s, ...later], T0 + min(16))).toBe(
-      "Your node is live, still catching up — 13,993 blocks behind",
+      "Your node is live, still catching up: 13,993 blocks behind",
     );
   });
 });

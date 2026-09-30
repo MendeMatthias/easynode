@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { historyCheckView } from "./history-check";
+import { historyCheckView, type HistoryCheck } from "./history-check";
 
 const INDEX = readFileSync(new URL("../index.html", import.meta.url), "utf8");
 /** An element's opening tag in index.html. */
@@ -46,6 +46,16 @@ describe("historyCheckView", () => {
     expect(historyCheckView(null)).toBeNull();
     expect(historyCheckView({ checked: 5, base: 0 })).toBeNull();
     expect(historyCheckView({ checked: Number.NaN, base: 225_927 })).toBeNull();
+  });
+
+  it("shows nothing when the object is missing a key", () => {
+    // The type promises both keys, but an older or mismatched backend could
+    // send a `history_check` object without one of them. Missing `base` is
+    // `undefined`, which fails `h.base > 0`; missing `checked` is
+    // `undefined`, which fails `Number.isFinite`. Either way the guard falls
+    // back to the same "no check" result as a null or an out-of-range value.
+    expect(historyCheckView({ base: 225_927 } as HistoryCheck)).toBeNull();
+    expect(historyCheckView({ checked: 131_200 } as HistoryCheck)).toBeNull();
   });
 
   // The confirmed-snapshot decision, section 7: the line gains a second

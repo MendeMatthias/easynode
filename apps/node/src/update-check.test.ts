@@ -288,22 +288,22 @@ describe("the Last check line", () => {
 
   it("renders each outcome in plain words", () => {
     expect(line("no-update", "automatic: v0.6.22 is current")).toBe(
-      "Last check: today 14:03 — you're on the latest version",
+      "Last check: today 14:03 · you're on the latest version",
     );
     expect(line("check-failed", "automatic: dns error")).toBe(
-      "Last check: today 14:03 — couldn't check",
+      "Last check: today 14:03 · couldn't check",
     );
     expect(line("check-failed", "automatic: no build for this platform")).toBe(
-      "Last check: today 14:03 — no build for this platform yet",
+      "Last check: today 14:03 · no build for this platform yet",
     );
     expect(line("found", "automatic: v0.6.23 offered, downloading")).toBe(
-      "Last check: today 14:03 — found v0.6.23",
+      "Last check: today 14:03 · found v0.6.23",
     );
     expect(line("install-failed", "automatic: v0.6.23: deb is not supported")).toBe(
-      "Last check: today 14:03 — v0.6.23 couldn't install — get it from easybtx.com/node",
+      "Last check: today 14:03 · v0.6.23 couldn't install, get it from easybtx.com/node",
     );
     expect(line("installed", "automatic: v0.6.23, restarting")).toBe(
-      "Last check: today 14:03 — v0.6.23 installed",
+      "Last check: today 14:03 · v0.6.23 installed",
     );
   });
 
@@ -320,7 +320,12 @@ describe("the Last check line", () => {
     expect(plainOutcome("installed", "automatic", "e")).toBe("an update installed");
     expect(plainOutcome("found", "manual", "e")).toBe("found an update");
     expect(plainOutcome("install-failed", "manual: deb", "e.com")).toBe(
-      "an update couldn't install — get it from e.com",
+      "an update couldn't install, get it from e.com",
+    );
+    // The hand-install branch (update_binding declined the offer) falls back
+    // the same way when the notice carries no version.
+    expect(plainOutcome("check-failed", "automatic: install it by hand", "e.com")).toBe(
+      "an update is out, install it by hand from e.com",
     );
   });
 
@@ -342,7 +347,7 @@ describe("the Last check line", () => {
 
   it("survives a timestamp it cannot read", () => {
     expect(lastCheckLine({ at: "not a date", outcome: "no-update", detail: "" }, now, "e")).toBe(
-      "Last check: at an unknown time — you're on the latest version",
+      "Last check: at an unknown time · you're on the latest version",
     );
   });
 });
@@ -522,7 +527,7 @@ describe("an update this copy will not download on its own", () => {
           now,
           "easybtx.com/node",
         ),
-      ).toBe("Last check: today 14:03 — v0.6.34 is out, install it by hand from easybtx.com/node");
+      ).toBe("Last check: today 14:03 · v0.6.34 is out, install it by hand from easybtx.com/node");
     }
     // A refusal still reads as a failed check.
     expect(plainOutcome("check-failed", `automatic: ${REFUSED}`, "e")).toBe("couldn't check");
@@ -628,7 +633,7 @@ describe("updateCheck() keeps a failed install from downloading again, and a pre
     expect(paint).toContain("setUpdateResult(");
   });
 
-  it("calls only commands the backend registers", () => {
+  it("invokes these four commands, each registered in lib.rs", () => {
     for (const name of [
       "record_update_check",
       "remember_failed_update",

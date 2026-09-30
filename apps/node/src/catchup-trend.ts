@@ -197,8 +197,8 @@ export const catchupLine = (behind: number, samples: CatchupSample[], now: numbe
   }
   const eta = trend === "converging" && pace ? timeToGo(behind, pace.closingPerHour) : null;
   return eta
-    ? `Your node is live, still catching up — ${n} blocks behind, ${eta} to go at this pace`
-    : `Your node is live, still catching up — ${n} blocks behind`;
+    ? `Your node is live, still catching up: ${n} blocks behind, ${eta} to go at this pace`
+    : `Your node is live, still catching up: ${n} blocks behind`;
 };
 
 /** Headers beyond blocks at which the stale card calls a node behind: two,

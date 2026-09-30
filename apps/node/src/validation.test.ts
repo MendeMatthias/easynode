@@ -192,7 +192,7 @@ describe("trusted mirror archive-authority escalation", () => {
       rc_trusted_mirror: true,
       archive_authority: 0,
     });
-    expect(v.state).toBe("Mirror — waiting for a source");
+    expect(v.state).toBe("Mirror: waiting for a source");
     expect(v.cls).toBe("is-stalled");
     expect(v.note).toContain("not connected to any node allowed to hand them over");
   });

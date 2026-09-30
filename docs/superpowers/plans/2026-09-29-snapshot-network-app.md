@@ -4,6 +4,8 @@
 
 > **Amended 2026-09-29 (night)**, after jpp's review and the owner's decisions of that night, against the amended design (`docs/decisions/2026-09-29-every-node-starts-near-the-tip.md` as committed in `12e44c3` on `claude/cosigned-snapshots`) and the contracts the three amended plans share. What changed: the grid is 100 and the depth 144 everywhere; the validated gate (`getchainstates`, no chainstate with `"validated": false`) runs before every diary entry, export, send and signature, and replaces the `attested_assumeutxo` file test; diary entries are dropped when their block leaves the active chain; `statement_check.rs` holds the checks and the one pure verdict, Sign, Dissent or Neither, that the app and `btx-confirmer` both call; a confirmer whose diary disagrees on a chain field sends a dissent built from its diary and signed by its node; the keeper waits per exported height (six-hour deadline, four pairs on disk); the website client reads the disputed `latest`, the dissent flag in `pending` and the closed-height refusal; Copy diagnostics counts mismatches, dissents sent and gate-closed skips; `btx-confirmer` and its unit are new (Tasks 7 and 8); the rehearsal adds `btx-confirmer`, a real disagreement and an unvalidated snapshot chainstate. The old Task 1 (publish the operator list for the website) is folded away: the list is now the core plan's `crates/btx-core/snapshot-operators.json`, which the website copies byte for byte, and this plan writes it nowhere else. Tasks are renumbered: old Tasks 2 to 7 are Tasks 1 to 6, old Task 8 is Task 9. Rebased on `origin/main` after the Tools merge (`aed8755`; `origin/main` is `b330e3d` on 29 September); every file anchor below was re-read there.
 
+> **Amended 2026-09-30, after the site code and the core crate were checked against this plan.** Two corrections, no design change: the route list now also carries the site's `409` on the file upload's `PUT` and `complete`, exactly as on `start`, when the file is already stored or the upload was let go, and its `400` on any query to `latest`, `pending` or `disputes` other than empty or exactly `?chain=main` / `?chain=regtest`; `upload_file` maps a `409` on `PUT` and `complete` to `Ok(None)` the same as it already does on `start`. And `confirmed_snapshot::dissent_statement` now returns `Option<[u8; STATEMENT_LEN]>` (`None` when the height does not fit the statement's 32-bit field), so `dissent_from` maps `None` to `Mismatch::Unreadable`.
+
 **Goal:** Every validating node writes down its own chain state at every multiple of 100, but only while its chain rests on its own checks; a producer on the operator list exports exactly there, waits until that block is 144 deep, checks its export against its node and its diary, and sends it to easybtx.com; a confirmer on the list, in the app or beside a plain btxd (`btx-confirmer`), co-signs a waiting statement only when its own diary, chain and holds agree field by field, and sends a signed dissent when its diary disagrees on a chain field; an end-to-end rehearsal on regtest proves the refusals and the happy path against real engines and the website's own route code.
 
 **Architecture:** `diary.rs` records `gettxoutsetinfo` and `getchaintxstats` at grid heights into `<datadir>/snapshot-diary.json`, asks the validated gate (`diary::gate_open`, over the core plan's pure `getchainstates` check) right before every entry, and drops entries whose block left the active chain. `statement_check.rs` reads what the node says (`NodeFacts`) and gives the one pure verdict: `Sign`, `Dissent` (a chain field differs from the diary) or `Neither` (the gate is closed, not 144 deep yet, no diary entry on this chain, a foreign chain, replay context or shielded commitment, a held root below the base); it also builds a dissent from a diary entry. `snapshot_site.rs` is the client of the website's routes. `snapshot_serve.rs` exports only on the grid into a waiting set (`waiting.json`), and every keeper tick looks at each waiting pair once (`mature_step`): 144 deep, re-verified, passed by a `BeforeOffer` hook, then offered; `snapshot_producer.rs` is that hook plus the submission. `snapshot_confirmer.rs` reads `pending`, never signs a dissent, and signs a copy or a dissent with the node's own `signutxosnapshotmanifest` under `<datadir>/snapshot-confirmer/`. `src/bin/btx-confirmer.rs` runs the same diary and confirmer beside a plain btxd, under `deploy/esplora/btx-confirmer.service.template`. The Tauri shell drives the diary and the confirmer from the status refresher and the producer from the snapshot keeper, and Copy diagnostics gains a "Snapshots" section. `tests/snapshot_network_regtest.rs` runs five regtest engines, `btx-confirmer` and the website's handlers (`site/scripts/snapshot-rendezvous-local.mjs`) together.
@@ -25,7 +27,7 @@
 - Confirmer: a node that validates, signs (`local_signer`), and whose key is on the list; every **600 s** (200 refresher ticks of 3 s, the first about 2 minutes after the node starts; `btx-confirmer`: the first a minute in) it asks the gate, and while it is closed does nothing more (`Round::Unvalidated`). Otherwise it reads `GET /api/snapshots/pending?chain=main`, skips every entry marked as a dissent (by the website's flag or by its own zero file fields: a dissent is never signed), skips statements its operator already signed, and takes each through the verdict. **Sign**: the engine signs a copy, the app checks the one new signature and posts a manifest carrying the statement and only that signature. **Dissent**: the app builds a dissent from its own diary entry (`statement_check::dissent_from`, the core plan's `dissent_statement`: that entry's height, block hash, UTXO hash, coin count and transaction count, the compiled chain id, replay context and shielded commitment, all four file fields zero), the engine signs it, and it is posted like any manifest, at most once per height (`<state>/snapshot-dissents.json`; a dissent this operator already has in `pending` counts as sent). **Neither**: nothing is signed or sent. It never signs without a diary match. Every mismatch is logged once per statement per run and counted in Copy diagnostics, with dissents sent and gate-closed skips.
 - The copy the engine signs: `<datadir>/snapshot-confirmer/<statement hash>.manifest`, handed to `signutxosnapshotmanifest` as the path relative to the node's data folder (`snapshot-confirmer/<statement hash>.manifest`), which the engine resolves against its own network data folder (`AbsPathForConfigVal(args, path)`, `src/rpc/blockchain.cpp:4631-4632`, net-specific by default, `src/common/config.cpp:252-258` at `84b998b4`). The engine refuses without a configured local signer (`:4624-4629`), checks only chain id, replay context and its blocklist before signing (`src/matmul/trusted_exact_replay_attestation.cpp:1387-1403`), and reads a manifest with no signatures, so a dissent can be signed this way. The copy is removed after the call.
 - `btx-confirmer` (section 5a): `crates/btx-core/src/bin/btx-confirmer.rs`, beside `btx-witness`, built and installed the same way (`cargo build --release --bin btx-confirmer`, then `/usr/local/bin`). Flags `--datadir <path>` (the node's data folder, holding its `.cookie`), `--state <path>` (its diary and dissents), `--rpc <addr:port>` (default `127.0.0.1:19334`), and `--once` (one diary look and one round, then exit, for a first check and for the rehearsal). At start it refuses to run unless the node is on a chain easyNode knows, reports the replay context compiled for it, checks blocks itself, and has a signing key. It reads the diary every 5 s and runs a round every 600 s, through the same `diary`, `statement_check`, `snapshot_site` and `snapshot_confirmer` code as the app. It learns its node's key from the engine's first signature (no RPC names the local signer's key, and it does not read the key file). It listens on nothing, exports, loads, pins and restarts nothing. Unit: `deploy/esplora/btx-confirmer.service.template`, in the shape of `btx-witness.service.template`, with `ReadWritePaths=` the state folder and `<datadir>/snapshot-confirmer/` only.
-- The website (routes, replies and limits exactly as the website plan's Global Constraints): `https://easybtx.com`, overridable with `EASYNODE_SNAPSHOT_SITE` only to another `https://` origin or to `http://127.0.0.1:<port>` / `http://localhost:<port>` (no path, no user info); header `x-ebtx-node: ebtx-snapshot-v1` on every write; every body `content-type: application/octet-stream`; parts of at most 4,194,304 bytes; client timeout 120 s. `GET /api/snapshots/latest` answers the pointer, or HTTP 200 with exactly `{"disputed": [<height>, ...]}` while a dispute stands, or HTTP 404 `{"version":1,"confirmed":null}` with nothing confirmed; `GET /api/snapshots/pending` entries carry `"dissent": true|false`; `POST /api/snapshots/statement` at a height the owner cleared is refused with exactly `422 {"error":"closed-height"}`. The app does not read `GET /api/snapshots/disputes`. Nothing the website says is trusted: loading still goes through `attested_snapshot::prepare_confirmed` and `confirmed_load::load`, which check everything again.
+- The website (routes, replies and limits exactly as the website plan's Global Constraints): `https://easybtx.com`, overridable with `EASYNODE_SNAPSHOT_SITE` only to another `https://` origin or to `http://127.0.0.1:<port>` / `http://localhost:<port>` (no path, no user info); header `x-ebtx-node: ebtx-snapshot-v1` on every write; every body `content-type: application/octet-stream`; parts of at most 4,194,304 bytes; client timeout 120 s. `GET /api/snapshots/latest` answers the pointer, or HTTP 200 with exactly `{"disputed": [<height>, ...]}` while a dispute stands, or HTTP 404 `{"version":1,"confirmed":null}` with nothing confirmed; `GET /api/snapshots/latest`, `/pending` and `/disputes` all answer `400` for any query other than empty or exactly `?chain=main` / `?chain=regtest`; `GET /api/snapshots/pending` entries carry `"dissent": true|false`; `POST /api/snapshots/statement` at a height the owner cleared is refused with exactly `422 {"error":"closed-height"}`; the file upload's `PUT` (a part) and its `complete` answer `409` exactly as `start` does, when the file is already stored or the upload was let go. The app does not read `GET /api/snapshots/disputes`. Nothing the website says is trusted: loading still goes through `attested_snapshot::prepare_confirmed` and `confirmed_load::load`, which check everything again.
 - Operator list: the core plan's `crates/btx-core/snapshot-operators.json`, compiled by `operators.rs` (Mende; Aleksander with three keys; jpp; and the mirrors' pins). It is the only place the list is written; this plan adds no second writer, and the website needs nothing from this repository beyond that file, which it copies byte for byte. Test chains: `EASYNODE_REGTEST_OPERATORS` (`name=key[,key];name=key`), only for regtest statements.
 - CI gates, all must pass before each commit that touches them: in `crates/btx-core` and `apps/node/src-tauri`: `cargo fmt --all --check`, `cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious`, `cargo test --locked` (in `crates/btx-core` this also runs `btx-confirmer`'s own tests); in `apps/node`: `npx tsc --noEmit`, `npm test`, `npx vite build`.
 - The Tauri crate needs `apps/node/src-tauri/resources/node-pkg/` to hold one file for `cargo check`/`test` (CI writes `CI-PLACEHOLDER`): `mkdir -p apps/node/src-tauri/resources/node-pkg && echo placeholder > apps/node/src-tauri/resources/node-pkg/CI-PLACEHOLDER` if it is empty (the folder is gitignored).
@@ -1780,7 +1782,13 @@ pub fn dissent_from(entry: &DiaryEntry, rules: &ChainRules) -> Result<Statement,
         &rules.genesis,
         &rules.replay_context,
         &rules.shielded,
-    );
+    )
+    .ok_or_else(|| {
+        Mismatch::Unreadable(format!(
+            "the diary's height does not fit a statement: {}",
+            entry.height
+        ))
+    })?;
     Ok(Statement::from_raw(raw))
 }
 ````
@@ -2391,7 +2399,7 @@ pub async fn upload_file(
         f.read_exact(&mut part)
             .await
             .map_err(|e| SiteError::Unreadable(format!("{}: {e}", file.display())))?;
-        let _: serde_json::Value = answer(
+        let put: Result<serde_json::Value, SiteError> = answer(
             client
                 .put(format!(
                     "{url}?statement={statement_hash}&upload={}&part={n}",
@@ -2403,9 +2411,14 @@ pub async fn upload_file(
                 .send()
                 .await,
         )
-        .await?;
+        .await;
+        match put {
+            Ok(_) => {}
+            Err(SiteError::Refused { status: 409, .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        }
     }
-    answer(
+    match answer(
         client
             .post(format!(
                 "{url}?statement={statement_hash}&upload={}&action=complete",
@@ -2416,7 +2429,11 @@ pub async fn upload_file(
             .await,
     )
     .await
-    .map(Some)
+    {
+        Ok(stored) => Ok(Some(stored)),
+        Err(SiteError::Refused { status: 409, .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 ````
 
@@ -7581,7 +7598,7 @@ The core plan was amended in parallel with this one. Every name below was checke
 | `confirmed_snapshot::SNAPSHOT_DEPTH: u32` (144) | the depth | `snapshot_serve::CONFIRMATIONS_REQUIRED`; `statement_check`'s tests |
 | `confirmed_snapshot::check_shape(&Statement, &ChainRules) -> Result<u64, Refusal>` | chain fields (version, chain id, replay context, shielded commitment), not a dissent, file geometry and size, grid; the height | `statement_check::{verdict, check_against_node}`; `statement_check`'s test of a dissent |
 | `confirmed_snapshot::is_dissent(&Statement) -> bool` | all four file fields zero | `snapshot_confirmer::Confirmer::confirm_one`, `statement_check`'s test |
-| `confirmed_snapshot::dissent_statement(height: u64, &Hash32 block, &Hash32 hash_serialized, coins: u64, chain_tx: u64, &Hash32 chain_id, &Hash32 replay_context, &Hash32 shielded) -> [u8; STATEMENT_LEN]` | a dissent's 229 bytes, wrapped with `Statement::from_raw` | `statement_check::dissent_from` only |
+| `confirmed_snapshot::dissent_statement(height: u64, &Hash32 block, &Hash32 hash_serialized, coins: u64, chain_tx: u64, &Hash32 chain_id, &Hash32 replay_context, &Hash32 shielded) -> Option<[u8; STATEMENT_LEN]>` | a dissent's 229 bytes, wrapped with `Statement::from_raw`; `None` when `height` does not fit the statement's 32-bit height field | `statement_check::dissent_from` only |
 | `ChainRules::shielded: Hash32` | the shielded commitment compiled for the chain (`MAINNET_SHIELDED_COMMITMENT` `94343b76…4541`, `REGTEST_SHIELDED_COMMITMENT` `e802781d…1d5e`) | `statement_check::dissent_from` and its test |
 | `node_api::read_chainstates_validated(&dyn Rpc) -> bool` (over the pure `chainstates_validated(Option<&Value>)`) | the validated gate | `diary::gate_open` only |
 | `attested_snapshot::{Latest, parse_latest}` (`Latest::Confirmed(ConfirmedPointer)`, `Latest::Disputed(Vec<u64>)`) | `latest`'s HTTP 200 answer | `snapshot_site::get_latest` (re-exported as `snapshot_site::Latest`); the rehearsal |

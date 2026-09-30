@@ -94,10 +94,11 @@ pub struct SnapshotSpec {
 /// share.
 ///
 /// ⚠ This pin REQUIRES an engine that compiles 219000 into `m_assumeutxo_data`.
-/// v0.34.9 (84b998b4) does. v0.34.5 and v0.34.6 stop at 203000, and there is no
-/// v0.34.7 tag, although the entry's comment calls 219000 the "0.34.7 release
-/// base". Paired with an older engine, `loadtxoutset` refuses and a fast start
-/// becomes a sync from genesis. `NODE_RELEASE_TAG` and this spec move together;
+/// v0.34.9 (84b998b4) and v0.34.12 (5f32c4c4) do. v0.34.5 and v0.34.6 stop at
+/// 203000, and there is no v0.34.7 tag, although the entry's comment calls
+/// 219000 the "0.34.7 release base". Paired with an older engine,
+/// `loadtxoutset` refuses and a fast start becomes a sync from genesis.
+/// `NODE_RELEASE_TAG` and this spec move together;
 /// a test in commands.rs holds them to it.
 pub fn v0_34_9_spec() -> SnapshotSpec {
     SnapshotSpec {

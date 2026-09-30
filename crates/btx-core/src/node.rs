@@ -835,6 +835,36 @@ pub fn build_node_command(
     // default: the most-work chain, with the fork detector (btx_core::fork)
     // saying out loud when a longer chain exists that this node cannot get.
     args.push("-parkdeepreorg=0".to_string());
+    // ...and on engine v0.34.12 and newer, legacy reorg mode beside it, so the
+    // node keeps the reorg behaviour it had on 0.34.9. 0.34.12 added
+    // `-reorgpolicy` with `bounded` as the default, and under bounded an
+    // explicit `-parkdeepreorg=0` is an init error: "-parkdeepreorg=0
+    // conflicts with -reorgpolicy=bounded. Use -reorgpolicy=legacy to follow a
+    // deeper chain without the recovery ceiling."
+    // (node/chainstatemanager_args.cpp:182-186 at v0.34.12, turned into
+    // InitError at init.cpp:2214-2216). Legacy skips the bounded decision
+    // (validation.cpp:10600) and keeps the park action `-parkdeepreorg` chooses
+    // (chainstatemanager_args.cpp:138-141), and with it at 0 the node never
+    // parks (kernel/chainstatemanager_opts.h:212-222). Bounded on a trusted
+    // mirror can also spin at 100% CPU holding cs_main when a signed competing
+    // prefix is deeper than 6 (upstream PR 211, not merged on 2026-09-30), and
+    // most easyNode nodes are trusted mirrors.
+    //
+    // The command line outranks a `reorgpolicy=` in the conf and in the
+    // datadir's btx_rw.conf, the same as every flag here (common/settings.cpp
+    // MergeSettings, v0.34.12). Measured 2026-09-30 on the v0.34.12 binary,
+    // regtest: with `reorgpolicy=bounded`, `parkdeepreorg=0` and
+    // `deepforkautoresolve=0` in the conf and `reorgpolicy=bounded` in
+    // btx_rw.conf, this launch started and logged `Command-line arg:
+    // reorgpolicy="legacy"`.
+    //
+    // Gated on the version in the install path like the flags below: v0.34.9
+    // refuses the argument outright ("Error parsing command line arguments:
+    // Invalid parameter -reorgpolicy=legacy", measured the same day), and the
+    // app launches the previous engine when provisioning a new one fails.
+    if node_has_reorg_policy(btxd) {
+        args.push("-reorgpolicy=legacy".to_string());
+    }
     // The prune posture must be EXPLICIT, for the same reason
     // -matmulvalidation is below: btxd loads the datadir's btx_rw.conf on every
     // start regardless of -conf, and a READ-WRITE setting outranks a config
@@ -1469,6 +1499,25 @@ fn node_allows_degraded_matmul_start(btxd: &Path) -> bool {
     (major, minor, patch) >= (0, 34, 5)
 }
 
+/// Whether the btxd at `path` has `-reorgpolicy`, i.e. is v0.34.12 or newer.
+/// v0.34.12 added it (init.cpp:694) with `bounded` as the default, which
+/// refuses the `-parkdeepreorg=0` every launch passes, so a launch of this
+/// engine must say `-reorgpolicy=legacy`. Older engines reject the unknown
+/// argument FATALLY, so this fails safe to `false` for any older, unknown or
+/// tag-less path, like the gates above.
+fn node_has_reorg_policy(btxd: &Path) -> bool {
+    let Some(tag) = release_tag_from_btxd_path(btxd) else {
+        return false;
+    };
+    let Some(v) = parse_tag_version(&tag) else {
+        return false;
+    };
+    let major = v.first().copied().unwrap_or(0);
+    let minor = v.get(1).copied().unwrap_or(0);
+    let patch = v.get(2).copied().unwrap_or(0);
+    (major, minor, patch) >= (0, 34, 12)
+}
+
 /// The `-matmulrcexecution` mode this host should run, or `None` to leave
 /// btxd's own default in place.
 ///
@@ -1795,6 +1844,18 @@ pub const PRUNED_DATADIR_REFUSED_MARKER: &str = "Block files have previously bee
 /// node up.
 pub const RPC_BIND_FAILED_MARKER: &str = "Unable to bind all endpoints for RPC server";
 
+/// Shared by engine v0.34.12's two init refusals under its default
+/// `-reorgpolicy=bounded`: an explicit `-parkdeepreorg=0` or
+/// `-deepforkautoresolve=0` (node/chainstatemanager_args.cpp:182-190). btxd
+/// prints it on stderr and exits before RPC binds.
+///
+/// It cannot come from a conf while the launch passes `-reorgpolicy=legacy`,
+/// because the command line outranks every conf (measured, see
+/// `build_node_command`). So it means this start did not pass it: the btxd in
+/// the install folder is 0.34.12 or newer while the folder's name, which is
+/// what `node_has_reorg_policy` reads, says older.
+pub const REORG_POLICY_CONFLICT_MARKER: &str = "conflicts with -reorgpolicy";
+
 pub fn launch_failure_hint(text: &str) -> Option<&'static str> {
     if text.contains(PRUNED_DATADIR_REFUSED_MARKER) {
         return Some(
@@ -1821,6 +1882,14 @@ pub fn launch_failure_hint(text: &str) -> Option<&'static str> {
             "the engine refused to validate on this Mac's graphics chip. The app retries \
              as a trusted mirror on its own, so reaching this message means that retry \
              did not start either.",
+        );
+    }
+    if text.contains(REORG_POLICY_CONFLICT_MARKER) {
+        return Some(
+            "the node engine refused its reorg settings because it is 0.34.12 or newer and \
+             this start did not put it in legacy reorg mode, which easyNode does only when \
+             the engine's install folder is named for 0.34.12 or newer, so the engine in that \
+             folder is newer than its name says; nothing in the node folder is damaged.",
         );
     }
     None
@@ -1944,21 +2013,6 @@ pub fn apply_start_choice(
     )
 }
 
-/// Does this node run on a signed snapshot? True while the engine's record of
-/// the snapshot's signed manifest is under `chainstate_snapshot/`
-/// ([`attested_snapshot_record`]; the decision of 2026-09-29, "every node
-/// starts near the tip", section 8).
-///
-/// The record outlives the background check of the older history by one
-/// start. It stays under `chainstate_snapshot/` until the first start after
-/// that check finishes, and that start moves it with the folder to
-/// `chainstate/`, where it no longer counts. So this says "signed", not
-/// "still being checked": for that, ask the engine
-/// (`node_api::HistoryProgress::unchecked`).
-pub fn on_signed_snapshot(datadir: &Path) -> bool {
-    attested_snapshot_record(datadir).exists()
-}
-
 /// Whether THIS launch should run as a trusted mirror.
 ///
 /// `trusted_mirror_enabled` answers the static question ("is this a host class
@@ -2060,9 +2114,13 @@ pub fn signs_here(conf: &Path) -> bool {
 ///
 /// The key is read from the file the conf line names (relative to the
 /// datadir, as the engine resolves it on mainnet). `None` when there is no
-/// line, the key cannot be read, or the conf already pins that key: the
-/// engine refuses a duplicate `-matmultrustedpubkey`, and a hand-managed conf
-/// may already carry it.
+/// line, the key cannot be read, or the conf or the datadir's `btx_rw.conf`
+/// already pins that key: the engine refuses a duplicate
+/// `-matmultrustedpubkey`, and a hand-managed conf, or a mirror-era leftover
+/// pin in `btx_rw.conf` (final review O1), may already carry it. `btxd`
+/// loads `btx_rw.conf` on every start regardless of `-conf` and merges its
+/// list settings with the command line, so a key it already pins must count
+/// here the same as a key `conf` pins.
 pub fn signing_key_self_pin(conf: &Path, datadir: &Path) -> Option<String> {
     let named = crate::setup::conf_kv(conf, crate::signer::SIGNER_KEY_CONF_KEY)?;
     let named = named.trim();
@@ -2076,7 +2134,9 @@ pub fn signing_key_self_pin(conf: &Path, datadir: &Path) -> Option<String> {
     };
     let wif = std::fs::read_to_string(key_path).ok()?;
     let pubkey = crate::signer::wif_to_pubkey_hex(&wif).ok()?;
-    let already_pinned = conf_pins(conf)
+    let mut already_pinned = conf_pins(conf);
+    already_pinned.extend(rw_conf_pins(&datadir.join("btx_rw.conf")));
+    let already_pinned = already_pinned
         .iter()
         .any(|v| v.eq_ignore_ascii_case(&pubkey));
     (!already_pinned).then_some(pubkey)
@@ -2108,13 +2168,117 @@ pub fn rw_conf_pins(rw_conf: &Path) -> Vec<String> {
     pins_read(rw_conf, true)
 }
 
-/// The two readers' one parser. `sections_dropped`: every section counts.
+/// The engine's `InterpretBool` (`common/args.cpp:65-70` at `84b998b4`),
+/// backed by `LocaleIndependentAtoi<int>` (`util/strencodings.h:119-144`):
+/// an empty value reads true. Otherwise, leading whitespace and a single
+/// leading `+` are skipped (a `+` directly followed by `-` is the engine's
+/// own special case and reads 0), then the leading `-`-or-digits run is
+/// atoi'd, C-`int`-style: no digit run at all reads 0, and a number too
+/// big or small for `int` does NOT read 0, it saturates to `i32::MAX` or
+/// `i32::MIN`. Since we only need "zero or not," and a saturated value is
+/// never zero, this only has to know whether that digit run holds any
+/// digit other than `0` - never how big the number actually is, so no
+/// parse can overflow here.
+fn interpret_bool(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    let s = value.trim_start();
+    let s = match s.strip_prefix('+') {
+        Some(rest) if rest.starts_with('-') => return false,
+        Some(rest) => rest,
+        None => s,
+    };
+    let end = s
+        .char_indices()
+        .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && c == '-')))
+        .map_or(s.len(), |(i, _)| i);
+    s[..end].bytes().any(|b| b.is_ascii_digit() && b != b'0')
+}
+
+/// The two readers' one parser.
+///
+/// `sections_dropped` (`btx_rw.conf`): the engine reads it as one span,
+/// every section merged into the same list regardless of where a line
+/// sits (`common/config.cpp` ~111, `settings_target`). Otherwise (a
+/// general conf file) mainnet reads it as the engine does: `[main]`/
+/// `main.` and the default section are the engine's own two SEPARATE
+/// lists (`common/config.cpp:113`,
+/// `m_settings.ro_config[key.section][key.name].push_back(...)`, at
+/// `84b998b4`, keyed first by the section `InterpretKey` computes, so a
+/// pin under `[test]` or with the `test.` prefix is in neither list and is
+/// not read here); a `[main]`/`main.` line and a same-named default-
+/// section line do not share one list even though they end up in the same
+/// pin count.
+///
+/// Negation follows the engine's `InterpretValue` (`common/args.cpp:113-
+/// 128` at `84b998b4`, reached for every conf line through `InterpretKey`
+/// and `ReadConfigStream`, `common/config.cpp:98-106`): a
+/// `nomatmultrustedpubkey=` line, with an empty value or one that reads
+/// true per [`interpret_bool`], clears every pin read so far for its own
+/// list only (`SettingsSpan::negated`, `common/settings.cpp:281-287`).
+/// `nomatmultrustedpubkey=0` is the documented double negative and does
+/// NOT clear - though it is not harmless: that line becomes a bogus `true`
+/// entry in the pin list itself (`GetArgs`, `common/args.cpp:369-375`,
+/// `value.isTrue() ? "1" : ...`), and the engine refuses to start on it
+/// ("Invalid compressed public key in -matmultrustedpubkey: 1",
+/// `init.cpp:1577-1583`).
+///
+/// The two lists are merged `[main]`'s pins first, then the default
+/// section's (`GetSettingsList`, `common/settings.cpp:216-259`, source
+/// order in `MergeSettings`, `common/settings.cpp:24-31,42-74`), always:
+/// this function does NOT drop the default section's pins even when
+/// `[main]`'s own list ends in a negation.
+///
+/// That IS one of the engine's real rules (the "zombie" revival,
+/// `prev_negated_empty |= span.last_negated() && result.empty()`,
+/// `GetSettingsList` again), but only half of it: the engine drops the
+/// default section's pins on a `[main]`-ending negation ONLY WHEN
+/// `result` - which by then already holds whatever the command line and
+/// `btx_rw.conf` contributed, since those merge before either conf-file
+/// section - is STILL empty at that point. This function reads one conf
+/// file in isolation and has no way to know that, so it cannot apply the
+/// rule correctly; and getting it wrong the other way (dropping the
+/// default section's pins when the engine would have kept them) is worse
+/// than useless here: this app fills the command line with every shipped
+/// key it does not think is already pinned (the mirror and validating
+/// arms below, and `signing_key_self_pin`), so a key this function wrongly
+/// calls "not pinned" gets pushed on the command line, `result` is then
+/// NOT empty by the time the engine reaches the default section, the
+/// engine revives that same key from the conf file after all, and the
+/// engine refuses to start on the duplicate ("Duplicate
+/// -matmultrustedpubkey", `init.cpp:1591-1596`). Always counting the
+/// default section's pins as live avoids that: the one way this can still
+/// be wrong is the corner the engine's own rule actually drops them
+/// (`result` genuinely empty). There, the cost is never a duplicate
+/// refusal: at worst the default section's pins are missing, which the
+/// engine may itself refuse over, as it would for any choice this app
+/// could make there (a mainnet mirror with fewer than 2 signers is
+/// refused, `init.cpp:1831` at `84b998b4`; a validating node on a signed
+/// snapshot needs the default section's pins too, see the pin rule above
+/// in `build_node_command`).
+///
+/// What this function does not follow at all, for the same one-file-at-a-
+/// time reason, and the app only takes the union of [`conf_pins`] and
+/// [`rw_conf_pins`] to avoid asking the engine to pin a key twice, never
+/// which file's value "wins": `rw_conf_pins` and `conf_pins` are read
+/// independently here and do not know about each other, so a
+/// `btx_rw.conf` whose own list ends in a negation would, on the engine's
+/// side, feed into that same `result.empty()` test for the conf file's
+/// sections one level up - not modeled here either, for the same reason
+/// and with the same "at worst a missing pin" cost.
 fn pins_read(conf: &Path, sections_dropped: bool) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(conf) else {
         return Vec::new();
     };
     let mut prefix = String::new();
-    let mut pins = Vec::new();
+    // `sections_dropped`: `default_pins` is the file's one flat list.
+    // Otherwise: `main_pins` is `[main]`/`main.`'s own list and
+    // `default_pins` is the default section's, each cleared independently
+    // by its own negations; see the doc comment for why they are always
+    // both kept, never one dropped for the other.
+    let mut default_pins = Vec::new();
+    let mut main_pins = Vec::new();
     for raw in text.lines() {
         let l = raw.split('#').next().unwrap_or("").trim();
         if l.len() >= 2 && l.starts_with('[') && l.ends_with(']') {
@@ -2129,13 +2293,37 @@ fn pins_read(conf: &Path, sections_dropped: bool) -> Vec<String> {
             Some((section, key)) => (Some(section), key),
             None => (None, full.as_str()),
         };
-        let mainnet_reads = sections_dropped || matches!(section, None | Some("main"));
         let value = value.trim();
-        if mainnet_reads && key == "matmultrustedpubkey" && !value.is_empty() {
-            pins.push(value.to_ascii_lowercase());
+        if sections_dropped {
+            if key == "matmultrustedpubkey" && !value.is_empty() {
+                default_pins.push(value.to_ascii_lowercase());
+            } else if key == "nomatmultrustedpubkey" && interpret_bool(value) {
+                default_pins.clear();
+            }
+            continue;
+        }
+        let is_main = match section {
+            Some("main") => true,
+            None => false,
+            _ => continue, // [test]/[regtest]/etc.: mainnet does not read it.
+        };
+        let pins = if is_main {
+            &mut main_pins
+        } else {
+            &mut default_pins
+        };
+        if key == "matmultrustedpubkey" {
+            if !value.is_empty() {
+                pins.push(value.to_ascii_lowercase());
+            }
+        } else if key == "nomatmultrustedpubkey" && interpret_bool(value) {
+            pins.clear();
         }
     }
-    pins
+    if sections_dropped {
+        return default_pins;
+    }
+    main_pins.into_iter().chain(default_pins).collect()
 }
 
 /// The engine's record that this node runs on a signed snapshot whose
@@ -4865,6 +5053,29 @@ consensus-validator service.";
         );
     }
 
+    /// Verbatim from the v0.34.12 binary on 2026-09-30, regtest, started with
+    /// `-parkdeepreorg=0` and no `-reorgpolicy`: it prints this on stderr
+    /// (easybtx-node.log) and exits 1 before debug.log says anything. The
+    /// second is its sibling for `-deepforkautoresolve=0`
+    /// (chainstatemanager_args.cpp:187-190).
+    #[test]
+    fn a_reorg_policy_refusal_is_named_and_is_not_a_reason_to_wipe() {
+        for log in [
+            "Error: -parkdeepreorg=0 conflicts with -reorgpolicy=bounded. Use \
+             -reorgpolicy=legacy to follow a deeper chain without the recovery ceiling.",
+            "Error: -deepforkautoresolve=0 conflicts with -reorgpolicy=bounded. Bounded mode \
+             replaces that bypass; use -reorgpolicy=legacy to keep it.",
+        ] {
+            let hint = launch_failure_hint(log).expect("a reorg policy refusal must be named");
+            assert!(hint.contains("0.34.12"), "{hint}");
+            assert!(
+                !hint.to_lowercase().contains("remove node data"),
+                "a refused setting must never read as a reason to wipe: {hint}"
+            );
+            assert!(!hint.contains('\u{2014}'), "{hint}");
+        }
+    }
+
     #[test]
     fn a_pruned_datadir_refusal_is_named_and_an_unknown_exit_is_not_guessed_at() {
         const REAL_PRUNED_REFUSAL: &str = "2026-08-30T21:17:13Z LoadBlockIndexDB: last block \
@@ -5027,30 +5238,6 @@ consensus-validator service.";
         assert!(serde_json::from_value::<StartChoice>(serde_json::json!("fast")).is_err());
         let none: Option<StartChoice> = serde_json::from_value(serde_json::Value::Null).unwrap();
         assert_eq!(none, None);
-    }
-
-    /// The engine keeps a signed snapshot's manifest beside the snapshot's
-    /// chain state until the first start after the background check, which
-    /// moves it to `chainstate/`, where it no longer counts.
-    #[test]
-    fn a_signed_snapshot_is_read_from_the_engines_own_file() {
-        let tmp = tempfile::tempdir().expect("temp datadir");
-        let dir = tmp.path();
-        assert!(!on_signed_snapshot(dir));
-        std::fs::create_dir_all(dir.join("chainstate_snapshot")).unwrap();
-        assert!(!on_signed_snapshot(dir), "an unsigned snapshot is not one");
-        std::fs::write(
-            dir.join("chainstate_snapshot").join("attested_assumeutxo"),
-            b"x",
-        )
-        .unwrap();
-        assert!(on_signed_snapshot(dir));
-        assert!(attested_snapshot_record(dir).exists(), "the one record");
-
-        // The first start after the check: the folder becomes chainstate/.
-        std::fs::rename(dir.join("chainstate_snapshot"), dir.join("chainstate")).unwrap();
-        assert!(dir.join("chainstate").join("attested_assumeutxo").exists());
-        assert!(!on_signed_snapshot(dir), "a retired snapshot's record");
     }
 
     /// A non-Metal host is a mirror on the static rule alone, with or without
@@ -5580,6 +5767,41 @@ consensus-validator service.";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Final review O1: `btx_rw.conf` is loaded on every start regardless of
+    /// `-conf` and merges into the same list as the command line
+    /// (`common/config.cpp`, `common/settings.cpp` `GetSettingsList`), so a
+    /// signer's own key already pinned there must count too. Without this,
+    /// a host carrying a mirror-era leftover pin of its own key in
+    /// `btx_rw.conf` gets the engine's duplicate-pin refusal at init
+    /// (init.cpp:1591-1596 at 84b998b4).
+    #[test]
+    fn a_signer_already_pinned_in_btx_rw_conf_is_not_pinned_again() {
+        let dir = std::env::temp_dir().join(format!("easynode-self-pin-rw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wif = crate::signer::generate_wif();
+        let pubkey = crate::signer::wif_to_pubkey_hex(&wif).unwrap();
+        std::fs::write(dir.join(crate::signer::SIGNER_KEY_FILE), format!("{wif}\n")).unwrap();
+        let conf = dir.join("signing.conf");
+        std::fs::write(
+            &conf,
+            "server=1\nmatmulattestationsignerkeyfile=attestation-signer.key\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("btx_rw.conf"),
+            format!("matmultrustedpubkey={pubkey}\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            signing_key_self_pin(&conf, &dir),
+            None,
+            "btx_rw.conf already pins the signer's own key"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn on_a_degraded_start_engine_a_keyless_cpu_host_is_a_trusted_mirror() {
         // The 08-31 rule sent this host into consensus mode too, where it
@@ -5872,6 +6094,47 @@ consensus-validator service.";
             Backend::Cpu,
         );
         assert!(!args.iter().any(|a| a.starts_with("-matmulrcexecution")));
+    }
+
+    /// Both sides of the 0.34.12 line, on every backend. v0.34.12 refuses
+    /// `-parkdeepreorg=0` under its default `-reorgpolicy=bounded`, and
+    /// v0.34.9 refuses `-reorgpolicy` as an unknown argument (measured on both
+    /// binaries, regtest, 2026-09-30). So the flag goes to 0.34.12 and newer
+    /// only, and `-parkdeepreorg=0` stays on both sides.
+    #[test]
+    fn legacy_reorg_mode_goes_only_to_an_engine_that_has_it() {
+        let dd = Path::new("/dd");
+        let conf = Path::new("/dd/btx.conf");
+        for backend in [Backend::Metal, Backend::Cuda, Backend::Cpu] {
+            for tag in ["v0.34.12", "v0.34.12-5f32c4c4", "v0.34.13", "v0.35.0"] {
+                let btxd = PathBuf::from(format!("/x/btx/{tag}/plat/bin/btxd"));
+                let (_, args, _) = build_node_command(&btxd, dd, conf, backend);
+                assert!(
+                    args.iter().any(|a| a == "-reorgpolicy=legacy"),
+                    "{tag} {backend:?}: {args:?}"
+                );
+                assert!(
+                    args.iter().any(|a| a == "-parkdeepreorg=0"),
+                    "{tag} {backend:?}: {args:?}"
+                );
+            }
+            for btxd in [
+                "/x/btx/v0.34.9/plat/bin/btxd",
+                "/x/btx/v0.34.6-3013c2c2/plat/bin/btxd",
+                "/x/btx/v0.34.11/plat/bin/btxd",
+                "/data/bin/btxd",
+            ] {
+                let (_, args, _) = build_node_command(Path::new(btxd), dd, conf, backend);
+                assert!(
+                    !args.iter().any(|a| a.starts_with("-reorgpolicy")),
+                    "{btxd} {backend:?}: {args:?}"
+                );
+                assert!(
+                    args.iter().any(|a| a == "-parkdeepreorg=0"),
+                    "{btxd} {backend:?}: {args:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -6870,7 +7133,10 @@ matmul: metal runtime_probe_ok, selecting metal\n\
     /// a commented line and a longer name ending in the option's do not. In
     /// `btx_rw.conf` the engine drops the section (`config.cpp` ~111,
     /// `settings_target`), so every section counts there, and a `test.`
-    /// line applies on mainnet.
+    /// line applies on mainnet. `conf_pins`'s two survivors come back
+    /// `[main]`'s pins first, then the default section's, the engine's own
+    /// merge order (`GetSettingsList`, `settings.cpp:216-259`), not file
+    /// order.
     #[test]
     fn conf_pins_counts_only_what_mainnet_reads_and_btx_rw_conf_drops_sections() {
         let dir = signed_snapshot_datadir("conf-pins-sections");
@@ -6903,13 +7169,227 @@ matmul: metal runtime_probe_ok, selecting metal\n\
             ),
         )
         .unwrap();
-        assert_eq!(conf_pins(&conf), vec![k(1), k(5), k(8)]);
+        assert_eq!(
+            conf_pins(&conf),
+            vec![k(5), k(8), k(1)],
+            "[main]'s pins (k5, k8) come before the default section's (k1), engine order"
+        );
         assert_eq!(
             rw_conf_pins(&conf),
             vec![k(1), k(3), k(5), k(6), k(7), k(8)],
             "btx_rw.conf: the section is dropped"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The engine reads `nomatmultrustedpubkey=1` (and, on the command
+    /// line only, a bare `-nomatmultrustedpubkey`) as clearing the pins
+    /// read so far at that point (`InterpretValue`, `common/args.cpp:113-
+    /// 128` at `84b998b4`, called for every conf line by
+    /// `ReadConfigStream`, `common/config.cpp:98-106`). `nomatmultrustedpubkey=0`
+    /// is the documented double negative and does NOT clear
+    /// (`InterpretValue`'s `value && !InterpretBool(*value)` arm) - though
+    /// it is not harmless: `conf_pins` runs, here as it does while building
+    /// launch arguments (~1225, ~1287), before the app ever starts the
+    /// engine on this conf, and the engine reads that same line as a bogus
+    /// `"1"` pin value (`GetArgs`, `common/args.cpp:369-375`) and refuses to
+    /// start ("Invalid compressed public key in -matmultrustedpubkey: 1",
+    /// `init.cpp:1577-1583`) once the app does launch it. A negation
+    /// under `[test]` or `test.` does not touch mainnet's list, same as a
+    /// pin there is not read; one under `[main]` or `main.` does, same as
+    /// the section tests above (also see
+    /// `pins_read_keeps_the_conf_files_two_sections_separate` for how a
+    /// `[main]`/default-section pair actually merges).
+    #[test]
+    fn a_no_line_clears_the_pins_read_so_far_in_that_file() {
+        let dir = signed_snapshot_datadir("conf-pins-negation");
+        let k = |n: u8| format!("02{}", format!("{n:02x}").repeat(32));
+        let conf = dir.join("negation.conf");
+
+        // A pin, then nomatmultrustedpubkey=1, then another pin: only the
+        // last pin survives.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\nnomatmultrustedpubkey=1\nmatmultrustedpubkey={}\n",
+                k(1),
+                k(2)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(2)]);
+
+        // nomatmultrustedpubkey=0 is the double negative: it does not
+        // clear (the engine would still refuse to start on this conf; see
+        // the doc comment above).
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\nnomatmultrustedpubkey=0\nmatmultrustedpubkey={}\n",
+                k(1),
+                k(2)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(1), k(2)]);
+
+        // A bare no-value line is also a clear, same as =1.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\nnomatmultrustedpubkey=\nmatmultrustedpubkey={}\n",
+                k(3),
+                k(4)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(4)]);
+
+        // Inside [main]: a pin, a clear, another pin, same rule.
+        std::fs::write(
+            &conf,
+            format!(
+                "[main]\nmatmultrustedpubkey={}\nnomatmultrustedpubkey=1\nmatmultrustedpubkey={}\n",
+                k(5),
+                k(6)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(6)]);
+
+        // A clear under [test] does not touch mainnet's list.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\n[test]\nnomatmultrustedpubkey=1\nmatmultrustedpubkey={}\n",
+                k(7),
+                k(8)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(7)], "the [test] clear stays there");
+
+        // btx_rw.conf drops sections, so a clear there is read wherever it sits.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\n[test]\nnomatmultrustedpubkey=1\nmatmultrustedpubkey={}\n",
+                k(9),
+                k(1)
+            ),
+        )
+        .unwrap();
+        assert_eq!(rw_conf_pins(&conf), vec![k(1)]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The engine keeps a conf file's `[main]`/`main.` pins and its default
+    /// section's pins as two separate lists (`common/config.cpp:113`,
+    /// `m_settings.ro_config[key.section][key.name].push_back(...)`, at
+    /// `84b998b4`): a negation clears only its own section's list
+    /// (`SettingsSpan::negated`, `common/settings.cpp:281-287`), and
+    /// `GetSettingsList` (`common/settings.cpp:216-259`) merges `[main]`'s
+    /// list before the default section's, so `pins_read` always returns
+    /// `[main]`'s pins first, then the default section's. See
+    /// `pins_read`'s own doc comment for why it does NOT also apply the
+    /// engine's further rule that drops the default section's pins when
+    /// `[main]`'s own list ends in a negation: that rule needs to know
+    /// whether the command line and `btx_rw.conf` already contributed
+    /// something, which this function, reading one conf file alone,
+    /// cannot.
+    #[test]
+    fn pins_read_keeps_the_conf_files_two_sections_separate() {
+        let dir = signed_snapshot_datadir("conf-pins-sections-separate");
+        let k = |n: u8| format!("02{}", format!("{n:02x}").repeat(32));
+        let conf = dir.join("sections-separate.conf");
+
+        // Scenario A: a default pin, then [main] clears and re-pins. The
+        // default pin is not cleared by [main]'s own negation: it comes
+        // back after [main]'s surviving pin, engine order.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\n[main]\nnomatmultrustedpubkey=1\nmatmultrustedpubkey={}\n",
+                k(1),
+                k(2)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            conf_pins(&conf),
+            vec![k(2), k(1)],
+            "K2 then K1, engine order"
+        );
+
+        // Scenario B: a main.-prefixed pin (still the [main] section, no
+        // header needed), then the DEFAULT section's own negation. The
+        // default section's negation cannot reach [main]'s span: it only
+        // clears its own (empty) list.
+        std::fs::write(
+            &conf,
+            format!(
+                "main.matmultrustedpubkey={}\nnomatmultrustedpubkey=1\n",
+                k(3)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(3)]);
+
+        // The main. prefix form of Scenario A, no [main] header at all:
+        // same rule, same result.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\nmain.nomatmultrustedpubkey=1\nmain.matmultrustedpubkey={}\n",
+                k(4),
+                k(5)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            conf_pins(&conf),
+            vec![k(5), k(4)],
+            "K5 then K4, engine order"
+        );
+
+        // [main]'s own list ending in a negation: the engine only drops
+        // the default section's pins here when `result` (which already
+        // holds anything from the command line and btx_rw.conf, merged
+        // before either conf-file section) is STILL empty at that point
+        // (`GetSettingsList`'s `prev_negated_empty |= span.last_negated()
+        // && result.empty()`, `settings.cpp:216-259`). This function reads
+        // one conf file in isolation and cannot know that, so it always
+        // keeps the default section's pin: K6 survives.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\n[main]\nmatmultrustedpubkey={}\nnomatmultrustedpubkey=1\n",
+                k(6),
+                k(7)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(6)]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `LocaleIndependentAtoi<int>` (`util/strencodings.h:119-144` at
+    /// `84b998b4`) saturates an out-of-range number to `i32::MAX` rather
+    /// than failing, so it is never zero: `interpret_bool` must read it as
+    /// true, not fall back to 0 on the overflow the way a plain
+    /// `str::parse` would.
+    #[test]
+    fn interpret_bool_reads_an_overflowing_number_as_true_not_zero() {
+        assert!(interpret_bool("99999999999999999999"));
+        assert!(interpret_bool("1"));
+        assert!(!interpret_bool("0"));
+        assert!(!interpret_bool("00000"));
+        assert!(interpret_bool(""));
+        assert!(!interpret_bool("abc"));
+        assert!(interpret_bool("+5"));
+        assert!(!interpret_bool("+-5"), "the engine's own +- special case");
     }
 
     /// Final review M7, the scenario: a hand-edited conf that pins the

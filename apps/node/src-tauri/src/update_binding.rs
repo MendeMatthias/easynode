@@ -52,8 +52,8 @@
 //! # What this copy will not download on its own
 //!
 //! Two offers are declined before anything is downloaded, with a notice that
-//! says what to do instead (docs/decisions/2026-09-28-deb-installs-update-
-//! themselves.md). A copy installed from the .deb, offered a release that lists
+//! says what to do instead (docs/decisions/2026-09-28-deb-installs-update-themselves.md).
+//! A copy installed from the .deb, offered a release that lists
 //! the AppImage and no .deb: the plugin would fetch the ~467 MB AppImage and
 //! `install_deb` would refuse it, at every launch and every six hours. And, on
 //! an automatic check, a version whose verified download already failed to
@@ -122,7 +122,8 @@ pub const HAND_INSTALL_MARK: &str = "install it by hand";
 /// What a .deb copy does by hand for `version`: fetch the package, then the
 /// command.
 fn deb_steps(version: &str) -> String {
-    let deb = expected_signed_name(DEB_KEY, version).unwrap_or_default();
+    let deb = expected_signed_name(DEB_KEY, version)
+        .expect("DEB_KEY names one of PLATFORM_SUFFIXES's own entries, so this always matches");
     format!("get the .deb from {DOWNLOADS_AT} and run sudo apt install ./{deb}")
 }
 
@@ -807,10 +808,11 @@ mod tests {
         );
     }
 
-    /// "Check now" forgets the failed version before it checks
-    /// (`forget_failed_update`), so a press always tries.
+    /// "Check now" calls `forget_failed_install` before it checks, so a press
+    /// always tries. This tests that building block: once the failed version
+    /// is forgotten, `decide_here` offers again.
     #[test]
-    fn check_now_clears_the_failed_version_so_it_tries_again() {
+    fn forget_failed_install_lets_decide_here_offer_again() {
         let dir = tempfile::tempdir().unwrap();
         let r = bound_0630_as("0.6.30");
         remember_failed_install(dir.path(), "0.6.30").unwrap();
@@ -836,7 +838,8 @@ mod tests {
     /// A notice is recorded as `<trigger>: <notice>` and a record holds
     /// `update_log::DETAIL_MAX_CHARS`, so the command must fit whole even for
     /// a long version. Each carries the phrase the pane finds it by, and none
-    /// uses an em-dash.
+    /// uses an em-dash. At 20 characters or more, the .deb failed notice no
+    /// longer fits; that gap is pinned below rather than fixed here.
     #[test]
     fn every_notice_fits_one_record_whole() {
         let long = "10.100.1000";
@@ -856,6 +859,35 @@ mod tests {
             assert!(notice.contains(DOWNLOADS_AT), "{notice}");
             assert!(!notice.contains('\u{2014}'), "{notice}");
         }
+
+        // A version of 20 characters or more (a long pre-release suffix, say)
+        // still fits the other two notices, but pushes the .deb failed notice
+        // 2 characters past the limit: it would be cut short in the record.
+        // This is a known gap, reported rather than fixed here, since fixing
+        // it means changing the notice text.
+        let longer = "0.7.0-beta.202610010";
+        assert_eq!(
+            longer.chars().count(),
+            20,
+            "the example must be 20 characters"
+        );
+        for notice in [
+            deb_hand_install_notice(longer),
+            failed_before_notice(longer, false),
+        ] {
+            let line = format!("automatic: {notice}");
+            assert!(
+                line.chars().count() <= crate::update_log::DETAIL_MAX_CHARS,
+                "{} chars: {line}",
+                line.chars().count()
+            );
+        }
+        let overflow = format!("automatic: {}", failed_before_notice(longer, true));
+        assert!(
+            overflow.chars().count() > crate::update_log::DETAIL_MAX_CHARS,
+            "expected this notice to have grown past the limit, got {} chars: {overflow}",
+            overflow.chars().count()
+        );
     }
 
     #[test]
