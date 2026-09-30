@@ -848,6 +848,17 @@ async fn fast_forward_finish_keeps_a_real_new_chain() {
         "the dated folder should be gone: {}",
         aside_dir.display()
     );
+    // finish renames the folder to *.discard before it deletes it, and only
+    // warns if that last delete fails: check the renamed folder is gone too.
+    let discard = aside_dir.with_file_name(format!(
+        "{}.discard",
+        aside_dir.file_name().unwrap().to_string_lossy()
+    ));
+    assert!(
+        !discard.exists(),
+        "the renamed folder should be gone: {}",
+        discard.display()
+    );
     assert_eq!(
         btx_core::fast_forward::read_record(&n.net()).unwrap(),
         None,
