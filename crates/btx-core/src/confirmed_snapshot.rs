@@ -59,7 +59,7 @@ pub const REGTEST_REPLAY_CONTEXT: &str =
 /// it with the candidate engine's newest mainnet entry before a bump.
 pub const MAINNET_SHIELDED_COMMITMENT: &str =
     "94343b766b39c0ea2d92d83323f77b5ccc5e775d99b34b01f5fa6400f2354541";
-/// Regtest's: the empty-tree pin that `validation.cpp:19051`'s comment
+/// Regtest's: the empty-tree pin that `validation.cpp:19056-19058`'s comment
 /// names, read from the spike's regtest statements. The regtest rehearsal
 /// checks a fresh chain still carries it.
 pub const REGTEST_SHIELDED_COMMITMENT: &str =

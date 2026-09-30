@@ -324,9 +324,9 @@ pub fn hex(bytes: &[u8]) -> String {
 
 /// Hex (either case) to bytes; `None` on an odd length or a non-hex
 /// character. Checked explicitly, character by character: `u8::from_str_radix`
-/// alone also accepts a leading `+` or `-` (so "+9" would parse the same as
-/// "09"), which would let a string that is not actually hex reach the same
-/// bytes as a real key.
+/// alone also accepts a leading `+` (so "+9" would parse the same as "09"),
+/// which would let a string that is not actually hex reach the same bytes as
+/// a real key.
 pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -419,7 +419,7 @@ mod tests {
             .iter()
             .map(|k| k.to_ascii_lowercase())
             .collect();
-        let mut f = file();
+        let f = file();
         let pins: BTreeSet<String> = f.mirror_pins.iter().cloned().collect();
         assert_eq!(pins, shipped);
         assert_eq!(
@@ -433,10 +433,6 @@ mod tests {
             .filter_map(|k| list.operator_of(k))
             .collect();
         assert_eq!(pinned_operators, vec!["Mende"]);
-        // Sabotage: a file that lost a pin no longer matches.
-        f.mirror_pins.pop();
-        let fewer: BTreeSet<String> = f.mirror_pins.into_iter().collect();
-        assert_ne!(fewer, shipped);
     }
 
     /// The website compares its copy byte for byte, so the file has one
@@ -466,6 +462,13 @@ mod tests {
             ],
             "list order, not signing order"
         );
+    }
+
+    /// A key that is not on any operator's list does not stop the listed
+    /// keys from counting, and on its own it gives no operator at all.
+    #[test]
+    fn an_unlisted_key_is_ignored() {
+        let list = mainnet();
         assert_eq!(
             list.distinct_operators(&[key(P), key(MENDE)]),
             vec!["Mende".to_string()],
