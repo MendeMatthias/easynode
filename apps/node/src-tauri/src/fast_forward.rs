@@ -223,7 +223,8 @@ fn log(datadir: &Path, msg: &str) {
 
 /// A run is under way, or cannot be ruled out: a driver is at work, a run is
 /// recorded, or a record is there that cannot be read. No run is offered or
-/// started then, and Remove node data waits.
+/// started then, and Remove node data waits, unless the run is one whose old
+/// chain cannot come back ([`removal_waits`]).
 pub(crate) fn active() -> bool {
     active_in(&node_datadir())
 }
@@ -237,6 +238,70 @@ pub(crate) fn active_in(datadir: &Path) -> bool {
 /// the driver, and it is no first load. For the start path.
 pub(crate) fn underway(datadir: &Path) -> bool {
     matches!(ff::read_record(datadir), Ok(Some(r)) if r.phase == Phase::Running)
+}
+
+/// Pure: may Remove node data go ahead? With no driver at work: when no run
+/// is recorded, and when the one recorded is at [`Phase::Running`] and its
+/// roll-back could not begin (`stuck`, [`STUCK`]): its old chain cannot come
+/// back, and Remove node data removes the new chain with the rest (review
+/// M6). Never while a driver is at work, over a record nobody can read, or
+/// over a run at any other phase.
+fn removal_goes_ahead(driving: bool, stuck: bool, record: OnRecord) -> bool {
+    !driving
+        && match record {
+            OnRecord::Nothing => true,
+            OnRecord::At(Phase::Running) => stuck,
+            OnRecord::Unreadable | OnRecord::At(_) => false,
+        }
+}
+
+/// Remove node data's first question, before it stops the node: must it
+/// wait for a run ([`removal_goes_ahead`])?
+pub(crate) fn removal_waits() -> bool {
+    let stuck = STUCK.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    !removal_goes_ahead(
+        DRIVING.load(Ordering::SeqCst),
+        stuck,
+        on_record(&node_datadir()),
+    )
+}
+
+/// Remove node data's part in a run, with the node stopped and the datadir
+/// to itself ([`with_disk`]): `Ok` when it may go ahead
+/// ([`removal_goes_ahead`]), a stuck run given up first; else
+/// [`REMOVE_WAITS`], and nothing changes.
+pub(crate) fn clear_for_removal(datadir: &Path) -> Result<(), String> {
+    clear_for_removal_with(datadir, DRIVING.load(Ordering::SeqCst), &STUCK)
+}
+
+/// [`clear_for_removal`], given whether a driver is at work and the
+/// [`STUCK`] to read. A stuck run is given up (`ff::abandon`, which checks
+/// on disk that its old chain cannot come back): its record goes, the sweep
+/// in Remove node data takes its dated folder, and starts are no longer held
+/// off for it.
+fn clear_for_removal_with(
+    datadir: &Path,
+    driving: bool,
+    stuck: &Mutex<Option<String>>,
+) -> Result<(), String> {
+    let mut stuck = stuck.lock().unwrap_or_else(|e| e.into_inner());
+    let record = on_record(datadir);
+    if !removal_goes_ahead(driving, stuck.is_some(), record) {
+        return Err(REMOVE_WAITS.into());
+    }
+    if record == OnRecord::At(Phase::Running) {
+        if let Err(e) = ff::abandon(datadir) {
+            log(datadir, &format!("not giving the run up: {e}"));
+            return Err(REMOVE_WAITS.into());
+        }
+        log(
+            datadir,
+            "the run whose old chain data cannot come back is given up; Remove node data takes \
+             its chain data with the rest",
+        );
+        *stuck = None;
+    }
+    Ok(())
 }
 
 /// Tell the driver the run's load failed, with the reason the window shows.
@@ -2264,6 +2329,95 @@ mod tests {
         assert_eq!(undo(d), Ok(()));
         assert_old_chain_back(d, "once the lock was free");
         assert_eq!(run_settings(d), before);
+    }
+
+    /// Review M6: Remove node data goes ahead, with no driver at work, when
+    /// no run is recorded, and when the one recorded is at Running and its
+    /// roll-back could not begin ([`STUCK`]): its old chain cannot come
+    /// back, and the node stays stopped on the new chain. Never while a
+    /// driver is at work, over a record nobody can read, or over a run at
+    /// any other phase.
+    #[test]
+    fn remove_node_data_waits_except_for_a_run_whose_old_chain_cannot_come_back() {
+        let records = [
+            OnRecord::Nothing,
+            OnRecord::Unreadable,
+            OnRecord::At(Phase::SettingAside),
+            OnRecord::At(Phase::Running),
+            OnRecord::At(Phase::Undoing),
+            OnRecord::At(Phase::Restoring),
+            OnRecord::At(Phase::Done),
+        ];
+        let goes_ahead = [
+            (false, false, OnRecord::Nothing),
+            (false, true, OnRecord::Nothing),
+            (false, true, OnRecord::At(Phase::Running)),
+        ];
+        let mut seen = 0;
+        for driving in [false, true] {
+            for stuck in [false, true] {
+                for record in records {
+                    seen += 1;
+                    assert_eq!(
+                        removal_goes_ahead(driving, stuck, record),
+                        goes_ahead.contains(&(driving, stuck, record)),
+                        "driving {driving}, stuck {stuck}, {record:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(seen, 28);
+    }
+
+    /// Review M6, on disk: a roll-back whose restore could not begin leaves
+    /// the run at Running, and the node stopped. Remove node data gives the
+    /// run up (`ff::abandon`): its record goes, starts are no longer held off
+    /// for it, and the sweep takes its dated folder. A run whose old chain
+    /// can still come back, or any run while the driver is at work, keeps
+    /// Remove node data waiting, and nothing changes.
+    #[test]
+    fn remove_node_data_gives_up_a_run_whose_old_chain_cannot_come_back() {
+        let tmp = datadir_with_chain(Before::default());
+        let d = tmp.path();
+        let record = set_aside_for_run(d, 232_000, 100).unwrap();
+        let folder = d.join(&record.aside);
+        attempt(d);
+        let waits = Err(REMOVE_WAITS.to_string());
+        let nothing = Mutex::new(None);
+        assert_eq!(clear_for_removal_with(d, false, &nothing), waits);
+        std::fs::remove_dir_all(folder.join("indexes")).unwrap();
+        let not_back = undo(d).unwrap_err();
+        assert!(not_back.could_not_begin);
+        let stuck = Mutex::new(Some(not_back.said.clone()));
+        assert_eq!(clear_for_removal_with(d, true, &stuck), waits, "a driver");
+        assert!(underway(d), "nothing changed");
+        assert_eq!(clear_for_removal_with(d, false, &stuck), Ok(()));
+        assert_eq!(*stuck.lock().unwrap(), None, "starts may run again");
+        assert!(ff::read_record(d).unwrap().is_none());
+        assert!(!active_in(d));
+        assert!(sweep_measured(d) > 0);
+        assert!(entries_named(d, "fast-forward-").is_empty());
+        assert!(
+            d.join("blocks/new").exists(),
+            "the rest is Remove node data's"
+        );
+
+        // The missing part came back meanwhile: the run can be rolled back
+        // again at the next opening, so it is not given up.
+        let tmp = datadir_with_chain(Before::default());
+        let d = tmp.path();
+        let record = set_aside_for_run(d, 232_000, 100).unwrap();
+        let folder = d.join(&record.aside);
+        attempt(d);
+        std::fs::rename(folder.join("indexes"), d.join("indexes-elsewhere")).unwrap();
+        let not_back = undo(d).unwrap_err();
+        assert!(not_back.could_not_begin);
+        std::fs::rename(d.join("indexes-elsewhere"), folder.join("indexes")).unwrap();
+        let stuck = Mutex::new(Some(not_back.said.clone()));
+        assert_eq!(clear_for_removal_with(d, false, &stuck), waits);
+        assert_eq!(*stuck.lock().unwrap(), Some(not_back.said));
+        assert!(underway(d));
+        assert!(folder.join("indexes/old").exists());
     }
 
     /// Review I3: the snapshot must still be above the node's tip once step

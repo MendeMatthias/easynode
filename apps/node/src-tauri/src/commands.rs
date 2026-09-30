@@ -7133,8 +7133,10 @@ pub async fn remove_node_data_now(
     destructive_allowed(node_ownership(&state, &datadir).await)?;
     // Not while a Fast-forward run is under way or recorded: this removes
     // chain data in place, and the run's record says what is where
-    // (controller note 2c). Asked again below, with the datadir to itself.
-    if crate::fast_forward::active() {
+    // (controller note 2c). The one exception is a run whose old chain
+    // cannot come back (review M6). Asked again below, with the datadir to
+    // itself.
+    if crate::fast_forward::removal_waits() {
         return Err(crate::fast_forward::REMOVE_WAITS.to_string());
     }
     stop_node_inner(&state).await;
@@ -7172,12 +7174,13 @@ pub async fn remove_node_data_now(
 
 /// [`remove_node_data_now`]'s part on disk, with the node stopped and the
 /// datadir to itself (`crate::fast_forward::with_disk`). Refused while a
-/// Fast-forward run is under way or recorded; otherwise the chain data, the
-/// node's sidecars, and the old chain data a finished or undone run left.
+/// Fast-forward run is under way or recorded, except one whose old chain
+/// cannot come back, which is given up first
+/// (`crate::fast_forward::clear_for_removal`); otherwise the chain data, the
+/// node's sidecars, and the old chain data a finished, undone or given-up
+/// run left.
 fn remove_node_files(dd: &Path) -> Result<btx_core::disk::ReclaimReport, String> {
-    if crate::fast_forward::active_in(dd) {
-        return Err(crate::fast_forward::REMOVE_WAITS.to_string());
-    }
+    crate::fast_forward::clear_for_removal(dd)?;
     let mut report = btx_core::disk::remove_node_data(dd);
     // Node sidecars btx-core's helper leaves behind (it serves the
     // miner's lite-pool too): snapshot-era dirs + p2p/mempool state +
@@ -7210,7 +7213,7 @@ fn remove_node_files(dd: &Path) -> Result<btx_core::disk::ReclaimReport, String>
         }
     }
     // Old chain data a Fast-forward set aside, when no run needs it (a
-    // finish or a sweep that was cut off).
+    // finish or a sweep that was cut off, or a run given up above).
     let bytes = crate::fast_forward::sweep_measured(dd);
     if bytes > 0 {
         report.freed_mb += bytes / (1024 * 1024);
@@ -7381,6 +7384,31 @@ mod signed_start_tests {
         let report = super::remove_node_files(d).unwrap();
         assert!(!d.join("blocks").exists());
         assert!(!d.join("fast-forward-7").exists());
+        assert!(
+            report.items.iter().any(|i| i.contains("Fast-forward")),
+            "{:?}",
+            report.items
+        );
+
+        // Review M6: a run whose old chain cannot come back, once given up
+        // (`crate::fast_forward::clear_for_removal`), leaves its dated
+        // folder to this removal, with the new chain.
+        let dir = synced_validating_datadir();
+        let d = dir.path();
+        let r = btx_core::fast_forward::set_aside(
+            d,
+            232_000,
+            btx_core::fast_forward::Before::default(),
+            100,
+        )
+        .unwrap();
+        std::fs::create_dir_all(d.join("blocks")).unwrap();
+        std::fs::write(d.join(&r.aside).join("blocks/old"), vec![0u8; 4096]).unwrap();
+        std::fs::remove_dir_all(d.join(&r.aside).join("chainstate")).unwrap();
+        btx_core::fast_forward::abandon(d).unwrap();
+        let report = super::remove_node_files(d).unwrap();
+        assert!(!d.join("blocks").exists());
+        assert!(!d.join(&r.aside).exists());
         assert!(
             report.items.iter().any(|i| i.contains("Fast-forward")),
             "{:?}",
