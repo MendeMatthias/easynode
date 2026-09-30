@@ -347,7 +347,7 @@ export function initWallet(): void {
     $("wallet-confirm-amt").textContent = `${fmtExact(amt)} BTX`;
     $("wallet-confirm-to").textContent = sendTo.value.trim();
     $("wallet-confirm-note").textContent = maxMode
-      ? "This is your whole spendable balance, so the network fee comes out of it, the receiver gets slightly less than the number above."
+      ? "This is your whole spendable balance, so the network fee comes out of it. The receiver gets slightly less than the number above."
       : "The network fee is added on top, and your node picks it.";
     $("wallet-send-form").hidden = true;
     $("wallet-confirm").hidden = false;
@@ -516,7 +516,7 @@ export function initWallet(): void {
     caveat.hidden = !d.backfilling;
     if (d.backfilling) {
       caveat.textContent =
-        "Your node is still backfilling older history in the background, the balance and list may still be filling in, so hold off on sending your whole balance until it settles.";
+        "Your node is still backfilling older history in the background. The balance and list may still be filling in, so hold off on sending your whole balance until it settles.";
     }
     if (!$("wallet-pane-send").hidden) {
       $("wallet-send-avail").textContent = `${fmtExact(spendable)} BTX ready to spend.`;

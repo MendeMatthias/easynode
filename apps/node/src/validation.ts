@@ -155,8 +155,8 @@ export function validationView(status: ValidationInput): ValidationView {
           "Your node follows the chain using signed confirmations from other operators, " +
           "but right now it is not connected to any node allowed to hand them over. It " +
           "will keep trying the known sources on its own. If this message stays for more " +
-          "than an hour, your node may sit at a fixed block height until one comes back, " +
-          "nothing is lost, it catches up when a source appears.",
+          "than an hour, your node may sit at a fixed block height until one comes back. " +
+          "Nothing is lost. It catches up when a source appears.",
         cls: "is-stalled",
       };
     }
