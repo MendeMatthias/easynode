@@ -749,6 +749,7 @@ mod tests {
             serves_attestations: true,
             matmul_validation_mode: mode.to_string(),
             trusted_mirror: mode == "trusted",
+            replay_authority_context: None,
         }
     }
 

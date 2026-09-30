@@ -460,6 +460,9 @@ pub struct MatmulTrustedStatus {
     pub matmul_validation_mode: String,
     #[serde(default)]
     pub trusted_mirror: bool,
+    /// Display order. Absent on a node with no pin and no key.
+    #[serde(default)]
+    pub replay_authority_context: Option<String>,
 }
 
 /// Read this node's own MatMul role. Cheap, and answered by every engine that

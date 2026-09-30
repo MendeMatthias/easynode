@@ -785,8 +785,8 @@ async fn wait_for_headers(rpc: &RpcClient, datadir: &Path, target: u64) -> bool 
 }
 
 /// What a `loadtxoutset` / `loadtxoutsetattested` call came to.
-#[derive(Debug, PartialEq)]
-enum LoadOutcome {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadOutcome {
     Loaded,
     /// "Work does not exceed active chainstate": a peer already advanced the
     /// chain past the snapshot — that's success, not error.
@@ -804,18 +804,35 @@ fn load_outcome(success: bool, stderr: &str) -> LoadOutcome {
     }
 }
 
+/// Run one snapshot-load RPC through btx-cli on `datadir`.
+async fn run_load(btx_cli: &Path, datadir: &Path, method: &str, files: &[&Path]) -> LoadOutcome {
+    run_cli_load(
+        btx_cli,
+        &[format!("-datadir={}", datadir.display())],
+        method,
+        files,
+    )
+    .await
+}
+
 /// Run one snapshot-load RPC through btx-cli. The load can take a while to
 /// read+validate the snapshot file; run it on a blocking thread with
 /// rpcclienttimeout=0 (no client-side timeout), mirroring the faststart
-/// wrapper's documented invocation.
-async fn run_load(btx_cli: &Path, datadir: &Path, method: &str, files: &[&Path]) -> LoadOutcome {
+/// wrapper's documented invocation. `args` come before the method: the
+/// datadir, and on regtest the network and port.
+pub async fn run_cli_load(
+    btx_cli: &Path,
+    args: &[String],
+    method: &str,
+    files: &[&Path],
+) -> LoadOutcome {
     let cli = btx_cli.to_path_buf();
-    let dd = datadir.to_path_buf();
+    let args = args.to_vec();
     let method = method.to_string();
     let files: Vec<PathBuf> = files.iter().map(|f| f.to_path_buf()).collect();
     let result = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new(&cli);
-        cmd.arg(format!("-datadir={}", dd.display()))
+        cmd.args(&args)
             .arg("-rpcclienttimeout=0")
             .arg(&method)
             .args(&files);
