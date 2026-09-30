@@ -650,6 +650,12 @@ pub struct AppState {
     /// blocks it lacks exist, and a node stranded on another branch is exactly
     /// that. Cleared on every stop/start like the others.
     pub signed_frontier: Arc<Mutex<Option<btx_core::node_api::AttestedTip>>>,
+    /// What the catch-up help (`btx_core::catchup_assist`) is doing this run,
+    /// as the refresher's last tick left it (`CatchUp::report`): the Copy
+    /// diagnostics lines, and whether it concluded that no archive peer serves
+    /// old blocks to this node. The status card and the Fast-forward offer
+    /// read that flag. Reset on every stop/start like the others.
+    pub catch_up_help: Arc<Mutex<btx_core::catchup_assist::CatchUpReport>>,
     /// Who signed the newest hundred blocks, from the node's own attestation
     /// store, kept current by the refresher only while the engine reports a
     /// local signer (`btx_core::signer::RecentSigners`). This is how the role
@@ -786,6 +792,7 @@ impl AppState {
             archive_service: Arc::new(Mutex::new(None)),
             matmul_trusted: Arc::new(Mutex::new(None)),
             signed_frontier: Arc::new(Mutex::new(None)),
+            catch_up_help: Arc::new(Mutex::new(Default::default())),
             recent_signers: Arc::new(Mutex::new(None)),
             signer_pubkey: Arc::new(Mutex::new(None)),
             signer_applies_here: Arc::new(Mutex::new(None)),
