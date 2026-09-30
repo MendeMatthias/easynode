@@ -1,9 +1,13 @@
 //! Confirmed snapshots against a real engine: a statement two operators
 //! signed, loaded on a regtest mirror through the app's own loading path
 //! (`confirmed_load::load`), then the node restarted as a validating node
-//! on it under the pin rule (`node::validating_snapshot_pin_args`). Also the
-//! engine-bump check of section 12: the replay contexts the app compiles are
-//! the engine's. Opt-in, like the other shipped-engine tests:
+//! on it under the pin rule (`node::validating_snapshot_pin_args`), with the
+//! pin on the command line and with the pin already in the node's
+//! btx_rw.conf. Also the engine-bump check of section 12: the replay contexts
+//! the app compiles are the engine's. The app's own launches are not run
+//! here: that the launch after a mirror launch carries nothing left over is
+//! node.rs's `a_mirror_load_marker_makes_only_the_load_launch_a_mirror`.
+//! Opt-in, like the other shipped-engine tests:
 //!
 //! ```text
 //! EASYNODE_TEST_BTXD=/path/to/btxd cargo test --test confirmed_snapshot_regtest -- --ignored --test-threads=1
@@ -34,12 +38,7 @@ fn regtest_key() -> (String, String) {
     payload.push(0x01);
     let wif = bs58::encode(payload).with_check().into_string();
     let pubkey = sk.public_key().to_encoded_point(true);
-    let hex: String = pubkey
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    (wif, hex)
+    (wif, btx_core::operators::hex(pubkey.as_bytes()))
 }
 
 /// One regtest btxd in its own folder, killed and reaped on drop.
@@ -74,9 +73,20 @@ impl Node {
         lines[lines.len().saturating_sub(40)..].join("\n")
     }
 
+    /// Kill and reap the engine, if one runs.
+    fn kill(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
     /// Start with `extra`, and wait for RPC. `Err` carries the log's tail
-    /// when the engine exits instead.
+    /// when the engine exits instead, or does not answer in time (then it
+    /// is killed first). An engine still running from before is killed, never
+    /// left behind unreaped.
     async fn start(&mut self, extra: &[String]) -> Result<RpcClient, String> {
+        self.kill();
         let _ = std::fs::remove_file(self.net().join(".cookie"));
         let child = std::process::Command::new(&self.btxd)
             .arg("-regtest")
@@ -114,6 +124,7 @@ impl Node {
                 }
             }
         }
+        self.kill();
         Err(format!("no RPC within 120 s:\n{}", self.log_tail()))
     }
 
@@ -134,10 +145,7 @@ impl Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.kill();
     }
 }
 
@@ -354,7 +362,10 @@ async fn a_two_operator_snapshot_loads_on_a_mirror_and_a_validating_node_restart
     )
     .await
     .unwrap_err();
-    assert!(matches!(err, LoadError::NotConfirmed(_)), "{err}");
+    assert!(
+        matches!(&err, LoadError::NotConfirmed(e) if e.contains("two are needed")),
+        "{err}"
+    );
 
     // 2. A wrong file hash: the two-operator manifest, one byte of the file
     //    changed.
@@ -434,6 +445,13 @@ async fn a_two_operator_snapshot_loads_on_a_mirror_and_a_validating_node_restart
         ],
     };
     let env3 = format!("{env};third={}", btx_core::operators::hex(&third_pub));
+    // Both signatures verify and name two operators under the list the load
+    // reads, so the missing pin is the only thing wrong with it.
+    let list3 = btx_core::operators::parse_env_list(&env3).unwrap();
+    assert_eq!(
+        cs::confirming_operators(&unpinned, &list3),
+        Ok(vec!["confirmer".to_string(), "third".to_string()])
+    );
     let unpinned_pair = copy_pair(
         &mirror.net().join("unpinned"),
         &a.net().join("snap.dat"),
@@ -563,11 +581,46 @@ async fn a_two_operator_snapshot_loads_on_a_mirror_and_a_validating_node_restart
         Some(base.clone())
     );
     mirror.stop(&rv).await;
-    let rw = std::fs::read_to_string(mirror.net().join("btx_rw.conf")).unwrap_or_default();
+    // A tripwire, not a proof: v0.34.9's daemon never writes btx_rw.conf
+    // (only the Qt options model calls ModifyRWConfigFile, and never for
+    // matmulvalidation), so a mirror launch cannot leave its mode there. If
+    // an engine bump starts writing it, this fails first. The app-side
+    // property, that the launch after the mirror launch carries nothing left
+    // over, is node.rs's
+    // `a_mirror_load_marker_makes_only_the_load_launch_a_mirror`.
+    let rw_conf = mirror.net().join("btx_rw.conf");
     assert!(
-        !rw.contains("matmulvalidation"),
-        "the mirror launch's mode must not outlive it: {rw}"
+        !rw_conf.exists(),
+        "the engine wrote {} on its own",
+        rw_conf.display()
     );
+
+    // Section 8 once more, with the pin already in the node's btx_rw.conf:
+    // the rule adds no key (the engine refuses a duplicate pin), only the
+    // threshold, and the engine counts the btx_rw.conf pin toward its check
+    // of the stored manifest.
+    std::fs::write(&rw_conf, format!("matmultrustedpubkey={p_pub}\n")).unwrap();
+    let already = btx_core::node::conf_pins(&rw_conf);
+    assert_eq!(already, vec![p_pub.clone()]);
+    let pin_args = btx_core::node::validating_snapshot_pin_args(&mirror.net(), &pins, &already);
+    assert_eq!(pin_args, vec!["-matmultrustedthreshold=1".to_string()]);
+    let mut with_conf_pin = validating.clone();
+    with_conf_pin.extend(pin_args);
+    let rv = mirror.start(&with_conf_pin).await.unwrap();
+    let status = call(&rv, "getmatmultrustedstatus", json!([])).await;
+    assert_eq!(
+        status["matmul_validation_mode"],
+        json!("consensus"),
+        "{status}"
+    );
+    assert_eq!(status["trusted_mirror"], json!(false), "{status}");
+    assert_eq!(status["trusted_signer_pubkeys"], json!([p_pub]), "{status}");
+    assert_eq!(
+        snapshot_base(&call(&rv, "getchainstates", json!([])).await),
+        Some(base.clone())
+    );
+    mirror.stop(&rv).await;
+    std::fs::remove_file(&rw_conf).unwrap();
 
     // A base above a held block: the engine refuses it once the app has
     // refused the block (section 7, step 3).
@@ -608,9 +661,14 @@ async fn a_two_operator_snapshot_loads_on_a_mirror_and_a_validating_node_restart
     .await
     .unwrap_err();
     // v0.34.9 answers "Attested snapshot base is incompatible with the
-    // current best-header chain" here (measured 2026-09-29), and "part of an
-    // invalid chain" for a base whose own header is marked failed.
-    assert!(matches!(&err, LoadError::Engine(_)), "{err}");
+    // current best-header chain" here (measured 2026-09-29 and 2026-09-30),
+    // and "part of an invalid chain" only for a base whose own header is
+    // marked failed, which this one is not.
+    assert!(
+        matches!(&err, LoadError::Engine(e)
+            if e.contains("incompatible with the current best-header chain")),
+        "{err}"
+    );
     assert_eq!(
         snapshot_base(&call(&rh, "getchainstates", json!([])).await),
         None
