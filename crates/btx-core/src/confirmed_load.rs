@@ -14,7 +14,9 @@
 //!    in order, as the fork check does every 30 seconds. The engine then
 //!    refuses a snapshot whose base sits above any of them (proven on regtest
 //!    by `tests/confirmed_snapshot_regtest.rs`). If one cannot be refused,
-//!    nothing is loaded.
+//!    nothing is loaded. Fails closed: only the engine's "Block not found"
+//!    lets a block pass as one the node has never seen; a lookup with any
+//!    other answer, or none, stops the load ([`LoadError::HeldNotRefused`]).
 //! 3. The start record (`crate::snapshot_start`): the height, the base and
 //!    the operators whose signatures step 1 verified, written before the
 //!    trim drops their signatures. If the load then does not happen, the
@@ -27,14 +29,19 @@
 //! 5. `loadtxoutsetattested`, which the engine allows only in mirror mode.
 //! 6. After the load, the block at each refused height must not be the
 //!    refused block. If it ever were, the caller stops the node and discards
-//!    the snapshot ([`set_aside_snapshot_chainstate`]).
+//!    the snapshot ([`set_aside_snapshot_chainstate`]). Fails closed: only a
+//!    block hash or the engine's "Block height out of range" is an answer;
+//!    anything else, or no answer, is [`LoadError::PostLoadCheckUnavailable`],
+//!    which callers treat exactly like [`LoadError::HeldRootOnChain`] (see
+//!    [`LoadError::restore_chain_data`]).
 //!
 //! Every [`LoadError`] is for the log: it can carry text from the manifest
 //! the website served or from the engine, so no caller shows it as is.
 
 use crate::attested_snapshot::{self, PairKind, ReadyPair};
 use crate::confirmed_snapshot::{self as cs, NodeView};
-use crate::known_invalid::{self, HeldBranch, KnownInvalidBlock, Refusal};
+use crate::error::AppError;
+use crate::known_invalid::{self, HeldBranch, KnownInvalidBlock};
 use crate::rpc::Rpc;
 use crate::snapshot::LoadOutcome;
 use crate::snapshot_start::{self, StartRecord, StartSource};
@@ -134,7 +141,32 @@ pub enum LoadError {
         height: u64,
         root: String,
     },
+    /// After the load the node did not say which block it has at a refused
+    /// height: no answer, or an answer that is neither a block hash nor the
+    /// engine's "Block height out of range". The app cannot vouch for the
+    /// chain it just loaded, so callers treat this exactly like
+    /// [`LoadError::HeldRootOnChain`]: stop the node and restore the chain
+    /// data ([`LoadError::restore_chain_data`]).
+    PostLoadCheckUnavailable {
+        height: u64,
+        root: String,
+        why: String,
+    },
     Io(String),
+}
+
+impl LoadError {
+    /// The engine loaded the snapshot and the app refuses the result: the
+    /// caller stops the node and sets the snapshot chainstate aside
+    /// ([`set_aside_snapshot_chainstate`]). [`LoadError::HeldRootOnChain`]
+    /// and [`LoadError::PostLoadCheckUnavailable`], and nothing else: every
+    /// other error leaves the chainstate as it was.
+    pub fn restore_chain_data(&self) -> bool {
+        matches!(
+            self,
+            LoadError::HeldRootOnChain { .. } | LoadError::PostLoadCheckUnavailable { .. }
+        )
+    }
 }
 
 impl std::fmt::Display for LoadError {
@@ -146,6 +178,10 @@ impl std::fmt::Display for LoadError {
             LoadError::HeldRootOnChain { height, root } => write!(
                 f,
                 "after the load, block {root} at {height} is on this node's chain, which the app refuses"
+            ),
+            LoadError::PostLoadCheckUnavailable { height, root, why } => write!(
+                f,
+                "after the load, the node did not say which block it has at {height}, so the app cannot tell whether {root} is on its chain: {why}"
             ),
             LoadError::Io(e) => write!(f, "{e}"),
         }
@@ -301,26 +337,7 @@ pub async fn load(
     datadir: &Path,
 ) -> Result<Loaded, LoadError> {
     let (m, start) = recheck(pair, view, regtest_env)?;
-
-    for block in holds.invalid {
-        match known_invalid::refuse(rpc, block).await {
-            Refusal::Refused | Refusal::NotKnownYet => {}
-            other => {
-                return Err(LoadError::HeldNotRefused(format!(
-                    "{} at {}: {other:?}",
-                    block.hash, block.height
-                )))
-            }
-        }
-    }
-    for (branch, outcome) in known_invalid::refuse_held_in_order(rpc, holds.held).await {
-        if !matches!(outcome, Refusal::Refused | Refusal::NotKnownYet) {
-            return Err(LoadError::HeldNotRefused(format!(
-                "{} at {}: {outcome:?}",
-                branch.root, branch.height
-            )));
-        }
-    }
+    refuse_holds(rpc, holds).await?;
 
     // Step 4: who confirmed it, before the trimmed manifest drops their
     // signatures. Put back as it was if the load does not happen.
@@ -369,16 +386,24 @@ async fn trim_and_load(
     };
 
     for (height, root) in holds.roots() {
-        let at = rpc
-            .call("getblockhash", json!([height]))
-            .await
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string));
-        if at.as_deref() == Some(root) {
-            return Err(LoadError::HeldRootOnChain {
-                height,
-                root: root.to_string(),
-            });
+        let unavailable = |why: String| LoadError::PostLoadCheckUnavailable {
+            height,
+            root: root.to_string(),
+            why,
+        };
+        match rpc.call("getblockhash", json!([height])).await {
+            Ok(v) => match v.as_str() {
+                Some(at) if at.eq_ignore_ascii_case(root) => {
+                    return Err(LoadError::HeldRootOnChain {
+                        height,
+                        root: root.to_string(),
+                    })
+                }
+                Some(at) if at.len() == 64 && at.bytes().all(|b| b.is_ascii_hexdigit()) => {}
+                _ => return Err(unavailable(format!("the answer {v} is not a block hash"))),
+            },
+            Err(e) if is_height_out_of_range(&e) => {}
+            Err(e) => return Err(unavailable(e.to_string())),
         }
     }
     Ok(Loaded {
@@ -386,6 +411,48 @@ async fn trim_and_load(
         signatures: trimmed.signatures.len(),
         superseded,
     })
+}
+
+/// Section 7, step 3: refuse every block the app refuses, invalid blocks
+/// first, then the held branches in order, as `crate::known_invalid` does
+/// for the fork check. Stricter than the fork check: only "Block not found"
+/// lets a block pass as one the node has never seen (a node cannot follow a
+/// block it does not know); a lookup with any other answer, or none, stops
+/// the load, and so does a failed `invalidateblock`. Stopping at the first
+/// also keeps the held order: nothing after a hold that stands is touched.
+async fn refuse_holds(rpc: &dyn Rpc, holds: &Holds<'_>) -> Result<(), LoadError> {
+    for (height, block) in holds.roots() {
+        match rpc.call("getblockheader", json!([block, true])).await {
+            Ok(_) => {}
+            Err(e) if is_block_not_found(&e) => continue,
+            Err(e) => {
+                return Err(LoadError::HeldNotRefused(format!(
+                    "{block} at {height}: the node did not say whether it has it: {e}"
+                )))
+            }
+        }
+        if let Err(e) = rpc.call("invalidateblock", json!([block])).await {
+            return Err(LoadError::HeldNotRefused(format!(
+                "{block} at {height}: {e}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `getblockheader` for a block the node has no header for: v0.34.9
+/// (84b998b4) `src/rpc/blockchain.cpp:881`, `RPC_INVALID_ADDRESS_OR_KEY`
+/// (-5), "Block not found". The one answer that says the node never saw it.
+fn is_block_not_found(e: &AppError) -> bool {
+    matches!(e, AppError::Rpc { code: -5, message } if message == "Block not found")
+}
+
+/// `getblockhash` for a height above the active tip: v0.34.9 (84b998b4)
+/// `src/rpc/blockchain.cpp:774`, `RPC_INVALID_PARAMETER` (-8), "Block height
+/// out of range". The one answer that says no block at that height is on
+/// the active chain.
+fn is_height_out_of_range(e: &AppError) -> bool {
+    matches!(e, AppError::Rpc { code: -8, message } if message == "Block height out of range")
 }
 
 /// Move a snapshot chainstate the app refuses out of the engine's way, as the
@@ -441,6 +508,11 @@ mod tests {
         reports_context: bool,
         /// Methods the node does not answer, as a node that went away.
         silent: Vec<&'static str>,
+        /// What getblockhash answers for a height not in `chain`: the
+        /// engine's error, or `None` for a `null` answer.
+        off_chain: Option<(i64, &'static str)>,
+        /// An error getblockheader answers instead of the usual.
+        header_error: Option<(i64, &'static str)>,
         calls: Mutex<Vec<String>>,
     }
 
@@ -454,6 +526,8 @@ mod tests {
                 trusted: vec![P],
                 reports_context: true,
                 silent: Vec::new(),
+                off_chain: Some((-8, "Block height out of range")),
+                header_error: None,
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -479,13 +553,14 @@ mod tests {
                     if h == 0 {
                         return Ok(json!(self.genesis));
                     }
-                    self.chain
-                        .get(&h)
-                        .map(|s| json!(s))
-                        .ok_or_else(|| AppError::Rpc {
-                            code: -8,
-                            message: "Block height out of range".into(),
-                        })
+                    match (self.chain.get(&h), self.off_chain) {
+                        (Some(s), _) => Ok(json!(s)),
+                        (None, Some((code, message))) => Err(AppError::Rpc {
+                            code,
+                            message: message.into(),
+                        }),
+                        (None, None) => Ok(Value::Null),
+                    }
                 }
                 "getmatmultrustedstatus" => {
                     let mut status = json!({
@@ -497,6 +572,13 @@ mod tests {
                         status["replay_authority_context"] = json!(cs::REGTEST_REPLAY_CONTEXT);
                     }
                     Ok(status)
+                }
+                "getblockheader" if self.header_error.is_some() => {
+                    let (code, message) = self.header_error.unwrap();
+                    Err(AppError::Rpc {
+                        code,
+                        message: message.into(),
+                    })
                 }
                 "getblockheader" if self.knows_root => Ok(json!({"height": 50})),
                 "getblockheader" => Err(not_found()),
@@ -688,6 +770,7 @@ mod tests {
                 root: ROOT.into()
             }
         );
+        assert!(err.restore_chain_data());
         assert_eq!(
             snapshot_start::read(tmp.path()),
             None,
@@ -714,6 +797,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err, LoadError::Engine(why.into()));
+        assert!(!err.restore_chain_data(), "the chainstate is untouched");
     }
 
     /// The record is written before the engine is asked, and put back as it
@@ -992,6 +1076,109 @@ mod tests {
             (v.genesis, v.replay_context, v.pinned),
             (None, None, vec![])
         );
+    }
+
+    /// Loads the PC pair under [`HELD`] on `node`: what it came to, and
+    /// whether the engine was asked.
+    async fn load_held(
+        node: &Node,
+        v: &NodeView,
+        invalid: &[KnownInvalidBlock],
+        dir: &Path,
+    ) -> (Result<Loaded, LoadError>, bool) {
+        let pair = pair_on_disk(dir, R_PC, R_DAT);
+        let runner = Runner::new(LoadOutcome::Loaded);
+        let holds = Holds {
+            invalid,
+            held: HELD,
+        };
+        let got = load(node, &runner, &pair, v, &holds, Some(&env()), dir).await;
+        let asked = runner.seen.lock().unwrap().is_some();
+        (got, asked)
+    }
+
+    /// Section 7, step 6 fails closed. Only the engine's "Block height out of
+    /// range" says nothing at a refused height is on the chain; with any
+    /// other answer, or none, the app cannot vouch for the chain it loaded.
+    #[tokio::test]
+    async fn a_check_after_the_load_that_gets_no_answer_fails_closed() {
+        // The engine's own answer for a height above its tip.
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::regtest();
+        let v = view(&node).await;
+        let (got, asked) = load_held(&node, &v, &[], tmp.path()).await;
+        assert!(got.is_ok() && asked, "{got:?}");
+        assert!(snapshot_start::read(tmp.path()).is_some());
+
+        let mut gone = Node::regtest();
+        let v = view(&gone).await;
+        gone.silent = vec!["getblockhash"];
+        let mut other_code = Node::regtest();
+        other_code.off_chain = Some((-1, "request timed out"));
+        let mut other_words = Node::regtest();
+        other_words.off_chain = Some((-8, "Invalid parameter"));
+        let mut no_hash = Node::regtest();
+        no_hash.off_chain = None;
+        let mut garbled = Node::regtest();
+        garbled.chain.insert(50, format!(" {ROOT}"));
+        for (what, node) in [
+            ("no answer", gone),
+            ("another code", other_code),
+            ("another message", other_words),
+            ("not a hash", no_hash),
+            ("not only a hash", garbled),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (got, asked) = load_held(&node, &v, &[], tmp.path()).await;
+            assert!(
+                matches!(
+                    &got,
+                    Err(LoadError::PostLoadCheckUnavailable { height: 50, root, .. })
+                        if root == ROOT
+                ),
+                "{what}: {got:?}"
+            );
+            assert!(got.unwrap_err().restore_chain_data(), "{what}");
+            assert!(asked, "{what}: the engine loaded it");
+            assert_eq!(
+                snapshot_start::read(tmp.path()),
+                None,
+                "{what}: a load the app discards leaves no record"
+            );
+        }
+    }
+
+    /// Section 7, step 3 fails closed too. Only "Block not found" says the
+    /// node has never seen a refused block; a lookup that gets any other
+    /// answer, or none, stops the load before anything is written.
+    #[tokio::test]
+    async fn a_refusal_that_gets_no_answer_stops_the_load() {
+        let split = known_invalid::KNOWN_INVALID_BLOCKS;
+        let mut gone = Node::regtest();
+        gone.silent = vec!["getblockheader"];
+        let mut warming = Node::regtest();
+        warming.header_error = Some((-28, "Loading block index..."));
+        let mut gone_again = Node::regtest();
+        gone_again.silent = vec!["getblockheader"];
+        for (what, node, invalid) in [
+            ("held, no answer", gone, &[][..]),
+            ("held, another code", warming, &[][..]),
+            ("invalid list, no answer", gone_again, split),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let v = view(&node).await;
+            let (got, asked) = load_held(&node, &v, invalid, tmp.path()).await;
+            assert!(
+                matches!(&got, Err(LoadError::HeldNotRefused(_))),
+                "{what}: {got:?}"
+            );
+            assert!(!asked, "{what}: the engine was never asked");
+            assert_eq!(snapshot_start::read(tmp.path()), None, "{what}");
+            assert!(
+                !node.methods().contains(&"invalidateblock".to_string()),
+                "{what}"
+            );
+        }
     }
 
     #[test]
