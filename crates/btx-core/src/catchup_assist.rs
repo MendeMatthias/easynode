@@ -130,10 +130,18 @@ pub struct Helper {
     /// Since when the next block has gone unrequested, at which tip.
     quiet_since: Option<(u64, Instant)>,
     batch: Option<Batch>,
-    /// The peer whose last batch connected: asked first.
-    last_good: Option<String>,
-    /// The peer to rotate away from on the next request.
-    slow: Option<String>,
+    /// The peer whose last batch connected, and whether that batch was of old
+    /// blocks for it: asked first, and when it has served old blocks to us,
+    /// before a full-history peer too.
+    last_good: Option<(String, bool)>,
+    /// The peers rotated away from since the last batch connected, the latest
+    /// last: the others are asked first. When every peer to ask is on it, a
+    /// new round starts in which only the latest waits.
+    tried: Vec<String>,
+    /// The peers whose batch of old blocks went three minutes with none of it
+    /// connected while they stayed connected, and that have delivered nothing
+    /// since: ranked last for old blocks.
+    stalled: Vec<String>,
     /// How often each peer dropped us while asked for old blocks this run, in
     /// the order they first did. Any peer counts, full-history or limited.
     drops: Vec<(String, u32)>,
@@ -146,9 +154,12 @@ pub struct Helper {
     /// the next block is on `refuses_old` and the next block is old for each.
     /// Set when the help pauses with [`Why::NoOldBlocks`]; kept while the
     /// engine's own rescue has the next block in flight (that holds the help
-    /// off, not the conclusion); cleared when a peer the help may ask is
-    /// connected again, a batch connects, or the help stops.
+    /// off, not the conclusion); cleared when the help asks a peer (so before
+    /// any batch of it connects), when a peer the help may ask is connected on
+    /// two ticks in a row, or when the help stops.
     no_old_blocks: bool,
+    /// While `no_old_blocks` holds: the last tick saw a peer the help may ask.
+    askable_last_tick: bool,
 }
 
 impl Helper {
@@ -163,11 +174,13 @@ impl Helper {
             quiet_since: None,
             batch: None,
             last_good: None,
-            slow: None,
+            tried: Vec::new(),
+            stalled: Vec::new(),
             drops: Vec::new(),
             refuses_old: Vec::new(),
             news: Vec::new(),
             no_old_blocks: false,
+            askable_last_tick: false,
         }
     }
 
@@ -217,13 +230,16 @@ impl Helper {
         if s.refused.is_some() {
             return self.stop(Why::Refused);
         }
-        if self.no_old_blocks && self.pick(s.peers, s.tip).is_ok() {
-            // A peer the help may ask is connected: a new archive peer, or a
-            // marked one the next block is no longer old for. Checked before
-            // the engine's rescue can hold the help off, so the conclusion
-            // ends the tick it stops being true.
+        // A peer the help may ask is connected: a new archive peer, or a
+        // marked one the next block is no longer old for. Checked before the
+        // engine's rescue can hold the help off, and on two ticks in a row,
+        // so a peer seen for one tick does not end the conclusion (asking a
+        // peer ends it at once, in `ask`).
+        let askable = self.no_old_blocks && self.pick(s.peers, s.tip).is_ok();
+        if askable && self.askable_last_tick {
             self.no_old_blocks = false;
         }
+        self.askable_last_tick = askable;
         let ours = self.batch.as_ref().map(|b| (b.from, b.to));
         if engine_fetching(s.peers, s.tip, ours) {
             return self.idle(Why::EngineFetching);
@@ -231,14 +247,25 @@ impl Helper {
         if let Some(b) = self.batch.take() {
             let peer_here = s.peers.iter().any(|p| p.id == b.peer_id);
             if s.tip >= b.to {
-                self.last_good = Some(b.addr);
-                self.slow = None;
-                self.no_old_blocks = false;
+                // Delivered: this peer is asked for the next batch, and every
+                // peer gets a turn again.
+                self.stalled.retain(|a| *a != b.addr);
+                self.tried.clear();
+                self.last_good = Some((b.addr, b.deep));
             } else if peer_here && s.now.duration_since(b.asked_at) < ROTATE_AFTER {
                 self.batch = Some(b);
                 return Decision::Wait(Why::BatchOut);
             } else {
-                if !peer_here && b.deep && s.tip < b.from {
+                if s.tip >= b.from {
+                    // Part of it connected: it delivered something.
+                    self.stalled.retain(|a| *a != b.addr);
+                } else if b.deep && peer_here {
+                    // Three minutes, still connected, and none of the old
+                    // blocks: not first for old blocks until it delivers.
+                    if !self.stalled.contains(&b.addr) {
+                        self.stalled.push(b.addr.clone());
+                    }
+                } else if b.deep {
                     // Gone, or back under a new connection id, before any of
                     // a batch of old blocks connected: what a limited peer
                     // does to a node it does not grant `noban` (engine
@@ -249,7 +276,7 @@ impl Helper {
                     // second time, the peer is marked.
                     self.count_drop(&b.addr);
                 }
-                self.slow = Some(b.addr);
+                self.rotate_from(b.addr);
             }
             return self.ask(s);
         }
@@ -283,7 +310,7 @@ impl Helper {
         };
         if accepted + already_have == 0 {
             // The peer took none: the next one, after another quiet wait.
-            self.slow = Some(addr.clone());
+            self.rotate_from(addr.clone());
             self.quiet_since = Some((first.0.saturating_sub(1), now));
             return;
         }
@@ -307,7 +334,15 @@ impl Helper {
     /// node is near the chain it follows, or that chain is refused.
     fn stop(&mut self, why: Why) -> Decision {
         self.no_old_blocks = false;
+        self.askable_last_tick = false;
         self.idle(why)
+    }
+
+    /// Rotate away from `addr`: the peers not tried since the last batch
+    /// connected are asked first.
+    fn rotate_from(&mut self, addr: String) {
+        self.tried.retain(|a| *a != addr);
+        self.tried.push(addr);
     }
 
     fn count_drop(&mut self, addr: &str) {
@@ -336,6 +371,14 @@ impl Helper {
         let peer = match self.pick(s.peers, s.tip) {
             Ok(p) => {
                 self.no_old_blocks = false;
+                if self.tried.contains(&p.addr) {
+                    // Every peer to ask has had its turn since the last batch
+                    // connected: a new round, in which only the one just
+                    // rotated away from waits.
+                    let latest = self.tried.pop();
+                    self.tried.clear();
+                    self.tried.extend(latest.filter(|a| *a != p.addr));
+                }
                 p
             }
             Err(Why::NoOldBlocks) => {
@@ -362,13 +405,17 @@ impl Helper {
         }
     }
 
-    /// The app's own archive peers that announced the next block, best
-    /// first: when the next block is old for a peer, one that keeps every
-    /// block before one that does not; then the one that delivered last;
-    /// then list order; starting after the slow one, which is also where a
-    /// peer that just dropped us once goes. A peer that dropped us over old
-    /// blocks [`DROPS_TO_MARK`] times is left out while the next block is old
-    /// for it. `Err` says why nobody is left.
+    /// The peer to ask among the app's own archive peers that announced the
+    /// next block. Ranked, when the next block is old for a peer: one that
+    /// went silent on old blocks (`stalled`) last; one that keeps every block,
+    /// or whose last batch of old blocks connected, before one that does not;
+    /// then, for any block, the one that delivered last; then list order. The
+    /// pick is the best that has not had its turn since the last batch
+    /// connected (`tried`, which is also where a peer that just dropped us
+    /// once goes), so a change in the ranking skips nobody; when every one
+    /// has, the best but the one just rotated away from. A peer that dropped
+    /// us over old blocks [`DROPS_TO_MARK`] times is left out while the next
+    /// block is old for it. `Err` says why nobody is left.
     fn pick<'p>(&self, peers: &'p [PeerInfo], tip: u64) -> Result<&'p PeerInfo, Why> {
         let first = tip + 1;
         let ours: Vec<&PeerInfo> = peers
@@ -392,18 +439,23 @@ impl Helper {
             });
         }
         ranked.sort_by_key(|p| {
+            let old = old_for(p, first);
+            let good = self.last_good.as_ref().filter(|(a, _)| *a == p.addr);
+            let served_old = good.is_some_and(|(_, deep)| *deep);
             (
-                old_for(p, first) && !serves_full_history(p),
-                self.last_good.as_ref() != Some(&p.addr),
+                old && self.stalled.contains(&p.addr),
+                old && !serves_full_history(p) && !served_old,
+                good.is_none(),
                 self.archive.iter().position(|a| *a == p.addr),
             )
         });
-        let start = self
-            .slow
-            .as_ref()
-            .and_then(|slow| ranked.iter().position(|p| p.addr == *slow))
-            .map_or(0, |i| (i + 1) % ranked.len());
-        Ok(ranked[start])
+        let latest = self.tried.last();
+        let chosen = ranked
+            .iter()
+            .find(|p| !self.tried.contains(&p.addr))
+            .or_else(|| ranked.iter().find(|p| Some(&p.addr) != latest))
+            .unwrap_or(&ranked[0]);
+        Ok(chosen)
     }
 }
 
@@ -487,11 +539,21 @@ pub fn dropped_once_line(addr: &str) -> String {
 /// The line for the log, and for Copy diagnostics, about a peer that dropped
 /// this node [`DROPS_TO_MARK`] times when asked for old blocks.
 pub fn refuses_old_line(addr: &str) -> String {
+    let times = times_in_words(DROPS_TO_MARK);
     format!(
-        "{addr} does not serve old blocks to us: it dropped the connection twice when asked \
+        "{addr} does not serve old blocks to us: it dropped the connection {times} when asked \
          for them, so until the node restarts it is asked only for blocks within \
          {LIMITED_SERVES} of its newest"
     )
+}
+
+/// "once", "twice", "3 times": how often, for the log lines.
+fn times_in_words(n: u32) -> String {
+    match n {
+        1 => "once".into(),
+        2 => "twice".into(),
+        n => format!("{n} times"),
+    }
 }
 
 #[cfg(test)]
@@ -915,13 +977,15 @@ mod tests {
                 Decision::Wait(Why::NoOldBlocks)
             );
         }
-        // Another archive peer is asked instead.
+        // Another archive peer is asked instead, and asking it ends the
+        // conclusion on that tick.
         let with_b = [
             recorded(6, A, LIMITED, 233_481),
             recorded(9, B, LIMITED, 233_481),
         ];
         let d = h.decide(&seen(t0 + secs(700), 225_927, &next, &with_b));
         assert_eq!(asked_of(&d).0, 9);
+        assert!(!h.no_archive_serves_old_blocks());
     }
 
     /// A alone, dropping us twice over old blocks: the conclusion that no
@@ -971,8 +1035,9 @@ mod tests {
         }
         assert!(h.no_archive_serves_old_blocks());
         assert!(h.take_news().is_empty(), "said once");
-        // A new archive peer appears: false at once, and it is asked after the
-        // quiet wait the rescue restarted.
+        // A new archive peer appears: false once it is still there on the next
+        // tick (one tick may be a blip), and it is asked after the quiet wait
+        // the rescue restarted.
         let with_b = [
             recorded(6, A, LIMITED, 233_481),
             recorded(9, B, LIMITED, 233_481),
@@ -980,22 +1045,29 @@ mod tests {
         h.decide(&seen(t0 + secs(600), 225_927, &next, &rescue));
         let d = h.decide(&seen(t0 + secs(603), 225_927, &next, &with_b));
         assert_eq!(d, Decision::Wait(Why::Quiet));
+        assert!(h.no_archive_serves_old_blocks(), "one tick may be a blip");
+        let d = h.decide(&seen(t0 + secs(606), 225_927, &next, &with_b));
+        assert_eq!(d, Decision::Wait(Why::Quiet));
         assert!(!h.no_archive_serves_old_blocks());
         let d = h.decide(&seen(t0 + secs(633), 225_927, &next, &with_b));
         assert_eq!(asked_of(&d).0, 9);
     }
 
     #[test]
-    fn no_archive_serves_old_blocks_ends_when_a_batch_connects_again() {
+    fn no_archive_serves_old_blocks_ends_when_a_marked_peer_may_be_asked_again() {
         let t0 = Instant::now();
         let mut h = concluded(t0);
         assert!(h.no_archive_serves_old_blocks());
         // The engine's rescue brings the tip within 288 of A's newest header.
-        // A serves those, so the conclusion ends and A is asked.
+        // A serves those, so once that holds on two ticks in a row the
+        // conclusion ends, and A is asked.
         let a6 = [recorded(6, A, LIMITED, 233_481)];
         let near = next_from(233_231);
         let mut s = seen(t0 + secs(60), 233_231, &near, &a6);
         s.target = Some(233_481);
+        assert_eq!(h.decide(&s), Decision::Wait(Why::Quiet));
+        assert!(h.no_archive_serves_old_blocks(), "one tick is not enough");
+        s.now = t0 + secs(63);
         assert_eq!(h.decide(&s), Decision::Wait(Why::Quiet));
         assert!(!h.no_archive_serves_old_blocks());
         s.now = t0 + secs(90);
@@ -1169,5 +1241,206 @@ mod tests {
         let once = dropped_once_line(A);
         assert!(once.starts_with("109.199.124.187:19335 dropped the connection once"));
         assert!(!once.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn the_mark_line_counts_the_drops_it_took() {
+        assert_eq!(times_in_words(1), "once");
+        assert_eq!(times_in_words(2), "twice");
+        assert_eq!(times_in_words(3), "3 times");
+        assert!(refuses_old_line(A).contains(&format!(
+            "it dropped the connection {} when asked for them",
+            times_in_words(DROPS_TO_MARK)
+        )));
+    }
+
+    #[test]
+    fn a_full_history_peer_that_connects_later_is_asked_before_the_limited_ones() {
+        let t0 = Instant::now();
+        let next = next_from(225_927);
+        let only_a = [recorded(4, A, LIMITED, 233_481)];
+        let mut h = helper();
+        h.decide(&seen(t0, 225_927, &next, &only_a));
+        let d = step(&mut h, &seen(t0 + QUIET, 225_927, &next, &only_a));
+        assert_eq!(asked_of(&d).0, 4);
+        // C (full history) and B (limited) connect while A's batch is out,
+        // and A's batch times out: C, never asked yet, is next, not B.
+        let all = [
+            recorded(4, A, LIMITED, 233_481),
+            recorded(9, B, LIMITED, 233_481),
+            recorded(6, C, FULL, 233_481),
+        ];
+        let t1 = t0 + QUIET;
+        assert_eq!(
+            h.decide(&seen(t1 + secs(60), 225_927, &next, &all)),
+            Decision::Wait(Why::BatchOut)
+        );
+        let d = step(&mut h, &seen(t1 + ROTATE_AFTER, 225_927, &next, &all));
+        assert_eq!(asked_of(&d).0, 6);
+        assert!(matches!(d, Decision::Ask { deep: true, .. }));
+        // C times out too: B, the one not tried yet, before A again.
+        let d = step(&mut h, &seen(t1 + ROTATE_AFTER * 2, 225_927, &next, &all));
+        assert_eq!(asked_of(&d).0, 9);
+        // Every one has had a turn: a new round, best first, but not the one
+        // just rotated away from.
+        let d = step(&mut h, &seen(t1 + ROTATE_AFTER * 3, 225_927, &next, &all));
+        assert_eq!(asked_of(&d).0, 6);
+        let d = step(&mut h, &seen(t1 + ROTATE_AFTER * 4, 225_927, &next, &all));
+        assert_eq!(asked_of(&d).0, 4);
+    }
+
+    #[test]
+    fn a_full_history_peer_that_connects_after_a_peer_took_nothing_is_asked_next() {
+        let t0 = Instant::now();
+        let next = next_from(225_927);
+        let only_a = [recorded(4, A, LIMITED, 233_481)];
+        let mut h = helper();
+        h.decide(&seen(t0, 225_927, &next, &only_a));
+        let d = h.decide(&seen(t0 + QUIET, 225_927, &next, &only_a));
+        h.sent(&d, t0 + QUIET, 0, 0);
+        let all = [
+            recorded(4, A, LIMITED, 233_481),
+            recorded(9, B, LIMITED, 233_481),
+            recorded(6, C, FULL, 233_481),
+        ];
+        assert_eq!(
+            h.decide(&seen(t0 + secs(33), 225_927, &next, &all)),
+            Decision::Wait(Why::Quiet)
+        );
+        let d = h.decide(&seen(t0 + QUIET * 2, 225_927, &next, &all));
+        assert_eq!(asked_of(&d).0, 6);
+    }
+
+    #[test]
+    fn a_limited_peer_that_serves_old_blocks_is_kept_while_a_full_history_one_stays_silent() {
+        let t0 = Instant::now();
+        let both = [
+            recorded(4, A, LIMITED, 233_481),
+            recorded(6, C, FULL, 233_481),
+        ];
+        let mut h = helper();
+        h.decide(&seen(t0, 225_927, &next_from(225_927), &both));
+        let d = step(
+            &mut h,
+            &seen(t0 + QUIET, 225_927, &next_from(225_927), &both),
+        );
+        assert_eq!(asked_of(&d).0, 6, "full history first");
+        // C sends nothing for three minutes; A is asked and delivers.
+        let t1 = t0 + QUIET + ROTATE_AFTER;
+        let d = step(&mut h, &seen(t1, 225_927, &next_from(225_927), &both));
+        assert_eq!(asked_of(&d).0, 4);
+        assert!(matches!(d, Decision::Ask { deep: true, .. }));
+        // Every batch A delivers is followed at once by the next from A: it
+        // has shown it serves old blocks to us, and C has not.
+        let mut tip = 225_927;
+        for k in 1..=10 {
+            tip += BATCH;
+            let d = step(&mut h, &seen(t1 + secs(5 * k), tip, &next_from(tip), &both));
+            assert_eq!(asked_of(&d), (4, tip + 1, tip + BATCH), "batch {k}");
+        }
+        // A goes slow in turn: C is asked, and once C delivers, C keeps the
+        // next batch.
+        let t2 = t1 + secs(50) + ROTATE_AFTER;
+        let d = step(&mut h, &seen(t2, tip, &next_from(tip), &both));
+        assert_eq!(asked_of(&d).0, 6);
+        tip += BATCH;
+        let d = step(&mut h, &seen(t2 + secs(5), tip, &next_from(tip), &both));
+        assert_eq!(asked_of(&d), (6, tip + 1, tip + BATCH));
+        assert_eq!(h.dropped(A) + h.dropped(C), 0);
+    }
+
+    #[test]
+    fn a_one_tick_blip_of_a_peer_to_ask_does_not_end_the_conclusion() {
+        let t0 = Instant::now();
+        let next = next_from(225_927);
+        let mut h = concluded(t0);
+        h.take_news();
+        let rescue = [with_inflight(recorded(6, A, LIMITED, 233_481), &[225_928])];
+        let blip = [
+            with_inflight(recorded(6, A, LIMITED, 233_481), &[225_928]),
+            recorded(9, B, LIMITED, 233_481),
+        ];
+        assert_eq!(
+            h.decide(&seen(t0 + secs(200), 225_927, &next, &blip)),
+            Decision::Wait(Why::EngineFetching)
+        );
+        assert!(h.no_archive_serves_old_blocks(), "one tick may be a blip");
+        for n in 1..=10 {
+            assert_eq!(
+                h.decide(&seen(t0 + secs(200 + 3 * n), 225_927, &next, &rescue)),
+                Decision::Wait(Why::EngineFetching)
+            );
+        }
+        assert!(h.no_archive_serves_old_blocks());
+        assert!(h.take_news().is_empty(), "not said again");
+        // On two ticks in a row it is no blip: the conclusion ends.
+        h.decide(&seen(t0 + secs(300), 225_927, &next, &blip));
+        assert!(h.no_archive_serves_old_blocks());
+        h.decide(&seen(t0 + secs(303), 225_927, &next, &blip));
+        assert!(!h.no_archive_serves_old_blocks());
+    }
+
+    #[test]
+    fn no_archive_serves_old_blocks_holds_while_no_archive_peer_is_connected() {
+        let t0 = Instant::now();
+        let next = next_from(225_927);
+        let mut h = concluded(t0);
+        h.take_news();
+        for n in 0..10 {
+            assert_eq!(
+                h.decide(&seen(t0 + secs(60 + 30 * n), 225_927, &next, &[])),
+                Decision::Wait(Why::NoPeer)
+            );
+        }
+        assert!(h.no_archive_serves_old_blocks());
+        let a7 = [recorded(7, A, LIMITED, 233_481)];
+        assert_eq!(
+            h.decide(&seen(t0 + secs(400), 225_927, &next, &a7)),
+            Decision::Wait(Why::NoOldBlocks)
+        );
+        assert!(h.no_archive_serves_old_blocks());
+        assert!(h.take_news().is_empty(), "said once");
+    }
+
+    #[test]
+    fn a_peer_still_connected_when_its_batch_times_out_is_not_counted_as_a_drop() {
+        let t0 = Instant::now();
+        let next = next_from(225_927);
+        let a = [recorded(4, A, LIMITED, 233_481)];
+        let mut h = helper();
+        h.decide(&seen(t0, 225_927, &next, &a));
+        step(&mut h, &seen(t0 + QUIET, 225_927, &next, &a));
+        for n in 1..=3 {
+            let d = step(
+                &mut h,
+                &seen(t0 + QUIET + ROTATE_AFTER * n, 225_927, &next, &a),
+            );
+            assert_eq!(asked_of(&d).0, 4, "the only archive peer, asked again");
+        }
+        assert_eq!(h.dropped(A), 0);
+        assert!(h.refuses_old().is_empty());
+        assert!(h.take_news().is_empty());
+    }
+
+    #[test]
+    fn a_peer_that_goes_while_asked_for_newer_blocks_is_not_counted_as_a_drop() {
+        let t0 = Instant::now();
+        let near = next_from(233_231);
+        let a4 = [recorded(4, A, LIMITED, 233_481)];
+        let mut h = helper();
+        let mut s = seen(t0, 233_231, &near, &a4);
+        s.target = Some(233_481);
+        h.decide(&s);
+        s.now = t0 + QUIET;
+        let d = step(&mut h, &s);
+        assert!(matches!(d, Decision::Ask { deep: false, .. }));
+        // Back under a new connection id, nothing connected: not the limited
+        // peers' rule, since none of these blocks is old for A.
+        let a5 = [recorded(5, A, LIMITED, 233_481)];
+        let mut s = seen(t0 + secs(33), 233_231, &near, &a5);
+        s.target = Some(233_481);
+        assert_eq!(asked_of(&step(&mut h, &s)), (5, 233_232, 233_331));
+        assert_eq!(h.dropped(A), 0);
+        assert!(h.take_news().is_empty());
     }
 }
