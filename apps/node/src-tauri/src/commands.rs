@@ -3280,11 +3280,6 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         Default::default()
     };
     let history_check = history.check;
-    // A validating node on a signed snapshot says its older history is still
-    // being checked, for as long as the engine reports it unchecked
-    // (btx_core::role). Not gated on the line's base height: the sentence
-    // needs none, and a getblockheader that keeps failing would hold it back.
-    let on_signed_snapshot = history.unchecked && btx_core::node::on_signed_snapshot(&datadir);
     let role = net.as_ref().filter(|_| running).map(|n| {
         btx_core::role::node_role(
             matmul_trusted.as_ref(),
@@ -3299,7 +3294,14 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         .with_distinct_signers(distinct_signers)
         .with_tip_age(tip_age_secs)
         .with_signed_frontier(signed_frontier.as_ref())
-        .with_signed_snapshot(on_signed_snapshot)
+        // A validating node says its older history is still being checked
+        // for as long as the engine reports it unchecked, whichever snapshot
+        // it started from: the engine's compiled one leaves that history as
+        // unchecked as a signed one, and the status screen shows the check
+        // for both (btx_core::role). Not gated on the line's base height:
+        // the sentence needs none, and a getblockheader that keeps failing
+        // would hold it back.
+        .with_unchecked_history(history.unchecked)
     });
     let role_lines = role.as_ref().map(|r| r.lines()).unwrap_or_default();
     let signing_live = role.as_ref().is_some_and(|r| r.signs_for_mirrors());
@@ -7444,6 +7446,29 @@ mod signed_start_tests {
         ] {
             assert!(between.contains(step), "missing before the retry: {step}");
         }
+    }
+
+    /// Integration review M1: a validating node on the engine's compiled
+    /// snapshot has no `attested_assumeutxo` file, and its older history is
+    /// just as unchecked. The role card follows the history check alone, so
+    /// it never says "takes nobody's word for the chain" while the status
+    /// screen shows "Checking older history".
+    #[test]
+    fn the_role_sentence_follows_the_history_check_alone() {
+        let src = include_str!("commands.rs");
+        let status = src
+            .split("\npub async fn get_node_status(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(
+            status.contains(".with_unchecked_history(history.unchecked)"),
+            "the role reads the history check"
+        );
+        assert!(
+            !status.contains("on_signed_snapshot("),
+            "and not the signed snapshot's file"
+        );
     }
 
     /// Minor 7: after a stop or another restart got there first, the log
