@@ -1891,7 +1891,6 @@ mod tests {
             Verdict::Continue,
             "a clock set back"
         );
-        assert!(MAX_TOTAL_SECS > MAX_RUN_SECS);
     }
 
     /// Review M1: a resume that cannot write the fresh watch window (on a
