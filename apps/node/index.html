@@ -76,6 +76,13 @@
         <span id="update-banner-text"><strong>Update available</strong></span>
       </section>
 
+      <!-- What the chip notice below says, spoken once when the notice
+           appears (main.ts reflectChipNotice) and cleared a few seconds
+           later, since the card still shows it. Always present and outside
+           both screens: a live region that appears together with its text
+           may not be announced (VoiceOver on WebKit). Visually hidden. -->
+      <p id="chip-announce" class="visually-hidden" role="status"></p>
+
       <!-- ── Wizard (first run) ──────────────────────────────────────── -->
       <section id="screen-wizard" class="screen" hidden>
         <div class="hero">
@@ -97,6 +104,40 @@
               <span class="fact-value" id="wizard-free-disk">—</span>
             </div>
           </div>
+          <!-- The one question (docs/decisions/2026-09-29-quick-start-full-
+               check-and-progress.md). main.ts selects Full check first on an
+               NVIDIA machine and Quick start first on a Mac (the owner's
+               decision of 2026-09-29), and greys Full check out where the
+               machine cannot check blocks (start-choice.ts); begin_setup
+               records the pick before the first start. -->
+          <fieldset class="start-choice" id="start-choice" role="radiogroup" aria-label="How your node starts" aria-describedby="start-choice-note">
+            <label class="choice" id="choice-quick-label">
+              <input type="radio" name="start-choice" value="quick_start" id="choice-quick" />
+              <span class="choice-text">
+                <span class="choice-name">Quick start</span>
+                <span class="choice-desc">Follows signatures, ready in minutes.</span>
+              </span>
+            </label>
+            <label class="choice" id="choice-full-label">
+              <input type="radio" name="start-choice" value="full_check" id="choice-full" />
+              <span class="choice-text">
+                <span class="choice-name">Full check</span>
+                <span class="choice-desc">Validates every block, takes longer the first time.</span>
+                <span class="choice-reason" id="choice-full-reason" hidden></span>
+              </span>
+            </label>
+            <!-- The owner's wording of 2026-09-30, "recent signed snapshot"
+                 until a second operator is on the list; then "confirmed by
+                 two node operators". The last sentence shows only where Full
+                 check is possible (start-choice.ts switchLaterShown): on a
+                 machine that cannot check blocks, Settings has no switch. -->
+            <p class="wizard-note start-choice-note" id="start-choice-note">
+              Both start from a recent signed snapshot and check the older
+              history in the background. Full check also checks every new
+              block on this computer's graphics card.
+              <span id="start-choice-switch" hidden>You can switch later in Settings.</span>
+            </p>
+          </fieldset>
           <button id="setup-btn" class="btn-primary" type="button">
             <span class="btn-spinner" aria-hidden="true"></span>
             <span class="btn-label" id="setup-btn-label">Set up my node</span>
@@ -149,6 +190,17 @@
           <canvas class="power-canvas" id="power-canvas" aria-hidden="true"></canvas>
           <div class="status-badge" id="status-badge">—</div>
           <div class="status-sub" id="status-sub"></div>
+          <!-- The background check of the snapshot's older history
+               (NodeStatusInfo.history_check, history-check.ts). Gone once the
+               engine reports it done. No time estimate on purpose. The line
+               is the bar's accessible name; the bar carries the percentage.
+               The line itself is hidden from screen readers, so it is heard
+               once, as the bar's name. -->
+          <div class="history-check" id="history-check" hidden>
+            <div class="history-line" id="history-line" aria-hidden="true"></div>
+            <div class="progress-track history-track" id="history-bar" role="progressbar"
+                 aria-labelledby="history-line" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="progress-fill" id="history-fill"></div></div>
+          </div>
         </div>
 
         <div class="stats-grid">
@@ -185,6 +237,15 @@
              lines ask something of the person; quiet ones only explain. -->
         <div class="card fork-card engine-card" id="engine-card" hidden>
           <div id="engine-notes"></div>
+        </div>
+
+        <!-- Once per engine, after the engine refused this Mac's graphics
+             chip and the app moved the node to following signatures
+             (start-choice.ts chipNoticeVisible). OK remembers it. A screen
+             reader hears it through #chip-announce, which is always there. -->
+        <div class="card chip-card" id="chip-card" hidden>
+          <p id="chip-msg">This Mac's graphics chip didn't pass the engine's check, so your node follows signatures. Nothing for you to do.</p>
+          <button id="chip-ok" class="btn-secondary" type="button">OK</button>
         </div>
 
         <!-- A machine that checks blocks itself, measured adding far fewer
