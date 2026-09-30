@@ -651,7 +651,12 @@ pub fn check(
 
 /// The running node is on the statement's chain and, when it reports one,
 /// has the statement's replay context. A node with no pin and no key
-/// reports no context; the compiled one then decides alone.
+/// reports no context; the compiled one then decides alone. A missing
+/// genesis or replay context here means nobody asked a running node yet, as
+/// in the pre-launch check (`attested_snapshot::prepare_start`, called
+/// before the node exists to ask); the loader refuses a running node that
+/// did not answer (`confirmed_load::recheck`, "the node did not say which
+/// chain it is on").
 pub fn node_agrees(st: &Statement, node: &NodeView) -> Result<(), Refusal> {
     if let Some(g) = &node.genesis {
         if Hash32::from_display_hex(g) != Some(st.chain_id()) {
