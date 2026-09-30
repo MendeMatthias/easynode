@@ -600,7 +600,7 @@ async fn a_two_operator_snapshot_loads_on_a_mirror_and_a_validating_node_restart
     // threshold, and the engine counts the btx_rw.conf pin toward its check
     // of the stored manifest.
     std::fs::write(&rw_conf, format!("matmultrustedpubkey={p_pub}\n")).unwrap();
-    let already = btx_core::node::conf_pins(&rw_conf);
+    let already = btx_core::node::rw_conf_pins(&rw_conf);
     assert_eq!(already, vec![p_pub.clone()]);
     let pin_args = btx_core::node::validating_snapshot_pin_args(&mirror.net(), &pins, &already);
     assert_eq!(pin_args, vec!["-matmultrustedthreshold=1".to_string()]);

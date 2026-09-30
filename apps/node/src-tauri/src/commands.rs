@@ -3939,11 +3939,13 @@ fn signing_key_the_app_does_not_manage(datadir: &Path) -> bool {
             .any(|l| !l.trim().starts_with(&removed))
 }
 
-/// The lines of `conf` that set any of `names` to a value, read as the
-/// engine reads a conf, the way `btx_core::node::conf_pins` does: a line is
-/// cut at the first `#`, then split at the first `=`, both halves trimmed;
-/// the bare name and the `main.` prefix both count; an empty value sets
-/// nothing. Each comes back as written.
+/// The lines of `conf` that set any of `names` to a value: a line is cut at
+/// the first `#`, then split at the first `=`, both halves trimmed; the bare
+/// name and the `main.` prefix both count, under whatever `[section]` header
+/// (unlike `btx_core::node::conf_pins`, which counts only what mainnet
+/// reads: a line counted here that the engine would not read only keeps the
+/// node off the mirror launch); an empty value sets nothing. Each comes back
+/// as written.
 fn conf_key_lines(conf: &Path, names: &[&str]) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(conf) else {
         return Vec::new();

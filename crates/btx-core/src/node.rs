@@ -1191,7 +1191,7 @@ pub fn build_node_command(
             // key already pinned gets the engine's "Duplicate
             // -matmultrustedpubkey" refusal at init (init.cpp ~1591-1597).
             let mut already_pinned = conf_pins(conf);
-            already_pinned.extend(conf_pins(&datadir.join("btx_rw.conf")));
+            already_pinned.extend(rw_conf_pins(&datadir.join("btx_rw.conf")));
             for pubkey in BTX_TRUSTED_ATTESTATION_PUBKEYS {
                 if !already_pinned
                     .iter()
@@ -1253,7 +1253,7 @@ pub fn build_node_command(
         // "Duplicate -matmultrustedpubkey" refusal at init.
         if !mirror_here {
             let mut already = conf_pins(conf);
-            already.extend(conf_pins(&datadir.join("btx_rw.conf")));
+            already.extend(rw_conf_pins(&datadir.join("btx_rw.conf")));
             already.extend(signing_key_self_pin(conf, datadir));
             args.extend(validating_snapshot_pin_args(
                 datadir,
@@ -1991,32 +1991,60 @@ pub fn signing_key_self_pin(conf: &Path, datadir: &Path) -> Option<String> {
     (!already_pinned).then_some(pubkey)
 }
 
-/// Every key `conf` already pins (`matmultrustedpubkey=`), lowercase. The
-/// engine refuses a duplicate pin, so the command line never repeats one.
+/// Every key `conf` already pins for mainnet (`matmultrustedpubkey=`),
+/// lowercase. The engine refuses a duplicate pin, so the command line never
+/// repeats one.
 ///
 /// Parses the way the engine's own conf reader does (`common/config.cpp`
-/// ~42-60, v0.34.9 at `84b998b4`): a line is cut at the first `#`, then split
-/// at the first `=`, both halves trimmed. The bare name and the `main.`
-/// section prefix both count, matching how btxd reads a flat conf for the
-/// mainnet section. `includeconf` is not followed: a pin listed only through
-/// an included file is not seen here.
+/// `GetConfigOptions` and `common/args.cpp` `InterpretKey`, v0.34.9 at
+/// `84b998b4`): a line is cut at the first `#` and trimmed; `[name]` starts a
+/// section, and every later name is read as `name.` plus the line's; a line
+/// is split at the first `=`, both halves trimmed; the section is whatever
+/// comes before the first `.`. Mainnet reads the default section and
+/// `main`, so a pin under `[main]` or with the `main.` prefix counts, and
+/// one under `[test]`, `[regtest]` or with their prefix does not.
+/// `includeconf` is not followed: a pin listed only through an included file
+/// is not seen here. For `btx_rw.conf` ask [`rw_conf_pins`].
 pub fn conf_pins(conf: &Path) -> Vec<String> {
-    std::fs::read_to_string(conf)
-        .map(|text| {
-            text.lines()
-                .filter_map(|l| {
-                    let l = l.split('#').next().unwrap_or("");
-                    let (name, value) = l.split_once('=')?;
-                    let name = name.trim();
-                    if name != "matmultrustedpubkey" && name != "main.matmultrustedpubkey" {
-                        return None;
-                    }
-                    let value = value.trim();
-                    (!value.is_empty()).then(|| value.to_ascii_lowercase())
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    pins_read(conf, false)
+}
+
+/// [`conf_pins`] for the datadir's `btx_rw.conf`, which the engine loads on
+/// every start and reads without sections: it keeps only the name after the
+/// section (`common/config.cpp` ~111, `settings_target`), so a pin under any
+/// section, or with any section prefix, applies on mainnet there.
+pub fn rw_conf_pins(rw_conf: &Path) -> Vec<String> {
+    pins_read(rw_conf, true)
+}
+
+/// The two readers' one parser. `sections_dropped`: every section counts.
+fn pins_read(conf: &Path, sections_dropped: bool) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(conf) else {
+        return Vec::new();
+    };
+    let mut prefix = String::new();
+    let mut pins = Vec::new();
+    for raw in text.lines() {
+        let l = raw.split('#').next().unwrap_or("").trim();
+        if l.len() >= 2 && l.starts_with('[') && l.ends_with(']') {
+            prefix = format!("{}.", &l[1..l.len() - 1]);
+            continue;
+        }
+        let Some((name, value)) = l.split_once('=') else {
+            continue;
+        };
+        let full = format!("{prefix}{}", name.trim());
+        let (section, key) = match full.split_once('.') {
+            Some((section, key)) => (Some(section), key),
+            None => (None, full.as_str()),
+        };
+        let mainnet_reads = sections_dropped || matches!(section, None | Some("main"));
+        let value = value.trim();
+        if mainnet_reads && key == "matmultrustedpubkey" && !value.is_empty() {
+            pins.push(value.to_ascii_lowercase());
+        }
+    }
+    pins
 }
 
 /// The engine's record that this node runs on a signed snapshot whose
@@ -6553,6 +6581,89 @@ matmul: metal runtime_probe_ok, selecting metal\n\
         let pins = conf_pins(&conf);
         assert!(pins.contains(&key1.to_string()), "{pins:?}");
         assert!(pins.contains(&key2.to_string()), "{pins:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Final review M7: `conf_pins` reads sections the way the engine does
+    /// for mainnet (`common/config.cpp` `GetConfigOptions`, then
+    /// `InterpretKey`, at 84b998b4): the default section, `[main]`, and the
+    /// `main.` prefix count; a pin under `[test]` or with the `test.` prefix,
+    /// a commented line and a longer name ending in the option's do not. In
+    /// `btx_rw.conf` the engine drops the section (`config.cpp` ~111,
+    /// `settings_target`), so every section counts there, and a `test.`
+    /// line applies on mainnet.
+    #[test]
+    fn conf_pins_counts_only_what_mainnet_reads_and_btx_rw_conf_drops_sections() {
+        let dir = signed_snapshot_datadir("conf-pins-sections");
+        let k = |n: u8| format!("02{}", format!("{n:02x}").repeat(32));
+        let conf = dir.join("sections.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\n\
+                 #matmultrustedpubkey={}\n\
+                 test.matmultrustedpubkey={}\n\
+                 extramatmultrustedpubkey={}\n\
+                 main.matmultrustedpubkey={}\n\
+                 [test]\n\
+                 matmultrustedpubkey={}\n\
+                 [regtest]\n\
+                 matmultrustedpubkey={}\n\
+                 [main]\n\
+                 matmultrustedpubkey={}\n\
+                 main.matmultrustedpubkey={}\n",
+                k(1),
+                k(2),
+                k(3),
+                k(4),
+                k(5),
+                k(6),
+                k(7),
+                k(8),
+                k(9)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(1), k(5), k(8)]);
+        assert_eq!(
+            rw_conf_pins(&conf),
+            vec![k(1), k(3), k(5), k(6), k(7), k(8)],
+            "btx_rw.conf: the section is dropped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Final review M7, the scenario: a hand-edited conf that pins the
+    /// 3060's key only under `[test]` does not pin it on mainnet, so the
+    /// mirror arm still passes it (the stored manifest on 225,927 carries
+    /// only that signature); in `btx_rw.conf` the same line pins it.
+    #[test]
+    fn a_pin_under_another_network_is_still_passed_on_mainnet() {
+        let dir = signed_snapshot_datadir("conf-pin-under-test");
+        let the_3060 = BTX_TRUSTED_ATTESTATION_PUBKEYS[3];
+        let conf = dir.join("sections.conf");
+        std::fs::write(
+            &conf,
+            format!("server=1\n[test]\nmatmultrustedpubkey={the_3060}\n"),
+        )
+        .unwrap();
+        let btxd = Path::new("/x/btx/v0.34.9/lin/btxd");
+        let pinned = |args: &[String]| {
+            args.iter()
+                .filter(|a| **a == format!("-matmultrustedpubkey={the_3060}"))
+                .count()
+        };
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Cpu);
+        assert_eq!(validation_modes(&args), vec!["trusted"], "{args:?}");
+        assert_eq!(pinned(&args), 1, "{args:?}");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        std::fs::write(
+            dir.join("btx_rw.conf"),
+            format!("[test]\nmatmultrustedpubkey={the_3060}\n"),
+        )
+        .unwrap();
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Cpu);
+        assert_eq!(pinned(&args), 0, "btx_rw.conf already pins it: {args:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
