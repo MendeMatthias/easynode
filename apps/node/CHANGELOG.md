@@ -75,7 +75,8 @@ still checks its older history in the background. A node that checks blocks
 itself also lists the signing keys mirrors follow, which it needs to keep
 starting from that snapshot; they never replace its own checks, and it passes
 their signatures on to its peers, as mirrors do. The node remembers who
-confirmed its start point. If there is no such snapshot yet, or the operators
+confirmed its start point, and names them under the check of older history
+and in Copy diagnostics. If there is no such snapshot yet, or the operators
 disagree about one, your node starts from the snapshot easyNode already ships,
 at block 225,927. A node that checks blocks itself used to start further back,
 from the one built into the node engine, and now takes easyNode's in the same

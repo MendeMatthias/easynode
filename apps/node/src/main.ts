@@ -237,6 +237,9 @@ interface NodeStatusInfo {
   /** How far the background check of the snapshot's older history has got;
    *  null when there is none running. */
   history_check: HistoryCheck | null;
+  /** The history line's second sentence: where the chain started and who
+   *  confirmed it, for the chain running now (btx_core::snapshot_start). */
+  started_from: string | null;
   /**
    * Bytes uploaded to peers this run. Null when stopped or when the node did
    * not answer `getnettotals` — the UI drops the claim rather than showing a
@@ -1769,7 +1772,7 @@ function reflectFork(status: NodeStatusInfo, reading: TrendReading): void {
 function reflectHistoryCheck(status: NodeStatusInfo): void {
   const wrap = $("history-check");
   const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
-  const view = running ? historyCheckView(status.history_check) : null;
+  const view = running ? historyCheckView(status.history_check, status.started_from) : null;
   if (!view) {
     wrap.hidden = true;
     return;

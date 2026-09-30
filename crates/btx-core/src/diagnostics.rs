@@ -63,6 +63,9 @@ pub struct DiagnosticsInput {
     pub chain: Option<BlockchainInfo>,
     pub best_block_hash: Option<String>,
     pub chainstates: Option<ChainStates>,
+    /// Where the running chain started and who confirmed it
+    /// (`snapshot_start::started_from_current`), or `None`.
+    pub started_from: Option<String>,
     pub tips: Vec<ChainTip>,
     pub held: Vec<HeldBranchState>,
     pub peers: Vec<PeerInfo>,
@@ -143,6 +146,9 @@ pub fn render(i: &DiagnosticsInput) -> String {
                 None => o.push(format!("  history check at {}", group(c.blocks))),
             }
         }
+    }
+    if let Some(from) = &i.started_from {
+        o.push(format!("  {from}"));
     }
     let others: Vec<&ChainTip> = i
         .tips
@@ -1118,6 +1124,7 @@ mod tests {
             }),
             best_block_hash: Some("11bd18812b6afcd1".into()),
             chainstates: None,
+            started_from: None,
             tips: vec![],
             held: vec![],
             peers: vec![
@@ -1263,6 +1270,7 @@ mod tests {
             }),
             best_block_hash: Some("11bd18812b6afcd1".into()),
             chainstates: None,
+            started_from: None,
             tips: vec![],
             held: vec![HeldBranchState {
                 height: 228146,
@@ -1302,5 +1310,33 @@ mod tests {
             assert!(r.contains(part), "missing {part}:\n{r}");
         }
         assert!(!r.contains('\u{2014}'));
+    }
+
+    /// Integration review M2: the report says where the chain started and
+    /// who confirmed it, as the status screen does, names intact after the
+    /// redaction; and says nothing when there is no current start record.
+    #[test]
+    fn the_report_says_where_the_chain_started() {
+        let base = "bd23c642be34c3a1f1a637d6352b8cfb390c801f2b873605b64986a1bc962c46";
+        let input = DiagnosticsInput {
+            chainstates: Some(ChainStates {
+                headers: 233_900,
+                chainstates: vec![crate::node_api::ChainstateEntry {
+                    blocks: 233_900,
+                    snapshot_blockhash: Some(base.into()),
+                    ..Default::default()
+                }],
+            }),
+            started_from: Some("Started from block 233,800, confirmed by Mende and jpp.".into()),
+            ..Default::default()
+        };
+        let out = report(&input, &ctx("unusedsecret"));
+        assert!(
+            out.lines()
+                .any(|l| l == "  Started from block 233,800, confirmed by Mende and jpp."),
+            "{out}"
+        );
+        let none = render(&DiagnosticsInput::default());
+        assert!(!none.contains("Started from"), "{none}");
     }
 }

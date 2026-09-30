@@ -47,6 +47,34 @@ describe("historyCheckView", () => {
     expect(historyCheckView({ checked: 5, base: 0 })).toBeNull();
     expect(historyCheckView({ checked: Number.NaN, base: 225_927 })).toBeNull();
   });
+
+  // The confirmed-snapshot decision, section 7: the line gains a second
+  // sentence, on a line of its own, saying where the node started.
+  it("says where the node started, as the decision wrote it", () => {
+    expect(
+      historyCheckView(
+        { checked: 131_200, base: 233_800 },
+        "Started from block 233,800, confirmed by Mende and jpp.",
+      ),
+    ).toEqual({
+      line: "Checking older history: 131,200 of 233,800 (56%).\nStarted from block 233,800, confirmed by Mende and jpp.",
+      pct: 56,
+    });
+    expect(
+      historyCheckView({ checked: 131_200, base: 225_927 }, "Started from block 225,927, built into this app.")
+        ?.line,
+    ).toBe("Checking older history: 131,200 of 225,927 (58%).\nStarted from block 225,927, built into this app.");
+  });
+
+  it("goes with the check, whatever the start point", () => {
+    expect(historyCheckView(null, "Started from block 233,800, confirmed by Mende and jpp.")).toBeNull();
+    expect(historyCheckView({ checked: 131_200, base: 225_927 }, null)?.line).toBe(
+      "Checking older history: 131,200 of 225,927 (58%)",
+    );
+    expect(historyCheckView({ checked: 131_200, base: 225_927 }, "  ")?.line).toBe(
+      "Checking older history: 131,200 of 225,927 (58%)",
+    );
+  });
 });
 
 describe("the history line for a screen reader", () => {
@@ -55,5 +83,12 @@ describe("the history line for a screen reader", () => {
     expect(tagOf("history-bar")).toContain('aria-labelledby="history-line"');
     // Without this the line is read twice: as text, then as the bar's name.
     expect(tagOf("history-line")).toContain('aria-hidden="true"');
+  });
+});
+
+describe("the history line's second sentence", () => {
+  it("sits on a line of its own", () => {
+    const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+    expect(css).toMatch(/\.history-line\s*\{[^}]*white-space:\s*pre-line/);
   });
 });

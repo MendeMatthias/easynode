@@ -525,6 +525,10 @@ pub async fn tools_diagnostics(
             .ok()
             .and_then(|v| v["subversion"].as_str().map(str::to_string));
         input.chainstates = api::get_chainstates(rpc).await.ok();
+        input.started_from = input
+            .chainstates
+            .as_ref()
+            .and_then(|cs| btx_core::snapshot_start::started_from_current(&datadir, cs));
         input.tips = api::get_chain_tips(rpc).await.unwrap_or_default();
         input.peers = api::get_peer_info(rpc).await.unwrap_or_default();
         input.attested_tip = api::get_attested_tip(rpc).await.ok();

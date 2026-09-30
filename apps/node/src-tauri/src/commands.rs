@@ -1047,6 +1047,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     *state.tip_median_time.lock().await = None;
     state.engine_warnings.lock().await.clear();
     *state.history_check.lock().await = Default::default();
+    *state.started_from.lock().await = None;
 
     set_phase(app, state, NodePhase::Starting).await;
 
@@ -1632,6 +1633,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
     let tip_time_slot = state.tip_median_time.clone();
     let engine_warnings_slot = state.engine_warnings.clone();
     let history_slot = state.history_check.clone();
+    let started_from_slot = state.started_from.clone();
     let anchor = snapshot_spec().anchor_height;
 
     tauri::async_runtime::spawn(async move {
@@ -1809,6 +1811,16 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     )
                     .await;
                     *history_slot.lock().await = history;
+                    // Where the chain the node runs on started, and who
+                    // confirmed it, for the history line's second sentence:
+                    // from the start record, only while it describes this
+                    // chain (btx_core::snapshot_start). A failed
+                    // getchainstates keeps the last answer, as above.
+                    if let Ok(cs) = &chainstates {
+                        let dd = node_datadir();
+                        *started_from_slot.lock().await =
+                            btx_core::snapshot_start::started_from_current(&dd, cs);
+                    }
                     let chainstates = chainstates.unwrap_or_default();
                     let peer_infos = peer_infos.ok();
                     // A FAILED MEASUREMENT IS NOT ZERO PEERS. `peers` is an i64
@@ -2659,6 +2671,7 @@ pub async fn stop_node_inner(state: &AppState) {
     *state.tip_median_time.lock().await = None;
     state.engine_warnings.lock().await.clear();
     *state.history_check.lock().await = Default::default();
+    *state.started_from.lock().await = None;
     // Release the keep-awake assertion — the Mac may sleep again.
     *state.sleep_guard.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
@@ -2872,6 +2885,12 @@ pub struct NodeStatusInfo {
     /// while the snapshot's own height (the check's base) has not been read
     /// yet: the line is never shown against a guessed base.
     pub history_check: Option<btx_core::node_api::HistoryCheck>,
+    /// The history line's second sentence: where the chain the node runs on
+    /// started, and who confirmed it ("Started from block 233,800, confirmed
+    /// by Mende and jpp."), from the start record, and only while that record
+    /// describes this chain (`btx_core::snapshot_start::started_from_current`).
+    /// `None` when the node is stopped or there is no such record.
+    pub started_from: Option<String>,
     /// The nickname the user has chosen (empty = none). This is what WILL be
     /// broadcast; `subversion` below is what IS.
     pub node_nickname: String,
@@ -3280,6 +3299,11 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         Default::default()
     };
     let history_check = history.check;
+    let started_from = if running {
+        state.started_from.lock().await.clone()
+    } else {
+        None
+    };
     let role = net.as_ref().filter(|_| running).map(|n| {
         btx_core::role::node_role(
             matmul_trusted.as_ref(),
@@ -3438,6 +3462,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         behind_signers_message,
         engine_notes,
         history_check,
+        started_from,
         fork,
         node_nickname: settings.node_nickname.clone(),
         broadcast_nickname: subversion
@@ -7468,6 +7493,41 @@ mod signed_start_tests {
         assert!(
             !status.contains("on_signed_snapshot("),
             "and not the signed snapshot's file"
+        );
+    }
+
+    /// Integration review M2, in the code: the refresher reads where the
+    /// chain started beside each tick's getchainstates (the record only
+    /// when it describes that chain), the status carries it while the node
+    /// runs, and a stop or a start forgets it like the history check.
+    #[test]
+    fn the_start_point_rides_the_tick_to_the_status() {
+        let src = include_str!("commands.rs");
+        let refresher = src
+            .split("\nfn spawn_status_refresher(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let history = refresher.find("refresh_history_check(").unwrap();
+        let start = refresher
+            .find("snapshot_start::started_from_current(&dd, cs)")
+            .expect("the refresher reads the start record");
+        assert!(history < start);
+        assert!(refresher.contains("*started_from_slot.lock().await ="));
+
+        let status = src
+            .split("\npub async fn get_node_status(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(status.contains("state.started_from.lock().await.clone()"));
+        assert!(status.contains("        started_from,\n"));
+        // Built here, so this test's own text is not counted.
+        let cleared = ["*state.started_from", ".lock().await = None;"].concat();
+        assert_eq!(
+            src.matches(&cleared).count(),
+            2,
+            "cleared on start and on stop"
         );
     }
 

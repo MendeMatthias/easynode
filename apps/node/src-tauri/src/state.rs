@@ -748,6 +748,12 @@ pub struct AppState {
     /// got (`check`, for the line and the bar). Kept through a failed read,
     /// like `engine_warnings`; cleared on every stop/start like the others.
     pub history_check: Arc<Mutex<btx_core::node_api::HistoryProgress>>,
+    /// Where the chain the node runs on started, and who confirmed it
+    /// (`btx_core::snapshot_start::started_from_current`), from the
+    /// refresher's `getchainstates`, for the history line's second sentence.
+    /// Kept through a failed read and cleared on every stop/start, like
+    /// `history_check`.
+    pub started_from: Arc<Mutex<Option<String>>>,
     /// The archive-peer census, computed ONCE per refresher tick from a single
     /// getpeerinfo and shared by the status snapshot, the watchdog and the
     /// service report. The UI poll used to run its own full getpeerinfo every
@@ -840,6 +846,7 @@ impl AppState {
             tip_median_time: Arc::new(Mutex::new(None)),
             engine_warnings: Arc::new(Mutex::new(Vec::new())),
             history_check: Arc::new(Mutex::new(Default::default())),
+            started_from: Arc::new(Mutex::new(None)),
             archive_peers_cache: Arc::new(Mutex::new(None)),
             peer_nicknames_cache: Arc::new(Mutex::new(Vec::new())),
             esplora: Arc::new(Mutex::new(None)),
