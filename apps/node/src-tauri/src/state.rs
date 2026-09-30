@@ -713,6 +713,13 @@ pub struct AppState {
     /// `tip_median_time`: one lost answer is not the engine taking a warning
     /// back, and a warning that blinks on and off reads as a false alarm.
     pub engine_warnings: Arc<Mutex<Vec<btx_core::engine_warnings::EngineWarning>>>,
+    /// The background check of a snapshot's older history
+    /// (`btx_core::node_api::refresh_history_check`), from the refresher's
+    /// `getchainstates`: whether one is running (`unchecked`, for the role
+    /// sentence) and, once the snapshot's own height is read, how far it has
+    /// got (`check`, for the line and the bar). Kept through a failed read,
+    /// like `engine_warnings`; cleared on every stop/start like the others.
+    pub history_check: Arc<Mutex<btx_core::node_api::HistoryProgress>>,
     /// The archive-peer census, computed ONCE per refresher tick from a single
     /// getpeerinfo and shared by the status snapshot, the watchdog and the
     /// service report. The UI poll used to run its own full getpeerinfo every
@@ -803,6 +810,7 @@ impl AppState {
             fork: Arc::new(Mutex::new(None)),
             tip_median_time: Arc::new(Mutex::new(None)),
             engine_warnings: Arc::new(Mutex::new(Vec::new())),
+            history_check: Arc::new(Mutex::new(Default::default())),
             archive_peers_cache: Arc::new(Mutex::new(None)),
             peer_nicknames_cache: Arc::new(Mutex::new(Vec::new())),
             esplora: Arc::new(Mutex::new(None)),
