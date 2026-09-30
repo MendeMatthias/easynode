@@ -45,17 +45,17 @@ name: Build Windows btxd (mingw cross, smoked on Windows)
 # 0.34 .. 0.34.4 engines; 0.34.5 and later allow a degraded start, which
 # scripts/check-engine-fleet-ready.sh verifies per pin.
 #
-# 84b998b4 is upstream's tag v0.34.9 (tagged 2026-09-23), and both engine
-# guards pass on it. Before that it was 3013c2c2, upstream's tag v0.34.6. A SHA
-# rather than the tag name so the artifact is named for the commit, which is
-# what node-win-installer.yml's identity check needs.
+# 5f32c4c4 is upstream's tag v0.34.12 (tagged 2026-09-29), and both engine
+# guards pass on it. Before that it was 84b998b4 (v0.34.9) and 3013c2c2
+# (v0.34.6). A SHA rather than the tag name so the artifact is named for the
+# commit, which is what node-win-installer.yml's identity check needs.
 on:
   workflow_dispatch:
     inputs:
       btxchain_ref:
         description: "btxchain/btx ref to build (default = NODE_RELEASE_COMMIT)"
         required: false
-        default: "84b998b4f3272775aaf8c241ac11dc683f4c4e23"
+        default: "5f32c4c4d1cb033180bcd40a461deae2c1bc1ee1"
   # Self-service trigger. This workflow is dispatch-only, which means a 50 minute
   # build that everything else pins against can only start from a browser, and a
   # release stalls whenever nobody is at a keyboard. Scoped to a throwaway branch
@@ -71,7 +71,7 @@ permissions:
 # fallback there. That is how a build ends up producing an artifact nobody can
 # ship. Every consumer below reads BTXCHAIN_REF instead.
 env:
-  BTXCHAIN_REF: ${{ inputs.btxchain_ref || '84b998b4f3272775aaf8c241ac11dc683f4c4e23' }}
+  BTXCHAIN_REF: ${{ inputs.btxchain_ref || '5f32c4c4d1cb033180bcd40a461deae2c1bc1ee1' }}
 
 jobs:
   build-btxd:
