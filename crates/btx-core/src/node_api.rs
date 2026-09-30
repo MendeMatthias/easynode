@@ -500,6 +500,24 @@ fn advertises_archive(p: &PeerInfo) -> bool {
         .any(|n| n == "MATMUL_ATTESTATION_ARCHIVE")
 }
 
+/// NODE_NETWORK, service bit 0: the peer keeps and serves every block.
+pub const NODE_NETWORK_BIT: u64 = 1;
+
+/// Does this peer say it serves every block, not only its last 288? Decided
+/// from the service bits as [`advertises_archive`] is, with the exact name
+/// only for peer objects without them. The difference matters for old
+/// blocks: a peer with NETWORK_LIMITED and without this bit drops a node it
+/// does not grant `noban` when asked for a block more than 290 below its tip
+/// (engine `src/net_processing.cpp:9384-9391` at 84b998b4); one with it does
+/// not. The catch-up help (`crate::catchup_assist`) chooses by it.
+pub fn serves_full_history(p: &PeerInfo) -> bool {
+    let hex = p.services.trim_start_matches("0x");
+    if let Ok(bits) = u64::from_str_radix(hex, 16) {
+        return bits & NODE_NETWORK_BIT != 0;
+    }
+    p.servicesnames.iter().any(|n| n == "NETWORK")
+}
+
 /// The gate rule, verbatim from the incident diagnosis: archive service bit
 /// AND (manual connection OR noban permission). Class C of the stall
 /// discriminator is `authority == 0`.
@@ -576,6 +594,11 @@ pub struct AttestedTip {
     /// Whether the signed frontier is on our active chain.
     #[serde(default)]
     pub on_active_chain: Option<bool>,
+    /// The hash the node recorded for the frontier's height
+    /// (`signed_frontier.hash`), when it knows one. The catch-up help
+    /// (`crate::catchup_assist`) follows this header.
+    #[serde(default)]
+    pub hash: Option<String>,
 }
 
 /// Read the signed frontier. The RPC nests it under `signed_frontier`; older
@@ -594,6 +617,7 @@ pub async fn get_attested_tip(rpc: &dyn Rpc) -> AppResult<AttestedTip> {
             .get("on_active_chain")
             .and_then(|x| x.as_bool())
             .or_else(|| v.get("on_active_chain").and_then(|x| x.as_bool())),
+        hash: sf.get("hash").and_then(|x| x.as_str()).map(str::to_string),
     })
 }
 
@@ -1151,6 +1175,42 @@ mod tests {
                 .cloned()
                 .unwrap_or(Value::Null))
         }
+    }
+
+    #[tokio::test]
+    async fn attested_tip_reads_the_signed_frontier_hash() {
+        let hash = "ab".repeat(32);
+        let rpc = FakeRpc::new(&[(
+            "getmatmulattestedtip",
+            json!({"configured": true, "signed_frontier": {
+                "height": 233475, "hash": hash, "on_active_chain": true,
+                "on_chain_attested_height": 225927, "blocks_behind": 7548}}),
+        )]);
+        let t = get_attested_tip(&rpc).await.unwrap();
+        assert_eq!(t.height, Some(233_475));
+        assert_eq!(t.hash.as_deref(), Some(hash.as_str()));
+        let unpinned = FakeRpc::new(&[("getmatmulattestedtip", json!({"configured": false}))]);
+        assert_eq!(
+            get_attested_tip(&unpinned).await.unwrap(),
+            AttestedTip::default()
+        );
+    }
+
+    /// Service bits as this crate's tests record them: 207.56.229.99 from the
+    /// live getpeerinfo of 2026-08-17 above (NETWORK among its bits), and
+    /// btxscan's mirror 20.86.181.203 as the snapshot_serve tests record it
+    /// (NETWORK_LIMITED, bit 10, without NETWORK).
+    #[test]
+    fn full_history_is_read_from_bit_0_with_the_name_as_fallback() {
+        let peers: Vec<PeerInfo> = serde_json::from_value(json!([
+            {"id": 1, "addr": "207.56.229.99:19335", "services": "0000000080000c09"},
+            {"id": 2, "addr": "20.86.181.203:19338", "services": "0000000088000d08"},
+            {"id": 3, "servicesnames": ["NETWORK", "WITNESS"]},
+            {"id": 4, "servicesnames": ["NETWORK_LIMITED"]}
+        ]))
+        .unwrap();
+        let full: Vec<bool> = peers.iter().map(serves_full_history).collect();
+        assert_eq!(full, [true, false, true, false]);
     }
 
     #[tokio::test]

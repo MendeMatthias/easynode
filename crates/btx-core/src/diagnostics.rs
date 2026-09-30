@@ -68,10 +68,14 @@ pub struct DiagnosticsInput {
     pub peers: Vec<PeerInfo>,
     pub attested_tip: Option<AttestedTip>,
     pub stall: Option<String>,
+    /// What the catch-up help is doing this run (`crate::catchup_assist`,
+    /// `CatchUp::diagnostics`), one line each. Empty when no refresher ran.
+    pub catch_up: Vec<String>,
     pub log_warnings: Vec<String>,
 }
 
-fn group(n: u64) -> String {
+/// 229400 as "229,400", the way the report writes heights.
+pub(crate) fn group(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
@@ -217,6 +221,13 @@ pub fn render(i: &DiagnosticsInput) -> String {
         "Watchdog: {}",
         i.stall.as_deref().unwrap_or("nothing to report")
     ));
+    o.push("Catch-up help".into());
+    if i.catch_up.is_empty() {
+        o.push("  nothing to report".into());
+    }
+    for l in &i.catch_up {
+        o.push(format!("  {l}"));
+    }
     o.push(format!(
         "Last warning lines of debug.log ({})",
         i.log_warnings.len()
@@ -1144,6 +1155,10 @@ mod tests {
             ],
             attested_tip: None,
             stall: None,
+            catch_up: vec![
+                crate::catchup_assist::refuses_old_line("109.199.124.187:19335"),
+                crate::catchup_assist::refuses_old_line("203.0.113.7:19335"),
+            ],
             log_warnings: vec![format!(
                 "[warning] signing key backup contains {wif}, update check via \
                  http://84.32.49.226:19335/status failed"
@@ -1155,9 +1170,17 @@ mod tests {
             published_hosts: crate::node::published_peer_hosts(),
         };
         let out = report(&input, &context);
-        for gone in [wif.as_str(), "84.32.49.226"] {
+        for gone in [wif.as_str(), "84.32.49.226", "203.0.113.7"] {
             assert!(!out.contains(gone), "{gone} survived end to end:\n{out}");
         }
+        assert!(
+            out.contains("  [peer address] does not serve old blocks to this node"),
+            "a catch-up line about someone else's node keeps its sentence, not the address:\n{out}"
+        );
+        assert!(
+            out.contains("  109.199.124.187:19335 does not serve old blocks to this node"),
+            "the app's own archive peer is named:\n{out}"
+        );
         for kept in [
             "easyNode diagnostics",
             "Chain",
@@ -1281,6 +1304,7 @@ mod tests {
             }],
             attested_tip: None,
             stall: None,
+            catch_up: vec!["not asking any peer for blocks right now".into()],
             log_warnings: vec!["[warning] something".into()],
         };
         let r = render(&input);
@@ -1297,6 +1321,7 @@ mod tests {
             "recent history",
             "Engine notices (1)",
             "not shown on the home screen",
+            "Catch-up help\n  not asking any peer for blocks right now",
             "Last warning lines of debug.log (1)",
         ] {
             assert!(r.contains(part), "missing {part}:\n{r}");

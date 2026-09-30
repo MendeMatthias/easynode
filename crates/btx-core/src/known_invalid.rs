@@ -122,6 +122,16 @@ pub const HELD_BRANCHES: &[HeldBranch] = &[
 /// that applied the hold follows the most-work chain again. Empty until one is.
 pub const LIFTED_BRANCHES: &[&str] = &[];
 
+/// Every block this app refuses, the known-invalid ones and the held roots, as
+/// (height, hash). The catch-up help (`crate::catchup_assist`) never asks a
+/// peer for a chain that passes one of them.
+pub fn refused_blocks() -> impl Iterator<Item = (u64, &'static str)> {
+    KNOWN_INVALID_BLOCKS
+        .iter()
+        .map(|b| (b.height, b.hash))
+        .chain(HELD_BRANCHES.iter().map(|b| (b.height, b.root)))
+}
+
 /// The operator's word on refusing known-invalid blocks, read from
 /// `EASYBTX_NODE_REFUSE_KNOWN_INVALID`. Refusal is the default; only an
 /// explicit `0`, `false`, `no` or `off` turns it off.
@@ -294,6 +304,16 @@ mod tests {
             .expect("the 227,313 split is on the list");
         assert!(split.hash.starts_with("b28c3e84"));
         assert!(split.valid_sibling.starts_with("d5f0e92f"));
+    }
+
+    #[test]
+    fn refused_blocks_names_the_invalid_block_and_every_held_root() {
+        let all: Vec<(u64, &str)> = refused_blocks().collect();
+        assert_eq!(all.len(), KNOWN_INVALID_BLOCKS.len() + HELD_BRANCHES.len());
+        assert!(all.contains(&(227_313, KNOWN_INVALID_BLOCKS[0].hash)));
+        for b in HELD_BRANCHES {
+            assert!(all.contains(&(b.height, b.root)), "{b:?}");
+        }
     }
 
     #[test]
