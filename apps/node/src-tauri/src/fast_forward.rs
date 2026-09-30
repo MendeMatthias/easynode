@@ -344,6 +344,50 @@ fn rolled_back(datadir: &Path) -> bool {
     matches!(ff::read_outcome(datadir), Some(Outcome::RolledBack { .. }))
 }
 
+/// What the run's phase alone says the Tools status should show, before it
+/// is allowed to look at any outcome (controller note 1, for Task 4's
+/// `tools_fast_forward_status`): a roll-back's outcome is written before its
+/// restore begins, so it may be shown only once no run is recorded at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolsPhase {
+    /// Not running, and never called "running": the driver's own plain
+    /// sentence, with the folder path. Set by [`STUCK`] and by a record
+    /// nobody can read.
+    Halted(String),
+    /// A run is genuinely under way: a record exists, whatever its phase, or
+    /// the driver is already at work before it has written one (checking
+    /// and downloading the confirmed pair, section 10 step 1).
+    Running,
+    /// No run recorded and no driver at work: the last outcome, if any,
+    /// says what happened.
+    Idle,
+}
+
+/// Pure half of [`tools_status_phase`].
+fn tools_phase(driving: bool, stuck: Option<&str>, record: OnRecord, datadir: &Path) -> ToolsPhase {
+    if let Some(said) = stuck {
+        return ToolsPhase::Halted(said.into());
+    }
+    match record {
+        OnRecord::Unreadable => ToolsPhase::Halted(unreadable_sentence(datadir)),
+        OnRecord::At(_) => ToolsPhase::Running,
+        OnRecord::Nothing if driving => ToolsPhase::Running,
+        OnRecord::Nothing => ToolsPhase::Idle,
+    }
+}
+
+/// What Task 4's Tools status asks first, before it looks at the last
+/// outcome.
+pub(crate) fn tools_status_phase(datadir: &Path) -> ToolsPhase {
+    let stuck = STUCK.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    tools_phase(
+        DRIVING.load(Ordering::SeqCst),
+        stuck.as_deref(),
+        on_record(datadir),
+        datadir,
+    )
+}
+
 /// What a start may do, from [`start_gate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Gate {
@@ -1699,6 +1743,61 @@ mod tests {
         );
     }
 
+    /// Controller note 1: Task 4's Tools status reads the phase before any
+    /// outcome. `STUCK` always wins; then an unreadable record is the same
+    /// kind of plain sentence; then any record at all, whatever its phase
+    /// (a roll-back's outcome may sit beside a still-`Running` one, and is
+    /// not shown while the record is there), or the driver at work before it
+    /// has written one, means a run is genuinely under way; with neither,
+    /// there is nothing recorded to call "running".
+    #[test]
+    fn the_tools_phase_decides_every_combination() {
+        let d = Path::new("/Users/someone/.easybtx");
+        let stuck = "the roll-back could not begin.";
+        for driving in [false, true] {
+            assert_eq!(
+                tools_phase(driving, Some(stuck), OnRecord::Nothing, d),
+                ToolsPhase::Halted(stuck.into())
+            );
+            assert_eq!(
+                tools_phase(driving, Some(stuck), OnRecord::At(Phase::Running), d),
+                ToolsPhase::Halted(stuck.into())
+            );
+        }
+        assert_eq!(
+            tools_phase(false, None, OnRecord::Unreadable, d),
+            ToolsPhase::Halted(unreadable_sentence(d))
+        );
+        assert_eq!(
+            tools_phase(true, None, OnRecord::Unreadable, d),
+            ToolsPhase::Halted(unreadable_sentence(d))
+        );
+        for phase in [
+            Phase::SettingAside,
+            Phase::Running,
+            Phase::Undoing,
+            Phase::Restoring,
+            Phase::Done,
+        ] {
+            for driving in [false, true] {
+                assert_eq!(
+                    tools_phase(driving, None, OnRecord::At(phase), d),
+                    ToolsPhase::Running,
+                    "{phase:?}, driving {driving}"
+                );
+            }
+        }
+        assert_eq!(
+            tools_phase(true, None, OnRecord::Nothing, d),
+            ToolsPhase::Running,
+            "checking and downloading, before a record exists"
+        );
+        assert_eq!(
+            tools_phase(false, None, OnRecord::Nothing, d),
+            ToolsPhase::Idle
+        );
+    }
+
     /// Review, minor 2: a roll-back is decided for good when its reason is
     /// written, since a run clears the outcome before it sets anything
     /// aside. A Running record beside a roll-back's outcome (the app was cut
@@ -1768,9 +1867,11 @@ mod tests {
     /// this run of the app, and drops the decision, so the next opening
     /// watches the intact new chain again rather than failing the same way.
     ///
-    /// This test sets and clears the global [`STUCK`], which every
-    /// [`before_start`] reads: it must stay the only test that calls
-    /// `before_start`, or tests running beside it would see its value.
+    /// This test sets and clears the global [`STUCK`], which [`before_start`]
+    /// and [`tools_status_phase`] read: it must stay the only test that
+    /// calls `before_start`, or tests running beside it would see its value.
+    /// Reading it back here, at points this test's own actions make certain,
+    /// is safe.
     #[tokio::test]
     async fn a_roll_back_that_cannot_begin_keeps_the_node_stopped_until_the_next_opening() {
         // Review minor 1: a put-back that began and stopped keeps this start
@@ -1788,6 +1889,9 @@ mod tests {
             None,
             "not the one that could not begin"
         );
+        // Task 4's Tools status: a record is still there, so it is
+        // "running", not the driver's stuck sentence.
+        assert_eq!(tools_status_phase(d), ToolsPhase::Running);
         // Clear what stood in the way: the attempt's entries in the places
         // the old ones go back to.
         for name in ["blocks", "chainstate", "chainstate_snapshot"] {
@@ -1796,6 +1900,11 @@ mod tests {
         std::fs::remove_file(d.join("snapshot-start.json")).unwrap();
         assert_eq!(before_start(d).await, Ok(()), "tried once more");
         assert_old_chain_back(d, "tried once more");
+        assert_eq!(
+            tools_status_phase(d),
+            ToolsPhase::Idle,
+            "put back, nothing left recorded"
+        );
 
         let tmp = datadir_with_chain(Before::default());
         let d = tmp.path();
@@ -1813,6 +1922,9 @@ mod tests {
         assert_eq!(before_start(d).await, Err(said.clone()));
         assert_eq!(ff::read_outcome(d), None);
         assert!(underway(d));
+        // Task 4's Tools status: STUCK wins over the record that is still
+        // there, and shows the driver's own sentence, never "running".
+        assert_eq!(tools_status_phase(d), ToolsPhase::Halted(said.clone()));
         // Put the missing part back: this run of the app still does not
         // start the node.
         std::fs::create_dir_all(folder.join("indexes")).unwrap();
@@ -1820,6 +1932,7 @@ mod tests {
         *STUCK.lock().unwrap() = None;
         assert_eq!(before_start(d).await, Ok(()), "the next opening");
         assert!(underway(d), "watched again");
+        assert_eq!(tools_status_phase(d), ToolsPhase::Running, "watched again");
     }
 
     /// Review, minor 3: a set-aside note written between the run's check

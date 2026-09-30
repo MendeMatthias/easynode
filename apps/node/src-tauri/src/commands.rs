@@ -4126,6 +4126,21 @@ fn signing_key_the_app_does_not_manage(datadir: &Path) -> bool {
             .any(|l| !l.trim().starts_with(&removed))
 }
 
+/// Would a validating node's one mirror launch even be tried here, apart
+/// from whether one is wanted right now? Off while [`MIRROR_LOAD_ENABLED`]
+/// is off, the operator has said `EASYBTX_NODE_TRUSTED_MIRROR=0`
+/// (`btx_core::node::trusted_mirror_override`), or
+/// [`signing_key_the_app_does_not_manage`]: the same three switches
+/// [`mirror_load_step`]'s `KeyElsewhere` arm and a real start's plain skip
+/// read. Tools asks this of a validating node before it offers
+/// Fast-forward, because such a launch is always refused and the run it
+/// starts always rolls back (controller note 3).
+pub(crate) fn mirror_launch_available(datadir: &Path) -> bool {
+    MIRROR_LOAD_ENABLED
+        && btx_core::node::trusted_mirror_override() != Some(false)
+        && !signing_key_the_app_does_not_manage(datadir)
+}
+
 /// The lines of `conf` that set any of `names` to a value: a line is cut at
 /// the first `#`, then split at the first `=`, both halves trimmed; the bare
 /// name and the `main.` prefix both count, under whatever `[section]` header
@@ -6970,13 +6985,14 @@ mod signed_start_tests {
         abandon_mirror_load, after_load_plan, chain_outgrew_first_load, clear_mirror_marker,
         ends_orphaned_mirror_launch, fails_the_run, first_load_settled, honour_pending_set_aside,
         honour_pending_set_aside_at, key_line_goes_back, mark_first_load_if_fresh,
-        mark_set_aside_pending, mirror_launch_failed, mirror_load_end_message, mirror_load_step,
-        mirror_load_wanted_here, nominal_btxd_path, prepared_within, refused_load_message,
-        run_failure_reason, runs_mirror_load, set_aside_pending, set_aside_refused_snapshot_at,
-        set_aside_waits, set_aside_will_move, settle_first_load, signed_load_failed,
-        signed_load_for, signer_for_launch, signing_key_the_app_does_not_manage, snapshot_base,
-        write_signer_key_line, AfterLoad, AfterRefusal, AttachedTo, MirrorLoadStep,
-        MIRROR_LOAD_ENABLED, PREPARE_START_DEADLINE, SET_ASIDE_STUCK,
+        mark_set_aside_pending, mirror_launch_available, mirror_launch_failed,
+        mirror_load_end_message, mirror_load_step, mirror_load_wanted_here, nominal_btxd_path,
+        prepared_within, refused_load_message, run_failure_reason, runs_mirror_load,
+        set_aside_pending, set_aside_refused_snapshot_at, set_aside_waits, set_aside_will_move,
+        settle_first_load, signed_load_failed, signed_load_for, signer_for_launch,
+        signing_key_the_app_does_not_manage, snapshot_base, write_signer_key_line, AfterLoad,
+        AfterRefusal, AttachedTo, MirrorLoadStep, MIRROR_LOAD_ENABLED, PREPARE_START_DEADLINE,
+        SET_ASIDE_STUCK,
     };
     use crate::state::NodeAppSettings;
     use btx_core::attested_snapshot::PairKind;
@@ -7490,6 +7506,26 @@ mod signed_start_tests {
         assert_eq!(
             mirror_load_step(true, false, true, true),
             MirrorLoadStep::KeyElsewhere
+        );
+    }
+
+    /// Controller note 3: Task 4's Fast-forward offer asks this before it
+    /// shows the button on a validating node, so it must read the same
+    /// switches a real start does. `MIRROR_LOAD_ENABLED` and the operator's
+    /// `EASYBTX_NODE_TRUSTED_MIRROR` are covered elsewhere (the const is
+    /// asserted on above; the env var is never touched by a test, the same
+    /// as `mirror_load_wanted_here`'s own read of it); this covers the
+    /// signing-key switch, the one that changes with the datadir.
+    #[test]
+    fn mirror_launch_available_reads_the_signing_key_switch() {
+        let dir = fresh_validating_datadir();
+        assert!(mirror_launch_available(dir.path()));
+        let rw = dir.path().join("btx_rw.conf");
+        std::fs::write(&rw, "matmulattestationsignerkeyfile=k.key\n").unwrap();
+        assert!(!mirror_launch_available(dir.path()));
+        assert_eq!(
+            mirror_launch_available(dir.path()),
+            !signing_key_the_app_does_not_manage(dir.path())
         );
     }
 

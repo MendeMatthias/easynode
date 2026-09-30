@@ -19,7 +19,10 @@ use btx_core::rpc::{Rpc, RpcClient};
 use btx_core::stuck_blocks::{self, FetchPlan};
 
 use crate::ask::{degrade, Ask};
-use crate::commands::{destructive_allowed, node_ownership, restart_node_projected};
+use crate::commands::{
+    destructive_allowed, mirror_launch_available, node_ownership, nominal_btxd_path,
+    restart_node_projected,
+};
 use crate::state::{node_datadir, AppState, NodePhase};
 
 /// Hosts this app itself talks to that are not node peers: the update feed
@@ -944,6 +947,310 @@ mod tests {
         assert!(
             hosts.iter().any(|h| h == "20.86.181.203"),
             "missing 20.86.181.203: {hosts:?}"
+        );
+    }
+}
+
+// ── Fast-forward (docs/decisions/2026-09-29-every-node-starts-near-the-tip.md,
+// sections 6a and 10; the button: the Tools decision, section 3) ────────────
+
+/// What the Fast-forward section shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FastForwardCheck {
+    /// Nothing to show.
+    None,
+    /// The button, the words its first click shows, and the line above it.
+    Offer {
+        height: u64,
+        button: String,
+        confirm: String,
+        note: String,
+    },
+    /// The snapshot operators disagree: the section says Fast-forward is off.
+    Off { height: u64, sentence: String },
+}
+
+/// Pure: what the section shows, from what `latest` said, the node's tip and
+/// whether the catch-up help has concluded that no archive peer serves this
+/// node old blocks. A dispute shows on any node the app owns, whatever the
+/// flag; the button only on one more than 1,000 blocks behind a confirmed
+/// snapshot, or any distance behind one while the flag holds. Controller
+/// note 3 (a validating node's mirror launch) is not this function's to
+/// decide: it needs the node's role, which `tools_fast_forward_check` asks
+/// separately, after this.
+fn fast_forward_check(
+    owned: bool,
+    peek: Option<btx_core::attested_snapshot::Peek>,
+    tip: u64,
+    old_blocks_refused: bool,
+) -> FastForwardCheck {
+    use btx_core::attested_snapshot::Peek;
+    use btx_core::fast_forward::{copy, offer};
+    match peek {
+        Some(Peek::Disputed { newest }) if owned => FastForwardCheck::Off {
+            height: newest,
+            sentence: copy::off(newest),
+        },
+        Some(Peek::Confirmed { height, operators }) => {
+            match offer(owned, Some(height), tip, old_blocks_refused) {
+                Some((h, why)) => FastForwardCheck::Offer {
+                    height: h,
+                    button: copy::button(h),
+                    confirm: copy::confirm(h, &operators),
+                    note: copy::note(why),
+                },
+                None => FastForwardCheck::None,
+            }
+        }
+        _ => FastForwardCheck::None,
+    }
+}
+
+/// The section's state: the button when the app owns the node, no run is
+/// under way, and a confirmed snapshot (checked as the loader checks it, but
+/// without its file) is more than 1,000 blocks above the tip, or above it at
+/// all while no archive peer serves this node old blocks; the dispute
+/// sentence while the operators disagree; else nothing. Withheld on a
+/// validating node whose one mirror launch could not even be tried
+/// (`mirror_launch_available`, controller note 3): such a run always rolls
+/// back, so the button would only promise something that cannot happen.
+#[tauri::command]
+pub async fn tools_fast_forward_check(
+    state: State<'_, AppState>,
+) -> Result<FastForwardCheck, String> {
+    let owned = destructive_allowed(node_ownership(&state, &node_datadir()).await).is_ok();
+    if !owned || crate::fast_forward::active() {
+        return Ok(FastForwardCheck::None);
+    }
+    let Some(rpc) = rpc_handle(&state).await else {
+        return Ok(FastForwardCheck::None);
+    };
+    let tip = match api::get_blockchain_info(&rpc).await {
+        Ok(info) => info.blocks,
+        Err(_) => return Ok(FastForwardCheck::None),
+    };
+    let anchor = crate::commands::snapshot_spec().anchor_height;
+    let view = btx_core::confirmed_load::node_view(
+        &rpc,
+        &btx_core::node::BTX_TRUSTED_ATTESTATION_PUBKEYS,
+        btx_core::attested_snapshot::fallback_start(anchor),
+    )
+    .await;
+    // A client that fails to build (never in practice) is nothing to show,
+    // like every other soft failure above: no raw error text reaches the
+    // window from a background check nobody asked for yet.
+    let Ok(client) = btx_core::attested_snapshot::http_client() else {
+        return Ok(FastForwardCheck::None);
+    };
+    let peek = btx_core::attested_snapshot::peek_confirmed(
+        &client,
+        btx_core::attested_snapshot::CONFIRMED_POINTER_URL,
+        &view,
+        btx_core::operators::regtest_env().as_deref(),
+        btx_core::attested_snapshot::confirmed_url_allowed,
+    )
+    .await
+    .ok();
+    // The catch-up help's conclusion as of the refresher's last tick (the
+    // catch-up plan): `false` after every start and stop until it concludes.
+    let old_blocks_refused = state
+        .catch_up_help
+        .lock()
+        .await
+        .no_archive_serves_old_blocks;
+    let check = fast_forward_check(owned, peek, tip, old_blocks_refused);
+    if matches!(check, FastForwardCheck::Offer { .. }) {
+        let datadir = node_datadir();
+        let validating = !btx_core::node::host_follows_signatures(
+            &nominal_btxd_path(),
+            &datadir,
+            btx_core::backend::node_host_backend(),
+        );
+        if validating && !mirror_launch_available(&datadir) {
+            return Ok(FastForwardCheck::None);
+        }
+    }
+    Ok(check)
+}
+
+/// The second click. Starts the run and returns; the overlay asks for the
+/// status until it ends.
+#[tauri::command]
+pub async fn tools_fast_forward_run(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    destructive_allowed(node_ownership(&state, &node_datadir()).await)?;
+    crate::fast_forward::spawn_run(app)?;
+    Ok(btx_core::fast_forward::copy::running())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FastForwardStatus {
+    pub running: bool,
+    pub message: Option<String>,
+}
+
+/// The run's phase decides first (controller note 1): a `RolledBack`
+/// outcome is written before its restore begins, so it may be shown only
+/// once no run is recorded at all; while the driver is stuck, or its record
+/// cannot be read, the driver's own plain sentence is shown, never
+/// "running" (`crate::fast_forward::tools_status_phase`).
+#[tauri::command]
+pub async fn tools_fast_forward_status() -> Result<FastForwardStatus, String> {
+    use crate::fast_forward::ToolsPhase;
+    use btx_core::fast_forward::{copy, read_outcome, Outcome};
+    let datadir = node_datadir();
+    Ok(match crate::fast_forward::tools_status_phase(&datadir) {
+        ToolsPhase::Halted(message) => FastForwardStatus {
+            running: false,
+            message: Some(message),
+        },
+        ToolsPhase::Running => FastForwardStatus {
+            running: true,
+            message: Some(copy::running()),
+        },
+        ToolsPhase::Idle => {
+            let message = read_outcome(&datadir).map(|o| match o {
+                Outcome::Done { height, operators } => copy::done(height, &operators),
+                Outcome::RolledBack { reason } => copy::rolled_back(&reason),
+            });
+            FastForwardStatus {
+                running: false,
+                message,
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod fast_forward_check_tests {
+    use super::{fast_forward_check, FastForwardCheck};
+    use btx_core::attested_snapshot::Peek;
+
+    fn confirmed(height: u64) -> Option<Peek> {
+        Some(Peek::Confirmed {
+            height,
+            operators: vec!["Mende".into(), "jpp".into()],
+        })
+    }
+
+    #[test]
+    fn the_button_names_the_block_and_who_confirmed_it() {
+        match fast_forward_check(true, confirmed(233_800), 232_000, false) {
+            FastForwardCheck::Offer {
+                height,
+                button,
+                confirm,
+                note,
+            } => {
+                assert_eq!(height, 233_800);
+                assert_eq!(button, "Fast-forward to block 233,800");
+                assert!(
+                    confirm
+                        .starts_with("Fast-forward to block 233,800, confirmed by Mende and jpp?"),
+                    "{confirm}"
+                );
+                assert_eq!(note, "A confirmed snapshot is far ahead of your node.");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            fast_forward_check(true, confirmed(233_800), 232_800, false),
+            FastForwardCheck::None,
+            "exactly 1,000 behind is not more"
+        );
+        assert_eq!(
+            fast_forward_check(false, confirmed(233_800), 1, false),
+            FastForwardCheck::None,
+            "not ours"
+        );
+        assert_eq!(
+            fast_forward_check(true, None, 1, false),
+            FastForwardCheck::None
+        );
+    }
+
+    /// The owner's decision: while no archive peer serves this node old
+    /// blocks, the button shows below the 1,000-block line. Never during a
+    /// dispute, never without a confirmed snapshot above the node.
+    #[test]
+    fn no_archive_serving_old_blocks_offers_it_sooner_and_nothing_else() {
+        assert_eq!(
+            fast_forward_check(true, confirmed(233_800), 232_801, false),
+            FastForwardCheck::None,
+            "flag false, 999 behind"
+        );
+        match fast_forward_check(true, confirmed(233_800), 233_500, true) {
+            FastForwardCheck::Offer { height, note, .. } => {
+                assert_eq!(height, 233_800, "flag true, 300 behind");
+                assert!(note.contains("offered sooner than usual"), "{note}");
+                assert!(note.contains("It works the same way as always."), "{note}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            matches!(
+                fast_forward_check(
+                    true,
+                    Some(Peek::Disputed { newest: 233_800 }),
+                    233_500,
+                    true
+                ),
+                FastForwardCheck::Off { .. }
+            ),
+            "flag true, dispute"
+        );
+        assert_eq!(
+            fast_forward_check(true, confirmed(233_800), 233_800, true),
+            FastForwardCheck::None,
+            "flag true, the confirmed snapshot is not above the node"
+        );
+        assert_eq!(
+            fast_forward_check(true, None, 233_500, true),
+            FastForwardCheck::None,
+            "flag true, no confirmed snapshot"
+        );
+    }
+
+    #[test]
+    fn a_dispute_turns_it_off_and_says_why() {
+        let off = fast_forward_check(
+            true,
+            Some(Peek::Disputed { newest: 233_800 }),
+            233_900,
+            false,
+        );
+        assert_eq!(
+            off,
+            FastForwardCheck::Off {
+                height: 233_800,
+                sentence:
+                    "Fast-forward is off while the snapshot operators disagree about block 233,800."
+                        .into()
+            }
+        );
+        assert_eq!(
+            fast_forward_check(false, Some(Peek::Disputed { newest: 233_800 }), 1, true),
+            FastForwardCheck::None
+        );
+    }
+
+    /// The window reads this shape (Task 5's `FastForwardCheck`).
+    #[test]
+    fn the_check_has_the_shape_the_window_reads() {
+        assert_eq!(
+            serde_json::to_value(FastForwardCheck::Off {
+                height: 233_800,
+                sentence: "s".into()
+            })
+            .unwrap(),
+            serde_json::json!({"kind": "off", "height": 233800, "sentence": "s"})
+        );
+        assert_eq!(
+            serde_json::to_value(FastForwardCheck::None).unwrap(),
+            serde_json::json!({"kind": "none"})
         );
     }
 }
