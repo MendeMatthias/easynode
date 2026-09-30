@@ -11,6 +11,7 @@ import {
   ReportCopy,
   RestartArm,
   capForDisplay,
+  fastForwardRun,
   fastForwardView,
   type FastForwardCheck,
   type FastForwardStatus,
@@ -109,7 +110,9 @@ export function initTools(): void {
     clearTimeout(ffArmTimer);
     ffArmTimer = undefined;
     ffArm.disarm();
-    $("tools-ff-note").textContent = ffNote;
+    const note = $("tools-ff-note");
+    note.textContent = ffNote;
+    note.hidden = ffNote === "";
     if (ffOffer) $("tools-ff-btn").textContent = ffOffer.button;
   };
   const stopFfPoll = () => {
@@ -275,16 +278,17 @@ export function initTools(): void {
     btn.disabled = true;
     btn.hidden = true;
     $("tools-ff-note").textContent = ffNote;
-    const msg = await invoke<string>("tools_fast_forward_run").catch((e) => String(e));
+    const { message, started } = await fastForwardRun(() => invoke<string>("tools_fast_forward_run"));
     if (run !== ffRun) return; // Tools closed meanwhile
     const result = $("tools-ff-result");
-    result.textContent = msg;
+    result.textContent = message;
     result.hidden = false;
     // Hiding the button left focus nowhere; the result line is the next
     // stable thing for a keyboard user to land on (tabindex="-1" in
     // index.html), as tools-fetch and buildReport refocus their own button.
     if (!overlay.hidden) result.focus();
-    pollFf();
+    // A refusal is no run: a poll would put the last run's outcome over it.
+    if (started) pollFf();
   });
 
   $("tools-fetch").addEventListener("click", async () => {

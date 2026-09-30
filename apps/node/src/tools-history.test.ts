@@ -8,6 +8,7 @@ import {
   DISPLAY_LIMIT,
   FAST_FORWARD_ARM_MS,
   FF_NOTE,
+  fastForwardRun,
   fastForwardView,
 } from "./tools-history";
 
@@ -159,5 +160,32 @@ describe("Fast-forward section", () => {
     expect(fastForwardView(offer, { running: true, message: "Fast-forward is running." }).button).toBeNull();
     expect(fastForwardView({ kind: "none" }, { running: false, message: null }).section).toBe(false);
     expect(fastForwardView(null, { running: false, message: "Done." }).section).toBe(true);
+  });
+  it("has no note beside a run or a last outcome, only beside an offer or a dispute", () => {
+    const done = "Done. Your node now starts from block 233,800, confirmed by Mende and jpp.";
+    expect(fastForwardView({ kind: "none" }, { running: false, message: done })).toEqual({
+      section: true,
+      button: null,
+      note: "",
+    });
+    expect(fastForwardView(null, { running: false, message: done }).note).toBe("");
+    expect(fastForwardView(offer, { running: true, message: "Fast-forward is running." }).note).toBe("");
+    expect(fastForwardView(null, null).note).toBe("");
+  });
+});
+
+describe("Fast-forward second click", () => {
+  it("polls only a run that started", async () => {
+    expect(await fastForwardRun(() => Promise.resolve("Fast-forward is running."))).toEqual({
+      message: "Fast-forward is running.",
+      started: true,
+    });
+  });
+  it("shows a refusal as it is, with nothing to poll", async () => {
+    const refused = "A Fast-forward has not finished yet.";
+    expect(await fastForwardRun(() => Promise.reject(refused))).toEqual({
+      message: refused,
+      started: false,
+    });
   });
 });

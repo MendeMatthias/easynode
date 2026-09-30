@@ -154,15 +154,32 @@ export interface FastForwardView {
  * dispute shows its sentence and no button (the confirmed-snapshot
  * decision, section 6a), an offer shows the button with the note Rust sent
  * (far ahead, or offered early because no archive peer serves old blocks),
- * and a last run's message keeps the section open on its own. */
+ * and a last run's message keeps the section open on its own. The note
+ * says why the button is there, so beside a run or a last outcome, with no
+ * button, there is none. */
 export function fastForwardView(
   check: FastForwardCheck | null,
   status: FastForwardStatus | null,
 ): FastForwardView {
-  if (status?.running) return { section: true, button: null, note: FF_NOTE };
+  if (status?.running) return { section: true, button: null, note: "" };
   if (check?.kind === "off") return { section: true, button: null, note: check.sentence };
   if (check?.kind === "offer") return { section: true, button: check.button, note: check.note };
-  return { section: Boolean(status?.message), button: null, note: FF_NOTE };
+  return { section: Boolean(status?.message), button: null, note: "" };
+}
+
+/** What the second click's `tools_fast_forward_run` came to: the sentence to
+ * show, and whether a run started. Only then does the overlay poll: a
+ * refusal (a run still recorded, the node not this app's) is no run, and
+ * the first poll would show the last run's outcome, maybe weeks old, over
+ * it. */
+export async function fastForwardRun(
+  run: () => Promise<string>,
+): Promise<{ message: string; started: boolean }> {
+  try {
+    return { message: await run(), started: true };
+  } catch (e) {
+    return { message: String(e), started: false };
+  }
 }
 
 // The note counts against DISPLAY_LIMIT itself, so the shown text (content
