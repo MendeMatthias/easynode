@@ -9,6 +9,7 @@
 
 mod ask;
 mod commands;
+mod fast_forward;
 mod state;
 mod tools;
 mod tray;
