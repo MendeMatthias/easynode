@@ -9,6 +9,9 @@
 //!   * `faststart/snapshot.dat` — the one-time assumeutxo bootstrap; dead once the
 //!     snapshot has been loaded (btxd re-downloads only if it ever re-bootstraps).
 //!   * `debug.log` — can balloon to GBs.
+//!   * `chainstate_snapshot.refused-*`: a snapshot chainstate the app refused
+//!     and set aside. Nothing reads it again; kept a week, like the repair
+//!     flow's quarantine.
 //!
 //! These functions MUST run with btxd NOT holding the files (stopped, or launching
 //! fresh): deleting a LevelDB index dir under a live btxd can crash it. Every
@@ -190,7 +193,21 @@ pub fn reclaim_disk(datadir: &Path, conf_path: &Path, snapshot_loaded: bool) -> 
             .push(format!("assumeutxo snapshot ({} MB)", bytes / MB));
     }
 
-    // 3) Cap debug.log (safe: btxd is stopped, so truncation can't race a write).
+    // 3) Snapshot chainstates the app refused and set aside, once they are
+    // as old as the repair flow's quarantine may get.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let bytes = sweep_refused_chainstates(datadir, Some((now, QUARANTINE_RETENTION_SECS)));
+    if bytes > 0 {
+        freed_bytes += bytes;
+        report
+            .items
+            .push(format!("refused snapshot chainstates ({} MB)", bytes / MB));
+    }
+
+    // 4) Cap debug.log (safe: btxd is stopped, so truncation can't race a write).
     let log = datadir.join("debug.log");
     if let Ok(meta) = std::fs::metadata(&log) {
         if meta.len() > DEBUG_LOG_CAP_MB * MB {
@@ -282,8 +299,51 @@ pub fn remove_node_data(datadir: &Path) -> ReclaimReport {
             report.items.push(format!("debug.log ({} MB)", bytes / MB));
         }
     }
+    // Refused snapshot chainstates are chain data too, whatever their age.
+    let bytes = sweep_refused_chainstates(datadir, None);
+    if bytes > 0 {
+        freed_bytes += bytes;
+        report
+            .items
+            .push(format!("refused snapshot chainstates ({} MB)", bytes / MB));
+    }
+    // A mirror-load marker beside a datadir with no blocks would make its
+    // header bootstrap launch a mirror: the load it named is gone with them.
+    crate::node::end_mirror_load(datadir);
     report.freed_mb = freed_bytes / MB;
     report
+}
+
+/// Remove the snapshot chainstates the app refused and set aside
+/// (`crate::confirmed_load::REFUSED_CHAINSTATE_PREFIX`), each a whole
+/// chainstate: every one, or with `older_than = Some((now, age))` only those
+/// set aside more than `age` seconds before `now`. When one was set aside is
+/// the time in its name, else its folder's mtime. The bytes freed. MUST run
+/// with btxd not running, as the rest of this module. Unlike the quarantine,
+/// the newest is not kept: nothing reads a refused chainstate again.
+fn sweep_refused_chainstates(datadir: &Path, older_than: Option<(u64, u64)>) -> u64 {
+    let prefix = crate::confirmed_load::REFUSED_CHAINSTATE_PREFIX;
+    let mut freed = 0;
+    for (path, mtime) in collect_quarantine_dirs(datadir, prefix) {
+        let set_aside = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix(prefix))
+            .and_then(|t| t.parse::<u64>().ok())
+            .unwrap_or(mtime);
+        if older_than.is_some_and(|(now, age)| now.saturating_sub(set_aside) <= age) {
+            continue;
+        }
+        let bytes = dir_size_bytes(&path);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => freed += bytes,
+            Err(e) => eprintln!(
+                "[disk] could not remove {} (non-fatal): {e}",
+                path.display()
+            ),
+        }
+    }
+    freed
 }
 
 /// How long a repair-flow quarantine dir is kept on disk before being eligible
@@ -810,6 +870,61 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A marker left beside a fresh datadir would make its header bootstrap
+    /// launch a mirror (the next start begins one, since `blocks/` is gone).
+    #[test]
+    fn remove_node_data_clears_a_mirror_load_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("blocks")).unwrap();
+        crate::node::begin_mirror_load(
+            dir.path(),
+            crate::attested_snapshot::PairKind::Pinned,
+            225_927,
+        )
+        .unwrap();
+        assert!(crate::node::mirror_load_marker_exists(dir.path()));
+        remove_node_data(dir.path());
+        assert!(!crate::node::mirror_load_marker_exists(dir.path()));
+    }
+
+    /// Final review M8: a snapshot chainstate the app refused and set aside
+    /// (`chainstate_snapshot.refused-<unix time>`) is a whole chainstate.
+    /// The launch sweep removes it once it is as old as the repair flow's
+    /// quarantine may get, and Remove node data removes it at once.
+    #[test]
+    fn refused_snapshot_chainstates_are_swept_like_the_quarantine() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let refused = |age: u64| {
+            let path = d.join(format!("chainstate_snapshot.refused-{}", now - age));
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("CURRENT"), vec![0u8; 4096]).unwrap();
+            path
+        };
+        let old = refused(QUARANTINE_RETENTION_SECS + 60);
+        let young = refused(60);
+        let conf = d.join("faststart.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        let report = reclaim_disk(d, &conf, false);
+        assert!(!old.exists(), "older than the quarantine's retention");
+        assert!(young.exists(), "kept while it is young");
+        assert!(
+            report.items.iter().any(|i| i.contains("refused snapshot")),
+            "{report:?}"
+        );
+        // The live chainstates are never touched.
+        std::fs::create_dir_all(d.join("chainstate_snapshot")).unwrap();
+        reclaim_disk(d, &conf, false);
+        assert!(d.join("chainstate_snapshot").exists());
+
+        remove_node_data(d);
+        assert!(!young.exists(), "Remove node data takes every one");
     }
 
     #[test]

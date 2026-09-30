@@ -398,6 +398,40 @@ pub async fn get_chainstates(rpc: &dyn Rpc) -> AppResult<ChainStates> {
     serde_json::from_value(v).map_err(|e| crate::error::AppError::Decode(e.to_string()))
 }
 
+/// The validated gate (docs/decisions/2026-09-29-every-node-starts-near-the-tip.md,
+/// section 3): is this node's chain one it checked itself? Open only when
+/// `answer` is a `getchainstates` answer whose `chainstates` array is not
+/// empty and every entry in it says `"validated": true`. Closed for a failed
+/// call (`None`), anything that is not such an answer, and any entry whose
+/// `validated` is false, missing or not a boolean.
+///
+/// WHY NOT THE `attested_assumeutxo` FILE. Only a signed load writes it
+/// (v0.34.9 `validation.cpp:17791` and `:17818`). Upstream's plain assumeutxo
+/// snapshot does not, although its history below the base is just as
+/// unchecked; `validated` is false for both until the background check has
+/// finished (`src/rpc/blockchain.cpp:5219`).
+///
+/// The diary, the producer and both confirmers ask this before every entry,
+/// export, send and signature. Section 8's pin rule still keys on the file.
+pub fn chainstates_validated(answer: Option<&serde_json::Value>) -> bool {
+    let Some(entries) = answer
+        .and_then(|v| v.get("chainstates"))
+        .and_then(|c| c.as_array())
+    else {
+        return false;
+    };
+    !entries.is_empty()
+        && entries
+            .iter()
+            .all(|e| e.get("validated").and_then(|v| v.as_bool()) == Some(true))
+}
+
+/// [`chainstates_validated`] on the node's answer now. A failed call is closed.
+pub async fn read_chainstates_validated(rpc: &dyn Rpc) -> bool {
+    let answer = rpc.call("getchainstates", json!([])).await.ok();
+    chainstates_validated(answer.as_ref())
+}
+
 /// Number of peer connections (`getconnectioncount` → a bare integer).
 pub async fn get_connection_count(rpc: &dyn Rpc) -> AppResult<i64> {
     let v = rpc.call("getconnectioncount", json!([])).await?;
@@ -560,6 +594,9 @@ pub struct MatmulTrustedStatus {
     pub matmul_validation_mode: String,
     #[serde(default)]
     pub trusted_mirror: bool,
+    /// Display order. Absent on a node with no pin and no key.
+    #[serde(default)]
+    pub replay_authority_context: Option<String>,
 }
 
 /// Read this node's own MatMul role. Cheap, and answered by every engine that
@@ -1692,6 +1729,96 @@ mod tests {
         // No snapshot chainstate, but it IS at tip via the normal chainstate.
         assert_eq!(cs.best_height(), 120000);
         assert!(cs.active().unwrap().validated);
+    }
+
+    // ── the validated gate (every-node-starts-near-the-tip, section 3) ──────
+
+    /// `getchainstates` as v0.34.9 writes it (`src/rpc/blockchain.cpp`,
+    /// `make_chain_data`): a background chainstate from genesis, then the
+    /// snapshot chainstate on `base`, still `validated: false`.
+    fn chainstates_on_a_snapshot(base: &str) -> Value {
+        json!({
+            "headers": 233_950,
+            "background_activation_yields": 0,
+            "chainstates": [
+                {
+                    "blocks": 131_200, "bestblockhash": "11".repeat(32),
+                    "verificationprogress": 0.56, "validated": true,
+                    "blocks_in_flight": 4
+                },
+                {
+                    "blocks": 233_949, "bestblockhash": "22".repeat(32),
+                    "verificationprogress": 0.99, "snapshot_blockhash": base,
+                    "validated": false, "blocks_in_flight": 1
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn chainstates_validated_opens_only_when_every_chainstate_is_validated() {
+        // A node that checked its whole chain: one chainstate, validated.
+        let checked = json!({"headers": 233_950, "chainstates": [
+            {"blocks": 233_949, "bestblockhash": "33".repeat(32), "validated": true}
+        ]});
+        assert!(chainstates_validated(Some(&checked)));
+        // After the background check: one chainstate left, still carrying
+        // its snapshot base, and validated.
+        let retired = json!({"headers": 233_950, "chainstates": [
+            {"blocks": 233_949, "snapshot_blockhash": "44".repeat(32), "validated": true}
+        ]});
+        assert!(chainstates_validated(Some(&retired)));
+    }
+
+    /// Upstream's plain assumeutxo snapshot (`loadtxoutset`, 219,000 on
+    /// 0.34.9, 228,000 on 0.34.12) writes no `attested_assumeutxo` file, so
+    /// the first design's file test would have let this node record and sign.
+    /// The gate never looks at the file: it takes no datadir at all.
+    #[test]
+    fn chainstates_validated_stays_closed_on_a_plain_assumeutxo_snapshot() {
+        let plain = chainstates_on_a_snapshot(
+            "dc51220bc7e5db96e29df9d817ae6179245d33eb8adcaaff765cfec83fdb87c3",
+        );
+        assert!(!chainstates_validated(Some(&plain)));
+    }
+
+    /// A signed snapshot (`loadtxoutsetattested`, 225,927) looks the same.
+    #[test]
+    fn chainstates_validated_stays_closed_on_a_signed_snapshot() {
+        let signed = chainstates_on_a_snapshot(
+            "06780445dae193010e099e6425c5430f121416b067b8d68a8a5c3b52e8a4b932",
+        );
+        assert!(!chainstates_validated(Some(&signed)));
+    }
+
+    #[test]
+    fn chainstates_validated_is_closed_when_the_answer_is_not_one() {
+        assert!(!chainstates_validated(None), "the call failed");
+        assert!(!chainstates_validated(Some(&Value::Null)));
+        assert!(!chainstates_validated(Some(&json!({"headers": 1}))));
+        assert!(!chainstates_validated(Some(&json!({"chainstates": []}))));
+        assert!(
+            !chainstates_validated(Some(&json!({"chainstates": [{}]}))),
+            "a chainstate with no tip yet writes an empty object"
+        );
+        assert!(!chainstates_validated(Some(
+            &json!({"chainstates": [{"validated": "true"}]})
+        )));
+        assert!(!chainstates_validated(Some(&json!({"chainstates": [
+            {"validated": true}, {"blocks": 5}
+        ]}))));
+    }
+
+    #[tokio::test]
+    async fn chainstates_validated_reads_the_node() {
+        let checked = json!({"chainstates": [{"blocks": 9, "validated": true}]});
+        assert!(read_chainstates_validated(&FakeRpc::new(&[("getchainstates", checked)])).await);
+        let on_snapshot = chainstates_on_a_snapshot(&"55".repeat(32));
+        assert!(
+            !read_chainstates_validated(&FakeRpc::new(&[("getchainstates", on_snapshot)])).await
+        );
+        // FakeRpc answers null for a method it does not know.
+        assert!(!read_chainstates_validated(&FakeRpc::new(&[])).await);
     }
 
     // ── the history check (docs/decisions/2026-09-29-quick-start-full-check-and-progress.md) ──

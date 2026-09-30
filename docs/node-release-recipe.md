@@ -358,6 +358,19 @@ line that stops matching cannot silently read as clean. Run it rather than
 retyping the grep. It does **not** run the assumeutxo check below. Run that one
 by hand.
 
+It also checks, on every run, that the newest mainnet snapshot the tag compiles
+pins the shielded commitment `confirmed_snapshot.rs` compiles. If the two
+differ, every node would refuse every confirmed snapshot. Before any engine
+bump, also run it with the candidate engine's btxd:
+`EASYNODE_TEST_BTXD=/path/to/btxd ENGINE_TAG_GUARD_REGTEST=1 scripts/check-engine-tag.sh <tag>`.
+That runs `crates/btx-core/tests/confirmed_snapshot_regtest.rs`: the replay
+contexts the engine reports must be the ones `confirmed_snapshot.rs` compiles,
+a fresh regtest chain must carry the compiled shielded commitment, and a
+validating node on a signed snapshot must still restart. A context that moves
+would stop every node on a signed snapshot from starting, because the engine
+re-checks the stored manifest at every start
+(docs/decisions/2026-09-29-every-node-starts-near-the-tip.md, section 12).
+
 ⚠ **Always pass the tag: `scripts/check-engine-tag.sh <tag>`.** Run with no
 argument it checks the pin in `commands.rs`, and today that exits 0 even though
 the pin is forked, because `ACKNOWLEDGED_FORKED_TAG` at the top of the script

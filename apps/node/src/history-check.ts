@@ -23,11 +23,22 @@ export const HISTORY_PCT_MAX = 99;
 /** "Checking older history: 131,200 of 225,927 (58%)" and the bar's width.
  *  Rounded down and capped at 99, so the bar never reads 100% before the
  *  engine reports the check done, which is when the field goes away. The
- *  counts are shown as the node reports them. */
-export function historyCheckView(h: HistoryCheck | null): HistoryCheckView | null {
+ *  counts are shown as the node reports them.
+ *
+ *  `startedFrom` (`NodeStatusInfo.started_from`) is the second sentence, on
+ *  a line of its own: "Started from block 233,800, confirmed by Mende and
+ *  jpp." (docs/decisions/2026-09-29-every-node-starts-near-the-tip.md,
+ *  section 7). The app builds it from its own start record, for the chain
+ *  running now; it goes with the line when the check is done. */
+export function historyCheckView(
+  h: HistoryCheck | null,
+  startedFrom: string | null = null,
+): HistoryCheckView | null {
   if (!h || !(h.base > 0) || !Number.isFinite(h.checked)) return null;
   const checked = Math.min(Math.max(0, h.checked), h.base);
   const pct = Math.min(HISTORY_PCT_MAX, Math.floor((checked / h.base) * 100));
   const fmt = (n: number) => n.toLocaleString("en-US");
-  return { line: `Checking older history: ${fmt(checked)} of ${fmt(h.base)} (${pct}%)`, pct };
+  const first = `Checking older history: ${fmt(checked)} of ${fmt(h.base)} (${pct}%)`;
+  const from = startedFrom?.trim();
+  return { line: from ? `${first}.\n${from}` : first, pct };
 }

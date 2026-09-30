@@ -94,6 +94,13 @@ pub struct NodeAppSettings {
     /// btx_core::snapshot (C3).
     #[serde(default)]
     pub snapshot_loaded: bool,
+    /// True from a start on a datadir that has never held a block until the
+    /// first load on it has a final outcome (`commands::settle_first_load`).
+    /// Only such a fresh chain gets the one mirror launch that loads a signed
+    /// snapshot: a datadir that already holds a chain is left alone (only
+    /// Fast-forward moves it), and one from 0.6.x never has this set.
+    #[serde(default)]
+    pub first_load_pending: bool,
     /// The BTX release tag whose binaries we launch (install dir key).
     #[serde(default)]
     pub btx_release_tag: Option<String>,
@@ -317,6 +324,7 @@ impl Default for NodeAppSettings {
             // this disagrees with the serde default.
             welcome_shown: false,
             snapshot_loaded: false,
+            first_load_pending: false,
             btx_release_tag: None,
             keep_awake: true,
             txindex_enabled: false,
@@ -435,8 +443,8 @@ impl NodeAppSettings {
 
     /// Turn signing on for an install that was never asked, once.
     ///
-    /// `applies_here` is whether this host will launch as a validator (the
-    /// only place a key signs anything, `btx_core::node::launches_as_mirror`
+    /// `applies_here` is whether this host checks blocks itself (the only
+    /// place a key signs anything, `btx_core::node::host_follows_signatures`
     /// negated). The setting is recorded either way, so a machine that later
     /// gains a card signs without being asked again; the welcome panel is
     /// armed only where the change means something today, because a panel
@@ -491,6 +499,12 @@ impl NodeAppSettings {
 /// `btx_core::snapshot::SnapshotFlags` backed by this app's settings file.
 pub struct NodeAppSnapshotFlags {
     pub datadir: PathBuf,
+    /// The run a start's load task belongs to: the app's run generation
+    /// (`AppState::refresher_gen`) and its value for that start. A Stop or
+    /// another Start moves it, and the task then loads nothing
+    /// (`btx_core::snapshot::SnapshotFlags::current`). `None`: no run to
+    /// outlive.
+    pub run: Option<(Arc<AtomicU64>, u64)>,
 }
 
 impl btx_core::snapshot::SnapshotFlags for NodeAppSnapshotFlags {
@@ -499,6 +513,11 @@ impl btx_core::snapshot::SnapshotFlags for NodeAppSnapshotFlags {
     }
     fn mark_loaded(&self) {
         NodeAppSettings::update(&self.datadir, |s| s.snapshot_loaded = true);
+    }
+    fn current(&self) -> bool {
+        self.run.as_ref().is_none_or(|(gen, this_run)| {
+            gen.load(std::sync::atomic::Ordering::SeqCst) == *this_run
+        })
     }
 }
 
@@ -621,6 +640,13 @@ pub struct AppState {
     /// the async shutdown already ran and can let the exit proceed instead of
     /// blocking the main thread a second time (the old force-quit-inducing hang).
     pub quitting: Arc<AtomicBool>,
+    /// Set when the start path's load watch stopped the node, set a snapshot
+    /// it refuses aside and restarted it (`commands::after_snapshot_load`).
+    /// Once per run of the app, so a load that keeps failing cannot restart
+    /// the node in a loop: a second refused load in the same run is logged
+    /// and the node keeps running as it is, and no mirror launch begins after
+    /// one. Never reset; the next run of the app starts with a new state.
+    pub load_failure_restarted: Arc<AtomicBool>,
     /// btxd's MatMul RC execution verdict for the CURRENT node run, remembered
     /// once observed: `(policy, stalled)`.
     ///
@@ -678,7 +704,9 @@ pub struct AppState {
     /// point from a file every second. `None` when there is no readable key.
     pub signer_pubkey: Arc<Mutex<Option<String>>>,
     /// Whether the last start decided this host validates (a key can sign)
-    /// or mirrors (it cannot), from `btx_core::node::launches_as_mirror`.
+    /// or mirrors (it cannot), from `btx_core::node::host_follows_signatures`:
+    /// the host's lasting role, so a validating node's one-time mirror launch
+    /// that loads a signed snapshot still reads as a host that can sign.
     /// `None` before the first start of this app run.
     pub signer_applies_here: Arc<Mutex<Option<bool>>>,
     /// What happened to the last attempt to offer this node's public signing
@@ -726,6 +754,12 @@ pub struct AppState {
     /// got (`check`, for the line and the bar). Kept through a failed read,
     /// like `engine_warnings`; cleared on every stop/start like the others.
     pub history_check: Arc<Mutex<btx_core::node_api::HistoryProgress>>,
+    /// Where the chain the node runs on started, and who confirmed it
+    /// (`btx_core::snapshot_start::started_from_current`), from the
+    /// refresher's `getchainstates`, for the history line's second sentence.
+    /// Kept through a failed read and cleared on every stop/start, like
+    /// `history_check`.
+    pub started_from: Arc<Mutex<Option<String>>>,
     /// The archive-peer census, computed ONCE per refresher tick from a single
     /// getpeerinfo and shared by the status snapshot, the watchdog and the
     /// service report. The UI poll used to run its own full getpeerinfo every
@@ -804,6 +838,7 @@ impl AppState {
             attached_to: Arc::new(Mutex::new(None)),
             refresher_gen: Arc::new(AtomicU64::new(0)),
             quitting: Arc::new(AtomicBool::new(false)),
+            load_failure_restarted: Arc::new(AtomicBool::new(false)),
             rc_status_cache: Arc::new(Mutex::new(None)),
             stall_verdict: Arc::new(Mutex::new(None)),
             archive_service: Arc::new(Mutex::new(None)),
@@ -818,6 +853,7 @@ impl AppState {
             tip_median_time: Arc::new(Mutex::new(None)),
             engine_warnings: Arc::new(Mutex::new(Vec::new())),
             history_check: Arc::new(Mutex::new(Default::default())),
+            started_from: Arc::new(Mutex::new(None)),
             archive_peers_cache: Arc::new(Mutex::new(None)),
             peer_nicknames_cache: Arc::new(Mutex::new(Vec::new())),
             esplora: Arc::new(Mutex::new(None)),
@@ -1141,13 +1177,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let flags = NodeAppSnapshotFlags {
             datadir: dir.path().to_path_buf(),
+            run: None,
         };
+        assert!(flags.current(), "no run to outlive");
         assert!(!flags.loaded());
         flags.mark_loaded();
         assert!(flags.loaded());
         // And it landed in THIS app's file, not the miner's easybtx-state.json.
         assert!(dir.path().join(SETTINGS_FILE_NAME).exists());
         assert!(!dir.path().join("easybtx-state.json").exists());
+    }
+
+    /// Final review M9: the flags a start hands its load task say whether
+    /// that start's run is still the current one: a Stop or another Start
+    /// moves the run's generation, and the task then loads nothing.
+    #[test]
+    fn snapshot_flags_know_whether_their_run_is_current() {
+        use btx_core::snapshot::SnapshotFlags;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let gen = Arc::new(AtomicU64::new(7));
+        let flags = NodeAppSnapshotFlags {
+            datadir: dir.path().to_path_buf(),
+            run: Some((gen.clone(), 7)),
+        };
+        assert!(flags.current());
+        gen.fetch_add(1, Ordering::SeqCst);
+        assert!(!flags.current());
     }
 
     #[test]

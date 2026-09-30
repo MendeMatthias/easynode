@@ -126,11 +126,15 @@
                 <span class="choice-reason" id="choice-full-reason" hidden></span>
               </span>
             </label>
-            <!-- The owner's wording of 2026-09-30, "recent signed snapshot"
-                 until a second operator is on the list; then "confirmed by
-                 two node operators". The last sentence shows only where Full
-                 check is possible (start-choice.ts switchLaterShown): on a
-                 machine that cannot check blocks, Settings has no switch. -->
+            <!-- The owner's wording of 2026-09-30. "Confirmed by two node
+                 operators" is true only of a snapshot a second operator has
+                 confirmed (docs/decisions/2026-09-29-quick-start-full-check-
+                 and-progress.md, section 1), and a node that finds none starts
+                 from the pinned snapshot, which carries one signature. So
+                 "recent signed snapshot" stays the honest wording for as long
+                 as that fallback is there. The last sentence shows only where
+                 Full check is possible (start-choice.ts switchLaterShown): on
+                 a machine that cannot check blocks, Settings has no switch. -->
             <p class="wizard-note start-choice-note" id="start-choice-note">
               Both start from a recent signed snapshot and check the older
               history in the background. Full check also checks every new
@@ -191,7 +195,8 @@
           <div class="status-badge" id="status-badge">—</div>
           <div class="status-sub" id="status-sub"></div>
           <!-- The background check of the snapshot's older history
-               (NodeStatusInfo.history_check, history-check.ts). Gone once the
+               (NodeStatusInfo.history_check, history-check.ts), with where
+               the node started on a second line (started_from). Gone once the
                engine reports it done. No time estimate on purpose. The line
                is the bar's accessible name; the bar carries the percentage.
                The line itself is hidden from screen readers, so it is heard

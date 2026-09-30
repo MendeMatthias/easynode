@@ -503,6 +503,8 @@ pub async fn tools_diagnostics(
             &datadir,
             diagnostics::LOG_TAIL_BYTES,
         )),
+        // Kept after the check is done, current or not: the report says which.
+        start_record: btx_core::snapshot_start::read(&datadir),
         ..Default::default()
     };
     let mut answering = None;

@@ -122,6 +122,68 @@ die() {
   exit 1
 }
 
+# --- 5, defined here: the compiled shielded commitment ----------------------
+# Section 12 of docs/decisions/2026-09-29-every-node-starts-near-the-tip.md:
+# every confirmed statement must carry the shielded commitment that
+# confirmed_snapshot.rs compiles (MAINNET_SHIELDED_COMMITMENT). An engine whose
+# newest mainnet snapshot pins another one would have every node refuse every
+# confirmed snapshot, so the bump fails here first. It reads the chainparams.cpp
+# fetched below, so it runs wherever this script runs, CI included.
+CONFIRMED_RS="$ROOT/crates/btx-core/src/confirmed_snapshot.rs"
+shielded_check() {
+  local compiled newest
+  compiled="$(grep -A1 '^pub const MAINNET_SHIELDED_COMMITMENT' "$CONFIRMED_RS" 2>/dev/null \
+    | grep -oE '[0-9a-f]{64}' | head -1 || true)"
+  [ -n "$compiled" ] || die "could not read MAINNET_SHIELDED_COMMITMENT from $CONFIRMED_RS" \
+    "Its shape changed. FIX THIS GUARD, do not delete it and do not skip it."
+  newest="$(awk '/^class CMainParams/{m=1} m && /^};/{exit} m' "$FILE" \
+    | grep -oE 'shielded_state_commitment = uint256\{"[0-9a-f]{64}"\}' \
+    | tail -1 | grep -oE '[0-9a-f]{64}' || true)"
+  [ -n "$newest" ] || die "found no mainnet shielded_state_commitment in $CHAINPARAMS for $TAG" \
+    "Either CMainParams moved or its assumeutxo entries changed shape. Read the file by hand."
+  if [ "$compiled" != "$newest" ]; then
+    die "the newest mainnet snapshot in $TAG pins shielded commitment $newest" \
+      "confirmed_snapshot.rs compiles $compiled. Every node would refuse every" \
+      "confirmed snapshot. Do not ship this engine until the two agree."
+  fi
+  echo "OK: the newest mainnet snapshot in $TAG pins the shielded commitment"
+  echo "    confirmed_snapshot.rs compiles (${compiled:0:8}...${compiled:60:4})."
+}
+
+# --- 6, defined here: the confirmed-snapshot rehearsal on regtest -----------
+# Section 12 of docs/decisions/2026-09-29-every-node-starts-near-the-tip.md,
+# before any engine bump: the replay contexts the engine reports are the ones
+# the app compiles (confirmed_snapshot.rs), and a node on a signed snapshot
+# still restarts as a validating node. A context that moves strands every
+# node on a signed snapshot: the engine re-checks the stored manifest at each
+# start and refuses to start when it no longer verifies.
+#
+# It needs the candidate engine's btxd, which CI does not have:
+#   EASYNODE_TEST_BTXD=/path/to/btxd scripts/check-engine-tag.sh <tag>
+# Without it the check is skipped with a note. ENGINE_TAG_GUARD_REGTEST=1
+# makes it required, so the release recipe cannot skip it by accident.
+regtest_check() {
+  if [ -z "${EASYNODE_TEST_BTXD:-}" ]; then
+    if [ -n "${ENGINE_TAG_GUARD_REGTEST:-}" ]; then
+      die "ENGINE_TAG_GUARD_REGTEST is set but EASYNODE_TEST_BTXD is not" \
+        "Point EASYNODE_TEST_BTXD at the candidate engine's btxd (btx-cli beside it)."
+    fi
+    echo "regtest check: skipped. Before an engine bump run it with"
+    echo "  EASYNODE_TEST_BTXD=/path/to/btxd ENGINE_TAG_GUARD_REGTEST=1 $0 <tag>"
+    return 0
+  fi
+  echo "regtest check: confirmed snapshots against $EASYNODE_TEST_BTXD"
+  if ! (cd "$ROOT/crates/btx-core" \
+        && cargo test --locked --test confirmed_snapshot_regtest -- --ignored --test-threads=1); then
+    die "the confirmed-snapshot rehearsal failed against $EASYNODE_TEST_BTXD" \
+      "Either the engine's replay context moved, which would stop every node on a" \
+      "signed snapshot from starting, or a validating node on a signed snapshot no" \
+      "longer restarts. Do not ship this engine until confirmed_snapshot.rs agrees."
+  fi
+  echo "OK: the engine's replay contexts are the compiled ones, and a validating"
+  echo "    node restarts on a signed snapshot."
+}
+
 # --- 1. which tag ----------------------------------------------------------
 OVERRIDE_TAG="${1:-}"
 if [ -n "$OVERRIDE_TAG" ]; then
@@ -271,6 +333,8 @@ if [ -z "$BAD" ]; then
   echo "OK: $TAG assigns nMatMulStallRecoveryHeight $TOTAL times, every one of them"
   echo "    the disabled sentinel $SENTINEL."
   echo "    No mainnet stall-recovery height. This engine follows the majority chain."
+  shielded_check
+  regtest_check
   if [ -z "$OVERRIDE_TAG" ] && [ -n "$ACKNOWLEDGED_FORKED_TAG" ] && [ "$TAG" = "$ACKNOWLEDGED_FORKED_TAG" ]; then
     echo
     echo "note: ACKNOWLEDGED_FORKED_TAG still names $TAG, which now checks out clean."
