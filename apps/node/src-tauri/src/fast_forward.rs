@@ -133,30 +133,35 @@ fn unreadable_sentence(datadir: &Path) -> String {
     )
 }
 
-/// Where the old chain data is, when a roll-back could not put it all back.
-/// `nothing_removed`: the restore could not begin (an original is missing
-/// from the dated folder, or could not be checked), so the run stands as it
-/// was, and the node is not started again in this run of the app: one plain
+/// A roll-back whose restore could not begin (an original is missing from
+/// the dated folder, or could not be checked): the run stands as it was,
+/// and the node is not started again in this run of the app. One plain
 /// sentence (controller note 2b). It names Remove node data, which goes
 /// ahead for exactly this run while this sentence stands ([`STUCK`],
-/// [`removal_goes_ahead`], review N5).
-fn stranded_sentence(folder: &Path, nothing_removed: bool) -> String {
-    if nothing_removed {
-        format!(
-            "Fast-forward could not put the old chain data back, because part of it is missing \
-             from {} or could not be checked, so easyNode leaves the node stopped: quit and \
-             reopen easyNode to start the node on the new chain data and carry Fast-forward on, \
-             or use Remove node data in Settings to set the node up again.",
-            folder.display()
-        )
+/// [`removal_goes_ahead`], review N5), and offers a reopen only when the
+/// next opening carries the run on (`reopen`, [`reopen_carries_on`]): one
+/// that would roll it back again before the launch stops the same way.
+fn stuck_sentence(folder: &Path, reopen: bool) -> String {
+    let way_out = if reopen {
+        "quit and reopen easyNode to try again with the new chain data, or use Remove node \
+         data in Settings to set the node up again"
     } else {
-        format!(
-            "Fast-forward could not put all of the old chain data back, so easyNode has not \
-             started the node. What is not back yet is in {}. Start the node again to try once \
-             more.",
-            folder.display()
-        )
-    }
+        "use Remove node data in Settings to set the node up again"
+    };
+    format!(
+        "Fast-forward could not put the old chain data back, because part of it is missing from \
+         {} or could not be checked, so easyNode leaves the node stopped: {way_out}.",
+        folder.display()
+    )
+}
+
+/// Where the old chain data is, when a put-back stopped part-way.
+fn stranded_sentence(folder: &Path) -> String {
+    format!(
+        "Fast-forward could not put all of the old chain data back, so easyNode has not started \
+         the node. What is not back yet is in {}. Start the node again to try once more.",
+        folder.display()
+    )
 }
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -597,7 +602,7 @@ fn at_start(datadir: &Path, now_unix: u64, node_down: bool) -> Result<(), NotBac
                 datadir,
                 "the roll-back decided before the app stopped is done before the launch",
             );
-            undo(datadir)
+            undo(datadir, now_unix, window_not_written)
         }
         Phase::Running if rolled_back(datadir) => {
             log(
@@ -607,7 +612,12 @@ fn at_start(datadir: &Path, now_unix: u64, node_down: bool) -> Result<(), NotBac
             );
             Ok(())
         }
-        Phase::Running => match roll_back_before_launch(&record, window_not_written, now_unix) {
+        Phase::Running => match roll_back_before_launch(
+            &record,
+            window_not_written,
+            loaded_by_the_loader(datadir),
+            now_unix,
+        ) {
             Some(why) if node_down => {
                 ff::write_outcome(
                     datadir,
@@ -616,7 +626,7 @@ fn at_start(datadir: &Path, now_unix: u64, node_down: bool) -> Result<(), NotBac
                     },
                 );
                 log(datadir, &format!("rolling back before the launch: {why}"));
-                undo(datadir)
+                undo(datadir, now_unix, window_not_written)
             }
             _ => {
                 log(
@@ -657,7 +667,7 @@ fn at_start(datadir: &Path, now_unix: u64, node_down: bool) -> Result<(), NotBac
                 );
             }
             log(datadir, &format!("rolling back before the launch: {why}"));
-            undo(datadir)
+            undo(datadir, now_unix, false)
         }
     }
 }
@@ -665,21 +675,43 @@ fn at_start(datadir: &Path, now_unix: u64, node_down: bool) -> Result<(), NotBac
 /// Pure: a run at [`Phase::Running`] that a start with the node down rolls
 /// back before the launch instead of launching on it, and why (review N1).
 /// The watch begins only once the node is up, so a node that cannot start
-/// on the new chain is never judged: one past its day (`ff::judge`'s total
-/// cap, or the window it kept), and one whose fresh watch window could not
-/// be written (`window_not_written`): a disk too full for the record is too
-/// full for btxd, which refuses to start below 50 MiB free. `None`: carry
+/// on the new chain is never judged: one whose fresh watch window could
+/// not be written (`window_not_written`; a disk too full for the record is
+/// too full for btxd, which refuses to start below 50 MiB free), and one
+/// past its day (`ff::judge`'s total cap). Not one past its day that the
+/// loader has already said is loaded (`loaded`, [`loaded_by_the_loader`]):
+/// the watch may judge it done, so it is left to the watch. `None`: carry
 /// it on.
 fn roll_back_before_launch(
     record: &Record,
     window_not_written: bool,
+    loaded: bool,
     now_unix: u64,
 ) -> Option<String> {
-    match ff::judge(record, &Look::default(), now_unix) {
-        Verdict::RollBack(why) => Some(why),
+    let judged = ff::judge(record, &Look::default(), now_unix);
+    match judged {
+        Verdict::RollBack(why) if window_not_written || !loaded => Some(why),
         _ if window_not_written => Some(WHY_NOT_SAVED.into()),
         _ => None,
     }
+}
+
+/// Pure: would the next opening of the app carry this run on, rather than
+/// roll it back again before the launch ([`roll_back_before_launch`])? It
+/// gets a fresh watch window there. A run whose window could not be written
+/// is taken to stop the same way again: the disk that stopped it is likely
+/// still full. For [`stuck_sentence`].
+fn reopen_carries_on(
+    record: &Record,
+    loaded: bool,
+    window_not_written: bool,
+    now_unix: u64,
+) -> bool {
+    let fresh = Record {
+        watch_started_at: now_unix,
+        ..record.clone()
+    };
+    !window_not_written && roll_back_before_launch(&fresh, false, loaded, now_unix).is_none()
 }
 
 /// What the watch makes of one look: a roll-back decided before the app
@@ -874,9 +906,12 @@ fn remove_attempts_refused(datadir: &Path, since: u64) {
 /// were refused and set aside ([`remove_attempts_refused`]). `Err` is a
 /// plain sentence: the old chain data is not all back, and the node must not
 /// start. A restore that could not begin changed nothing, and the decision
-/// to roll back goes with it: the run stands, and is watched again from the
-/// next opening of the app (controller note 2b).
-fn undo(datadir: &Path) -> Result<(), NotBack> {
+/// to roll back goes with it: the run stands, and the next opening of the
+/// app carries it on or rolls it back again (controller note 2b); its
+/// sentence says which, from the time (`now_unix`) and whether this start
+/// could write the run's watch window (`window_not_written`,
+/// [`reopen_carries_on`]).
+fn undo(datadir: &Path, now_unix: u64, window_not_written: bool) -> Result<(), NotBack> {
     let record = match ff::read_record(datadir) {
         Ok(Some(r)) => r,
         Ok(None) => return Ok(()),
@@ -924,6 +959,14 @@ fn undo(datadir: &Path) -> Result<(), NotBack> {
             // stands, with its own settings and launches.
             let nothing_removed =
                 matches!(ff::read_record(datadir), Ok(Some(r)) if r.phase == Phase::Running);
+            // What the next opening would do with the run that stands, for
+            // the sentence: the loader's word is the run's own setting.
+            let reopen = reopen_carries_on(
+                &record,
+                during.snapshot_loaded,
+                window_not_written,
+                now_unix,
+            );
             if nothing_removed {
                 put_settings(datadir, during);
                 ff::clear_outcome(datadir);
@@ -933,7 +976,11 @@ fn undo(datadir: &Path) -> Result<(), NotBack> {
             }
             Err(match e {
                 MoveError::Stranded { folder, .. } => NotBack {
-                    said: stranded_sentence(&folder, nothing_removed),
+                    said: if nothing_removed {
+                        stuck_sentence(&folder, reopen)
+                    } else {
+                        stranded_sentence(&folder)
+                    },
                     could_not_begin: nothing_removed,
                 },
                 MoveError::Untouched(_) => NotBack::plain(UNDO_FAILED),
@@ -1224,7 +1271,7 @@ async fn run(app: &AppHandle, state: &State<'_, AppState>) {
                 &format!("setting aside failed and not all went back ({error})"),
             );
             not_started(&datadir, WHY_NOT_SET_ASIDE).await;
-            let message = stranded_sentence(&folder, false);
+            let message = stranded_sentence(&folder);
             set_phase(app, state, NodePhase::Error { message }).await;
             return;
         }
@@ -1413,7 +1460,7 @@ async fn roll_back(app: &AppHandle, state: &State<'_, AppState>, why: String) {
         return;
     }
     let dd = datadir.clone();
-    let undone = on_disk(move || undo(&dd))
+    let undone = on_disk(move || undo(&dd, now(), false))
         .await
         .unwrap_or_else(|| Err(NotBack::plain(MOVE_CUT_OFF)));
     match undone {
@@ -1738,21 +1785,33 @@ mod tests {
         };
         let now = 1_000_000;
         assert_eq!(
-            roll_back_before_launch(&at(now - 60, now), false, now),
+            roll_back_before_launch(&at(now - 60, now), false, false, now),
             None
         );
         assert_eq!(
-            roll_back_before_launch(&at(now - ff::MAX_TOTAL_SECS, now), false, now),
+            roll_back_before_launch(&at(now - ff::MAX_TOTAL_SECS, now), false, false, now),
             Some("it had not finished 24 hours after it started".into())
         );
         assert_eq!(
-            roll_back_before_launch(&at(now - 120, now - 60), true, now),
+            roll_back_before_launch(&at(now - 120, now - 60), true, false, now),
             Some(WHY_NOT_SAVED.into()),
             "the window it had is not over yet"
         );
         assert_eq!(
-            roll_back_before_launch(&at(now - 5 * 60 * 60, now - 4 * 60 * 60), true, now),
+            roll_back_before_launch(&at(now - 5 * 60 * 60, now - 4 * 60 * 60), true, false, now),
             Some("it did not finish within 3 hours".into())
+        );
+        // The re-check's minor: past its day, but the loader has said the
+        // snapshot is loaded, so the watch may well judge it Done: it is
+        // carried on and left to the watch. A window that could not be
+        // written still rolls it back: the node cannot start to be watched.
+        assert_eq!(
+            roll_back_before_launch(&at(now - ff::MAX_TOTAL_SECS, now), false, true, now),
+            None
+        );
+        assert_eq!(
+            roll_back_before_launch(&at(now - 120, now - 60), true, true, now),
+            Some(WHY_NOT_SAVED.into())
         );
 
         // On disk, at the start: past its day with the node down, the old
@@ -1778,6 +1837,71 @@ mod tests {
                 reason: "it had not finished 24 hours after it started".into()
             })
         );
+
+        // Past its day, with the loader's word: carried on for the watch.
+        let tmp = datadir_with_chain(before);
+        let d = tmp.path();
+        set_aside_for_run(d, 232_000, 100).unwrap();
+        attempt(d);
+        NodeAppSettings::update(d, |s| s.snapshot_loaded = true);
+        assert_eq!(at_start(d, a_day_later, true), Ok(()));
+        assert!(underway(d), "left to the watch");
+        assert!(d.join("blocks/new").exists());
+    }
+
+    /// Review N5, re-checked after N1: the sentence for a roll-back whose
+    /// restore cannot begin offers a reopen only where the next opening
+    /// carries the run on. A run past its day (with no word from the loader)
+    /// is rolled back again before the launch there, stops the same way,
+    /// and shows the same sentence, so for it, and for a run whose window
+    /// could not be written, only Remove node data is offered. Each state is
+    /// followed to the next opening, which must do what the sentence says.
+    #[test]
+    fn the_stuck_sentence_offers_a_reopen_only_where_it_carries_the_run_on() {
+        let now = 1_000_000;
+        for (started_at, loaded, reopen) in [
+            (now - 60, false, true),
+            (now - ff::MAX_TOTAL_SECS, false, false),
+            (now - ff::MAX_TOTAL_SECS, true, true),
+        ] {
+            let when = format!("started {started_at}, loaded {loaded}");
+            let tmp = datadir_with_chain(Before::default());
+            let d = tmp.path();
+            let record = set_aside_for_run(d, 232_000, started_at).unwrap();
+            let folder = d.join(&record.aside);
+            attempt(d);
+            NodeAppSettings::update(d, |s| s.snapshot_loaded = loaded);
+            std::fs::remove_dir_all(folder.join("indexes")).unwrap();
+            let not_back = undo(d, now, false).unwrap_err();
+            assert!(not_back.could_not_begin, "{when}");
+            assert_eq!(not_back.said, stuck_sentence(&folder, reopen), "{when}");
+            // The next opening, with the node down.
+            let next = at_start(d, now + 60, true);
+            if reopen {
+                assert_eq!(next, Ok(()), "{when}");
+                assert!(underway(d), "carried on, {when}");
+                assert!(d.join("blocks/new").exists(), "{when}");
+            } else {
+                assert_eq!(
+                    next,
+                    Err(NotBack {
+                        said: stuck_sentence(&folder, false),
+                        could_not_begin: true
+                    }),
+                    "rolled back again and stopped the same way, {when}"
+                );
+            }
+        }
+        // A window that could not be written: the disk that stopped it
+        // stops the next opening's too.
+        let tmp = datadir_with_chain(Before::default());
+        let d = tmp.path();
+        let record = set_aside_for_run(d, 232_000, now - 60).unwrap();
+        let folder = d.join(&record.aside);
+        attempt(d);
+        std::fs::remove_dir_all(folder.join("indexes")).unwrap();
+        let not_back = undo(d, now, true).unwrap_err();
+        assert_eq!(not_back.said, stuck_sentence(&folder, false));
     }
 
     /// Controller notes 1 (a0, c): a run recorded done is finished at the
@@ -1845,7 +1969,7 @@ mod tests {
             attempt(d);
             NodeAppSettings::update(d, |s| s.snapshot_loaded = true);
             mark_snapshot_marker(d);
-            assert_eq!(undo(d), Ok(()), "{before:?}");
+            assert_eq!(undo(d, 50_000, false), Ok(()), "{before:?}");
             assert_eq!(run_settings(d), before, "{before:?}");
             assert_eq!(snapshot_marker_present(d), snapshot_loaded, "{before:?}");
             assert_old_chain_back(d, &format!("{before:?}"));
@@ -1877,13 +2001,13 @@ mod tests {
                 reason: WHY_NOT_LOADED.into(),
             },
         );
-        let not_back = undo(d).unwrap_err();
+        let not_back = undo(d, 50_000, false).unwrap_err();
         assert!(
             not_back.could_not_begin,
             "the one that keeps the node stopped"
         );
         let said = not_back.said;
-        assert_eq!(said, stranded_sentence(&folder, true));
+        assert_eq!(said, stuck_sentence(&folder, true));
         assert_eq!(
             ff::read_outcome(d),
             None,
@@ -1916,10 +2040,10 @@ mod tests {
         // `blocks`, `chainstate`, `chainstate_snapshot` and start record
         // still in the places the old ones go back to: those cannot go back.
         record_at(d, Phase::Restoring);
-        let not_back = undo(d).unwrap_err();
+        let not_back = undo(d, 50_000, false).unwrap_err();
         assert!(!not_back.could_not_begin, "starting again tries once more");
         let said = not_back.said;
-        assert_eq!(said, stranded_sentence(&folder, false));
+        assert_eq!(said, stranded_sentence(&folder));
         assert_eq!(run_settings(d), before, "put back before the restore");
         assert_eq!(ff::read_record(d).unwrap().unwrap().phase, Phase::Restoring);
         assert_eq!(
@@ -2024,7 +2148,7 @@ mod tests {
         set_aside_for_run(d, 232_000, 100).unwrap();
         attempt(d);
         std::fs::write(d.join(crate::commands::SET_ASIDE_PENDING_FILE), b"{}").unwrap();
-        assert_eq!(undo(d), Ok(()));
+        assert_eq!(undo(d, 50_000, false), Ok(()));
         assert!(!d.join(crate::commands::SET_ASIDE_PENDING_FILE).exists());
     }
 
@@ -2245,7 +2369,7 @@ mod tests {
         let folder = d.join(&record.aside);
         attempt(d);
         record_at(d, Phase::Restoring);
-        let said = stranded_sentence(&folder, false);
+        let said = stranded_sentence(&folder);
         assert_eq!(before_start(d).await, Err(said));
         assert_eq!(
             *STUCK.lock().unwrap(),
@@ -2286,7 +2410,7 @@ mod tests {
             },
         );
         std::fs::remove_dir_all(folder.join("indexes")).unwrap();
-        let said = stranded_sentence(&folder, true);
+        let said = stuck_sentence(&folder, true);
         assert_eq!(before_start(d).await, Err(said.clone()));
         assert_eq!(ff::read_outcome(d), None);
         assert!(underway(d));
@@ -2340,7 +2464,7 @@ mod tests {
         }
         .mark_loaded();
         assert!(loaded_by_the_loader(d), "the loader's word");
-        assert_eq!(undo(d), Ok(()));
+        assert_eq!(undo(d, 50_000, false), Ok(()));
         assert!(loaded_by_the_loader(d), "as before the run");
     }
 
@@ -2429,7 +2553,7 @@ mod tests {
         }
         std::fs::create_dir_all(d.join(format!("{prefix}later/x"))).unwrap();
         std::fs::write(d.join(format!("{prefix}6000")), b"a file").unwrap();
-        assert_eq!(undo(d), Ok(()));
+        assert_eq!(undo(d, 50_000, false), Ok(()));
         assert_eq!(
             entries_named(d, prefix),
             [
@@ -2536,12 +2660,12 @@ mod tests {
         // Review N6: a node this app did not start holds the folder; nothing
         // was stopped, and from a start an earlier put-back may have moved
         // something already, so NOT_STOPPED would say both wrong.
-        assert_eq!(undo(d), Err(NotBack::plain(NODE_IN_THE_WAY)));
+        assert_eq!(undo(d, 50_000, false), Err(NotBack::plain(NODE_IN_THE_WAY)));
         assert_eq!(ff::read_record(d).unwrap(), Some(record), "the run stands");
         assert!(d.join("blocks/new").exists(), "nothing removed");
         assert_eq!(run_settings(d), Before::default(), "the run's own");
         holder.release();
-        assert_eq!(undo(d), Ok(()));
+        assert_eq!(undo(d, 50_000, false), Ok(()));
         assert_old_chain_back(d, "once the lock was free");
         assert_eq!(run_settings(d), before);
     }
@@ -2601,7 +2725,7 @@ mod tests {
         let nothing = Mutex::new(None);
         assert_eq!(clear_for_removal_with(d, false, &nothing), waits);
         std::fs::remove_dir_all(folder.join("indexes")).unwrap();
-        let not_back = undo(d).unwrap_err();
+        let not_back = undo(d, 50_000, false).unwrap_err();
         assert!(not_back.could_not_begin);
         assert!(
             not_back.said.contains("Remove node data in Settings"),
@@ -2630,7 +2754,7 @@ mod tests {
         let folder = d.join(&record.aside);
         attempt(d);
         std::fs::rename(folder.join("indexes"), d.join("indexes-elsewhere")).unwrap();
-        let not_back = undo(d).unwrap_err();
+        let not_back = undo(d, 50_000, false).unwrap_err();
         assert!(not_back.could_not_begin);
         std::fs::rename(d.join("indexes-elsewhere"), folder.join("indexes")).unwrap();
         let stuck = Mutex::new(Some(not_back.said.clone()));
@@ -2762,8 +2886,9 @@ mod tests {
     fn what_the_driver_says_is_plain() {
         let folder = Path::new("/Users/someone/.easybtx/fast-forward-100");
         let stranded = [
-            stranded_sentence(folder, true),
-            stranded_sentence(folder, false),
+            stuck_sentence(folder, true),
+            stuck_sentence(folder, false),
+            stranded_sentence(folder),
         ];
         for s in &stranded {
             assert!(
@@ -2772,12 +2897,17 @@ mod tests {
             );
         }
         // Review N5: Remove node data is named only beside the run it goes
-        // ahead for; a put-back that stopped part-way still waits.
+        // ahead for; a put-back that stopped part-way still waits. A reopen
+        // is offered only where it carries the run on.
         assert!(stranded[0].contains("Remove node data in Settings"));
-        assert!(!stranded[1].contains("Remove node data"));
+        assert!(stranded[1].contains("Remove node data in Settings"));
+        assert!(!stranded[2].contains("Remove node data"));
+        assert!(stranded[0].contains("reopen"));
+        assert!(!stranded[1].contains("reopen"));
         // Controller note 2b: one plain sentence, like the unreadable one.
         for s in [
             &stranded[0],
+            &stranded[1],
             &unreadable_sentence(Path::new("/Users/someone/.easybtx")),
         ] {
             assert_eq!(s.matches(". ").count(), 0, "one sentence: {s}");
