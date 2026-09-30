@@ -21,7 +21,7 @@
 //! back. It never adds, bans, disconnects or reconnects a peer:
 //! `getblockfrompeer` is the only command it sends that changes anything.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::json;
 
@@ -58,6 +58,10 @@ pub const SLOW_TICK: Duration = Duration::from_secs(1);
 /// 84b998b4). A block further below the height a peer announced is old for it
 /// ([`old_for`]).
 pub const LIMITED_SERVES: u64 = 288;
+/// Two ticks this far apart on the wall clock (the refresher ticks every 3
+/// seconds) mean this Mac slept or the app stood still: a peer gone across
+/// that gap did not drop us.
+pub const OUTAGE_GAP: Duration = Duration::from_secs(30);
 /// Drops over old blocks, this run, before a peer is not asked for them
 /// again (the controller's decision of 2026-09-29, night: two strikes, so one
 /// unexplained drop like the regtest dry run's does not lose a peer).
@@ -112,6 +116,10 @@ pub enum Decision {
 #[derive(Debug, Clone)]
 pub struct Seen<'a> {
     pub now: Instant,
+    /// The wall clock at this tick, when known. `Instant` stands still while
+    /// a Mac sleeps; this does not, so a gap above [`OUTAGE_GAP`] since the
+    /// last tick shows the sleep.
+    pub wall: Option<SystemTime>,
     /// The node's tip height.
     pub tip: u64,
     /// The followed chain's height, `None` when there is nothing to follow.
@@ -184,6 +192,10 @@ pub struct Helper {
     no_old_blocks: bool,
     /// While `no_old_blocks` holds: the last tick saw a peer the help may ask.
     askable_last_tick: bool,
+    /// The connection ids the last tick saw, and its wall clock: what tells
+    /// this Mac losing its connections from a peer dropping us.
+    last_peers: Vec<i64>,
+    last_wall: Option<SystemTime>,
 }
 
 impl Helper {
@@ -207,6 +219,8 @@ impl Helper {
             news: Vec::new(),
             no_old_blocks: false,
             askable_last_tick: false,
+            last_peers: Vec::new(),
+            last_wall: None,
         }
     }
 
@@ -276,8 +290,31 @@ impl Helper {
         moving && in_flight_elsewhere(peers, tip, ours)
     }
 
+    /// Whether this tick looks like this Mac lost its connections (a Wi-Fi
+    /// change, a VPN toggle, a sleep) rather than one peer dropping us: no
+    /// peer of the last tick but the batch's is still connected (when there
+    /// was one), or the wall clock moved more than [`OUTAGE_GAP`] since.
+    fn local_outage(&self, s: &Seen) -> bool {
+        let batch_peer = self.batch.as_ref().map(|b| b.peer_id);
+        let mut others = self
+            .last_peers
+            .iter()
+            .filter(|id| Some(**id) != batch_peer)
+            .peekable();
+        let all_gone =
+            others.peek().is_some() && others.all(|id| s.peers.iter().all(|p| p.id != *id));
+        let gap = match (self.last_wall, s.wall) {
+            (Some(was), Some(now)) => now.duration_since(was).is_ok_and(|d| d > OUTAGE_GAP),
+            _ => false,
+        };
+        all_gone || gap
+    }
+
     pub fn decide(&mut self, s: &Seen) -> Decision {
         self.observe(s.tip, s.now);
+        let outage = self.local_outage(s);
+        self.last_peers = s.peers.iter().map(|p| p.id).collect();
+        self.last_wall = s.wall.or(self.last_wall);
         if !self.enabled {
             return self.stop(Why::Off);
         }
@@ -332,14 +369,15 @@ impl Helper {
                     if !self.stalled.contains(&b.addr) {
                         self.stalled.push(b.addr.clone());
                     }
-                } else if b.deep {
+                } else if b.deep && !outage {
                     // Gone, or back under a new connection id, before any of
                     // a batch of old blocks connected: what a limited peer
                     // does to a node it does not grant `noban` (engine
                     // net_processing.cpp:9384-9391), and a full-history one
                     // at its outbound target (:9373-9381). It applies the
                     // rule to the first old block asked for, so a batch that
-                    // partly connected is not this, and only rotates. The
+                    // partly connected is not this, and only rotates; nor
+                    // is this Mac losing every connection at once. The
                     // second time, the peer is marked.
                     self.count_drop(&b.addr);
                 }
@@ -770,6 +808,7 @@ async fn tick_until(
     let was_helping = cu.helper.helping();
     let mut seen = Seen {
         now,
+        wall: Some(SystemTime::now()),
         tip: t.blocks,
         target: None,
         next: &[],
@@ -1021,6 +1060,7 @@ mod tests {
     ) -> Seen<'a> {
         Seen {
             now,
+            wall: None,
             tip,
             target: Some(tip + 7_000),
             next,
@@ -1645,6 +1685,46 @@ mod tests {
         h.decide(&s);
         s.now = t0 + secs(90);
         assert_eq!(asked_of(&h.decide(&s)), (6, 233_232, 233_331));
+    }
+
+    #[test]
+    fn a_drop_that_looks_like_this_mac_losing_its_connections_is_not_counted() {
+        // A Wi-Fi change or a VPN toggle drops every connection at once: A is
+        // back under a new id, and so is everyone else. A Mac that slept
+        // comes back to the same. That is this Mac, not A, so it only
+        // rotates, and the other drop tests stay as they are.
+        let t0 = Instant::now();
+        let w0 = std::time::SystemTime::now();
+        let next = next_from(225_927);
+        let other = |id| {
+            let mut p = recorded(id, "5.6.7.8:19335", LIMITED, 233_481);
+            p.connection_type = "outbound-full-relay".into();
+            p
+        };
+        let at = |dt: u64, wall: u64, peers| {
+            let mut s = seen(t0 + secs(dt), 225_927, &next, peers);
+            s.wall = Some(w0 + secs(wall));
+            s
+        };
+        let before = [recorded(4, A, LIMITED, 233_481), other(30)];
+        let mut h = helper();
+        h.decide(&at(0, 0, &before));
+        step(&mut h, &at(30, 30, &before));
+        // Everyone is back under a new id.
+        let after = [recorded(5, A, LIMITED, 233_481), other(31)];
+        assert_eq!(asked_of(&step(&mut h, &at(33, 33, &after))).0, 5);
+        assert_eq!(h.dropped(A), 0, "every connection went");
+        assert!(h.take_news().is_empty());
+        // The Mac slept for ten minutes: the next tick comes that much later
+        // on the wall clock, and A is back under a new id.
+        let woke = [recorded(6, A, LIMITED, 233_481), other(31)];
+        assert_eq!(asked_of(&step(&mut h, &at(36, 636, &woke))).0, 6);
+        assert_eq!(h.dropped(A), 0, "the Mac slept");
+        // With the other peer still there and no gap, the same drop counts.
+        let again = [recorded(7, A, LIMITED, 233_481), other(31)];
+        assert_eq!(asked_of(&step(&mut h, &at(39, 639, &again))).0, 7);
+        assert_eq!(h.dropped(A), 1);
+        assert_eq!(h.take_news(), [dropped_once_line(A)]);
     }
 
     #[test]
