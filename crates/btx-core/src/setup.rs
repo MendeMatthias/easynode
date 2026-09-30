@@ -364,7 +364,7 @@ pub fn remove_addnodes_str(conf: &str, remove: &[&str]) -> String {
     chunks
         .into_iter()
         .filter(|raw| {
-            let before_hash = raw.split('#').next().unwrap_or("");
+            let before_hash = raw.split_once('#').map_or(*raw, |(before, _)| before);
             let trimmed = before_hash.trim_matches(PATTERN);
             let Some(eq) = trimmed.find('=') else {
                 // No section handling here, unlike the engine (which would
@@ -957,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_addnodes_str_keeps_a_section_header_line() {
+    fn remove_addnodes_str_removes_a_relay_line_under_a_section_header_too() {
         // No section handling here (unlike the engine's `GetConfigOptions`,
         // which would read this as `main.addnode` and treat it as a
         // different key from the top-level `addnode`): matching only the
