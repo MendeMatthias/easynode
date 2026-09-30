@@ -24,12 +24,13 @@ from everyone, or left on a branch the others have moved on from, knows of no
 newer blocks either. Now a newest block more than two hours old, or signed
 blocks the node does not have, overrule it, and the line says which one it is.
 
-**The hold on Branch B no longer lets go when the node is slow to answer.**
+**A slow node no longer leaves the dead branch before Branch B is refused.**
 Before a node leaves the dead branch it first refuses Branch B, so B cannot
 become the chain it follows. Until now, a node that took too long to say
 whether it had seen B's first block was treated as one that had never seen it,
-and the dead branch could be left with B still open. Now only the node's own
-"never seen it" counts; any other answer waits and asks again.
+and the dead branch could be left with B still open. Now only the node saying
+it has never seen that block counts. No answer, or any other error, keeps the
+dead branch waiting and the app asks again.
 
 ## [0.6.32] - 2026-09-28
 

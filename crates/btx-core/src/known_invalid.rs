@@ -152,7 +152,8 @@ pub enum Refusal {
     /// `invalidateblock` returned. The block and its descendants are failed in
     /// the node's block index, which persists across restarts.
     Refused,
-    /// The node knows the block but `invalidateblock` failed. Asked again later.
+    /// The node knows the block but `invalidateblock` failed, or it did not
+    /// answer whether it knows the block. Asked again later.
     Failed(String),
     /// Not attempted: an earlier held branch failed, and the order is the
     /// point. Asked again later.
@@ -171,15 +172,19 @@ pub async fn refuse(rpc: &dyn Rpc, block: &KnownInvalidBlock) -> Refusal {
 }
 
 /// Does the node have a header for `hash`? `Ok(false)` only on the engine's own
-/// answer for a header it never saw, `RPC_INVALID_ADDRESS_OR_KEY` (-5) "Block
-/// not found" (`src/rpc/blockchain.cpp:881` at 84b998b4). Any other error, a
-/// timeout or a node that is still starting, is `Err`: it says nothing about
-/// the header, so it must not read as "never heard of it". That reading would
-/// let a node leave the dead branch while B, unanswered, stood open.
-async fn header_known(rpc: &dyn Rpc, hash: &str) -> Result<bool, String> {
+/// answer for a header it never saw, `RPC_INVALID_ADDRESS_OR_KEY` (-5), "Block
+/// not found" (`src/rpc/blockchain.cpp:881` at 84b998b4, unchanged in
+/// v0.34.12). The code decides, not the words: in `getblockheader` -5 means
+/// only that (a malformed hash is -8), and a later engine that rewords the
+/// message must not strand every node that never heard of B on the dead
+/// branch. Any other error, a timeout or a node still warming up (-28), is
+/// `Err`: it says nothing about the header, so it must not read as "never
+/// heard of it". That reading would let a node leave the dead branch while B,
+/// unanswered, stood open.
+pub async fn header_known(rpc: &dyn Rpc, hash: &str) -> Result<bool, String> {
     match rpc.call("getblockheader", json!([hash, true])).await {
         Ok(_) => Ok(true),
-        Err(AppError::Rpc { code: -5, message }) if message == "Block not found" => Ok(false),
+        Err(AppError::Rpc { code: -5, .. }) => Ok(false),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -239,7 +244,8 @@ pub enum Lift {
     /// `reconsiderblock` returned. On a block that was not failed it changes
     /// nothing, which is why it is safe to ask on every run.
     Lifted,
-    /// The node knows the root but `reconsiderblock` failed. Asked again later.
+    /// The node knows the root but `reconsiderblock` failed, or it did not
+    /// answer whether it knows the root. Asked again later.
     Failed(String),
 }
 
@@ -411,6 +417,10 @@ mod tests {
         failing: Vec<&'static str>,
         /// Headers the node does not answer for: a timeout, not "not found".
         silent: Vec<&'static str>,
+        /// Headers asked while the node warms up: the engine's -28.
+        warming: Vec<&'static str>,
+        /// Headers the node never saw, said in other words than today's.
+        reworded: Vec<&'static str>,
         calls: Mutex<Vec<(String, Value)>>,
     }
 
@@ -420,11 +430,21 @@ mod tests {
                 unknown: unknown.to_vec(),
                 failing: failing.to_vec(),
                 silent: Vec::new(),
+                warming: Vec::new(),
+                reworded: Vec::new(),
                 calls: Mutex::new(Vec::new()),
             }
         }
         fn silent(mut self, silent: &[&'static str]) -> Self {
             self.silent = silent.to_vec();
+            self
+        }
+        fn warming(mut self, warming: &[&'static str]) -> Self {
+            self.warming = warming.to_vec();
+            self
+        }
+        fn reworded(mut self, reworded: &[&'static str]) -> Self {
+            self.reworded = reworded.to_vec();
             self
         }
         fn calls(&self) -> Vec<(String, Value)> {
@@ -451,6 +471,14 @@ mod tests {
                 "getblockheader" if self.silent.contains(&hash) => {
                     Err(AppError::Http("operation timed out".into()))
                 }
+                "getblockheader" if self.warming.contains(&hash) => Err(AppError::Rpc {
+                    code: -28,
+                    message: "Loading block index...".into(),
+                }),
+                "getblockheader" if self.reworded.contains(&hash) => Err(AppError::Rpc {
+                    code: -5,
+                    message: "No such block".into(),
+                }),
                 "getblockheader" if self.unknown.contains(&hash) => Err(AppError::Rpc {
                     code: -5,
                     message: "Block not found".into(),
@@ -538,6 +566,29 @@ mod tests {
             "the dead branch was touched while B was unanswered"
         );
         assert!(node.invalidated().is_empty(), "nothing was refused");
+    }
+
+    /// An error that IS an engine answer, but not "not found", is no answer
+    /// about the header either: the warm-up refusal (-28) every method returns
+    /// while the node starts. It holds the dead branch back like a timeout.
+    #[tokio::test]
+    async fn a_warming_node_holds_the_dead_branch_back() {
+        let node = PerHashNode::new(&[], &[]).warming(&[B]);
+        let got = refuse_held(&node).await;
+        assert!(matches!(got[0].1, Refusal::Failed(_)), "{got:?}");
+        assert_eq!(got[1].1, Refusal::Waiting);
+        assert!(node.invalidated().is_empty(), "nothing was refused");
+    }
+
+    /// The engine's code for a header it never saw is what counts, not its
+    /// wording: a later engine that rewords "Block not found" must not strand
+    /// every node that never heard of B on the dead branch.
+    #[tokio::test]
+    async fn not_found_is_the_code_not_the_words() {
+        let node = PerHashNode::new(&[], &[]).reworded(&[B]);
+        let got = refuse_held(&node).await;
+        assert_eq!(got[0].1, Refusal::NotKnownYet);
+        assert_eq!(got[1].1, Refusal::Refused);
     }
 
     /// A lift the node does not answer for is a failure, asked again, not a
