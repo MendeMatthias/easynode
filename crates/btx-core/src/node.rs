@@ -1944,21 +1944,6 @@ pub fn apply_start_choice(
     )
 }
 
-/// Does this node run on a signed snapshot? True while the engine's record of
-/// the snapshot's signed manifest is under `chainstate_snapshot/`
-/// ([`attested_snapshot_record`]; the decision of 2026-09-29, "every node
-/// starts near the tip", section 8).
-///
-/// The record outlives the background check of the older history by one
-/// start. It stays under `chainstate_snapshot/` until the first start after
-/// that check finishes, and that start moves it with the folder to
-/// `chainstate/`, where it no longer counts. So this says "signed", not
-/// "still being checked": for that, ask the engine
-/// (`node_api::HistoryProgress::unchecked`).
-pub fn on_signed_snapshot(datadir: &Path) -> bool {
-    attested_snapshot_record(datadir).exists()
-}
-
 /// Whether THIS launch should run as a trusted mirror.
 ///
 /// `trusted_mirror_enabled` answers the static question ("is this a host class
@@ -5027,30 +5012,6 @@ consensus-validator service.";
         assert!(serde_json::from_value::<StartChoice>(serde_json::json!("fast")).is_err());
         let none: Option<StartChoice> = serde_json::from_value(serde_json::Value::Null).unwrap();
         assert_eq!(none, None);
-    }
-
-    /// The engine keeps a signed snapshot's manifest beside the snapshot's
-    /// chain state until the first start after the background check, which
-    /// moves it to `chainstate/`, where it no longer counts.
-    #[test]
-    fn a_signed_snapshot_is_read_from_the_engines_own_file() {
-        let tmp = tempfile::tempdir().expect("temp datadir");
-        let dir = tmp.path();
-        assert!(!on_signed_snapshot(dir));
-        std::fs::create_dir_all(dir.join("chainstate_snapshot")).unwrap();
-        assert!(!on_signed_snapshot(dir), "an unsigned snapshot is not one");
-        std::fs::write(
-            dir.join("chainstate_snapshot").join("attested_assumeutxo"),
-            b"x",
-        )
-        .unwrap();
-        assert!(on_signed_snapshot(dir));
-        assert!(attested_snapshot_record(dir).exists(), "the one record");
-
-        // The first start after the check: the folder becomes chainstate/.
-        std::fs::rename(dir.join("chainstate_snapshot"), dir.join("chainstate")).unwrap();
-        assert!(dir.join("chainstate").join("attested_assumeutxo").exists());
-        assert!(!on_signed_snapshot(dir), "a retired snapshot's record");
     }
 
     /// A non-Metal host is a mirror on the static rule alone, with or without
