@@ -322,6 +322,11 @@ describe("the Last check line", () => {
     expect(plainOutcome("install-failed", "manual: deb", "e.com")).toBe(
       "an update couldn't install — get it from e.com",
     );
+    // The hand-install branch (update_binding declined the offer) falls back
+    // the same way when the notice carries no version.
+    expect(plainOutcome("check-failed", "automatic: install it by hand", "e.com")).toBe(
+      "an update is out, install it by hand from e.com",
+    );
   });
 
   it("shows a word this build does not know rather than hiding it", () => {
@@ -628,7 +633,7 @@ describe("updateCheck() keeps a failed install from downloading again, and a pre
     expect(paint).toContain("setUpdateResult(");
   });
 
-  it("calls only commands the backend registers", () => {
+  it("invokes these four commands, each registered in lib.rs", () => {
     for (const name of [
       "record_update_check",
       "remember_failed_update",
