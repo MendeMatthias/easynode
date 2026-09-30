@@ -4692,10 +4692,10 @@ pub async fn open_data_folder() -> Result<String, String> {
 }
 
 /// Settings: serve historical attestations back to the network
-/// (`matmulattestationserve=1` — ~208 bytes/block, protocol-rate-limited, and
+/// (`matmulattestationserve=1`: ~208 bytes/block, protocol-rate-limited, and
 /// the scarcest service on today's network). Persists the choice and asserts
 /// or removes the conf key EXPLICITLY: this toggle is the ONE place the key
-/// is ever removed — the start path only adds or adopts, so an operator's
+/// is ever removed; the start path only adds or adopts, so an operator's
 /// hand-set flag survives every start (it used to be deleted on each one).
 /// btxd reads the flag at startup, so a change applies on the next (re)start.
 #[tauri::command]
@@ -4763,7 +4763,7 @@ pub async fn set_signer_publish(state: State<'_, AppState>, on: bool) -> Result<
     *state.signer_offer.lock().await = None;
     Ok(
         "Your node will stop offering its key. It keeps signing, and any mirror that already \
-         pinned the key keeps following it — that copy lives in their configuration, not here."
+         pinned the key keeps following it; that copy lives in their configuration, not here."
             .to_string(),
     )
 }
@@ -4815,13 +4815,13 @@ pub fn conf_nickname(setting: &str) -> Option<String> {
 /// Set (or clear) the public nickname other nodes see.
 ///
 /// Writes `uacomment` into the conf and persists the choice. It applies at the
-/// next node start, like every other conf-level setting — btxd builds its user
+/// next node start, like every other conf-level setting: btxd builds its user
 /// agent once at init and there is no RPC to change it live.
 ///
 /// Returns the CLEANED value so the settings box can show what was actually
 /// stored: outer whitespace trimmed, inner runs collapsed. An invalid nickname
-/// is refused with a sentence the UI can print verbatim, and nothing is written
-/// — which matters more than usual here, because btxd fails to start on a
+/// is refused with a sentence the UI can print verbatim, and nothing is written,
+/// which matters more than usual here, because btxd fails to start on a
 /// comment it rejects, so a bad value would turn a cosmetic setting into a node
 /// that will not come back up.
 #[tauri::command]
@@ -4860,7 +4860,7 @@ pub async fn set_node_nickname(name: String) -> Result<String, String> {
 ///
 /// ⚠ Why this exists at all. `service_report_enabled` has been read on every
 /// refresher tick since it was added and written by nothing, so the report
-/// could not be turned on — the branch ran, looked complete, and was
+/// could not be turned on: the branch ran, looked complete, and was
 /// unreachable. That is worse than either shipping the feature or deleting it,
 /// because it reads as done. This is the "expose it" half of that choice.
 #[tauri::command]

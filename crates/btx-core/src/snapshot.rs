@@ -891,7 +891,7 @@ async fn after_compiled_load(
         }
         LoadOutcome::Superseded => {
             eprintln!("[snapshot] snapshot already superseded by active chain; continuing");
-            // Active chain already past the snapshot — snapshot.dat is
+            // Active chain already past the snapshot, so snapshot.dat is
             // safe to drop on the next reclaim, exactly as if it had
             // been loaded into the snapshot chainstate.
             flags.mark_loaded();
@@ -948,7 +948,7 @@ async fn compiled_loaded(
     anchor_height: u64,
     flags: &dyn SnapshotFlags,
 ) -> SnapshotOutcome {
-    // C3: persist loaded=true ONLY here — on a confirmed successful
+    // C3: persist loaded=true ONLY here: on a confirmed successful
     // loadtxoutset. `disk::reclaim_disk` gates deleting snapshot.dat
     // on this flag AND the shared cross-process marker.
     flags.mark_loaded();
@@ -1116,7 +1116,7 @@ async fn wait_for_headers(rpc: &RpcClient, datadir: &Path, target: u64) -> bool 
 pub enum LoadOutcome {
     Loaded,
     /// "Work does not exceed active chainstate": a peer already advanced the
-    /// chain past the snapshot — that's success, not error. The engine says
+    /// chain past the snapshot: that's success, not error. The engine says
     /// it before the load and again, in lowercase, after the snapshot is
     /// populated (v0.34.9 `validation.cpp:17704`); both are this.
     Superseded,
