@@ -2093,7 +2093,40 @@ pub fn rw_conf_pins(rw_conf: &Path) -> Vec<String> {
     pins_read(rw_conf, true)
 }
 
+/// The engine's `InterpretBool` (`common/args.cpp:65-70` at `84b998b4`): an
+/// empty value reads true; otherwise it is the value's leading integer,
+/// atoi-style (non-numeric text reads as 0), compared to zero.
+fn interpret_bool(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    let value = value.trim_start();
+    let end = value
+        .char_indices()
+        .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
+        .map_or(value.len(), |(i, _)| i);
+    value[..end].parse::<i64>().unwrap_or(0) != 0
+}
+
 /// The two readers' one parser. `sections_dropped`: every section counts.
+///
+/// Negation follows the engine's `InterpretValue` (`common/args.cpp:113-
+/// 128` at `84b998b4`, reached for every conf line through
+/// `InterpretKey` and `ReadConfigStream`, `common/config.cpp:102-106`):
+/// `nomatmultrustedpubkey=`, with an empty value or one that reads true
+/// per [`interpret_bool`] (so a bare `nomatmultrustedpubkey=1` and, on the
+/// engine's command line, a bare `-nomatmultrustedpubkey`, though a conf
+/// file itself requires the `=`), clears every pin read from this file so
+/// far, at that point in it; `nomatmultrustedpubkey=0` is the documented
+/// double negative and does not clear. This is scoped to one file: the
+/// engine actually merges list settings across sources in the order
+/// forced settings, the command line, `btx_rw.conf`
+/// (`Source::CONFIG_FILE_RW`), then a conf file's `[main]` section and
+/// default section (`common/settings.cpp:24-31,42-70`, `GetSettingsList`
+/// at `216-262`), each with its own such clearing and a "zombie" rule that
+/// can revive a lower-priority source; this app only needs each file's own
+/// surviving pins, to avoid asking the engine to pin one twice, so it does
+/// not model that cross-source revival.
 fn pins_read(conf: &Path, sections_dropped: bool) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(conf) else {
         return Vec::new();
@@ -2115,9 +2148,14 @@ fn pins_read(conf: &Path, sections_dropped: bool) -> Vec<String> {
             None => (None, full.as_str()),
         };
         let mainnet_reads = sections_dropped || matches!(section, None | Some("main"));
+        if !mainnet_reads {
+            continue;
+        }
         let value = value.trim();
-        if mainnet_reads && key == "matmultrustedpubkey" && !value.is_empty() {
+        if key == "matmultrustedpubkey" && !value.is_empty() {
             pins.push(value.to_ascii_lowercase());
+        } else if key == "nomatmultrustedpubkey" && interpret_bool(value) {
+            pins.clear();
         }
     }
     pins
@@ -6870,6 +6908,98 @@ matmul: metal runtime_probe_ok, selecting metal\n\
             vec![k(1), k(3), k(5), k(6), k(7), k(8)],
             "btx_rw.conf: the section is dropped"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The engine reads `nomatmultrustedpubkey=1` (and, on the command
+    /// line only, a bare `-nomatmultrustedpubkey`) as clearing the pins
+    /// read so far at that point (`InterpretValue`, `common/args.cpp:113-
+    /// 128` at `84b998b4`, called for every conf line by
+    /// `ReadConfigStream`, `common/config.cpp:98-106`). `nomatmultrustedpubkey=0`
+    /// is the documented double negative and does NOT clear
+    /// (`InterpretValue`'s `value && !InterpretBool(*value)` arm). A
+    /// negation under `[test]` or `test.` does not touch mainnet's list,
+    /// same as a pin there is not read; one under `[main]` or `main.`
+    /// does, same as the section tests above.
+    #[test]
+    fn a_no_line_clears_the_pins_read_so_far_in_that_file() {
+        let dir = signed_snapshot_datadir("conf-pins-negation");
+        let k = |n: u8| format!("02{}", format!("{n:02x}").repeat(32));
+        let conf = dir.join("negation.conf");
+
+        // A pin, then nomatmultrustedpubkey=1, then another pin: only the
+        // last pin survives.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\nnomatmultrustedpubkey=1\nmatmultrustedpubkey={}\n",
+                k(1),
+                k(2)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(2)]);
+
+        // nomatmultrustedpubkey=0 is the double negative: it does not clear.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\nnomatmultrustedpubkey=0\nmatmultrustedpubkey={}\n",
+                k(1),
+                k(2)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(1), k(2)]);
+
+        // A bare no-value line is also a clear, same as =1.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\nnomatmultrustedpubkey=\nmatmultrustedpubkey={}\n",
+                k(3),
+                k(4)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(4)]);
+
+        // Inside [main]: a pin, a clear, another pin, same rule.
+        std::fs::write(
+            &conf,
+            format!(
+                "[main]\nmatmultrustedpubkey={}\nnomatmultrustedpubkey=1\nmatmultrustedpubkey={}\n",
+                k(5),
+                k(6)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(6)]);
+
+        // A clear under [test] does not touch mainnet's list.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\n[test]\nnomatmultrustedpubkey=1\nmatmultrustedpubkey={}\n",
+                k(7),
+                k(8)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(7)], "the [test] clear stays there");
+
+        // btx_rw.conf drops sections, so a clear there is read wherever it sits.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\n[test]\nnomatmultrustedpubkey=1\nmatmultrustedpubkey={}\n",
+                k(9),
+                k(1)
+            ),
+        )
+        .unwrap();
+        assert_eq!(rw_conf_pins(&conf), vec![k(1)]);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
