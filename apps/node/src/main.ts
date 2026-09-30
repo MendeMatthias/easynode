@@ -26,6 +26,7 @@ import { type HistoryCheck, historyCheckView } from "./history-check";
 import {
   NO_GPU_REASON,
   type StartChoice,
+  announcer,
   chipNoticeVisible,
   setupArgs,
   startChoiceView,
@@ -1781,6 +1782,8 @@ function reflectHistoryCheck(status: NodeStatusInfo): void {
  *  tag; where storage is unavailable it still closes for this run. */
 const CHIP_NOTICE_KEY = "ebtx-node.chip-notice-seen";
 let chipNoticeClosed = false;
+/** The always-present live region that says the notice, then lets it go. */
+const announceChip = announcer($("chip-announce"));
 
 function reflectChipNotice(status: NodeStatusInfo): void {
   let seen: string | null = null;
@@ -1794,9 +1797,10 @@ function reflectChipNotice(status: NodeStatusInfo): void {
     !chipNoticeClosed &&
     chipNoticeVisible(status.chip_refused, status.rc_trusted_mirror, seen, status.node_tag);
   // Spoken through the region that is always there, once, as the notice
-  // appears: a poll that rewrote the same text could repeat it.
-  if (shown && card.hidden) $("chip-announce").textContent = $("chip-msg").textContent;
-  if (!shown) $("chip-announce").textContent = "";
+  // appears (a poll that rewrote the same text could repeat it), and cleared
+  // a few seconds later, since the card still shows it.
+  if (shown && card.hidden) announceChip($("chip-msg").textContent ?? "");
+  if (!shown && $("chip-announce").textContent) announceChip("");
   card.hidden = !shown;
 }
 
@@ -1833,7 +1837,7 @@ $("chip-ok").addEventListener("click", () => {
   // focuses a clicked button): hiding it would drop focus to the page.
   const next = card.contains(document.activeElement) ? focusTargetAfter(card, screenStatus) : null;
   card.hidden = true;
-  $("chip-announce").textContent = "";
+  announceChip("");
   next?.focus();
 });
 

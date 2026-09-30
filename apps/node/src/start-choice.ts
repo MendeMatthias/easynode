@@ -58,3 +58,27 @@ export function chipNoticeVisible(
 ): boolean {
   return chipRefused && followsSignatures && seenForTag !== tag;
 }
+
+/** How long the hidden live region holds the chip notice's text: long enough
+ *  for a screen reader to pick it up, short enough that one reading the page
+ *  afterwards meets the sentence once, in the card. */
+export const ANNOUNCE_HOLD_MS = 5_000;
+
+/** Say `text` through a live region, then clear it after `holdMs`. Empty text
+ *  clears it at once; a new text restarts the hold. `region` is the element
+ *  (main.ts #chip-announce), anything with a `textContent` in tests. */
+export function announcer(
+  region: { textContent: string | null },
+  holdMs: number = ANNOUNCE_HOLD_MS,
+): (text: string) => void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return (text) => {
+    clearTimeout(timer);
+    region.textContent = text;
+    if (text) {
+      timer = setTimeout(() => {
+        region.textContent = "";
+      }, holdMs);
+    }
+  };
+}

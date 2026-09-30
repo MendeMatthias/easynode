@@ -1,7 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import {
+  ANNOUNCE_HOLD_MS,
   NO_GPU_REASON,
+  announcer,
   chipNoticeVisible,
   setupArgs,
   startChoiceView,
@@ -120,6 +122,49 @@ describe("the setup screen and the chip notice for a screen reader", () => {
     // The card shows and hides; it is not a live region itself, so the
     // sentence is not said twice.
     expect(tagOf("chip-card")).not.toContain('role="status"');
+  });
+});
+
+describe("announcer", () => {
+  // The hidden live region says the chip notice, then lets it go: the card
+  // still shows the sentence, and a screen reader reading the page should
+  // meet it once.
+  it("holds the text a few seconds, then clears it", () => {
+    vi.useFakeTimers();
+    try {
+      const region = { textContent: "" as string | null };
+      const say = announcer(region);
+      say("This Mac's graphics chip didn't pass the engine's check.");
+      expect(region.textContent).toBe("This Mac's graphics chip didn't pass the engine's check.");
+      vi.advanceTimersByTime(ANNOUNCE_HOLD_MS - 1);
+      expect(region.textContent).toBe("This Mac's graphics chip didn't pass the engine's check.");
+      vi.advanceTimersByTime(1);
+      expect(region.textContent).toBe("");
+      expect(ANNOUNCE_HOLD_MS).toBeGreaterThanOrEqual(3_000);
+      expect(ANNOUNCE_HOLD_MS).toBeLessThanOrEqual(10_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears at once on empty text, and a new text restarts the hold", () => {
+    vi.useFakeTimers();
+    try {
+      const region = { textContent: "" as string | null };
+      const say = announcer(region, 1_000);
+      say("first");
+      say("");
+      expect(region.textContent).toBe("");
+      say("second");
+      vi.advanceTimersByTime(900);
+      say("third");
+      vi.advanceTimersByTime(900);
+      expect(region.textContent).toBe("third");
+      vi.advanceTimersByTime(100);
+      expect(region.textContent).toBe("");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
