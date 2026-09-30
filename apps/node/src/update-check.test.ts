@@ -22,8 +22,12 @@ import {
   classifyCheckFailure,
   checkFailureMessage,
   describeWhen,
+  handInstallBanner,
+  handInstallNotice,
+  HAND_INSTALL_MARK,
   installErrorFromDetail,
   lastCheckLine,
+  noUpdateMessage,
   plainOutcome,
   updateCheckRecord,
   UPDATE_CHECK_OUTCOMES,
@@ -449,6 +453,190 @@ describe("installErrorFromDetail", () => {
       "",
     ]) {
       expect(installErrorFromDetail(d)).toBe(d);
+    }
+  });
+});
+
+// ── An update this copy will not download on its own ─────────────────────────
+// update_binding.rs declines two offers before anything is downloaded: a .deb
+// copy offered only the AppImage, and, on an automatic check, a version whose
+// install already failed here. Its notices are the strings below, verbatim
+// (update_binding.rs pins the same text in its own tests).
+
+const DEB_NOTICE =
+  "v0.6.34 is out. This copy came from a .deb, so install it by hand: " +
+  "get the .deb from easybtx.com/node and run sudo apt install ./BTX-Node_0.6.34_amd64.deb";
+const FAILED_NOTICE =
+  "v0.6.34 failed to install here, so it is not downloaded again. " +
+  "Press Check now to try again, or install it by hand from easybtx.com/node";
+const REFUSED = "refused v0.9.0: its linux-x86_64 build is signed as X, not Y";
+
+describe("an update this copy will not download on its own", () => {
+  it("is found by the same phrase in TypeScript and in Rust", () => {
+    const src = read("../src-tauri/src/update_binding.rs");
+    const m = /HAND_INSTALL_MARK: &str = "([^"]+)"/.exec(src);
+    expect(m, "HAND_INSTALL_MARK in update_binding.rs").not.toBeNull();
+    expect(HAND_INSTALL_MARK).toBe(m![1]);
+  });
+
+  it("reads a notice from a refusal or from a recorded detail", () => {
+    expect(handInstallNotice(DEB_NOTICE)).toBe(DEB_NOTICE);
+    expect(handInstallNotice(`automatic: ${DEB_NOTICE}`)).toBe(DEB_NOTICE);
+    expect(handInstallNotice(`manual: ${FAILED_NOTICE}`)).toBe(FAILED_NOTICE);
+    // A refused feed and an ordinary detail are not notices.
+    expect(handInstallNotice(REFUSED)).toBeNull();
+    expect(handInstallNotice(`automatic: ${REFUSED}`)).toBeNull();
+    expect(handInstallNotice("automatic: v0.6.33 is current")).toBeNull();
+    expect(handInstallNotice("")).toBeNull();
+  });
+
+  it("puts the version in the banner and sends the reader to Settings", () => {
+    expect(handInstallBanner(DEB_NOTICE)).toEqual({
+      head: "v0.6.34 is out.",
+      tail: "Install it by hand, the steps are in Settings.",
+    });
+    expect(handInstallBanner("install it by hand").head).toBe("An update is out.");
+  });
+
+  it("never says 'latest version' after a pressed check that was declined or refused", () => {
+    expect(noUpdateMessage(null, "0.6.33", "easybtx.com/node")).toBe(
+      "You're on the latest version (v0.6.33).",
+    );
+    expect(noUpdateMessage(null, "", "easybtx.com/node")).toBe("You're on the latest version.");
+    // A notice is written for people already, and it carries the command.
+    expect(noUpdateMessage(DEB_NOTICE, "0.6.33", "easybtx.com/node")).toBe(DEB_NOTICE);
+    const refused = noUpdateMessage(REFUSED, "0.6.33", "easybtx.com/node");
+    expect(refused).not.toMatch(/latest version/);
+    expect(refused).toContain(REFUSED);
+    expect(refused).toContain("easybtx.com/node");
+    expect(noUpdateMessage("x".repeat(500), "0.6.33", "e.com").length).toBeLessThan(260);
+  });
+
+  it("shows the Last check line in plain words, with the version", () => {
+    const now = new Date(2026, 8, 29, 16, 30);
+    const at = new Date(2026, 8, 29, 14, 3).toISOString();
+    for (const notice of [DEB_NOTICE, FAILED_NOTICE]) {
+      expect(
+        lastCheckLine(
+          { at, outcome: "check-failed", detail: `automatic: ${notice}` },
+          now,
+          "easybtx.com/node",
+        ),
+      ).toBe("Last check: today 14:03 — v0.6.34 is out, install it by hand from easybtx.com/node");
+    }
+    // A refusal still reads as a failed check.
+    expect(plainOutcome("check-failed", `automatic: ${REFUSED}`, "e")).toBe("couldn't check");
+  });
+
+  it("adds no em-dash of its own", () => {
+    for (const text of [
+      handInstallBanner(DEB_NOTICE).head,
+      handInstallBanner(DEB_NOTICE).tail,
+      noUpdateMessage(REFUSED, "0.6.33", "easybtx.com/node"),
+      plainOutcome("check-failed", DEB_NOTICE, "easybtx.com/node"),
+    ]) {
+      expect(text).not.toContain("—");
+    }
+  });
+});
+
+// ── main.ts: the failed version, the declined offer, and "Check now" ─────────
+// Read from main.ts, the way the tests above read it: updateCheck() is a thin
+// Tauri veneer that cannot run under vitest, but its order can be pinned.
+
+describe("updateCheck() keeps a failed install from downloading again, and a press still tries", () => {
+  const main = read("./main.ts");
+  const lib = read("../src-tauri/src/lib.rs");
+  const fn = (name: string) => {
+    const s = main.indexOf(`function ${name}(`);
+    expect(s, `function ${name} in main.ts`).toBeGreaterThan(-1);
+    return main.slice(s, main.indexOf("\n}\n", s));
+  };
+  const body = fn("updateCheck");
+
+  it("clears the failed version before a pressed check, and only then", () => {
+    const forget = body.indexOf('invoke("forget_failed_update")');
+    expect(forget).toBeGreaterThan(-1);
+    expect(forget).toBeLessThan(body.indexOf("await checkForUpdate()"));
+    expect(body.slice(0, forget)).toMatch(/if \(manual\) \{\s*await $/);
+  });
+
+  it("never lets clearing the failed version or reading the refusal end a press in silence", () => {
+    // Without the catch a failing forget rejects updateCheck(), and a press
+    // ends with nothing on screen. Each failure is a console warning instead.
+    expect(body).toMatch(
+      /await invoke\("forget_failed_update"\)\.catch\(\(e\) =>\s*console\.warn\("update-check: could not clear the failed version", e\),?\s*\);/,
+    );
+    expect(fn("peekUpdateRefusal")).toMatch(
+      /invoke<string \| null>\("peek_update_refusal"\)\.catch\(\(e\) => \{\s*console\.warn\("update-check: could not read the refusal", e\);\s*return null;\s*\}\);/,
+    );
+  });
+
+  it("downloads, then installs, and remembers a version only when the install failed", () => {
+    expect(body).not.toContain("downloadAndInstall(");
+    const download = body.indexOf("await update.download()");
+    const downloaded = body.indexOf("downloaded = true;");
+    const install = body.indexOf("await update.install()");
+    const remember = body.indexOf('invoke("remember_failed_update"');
+    expect(download).toBeGreaterThan(-1);
+    expect(download < downloaded && downloaded < install && install < remember).toBe(true);
+    expect(body.slice(install, remember)).toMatch(/if \(downloaded\) \{\s*void $/);
+  });
+
+  it("records what it found before it downloads, which keeps the six-hourly timer away", () => {
+    // update_timer.rs skips a tick while the last record is a `found` under
+    // an hour old, so a launch check or a press waiting in a .deb's password
+    // prompt is not raced by a second download and a second prompt.
+    const found = body.indexOf('branch: "found"');
+    expect(found).toBeGreaterThan(-1);
+    expect(found).toBeLessThan(body.indexOf("await update.download()"));
+    const timer = read("../src-tauri/src/update_timer.rs");
+    expect(timer).toContain('if last_outcome != Some("found")');
+  });
+
+  it("frees the downloaded package when the download or the install fails", () => {
+    // The plugin frees the package (150-470 MB) only after an install that
+    // succeeded. Without the close, every failed launch check or press holds
+    // it in memory until the app quits.
+    const install = body.indexOf("await update.install()");
+    const caught = body.indexOf("} catch (e) {", install);
+    expect(caught).toBeGreaterThan(install);
+    const failed = body.slice(caught, body.indexOf("return;", caught));
+    expect(failed).toMatch(/void update\.close\(\)\.catch\(/);
+    // And the calls around it keep their order: remember, paint, record.
+    const remember = failed.indexOf('invoke("remember_failed_update"');
+    const paint = failed.indexOf('paintUpdateProgress("install-failed"');
+    const record = failed.indexOf('branch: "install-failed"');
+    expect(remember, "remember inside the catch").toBeGreaterThan(-1);
+    expect(remember, "remember before paint").toBeLessThan(paint);
+    expect(paint, "paint before record").toBeLessThan(record);
+  });
+
+  it("reads why an offer was declined before the record takes it, and shows it", () => {
+    const peek = body.indexOf("await peekUpdateRefusal()");
+    expect(peek).toBeGreaterThan(-1);
+    expect(peek).toBeLessThan(body.indexOf('branch: "no-update"'));
+    expect(body).toContain("paintHandInstall(declined");
+    expect(body).toContain("noUpdateMessage(declined, appVersion, MANUAL_DOWNLOAD)");
+  });
+
+  it("shows a notice from the six-hourly timer the same way", () => {
+    expect(fn("onUpdateCheckEvent")).toContain("paintHandInstall(ev.detail)");
+    const paint = fn("paintHandInstall");
+    expect(paint).toContain("handInstallNotice(");
+    expect(paint).toContain("showUpdateBanner(");
+    expect(paint).toContain("setUpdateResult(");
+  });
+
+  it("calls only commands the backend registers", () => {
+    for (const name of [
+      "record_update_check",
+      "remember_failed_update",
+      "forget_failed_update",
+      "peek_update_refusal",
+    ]) {
+      expect(main, name).toMatch(new RegExp(`invoke(<[^>]*>)?\\("${name}"`));
+      expect(lib, name).toContain(`commands::${name},`);
     }
   });
 });

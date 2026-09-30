@@ -274,6 +274,15 @@ pub struct NodeAppSettings {
     /// first launch that records it; never a pre-release.
     #[serde(default)]
     pub update_high_water: Option<String>,
+    /// A version whose verified download then failed to install here: a .deb
+    /// copy whose password prompt was cancelled or could not be shown, an
+    /// install that `dpkg` or the AppImage swap refused. The automatic checks
+    /// do not download it again (`update_binding::decide_here`), so a machine
+    /// that cannot install it does not fetch it every six hours; "Check now"
+    /// clears it first and tries. `None` until an install fails; a newer
+    /// release is a different version and is offered as usual.
+    #[serde(default)]
+    pub update_install_failed: Option<String>,
 }
 
 fn default_on_close() -> String {
@@ -340,6 +349,7 @@ impl Default for NodeAppSettings {
             last_update_check_outcome: None,
             last_update_check_detail: String::new(),
             update_high_water: None,
+            update_install_failed: None,
         }
     }
 }
