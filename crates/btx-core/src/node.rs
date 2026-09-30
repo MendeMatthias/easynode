@@ -1226,8 +1226,17 @@ pub fn build_node_command(
         // or the engine's start-up check of the stored manifest refuses to
         // start it (section 8 of the confirmed-snapshot decision). In
         // consensus mode they are telemetry: they skip no check.
+        //
+        // btxd loads the datadir's own btx_rw.conf on every start regardless
+        // of -conf, and MERGES its list settings with the command line
+        // (common/config.cpp, common/settings.cpp GetSettingsList), so a key
+        // already pinned THERE must count as already pinned here too: the
+        // mirror-era app left a single signer pin in btx_rw.conf on much of
+        // the fleet, and pushing that same key again gets the engine's
+        // "Duplicate -matmultrustedpubkey" refusal at init.
         if !mirror_here {
             let mut already = conf_pins(conf);
+            already.extend(conf_pins(&datadir.join("btx_rw.conf")));
             already.extend(signing_key_self_pin(conf, datadir));
             args.extend(validating_snapshot_pin_args(
                 datadir,
@@ -1942,25 +1951,35 @@ pub fn signing_key_self_pin(conf: &Path, datadir: &Path) -> Option<String> {
     };
     let wif = std::fs::read_to_string(key_path).ok()?;
     let pubkey = crate::signer::wif_to_pubkey_hex(&wif).ok()?;
-    let already_pinned = std::fs::read_to_string(conf).ok().is_some_and(|text| {
-        text.lines().any(|l| {
-            l.trim()
-                .strip_prefix("matmultrustedpubkey=")
-                .is_some_and(|v| v.trim().eq_ignore_ascii_case(&pubkey))
-        })
-    });
+    let already_pinned = conf_pins(conf)
+        .iter()
+        .any(|v| v.eq_ignore_ascii_case(&pubkey));
     (!already_pinned).then_some(pubkey)
 }
 
-/// Every key the conf already pins (`matmultrustedpubkey=`), lowercase. The
+/// Every key `conf` already pins (`matmultrustedpubkey=`), lowercase. The
 /// engine refuses a duplicate pin, so the command line never repeats one.
+///
+/// Parses the way the engine's own conf reader does (`common/config.cpp`
+/// ~42-60, v0.34.9 at `84b998b4`): a line is cut at the first `#`, then split
+/// at the first `=`, both halves trimmed. The bare name and the `main.`
+/// section prefix both count, matching how btxd reads a flat conf for the
+/// mainnet section. `includeconf` is not followed: a pin listed only through
+/// an included file is not seen here.
 pub fn conf_pins(conf: &Path) -> Vec<String> {
     std::fs::read_to_string(conf)
         .map(|text| {
             text.lines()
-                .filter_map(|l| l.trim().strip_prefix("matmultrustedpubkey="))
-                .map(|v| v.trim().to_ascii_lowercase())
-                .filter(|v| !v.is_empty())
+                .filter_map(|l| {
+                    let l = l.split('#').next().unwrap_or("");
+                    let (name, value) = l.split_once('=')?;
+                    let name = name.trim();
+                    if name != "matmultrustedpubkey" && name != "main.matmultrustedpubkey" {
+                        return None;
+                    }
+                    let value = value.trim();
+                    (!value.is_empty()).then(|| value.to_ascii_lowercase())
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -1968,8 +1987,19 @@ pub fn conf_pins(conf: &Path) -> Vec<String> {
 
 /// The engine's record that this node runs on a signed snapshot whose
 /// background check has not finished (`SNAPSHOT_ATTESTED_ASSUMEUTXO_FILENAME`,
-/// v0.34.9 `src/node/utxo_snapshot.h:254`). It goes away when the engine
-/// retires the snapshot. `network_dir` is the datadir on mainnet.
+/// v0.34.9 `src/node/utxo_snapshot.h:254`). `network_dir` is the datadir on
+/// mainnet.
+///
+/// It does not simply vanish when the check finishes: the file stays right
+/// here, under `chainstate_snapshot/`, until the first start AFTER the
+/// background check completes (that start still re-checks the stored
+/// manifest, pins and all). On THAT start the engine renames
+/// `chainstate_snapshot/` to `chainstate/`, and this file rides along,
+/// unread, at `chainstate/attested_assumeutxo`; an invalid snapshot's folder
+/// becomes `chainstate_snapshot_INVALID` instead. Only the copy still under
+/// `chainstate_snapshot/` means "this node is on a signed snapshot"; this
+/// function is that check, nothing under `chainstate/` or
+/// `chainstate_snapshot_INVALID/` counts.
 pub fn attested_snapshot_record(network_dir: &Path) -> PathBuf {
     network_dir
         .join("chainstate_snapshot")
@@ -6335,6 +6365,102 @@ matmul: metal runtime_probe_ok, selecting metal\n\
                 .count(),
             1
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mirror-era app left a single signer pin in `btx_rw.conf` on much
+    /// of the fleet (`disk::remove_node_data` keeps that file). btxd loads it
+    /// on every start regardless of `-conf` and MERGES its list settings with
+    /// the command line, so a key already there must count as "already
+    /// pinned" or the engine refuses at init with "Duplicate
+    /// -matmultrustedpubkey" (`init.cpp:1591-1597`, `common/settings.cpp
+    /// GetSettingsList`, measured at `84b998b4`).
+    #[test]
+    fn a_key_btx_rw_conf_already_pins_is_not_repeated() {
+        let dir = signed_snapshot_datadir("pin-rw-conf");
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        let leftover = BTX_TRUSTED_ATTESTATION_PUBKEYS[0];
+        std::fs::write(
+            dir.join("btx_rw.conf"),
+            format!("matmultrustedpubkey={leftover}\n"),
+        )
+        .unwrap();
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.9/lin/btxd"),
+            &dir,
+            &conf,
+            Backend::Cuda,
+        );
+        // btxd merges btx_rw.conf's list settings with the command line, so a
+        // key btx_rw.conf already pins must never also be pushed here: doing
+        // so would refuse the engine at init on "Duplicate
+        // -matmultrustedpubkey", not add a redundant pin. The command line
+        // itself never repeats a flag either way, so the check that matters
+        // is absence, not a count of 1.
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == &format!("-matmultrustedpubkey={leftover}")),
+            "leftover already pinned by btx_rw.conf, pushed again: {args:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `conf_pins` reads the way the engine's own conf parser does
+    /// (`common/config.cpp` ~42-60 at `84b998b4`): cut at `#`, split at the
+    /// first `=`, trim both halves, and accept both the bare name and the
+    /// `main.` section prefix.
+    #[test]
+    fn conf_pins_reads_the_engines_syntax_spaces_comments_and_the_main_prefix() {
+        let dir = signed_snapshot_datadir("conf-pins-syntax");
+        let key1 = BTX_TRUSTED_ATTESTATION_PUBKEYS[1];
+        let key2 = BTX_TRUSTED_ATTESTATION_PUBKEYS[2];
+        let conf = dir.join("test.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey = {} # a trailing note\nmain.matmultrustedpubkey={}\n",
+                key1.to_ascii_uppercase(),
+                key2
+            ),
+        )
+        .unwrap();
+        let pins = conf_pins(&conf);
+        assert!(pins.contains(&key1.to_string()), "{pins:?}");
+        assert!(pins.contains(&key2.to_string()), "{pins:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A validating node whose own key happens to be one of the mirrors'
+    /// keys (the 3060's node) must not pin it a second time.
+    ///
+    /// `signing_key_self_pin` needs a real private key on disk, and there is
+    /// no private key on hand for any of `BTX_TRUSTED_ATTESTATION_PUBKEYS`
+    /// (the 3060's is Mende's own, off this machine), so this exercises the
+    /// pure rule directly: `already` holding the node's own key is exactly
+    /// what `signing_key_self_pin` would contribute were it that key.
+    #[test]
+    fn a_signer_whose_own_key_is_a_trusted_pubkey_is_not_pinned_twice() {
+        let dir = signed_snapshot_datadir("pin-self-is-trusted");
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        let the_3060 = BTX_TRUSTED_ATTESTATION_PUBKEYS[3];
+        let got = validating_snapshot_pin_args(
+            &dir,
+            &BTX_TRUSTED_ATTESTATION_PUBKEYS,
+            &[the_3060.to_string()],
+        );
+        let pins: Vec<&String> = got
+            .iter()
+            .filter(|a| a.starts_with("-matmultrustedpubkey="))
+            .collect();
+        assert_eq!(
+            pins.len(),
+            BTX_TRUSTED_ATTESTATION_PUBKEYS.len() - 1,
+            "{got:?}"
+        );
+        assert!(!pins.iter().any(|p| p.ends_with(the_3060)), "{got:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
