@@ -30,12 +30,15 @@ least two of the people on its operator list have signed (today Mende,
 Aleksander and jpp), checks every signature itself, and starts your node there
 instead of thousands of blocks back. A node that checks blocks itself loads it
 in one short extra start, then goes back to checking every new block, and it
-still checks its older history in the background. The node remembers who
+still checks its older history in the background. A node that checks blocks
+itself also lists the signing keys mirrors follow, which it needs to keep
+starting from that snapshot; they never replace its own checks, and it passes
+their signatures on to its peers, as mirrors do. The node remembers who
 confirmed its start point. If there is no such snapshot yet, or the operators
 disagree about one, your node starts from the snapshot easyNode already ships,
-as before. A node that checks blocks itself also trusts the same signing keys
-mirrors do, only so it can keep starting from that snapshot; it still checks
-every block itself.
+at block 225,927. A node that checks blocks itself used to start further back,
+from the one built into the node engine, and now takes easyNode's in the same
+short extra start.
 
 ## [0.6.32] - 2026-09-28
 
