@@ -44,9 +44,10 @@ pub enum WalletFileKind {
     WalletDatBerkeley,
     /// The text file `dumpwallet` writes: a legacy wallet's WIF keys in plain
     /// text. Recognised so it gets its own answer, and never imported. On
-    /// v0.34.9, which easyNode pins from 2026-09-23, `importwallet` refuses
-    /// every file with "BTX PQ policy: importwallet is disabled (legacy WIF);
-    /// use importdescriptors with P2MR". On v0.34.6 it imported only into a
+    /// v0.34.9, which easyNode pinned from 2026-09-23, and on v0.34.12 after
+    /// it (wallet/rpc/backup.cpp:78), `importwallet` refuses every file with
+    /// "BTX PQ policy: importwallet is disabled (legacy WIF); use
+    /// importdescriptors with P2MR". On v0.34.6 it imported only into a
     /// legacy wallet, which easyNode never creates; the one way to have one was
     /// to restore a legacy wallet.dat on Windows, the only engine of ours built
     /// with Berkeley DB.
