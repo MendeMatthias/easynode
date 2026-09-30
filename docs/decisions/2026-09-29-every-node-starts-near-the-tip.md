@@ -651,7 +651,11 @@ a day of the tip instead of at 225,927.
 - Website: `latest` returns nothing, and every node falls back (section 9). A
   dispute does the same on its own.
 - App: the confirmed path, the validating restart and the catch-up help each
-  sit behind one constant. The diary is harmless on its own.
+  sit behind one constant. The diary is harmless on its own. As built, a
+  validating node's one mirror launch is switched off by `MIRROR_LOAD_ENABLED`
+  in the app's start path, the confirmed path by the website's pointer
+  (`latest` answering nothing), and both on one machine by
+  `EASYBTX_NODE_TRUSTED_MIRROR=0`.
 - `btx-confirmer` is its own unit; stopping it stops that operator's
   confirmations and nothing else.
 

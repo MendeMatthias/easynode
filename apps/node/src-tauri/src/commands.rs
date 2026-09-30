@@ -3833,6 +3833,14 @@ fn mirror_load_step(
     }
 }
 
+/// The rollback for a validating node's one mirror launch (the design's
+/// Rollback): `false` and no start begins one, so every validating node
+/// starts from the snapshot compiled into its engine, as before 0.7.0. The
+/// other switches are the website's pointer (`latest` answering nothing:
+/// every node falls back) and, on one machine,
+/// `EASYBTX_NODE_TRUSTED_MIRROR=0`.
+const MIRROR_LOAD_ENABLED: bool = true;
+
 /// [`btx_core::node::mirror_load_wanted`], asked of this datadir, for a fresh
 /// chain only: its first load is still to come
 /// (`NodeAppSettings::first_load_pending`, never set on a datadir that
@@ -3841,11 +3849,13 @@ fn mirror_load_step(
 /// about to get one), it never loaded a snapshot, it holds no snapshot
 /// chainstate (`chainstate_snapshot/`, not the `chainstate/` every node has;
 /// one a set-aside note moves before the launch, [`set_aside_will_move`],
-/// counts as gone), and the operator has not said "never a mirror".
+/// counts as gone), and the operator has not said "never a mirror". Never
+/// while [`MIRROR_LOAD_ENABLED`] is off.
 fn mirror_load_wanted_here(btxd: &Path, datadir: &Path, backend: Backend) -> bool {
     use btx_core::node;
     let settings = NodeAppSettings::load(datadir);
-    settings.first_load_pending
+    MIRROR_LOAD_ENABLED
+        && settings.first_load_pending
         && node::mirror_load_wanted(
             !node::host_follows_signatures(btxd, datadir, backend),
             node::header_bootstrap_pending(datadir) || node::header_bootstrap_wanted(datadir),
@@ -6522,7 +6532,7 @@ mod signed_start_tests {
         set_aside_will_move, settle_first_load, signed_load_failed, signed_load_for,
         signer_for_launch, signing_key_the_app_does_not_manage, snapshot_base,
         write_signer_key_line, AfterLoad, AfterRefusal, AttachedTo, MirrorLoadStep,
-        PREPARE_START_DEADLINE, SET_ASIDE_STUCK,
+        MIRROR_LOAD_ENABLED, PREPARE_START_DEADLINE, SET_ASIDE_STUCK,
     };
     use crate::state::NodeAppSettings;
     use btx_core::attested_snapshot::PairKind;
@@ -7418,6 +7428,21 @@ mod signed_start_tests {
         ] {
             assert!(after.find(call).unwrap() < stop, "{call}");
         }
+    }
+
+    /// Final review M13: the design's rollback for a validating node's
+    /// mirror launch is one constant, shipped on and read where the launch
+    /// is decided, so a release can switch it off without touching the rest.
+    #[test]
+    fn the_mirror_launch_sits_behind_one_constant() {
+        assert!(MIRROR_LOAD_ENABLED, "shipped on");
+        let src = include_str!("commands.rs");
+        let wanted = src
+            .split("\nfn mirror_load_wanted_here(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(wanted.contains("MIRROR_LOAD_ENABLED\n"), "{wanted}");
     }
 
     /// Final review M5: the first validating start waits for its signed
