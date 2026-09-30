@@ -540,14 +540,14 @@ pub async fn tools_diagnostics(
                 .await
                 .ok()
                 .and_then(|v| v.as_str().map(|s| s == h.root));
-            let known = rpc
-                .call("getblockheader", json!([h.root, true]))
-                .await
-                .is_ok();
+            // "Not seen" only on the engine's own answer; a node that did not
+            // answer is reported as such, not as one that never saw the root.
+            let known = btx_core::known_invalid::header_known(rpc, h.root).await;
             let held_state = match (known, on_chain) {
                 (_, Some(true)) => "ON THIS NODE'S CHAIN",
-                (true, _) => "seen, not on this node's chain",
-                (false, _) => "not seen by this node",
+                (Ok(true), _) => "seen, not on this node's chain",
+                (Ok(false), _) => "not seen by this node",
+                (Err(_), _) => "could not ask this node",
             };
             input.held.push(HeldBranchState {
                 height: h.height,
