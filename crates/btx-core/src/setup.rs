@@ -314,6 +314,87 @@ pub fn prune_retired_addnodes_in_conf(conf_path: &Path, keep: &[&str]) -> usize 
     }
 }
 
+/// Remove `addnode=<host>` lines for exactly `remove`, leaving every other
+/// line untouched, byte for byte, including its own line ending. Pure →
+/// testable.
+///
+/// Exists for a narrower job than [`prune_retired_addnodes_str`], which takes
+/// a KEEP list and rewrites everything not in it, and in doing so loses each
+/// surviving line's own line ending, because it splits on
+/// [`str::lines`] (which strips a trailing `\r\n` or `\n`) and rejoins with a
+/// bare `\n`. That is fine for that function's job (converging the conf on
+/// exactly the current shipped census) but wrong for this one: migrating an
+/// old conf off a few specific, named lines (the discovery relays' old
+/// `addnode=` entries) must leave every other line exactly as it was,
+/// CRLF included, whether or not that line happens to be one this build
+/// ships. So this walks the raw text keeping each line's own terminator, and
+/// only drops the ones that match `remove`.
+pub fn remove_addnodes_str(conf: &str, remove: &[&str]) -> String {
+    // Split `conf` into raw chunks, each ending right after its own `\n` (with
+    // any preceding `\r` still attached, i.e. whatever terminator the line
+    // actually had), and the last chunk terminator-less if the file did not
+    // end in a newline. `.trim()` below strips that terminator for the
+    // comparison without touching the chunk itself.
+    let mut chunks: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for (i, b) in conf.bytes().enumerate() {
+        if b == b'\n' {
+            chunks.push(&conf[start..=i]);
+            start = i + 1;
+        }
+    }
+    if start < conf.len() {
+        chunks.push(&conf[start..]);
+    }
+
+    chunks
+        .into_iter()
+        .filter(|raw| {
+            let t = raw.trim();
+            match t.strip_prefix("addnode=") {
+                // Not an addnode line: never our business.
+                None => true,
+                // An addnode line survives unless it names a peer we were
+                // told to remove.
+                Some(peer) => !remove.iter().any(|r| *r == peer.trim()),
+            }
+        })
+        .collect::<String>()
+}
+
+/// Rewrite `conf_path` to drop `addnode=<host>` lines for exactly `remove`.
+/// Returns how many lines were removed, 0 when the file was already correct
+/// or unreadable, and in that case the file is never opened for writing, so
+/// its mtime is untouched along with its content.
+///
+/// Used to migrate a conf written by an earlier version off `addnode=` lines
+/// for peers this build now dials a different way (the discovery relays, as
+/// `-seednode=`, see `node::BTX_DISCOVERY_PEERS`), independent of whatever
+/// the current manual census happens to be.
+pub fn remove_addnodes_in_conf(conf_path: &Path, remove: &[&str]) -> usize {
+    // Hold the conf lock across the WHOLE read-modify-write: reading before
+    // another writer's rename and writing after it is how an edit gets lost.
+    // See `fsx::ConfLock` for what that costs on this file and what the lock
+    // does and does not bind.
+    let _guard = crate::fsx::ConfLock::acquire(conf_path);
+    let Ok(original) = std::fs::read_to_string(conf_path) else {
+        return 0;
+    };
+    let rewritten = remove_addnodes_str(&original, remove);
+    if rewritten == original {
+        return 0;
+    }
+    let removed = original
+        .lines()
+        .count()
+        .saturating_sub(rewritten.lines().count());
+    if crate::fsx::atomic_write(conf_path, rewritten.as_bytes()).is_ok() {
+        removed
+    } else {
+        0
+    }
+}
+
 /// Managed-block markers for the archive noban whitelist. Everything between
 /// them is OWNED by the app and rewritten wholesale on every start.
 pub const WHITELIST_BLOCK_BEGIN: &str =
@@ -743,6 +824,128 @@ mod tests {
         let missing = std::env::temp_dir().join("ebtx-prune-does-not-exist.conf");
         std::fs::remove_file(&missing).ok();
         assert_eq!(super::prune_retired_addnodes_in_conf(&missing, &["a:1"]), 0);
+    }
+
+    // ---- named addnode removal (discovery relays as seed nodes) -----------
+    //
+    // Unlike `prune_retired_addnodes_str` (a KEEP list: anything not in it
+    // goes), this is a REMOVE list: exactly the named hosts go and every
+    // other line, kept or not, is untouched byte for byte, including its own
+    // line ending, which `prune_retired_addnodes_str` does not preserve
+    // (`.lines()` strips CRLF and `.join("\n")` puts LF back on every kept
+    // line). That distinction is the point here: a conf carrying `addnode=`
+    // lines for the discovery relays from an earlier version must lose
+    // exactly those three lines, with everything else (an operator's own
+    // addnode, a comment, a CRLF ending) left exactly as it was.
+
+    #[test]
+    fn remove_addnodes_str_drops_exactly_the_named_lines_and_nothing_else() {
+        let relays = [
+            "node.btx.dev:19335",
+            "node.btxchain.org:19335",
+            "node.btx.tools:19335",
+        ];
+        let conf = "server=1\r\n\
+                     addnode=207.56.229.99:19335\r\n\
+                     addnode=node.btx.dev:19335\r\n\
+                     # addnode=node.btx.dev:19335 kept for the record\r\n\
+                     addnode=node.btxchain.org:19335\r\n\
+                     addnode=node.btx.tools:19335\r\n\
+                     prune=0\r\n";
+        let out = super::remove_addnodes_str(conf, &relays);
+
+        for relay in relays {
+            assert!(
+                !out.lines().any(|l| l.trim() == format!("addnode={relay}")),
+                "{relay} line must be gone from:\n{out}"
+            );
+        }
+        assert!(
+            out.contains("addnode=207.56.229.99:19335\r\n"),
+            "an unrelated addnode line stays, CRLF included: {out:?}"
+        );
+        assert!(
+            out.contains("# addnode=node.btx.dev:19335 kept for the record\r\n"),
+            "a comment mentioning a relay is not configuration: {out:?}"
+        );
+        assert!(out.contains("server=1\r\n") && out.contains("prune=0\r\n"));
+
+        // Byte for byte: every surviving line keeps its OWN line ending. Only
+        // the three removed lines' CRLFs should be gone.
+        let original_crlfs = conf.matches("\r\n").count();
+        let out_crlfs = out.matches("\r\n").count();
+        assert_eq!(
+            out_crlfs,
+            original_crlfs - 3,
+            "a surviving CRLF line must not be flattened to LF: {out:?}"
+        );
+        let bytes = out.as_bytes();
+        assert!(
+            bytes
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b != b'\n' || i.checked_sub(1).map(|j| bytes[j]) == Some(b'\r')),
+            "a bare LF was introduced on a file that only ever used CRLF: {out:?}"
+        );
+    }
+
+    #[test]
+    fn remove_addnodes_str_is_a_no_op_when_nothing_matches() {
+        let conf = "server=1\naddnode=207.56.229.99:19335\n";
+        assert_eq!(
+            super::remove_addnodes_str(conf, &["node.btx.dev:19335"]),
+            conf,
+            "an already-correct conf must come back byte identical"
+        );
+    }
+
+    #[test]
+    fn remove_addnodes_in_conf_does_not_rewrite_when_nothing_matches() {
+        let dir =
+            std::env::temp_dir().join(format!("ebtx-relay-removal-noop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("faststart.conf");
+        let original = "server=1\naddnode=207.56.229.99:19335\n";
+        std::fs::write(&conf, original).unwrap();
+
+        let removed = super::remove_addnodes_in_conf(&conf, &["node.btx.dev:19335"]);
+        assert_eq!(removed, 0);
+        assert_eq!(
+            std::fs::read_to_string(&conf).unwrap(),
+            original,
+            "a conf without the named lines must not be rewritten"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_addnodes_in_conf_drops_the_named_lines_on_disk() {
+        let dir = std::env::temp_dir().join(format!("ebtx-relay-removal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("faststart.conf");
+        std::fs::write(
+            &conf,
+            "server=1\naddnode=node.btx.dev:19335\naddnode=207.56.229.99:19335\n",
+        )
+        .unwrap();
+
+        let removed = super::remove_addnodes_in_conf(&conf, &["node.btx.dev:19335"]);
+        assert_eq!(removed, 1);
+        let out = std::fs::read_to_string(&conf).unwrap();
+        assert!(!out.contains("node.btx.dev"));
+        assert!(out.contains("addnode=207.56.229.99:19335"));
+        assert!(out.contains("server=1"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_addnodes_in_conf_reports_zero_on_a_missing_file() {
+        let missing = std::env::temp_dir().join("ebtx-relay-removal-missing.conf");
+        std::fs::remove_file(&missing).ok();
+        assert_eq!(
+            super::remove_addnodes_in_conf(&missing, &["node.btx.dev:19335"]),
+            0
+        );
     }
 
     use super::*;

@@ -18,7 +18,8 @@ use btx_core::node::{DatadirHolder, NodeController};
 use btx_core::node_api::{get_blockchain_info, get_chainstates};
 use btx_core::rpc::RpcClient;
 use btx_core::setup::{
-    enough_free_disk, ensure_addnodes_in_conf, free_disk_bytes, rpc_url, wait_for_node_rpc,
+    enough_free_disk, ensure_addnodes_in_conf, free_disk_bytes, remove_addnodes_in_conf, rpc_url,
+    wait_for_node_rpc,
 };
 use btx_core::snapshot::SnapshotSpec;
 use btx_core::snapshot_serve as snap;
@@ -761,6 +762,23 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
         }
     }
 
+    // Discovery relays used to be dialled as manual (`-addnode`) peers, and an
+    // earlier version's conf may still carry those lines. They cannot serve a
+    // block. Measured on mainnet 30 September 2026, dialled that way they
+    // held a fresh mirror to one block in 3.5 minutes, and the same node
+    // gained 561 blocks in the following 5.5 minutes once they were removed:
+    // so this build dials them with `-seednode=` instead (`build_node_command`)
+    // and cleans up the stale lines here, ahead of the manual set below, so a
+    // returning conf converges on the new shape rather than keeping both.
+    let removed_relays =
+        remove_addnodes_in_conf(&paths.faststart_conf, btx_core::node::BTX_DISCOVERY_PEERS);
+    if removed_relays > 0 {
+        eprintln!(
+            "[node-app] conf: dropped {removed_relays} discovery-relay addnode line(s) left by \
+             an earlier version; they are dialled with -seednode now"
+        );
+    }
+
     // The manual peer set belongs in the conf on every start (idempotent) so
     // even a hand-started btxd against this datadir reaches the sparse BTX
     // network. It is the SAME set `build_node_command` passes on the CLI —
@@ -777,10 +795,14 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     // was just btxd dropping the tail instead of us. Say which ones out loud,
     // because the list order is now a decision and a decision nobody can see is
     // one nobody revisits.
+    //
+    // Discovery relays are deliberately excluded from this count: they are
+    // not past the cap, they are never manual peers at all (dialled instead
+    // with `-seednode=`, above), so listing them here would call a decision
+    // an eviction.
     let dropped: Vec<&str> = btx_core::node::BTX_BOOTSTRAP_PEERS
         .iter()
         .chain(btx_core::node::BTX_ARCHIVE_PEERS.iter())
-        .chain(btx_core::node::BTX_DISCOVERY_PEERS.iter())
         .copied()
         .filter(|p| !manual.contains(p))
         .collect();
