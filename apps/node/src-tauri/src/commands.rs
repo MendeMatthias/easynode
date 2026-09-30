@@ -855,7 +855,9 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     // Until the node serves: a marked launch whose start fails ends here.
     let mut abort_mirror_load = MirrorLoadAbort {
         datadir: &datadir,
+        quitting: &state.quitting,
         armed: mirror_load_marked,
+        launched: std::sync::atomic::AtomicBool::new(false),
     };
     let signer_pubkey = write_signer_key_line(
         &datadir,
@@ -1144,7 +1146,8 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
             }
             // A node we spawn is ours by construction.
             *state.attached_to.lock().await = None;
-            spawn_node_with_lock_retry(app, state, &datadir, &paths).await?
+            spawn_node_with_lock_retry(app, state, &datadir, &paths, &abort_mirror_load.launched)
+                .await?
         }
     };
 
@@ -1302,6 +1305,7 @@ async fn spawn_node_with_lock_retry(
     state: &AppState,
     datadir: &Path,
     paths: &FaststartResult,
+    launched: &std::sync::atomic::AtomicBool,
 ) -> Result<RpcClient, String> {
     for attempt in 1..=LAUNCH_ATTEMPTS {
         // A quit that started mid-retry must win: spawning after the graceful
@@ -1353,7 +1357,7 @@ async fn spawn_node_with_lock_retry(
             // now, before the loaded flag below is read (it would let the
             // reclaim sweep the compiled snapshot the node then needs) and
             // before the launch reads the pin rule's file.
-            honour_pending_set_aside(datadir);
+            honour_pending_set_aside(datadir)?;
             let dd = datadir.to_path_buf();
             let conf = paths.faststart_conf.clone();
             let loaded = NodeAppSettings::load(datadir).snapshot_loaded;
@@ -1371,6 +1375,9 @@ async fn spawn_node_with_lock_retry(
             }
         }
 
+        // A marked mirror launch counts as failed only from here on
+        // (`mirror_launch_failed`): btxd is being started.
+        launched.store(true, Ordering::SeqCst);
         let mut controller = NodeController::new();
         controller
             .start(
@@ -3738,17 +3745,24 @@ fn key_line_goes_back(marked: bool, mirror_load_launch: bool, signer_enabled: bo
 }
 
 /// Armed for a marked mirror launch until the node serves: a start that
-/// fails on the way ([`abandon_mirror_load`]) does not leave the marker to
-/// make every later start the same launch.
+/// ends on the way ([`abandon_mirror_load`]) does not leave the marker to
+/// make every later start the same launch. `launched` is set by
+/// `spawn_node_with_lock_retry` just before it starts btxd.
 struct MirrorLoadAbort<'a> {
     datadir: &'a Path,
+    quitting: &'a std::sync::atomic::AtomicBool,
     armed: bool,
+    launched: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for MirrorLoadAbort<'_> {
     fn drop(&mut self) {
         if self.armed {
-            abandon_mirror_load(self.datadir, &SIGNED_LOAD_FAILED);
+            let launch_failed = mirror_launch_failed(
+                self.launched.load(Ordering::SeqCst),
+                self.quitting.load(Ordering::SeqCst),
+            );
+            abandon_mirror_load(self.datadir, &SIGNED_LOAD_FAILED, launch_failed);
         }
     }
 }
@@ -3795,8 +3809,9 @@ fn mirror_load_step(
 /// already held a chain), the host checks blocks itself, its next launch is
 /// not a header bootstrap (the marker, or a datadir with no blocks that is
 /// about to get one), it never loaded a snapshot, it holds no snapshot
-/// chainstate (`chainstate_snapshot/`, not the `chainstate/` every node has),
-/// and the operator has not said "never a mirror".
+/// chainstate (`chainstate_snapshot/`, not the `chainstate/` every node has;
+/// one with a set-aside note goes before the launch, [`honour_pending_set_aside`],
+/// so it counts as gone), and the operator has not said "never a mirror".
 fn mirror_load_wanted_here(btxd: &Path, datadir: &Path, backend: Backend) -> bool {
     use btx_core::node;
     let settings = NodeAppSettings::load(datadir);
@@ -3805,7 +3820,7 @@ fn mirror_load_wanted_here(btxd: &Path, datadir: &Path, backend: Backend) -> boo
             !node::host_follows_signatures(btxd, datadir, backend),
             node::header_bootstrap_pending(datadir) || node::header_bootstrap_wanted(datadir),
             settings.snapshot_loaded,
-            datadir.join("chainstate_snapshot").exists(),
+            datadir.join("chainstate_snapshot").exists() && !set_aside_pending(datadir),
             node::trusted_mirror_override() == Some(false),
         )
 }
@@ -3824,11 +3839,23 @@ fn mark_first_load_if_fresh(datadir: &Path) {
 /// one: loaded, superseded (`AlreadyLoaded`), refused, and nothing loaded
 /// after the one mirror launch. Nothing loaded on an ordinary launch (no
 /// pair was ready, headers stalled, the engine said no) leaves it to come.
+/// When a stop, a quit or another restart got there first (`superseded`),
+/// only a load settles it: a refused one is set aside before the next
+/// launch, which leaves the chain fresh again, and an unanswered one says
+/// nothing.
 fn first_load_settled(
     mirror_load_launch: bool,
     outcome: &btx_core::snapshot::SnapshotOutcome,
+    superseded: bool,
 ) -> bool {
-    mirror_load_launch || !matches!(outcome, btx_core::snapshot::SnapshotOutcome::NotLoaded(_))
+    use btx_core::snapshot::SnapshotOutcome as O;
+    if superseded {
+        return matches!(
+            outcome,
+            O::SignedLoaded { .. } | O::AlreadyLoaded | O::CompiledLoaded
+        );
+    }
+    mirror_load_launch || !matches!(outcome, O::NotLoaded(_))
 }
 
 /// Clear [`NodeAppSettings::first_load_pending`] when this outcome settles
@@ -3837,8 +3864,9 @@ fn settle_first_load(
     datadir: &Path,
     mirror_load_launch: bool,
     outcome: &btx_core::snapshot::SnapshotOutcome,
+    superseded: bool,
 ) {
-    if first_load_settled(mirror_load_launch, outcome)
+    if first_load_settled(mirror_load_launch, outcome, superseded)
         && NodeAppSettings::load(datadir).first_load_pending
     {
         NodeAppSettings::update(datadir, |s| s.first_load_pending = false);
@@ -3921,17 +3949,33 @@ fn clear_mirror_marker(datadir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// A marked mirror launch whose start failed (the engine can refuse it at
-/// init, v0.34.9 `init.cpp:1729-1731` for a key the app did not take out):
-/// the marker goes and `failed` ([`SIGNED_LOAD_FAILED`]) is set, so later
-/// starts in this run do not repeat it.
-fn abandon_mirror_load(datadir: &Path, failed: &std::sync::atomic::AtomicBool) {
+/// A marked mirror launch whose start ended early: the marker always goes.
+/// When `launch_failed` (a btxd this start launched for it did not come up;
+/// the engine can refuse it at init, v0.34.9 `init.cpp:1729-1731` for a key
+/// the app did not take out), `failed` ([`SIGNED_LOAD_FAILED`]) is set too,
+/// so later starts in this run do not repeat it.
+fn abandon_mirror_load(
+    datadir: &Path,
+    failed: &std::sync::atomic::AtomicBool,
+    launch_failed: bool,
+) {
     btx_core::node::end_mirror_load(datadir);
-    failed.store(true, Ordering::SeqCst);
-    let msg = "the node did not start for its one mirror launch; no signed snapshot is tried \
-               again until the app restarts";
+    let msg = if launch_failed {
+        failed.store(true, Ordering::SeqCst);
+        "the node did not start for its one mirror launch; no signed snapshot is tried again \
+         until the app restarts"
+    } else {
+        "the start that was to run the mirror launch ended before the node served; its marker \
+         is cleared"
+    };
     eprintln!("[node-app] {msg}");
     setup_log(datadir, msg);
+}
+
+/// Did the marked launch fail, for [`abandon_mirror_load`]? Only when this
+/// start launched btxd for it (`launched`) and the app is not quitting.
+fn mirror_launch_failed(launched: bool, quitting: bool) -> bool {
+    launched && !quitting
 }
 
 /// Before a launch: begin a validating node's one mirror launch when it has
@@ -4055,6 +4099,9 @@ enum AfterRefusal {
     /// A stop or another restart got there first: the next launch sets it
     /// aside first.
     AtNextLaunch,
+    /// The node is another app's: it is left running, and the snapshot goes
+    /// aside before this app next starts the node itself.
+    NotOurs,
 }
 
 /// What the log says when an ordinary launch loaded a snapshot the app
@@ -4086,6 +4133,11 @@ fn refused_load_message(
         AfterRefusal::AtNextLaunch => format!(
             "{kind} snapshot load not accepted ({why}); the node was stopped or restarted \
              meanwhile, so it is set aside before the next launch"
+        ),
+        AfterRefusal::NotOurs => format!(
+            "{kind} snapshot load not accepted ({why}); the node belongs to another app (the \
+             miner, or another window of this app), so easyNode does not stop it and sets the \
+             snapshot aside before it next starts the node itself"
         ),
     })
 }
@@ -4129,22 +4181,56 @@ fn set_aside_refused_snapshot_at(datadir: &Path, now_unix: u64) -> bool {
 
 /// `<datadir>/.set-aside-snapshot`: a snapshot chainstate the app refused,
 /// or could not vouch for, is still in place, because a stop or another
-/// restart got there first, a load was already set aside once this run, or
-/// the move itself failed. The next launch this app spawns sets it aside
-/// before the node starts ([`honour_pending_set_aside`]); a node it attaches
-/// to is running and is left alone.
+/// restart got there first, a load was already set aside once this run, the
+/// node is another app's, or the move itself failed. The next launch this
+/// app spawns sets it aside before the node starts
+/// ([`honour_pending_set_aside`]); a node it attaches to is running and is
+/// left alone. JSON: the base block of the chainstate it is about
+/// ([`snapshot_base`], `null` when there was none to read) and a sentence
+/// for whoever finds it.
 const SET_ASIDE_PENDING_FILE: &str = ".set-aside-snapshot";
 
-/// Write [`SET_ASIDE_PENDING_FILE`]. Best-effort: a datadir that cannot
-/// take it keeps the snapshot, as before this existed, and says so.
+/// What [`SET_ASIDE_PENDING_FILE`] holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+struct SetAsideNote {
+    base_blockhash: Option<String>,
+    note: String,
+}
+
+/// The plain sentence when a written-down set-aside still cannot happen:
+/// the node is not started on the chainstate the app refused.
+const SET_ASIDE_STUCK: &str = "easyNode could not move a snapshot it did not accept out of \
+     the way in its data folder, so it is not starting the node. Make sure the data folder can \
+     be written to, then start the node again.";
+
+/// The base block of `<datadir>/chainstate_snapshot`, display order, from the
+/// engine's own record of it (`base_blockhash`, 32 raw bytes, v0.34.9
+/// `src/node/utxo_snapshot.cpp` `WriteSnapshotBaseBlockhash`). `None` when
+/// there is no snapshot chainstate or the file is not 32 bytes.
+fn snapshot_base(datadir: &Path) -> Option<String> {
+    let raw = std::fs::read(datadir.join("chainstate_snapshot").join("base_blockhash")).ok()?;
+    if raw.len() != 32 {
+        return None;
+    }
+    Some(raw.iter().rev().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Write [`SET_ASIDE_PENDING_FILE`], naming the snapshot chainstate there
+/// now. Best-effort: a datadir that cannot take it keeps the snapshot, as
+/// before this existed, and says so.
 fn mark_set_aside_pending(datadir: &Path) {
     let path = datadir.join(SET_ASIDE_PENDING_FILE);
-    if let Err(e) = std::fs::write(
-        &path,
-        "easyNode refused the snapshot chainstate this node loaded, or could not check it,\n\
-         and could not set it aside at the time. It sets it aside before the next launch,\n\
-         and deletes this file.\n",
-    ) {
+    let note = SetAsideNote {
+        base_blockhash: snapshot_base(datadir),
+        note: "easyNode refused the snapshot chainstate this node loaded, or could not check \
+               it, and could not set it aside at the time. It sets it aside before it next \
+               starts the node, and deletes this file."
+            .to_string(),
+    };
+    let written = serde_json::to_string_pretty(&note)
+        .map_err(std::io::Error::other)
+        .and_then(|json| std::fs::write(&path, json));
+    if let Err(e) = written {
         eprintln!("[node-app] could not write {}: {e}", path.display());
     }
 }
@@ -4154,24 +4240,61 @@ fn set_aside_pending(datadir: &Path) -> bool {
     datadir.join(SET_ASIDE_PENDING_FILE).exists()
 }
 
+/// Remove [`SET_ASIDE_PENDING_FILE`].
+fn clear_set_aside_note(datadir: &Path) {
+    let path = datadir.join(SET_ASIDE_PENDING_FILE);
+    if let Err(e) = std::fs::remove_file(&path) {
+        eprintln!("[node-app] could not clear {}: {e}", path.display());
+    }
+}
+
 /// Before a spawn, with no node running on the datadir: do a set-aside
 /// written down earlier, the way the normal path does it
-/// ([`set_aside_refused_snapshot`]), then clear the note. Once: a move that
-/// fails again leaves the note for the next spawn. `true` when there was one.
-fn honour_pending_set_aside(datadir: &Path) -> bool {
-    if !set_aside_pending(datadir) {
-        return false;
-    }
-    let msg = "setting aside a snapshot chainstate refused before the last launch";
-    eprintln!("[node-app] {msg}");
-    setup_log(datadir, msg);
-    if set_aside_refused_snapshot(datadir) {
-        let path = datadir.join(SET_ASIDE_PENDING_FILE);
-        if let Err(e) = std::fs::remove_file(&path) {
-            eprintln!("[node-app] could not clear {}: {e}", path.display());
+/// ([`set_aside_refused_snapshot`]), then clear the note. `Ok(true)` when it
+/// did (the chainstate moved, or there was none left to move), `Ok(false)`
+/// when there was nothing to do: no note, or a note about another chainstate
+/// than the one there now, which stays where it is (the note goes). `Err` is [`SET_ASIDE_STUCK`]: the move
+/// failed again, the note stays, and the node is not started on it.
+fn honour_pending_set_aside(datadir: &Path) -> Result<bool, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    honour_pending_set_aside_at(datadir, now)
+}
+
+/// [`honour_pending_set_aside`] at a given time, which names the folder.
+fn honour_pending_set_aside_at(datadir: &Path, now_unix: u64) -> Result<bool, String> {
+    let Ok(raw) = std::fs::read_to_string(datadir.join(SET_ASIDE_PENDING_FILE)) else {
+        return Ok(false);
+    };
+    // A note nothing can read names no base, like one written with no
+    // snapshot chainstate to name.
+    let named = serde_json::from_str::<SetAsideNote>(&raw)
+        .ok()
+        .and_then(|n| n.base_blockhash);
+    let there = snapshot_base(datadir);
+    if let Some(named) = &named {
+        if there.as_ref() != Some(named) {
+            let msg = format!(
+                "a set-aside was written down for the snapshot chainstate based at {named}, but \
+                 the one here now is {}; leaving it where it is",
+                there.as_deref().unwrap_or("none")
+            );
+            eprintln!("[node-app] {msg}");
+            setup_log(datadir, &msg);
+            clear_set_aside_note(datadir);
+            return Ok(false);
         }
     }
-    true
+    let msg = "setting aside a snapshot chainstate refused before this launch";
+    eprintln!("[node-app] {msg}");
+    setup_log(datadir, msg);
+    if !set_aside_refused_snapshot_at(datadir, now_unix) {
+        return Err(SET_ASIDE_STUCK.to_string());
+    }
+    clear_set_aside_note(datadir);
+    Ok(true)
 }
 
 /// The datadir half of ending a load, with the node stopped: set a refused
@@ -4197,23 +4320,38 @@ enum AfterLoad {
     /// A load the app refuses, after one was already set aside in this run:
     /// the log says so and the node keeps running as it is (a slow sync).
     LeaveRunning,
+    /// A load the app refuses on a node another app runs: not this app's to
+    /// stop, and its chainstate is not moved from under a running btxd. The
+    /// set-aside waits for a launch this app spawns.
+    NotOurs,
 }
 
 /// Pure half of [`after_snapshot_load`]. A validating node's mirror launch
 /// always ends in a restart, so it never stays a mirror; and
 /// [`prepare_mirror_load`] begins none after a set-aside, so this too is at
 /// most once per run. Any other launch acts only on a load the app refuses,
-/// and at most once per app run (`restarted_this_run`, controller note 3).
+/// and at most once per app run (`restarted_this_run`, controller note 3),
+/// and only on a node that is this app's to stop (`ours_to_stop`,
+/// `attached_node_is_ours_to_stop`).
 fn after_load_plan(
     mirror_load_launch: bool,
     outcome: &btx_core::snapshot::SnapshotOutcome,
     restarted_this_run: bool,
+    ours_to_stop: bool,
 ) -> AfterLoad {
     use btx_core::snapshot::SnapshotOutcome as O;
     let set_aside = matches!(
         outcome,
         O::HeldRootOnChain(_) | O::CompiledHeldRootOnChain(_)
     );
+    if !ours_to_stop {
+        // `runs_mirror_load` never gives another app's node a mirror launch.
+        return if set_aside {
+            AfterLoad::NotOurs
+        } else {
+            AfterLoad::Nothing
+        };
+    }
     if mirror_load_launch {
         AfterLoad::Restart { set_aside }
     } else if !set_aside {
@@ -4226,12 +4364,12 @@ fn after_load_plan(
 }
 
 /// Must the set-aside wait for the next launch ([`mark_set_aside_pending`])?
-/// When the node keeps running after a second refusal this run, and when a
-/// stop or another restart got to the node first (`superseded`) on a load
-/// the app refuses.
+/// When the node keeps running after a second refusal this run, when it is
+/// another app's node, and when a stop or another restart got to the node
+/// first (`superseded`) on a load the app refuses.
 fn set_aside_waits(plan: AfterLoad, superseded: bool) -> bool {
     match plan {
-        AfterLoad::LeaveRunning => true,
+        AfterLoad::LeaveRunning | AfterLoad::NotOurs => true,
         AfterLoad::Restart { set_aside } => set_aside && superseded,
         AfterLoad::Nothing => false,
     }
@@ -4293,18 +4431,19 @@ async fn after_snapshot_load(
     if signed_load_failed(mirror_load_launch, &outcome) {
         SIGNED_LOAD_FAILED.store(true, Ordering::SeqCst);
     }
-    settle_first_load(&datadir, mirror_load_launch, &outcome);
+    let superseded = state.refresher_gen.load(Ordering::SeqCst) != gen
+        || state.rpc.lock().await.is_none()
+        || state.quitting.load(Ordering::SeqCst);
+    settle_first_load(&datadir, mirror_load_launch, &outcome, superseded);
     let plan = after_load_plan(
         mirror_load_launch,
         &outcome,
         state.load_failure_restarted.load(Ordering::SeqCst),
+        attached_node_is_ours_to_stop(*state.attached_to.lock().await),
     );
     if plan == AfterLoad::Nothing {
         return Ok(());
     }
-    let superseded = state.refresher_gen.load(Ordering::SeqCst) != gen
-        || state.rpc.lock().await.is_none()
-        || state.quitting.load(Ordering::SeqCst);
     let log = |msg: &str| {
         eprintln!("[node-app] {msg}");
         setup_log(&datadir, msg);
@@ -4329,6 +4468,12 @@ async fn after_snapshot_load(
         }
         AfterLoad::LeaveRunning => {
             if let Some(msg) = refused_load_message(&outcome, AfterRefusal::KeepRunning) {
+                log(&msg);
+            }
+            return Ok(());
+        }
+        AfterLoad::NotOurs => {
+            if let Some(msg) = refused_load_message(&outcome, AfterRefusal::NotOurs) {
                 log(&msg);
             }
             return Ok(());
@@ -6217,12 +6362,13 @@ pub async fn open_global_stats() -> Result<(), String> {
 mod signed_start_tests {
     use super::{
         abandon_mirror_load, after_load_plan, clear_mirror_marker, first_load_settled,
-        honour_pending_set_aside, key_line_goes_back, mark_first_load_if_fresh,
-        mark_set_aside_pending, mirror_load_end_message, mirror_load_step, mirror_load_wanted_here,
-        nominal_btxd_path, refused_load_message, runs_mirror_load, set_aside_pending,
-        set_aside_refused_snapshot_at, set_aside_waits, settle_first_load, signed_load_failed,
-        signed_load_for, signer_for_launch, signing_key_the_app_does_not_manage,
-        write_signer_key_line, AfterLoad, AfterRefusal, AttachedTo, MirrorLoadStep,
+        honour_pending_set_aside, honour_pending_set_aside_at, key_line_goes_back,
+        mark_first_load_if_fresh, mark_set_aside_pending, mirror_launch_failed,
+        mirror_load_end_message, mirror_load_step, mirror_load_wanted_here, nominal_btxd_path,
+        refused_load_message, runs_mirror_load, set_aside_pending, set_aside_refused_snapshot_at,
+        set_aside_waits, settle_first_load, signed_load_failed, signed_load_for, signer_for_launch,
+        signing_key_the_app_does_not_manage, snapshot_base, write_signer_key_line, AfterLoad,
+        AfterRefusal, AttachedTo, MirrorLoadStep, SET_ASIDE_STUCK,
     };
     use crate::state::NodeAppSettings;
     use btx_core::backend::Backend;
@@ -6307,12 +6453,12 @@ mod signed_start_tests {
     fn a_second_refused_load_in_one_run_does_not_restart_the_node() {
         for refused in [held(), compiled_held()] {
             assert_eq!(
-                after_load_plan(false, &refused, false),
+                after_load_plan(false, &refused, false, true),
                 AfterLoad::Restart { set_aside: true },
                 "{refused:?}"
             );
             assert_eq!(
-                after_load_plan(false, &refused, true),
+                after_load_plan(false, &refused, true, true),
                 AfterLoad::LeaveRunning,
                 "{refused:?}"
             );
@@ -6338,8 +6484,8 @@ mod signed_start_tests {
     #[test]
     fn a_refused_compiled_load_is_set_aside_but_not_called_a_signed_one() {
         assert_eq!(
-            after_load_plan(false, &compiled_held(), false),
-            after_load_plan(false, &held(), false)
+            after_load_plan(false, &compiled_held(), false, true),
+            after_load_plan(false, &held(), false, true)
         );
         assert!(signed_load_failed(false, &held()));
         assert!(!signed_load_failed(false, &compiled_held()));
@@ -6378,11 +6524,11 @@ mod signed_start_tests {
         );
         for mirror_load_launch in [true, false] {
             assert_eq!(
-                after_load_plan(mirror_load_launch, &unavailable, false),
-                after_load_plan(mirror_load_launch, &held(), false)
+                after_load_plan(mirror_load_launch, &unavailable, false, true),
+                after_load_plan(mirror_load_launch, &held(), false, true)
             );
             assert_eq!(
-                after_load_plan(mirror_load_launch, &unavailable, false),
+                after_load_plan(mirror_load_launch, &unavailable, false, true),
                 AfterLoad::Restart { set_aside: true }
             );
             assert_eq!(
@@ -6431,7 +6577,7 @@ mod signed_start_tests {
         for (outcome, set_aside, failed) in outcomes {
             for restarted_this_run in [false, true] {
                 assert_eq!(
-                    after_load_plan(true, &outcome, restarted_this_run),
+                    after_load_plan(true, &outcome, restarted_this_run, true),
                     AfterLoad::Restart { set_aside },
                     "{outcome:?}"
                 );
@@ -6445,7 +6591,10 @@ mod signed_start_tests {
             SnapshotOutcome::CompiledLoaded,
             SnapshotOutcome::NotLoaded("no snapshot.dat".into()),
         ] {
-            assert_eq!(after_load_plan(false, &outcome, false), AfterLoad::Nothing);
+            assert_eq!(
+                after_load_plan(false, &outcome, false, true),
+                AfterLoad::Nothing
+            );
             assert!(!signed_load_failed(false, &outcome), "{outcome:?}");
         }
     }
@@ -6750,18 +6899,18 @@ mod signed_start_tests {
             compiled_held(),
         ];
         for outcome in &outcomes {
-            assert!(first_load_settled(true, outcome), "{outcome:?}");
-            assert!(first_load_settled(false, outcome), "{outcome:?}");
+            assert!(first_load_settled(true, outcome, false), "{outcome:?}");
+            assert!(first_load_settled(false, outcome, false), "{outcome:?}");
         }
         let none = SnapshotOutcome::NotLoaded("HTTP 404".into());
-        assert!(first_load_settled(true, &none));
-        assert!(!first_load_settled(false, &none));
+        assert!(first_load_settled(true, &none, false));
+        assert!(!first_load_settled(false, &none, false));
 
         let btxd = nominal_btxd_path();
         let dir = fresh_validating_datadir();
-        settle_first_load(dir.path(), false, &none);
+        settle_first_load(dir.path(), false, &none, false);
         assert!(mirror_load_wanted_here(&btxd, dir.path(), Backend::Metal));
-        settle_first_load(dir.path(), true, &none);
+        settle_first_load(dir.path(), true, &none, false);
         assert!(!NodeAppSettings::load(dir.path()).first_load_pending);
         assert!(!mirror_load_wanted_here(&btxd, dir.path(), Backend::Metal));
     }
@@ -6806,18 +6955,18 @@ mod signed_start_tests {
         std::fs::create_dir_all(&snap).unwrap();
         NodeAppSettings::update(dir.path(), |s| s.snapshot_loaded = true);
         assert!(
-            !honour_pending_set_aside(dir.path()),
+            !honour_pending_set_aside(dir.path()).unwrap(),
             "nothing written down"
         );
         assert!(snap.exists());
 
         mark_set_aside_pending(dir.path());
-        assert!(honour_pending_set_aside(dir.path()));
+        assert!(honour_pending_set_aside(dir.path()).unwrap());
         assert!(!snap.exists());
         assert!(!NodeAppSettings::load(dir.path()).snapshot_loaded);
         assert!(!set_aside_pending(dir.path()));
         std::fs::create_dir_all(&snap).unwrap();
-        assert!(!honour_pending_set_aside(dir.path()), "once");
+        assert!(!honour_pending_set_aside(dir.path()).unwrap(), "once");
         assert!(snap.exists());
 
         let src = include_str!("commands.rs");
@@ -6826,7 +6975,7 @@ mod signed_start_tests {
             .nth(1)
             .and_then(|s| s.split("\n}\n").next())
             .unwrap();
-        let honour = spawn.find("honour_pending_set_aside(datadir)").unwrap();
+        let honour = spawn.find("honour_pending_set_aside(datadir)?").unwrap();
         assert!(honour < spawn.find("reclaim_disk(").unwrap());
         let start = src
             .split("pub(crate) async fn start_node_inner(")
@@ -6847,9 +6996,26 @@ mod signed_start_tests {
         let dir = fresh_validating_datadir();
         node::begin_mirror_load(dir.path(), 232_000).unwrap();
         let failed = AtomicBool::new(false);
-        abandon_mirror_load(dir.path(), &failed);
+        abandon_mirror_load(dir.path(), &failed, true);
         assert!(!node::mirror_load_marker_exists(dir.path()));
         assert!(failed.load(Ordering::SeqCst));
+    }
+
+    /// Minor 3 (round 2): only a btxd this start launched for the mirror
+    /// launch, whose start then failed, ends signed loads for the run. A
+    /// quit, or a start that never launched one (another app's node, a
+    /// set-aside that could not happen), only ends the marker.
+    #[test]
+    fn only_a_launch_that_failed_ends_signed_loads_for_the_run() {
+        assert!(mirror_launch_failed(true, false));
+        assert!(!mirror_launch_failed(true, true), "a quit");
+        assert!(!mirror_launch_failed(false, false), "nothing was launched");
+        let dir = fresh_validating_datadir();
+        node::begin_mirror_load(dir.path(), 232_000).unwrap();
+        let failed = AtomicBool::new(false);
+        abandon_mirror_load(dir.path(), &failed, false);
+        assert!(!node::mirror_load_marker_exists(dir.path()), "always ended");
+        assert!(!failed.load(Ordering::SeqCst));
     }
 
     /// Minor 5: the load launch took the key line out of the shared conf.
@@ -6898,6 +7064,199 @@ mod signed_start_tests {
             assert!(!m.contains("keeps running"), "{m}");
             assert!(m.contains("next launch"), "{m}");
             assert!(!m.contains('\u{2014}'), "no em-dash: {m}");
+        }
+    }
+
+    /// Round 2, IMPORTANT: a load the app refuses on a node another app
+    /// runs (the miner on the shared data folder) is not this app's to stop:
+    /// moving its chainstate would pull it out from under a running btxd.
+    /// The set-aside is written down for when this app starts the node
+    /// itself, and nothing is stopped, moved or restarted.
+    #[test]
+    fn a_refused_load_on_another_apps_node_is_left_to_that_app() {
+        for refused in [held(), compiled_held()] {
+            for restarted_this_run in [false, true] {
+                assert_eq!(
+                    after_load_plan(false, &refused, restarted_this_run, false),
+                    AfterLoad::NotOurs,
+                    "{refused:?}"
+                );
+            }
+            let m = refused_load_message(&refused, AfterRefusal::NotOurs).unwrap();
+            assert!(m.contains("another app"), "{m}");
+            assert!(!m.contains('\u{2014}'), "no em-dash: {m}");
+        }
+        assert!(set_aside_waits(AfterLoad::NotOurs, false));
+        assert!(set_aside_waits(AfterLoad::NotOurs, true));
+        for outcome in [
+            SnapshotOutcome::CompiledLoaded,
+            SnapshotOutcome::NotLoaded("no snapshot.dat".into()),
+        ] {
+            assert_eq!(
+                after_load_plan(false, &outcome, false, false),
+                AfterLoad::Nothing
+            );
+        }
+    }
+
+    /// Round 2, minor 1: a stop or a quit during the first load does not
+    /// lose the signed start for good. Only a load settles it then; a
+    /// refused or unanswered one leaves it to come, since the note sets the
+    /// refused chain aside and the chain is fresh again, which the wanted
+    /// check counts.
+    #[test]
+    fn a_stop_during_the_first_load_keeps_it_to_come() {
+        for loaded in [
+            SnapshotOutcome::SignedLoaded { height: 232_000 },
+            SnapshotOutcome::AlreadyLoaded,
+            SnapshotOutcome::CompiledLoaded,
+        ] {
+            assert!(first_load_settled(true, &loaded, true), "{loaded:?}");
+            assert!(first_load_settled(false, &loaded, true), "{loaded:?}");
+        }
+        for unsettled in [
+            held(),
+            compiled_held(),
+            SnapshotOutcome::NotLoaded("the load task ended".into()),
+        ] {
+            assert!(!first_load_settled(true, &unsettled, true), "{unsettled:?}");
+            assert!(
+                !first_load_settled(false, &unsettled, true),
+                "{unsettled:?}"
+            );
+        }
+        let btxd = nominal_btxd_path();
+        let dir = fresh_validating_datadir();
+        std::fs::create_dir_all(dir.path().join("chainstate_snapshot")).unwrap();
+        settle_first_load(dir.path(), true, &held(), true);
+        assert!(NodeAppSettings::load(dir.path()).first_load_pending);
+        assert!(!mirror_load_wanted_here(&btxd, dir.path(), Backend::Metal));
+        mark_set_aside_pending(dir.path());
+        assert!(
+            mirror_load_wanted_here(&btxd, dir.path(), Backend::Metal),
+            "the chainstate goes aside before the launch"
+        );
+    }
+
+    /// Round 2, minor 4: a written-down set-aside that still cannot happen
+    /// stops the start with one plain sentence, and the node is not started
+    /// on the refused chainstate.
+    #[test]
+    fn a_set_aside_that_still_cannot_happen_stops_the_start() {
+        let dir = fresh_validating_datadir();
+        let snap = dir.path().join("chainstate_snapshot");
+        std::fs::create_dir_all(&snap).unwrap();
+        mark_set_aside_pending(dir.path());
+        std::fs::create_dir_all(dir.path().join("chainstate_snapshot.refused-1000/x")).unwrap();
+        let e = honour_pending_set_aside_at(dir.path(), 1000).unwrap_err();
+        assert_eq!(e, SET_ASIDE_STUCK);
+        assert!(e.contains("data folder"), "{e}");
+        assert!(!e.contains('\u{2014}'), "no em-dash: {e}");
+        assert!(snap.exists());
+        assert!(
+            set_aside_pending(dir.path()),
+            "tried again at the next start"
+        );
+    }
+
+    /// Round 2, minor 6: the note names the base of the snapshot chainstate
+    /// it is about, and only that one is moved: a different one found at the
+    /// next launch stays, and the note goes.
+    #[test]
+    fn only_the_refused_snapshot_chainstate_is_set_aside() {
+        let base = |dir: &std::path::Path, first: u8| {
+            let snap = dir.join("chainstate_snapshot");
+            std::fs::create_dir_all(&snap).unwrap();
+            let mut raw = [0u8; 32];
+            raw[0] = first;
+            std::fs::write(snap.join("base_blockhash"), raw).unwrap();
+        };
+        let dir = fresh_validating_datadir();
+        assert_eq!(snapshot_base(dir.path()), None);
+        base(dir.path(), 0xab);
+        // Display order: the engine writes the hash's bytes reversed.
+        assert_eq!(
+            snapshot_base(dir.path()).unwrap(),
+            format!("{}ab", "00".repeat(31))
+        );
+        mark_set_aside_pending(dir.path());
+        let note = std::fs::read_to_string(dir.path().join(".set-aside-snapshot")).unwrap();
+        assert!(note.contains(&format!("{}ab", "00".repeat(31))), "{note}");
+
+        // Another chainstate since: left where it is, and the note goes.
+        base(dir.path(), 0xcd);
+        assert_eq!(honour_pending_set_aside_at(dir.path(), 1000), Ok(false));
+        assert!(dir.path().join("chainstate_snapshot").exists());
+        assert!(!set_aside_pending(dir.path()));
+
+        // The same one: moved.
+        mark_set_aside_pending(dir.path());
+        assert_eq!(honour_pending_set_aside_at(dir.path(), 1000), Ok(true));
+        assert!(!dir.path().join("chainstate_snapshot").exists());
+        assert!(!set_aside_pending(dir.path()));
+
+        // A note written with no snapshot chainstate to name: the refused
+        // load may have finished after it, so whatever is there goes.
+        let none = fresh_validating_datadir();
+        mark_set_aside_pending(none.path());
+        base(none.path(), 0x01);
+        assert_eq!(honour_pending_set_aside_at(none.path(), 1000), Ok(true));
+        assert!(!none.path().join("chainstate_snapshot").exists());
+    }
+
+    /// Round 2, minor 5: the wiring, in the code. The abort guard is armed
+    /// once the launch is marked, before the key line, and disarmed only
+    /// once the node serves; `after_snapshot_load` settles the first load
+    /// and writes the set-aside down, and asks whose node it is, before it
+    /// stops anything.
+    #[test]
+    fn the_start_path_wiring_is_where_it_must_be() {
+        let src = include_str!("commands.rs");
+        let start = src
+            .split("pub(crate) async fn start_node_inner(")
+            .nth(1)
+            .and_then(|s| s.split("\nasync fn spawn_node_with_lock_retry(").next())
+            .unwrap();
+        let marked = start.find("let mirror_load_marked =").unwrap();
+        let armed = start
+            .find("let mut abort_mirror_load = MirrorLoadAbort {")
+            .unwrap();
+        let key_line = start.find("write_signer_key_line(").unwrap();
+        assert!(marked < armed && armed < key_line);
+        let spawn = start.find("spawn_node_with_lock_retry(").unwrap();
+        let serving = start
+            .find("*state.rpc.lock().await = Some(rpc.clone());")
+            .unwrap();
+        let disarmed = start.find("abort_mirror_load.armed = false;").unwrap();
+        assert!(spawn < serving && serving < disarmed);
+        assert_eq!(start.matches("abort_mirror_load.armed = false;").count(), 1);
+        // `launched` is set only where btxd is started, after the note is
+        // honoured, so neither a quit nor a set-aside that could not happen
+        // counts as a failed launch.
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let launched = spawn_fn
+            .find("launched.store(true, Ordering::SeqCst);")
+            .unwrap();
+        assert!(spawn_fn.find("honour_pending_set_aside(datadir)?").unwrap() < launched);
+        assert!(launched < spawn_fn.find(".start(").unwrap());
+        assert!(!start.contains("launched.store("));
+
+        let after = src
+            .split("\nasync fn after_snapshot_load(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let stop = after.find("stop_node_inner(state)").unwrap();
+        for call in [
+            "settle_first_load(&datadir",
+            "set_aside_waits(plan, superseded)",
+            "attached_node_is_ours_to_stop(",
+        ] {
+            assert!(after.find(call).unwrap() < stop, "{call}");
         }
     }
 }
