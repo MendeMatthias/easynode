@@ -24,6 +24,17 @@ from everyone, or left on a branch the others have moved on from, knows of no
 newer blocks either. Now a newest block more than two hours old, or signed
 blocks the node does not have, overrule it, and the line says which one it is.
 
+**A .deb install updates itself, after one password prompt.** Until now only
+the AppImage updated itself on Linux. A copy installed from the .deb downloaded
+the AppImage on every check, could not install it, and tried again six hours
+later. From this version on, a .deb copy reads a feed of its own and installs
+the new .deb after asking for your password once, the way any system package
+does. Where there is no .deb to install, it downloads nothing and shows the
+command to install it by hand. On every platform, an update that downloaded but
+failed to install is not downloaded again by the automatic checks; Check now
+still tries. A .deb copy on 0.6.32 or older moves to this version by hand one
+last time, with the command on easybtx.com/node.
+
 **A slow node no longer leaves the dead branch before Branch B is refused.**
 Before a node leaves the dead branch it first refuses Branch B, so B cannot
 become the chain it follows. Until now, a node that took too long to say
