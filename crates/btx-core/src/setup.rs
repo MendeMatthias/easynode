@@ -650,6 +650,10 @@ pub fn set_conf_kv(conf_path: &Path, key: &str, value: Option<&str>) -> AppResul
 ///
 /// The cookie is re-read on every attempt: btxd regenerates it per start, so a
 /// client built from a stale cookie would 401 forever.
+///
+/// This form cannot see the process. A caller that spawned the node itself
+/// should use [`wait_for_node_rpc_watching`], which stops the moment the child
+/// is gone.
 pub async fn wait_for_node_rpc(
     datadir: &Path,
     url: &str,
@@ -657,14 +661,68 @@ pub async fn wait_for_node_rpc(
     poll_ms: u64,
     warmup_max_polls: u32,
 ) -> Result<RpcClient, String> {
+    match wait_for_node_rpc_watching(datadir, url, max_polls, poll_ms, warmup_max_polls, || false)
+        .await
+    {
+        RpcWait::Ready(client) => Ok(client),
+        RpcWait::Exited { last } | RpcWait::TimedOut { last, .. } => Err(last),
+    }
+}
+
+/// How a watched RPC wait ended. No `Debug`: `RpcClient` deliberately has
+/// none, because it would print the RPC credentials.
+pub enum RpcWait {
+    /// The node answered `getblockchaininfo`.
+    Ready(RpcClient),
+    /// The child exited while the wait ran. `last` is what the wait had seen
+    /// so far, which for an init exit is nearly always "no .cookie yet": the
+    /// cause is in the child's own log, not here.
+    Exited { last: String },
+    /// A budget ran out with the child still there. `warming` is true when
+    /// the node answered RPC_IN_WARMUP at least once, so its RPC is up and a
+    /// graceful `stop` can reach it; false means it never answered at all.
+    TimedOut { last: String, warming: bool },
+}
+
+/// [`wait_for_node_rpc`], watching the child: `child_gone` is asked once per
+/// poll, and the wait ends with [`RpcWait::Exited`] the first time it says
+/// yes.
+///
+/// Why (2026-10-01, Zan's two Linux nodes after 0.6.32 to 0.7.0). The app's
+/// launch watch only looks at the child for 5 s. Engine v0.34.12 runs its GPU
+/// readiness (CUDA probe, self-qualification and canary,
+/// `InitializeMatMulRCReadinessPostDaemon`, init.cpp:2928) and opens the
+/// durable attestation archive (init.cpp:2888-2900, which verifies every
+/// record) BEFORE `AppInitServers` binds RPC and writes the cookie
+/// (init.cpp:3100-3104). On a CUDA consensus host that is well over 5 s, so
+/// every init exit after those steps landed inside this wait, which never
+/// looked at the process: three minutes against a dead btxd, then "no .cookie
+/// yet", with no cause read from its log and no retry. On regtest RC is off
+/// and init is instant, which is why that path was never exercised.
+///
+/// The probe is a plain `FnMut() -> bool` so this crate does not need to know
+/// where the caller keeps its child. It is asked once more after a budget
+/// runs out, so a child that died in the same moment is reported as an exit
+/// (read its log, retry) rather than a timeout (stop a live process).
+pub async fn wait_for_node_rpc_watching<F: FnMut() -> bool>(
+    datadir: &Path,
+    url: &str,
+    max_polls: u32,
+    poll_ms: u64,
+    warmup_max_polls: u32,
+    mut child_gone: F,
+) -> RpcWait {
     let cookie = datadir.join(".cookie");
     let mut last = String::from("the node's RPC never became reachable (no .cookie yet)");
     let mut unreachable_polls: u32 = 0;
     let mut warmup_polls: u32 = 0;
     while unreachable_polls < max_polls && warmup_polls < warmup_max_polls {
+        if child_gone() {
+            return RpcWait::Exited { last };
+        }
         if let Ok(client) = RpcClient::from_cookie(url, &cookie) {
             match crate::node_api::get_blockchain_info(&client).await {
-                Ok(_) => return Ok(client),
+                Ok(_) => return RpcWait::Ready(client),
                 Err(AppError::Rpc { code: -28, message }) => {
                     last = format!("node is warming up: {message}");
                     warmup_polls += 1;
@@ -679,7 +737,13 @@ pub async fn wait_for_node_rpc(
         unreachable_polls += 1;
         tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
     }
-    Err(last)
+    if child_gone() {
+        return RpcWait::Exited { last };
+    }
+    RpcWait::TimedOut {
+        last,
+        warming: warmup_polls > 0,
+    }
 }
 
 #[cfg(test)]
@@ -1577,5 +1641,113 @@ maxreorgdepthwarn=9
             err.contains("warming up"),
             "expected the warmup message to surface, got: {err}"
         );
+    }
+
+    // ── wait_for_node_rpc_watching: the wait that watches the child ────────
+
+    /// ZAN'S TWO NODES, 2026-10-01. A btxd that dies AFTER the 5 s launch
+    /// watch (engine v0.34.12 runs its GPU readiness before it binds RPC, so
+    /// on a CUDA host every init exit lands there) must end the wait at once,
+    /// not after 360 polls against a process that is already gone.
+    #[tokio::test]
+    async fn a_child_that_exits_during_the_wait_ends_it_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut probes = 0u32;
+        let started = std::time::Instant::now();
+        // A budget of 1000 polls x 10 ms: a wait that ignored the probe would
+        // take ten seconds, one that honours it well under one.
+        let got =
+            wait_for_node_rpc_watching(dir.path(), "http://127.0.0.1:1", 1000, 10, 1000, || {
+                probes += 1;
+                probes >= 3
+            })
+            .await;
+        assert!(matches!(got, RpcWait::Exited { .. }), "expected Exited");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            probes <= 4,
+            "kept polling after the child was gone: {probes}"
+        );
+    }
+
+    /// The probe says the child is alive: a node that never writes a cookie
+    /// runs the whole budget and times out, and says it never answered.
+    #[tokio::test]
+    async fn a_live_child_without_a_cookie_times_out_and_never_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        match wait_for_node_rpc_watching(dir.path(), "http://127.0.0.1:1", 3, 10, 100, || false)
+            .await
+        {
+            RpcWait::TimedOut { last, warming } => {
+                assert!(last.contains("cookie"), "{last}");
+                assert!(!warming, "nothing ever answered");
+            }
+            _ => panic!("expected a timeout"),
+        }
+    }
+
+    /// Warmup is unchanged by the probe: -28 answers are alive, use the long
+    /// budget, and the timeout says the node was answering.
+    #[tokio::test]
+    async fn a_warming_child_keeps_the_warmup_budget_under_the_watch() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"result":null,"error":{"code":-28,"message":"Verifying blocks…"},"id":"easybtx"}"#,
+            )
+            .expect_at_least(4)
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".cookie"), "__cookie__:secret").unwrap();
+        match wait_for_node_rpc_watching(dir.path(), &server.url(), 1, 10, 4, || false).await {
+            RpcWait::TimedOut { last, warming } => {
+                assert!(last.contains("warming up"), "{last}");
+                assert!(warming, "the node answered -28, so it was reachable");
+            }
+            _ => panic!("expected the warmup budget to expire"),
+        }
+    }
+
+    /// A ready node is ready whatever the probe would say later.
+    #[tokio::test]
+    async fn a_ready_node_is_ready_under_the_watch() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"result":{"blocks":10,"headers":10,"verificationprogress":1.0,"initialblockdownload":false},"error":null,"id":"easybtx"}"#,
+            )
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".cookie"), "__cookie__:secret").unwrap();
+        let got = wait_for_node_rpc_watching(dir.path(), &server.url(), 5, 10, 100, || false).await;
+        assert!(matches!(got, RpcWait::Ready(_)), "expected Ready");
+    }
+
+    /// The budget ran out and the child died in the same moment: that is an
+    /// exit, so the caller reads its log and retries instead of stopping a
+    /// process that is not there.
+    #[tokio::test]
+    async fn an_exit_seen_as_the_budget_ends_is_an_exit_not_a_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut probes = 0u32;
+        // max_polls 2: probes 1 and 2 run inside the loop, probe 3 after it.
+        let got = wait_for_node_rpc_watching(dir.path(), "http://127.0.0.1:1", 2, 10, 100, || {
+            probes += 1;
+            probes >= 3
+        })
+        .await;
+        assert!(matches!(got, RpcWait::Exited { .. }), "expected Exited");
     }
 }
