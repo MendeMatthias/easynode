@@ -105,6 +105,53 @@ export class ReportCopy {
   }
 }
 
+/** Fast-forward's second click must come within this long of the first
+ * (the Tools decision, section 3). The arm itself is a RestartArm. */
+export const FAST_FORWARD_ARM_MS = 10_000;
+
+/** How often the overlay asks how a Fast-forward is going. */
+export const FAST_FORWARD_POLL_MS = 3_000;
+
+/** The section's line when nothing else needs saying. */
+export const FF_NOTE = "A confirmed snapshot is far ahead of your node.";
+
+/** What `tools_fast_forward_check` answers. */
+export type FastForwardCheck =
+  | { kind: "none" }
+  | { kind: "offer"; height: number; button: string; confirm: string; note: string }
+  | { kind: "off"; height: number; sentence: string };
+
+/** What `tools_fast_forward_status` answers. */
+export interface FastForwardStatus {
+  running: boolean;
+  message: string | null;
+}
+
+/** What the Fast-forward section shows. */
+export interface FastForwardView {
+  /** The section is visible. */
+  section: boolean;
+  /** The button's label, or null for no button. */
+  button: string | null;
+  /** The line above the button. */
+  note: string;
+}
+
+/** Decided in one place, so it has a test: a run hides the button, a
+ * dispute shows its sentence and no button (the confirmed-snapshot
+ * decision, section 6a), an offer shows the button with the note Rust sent
+ * (far ahead, or offered early because no archive peer serves old blocks),
+ * and a last run's message keeps the section open on its own. */
+export function fastForwardView(
+  check: FastForwardCheck | null,
+  status: FastForwardStatus | null,
+): FastForwardView {
+  if (status?.running) return { section: true, button: null, note: FF_NOTE };
+  if (check?.kind === "off") return { section: true, button: null, note: check.sentence };
+  if (check?.kind === "offer") return { section: true, button: check.button, note: check.note };
+  return { section: Boolean(status?.message), button: null, note: FF_NOTE };
+}
+
 // The note counts against DISPLAY_LIMIT itself, so the shown text (content
 // plus note) never exceeds the cap and is always shorter than the original.
 const TRUNCATION_NOTE = "\n\n(The answer is longer than this window shows. Copy takes the whole answer.)";

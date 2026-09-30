@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { History, ReportCopy, RestartArm, capForDisplay, DISPLAY_LIMIT } from "./tools-history";
+import {
+  History,
+  ReportCopy,
+  RestartArm,
+  capForDisplay,
+  DISPLAY_LIMIT,
+  FAST_FORWARD_ARM_MS,
+  FF_NOTE,
+  fastForwardView,
+} from "./tools-history";
 
 describe("History", () => {
   it("keeps the last 50 and recalls them with up and down", () => {
@@ -77,5 +86,51 @@ describe("capForDisplay", () => {
     expect(shown.startsWith("x".repeat(100))).toBe(true);
     expect(shown).toContain("Copy takes the whole answer");
     expect(shown.length).toBeLessThan(long.length);
+  });
+});
+
+describe("Fast-forward arm", () => {
+  it("gives ten seconds for the second click", () => {
+    expect(FAST_FORWARD_ARM_MS).toBe(10_000);
+  });
+  it("runs only on the second click, and a disarm starts over", () => {
+    const arm = new RestartArm();
+    expect(arm.click()).toBe(false); // shows what will happen
+    arm.disarm(); // ten seconds passed
+    expect(arm.click()).toBe(false);
+    expect(arm.click()).toBe(true); // runs
+  });
+});
+
+describe("Fast-forward section", () => {
+  const offer = {
+    kind: "offer" as const,
+    height: 233800,
+    button: "Fast-forward to block 233,800",
+    confirm: "Fast-forward to block 233,800, confirmed by Mende and jpp? ...",
+    note: FF_NOTE,
+  };
+  it("offers the button with the note Rust sent", () => {
+    expect(fastForwardView(offer, { running: false, message: null })).toEqual({
+      section: true,
+      button: "Fast-forward to block 233,800",
+      note: FF_NOTE,
+    });
+    const early =
+      "Your node's peers are not sending the older blocks it needs, so Fast-forward is offered sooner than usual. It works the same way as always.";
+    expect(fastForwardView({ ...offer, note: early }, null).note).toBe(early);
+  });
+  it("says it is off, with no button, while the operators disagree", () => {
+    const sentence = "Fast-forward is off while the snapshot operators disagree about block 233,800.";
+    expect(fastForwardView({ kind: "off", height: 233800, sentence }, null)).toEqual({
+      section: true,
+      button: null,
+      note: sentence,
+    });
+  });
+  it("shows no button during a run, and nothing when there is nothing to say", () => {
+    expect(fastForwardView(offer, { running: true, message: "Fast-forward is running." }).button).toBeNull();
+    expect(fastForwardView({ kind: "none" }, { running: false, message: null }).section).toBe(false);
+    expect(fastForwardView(null, { running: false, message: "Done." }).section).toBe(true);
   });
 });

@@ -3,7 +3,18 @@
 // is set as text, never HTML.
 
 import { invoke } from "@tauri-apps/api/core";
-import { History, ReportCopy, RestartArm, capForDisplay } from "./tools-history";
+import {
+  FAST_FORWARD_ARM_MS,
+  FAST_FORWARD_POLL_MS,
+  FF_NOTE,
+  History,
+  ReportCopy,
+  RestartArm,
+  capForDisplay,
+  fastForwardView,
+  type FastForwardCheck,
+  type FastForwardStatus,
+} from "./tools-history";
 
 type ConsoleAnswer =
   | { kind: "output"; text: string }
@@ -84,6 +95,60 @@ export function initTools(): void {
    * one either way; this only keeps the button saying so across a close. */
   let restartInFlight = false;
 
+  const ffArm = new RestartArm();
+  let ffArmTimer: ReturnType<typeof setTimeout> | undefined;
+  let ffPoll: ReturnType<typeof setInterval> | undefined;
+  let ffOffer: Extract<FastForwardCheck, { kind: "offer" }> | null = null;
+  let ffNote = FF_NOTE;
+
+  /** Back to one click away, as the section says. */
+  const resetFfArm = () => {
+    clearTimeout(ffArmTimer);
+    ffArmTimer = undefined;
+    ffArm.disarm();
+    $("tools-ff-note").textContent = ffNote;
+    if (ffOffer) $("tools-ff-btn").textContent = ffOffer.button;
+  };
+  const stopFfPoll = () => {
+    clearInterval(ffPoll);
+    ffPoll = undefined;
+  };
+  const showFfStatus = (status: FastForwardStatus | null) => {
+    const result = $("tools-ff-result");
+    if (status?.message) {
+      result.textContent = status.message;
+      result.hidden = false;
+    }
+    if (status?.running) $("tools-ff").hidden = false;
+  };
+  /** While a run is going: ask every few seconds, stop when it ends. */
+  const pollFf = () => {
+    stopFfPoll();
+    ffPoll = setInterval(async () => {
+      const status = await invoke<FastForwardStatus>("tools_fast_forward_status").catch(() => null);
+      showFfStatus(status);
+      if (status && !status.running) stopFfPoll();
+    }, FAST_FORWARD_POLL_MS);
+  };
+  const refreshFastForward = async () => {
+    const btn = $<HTMLButtonElement>("tools-ff-btn");
+    const status = await invoke<FastForwardStatus>("tools_fast_forward_status").catch(() => null);
+    showFfStatus(status);
+    if (status?.running) {
+      btn.hidden = true;
+      pollFf();
+      return;
+    }
+    const check = await invoke<FastForwardCheck>("tools_fast_forward_check").catch(() => null);
+    ffOffer = check?.kind === "offer" ? check : null;
+    const view = fastForwardView(check, status);
+    ffNote = view.note;
+    btn.hidden = view.button === null;
+    btn.disabled = false;
+    resetFfArm();
+    $("tools-ff").hidden = !view.section;
+  };
+
   /** The 5s timer elapsed, or the overlay is closing: back to one click away. */
   const resetRestartArm = () => {
     clearTimeout(restartArmTimer);
@@ -111,6 +176,8 @@ export function initTools(): void {
   const closeTools = () => {
     overlay.hidden = true;
     resetRestartArm();
+    resetFfArm();
+    stopFfPoll();
     pendingToken = null;
     $("tools-confirm").hidden = true;
     resetReport();
@@ -125,6 +192,7 @@ export function initTools(): void {
     restart.disabled = restartInFlight || why !== null;
     restart.title = why ?? "";
     if (why !== null) say(why);
+    void refreshFastForward();
   };
   $("tools-btn").addEventListener("click", () => void open());
   $("tools-close").addEventListener("click", () => closeTools());
@@ -157,6 +225,31 @@ export function initTools(): void {
       btn.disabled = false;
       btn.title = "";
     }
+  });
+
+  // Fast-forward: the first click says what will happen and who confirmed
+  // the snapshot, a second within ten seconds runs it (the Tools decision,
+  // section 3).
+  $("tools-ff-btn").addEventListener("click", async () => {
+    const btn = $<HTMLButtonElement>("tools-ff-btn");
+    if (!ffOffer) return;
+    if (!ffArm.click()) {
+      $("tools-ff-note").textContent = ffOffer.confirm;
+      btn.textContent = "Click again to fast-forward";
+      clearTimeout(ffArmTimer);
+      ffArmTimer = setTimeout(resetFfArm, FAST_FORWARD_ARM_MS);
+      return;
+    }
+    clearTimeout(ffArmTimer);
+    ffArmTimer = undefined;
+    btn.disabled = true;
+    btn.hidden = true;
+    $("tools-ff-note").textContent = ffNote;
+    const msg = await invoke<string>("tools_fast_forward_run").catch((e) => String(e));
+    const result = $("tools-ff-result");
+    result.textContent = msg;
+    result.hidden = false;
+    pollFf();
   });
 
   $("tools-fetch").addEventListener("click", async () => {
