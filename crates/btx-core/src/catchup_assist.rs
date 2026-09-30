@@ -35,7 +35,9 @@ use crate::rpc::Rpc;
 pub const ENABLED: bool = true;
 /// Help only when the followed chain is at least this many blocks above the tip.
 pub const MIN_BEHIND: u64 = 20;
-/// ...and nobody has been asked for the next block for this long.
+/// ...and the newest block has not changed for this long, whatever requests
+/// the engine has out. Also how recent the engine's own progress must be for
+/// it to count as fetching on its own.
 pub const QUIET: Duration = Duration::from_secs(30);
 /// Blocks asked for at once, from one peer.
 pub const BATCH: u64 = 100;
@@ -66,9 +68,10 @@ pub enum Why {
     Off,
     /// The followed chain is fewer than [`MIN_BEHIND`] blocks above the tip.
     NotBehind,
-    /// Some peer is being asked for one of the next blocks, and not by us.
+    /// The engine is fetching on its own: blocks it asked for keep arriving
+    /// ([`Helper::engine_fetching`]).
     EngineFetching,
-    /// Waiting for [`QUIET`] to pass.
+    /// Waiting for the newest block to stand still for [`QUIET`].
     Quiet,
     /// The headers to follow are not read yet, or not on the node's tip.
     NoPath,
@@ -131,8 +134,13 @@ pub struct Helper {
     /// The addresses of the peers the app dials that can serve a block, in
     /// the order it prefers them.
     archive: Vec<String>,
-    /// Since when the next block has gone unrequested, at which tip.
+    /// The tip, and since when it has stood still. Restarts only when the
+    /// tip moves, and after a peer took none of a batch, never because a
+    /// request is in flight (the relays of 30 September hold theirs for good).
     quiet_since: Option<(u64, Instant)>,
+    /// When the engine last connected blocks of its own: the tip rose while
+    /// no batch of ours was out, or went past our batch's last block.
+    engine_moved_at: Option<Instant>,
     batch: Option<Batch>,
     /// The peer whose last batch connected, and whether that batch was of old
     /// blocks for it: asked first, and when it has served old blocks to us,
@@ -157,8 +165,9 @@ pub struct Helper {
     /// No archive peer will serve old blocks: every archive peer connected with
     /// the next block is on `refuses_old` and the next block is old for each.
     /// Set when the help pauses with [`Why::NoOldBlocks`]; kept while the
-    /// engine's own rescue has the next block in flight (that holds the help
-    /// off, not the conclusion); cleared when the help asks a peer (so before
+    /// engine counts as fetching for 30 seconds after each block its own
+    /// rescue brings (that holds the help off, not the conclusion); cleared
+    /// when the help asks a peer (so before
     /// any batch of it connects), when a peer the help may ask is connected on
     /// two ticks in a row, or when the help stops.
     no_old_blocks: bool,
@@ -176,6 +185,7 @@ impl Helper {
             enabled,
             archive,
             quiet_since: None,
+            engine_moved_at: None,
             batch: None,
             last_good: None,
             tried: Vec::new(),
@@ -224,7 +234,38 @@ impl Helper {
         self.no_old_blocks
     }
 
+    /// Note the tip this tick: when it moved, the quiet wait starts again;
+    /// when the engine moved it (it rose while no batch of ours was out, or
+    /// went past our batch's last block), that is the engine's progress.
+    /// Called again with the same tip, it changes nothing.
+    pub fn observe(&mut self, tip: u64, now: Instant) {
+        match self.quiet_since {
+            Some((was, _)) if was == tip => return,
+            Some((was, _)) if tip > was && self.batch.as_ref().is_none_or(|b| tip > b.to) => {
+                self.engine_moved_at = Some(now);
+            }
+            _ => {}
+        }
+        self.quiet_since = Some((tip, now));
+    }
+
+    /// Whether the engine is fetching on its own: it moved the tip within
+    /// the last [`QUIET`] ([`observe`](Self::observe)), and one of the next
+    /// [`BATCH`] blocks is in flight at some peer outside our batch
+    /// (`getblockfrompeer` marks the blocks it asks for in flight too). A
+    /// request alone is no sign: on 30 September the engine's next three
+    /// blocks sat in flight at the app's discovery relays, which never
+    /// delivered them, while the tip stood still.
+    fn engine_fetching(&self, peers: &[PeerInfo], tip: u64, now: Instant) -> bool {
+        let moving = self
+            .engine_moved_at
+            .is_some_and(|at| now.duration_since(at) < QUIET);
+        let ours = self.batch.as_ref().map(|b| (b.from, b.to));
+        moving && in_flight_elsewhere(peers, tip, ours)
+    }
+
     pub fn decide(&mut self, s: &Seen) -> Decision {
+        self.observe(s.tip, s.now);
         if !self.enabled {
             return self.stop(Why::Off);
         }
@@ -244,8 +285,7 @@ impl Helper {
             self.no_old_blocks = false;
         }
         self.askable_last_tick = askable;
-        let ours = self.batch.as_ref().map(|b| (b.from, b.to));
-        if engine_fetching(s.peers, s.tip, ours) {
+        if self.engine_fetching(s.peers, s.tip, s.now) {
             return self.idle(Why::EngineFetching);
         }
         if let Some(b) = self.batch.take() {
@@ -284,13 +324,8 @@ impl Helper {
             }
             return self.ask(s);
         }
-        let since = match self.quiet_since {
-            Some((tip, at)) if tip == s.tip => at,
-            _ => {
-                self.quiet_since = Some((s.tip, s.now));
-                s.now
-            }
-        };
+        // `observe` has set it for this tip.
+        let since = self.quiet_since.map_or(s.now, |(_, at)| at);
         if s.now.duration_since(since) < QUIET {
             return Decision::Wait(Why::Quiet);
         }
@@ -328,9 +363,10 @@ impl Helper {
         });
     }
 
+    /// No batch out. The quiet wait goes on: it restarts only when the tip
+    /// moves.
     fn idle(&mut self, why: Why) -> Decision {
         self.batch = None;
-        self.quiet_since = None;
         Decision::Wait(why)
     }
 
@@ -471,10 +507,10 @@ pub fn old_for(p: &PeerInfo, height: u64) -> bool {
     p.synced_headers.saturating_sub(height as i64) > LIMITED_SERVES as i64
 }
 
-/// Whether some peer is being asked for one of the next [`BATCH`] blocks by
-/// the engine. `getblockfrompeer` marks a block in flight at the peer asked,
-/// so the batch this help has out (`ours`) does not count.
-fn engine_fetching(peers: &[PeerInfo], tip: u64, ours: Option<(u64, u64)>) -> bool {
+/// Whether one of the next [`BATCH`] blocks is in flight at some peer, other
+/// than in the batch this help has out (`ours`): `getblockfrompeer` marks a
+/// block in flight at the peer asked, so ours show up there too.
+fn in_flight_elsewhere(peers: &[PeerInfo], tip: u64, ours: Option<(u64, u64)>) -> bool {
     let window = (tip as i64 + 1)..=((tip + BATCH) as i64);
     peers.iter().flat_map(|p| p.inflight.iter()).any(|&h| {
         window.contains(&h)
@@ -927,25 +963,47 @@ mod tests {
     }
 
     #[test]
-    fn the_next_block_in_flight_restarts_the_quiet_wait() {
+    fn a_request_in_flight_while_the_tip_stands_still_does_not_restart_the_quiet_wait() {
+        // The quiet wait is about the newest block: a request some other peer
+        // has out for the next block, while the tip does not move, is no
+        // reason to wait longer (the discovery relays of 30 September hold
+        // theirs for good).
         let t0 = Instant::now();
         let next = next_from(1_000);
         let idle = [peer(7, A, 8_000)];
-        let busy = [with_inflight(peer(7, A, 8_000), &[1_001])];
+        let busy = [
+            peer(7, A, 8_000),
+            with_inflight(peer(12, "1.2.3.4:19335", 8_000), &[1_001]),
+        ];
         let mut h = helper();
-        h.decide(&seen(t0, 1_000, &next, &idle));
         assert_eq!(
-            h.decide(&seen(t0 + secs(20), 1_000, &next, &busy)),
-            Decision::Wait(Why::EngineFetching)
-        );
-        assert_eq!(
-            h.decide(&seen(t0 + secs(45), 1_000, &next, &idle)),
+            h.decide(&seen(t0, 1_000, &next, &idle)),
             Decision::Wait(Why::Quiet)
         );
-        assert!(matches!(
-            h.decide(&seen(t0 + secs(75), 1_000, &next, &idle)),
-            Decision::Ask { .. }
-        ));
+        assert_eq!(
+            h.decide(&seen(t0 + secs(20), 1_000, &next, &busy)),
+            Decision::Wait(Why::Quiet)
+        );
+        let d = h.decide(&seen(t0 + QUIET, 1_000, &next, &busy));
+        assert_eq!(asked_of(&d), (7, 1_001, 1_100));
+    }
+
+    #[test]
+    fn while_the_engine_keeps_connecting_blocks_the_help_never_asks() {
+        // A healthy engine: a block every 21 seconds, the next one in flight.
+        // The newest block never stands still for 30 seconds.
+        let t0 = Instant::now();
+        let mut h = helper();
+        for n in 0..100u64 {
+            let tip = 1_000 + n / 7;
+            let next = next_from(tip);
+            let peers = [
+                peer(7, A, 8_000),
+                with_inflight(peer(12, "1.2.3.4:19335", 8_000), &[tip as i64 + 1]),
+            ];
+            let d = h.decide(&seen(t0 + secs(3 * n), tip, &next, &peers));
+            assert!(!matches!(d, Decision::Ask { .. }), "tick {n}: {d:?}");
+        }
     }
 
     #[test]
@@ -1021,27 +1079,45 @@ mod tests {
     }
 
     #[test]
-    fn stops_when_the_engine_asks_for_the_next_blocks_itself() {
+    fn stops_when_the_engine_connects_blocks_past_the_batch_and_asks_again_when_they_stop() {
         let t0 = Instant::now();
         let mut h = helper();
         let quiet = [peer(7, A, 8_000)];
         h.decide(&seen(t0, 1_000, &next_from(1_000), &quiet));
         step(&mut h, &seen(t0 + QUIET, 1_000, &next_from(1_000), &quiet));
-        // Our own requests show up in flight and do not count.
-        let ours = [with_inflight(peer(7, A, 8_000), &[1_051, 1_052])];
+        // Our own requests show up in flight and do not count, and while
+        // only our blocks connect, neither does a request the engine has out.
+        let ours = [
+            with_inflight(peer(7, A, 8_000), &[1_051, 1_052]),
+            with_inflight(peer(12, "1.2.3.4:19335", 8_000), &[1_120]),
+        ];
         assert_eq!(
             h.decide(&seen(t0 + secs(35), 1_050, &next_from(1_050), &ours)),
             Decision::Wait(Why::BatchOut)
         );
+        // Blocks beyond the batch connect and the engine has the next ones
+        // out: it is fetching on its own again.
         let engine = [
-            with_inflight(peer(7, A, 8_000), &[1_051]),
-            with_inflight(peer(12, "1.2.3.4:19335", 8_000), &[1_120]),
+            peer(7, A, 8_000),
+            with_inflight(peer(12, "1.2.3.4:19335", 8_000), &[1_106, 1_107]),
         ];
+        let d = h.decide(&seen(t0 + secs(38), 1_105, &next_from(1_105), &engine));
+        assert_eq!(d, Decision::Wait(Why::EngineFetching));
+        assert!(!h.helping());
+        assert!(note(true, &d).unwrap().contains("on its own"));
         assert_eq!(
-            h.decide(&seen(t0 + secs(38), 1_050, &next_from(1_050), &engine)),
+            h.decide(&seen(t0 + secs(41), 1_105, &next_from(1_105), &engine)),
             Decision::Wait(Why::EngineFetching)
         );
-        assert!(!h.helping());
+        // Its blocks stop coming. The requests it still has out are no reason
+        // to wait: 30 seconds after the newest block, the help asks.
+        let d = h.decide(&seen(
+            t0 + secs(38) + QUIET,
+            1_105,
+            &next_from(1_105),
+            &engine,
+        ));
+        assert_eq!(asked_of(&d), (7, 1_106, 1_205));
     }
 
     #[test]
@@ -1261,10 +1337,19 @@ mod tests {
         h
     }
 
+    /// A with the next block in flight: the engine's own rescue, which asks
+    /// for the tip's next block once it has waited 120 seconds, and again
+    /// right after each block it brings.
+    fn rescue(tip: u64) -> [PeerInfo; 1] {
+        [with_inflight(
+            recorded(6, A, LIMITED, 233_481),
+            &[tip as i64 + 1],
+        )]
+    }
+
     #[test]
     fn no_archive_serves_old_blocks_until_a_new_archive_peer_appears() {
         let t0 = Instant::now();
-        let next = next_from(225_927);
         let mut h = concluded(t0);
         assert!(h.no_archive_serves_old_blocks());
         assert_eq!(
@@ -1274,35 +1359,43 @@ mod tests {
                 NO_ARCHIVE_SERVES_OLD_BLOCKS.to_string()
             ]
         );
-        // It holds while the engine's own rescue has the next block in flight,
-        // which holds the help off, and it is said once.
-        let rescue = [with_inflight(recorded(6, A, LIMITED, 233_481), &[225_928])];
-        assert_eq!(
-            h.decide(&seen(t0 + secs(200), 225_927, &next, &rescue)),
-            Decision::Wait(Why::EngineFetching)
-        );
-        assert!(h.no_archive_serves_old_blocks());
-        let a6 = [recorded(6, A, LIMITED, 233_481)];
-        for n in 1..=10 {
-            h.decide(&seen(t0 + secs(200 + 30 * n), 225_927, &next, &a6));
+        // The engine's rescue brings a block every two minutes. For 30
+        // seconds after each, the engine counts as fetching and holds the help
+        // off; then the help looks again and finds nobody to ask. The
+        // conclusion holds through it all, and is said once.
+        let (mut tip, mut at) = (225_927, t0 + secs(36));
+        for _ in 0..4 {
+            (tip, at) = (tip + 1, at + secs(120));
+            let next = next_from(tip);
+            assert_eq!(
+                h.decide(&seen(at, tip, &next, &rescue(tip))),
+                Decision::Wait(Why::EngineFetching)
+            );
+            assert!(h.no_archive_serves_old_blocks());
+            assert_eq!(
+                h.decide(&seen(at + QUIET, tip, &next, &rescue(tip))),
+                Decision::Wait(Why::NoOldBlocks)
+            );
+            assert!(h.no_archive_serves_old_blocks());
         }
-        assert!(h.no_archive_serves_old_blocks());
         assert!(h.take_news().is_empty(), "said once");
         // A new archive peer appears: false once it is still there on the next
-        // tick (one tick may be a blip), and it is asked after the quiet wait
-        // the rescue restarted.
+        // tick (one tick may be a blip), and it is asked 30 seconds after the
+        // rescue's last block.
+        (tip, at) = (tip + 1, at + secs(120));
+        let next = next_from(tip);
+        h.decide(&seen(at, tip, &next, &rescue(tip)));
         let with_b = [
             recorded(6, A, LIMITED, 233_481),
             recorded(9, B, LIMITED, 233_481),
         ];
-        h.decide(&seen(t0 + secs(600), 225_927, &next, &rescue));
-        let d = h.decide(&seen(t0 + secs(603), 225_927, &next, &with_b));
+        let d = h.decide(&seen(at + secs(3), tip, &next, &with_b));
         assert_eq!(d, Decision::Wait(Why::Quiet));
         assert!(h.no_archive_serves_old_blocks(), "one tick may be a blip");
-        let d = h.decide(&seen(t0 + secs(606), 225_927, &next, &with_b));
+        let d = h.decide(&seen(at + secs(6), tip, &next, &with_b));
         assert_eq!(d, Decision::Wait(Why::Quiet));
         assert!(!h.no_archive_serves_old_blocks());
-        let d = h.decide(&seen(t0 + secs(633), 225_927, &next, &with_b));
+        let d = h.decide(&seen(at + QUIET, tip, &next, &with_b));
         assert_eq!(asked_of(&d).0, 9);
     }
 
@@ -1417,22 +1510,29 @@ mod tests {
     }
 
     #[test]
-    fn two_hundred_behind_after_a_snapshot_load_the_help_stays_idle() {
+    fn two_hundred_behind_after_a_snapshot_load_the_help_stays_idle_while_the_engine_connects_blocks(
+    ) {
         // Section 11: a load from a confirmed snapshot (grid 100, 144 deep)
         // leaves the node 144 to about 250 behind, inside what limited peers
-        // serve, so the engine asks for the next blocks itself.
+        // serve, so the engine asks for the next blocks itself and they keep
+        // connecting.
         let t0 = Instant::now();
-        let tip = 233_281;
-        let next = next_from(tip);
-        let mut engine_peer = recorded(12, "1.2.3.4:19335", LIMITED, 233_481);
-        engine_peer.connection_type = "outbound-full-relay".into();
-        engine_peer.inflight = (tip as i64 + 1..=tip as i64 + 16).collect();
-        let peers = [recorded(4, A, LIMITED, 233_481), engine_peer];
         let mut h = helper();
-        for n in 0..40 {
+        for n in 0..40u64 {
+            let tip = 233_281 + 4 * n;
+            let next = next_from(tip);
+            let mut engine_peer = recorded(12, "1.2.3.4:19335", LIMITED, 233_481);
+            engine_peer.connection_type = "outbound-full-relay".into();
+            engine_peer.inflight = (tip as i64 + 1..=tip as i64 + 16).collect();
+            let peers = [recorded(4, A, LIMITED, 233_481), engine_peer];
             let mut s = seen(t0 + secs(3 * n), tip, &next, &peers);
-            s.target = Some(tip + 200);
-            assert_eq!(h.decide(&s), Decision::Wait(Why::EngineFetching));
+            s.target = Some(233_481);
+            let d = h.decide(&s);
+            if n > 0 {
+                assert_eq!(d, Decision::Wait(Why::EngineFetching), "tick {n}");
+            } else {
+                assert_eq!(d, Decision::Wait(Why::Quiet), "the first look");
+            }
         }
         assert!(!h.helping());
     }
@@ -1605,31 +1705,39 @@ mod tests {
     #[test]
     fn a_one_tick_blip_of_a_peer_to_ask_does_not_end_the_conclusion() {
         let t0 = Instant::now();
-        let next = next_from(225_927);
         let mut h = concluded(t0);
         h.take_news();
-        let rescue = [with_inflight(recorded(6, A, LIMITED, 233_481), &[225_928])];
-        let blip = [
-            with_inflight(recorded(6, A, LIMITED, 233_481), &[225_928]),
-            recorded(9, B, LIMITED, 233_481),
-        ];
+        // The rescue brings 225,928 and asks for the next; B shows for one
+        // tick while that holds the help off.
+        let blip = |tip: u64| {
+            let [a] = rescue(tip);
+            [a, recorded(9, B, LIMITED, 233_481)]
+        };
+        let next = next_from(225_928);
         assert_eq!(
-            h.decide(&seen(t0 + secs(200), 225_927, &next, &blip)),
+            h.decide(&seen(t0 + secs(200), 225_928, &next, &blip(225_928))),
             Decision::Wait(Why::EngineFetching)
         );
         assert!(h.no_archive_serves_old_blocks(), "one tick may be a blip");
-        for n in 1..=10 {
+        for n in 1..=9 {
             assert_eq!(
-                h.decide(&seen(t0 + secs(200 + 3 * n), 225_927, &next, &rescue)),
+                h.decide(&seen(
+                    t0 + secs(200 + 3 * n),
+                    225_928,
+                    &next,
+                    &rescue(225_928)
+                )),
                 Decision::Wait(Why::EngineFetching)
             );
         }
         assert!(h.no_archive_serves_old_blocks());
         assert!(h.take_news().is_empty(), "not said again");
-        // On two ticks in a row it is no blip: the conclusion ends.
-        h.decide(&seen(t0 + secs(300), 225_927, &next, &blip));
+        // After the rescue's next block, B on two ticks in a row is no blip:
+        // the conclusion ends.
+        let next = next_from(225_929);
+        h.decide(&seen(t0 + secs(320), 225_929, &next, &blip(225_929)));
         assert!(h.no_archive_serves_old_blocks());
-        h.decide(&seen(t0 + secs(303), 225_927, &next, &blip));
+        h.decide(&seen(t0 + secs(323), 225_929, &next, &blip(225_929)));
         assert!(!h.no_archive_serves_old_blocks());
     }
 
@@ -1862,6 +1970,65 @@ mod tests {
         assert_eq!(asked.len(), 100);
         assert_eq!(asked[0], (hash(101), 7));
         assert_eq!(asked[99], (hash(200), 7));
+    }
+
+    /// What the app's discovery relays advertise (`node::BTX_DISCOVERY_PEERS`):
+    /// WITNESS, SHIELDED, P2P_V2 and MATMUL_DISCOVERY, and no NETWORK bit.
+    const RELAY: &str = "0000000200000908";
+
+    #[tokio::test]
+    async fn the_mainnet_stall_of_30_september_asks_the_archive_peer_past_the_relays_hung_requests()
+    {
+        // Measured on the owner's Mac, 30 September 02:05 UTC: a keeper mirror
+        // at 225,932, headers at 234,039, its signed frontier at 234,038. The
+        // engine's next three blocks sat in flight at the app's three
+        // discovery relays, which never deliver them, and the tip did not
+        // move. 109.199.124.187 was connected with nothing in flight.
+        let mut node = FakeNode::new(234_039, 225_932, Some(234_038));
+        let slot = node.attested();
+        let tips = [tip(234_039, "headers-only")];
+        let shape = |next: i64| -> Vec<PeerInfo> {
+            let mut peers: Vec<PeerInfo> = crate::node::BTX_DISCOVERY_PEERS
+                .iter()
+                .zip(20..)
+                .map(|(addr, id)| {
+                    let relay = recorded(id, addr, RELAY, 234_039);
+                    with_inflight(relay, &[next, next + 1, next + 2])
+                })
+                .collect();
+            peers.push(recorded(6, A, LIMITED, 234_039));
+            peers
+        };
+        let peers = shape(225_933);
+        let t = Tick {
+            frontier: slot.as_ref(),
+            ..tick_of(225_932, 234_039, &tips, &peers)
+        };
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        for n in 0..10 {
+            let lines = tick(&node, &mut cu, &t, t0 + secs(3 * n)).await;
+            assert!(lines.is_empty(), "tick {n}: {lines:?}");
+        }
+        assert_eq!(
+            tick(&node, &mut cu, &t, t0 + QUIET).await,
+            ["asked 109.199.124.187:19335 for blocks 225933 to 226032 (100 sent, 0 already here)"]
+        );
+        // The batch connects, and the relays have the next three out and
+        // hung again: the next batch goes out at once.
+        node.tip = 226_032;
+        let peers = shape(226_033);
+        let t = Tick {
+            frontier: slot.as_ref(),
+            ..tick_of(226_032, 234_039, &tips, &peers)
+        };
+        assert_eq!(
+            tick(&node, &mut cu, &t, t0 + QUIET + secs(6)).await,
+            ["asked 109.199.124.187:19335 for blocks 226033 to 226132 (100 sent, 0 already here)"]
+        );
+        let asked = node.asked();
+        assert_eq!(asked.len(), 200);
+        assert!(asked.iter().all(|(_, id)| *id == 6), "only A is asked");
     }
 
     #[tokio::test]
