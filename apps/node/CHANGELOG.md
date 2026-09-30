@@ -116,6 +116,17 @@ blocks in 8 minutes, from a peer that serves old blocks to it. It never
 adds, bans or disconnects a peer, and never asks for a branch the app
 refuses.
 
+**easyNode now runs BTX engine 0.34.12, up from 0.34.9.** When the engine
+rejects a block, it now retires the whole branch of headers built on it,
+instead of keeping that branch as a longer chain it cannot get. A node that
+follows signatures catches up better across gaps. The other fixes of 0.34.10
+to 0.34.12 come with it. Your node keeps following the chain with the most
+work, as before: easyNode starts this engine in its legacy reorg mode, because
+the engine's new default would stop at a deep reorg and wait for someone to
+act. If an engine ever does stop at one, the status screen now says so. The
+update carries the new engine, and the first start after it puts the engine
+in place, once.
+
 ## [0.6.32] - 2026-09-28
 
 **Every node is held off two branches until BTX's developers rule on them.**
