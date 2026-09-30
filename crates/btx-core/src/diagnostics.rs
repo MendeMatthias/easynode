@@ -1154,9 +1154,10 @@ mod tests {
             ],
             attested_tip: None,
             stall: None,
-            catch_up: vec![crate::catchup_assist::refuses_old_line(
-                "109.199.124.187:19335",
-            )],
+            catch_up: vec![
+                crate::catchup_assist::refuses_old_line("109.199.124.187:19335"),
+                crate::catchup_assist::refuses_old_line("203.0.113.7:19335"),
+            ],
             log_warnings: vec![format!(
                 "[warning] signing key backup contains {wif}, update check via \
                  http://84.32.49.226:19335/status failed"
@@ -1168,9 +1169,13 @@ mod tests {
             published_hosts: crate::node::published_peer_hosts(),
         };
         let out = report(&input, &context);
-        for gone in [wif.as_str(), "84.32.49.226"] {
+        for gone in [wif.as_str(), "84.32.49.226", "203.0.113.7"] {
             assert!(!out.contains(gone), "{gone} survived end to end:\n{out}");
         }
+        assert!(
+            out.contains("  [peer address] does not serve old blocks to us"),
+            "a catch-up line about someone else's node keeps its sentence, not the address:\n{out}"
+        );
         assert!(
             out.contains("  109.199.124.187:19335 does not serve old blocks to us"),
             "the app's own archive peer is named:\n{out}"
