@@ -2128,7 +2128,7 @@ fn interpret_bool(value: &str) -> bool {
 /// sits (`common/config.cpp` ~111, `settings_target`). Otherwise (a
 /// general conf file) mainnet reads it as the engine does: `[main]`/
 /// `main.` and the default section are the engine's own two SEPARATE
-/// lists (`common/config.cpp:112`,
+/// lists (`common/config.cpp:113`,
 /// `m_settings.ro_config[key.section][key.name].push_back(...)`, at
 /// `84b998b4`, keyed first by the section `InterpretKey` computes, so a
 /// pin under `[test]` or with the `test.` prefix is in neither list and is
@@ -2149,40 +2149,57 @@ fn interpret_bool(value: &str) -> bool {
 /// ("Invalid compressed public key in -matmultrustedpubkey: 1",
 /// `init.cpp:1577-1583`).
 ///
-/// The two lists are not merged independently: `GetSettingsList`
-/// (`common/settings.cpp:216-259`) merges `[main]`'s list before the
-/// default section's (source order in `MergeSettings`,
-/// `common/settings.cpp:24-31,42-72`), and normally brings the default
-/// section's pins back even after `[main]` clears its own list (the
-/// "zombie" rule) - UNLESS `[main]`'s list ends up empty specifically
-/// because its OWN last entry was the negation
-/// (`SettingsSpan::last_negated`, `settings.cpp:280`), in which case the
-/// default section's pins are dropped too. That is the one cross-list rule
-/// this function follows.
+/// The two lists are merged `[main]`'s pins first, then the default
+/// section's (`GetSettingsList`, `common/settings.cpp:216-259`, source
+/// order in `MergeSettings`, `common/settings.cpp:24-31,42-74`), always:
+/// this function does NOT drop the default section's pins even when
+/// `[main]`'s own list ends in a negation.
 ///
-/// What it does NOT follow, since this function reads one file at a time
-/// and the app only takes the union of [`conf_pins`] and [`rw_conf_pins`]
-/// to avoid asking the engine to pin a key twice (never which file's value
-/// "wins"): the engine reads `btx_rw.conf` (`Source::CONFIG_FILE_RW`)
-/// and the command line BEFORE either conf-file list, in that same merge.
-/// A `btx_rw.conf` whose own list ends in a negation, with nothing pinned
-/// on the command line, makes the engine drop the conf file's two lists
-/// too, by the same "zombie" rule, one level up; `rw_conf_pins` and
-/// `conf_pins` are read independently here and do not know about each
-/// other, so this app would still report the conf file's pins as live.
+/// That IS one of the engine's real rules (the "zombie" revival,
+/// `prev_negated_empty = span.last_negated() && result.empty()`,
+/// `GetSettingsList` again), but only half of it: the engine drops the
+/// default section's pins on a `[main]`-ending negation ONLY WHEN
+/// `result` - which by then already holds whatever the command line and
+/// `btx_rw.conf` contributed, since those merge before either conf-file
+/// section - is STILL empty at that point. This function reads one conf
+/// file in isolation and has no way to know that, so it cannot apply the
+/// rule correctly; and getting it wrong the other way (dropping the
+/// default section's pins when the engine would have kept them) is worse
+/// than useless here: this app fills the command line with every shipped
+/// key it does not think is already pinned (the mirror and validating
+/// arms below, and `signing_key_self_pin`), so a key this function wrongly
+/// calls "not pinned" gets pushed on the command line, `result` is then
+/// NOT empty by the time the engine reaches the default section, the
+/// engine revives that same key from the conf file after all, and the
+/// engine refuses to start on the duplicate ("Duplicate
+/// -matmultrustedpubkey", `init.cpp:1591-1596`). Always counting the
+/// default section's pins as live avoids that: the one way this can still
+/// be wrong is the corner the engine's own rule actually drops them
+/// (`result` genuinely empty), and there the cost is at worst one pin this
+/// app fails to add that the engine also did not add - never a duplicate,
+/// never a refusal to start.
+///
+/// What this function does not follow at all, for the same one-file-at-a-
+/// time reason, and the app only takes the union of [`conf_pins`] and
+/// [`rw_conf_pins`] to avoid asking the engine to pin a key twice, never
+/// which file's value "wins": `rw_conf_pins` and `conf_pins` are read
+/// independently here and do not know about each other, so a
+/// `btx_rw.conf` whose own list ends in a negation would, on the engine's
+/// side, feed into that same `result.empty()` test for the conf file's
+/// sections one level up - not modeled here either, for the same reason
+/// and with the same "at worst a missing pin" cost.
 fn pins_read(conf: &Path, sections_dropped: bool) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(conf) else {
         return Vec::new();
     };
     let mut prefix = String::new();
     // `sections_dropped`: `default_pins` is the file's one flat list.
-    // Otherwise: `main_pins` is `[main]`/`main.`'s own list, `default_pins`
-    // is the default section's, and `main_ends_in_negation` is whether the
-    // LAST relevant `main` line was a real (clearing) negation - the one
-    // fact the cross-list merge below needs from `main`'s own list.
+    // Otherwise: `main_pins` is `[main]`/`main.`'s own list and
+    // `default_pins` is the default section's, each cleared independently
+    // by its own negations; see the doc comment for why they are always
+    // both kept, never one dropped for the other.
     let mut default_pins = Vec::new();
     let mut main_pins = Vec::new();
-    let mut main_ends_in_negation = false;
     for raw in text.lines() {
         let l = raw.split('#').next().unwrap_or("").trim();
         if l.len() >= 2 && l.starts_with('[') && l.ends_with(']') {
@@ -2217,32 +2234,17 @@ fn pins_read(conf: &Path, sections_dropped: bool) -> Vec<String> {
             &mut default_pins
         };
         if key == "matmultrustedpubkey" {
-            // A real pin, kept: whatever `main` owed a prior negation, it
-            // does not end there anymore.
-            if is_main {
-                main_ends_in_negation = false;
-            }
             if !value.is_empty() {
                 pins.push(value.to_ascii_lowercase());
             }
-        } else if key == "nomatmultrustedpubkey" {
-            let negates = interpret_bool(value);
-            if is_main {
-                main_ends_in_negation = negates;
-            }
-            if negates {
-                pins.clear();
-            }
+        } else if key == "nomatmultrustedpubkey" && interpret_bool(value) {
+            pins.clear();
         }
     }
     if sections_dropped {
         return default_pins;
     }
-    if main_ends_in_negation {
-        main_pins
-    } else {
-        main_pins.into_iter().chain(default_pins).collect()
-    }
+    main_pins.into_iter().chain(default_pins).collect()
 }
 
 /// The engine's record that this node runs on a signed snapshot whose
@@ -7009,12 +7011,12 @@ matmul: metal runtime_probe_ok, selecting metal\n\
     /// `ReadConfigStream`, `common/config.cpp:98-106`). `nomatmultrustedpubkey=0`
     /// is the documented double negative and does NOT clear
     /// (`InterpretValue`'s `value && !InterpretBool(*value)` arm) - though
-    /// it is not harmless: the engine reads that line as a bogus `"1"` pin
-    /// value (`GetArgs`, `common/args.cpp:369-375`) and refuses to start
-    /// ("Invalid compressed public key in -matmultrustedpubkey: 1",
-    /// `init.cpp:1577-1583`), so a conf with it never actually reaches the
-    /// app's pin-reading code in practice; this test only checks that
-    /// `pins_read` itself does not treat the line as a clear. A negation
+    /// it is not harmless: `conf_pins` runs, here as it does while building
+    /// launch arguments (~1225, ~1287), before the app ever starts the
+    /// engine on this conf, and the engine reads that same line as a bogus
+    /// `"1"` pin value (`GetArgs`, `common/args.cpp:369-375`) and refuses to
+    /// start ("Invalid compressed public key in -matmultrustedpubkey: 1",
+    /// `init.cpp:1577-1583`) once the app does launch it. A negation
     /// under `[test]` or `test.` does not touch mainnet's list, same as a
     /// pin there is not read; one under `[main]` or `main.` does, same as
     /// the section tests above (also see
@@ -7105,16 +7107,19 @@ matmul: metal runtime_probe_ok, selecting metal\n\
     }
 
     /// The engine keeps a conf file's `[main]`/`main.` pins and its default
-    /// section's pins as two separate lists (`common/config.cpp:112`,
-    /// `m_settings.ro_config[key.section][key.name]`, at `84b998b4`): a
-    /// negation clears only its own section's list
+    /// section's pins as two separate lists (`common/config.cpp:113`,
+    /// `m_settings.ro_config[key.section][key.name].push_back(...)`, at
+    /// `84b998b4`): a negation clears only its own section's list
     /// (`SettingsSpan::negated`, `common/settings.cpp:281-287`), and
     /// `GetSettingsList` (`common/settings.cpp:216-259`) merges `[main]`'s
-    /// list before the default section's, bringing the default section's
-    /// pins back even after `[main]` clears its own - UNLESS `[main]`'s
-    /// list ends up empty specifically because ITS OWN last entry was the
-    /// negation (`SettingsSpan::last_negated`, `settings.cpp:280`), in
-    /// which case the default section's pins are dropped too.
+    /// list before the default section's, so `pins_read` always returns
+    /// `[main]`'s pins first, then the default section's. See
+    /// `pins_read`'s own doc comment for why it does NOT also apply the
+    /// engine's further rule that drops the default section's pins when
+    /// `[main]`'s own list ends in a negation: that rule needs to know
+    /// whether the command line and `btx_rw.conf` already contributed
+    /// something, which this function, reading one conf file alone,
+    /// cannot.
     #[test]
     fn pins_read_keeps_the_conf_files_two_sections_separate() {
         let dir = signed_snapshot_datadir("conf-pins-sections-separate");
@@ -7170,8 +7175,14 @@ matmul: metal runtime_probe_ok, selecting metal\n\
             "K5 then K4, engine order"
         );
 
-        // [main]'s own list ending in a negation (nothing survives past
-        // it) DOES drop the default section's pins too.
+        // [main]'s own list ending in a negation: the engine only drops
+        // the default section's pins here when `result` (which already
+        // holds anything from the command line and btx_rw.conf, merged
+        // before either conf-file section) is STILL empty at that point
+        // (`GetSettingsList`'s `prev_negated_empty = span.last_negated()
+        // && result.empty()`, `settings.cpp:216-259`). This function reads
+        // one conf file in isolation and cannot know that, so it always
+        // keeps the default section's pin: K6 survives.
         std::fs::write(
             &conf,
             format!(
@@ -7181,11 +7192,7 @@ matmul: metal runtime_probe_ok, selecting metal\n\
             ),
         )
         .unwrap();
-        assert_eq!(
-            conf_pins(&conf),
-            Vec::<String>::new(),
-            "[main] ends in a negation, so even the default section's pin is dropped"
-        );
+        assert_eq!(conf_pins(&conf), vec![k(6)]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
