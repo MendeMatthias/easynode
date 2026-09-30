@@ -141,6 +141,8 @@ pub struct Helper {
     /// When the engine last connected blocks of its own: the tip rose while
     /// no batch of ours was out, or went past our batch's last block.
     engine_moved_at: Option<Instant>,
+    /// When it did so the time before.
+    engine_moved_before: Option<Instant>,
     batch: Option<Batch>,
     /// The peer whose last batch connected, and whether that batch was of old
     /// blocks for it: asked first, and when it has served old blocks to us,
@@ -167,9 +169,10 @@ pub struct Helper {
     /// Set when the help pauses with [`Why::NoOldBlocks`]; kept while the
     /// engine counts as fetching for 30 seconds after each block its own
     /// rescue brings (that holds the help off, not the conclusion); cleared
-    /// when the help asks a peer (so before
-    /// any batch of it connects), when a peer the help may ask is connected on
-    /// two ticks in a row, or when the help stops.
+    /// when the help asks a peer (so before any batch of it connects), when a
+    /// peer the help may ask is connected on two ticks in a row, when the
+    /// engine really fetches (two blocks of its own within [`QUIET`], which
+    /// its 120-second rescue never brings), or when the help stops.
     no_old_blocks: bool,
     /// While `no_old_blocks` holds: the last tick saw a peer the help may ask.
     askable_last_tick: bool,
@@ -186,6 +189,7 @@ impl Helper {
             archive,
             quiet_since: None,
             engine_moved_at: None,
+            engine_moved_before: None,
             batch: None,
             last_good: None,
             tried: Vec::new(),
@@ -242,7 +246,7 @@ impl Helper {
         match self.quiet_since {
             Some((was, _)) if was == tip => return,
             Some((was, _)) if tip > was && self.batch.as_ref().is_none_or(|b| tip > b.to) => {
-                self.engine_moved_at = Some(now);
+                self.engine_moved_before = self.engine_moved_at.replace(now);
             }
             _ => {}
         }
@@ -286,6 +290,17 @@ impl Helper {
         }
         self.askable_last_tick = askable;
         if self.engine_fetching(s.peers, s.tip, s.now) {
+            // A second block of its own within QUIET: the engine is really
+            // fetching, which its rescue (one block per 120 seconds) never
+            // is, so the conclusion that the node is left to the slow rescue
+            // ends.
+            if self
+                .engine_moved_before
+                .is_some_and(|at| s.now.duration_since(at) < QUIET)
+            {
+                self.no_old_blocks = false;
+                self.askable_last_tick = false;
+            }
             return self.idle(Why::EngineFetching);
         }
         if let Some(b) = self.batch.take() {
@@ -1397,6 +1412,36 @@ mod tests {
         assert!(!h.no_archive_serves_old_blocks());
         let d = h.decide(&seen(at + QUIET, tip, &next, &with_b));
         assert_eq!(asked_of(&d).0, 9);
+    }
+
+    #[test]
+    fn no_archive_serves_old_blocks_ends_when_the_engine_fetches_them_itself() {
+        // A full-history peer that is not one of the app's archive peers
+        // connects, and the engine fetches the old blocks from it at full
+        // speed. The conclusion (and the card's "which is slow") ends with the
+        // second block of its own within 30 seconds, which the engine's
+        // 120-second rescue never brings.
+        let t0 = Instant::now();
+        let mut h = concluded(t0);
+        h.take_news();
+        let fast = |tip: u64| {
+            let mut other = recorded(30, "5.6.7.8:19335", FULL, 233_481);
+            other.connection_type = "outbound-full-relay".into();
+            other.inflight = (tip as i64 + 1..=tip as i64 + 16).collect();
+            [recorded(6, A, LIMITED, 233_481), other]
+        };
+        let tip = 225_977;
+        let d = h.decide(&seen(t0 + secs(60), tip, &next_from(tip), &fast(tip)));
+        assert_eq!(d, Decision::Wait(Why::EngineFetching));
+        assert!(
+            h.no_archive_serves_old_blocks(),
+            "one block may be the rescue"
+        );
+        let tip = 226_027;
+        let d = h.decide(&seen(t0 + secs(63), tip, &next_from(tip), &fast(tip)));
+        assert_eq!(d, Decision::Wait(Why::EngineFetching));
+        assert!(!h.no_archive_serves_old_blocks());
+        assert!(h.take_news().is_empty());
     }
 
     #[test]
