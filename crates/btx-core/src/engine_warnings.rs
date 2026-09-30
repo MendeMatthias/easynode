@@ -34,13 +34,18 @@
 //!   in the engine's own words "not a consensus invalidity", and never cleared
 //!   while the node runs. The catch-up line already says when a gap is
 //!   closing slowly, from the gap's own trend.
-//! * **Deep reorg** (validation.cpp:10564). Never cleared while the node runs
-//!   either, and on this network the reorg it reports is usually a recovery: a
-//!   node stranded on one of September's dead branches that rejoins the main
-//!   chain reorganises hundreds of blocks. It would then carry "this may
-//!   indicate a 51% attack -- raise required confirmations and investigate"
-//!   until its next restart, for the event that fixed it, with nothing for the
-//!   person to do.
+//! * **Deep reorg, followed** (validation.cpp:10635 at v0.34.12). Never
+//!   cleared while the node runs either, and on this network the reorg it
+//!   reports is usually a recovery: a node stranded on one of September's dead
+//!   branches that rejoins the main chain reorganises hundreds of blocks. It
+//!   would then carry "this may indicate a 51% attack -- raise required
+//!   confirmations and investigate" until its next restart, for the event
+//!   that fixed it, with nothing for the person to do. The same warning ends
+//!   "Parking the branch" when the engine refused to switch instead
+//!   (validation.cpp:10643): that one IS shown, as needing attention, because
+//!   the node then stays where it is until somebody acts. easyNode's launch
+//!   (`-parkdeepreorg=0`, plus `-reorgpolicy=legacy` from 0.34.12) never
+//!   parks, so it appears only when something else chose parking.
 //! * **Pre-release build**. Which engine ships is this project's choice, not
 //!   something the person running it can change.
 //! * **Unknown rules being signalled** (as opposed to activated). Miners
@@ -92,6 +97,10 @@ pub enum EngineWarning {
     /// `LARGE_WORK_INVALID_CHAIN`: a longer chain exists that the node holds
     /// invalid.
     RefusingInvalidChain,
+    /// `DEEP_REORG_DETECTED` when the engine PARKED the branch: the node stays
+    /// on its chain rather than replacing its last `depth` blocks, until
+    /// somebody acts.
+    ParkedDeepReorg { depth: Option<u64> },
     /// A warning this version does not recognise, first sentence only.
     Other { text: String },
 }
@@ -114,6 +123,7 @@ impl EngineWarning {
                 | EngineWarning::BehindSigners { .. }
                 | EngineWarning::ClockOff { .. }
                 | EngineWarning::OutOfDate
+                | EngineWarning::ParkedDeepReorg { .. }
         )
     }
 
@@ -202,6 +212,17 @@ impl EngineWarning {
                  computers stay on a chain that breaks the rules, as after the split at height \
                  227,313."
                 .to_string(),
+            EngineWarning::ParkedDeepReorg { depth } => {
+                let blocks = match depth {
+                    Some(n) => format!("its last {} blocks", group(*n)),
+                    None => "some of its recent blocks".to_string(),
+                };
+                format!(
+                    "Your node found a branch that would replace {blocks} and parked it, so it \
+                     stays on the chain it has until someone decides which one is right. If the \
+                     rest of the network is on that branch, your node has stopped following it."
+                )
+            }
             EngineWarning::Other { text } => format!("Your node's engine reports: {text}"),
         }
     }
@@ -257,6 +278,11 @@ pub fn classify(raw: &str) -> Option<EngineWarning> {
     }
     if t.contains("Found invalid chain more than") {
         return Some(EngineWarning::RefusingInvalidChain);
+    }
+    if t.contains(DEEP_REORG_PARKED) {
+        return Some(EngineWarning::ParkedDeepReorg {
+            depth: number_after(t, "would reorganize "),
+        });
     }
     Some(EngineWarning::Other {
         text: first_sentence(t),
@@ -325,7 +351,17 @@ const HIDDEN: [(&str, &str, &str); 5] = [
     ),
 ];
 
+/// How btxd ends a "Deep reorg detected" alarm when it PARKS the branch
+/// instead of following it (validation.cpp:10643 at v0.34.12, and :10572 at
+/// v0.34.9). It opens with the same words as the follow alarm the table above
+/// hides, and it is the opposite case: the node did not switch, and stays
+/// where it is until somebody acts. So it is never hidden.
+const DEEP_REORG_PARKED: &str = "Parking the branch";
+
 fn hidden_kind(t: &str) -> Option<(&'static str, &'static str)> {
+    if t.contains(DEEP_REORG_PARKED) {
+        return None;
+    }
     HIDDEN
         .iter()
         .find(|(phrase, _, _)| t.contains(phrase))
@@ -480,6 +516,16 @@ mod tests {
         the most-work chain (warn-only). This may indicate a 51% attack -- raise required \
         confirmations and investigate.";
 
+    /// validation.cpp:10635 and :10643 at v0.34.12, the same alarm when the
+    /// engine PARKS the branch instead of following it. On a legacy launch
+    /// with `-parkdeepreorg=0` it never parks; this is what a node shows when
+    /// something else chose parking. The wording is the engine's, the heights
+    /// are made up.
+    const DEEP_REORG_PARKED: &str = "Deep reorg detected: a branch would reorganize 17 blocks \
+        (profile=emergency; warn=6; park=6; tip=233453, fork=233436, candidate=233470). Parking \
+        the branch and staying on the current chain pending operator action. This may indicate \
+        a 51% attack -- raise required confirmations and investigate.";
+
     fn info(warnings: &[&str], blocks: u64, headers: u64, ibd: bool) -> BlockchainInfo {
         BlockchainInfo {
             blocks,
@@ -629,6 +675,42 @@ mod tests {
         }
     }
 
+    /// The two cases share their opening words and are opposites. Following
+    /// (and the engine's two automatic recoveries) is what fixed a stranded
+    /// node, so it stays hidden. Parking means the node stays where it is
+    /// until somebody acts, which is the one reorg alarm a person must see.
+    #[test]
+    fn a_parked_deep_reorg_asks_for_attention_and_a_followed_one_stays_hidden() {
+        for followed in [
+            DEEP_REORG,
+            &DEEP_REORG_PARKED.replace(
+                "Parking the branch and staying on the current chain pending operator action.",
+                "Activating the uniquely authenticated shallow-race recovery branch.",
+            ),
+            &DEEP_REORG_PARKED.replace(
+                "Parking the branch and staying on the current chain pending operator action.",
+                "Auto-activating the honest deep-reorg branch (deep-fork auto-resolve): observed \
+                 live as our tip climbed and sustained.",
+            ),
+        ] {
+            assert_eq!(classify(followed), None, "{followed}");
+            let n = &all_notices(&info_with(&[followed]))[0];
+            assert!(n.hidden_because.is_some() && !n.needs_attention, "{n:?}");
+        }
+
+        let w = classify(DEEP_REORG_PARKED).expect("a parked deep reorg is shown");
+        assert_eq!(w, EngineWarning::ParkedDeepReorg { depth: Some(17) });
+        assert!(w.needs_attention());
+        assert!(w.is_note());
+        assert!(w.message().contains("17 blocks"), "{}", w.message());
+        let n = &all_notices(&info_with(&[DEEP_REORG_PARKED]))[0];
+        assert_eq!(n.hidden_because, None);
+        assert!(n.needs_attention);
+        assert_eq!(n.message, w.message());
+        let node = info(&[DEEP_REORG, DEEP_REORG_PARKED], 233_453, 233_470, false);
+        assert_eq!(from_node(&node), vec![w]);
+    }
+
     #[test]
     fn an_unknown_warning_is_shown_in_the_engines_words_not_hidden() {
         let w = classify(
@@ -755,6 +837,8 @@ mod tests {
             EngineWarning::RefusedWrongDifficulty { height: Some(1) },
             EngineWarning::RefusedWrongDifficulty { height: None },
             EngineWarning::RefusingInvalidChain,
+            EngineWarning::ParkedDeepReorg { depth: Some(17) },
+            EngineWarning::ParkedDeepReorg { depth: None },
         ];
         for w in all {
             let m = w.message();
