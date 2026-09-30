@@ -14,10 +14,24 @@ import { followRowVisible, stalledFollowOffer, validationView } from "./validati
 import {
   CHAIN_BLOCKS_PER_HOUR,
   type CatchupSample,
+  type TrendReading,
   cannotCatchUp,
   catchupLine,
-  pushSample,
+  chainCardMessage,
+  recordReading,
+  staleCard,
+  trendReading,
 } from "./catchup-trend";
+import { type HistoryCheck, historyCheckView } from "./history-check";
+import {
+  NO_GPU_REASON,
+  type StartChoice,
+  announcer,
+  chipNoticeVisible,
+  setupArgs,
+  startChoiceView,
+  switchLaterShown,
+} from "./start-choice";
 import {
   classifyCheckFailure,
   checkFailureMessage,
@@ -211,6 +225,18 @@ interface NodeStatusInfo {
   rc_trusted_mirror: boolean;
   /** The owner chose to follow signatures on a machine that could validate. */
   follow_signatures: boolean;
+  /** This machine may check blocks itself, as far as the app can know before
+   *  the engine's first start. The setup screen greys out Full check when not. */
+  full_check_possible: boolean;
+  /** The setup screen selects Full check first: an NVIDIA machine. False on a
+   *  Mac, where Quick start comes first and Full check can still be picked. */
+  full_check_first: boolean;
+  /** The engine refused this Mac's graphics chip, so the node follows
+   *  signatures. The status screen says so once per engine. */
+  chip_refused: boolean;
+  /** How far the background check of the snapshot's older history has got;
+   *  null when there is none running. */
+  history_check: HistoryCheck | null;
   /**
    * Bytes uploaded to peers this run. Null when stopped or when the node did
    * not answer `getnettotals` — the UI drops the claim rather than showing a
@@ -520,6 +546,49 @@ function setStep(active: number, downloadPct?: number) {
   }
 }
 
+/** The owner's pick on the setup screen, null until they touch it, so the
+ *  default can follow what the machine can do (start-choice.ts). */
+let pickedChoice: StartChoice | null = null;
+
+function reflectStartChoice(status: NodeStatusInfo, inProgress: boolean): void {
+  const view = startChoiceView(status.full_check_possible, status.full_check_first, pickedChoice);
+  const quick = $<HTMLInputElement>("choice-quick");
+  const full = $<HTMLInputElement>("choice-full");
+  quick.checked = view.selected === "quick_start";
+  full.checked = view.selected === "full_check";
+  // No changing course once setup has started; the choice is already recorded.
+  quick.disabled = inProgress;
+  full.disabled = inProgress || view.fullCheckDisabled;
+  $("choice-quick-label").classList.toggle("is-selected", quick.checked);
+  $("choice-full-label").classList.toggle("is-selected", full.checked);
+  $("choice-full-label").classList.toggle("is-disabled", view.fullCheckDisabled);
+  // Locked, not dimmed: the pick stays readable while setup runs.
+  $("choice-quick-label").classList.toggle("is-locked", inProgress);
+  $("choice-full-label").classList.toggle("is-locked", inProgress);
+  const reason = $("choice-full-reason");
+  reason.hidden = !view.fullCheckDisabled;
+  reason.textContent = view.fullCheckDisabled ? NO_GPU_REASON : "";
+  $("start-choice-switch").hidden = !switchLaterShown(status.full_check_possible);
+}
+
+/** What the setup button sends: the owner's pick, or the default for this
+ *  machine. */
+function currentChoice(): StartChoice {
+  return startChoiceView(
+    lastStatus?.full_check_possible ?? false,
+    lastStatus?.full_check_first ?? false,
+    pickedChoice,
+  ).selected;
+}
+
+for (const id of ["choice-quick", "choice-full"]) {
+  $<HTMLInputElement>(id).addEventListener("change", (e) => {
+    const box = e.target as HTMLInputElement;
+    if (box.checked) pickedChoice = box.value as StartChoice;
+    if (lastStatus) reflectStartChoice(lastStatus, setupInFlight);
+  });
+}
+
 function renderWizard(status: NodeStatusInfo) {
   showScreen("wizard");
   const p = status.phase;
@@ -530,6 +599,8 @@ function renderWizard(status: NodeStatusInfo) {
     p.phase === "starting" ||
     p.phase === "warming" ||
     p.phase === "loading_snapshot";
+
+  reflectStartChoice(status, inProgress);
 
   // The button IS the live readout while setting up; idle otherwise.
   if (inProgress) setSetupButton(true, setupPhaseLabel(p));
@@ -929,8 +1000,9 @@ function renderStatus(status: NodeStatusInfo) {
   const errCard = $("status-error");
 
   reflectPeerNames(status);
-  reflectFork(status);
   reflectEngineNotes(status);
+  reflectChipNotice(status);
+  reflectHistoryCheck(status);
   renderRole(status);
   reflectSignerRow(status);
   // The close dialog's warning follows the wire on every tick, so a dialog
@@ -954,21 +1026,16 @@ function renderStatus(status: NodeStatusInfo) {
   lastActive = mode === "ready" || mode === "syncing";
   core?.setActive(lastActive);
 
-  // Record the gap on every poll while the node claims to be ready, so the
-  // wording below can tell a closing gap from a pinned one. Cheap, bounded,
-  // and the only place the sample is available.
-  if (p.phase === "ready") {
-    catchupSamples = pushSample(
-      catchupSamples,
-      { at: Date.now(), behind: p.blocks_behind, height: p.height },
-      Date.now(),
-    );
-  } else if (p.phase !== "syncing") {
-    // A stop, an error or a fresh start invalidates the history: a gap
-    // measured before a restart says nothing about the one after it.
-    catchupSamples = [];
-  }
+  // Record the gap on every poll while the node runs, so the wording below
+  // can tell a closing gap from a pinned one, and a syncing node that adds
+  // blocks from one that has stopped. Cheap, bounded, and the only place the
+  // sample is available. Which phases feed it, with what gap, and which start
+  // it over is catchup-trend.ts `trendReading`.
+  const reading = trendReading(p, Date.now());
+  catchupSamples = recordReading(catchupSamples, reading, Date.now());
 
+  // After the sample above, so the stale card judges the trend as it is now.
+  reflectFork(status, reading);
   reflectFollowOffer(status);
 
   let height = 0;
@@ -1153,6 +1220,7 @@ async function beginSetup() {
   // Immediate feedback on the click: the button becomes a spinner + live label
   // and the "come back later" note appears, before any backend round-trip.
   setSetupButton(true, "Setting up your node…");
+  if (lastStatus) reflectStartChoice(lastStatus, true);
   $<HTMLButtonElement>("retry-btn").disabled = true;
   wizardProgress.hidden = false;
   setStep(0);
@@ -1164,7 +1232,7 @@ async function beginSetup() {
     // Completion truth comes from the polled status.setup_complete — a
     // resolved invoke is NOT proof (the backend rejects a duplicate run with
     // an error, and older builds resolved it silently).
-    await invoke("begin_setup");
+    await invoke("begin_setup", setupArgs(currentChoice()));
   } catch (e) {
     $("wizard-error-msg").textContent = String(e);
     wizardError.hidden = false;
@@ -1665,34 +1733,118 @@ function reflectArchiveService(status: NodeStatusInfo): void {
   el.classList.toggle("needs-attention", status.archive_service_needs_attention);
 }
 
+/** Whether the stale sentence was amber on a syncing node at the last poll.
+ *  A syncing node's card keeps amber until its hour's pace is back at the
+ *  chain's (catchup-trend.ts `staleCard`, `wasAmber`), so it does not blink. */
+let syncingStaleAmber = false;
+
 /**
- * A longer chain exists that this node cannot obtain blocks for. Shown in
- * amber beside the height and never guessed: the sentence is btx_core::fork's,
- * the facts are btxd's own getchaintips. Hidden the moment the verdict
- * clears, so a stale alarm never outlives the condition, and hidden on any
- * phase that is not running: a stopped node has no view of the chain to be
- * behind with.
+ * The chain card, one sentence about whether this node follows the chain:
+ * its newest block is hours old by the clock, a longer chain exists that it
+ * cannot obtain blocks for, or it is behind the signers. Amber, and never
+ * guessed: the sentences are Rust's (btx_core::fork, engine_warnings), the
+ * facts btxd's own. Before the catch-up trend is measured it can instead say
+ * "Checking whether your node is catching up..." in the quiet colours, which
+ * is not a verdict and yields to both of the others (catchup-trend.ts
+ * `staleCard` and `chainCardMessage`). Hidden the moment the verdict clears,
+ * so a stale alarm never outlives the condition, and hidden on any phase that
+ * is not running: a stopped node has no view of the chain to be behind with.
  */
-function reflectFork(status: NodeStatusInfo): void {
+function reflectFork(status: NodeStatusInfo, reading: TrendReading): void {
   const card = $("fork-card");
   const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
-  // A stale tip outranks a fork verdict. A fork says "there is a better chain
-  // we cannot reach"; a stale tip says "the newest block we have is hours old
-  // however healthy everything else reads", which is the condition every
-  // peer-derived signal in this app is blind to by construction.
-  //
-  // Behind the signers comes last because it is the earliest and the least
-  // specific: it fires minutes into a split the node cannot see, before the
-  // tip is old enough to be stale, and says less than either once they do.
-  const message =
-    status.tip_stale_message ?? status.fork_message ?? status.behind_signers_message;
-  if (!running || !message) {
+  const stale = staleCard(status.tip_stale_message, reading, catchupSamples, Date.now(), syncingStaleAmber);
+  syncingStaleAmber = reading.kind === "syncing" && stale?.tone === "amber";
+  const shown = chainCardMessage(stale, status.fork_message, status.behind_signers_message);
+  if (!running || !shown) {
     card.hidden = true;
     return;
   }
   card.hidden = false;
-  $("fork-msg").textContent = message;
+  card.classList.toggle("is-calm", shown.calm);
+  $("fork-msg").textContent = shown.message;
 }
+
+/** The background check of the snapshot's older history: one line and a thin
+ *  bar under the status line while it runs (history-check.ts). Hidden on a
+ *  node that is not running, and the moment the engine reports it done. */
+function reflectHistoryCheck(status: NodeStatusInfo): void {
+  const wrap = $("history-check");
+  const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
+  const view = running ? historyCheckView(status.history_check) : null;
+  if (!view) {
+    wrap.hidden = true;
+    return;
+  }
+  wrap.hidden = false;
+  $("history-line").textContent = view.line;
+  $("history-fill").style.width = `${view.pct}%`;
+  $("history-bar").setAttribute("aria-valuenow", String(view.pct));
+}
+
+/** The note after the engine turned this Mac's chip down, once per engine
+ *  (start-choice.ts `chipNoticeVisible`). Remembered in localStorage by engine
+ *  tag; where storage is unavailable it still closes for this run. */
+const CHIP_NOTICE_KEY = "ebtx-node.chip-notice-seen";
+let chipNoticeClosed = false;
+/** The always-present live region that says the notice, then lets it go. */
+const announceChip = announcer($("chip-announce"));
+
+function reflectChipNotice(status: NodeStatusInfo): void {
+  let seen: string | null = null;
+  try {
+    seen = localStorage.getItem(CHIP_NOTICE_KEY);
+  } catch {
+    // No storage: show it until OK is pressed in this run.
+  }
+  const card = $("chip-card");
+  const shown =
+    !chipNoticeClosed &&
+    chipNoticeVisible(status.chip_refused, status.rc_trusted_mirror, seen, status.node_tag);
+  // Spoken through the region that is always there, once, as the notice
+  // appears (a poll that rewrote the same text could repeat it), and cleared
+  // a few seconds later, since the card still shows it.
+  if (shown && card.hidden) announceChip($("chip-msg").textContent ?? "");
+  if (!shown && $("chip-announce").textContent) announceChip("");
+  card.hidden = !shown;
+}
+
+/** The element focus moves to when `leaving` is about to hide with focus in
+ *  it: the next one on the screen that can take focus, or the one before it
+ *  when there is none after. Without this a keyboard user is dropped back to
+ *  the top of the page. */
+function focusTargetAfter(leaving: HTMLElement, screen: HTMLElement): HTMLElement | null {
+  const candidates = Array.from(
+    screen.querySelectorAll<HTMLElement>(
+      'button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter(
+    (el) => !leaving.contains(el) && !el.matches(":disabled") && el.getClientRects().length > 0,
+  );
+  const after = candidates.find(
+    (el) => leaving.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING,
+  );
+  const before = candidates.filter(
+    (el) => leaving.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_PRECEDING,
+  );
+  return after ?? before[before.length - 1] ?? null;
+}
+
+$("chip-ok").addEventListener("click", () => {
+  chipNoticeClosed = true;
+  try {
+    if (lastStatus) localStorage.setItem(CHIP_NOTICE_KEY, lastStatus.node_tag);
+  } catch {
+    // Closed for this run; it may show again on the next.
+  }
+  const card = $("chip-card");
+  // Only when the card held focus (a keyboard press, or a browser that
+  // focuses a clicked button): hiding it would drop focus to the page.
+  const next = card.contains(document.activeElement) ? focusTargetAfter(card, screenStatus) : null;
+  card.hidden = true;
+  announceChip("");
+  next?.focus();
+});
 
 /**
  * What btxd itself is warning about, beyond what the Block checking and chain
