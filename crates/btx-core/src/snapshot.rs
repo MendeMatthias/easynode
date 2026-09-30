@@ -665,7 +665,8 @@ enum Signed {
 }
 
 /// A confirmed or pinned pair, checked against this node and loaded through
-/// `crate::confirmed_load`.
+/// `crate::confirmed_load`; a confirmed pair refused at load time is followed
+/// by the pinned pair once ([`load_in_order`]).
 async fn load_signed(
     rpc: &RpcClient,
     btx_cli: &Path,
@@ -700,18 +701,15 @@ async fn load_signed(
     );
     let runner = CliRunner::for_datadir(btx_cli, datadir);
     let env = crate::operators::regtest_env();
-    signed_from(
-        confirmed_load::load(
-            rpc,
-            &runner,
-            &pair,
-            &view,
-            &Holds::compiled(),
-            env.as_deref(),
-            datadir,
-        )
-        .await,
-    )
+    let holds = Holds::compiled();
+    let (runner, env, holds, view) = (&runner, env.as_deref(), &holds, &view);
+    let load = |pair: crate::attested_snapshot::ReadyPair| async move {
+        confirmed_load::load(rpc, runner, &pair, view, holds, env, datadir).await
+    };
+    // The pinned pair's base is below the confirmed one's, so the headers
+    // waited for above already reach it.
+    let pinned = || crate::attested_snapshot::prepare_pinned(datadir, anchor_height);
+    signed_from(load_in_order(pair, load, pinned).await)
 }
 
 /// A snapshot chainstate a signed-only load finds already there, before it
@@ -744,6 +742,47 @@ fn signed_from(
         }
         Err(e) if e.restore_chain_data() => Signed::HeldRootOnChain(e.to_string()),
         Err(e) => Signed::NotLoaded(e.to_string()),
+    }
+}
+
+/// Section 9's order at load time. `load` loads one pair. A confirmed pair
+/// it refuses while leaving the chainstate as it was (the engine said no,
+/// `LoadError::Engine`, or the pair no longer checks out against this node,
+/// `LoadError::NotConfirmed`) goes to the pinned pair once (`pinned`, asked
+/// only then), before the caller falls to the compiled snapshot. Every other
+/// error stands: after one with `LoadError::restore_chain_data` the engine
+/// may hold a snapshot the app refuses, and nothing else is loaded over it.
+async fn load_in_order<L, LF, P, PF>(
+    pair: crate::attested_snapshot::ReadyPair,
+    load: L,
+    pinned: P,
+) -> Result<crate::confirmed_load::Loaded, crate::confirmed_load::LoadError>
+where
+    L: Fn(crate::attested_snapshot::ReadyPair) -> LF,
+    LF: std::future::Future<
+        Output = Result<crate::confirmed_load::Loaded, crate::confirmed_load::LoadError>,
+    >,
+    P: FnOnce() -> PF,
+    PF: std::future::Future<Output = Option<crate::attested_snapshot::ReadyPair>>,
+{
+    use crate::attested_snapshot::PairKind;
+    use crate::confirmed_load::LoadError;
+    let kind = pair.kind;
+    let height = pair.height;
+    match load(pair).await {
+        Err(e @ (LoadError::Engine(_) | LoadError::NotConfirmed(_)))
+            if kind == PairKind::Confirmed =>
+        {
+            let Some(next) = pinned().await else {
+                return Err(e);
+            };
+            eprintln!(
+                "[snapshot] confirmed pair {height} not loaded ({e}); trying the pinned pair {}",
+                next.height
+            );
+            load(next).await
+        }
+        other => other,
     }
 }
 
@@ -1836,6 +1875,135 @@ mod tests {
                 operators: vec![],
             })
         );
+    }
+
+    /// Final review M3, the design's order (section 9) at load time: a
+    /// confirmed pair the load refuses while leaving the chainstate as it
+    /// was (the engine said no, the pair no longer checks out) goes to the
+    /// pinned pair once, before the compiled snapshot. A refusal after which
+    /// the engine may hold a snapshot the app refuses never goes on, nor
+    /// does a pinned pair refused, nor a hold that could not be refused.
+    #[tokio::test]
+    async fn a_confirmed_pair_refused_at_load_time_tries_the_pinned_pair_once() {
+        use crate::attested_snapshot::{PairKind, ReadyPair};
+        use crate::confirmed_load::{LoadError, Loaded};
+        let pair = |kind, height| ReadyPair {
+            kind,
+            height,
+            file: PathBuf::from("f"),
+            manifest: PathBuf::from("m"),
+        };
+        let engine = LoadError::Engine("error code: -32603".into());
+        let recheck = LoadError::NotConfirmed("the node did not say".into());
+        let held = LoadError::HeldRootOnChain {
+            height: 228_146,
+            root: "ab".into(),
+        };
+        let unanswered = LoadError::EngineUnanswered("EOF".into());
+        let not_refused = LoadError::HeldNotRefused("no answer".into());
+        let ok = |height| {
+            Ok(Loaded {
+                height,
+                signatures: 1,
+                superseded: false,
+            })
+        };
+        type Answer = Result<Loaded, LoadError>;
+        let cases: Vec<(PairKind, Answer, bool, Answer, Vec<PairKind>)> = vec![
+            (
+                PairKind::Confirmed,
+                ok(232_000),
+                true,
+                ok(232_000),
+                vec![PairKind::Confirmed],
+            ),
+            (
+                PairKind::Confirmed,
+                Err(engine.clone()),
+                true,
+                ok(225_927),
+                vec![PairKind::Confirmed, PairKind::Pinned],
+            ),
+            (
+                PairKind::Confirmed,
+                Err(recheck.clone()),
+                true,
+                ok(225_927),
+                vec![PairKind::Confirmed, PairKind::Pinned],
+            ),
+            (
+                PairKind::Confirmed,
+                Err(engine.clone()),
+                false,
+                Err(engine.clone()),
+                vec![PairKind::Confirmed],
+            ),
+            (
+                PairKind::Confirmed,
+                Err(held.clone()),
+                true,
+                Err(held.clone()),
+                vec![PairKind::Confirmed],
+            ),
+            (
+                PairKind::Confirmed,
+                Err(unanswered.clone()),
+                true,
+                Err(unanswered.clone()),
+                vec![PairKind::Confirmed],
+            ),
+            (
+                PairKind::Confirmed,
+                Err(not_refused.clone()),
+                true,
+                Err(not_refused.clone()),
+                vec![PairKind::Confirmed],
+            ),
+            (
+                PairKind::Pinned,
+                Err(engine.clone()),
+                true,
+                Err(engine.clone()),
+                vec![PairKind::Pinned],
+            ),
+        ];
+        for (first, answer, pinned_there, want, want_loads) in cases {
+            let loads = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let asked = Arc::new(AtomicBool::new(false));
+            let first_answer = answer.clone();
+            let log = loads.clone();
+            let load = move |p: ReadyPair| {
+                let log = log.clone();
+                let answer = if p.kind == first {
+                    first_answer.clone()
+                } else {
+                    ok(p.height)
+                };
+                async move {
+                    log.lock().unwrap().push(p.kind);
+                    answer
+                }
+            };
+            let was_asked = asked.clone();
+            let pinned = move || async move {
+                was_asked.store(true, Ordering::SeqCst);
+                pinned_there.then(|| pair(PairKind::Pinned, 225_927))
+            };
+            let got = load_in_order(pair(first, 232_000), load, pinned).await;
+            assert_eq!(got, want, "{first:?} {answer:?} {pinned_there}");
+            assert_eq!(*loads.lock().unwrap(), want_loads, "{first:?} {answer:?}");
+            if want_loads.len() == 1
+                && !matches!(
+                    answer,
+                    Err(LoadError::Engine(_) | LoadError::NotConfirmed(_))
+                )
+            {
+                assert!(
+                    !asked.load(Ordering::SeqCst),
+                    "{first:?} {answer:?}: the pinned pair is not even prepared"
+                );
+            }
+        }
     }
 
     /// A signed load, or a snapshot chainstate that turned up while one was

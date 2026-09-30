@@ -764,13 +764,36 @@ pub async fn prepare_start_marked(
         // A disputed `latest`, a 404 and every refusal alike (section 9).
         Err(e) => eprintln!("[attested] {e}; trying the pinned pair"),
     }
+    pinned_ready(&client, datadir, compiled_anchor).await
+}
+
+/// Section 9's second start point alone: the pinned pair, on disk and
+/// matching its compiled sizes and hashes (downloaded when it is not there
+/// yet), or `None`. For a confirmed pair the load then refuses.
+pub async fn prepare_pinned(datadir: &Path, compiled_anchor: u64) -> Option<ReadyPair> {
+    let client = match http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[attested] {e}; using the compiled snapshot");
+            return None;
+        }
+    };
+    pinned_ready(&client, datadir, compiled_anchor).await
+}
+
+/// The pinned half of [`prepare_start`] and [`prepare_pinned`].
+async fn pinned_ready(
+    client: &reqwest::Client,
+    datadir: &Path,
+    compiled_anchor: u64,
+) -> Option<ReadyPair> {
     let pinned = pinned_pair();
     if let Err(e) = check(&pinned, compiled_anchor) {
         eprintln!("[attested] pinned pair not used: {e}");
         return None;
     }
     if !on_disk(datadir, &pinned) {
-        if let Err(e) = download_pair(&client, datadir, &pinned).await {
+        if let Err(e) = download_pair(client, datadir, &pinned).await {
             eprintln!(
                 "[attested] pinned pair {} not downloaded: {e}",
                 pinned.height
