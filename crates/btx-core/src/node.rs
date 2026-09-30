@@ -2156,7 +2156,7 @@ fn interpret_bool(value: &str) -> bool {
 /// `[main]`'s own list ends in a negation.
 ///
 /// That IS one of the engine's real rules (the "zombie" revival,
-/// `prev_negated_empty = span.last_negated() && result.empty()`,
+/// `prev_negated_empty |= span.last_negated() && result.empty()`,
 /// `GetSettingsList` again), but only half of it: the engine drops the
 /// default section's pins on a `[main]`-ending negation ONLY WHEN
 /// `result` - which by then already holds whatever the command line and
@@ -2175,9 +2175,13 @@ fn interpret_bool(value: &str) -> bool {
 /// -matmultrustedpubkey", `init.cpp:1591-1596`). Always counting the
 /// default section's pins as live avoids that: the one way this can still
 /// be wrong is the corner the engine's own rule actually drops them
-/// (`result` genuinely empty), and there the cost is at worst one pin this
-/// app fails to add that the engine also did not add - never a duplicate,
-/// never a refusal to start.
+/// (`result` genuinely empty). There, the cost is never a duplicate
+/// refusal: at worst the default section's pins are missing, which the
+/// engine may itself refuse over, as it would for any choice this app
+/// could make there (a mainnet mirror with fewer than 2 signers is
+/// refused, `init.cpp:1831` at `84b998b4`; a validating node on a signed
+/// snapshot needs the default section's pins too, see the pin rule above
+/// in `build_node_command`).
 ///
 /// What this function does not follow at all, for the same one-file-at-a-
 /// time reason, and the app only takes the union of [`conf_pins`] and
@@ -7179,7 +7183,7 @@ matmul: metal runtime_probe_ok, selecting metal\n\
         // the default section's pins here when `result` (which already
         // holds anything from the command line and btx_rw.conf, merged
         // before either conf-file section) is STILL empty at that point
-        // (`GetSettingsList`'s `prev_negated_empty = span.last_negated()
+        // (`GetSettingsList`'s `prev_negated_empty |= span.last_negated()
         // && result.empty()`, `settings.cpp:216-259`). This function reads
         // one conf file in isolation and cannot know that, so it always
         // keeps the default section's pin: K6 survives.
