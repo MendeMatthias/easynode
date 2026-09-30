@@ -93,6 +93,85 @@ pub(crate) fn group(n: u64) -> String {
     out
 }
 
+/// A unix timestamp as `YYYY-MM-DD HH:MM UTC`, the same minute precision and
+/// shape `generated_at` already uses (built by the Tauri side's own
+/// `chrono_like_now`, a civil-from-days conversion with no timezone crate;
+/// this is that same conversion, parameterised on a given time rather than
+/// always reading the real clock, so [`relative_ago`] can be tested against a
+/// fixed one).
+fn format_utc_minute(unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400);
+    let rem = unix_secs.rem_euclid(86_400);
+    // Civil-from-days (Howard Hinnant), proleptic Gregorian.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
+        rem / 3_600,
+        (rem % 3_600) / 60
+    )
+}
+
+/// The inverse of [`format_utc_minute`]: reads the report's own `generated_at`
+/// back into a unix timestamp, so the chain line's "how long ago" can be
+/// worked out from the same "now" the rest of the report already shows,
+/// rather than a second, undeclared notion of the current time. `None` on
+/// anything that is not exactly that shape (a caller that changed the format,
+/// or a blank field); the age clause is then left out rather than guessed at.
+fn parse_generated_at(s: &str) -> Option<i64> {
+    let (date, time) = s.strip_suffix(" UTC")?.split_once(' ')?;
+    let mut ymd = date.splitn(4, '-');
+    let y: i64 = ymd.next()?.parse().ok()?;
+    let m: i64 = ymd.next()?.parse().ok()?;
+    let d: i64 = ymd.next()?.parse().ok()?;
+    if ymd.next().is_some() {
+        return None;
+    }
+    let mut hm = time.splitn(3, ':');
+    let hh: i64 = hm.next()?.parse().ok()?;
+    let mm: i64 = hm.next()?.parse().ok()?;
+    if hm.next().is_some() {
+        return None;
+    }
+    // Days-from-civil (Howard Hinnant), the exact inverse of the
+    // civil-from-days step in `format_utc_minute`.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hh * 3_600 + mm * 60)
+}
+
+/// "about N minutes/hours ago", `then` relative to `now`. Minutes below an
+/// hour, hours from then on; a `then` at or after `now` (clock skew between
+/// the report's own timestamp and a node's median time, both already
+/// second-guessed values) reads as "about 0 minutes ago" rather than a
+/// negative age.
+fn relative_ago(now: i64, then: i64) -> String {
+    let minutes = now.saturating_sub(then).max(0) / 60;
+    if minutes < 60 {
+        format!(
+            "about {minutes} minute{} ago",
+            if minutes == 1 { "" } else { "s" }
+        )
+    } else {
+        let hours = minutes / 60;
+        format!(
+            "about {hours} hour{} ago",
+            if hours == 1 { "" } else { "s" }
+        )
+    }
+}
+
 fn history(p: &PeerInfo) -> &'static str {
     if p.servicesnames.iter().any(|s| s == "NETWORK") {
         "full history"
@@ -146,17 +225,35 @@ pub fn render(i: &DiagnosticsInput) -> String {
     o.push(String::new());
     o.push("Chain".into());
     match &i.chain {
-        Some(c) => o.push(format!(
-            "  blocks {} · headers {} · progress {:.4} · first sync {}",
-            group(c.blocks),
-            group(c.headers),
-            c.verification_progress,
-            if c.initial_block_download {
-                "yes"
-            } else {
-                "no"
+        Some(c) => {
+            o.push(format!(
+                "  blocks {} · headers {} · progress {:.4} · first sync {}",
+                group(c.blocks),
+                group(c.headers),
+                c.verification_progress,
+                if c.initial_block_download {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ));
+            // `median_time` of 0 means the node did not tell us
+            // (`node_api::BlockchainInfo::median_time`), so it is left out
+            // rather than shown as an age. `generated_at` is how the rest of
+            // the report already knows "now" (it is built from the same wall
+            // clock and, in a test, set to a fixed string), so it is reused
+            // here too rather than reading a real clock, which would make
+            // this line untestable.
+            if c.median_time > 0 {
+                if let Some(now) = parse_generated_at(&i.generated_at) {
+                    o.push(format!(
+                        "  tip time {}, {}",
+                        format_utc_minute(c.median_time),
+                        relative_ago(now, c.median_time)
+                    ));
+                }
             }
-        )),
+        }
         None => o.push("  not answering".into()),
     }
     if let Some(h) = &i.best_block_hash {
@@ -1363,6 +1460,91 @@ mod tests {
             assert!(r.contains(part), "missing {part}:\n{r}");
         }
         assert!(!r.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn format_and_parse_utc_minute_round_trip_known_times() {
+        for (secs, s) in [
+            (1_790_690_700, "2026-09-29 14:05 UTC"),
+            (1_790_689_800, "2026-09-29 13:50 UTC"),
+            (0, "1970-01-01 00:00 UTC"),
+            (1_735_689_600, "2025-01-01 00:00 UTC"),
+            (1_709_210_040, "2024-02-29 12:34 UTC"), // a leap day
+        ] {
+            assert_eq!(format_utc_minute(secs), s, "format {secs}");
+            assert_eq!(parse_generated_at(s), Some(secs), "parse {s:?}");
+        }
+        assert_eq!(parse_generated_at("garbage"), None);
+        assert_eq!(parse_generated_at("2026-09-29 14:05"), None, "missing UTC");
+    }
+
+    /// The chain line already reads `c.median_time` off `BlockchainInfo`
+    /// (`node_api::BlockchainInfo::median_time`) but never printed it. Times
+    /// are fixed (`generated_at` is the report's own "now", the same way the
+    /// rest of the report gets it) so the relative wording stays exact
+    /// without touching a real clock.
+    #[test]
+    fn chain_line_adds_the_tips_age_when_the_node_reports_a_median_time() {
+        let input = DiagnosticsInput {
+            generated_at: "2026-09-29 14:05 UTC".into(),
+            chain: Some(BlockchainInfo {
+                blocks: 233_480,
+                headers: 233_481,
+                median_time: 1_790_689_800, // 2026-09-29 13:50 UTC
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = render(&input);
+        assert!(
+            r.contains("  blocks 233,480 · headers 233,481 · progress 0.0000 · first sync no"),
+            "the existing chain line must stay byte identical:\n{r}"
+        );
+        assert!(
+            r.contains("  tip time 2026-09-29 13:50 UTC, about 15 minutes ago"),
+            "missing the tip's age:\n{r}"
+        );
+    }
+
+    #[test]
+    fn the_tips_age_is_said_in_hours_once_it_passes_an_hour() {
+        let input = DiagnosticsInput {
+            generated_at: "2026-09-29 14:05 UTC".into(),
+            chain: Some(BlockchainInfo {
+                blocks: 1,
+                headers: 1,
+                median_time: 1_790_679_900, // 2026-09-29 11:05 UTC, 3 hours before
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = render(&input);
+        assert!(
+            r.contains("  tip time 2026-09-29 11:05 UTC, about 3 hours ago"),
+            "{r}"
+        );
+    }
+
+    /// `median_time` of 0 means the node did not tell us
+    /// (`node_api::BlockchainInfo::median_time`'s own doc), and unknown must
+    /// never render as an age, the same rule `node_api::tip_is_stale` follows.
+    #[test]
+    fn the_tips_age_is_left_out_when_the_node_did_not_report_a_median_time() {
+        let input = DiagnosticsInput {
+            generated_at: "2026-09-29 14:05 UTC".into(),
+            chain: Some(BlockchainInfo {
+                blocks: 1,
+                headers: 1,
+                median_time: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = render(&input);
+        assert!(
+            !r.contains("tip time"),
+            "an unknown median time must not be shown as an age:\n{r}"
+        );
     }
 
     /// Integration review M2, and the confirmed-snapshot decision, section 7:
