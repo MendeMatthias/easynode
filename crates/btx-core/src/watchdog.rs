@@ -139,6 +139,11 @@ pub enum StallClass {
     /// the remedy is disjoint — nudging beats redialling, and redialling is a
     /// guaranteed no-op.
     BlockFetchGated,
+    /// The catch-up help concluded that no archive peer connected serves old
+    /// blocks to this node (`crate::catchup_assist::CatchUp::
+    /// no_archive_serves_old_blocks`). Not issued by [`discriminate`]: the
+    /// shell shows [`old_blocks_refused_verdict`] while that holds.
+    OldBlocksRefused,
     AttestationMissing,
     NoQualifyingPeer,
     MsghandSpin,
@@ -241,9 +246,12 @@ pub fn discriminate(f: &StallFacts) -> Option<StallVerdict> {
         return Some(StallVerdict {
             class: StallClass::BlockFetchGated,
             summary: "this node can see the next blocks and is not asking any peer for them \
-                      (a known upstream scheduler bug); adding or redialling peers will NOT \
-                      help — the fix is to request the next blocks by name with \
-                      getblockfrompeer, which nothing in this app does yet",
+                      (a known upstream scheduler bug), so adding or redialling peers will not \
+                      help. While it is 20 or more blocks behind, this app asks its own \
+                      archive peers for the next blocks by name; closer than that, Tools > \
+                      Fetch a stuck block asks for them once. If the tip still does not move, \
+                      those peers may not be connected, or may not serve old blocks to this \
+                      node. Copy diagnostics in Tools shows what the app tried",
         });
     }
     // A: body missing. Requests ARE outstanding (or we could not measure), so
@@ -253,6 +261,21 @@ pub fn discriminate(f: &StallFacts) -> Option<StallVerdict> {
         summary: "this node has asked for the next blocks and no peer has served them yet; \
                   this is peer selection, not corruption — archive/noban peers usually fix it",
     })
+}
+
+/// The status card's sentence while the catch-up help concludes that no
+/// archive peer serves old blocks to this node (the owner's decision 1, the
+/// night of 2026-09-29). On any node, not only mirrors, and without waiting
+/// for a freeze: the engine's own rescue still connects a block every few
+/// minutes in that state.
+pub fn old_blocks_refused_verdict() -> StallVerdict {
+    StallVerdict {
+        class: StallClass::OldBlocksRefused,
+        summary: "this node is far behind and none of the archive peers connected now serves \
+                  old blocks to it: each dropped the connection twice when asked for them. \
+                  This app has stopped asking them, and the node keeps asking on its own, \
+                  which is slow. Copy diagnostics in Tools names the peers",
+    }
 }
 
 /// The class-C verdict — issued both on a frozen gap and on a frontier
@@ -559,14 +582,42 @@ mod tests {
         assert_eq!(v.class, StallClass::BlockFetchGated);
         // The operator-facing half of the lesson: this must not send anyone
         // back to the peer list, because that is where 75 minutes went.
-        assert!(v.summary.contains("will NOT"));
-        // And it must not promise a repair nothing performs. The copy used to
-        // end "which the guardian does automatically"; there is no
-        // getblockfrompeer call anywhere in this workspace, so the sentence
-        // told a stuck operator to wait for a fix that was never coming.
+        assert!(v.summary.contains("will not help"));
+        assert!(!v.summary.contains("NOT"), "no shouting");
+        // It names the help that now exists (crate::catchup_assist), and only
+        // what that help does: it asks, and peers may not answer. The copy once
+        // ended "which the guardian does automatically" while nothing did.
+        assert!(v.summary.contains("asks its own archive peers"));
+        assert!(!v.summary.contains("nothing in this app"));
         assert!(
-            !v.summary.contains("automatically"),
-            "do not claim an automatic fix unless something in the tree performs it"
+            !v.summary.contains("automatically") && !v.summary.contains("will fix"),
+            "say what the app does, never promise the outcome"
+        );
+        assert!(!v.summary.contains('\u{2014}'), "no em-dashes in copy");
+        assert!(v
+            .summary
+            .contains(&crate::catchup_assist::MIN_BEHIND.to_string()));
+        // Closer than that, the Tools button on main does it once; and when
+        // the tip still does not move, the report says what was tried.
+        assert!(v.summary.contains("Fetch a stuck block"));
+        assert!(v.summary.contains("Copy diagnostics"));
+    }
+
+    #[test]
+    fn the_catch_up_help_s_conclusion_has_its_own_sentence() {
+        let v = old_blocks_refused_verdict();
+        assert_eq!(v.class, StallClass::OldBlocksRefused);
+        assert_eq!(serde_json::to_value(v.class).unwrap(), "old_blocks_refused");
+        for part in ["none of the archive peers", "twice", "Copy diagnostics"] {
+            assert!(v.summary.contains(part), "{part}");
+        }
+        // This build has no Fast-forward, so the card does not name it; the
+        // Fast-forward branch adds the clause back with the button.
+        assert!(!v.summary.contains("Fast-forward"));
+        assert!(!v.summary.contains('\u{2014}'), "no em-dashes in copy");
+        assert!(
+            !v.summary.contains("automatically") && !v.summary.contains("will fix"),
+            "say what the app does, never promise the outcome"
         );
     }
 

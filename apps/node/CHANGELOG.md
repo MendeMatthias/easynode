@@ -82,6 +82,40 @@ hour your node adds against the network's 40. A node that is still syncing is
 judged by the blocks it adds, and a fresh install that is still counting the
 chain's headers stays calm.
 
+**A slow node no longer leaves the dead branch before Branch B is refused.**
+Before a node leaves the dead branch it first refuses Branch B, so B cannot
+become the chain it follows. Until now, a node that took too long to say
+whether it had seen B's first block was treated as one that had never seen it,
+and the dead branch could be left with B still open. Now only the node saying
+it has never seen that block counts. No answer, or any other error, keeps the
+dead branch waiting and the app asks again.
+
+**A node that starts far behind no longer waits on peers that cannot send
+blocks.** The app kept a steady connection to three introducer nodes that only
+know other nodes' addresses, and the node engine kept asking them for its next
+blocks and waiting. A node that started from a snapshot gained a block only
+every few minutes. Now the app asks them for addresses and lets them go. On 30
+September a test node gained one block in three and a half minutes with them,
+and 561 blocks in the five and a half minutes after they were gone.
+
+**A node that is far behind now asks for its next blocks by name.** Most
+nodes on the network keep only recent blocks, and the node engine asks them
+for an older block only after two minutes of waiting, so a node that started
+days behind gained about one block every two minutes. When your node is 20 or
+more blocks behind and its newest block has not changed for 30 seconds, even
+while the engine waits on a peer that does not answer, the app now asks its
+own archive peers for the next 100 blocks by name, waits for them to arrive,
+and repeats. For older blocks it asks peers that keep the whole chain first.
+A peer that drops the connection twice when asked for older blocks is not
+asked for them again until the app or the node restarts, and Copy
+diagnostics in Tools names it. If none of the archive peers connected serves
+older blocks to your node, the app stops asking them and the status card
+says so. The app stops asking as soon as the engine is fetching blocks on
+its own again. On 29 September, asking this way moved a test node 7,490
+blocks in 8 minutes, from a peer that serves old blocks to it. It never
+adds, bans or disconnects a peer, and never asks for a branch the app
+refuses.
+
 ## [0.6.32] - 2026-09-28
 
 **Every node is held off two branches until BTX's developers rule on them.**

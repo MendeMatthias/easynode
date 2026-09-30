@@ -18,7 +18,8 @@ use btx_core::node::{DatadirHolder, NodeController};
 use btx_core::node_api::{get_blockchain_info, get_chainstates};
 use btx_core::rpc::RpcClient;
 use btx_core::setup::{
-    enough_free_disk, ensure_addnodes_in_conf, free_disk_bytes, rpc_url, wait_for_node_rpc,
+    enough_free_disk, ensure_addnodes_in_conf, free_disk_bytes, remove_addnodes_in_conf, rpc_url,
+    wait_for_node_rpc,
 };
 use btx_core::snapshot::SnapshotSpec;
 use btx_core::snapshot_serve as snap;
@@ -761,6 +762,23 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
         }
     }
 
+    // Discovery relays used to be dialled as manual (`-addnode`) peers, and an
+    // earlier version's conf may still carry those lines. They cannot serve a
+    // block. Measured on mainnet 30 September 2026, dialled that way they
+    // held a fresh mirror to one block in 3.5 minutes, and the same node
+    // gained 561 blocks in the following 5.5 minutes once they were removed:
+    // so this build dials them with `-seednode=` instead (`build_node_command`)
+    // and cleans up the stale lines here, ahead of the manual set below, so a
+    // returning conf converges on the new shape rather than keeping both.
+    let removed_relays =
+        remove_addnodes_in_conf(&paths.faststart_conf, btx_core::node::BTX_DISCOVERY_PEERS);
+    if removed_relays > 0 {
+        eprintln!(
+            "[node-app] conf: dropped {removed_relays} discovery-relay addnode line(s) left by \
+             an earlier version; they are dialled with -seednode now"
+        );
+    }
+
     // The manual peer set belongs in the conf on every start (idempotent) so
     // even a hand-started btxd against this datadir reaches the sparse BTX
     // network. It is the SAME set `build_node_command` passes on the CLI —
@@ -777,10 +795,14 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     // was just btxd dropping the tail instead of us. Say which ones out loud,
     // because the list order is now a decision and a decision nobody can see is
     // one nobody revisits.
+    //
+    // Discovery relays are deliberately excluded from this count: they are
+    // not past the cap, they are never manual peers at all (dialled instead
+    // with `-seednode=`, above), so listing them here would call a decision
+    // an eviction.
     let dropped: Vec<&str> = btx_core::node::BTX_BOOTSTRAP_PEERS
         .iter()
         .chain(btx_core::node::BTX_ARCHIVE_PEERS.iter())
-        .chain(btx_core::node::BTX_DISCOVERY_PEERS.iter())
         .copied()
         .filter(|p| !manual.contains(p))
         .collect();
@@ -1042,6 +1064,7 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     *state.archive_service.lock().await = None;
     *state.matmul_trusted.lock().await = None;
     *state.signed_frontier.lock().await = None;
+    *state.catch_up_help.lock().await = Default::default();
     *state.recent_signers.lock().await = None;
     *state.fork.lock().await = None;
     *state.tip_median_time.lock().await = None;
@@ -1626,6 +1649,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
     let archive_service_slot = state.archive_service.clone();
     let matmul_trusted_slot = state.matmul_trusted.clone();
     let signed_frontier_slot = state.signed_frontier.clone();
+    let catch_up_slot = state.catch_up_help.clone();
     let recent_signers_slot = state.recent_signers.clone();
     let signer_pubkey_slot = state.signer_pubkey.clone();
     let signer_offer_slot = state.signer_offer.clone();
@@ -1679,6 +1703,9 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         let mut gap_since: Option<(std::time::Instant, u64)> = None;
         let mut fork_first_seen: Option<std::time::Instant> = None;
         let mut fork_tips: Vec<btx_core::fork::ChainTip> = Vec::new();
+        // Until getchaintips has answered once this run, `fork_tips` is no
+        // read at all, and the catch-up help must not take it for one.
+        let mut fork_tips_read = false;
         // Known-invalid blocks (btx_core::known_invalid): refused with
         // invalidateblock on the fork tick until every entry is refused, then
         // not again this run. Off the tick, because on a mirror that followed
@@ -1696,6 +1723,13 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         // CHANGED, which is what the stall rule measures.
         let mut bootstrap_headers: Option<u64> = None;
         let mut bootstrap_moved_at = std::time::Instant::now();
+        // Catch-up help (btx_core::catchup_assist, decision 2026-09-29 §11):
+        // while the node is behind and its newest block has stood still for
+        // 30 seconds, whatever requests the engine has out, ask this app's
+        // archive peers for the next blocks by name. Its memory (the walked
+        // headers, the batch out, the peers that dropped us over old blocks)
+        // lasts for this run only.
+        let mut catch_up = btx_core::catchup_assist::CatchUp::for_this_app();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             if gen_counter.load(Ordering::SeqCst) != gen {
@@ -2135,6 +2169,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                             }
                             if let Ok(tips) = btx_core::node_api::get_chain_tips(&rpc).await {
                                 fork_tips = tips;
+                                fork_tips_read = true;
                             }
                             // btxd's own answer to the question `getchaintips`
                             // cannot answer: is anyone actually serving us the
@@ -2201,6 +2236,56 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                             }
                         };
                         *fork_slot.lock().await = verdict;
+                    }
+
+                    // ── Catch-up help ───────────────────────────────────────
+                    // Every node, every tick, from the reads above, the signed
+                    // frontier included: the slot this tick already filled
+                    // (#160), so no second getmatmulattestedtip. It reads more
+                    // from the node only while a header it knows is 20 or more
+                    // blocks above the tip. Not during a header bootstrap,
+                    // which ends in a restart: this app's own launch, or one
+                    // the marker still names (`node::build_node_command` reads
+                    // it, so another app's launch on this datadir is one too).
+                    // Never on a read that failed (`catch_up_tick`). No slot
+                    // is locked while it asks: the frontier is copied out
+                    // first, the report written after.
+                    let frontier = signed_frontier_slot.lock().await.clone();
+                    if let Some(tick) = catch_up_tick(
+                        bootstrap_launch
+                            || btx_core::node::header_bootstrap_pending(&node_datadir()),
+                        chain.blocks,
+                        chain.headers,
+                        fork_tips_read.then_some(fork_tips.as_slice()),
+                        peer_infos.as_deref(),
+                        frontier.as_ref(),
+                    ) {
+                        for line in btx_core::catchup_assist::tick(
+                            &rpc,
+                            &mut catch_up,
+                            &tick,
+                            std::time::Instant::now(),
+                        )
+                        .await
+                        {
+                            let msg = format!("catch-up help: {line}");
+                            eprintln!("[node-app] {msg}");
+                            setup_log(&node_datadir(), &msg);
+                        }
+                        // A stop or restart that came while the help was out
+                        // asking has superseded this refresher: nothing below
+                        // (the watchdog's slot, its redial) is this run's to
+                        // do any more.
+                        if !keep_catch_up_report(
+                            &catch_up_slot,
+                            &gen_counter,
+                            gen,
+                            catch_up.report(),
+                        )
+                        .await
+                        {
+                            return;
+                        }
                     }
 
                     // ── Trusted-mirror stall watchdog tick ──────────────────
@@ -2527,6 +2612,78 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
     });
 }
 
+/// What the catch-up help (`btx_core::catchup_assist::tick`) is given this
+/// refresher tick, or `None` for no tick. `blocks` and `headers` are this
+/// tick's `getblockchaininfo`, which the refresher only gets this far with
+/// when it answered. `tips` is the last `getchaintips` that answered (read
+/// every `FORK_CHECK_EVERY` ticks), `None` until one has this run; `peers` is
+/// this tick's `getpeerinfo`, `None` when it failed; `frontier` the
+/// `signed_frontier` slot. A read that failed is never handed on as an empty
+/// one: no tips would stop the help as if nothing were above the tip, no
+/// peers would count the batch's peer as gone, and either would end its
+/// conclusion without a line in the log. Never during a header bootstrap
+/// (plan decision 9): its node has loaded no snapshot and is restarted when
+/// the headers are in.
+fn catch_up_tick<'a>(
+    header_bootstrap: bool,
+    blocks: u64,
+    headers: u64,
+    tips: Option<&'a [btx_core::fork::ChainTip]>,
+    peers: Option<&'a [btx_core::node_api::PeerInfo]>,
+    frontier: Option<&'a btx_core::node_api::AttestedTip>,
+) -> Option<btx_core::catchup_assist::Tick<'a>> {
+    if header_bootstrap {
+        return None;
+    }
+    Some(btx_core::catchup_assist::Tick {
+        blocks,
+        headers,
+        tips: tips?,
+        peers: peers?,
+        frontier,
+    })
+}
+
+/// Writes the help's report into `AppState::catch_up_help`, unless a stop or
+/// restart has superseded this refresher (`refresher_gen`) while its tick
+/// was out asking peers. The stop has reset the slot by then, and a late
+/// write would carry the old run's conclusion over the reset. The stop bumps
+/// the generation before it resets the slot, and the generation is read here
+/// under the slot's lock, so a write this lets through lands before the reset.
+/// `false` when superseded: the refresher then goes no further this tick.
+async fn keep_catch_up_report(
+    slot: &tokio::sync::Mutex<btx_core::catchup_assist::CatchUpReport>,
+    gen_counter: &std::sync::atomic::AtomicU64,
+    gen: u64,
+    report: btx_core::catchup_assist::CatchUpReport,
+) -> bool {
+    let mut kept = slot.lock().await;
+    let current = gen_counter.load(Ordering::SeqCst) == gen;
+    if current {
+        *kept = report;
+    }
+    current
+}
+
+/// The status card's stall sentence. The catch-up help's conclusion
+/// (btx_core::catchup_assist) outranks the watchdog's verdict: it holds on
+/// any node while the tip trickles in from the engine's rescue, and it says
+/// what to do. Not while the engine warns that it cannot check blocks
+/// (`cannot_verify`): that is the cause, and the card shows that warning
+/// only when no stall is shown. The watchdog's slot is left as it is, so its
+/// progress rule and its redial are unchanged.
+fn shown_stall(
+    no_archive_serves_old_blocks: bool,
+    cannot_verify: bool,
+    watchdog: Option<btx_core::watchdog::StallVerdict>,
+) -> Option<btx_core::watchdog::StallVerdict> {
+    if no_archive_serves_old_blocks && !cannot_verify {
+        Some(btx_core::watchdog::old_blocks_refused_verdict())
+    } else {
+        watchdog
+    }
+}
+
 /// May the attached-mode stop path actually stop the node it is attached to?
 ///
 /// `None` is "we spawned it" (nothing was ever attached), which is ours.
@@ -2667,6 +2824,7 @@ pub async fn stop_node_inner(state: &AppState) {
     *state.archive_service.lock().await = None;
     *state.matmul_trusted.lock().await = None;
     *state.signed_frontier.lock().await = None;
+    *state.catch_up_help.lock().await = Default::default();
     *state.fork.lock().await = None;
     *state.tip_median_time.lock().await = None;
     state.engine_warnings.lock().await.clear();
@@ -3408,6 +3566,20 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
             .as_deref()
             .unwrap_or(&settings.witness_listen),
     );
+    // The catch-up help's conclusion that no archive peer serves old blocks
+    // outranks the watchdog's verdict, unless the engine cannot check blocks
+    // (`shown_stall`). Read here, so neither lock is held while the rest of
+    // the answer is gathered.
+    let old_blocks_refused = state
+        .catch_up_help
+        .lock()
+        .await
+        .no_archive_serves_old_blocks;
+    let stall = shown_stall(
+        old_blocks_refused,
+        cannot_verify.is_some(),
+        state.stall_verdict.lock().await.clone(),
+    );
 
     Ok(NodeStatusInfo {
         running,
@@ -3494,7 +3666,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         full_check_first: full_check_first(),
         chip_refused: btx_core::node::matmul_consensus_was_refused(&datadir),
         archive_peers,
-        stall: state.stall_verdict.lock().await.clone(),
+        stall,
         node_profile: settings.node_profile.clone(),
         datadir_pruned: btx_core::node::datadir_has_pruned(&datadir),
         // `&tag`, not NODE_RELEASE_TAG — the same choice `start_node_inner`
@@ -6372,6 +6544,177 @@ mod tests {
         })
         .await;
         assert_eq!(*state.phase.lock().await, super::NodePhase::Welcome);
+    }
+
+    // ── The catch-up help in the refresher (btx_core::catchup_assist) ──────
+
+    fn concluded() -> btx_core::catchup_assist::CatchUpReport {
+        btx_core::catchup_assist::CatchUpReport {
+            lines: vec![btx_core::catchup_assist::NO_ARCHIVE_SERVES_OLD_BLOCKS.to_string()],
+            no_archive_serves_old_blocks: true,
+        }
+    }
+
+    /// A stopped node has no catch-up help: what the last run concluded (the
+    /// card's old-blocks sentence, the Copy diagnostics lines) goes with it,
+    /// as the other refresher slots do.
+    #[tokio::test]
+    async fn a_stop_forgets_what_the_catch_up_help_concluded() {
+        let state = super::AppState::new();
+        *state.catch_up_help.lock().await = concluded();
+        super::stop_node_inner(&state).await;
+        assert_eq!(*state.catch_up_help.lock().await, Default::default());
+    }
+
+    /// A tick that was still asking peers when the stop came must not write
+    /// its run's report over the stop's reset: the next run, or a stopped
+    /// node, would show the old run's old-blocks sentence. And it tells the
+    /// refresher it was overtaken, so that refresher goes no further (the
+    /// watchdog below it could redial on the new run's node).
+    #[tokio::test]
+    async fn a_tick_the_stop_overtook_does_not_write_its_report_back() {
+        let state = super::AppState::new();
+        // The refresher of this run, as spawn_status_refresher numbers it.
+        let gen = state
+            .refresher_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        assert!(
+            super::keep_catch_up_report(
+                &state.catch_up_help,
+                &state.refresher_gen,
+                gen,
+                concluded()
+            )
+            .await,
+            "still this run's refresher"
+        );
+        assert_eq!(*state.catch_up_help.lock().await, concluded());
+
+        super::stop_node_inner(&state).await;
+        assert!(
+            !super::keep_catch_up_report(
+                &state.catch_up_help,
+                &state.refresher_gen,
+                gen,
+                concluded()
+            )
+            .await,
+            "overtaken by the stop"
+        );
+        assert_eq!(*state.catch_up_help.lock().await, Default::default());
+    }
+
+    /// The help ticks on reads that answered, and only then: a failed read
+    /// handed on as an empty answer would stop it as if nothing were above
+    /// the tip (no tips) or count every peer as gone (no peers), and end its
+    /// conclusion without a line in the log. Never during a header bootstrap
+    /// launch (plan decision 9), which ends in a restart.
+    #[test]
+    fn the_catch_up_help_ticks_only_on_reads_that_answered() {
+        use btx_core::fork::ChainTip;
+        use btx_core::node_api::{AttestedTip, PeerInfo};
+        let tips = vec![ChainTip {
+            height: 230_000,
+            status: "headers-only".into(),
+            ..Default::default()
+        }];
+        let peers = vec![PeerInfo {
+            id: 7,
+            ..Default::default()
+        }];
+        let frontier = AttestedTip {
+            height: Some(229_990),
+            ..Default::default()
+        };
+        let t = super::catch_up_tick(
+            false,
+            229_000,
+            230_000,
+            Some(&tips),
+            Some(&peers),
+            Some(&frontier),
+        )
+        .expect("every read answered");
+        assert_eq!((t.blocks, t.headers), (229_000, 230_000));
+        assert_eq!(t.tips, &tips[..]);
+        assert_eq!(t.peers, &peers[..]);
+        assert_eq!(t.frontier, Some(&frontier));
+
+        // No signed frontier read yet: the help follows the best header.
+        let t = super::catch_up_tick(false, 229_000, 230_000, Some(&tips), Some(&peers), None)
+            .expect("a frontier is not needed");
+        assert_eq!(t.frontier, None);
+
+        // getchaintips has not answered this run yet.
+        assert!(
+            super::catch_up_tick(false, 229_000, 230_000, None, Some(&peers), Some(&frontier))
+                .is_none()
+        );
+        // This tick's getpeerinfo failed.
+        assert!(
+            super::catch_up_tick(false, 229_000, 230_000, Some(&tips), None, Some(&frontier))
+                .is_none()
+        );
+        // A header bootstrap launch, whatever it read.
+        assert!(super::catch_up_tick(
+            true,
+            229_000,
+            230_000,
+            Some(&tips),
+            Some(&peers),
+            Some(&frontier)
+        )
+        .is_none());
+    }
+
+    /// The owner's decision 1: while the help concludes that no archive peer
+    /// serves old blocks, the card says so on any node, ahead of the
+    /// watchdog's own verdict. Otherwise the watchdog's verdict shows as
+    /// before. Not while the engine warns that it cannot check blocks (a
+    /// chip quarantined mid-run): that is the cause, and the card shows it
+    /// (validation.ts puts `stall` first, so the old-blocks sentence would
+    /// hide it).
+    #[test]
+    fn the_card_says_no_archive_peer_serves_old_blocks_while_the_help_concludes_it() {
+        use btx_core::watchdog::{old_blocks_refused_verdict, StallClass, StallVerdict};
+        let watchdog = Some(StallVerdict {
+            class: StallClass::BlockFetchGated,
+            summary: "the watchdog's own sentence",
+        });
+        let refused = Some(old_blocks_refused_verdict());
+        assert_eq!(super::shown_stall(true, false, watchdog.clone()), refused);
+        assert_eq!(super::shown_stall(true, false, None), refused);
+        assert_eq!(super::shown_stall(false, false, watchdog.clone()), watchdog);
+        assert_eq!(super::shown_stall(false, false, None), None);
+        // The engine cannot check blocks: its warning stands, as before.
+        assert_eq!(super::shown_stall(true, true, watchdog.clone()), watchdog);
+        assert_eq!(super::shown_stall(true, true, None), None);
+        assert_eq!(super::shown_stall(false, true, None), None);
+    }
+
+    /// The refresher awaits the tick on its spawned task, so the tick's
+    /// future has to be Send: this spawns one (`tokio::spawn` has the same
+    /// `Send + 'static` bound as `tauri::async_runtime::spawn`). A node with no
+    /// block yet reads nothing from the node, so the address answers nothing.
+    #[tokio::test]
+    async fn the_catch_up_tick_runs_on_a_spawned_task() {
+        let rpc = btx_core::rpc::RpcClient::new("http://127.0.0.1:9", "user", "pass");
+        let lines = tokio::spawn(async move {
+            let mut catch_up = btx_core::catchup_assist::CatchUp::for_this_app();
+            let tick = btx_core::catchup_assist::Tick {
+                blocks: 0,
+                headers: 230_000,
+                tips: &[],
+                peers: &[],
+                frontier: None,
+            };
+            btx_core::catchup_assist::tick(&rpc, &mut catch_up, &tick, std::time::Instant::now())
+                .await
+        })
+        .await
+        .expect("the tick ran");
+        assert!(lines.is_empty(), "{lines:?}");
     }
 
     /// The two quit budgets are INDEPENDENT literals, and their order is the

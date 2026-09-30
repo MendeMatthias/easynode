@@ -260,9 +260,11 @@ interface NodeStatusInfo {
     served_by_us: number;
   } | null;
   /**
-   * The stall discriminator's verdict for a frozen trusted mirror (null =
-   * healthy / no verdict). class is one of "body_missing" |
-   * "attestation_missing" | "no_qualifying_peer" | "msghand_spin".
+   * The stall discriminator's verdict for a frozen trusted mirror, or on any
+   * node the catch-up help's conclusion that no archive peer serves old
+   * blocks to it (null = healthy / no verdict). class is one of
+   * "body_missing" | "block_fetch_gated" | "attestation_missing" |
+   * "no_qualifying_peer" | "msghand_spin" | "old_blocks_refused".
    */
   stall: { class: string; summary: string } | null;
   /** The user's node profile CHOICE ("full" | "keeper"). */

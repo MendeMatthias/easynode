@@ -69,6 +69,7 @@
 //!
 //! The same switch turns holds off: `EASYBTX_NODE_REFUSE_KNOWN_INVALID=0`.
 
+use crate::error::AppError;
 use crate::rpc::Rpc;
 use serde_json::json;
 
@@ -122,6 +123,16 @@ pub const HELD_BRANCHES: &[HeldBranch] = &[
 /// that applied the hold follows the most-work chain again. Empty until one is.
 pub const LIFTED_BRANCHES: &[&str] = &[];
 
+/// Every block this app refuses, the known-invalid ones and the held roots, as
+/// (height, hash). The catch-up help (`crate::catchup_assist`) never asks a
+/// peer for a chain that passes one of them.
+pub fn refused_blocks() -> impl Iterator<Item = (u64, &'static str)> {
+    KNOWN_INVALID_BLOCKS
+        .iter()
+        .map(|b| (b.height, b.hash))
+        .chain(HELD_BRANCHES.iter().map(|b| (b.height, b.root)))
+}
+
 /// The operator's word on refusing known-invalid blocks, read from
 /// `EASYBTX_NODE_REFUSE_KNOWN_INVALID`. Refusal is the default; only an
 /// explicit `0`, `false`, `no` or `off` turns it off.
@@ -151,7 +162,8 @@ pub enum Refusal {
     /// `invalidateblock` returned. The block and its descendants are failed in
     /// the node's block index, which persists across restarts.
     Refused,
-    /// The node knows the block but `invalidateblock` failed. Asked again later.
+    /// The node knows the block but `invalidateblock` failed, or it did not
+    /// answer whether it knows the block. Asked again later.
     Failed(String),
     /// Not attempted: an earlier held branch failed, and the order is the
     /// point. Asked again later.
@@ -169,14 +181,30 @@ pub async fn refuse(rpc: &dyn Rpc, block: &KnownInvalidBlock) -> Refusal {
     refuse_hash(rpc, block.hash).await
 }
 
+/// Does the node have a header for `hash`? `Ok(false)` only on the engine's own
+/// answer for a header it never saw, `RPC_INVALID_ADDRESS_OR_KEY` (-5), "Block
+/// not found" (`src/rpc/blockchain.cpp:881` at 84b998b4, unchanged in
+/// v0.34.12). The code decides, not the words: in `getblockheader` -5 means
+/// only that (a malformed hash is -8), and a later engine that rewords the
+/// message must not strand every node that never heard of B on the dead
+/// branch. Any other error, a timeout or a node still warming up (-28), is
+/// `Err`: it says nothing about the header, so it must not read as "never
+/// heard of it". That reading would let a node leave the dead branch while B,
+/// unanswered, stood open.
+pub async fn header_known(rpc: &dyn Rpc, hash: &str) -> Result<bool, String> {
+    match rpc.call("getblockheader", json!([hash, true])).await {
+        Ok(_) => Ok(true),
+        Err(AppError::Rpc { code: -5, .. }) => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// [`refuse`], for any block hash.
 async fn refuse_hash(rpc: &dyn Rpc, hash: &str) -> Refusal {
-    if rpc
-        .call("getblockheader", json!([hash, true]))
-        .await
-        .is_err()
-    {
-        return Refusal::NotKnownYet;
+    match header_known(rpc, hash).await {
+        Ok(true) => {}
+        Ok(false) => return Refusal::NotKnownYet,
+        Err(e) => return Refusal::Failed(e),
     }
     match rpc.call("invalidateblock", json!([hash])).await {
         Ok(_) => Refusal::Refused,
@@ -189,6 +217,8 @@ async fn refuse_hash(rpc: &dyn Rpc, hash: &str) -> Refusal {
 /// heaviest chain the node can check would be B. A branch the node has never
 /// heard of does not hold the rest back, because a branch it does not know is
 /// one it cannot follow, and the next attempt refuses it once the header lands.
+/// "Never heard of" means the engine said so ([`header_known`]); a lookup it
+/// did not answer is a failure and holds the rest back like any other.
 ///
 /// On a node whose ACTIVE chain contains the root, `invalidateblock` outlasts
 /// the RPC client's timeout (thousands of blocks for B), so it reads as Failed
@@ -224,7 +254,8 @@ pub enum Lift {
     /// `reconsiderblock` returned. On a block that was not failed it changes
     /// nothing, which is why it is safe to ask on every run.
     Lifted,
-    /// The node knows the root but `reconsiderblock` failed. Asked again later.
+    /// The node knows the root but `reconsiderblock` failed, or it did not
+    /// answer whether it knows the root. Asked again later.
     Failed(String),
 }
 
@@ -232,17 +263,13 @@ pub enum Lift {
 pub async fn lift_roots(rpc: &dyn Rpc, roots: &[&'static str]) -> Vec<(&'static str, Lift)> {
     let mut out = Vec::with_capacity(roots.len());
     for root in roots {
-        let outcome = if rpc
-            .call("getblockheader", json!([root, true]))
-            .await
-            .is_err()
-        {
-            Lift::NotKnownYet
-        } else {
-            match rpc.call("reconsiderblock", json!([root])).await {
+        let outcome = match header_known(rpc, root).await {
+            Ok(false) => Lift::NotKnownYet,
+            Err(e) => Lift::Failed(e),
+            Ok(true) => match rpc.call("reconsiderblock", json!([root])).await {
                 Ok(_) => Lift::Lifted,
                 Err(e) => Lift::Failed(e.to_string()),
-            }
+            },
         };
         out.push((*root, outcome));
     }
@@ -267,7 +294,7 @@ pub async fn refuse_all(rpc: &dyn Rpc) -> Vec<(KnownInvalidBlock, Refusal)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::{AppError, AppResult};
+    use crate::error::AppResult;
     use async_trait::async_trait;
     use serde_json::Value;
     use std::sync::Mutex;
@@ -294,6 +321,16 @@ mod tests {
             .expect("the 227,313 split is on the list");
         assert!(split.hash.starts_with("b28c3e84"));
         assert!(split.valid_sibling.starts_with("d5f0e92f"));
+    }
+
+    #[test]
+    fn refused_blocks_names_the_invalid_block_and_every_held_root() {
+        let all: Vec<(u64, &str)> = refused_blocks().collect();
+        assert_eq!(all.len(), KNOWN_INVALID_BLOCKS.len() + HELD_BRANCHES.len());
+        assert!(all.contains(&(227_313, KNOWN_INVALID_BLOCKS[0].hash)));
+        for b in HELD_BRANCHES {
+            assert!(all.contains(&(b.height, b.root)), "{b:?}");
+        }
     }
 
     #[test]
@@ -398,6 +435,12 @@ mod tests {
     struct PerHashNode {
         unknown: Vec<&'static str>,
         failing: Vec<&'static str>,
+        /// Headers the node does not answer for: a timeout, not "not found".
+        silent: Vec<&'static str>,
+        /// Headers asked while the node warms up: the engine's -28.
+        warming: Vec<&'static str>,
+        /// Headers the node never saw, said in other words than today's.
+        reworded: Vec<&'static str>,
         calls: Mutex<Vec<(String, Value)>>,
     }
 
@@ -406,8 +449,23 @@ mod tests {
             Self {
                 unknown: unknown.to_vec(),
                 failing: failing.to_vec(),
+                silent: Vec::new(),
+                warming: Vec::new(),
+                reworded: Vec::new(),
                 calls: Mutex::new(Vec::new()),
             }
+        }
+        fn silent(mut self, silent: &[&'static str]) -> Self {
+            self.silent = silent.to_vec();
+            self
+        }
+        fn warming(mut self, warming: &[&'static str]) -> Self {
+            self.warming = warming.to_vec();
+            self
+        }
+        fn reworded(mut self, reworded: &[&'static str]) -> Self {
+            self.reworded = reworded.to_vec();
+            self
         }
         fn calls(&self) -> Vec<(String, Value)> {
             self.calls.lock().unwrap().clone()
@@ -430,6 +488,17 @@ mod tests {
                 .push((method.to_string(), params.clone()));
             let hash = params[0].as_str().unwrap_or_default();
             match method {
+                "getblockheader" if self.silent.contains(&hash) => {
+                    Err(AppError::Http("operation timed out".into()))
+                }
+                "getblockheader" if self.warming.contains(&hash) => Err(AppError::Rpc {
+                    code: -28,
+                    message: "Loading block index...".into(),
+                }),
+                "getblockheader" if self.reworded.contains(&hash) => Err(AppError::Rpc {
+                    code: -5,
+                    message: "No such block".into(),
+                }),
                 "getblockheader" if self.unknown.contains(&hash) => Err(AppError::Rpc {
                     code: -5,
                     message: "Block not found".into(),
@@ -500,6 +569,55 @@ mod tests {
         assert_eq!(got[0].1, Refusal::NotKnownYet);
         assert_eq!(got[1].1, Refusal::Refused);
         assert_eq!(node.invalidated(), vec![DEAD.to_string()]);
+    }
+
+    /// A lookup the node does not answer is not "never heard of it". Were it
+    /// read that way, a node that timed out on B would leave the dead branch
+    /// with B still open, and B is then the heaviest chain it can check. Only
+    /// the engine's "Block not found" (-5) says the node has no such header.
+    #[tokio::test]
+    async fn an_unanswered_lookup_for_b_holds_the_dead_branch_back() {
+        let node = PerHashNode::new(&[], &[]).silent(&[B]);
+        let got = refuse_held(&node).await;
+        assert!(matches!(got[0].1, Refusal::Failed(_)), "{got:?}");
+        assert_eq!(got[1].1, Refusal::Waiting);
+        assert!(
+            node.calls().iter().all(|(_, p)| p[0] != json!(DEAD)),
+            "the dead branch was touched while B was unanswered"
+        );
+        assert!(node.invalidated().is_empty(), "nothing was refused");
+    }
+
+    /// An error that IS an engine answer, but not "not found", is no answer
+    /// about the header either: the warm-up refusal (-28) every method returns
+    /// while the node starts. It holds the dead branch back like a timeout.
+    #[tokio::test]
+    async fn a_warming_node_holds_the_dead_branch_back() {
+        let node = PerHashNode::new(&[], &[]).warming(&[B]);
+        let got = refuse_held(&node).await;
+        assert!(matches!(got[0].1, Refusal::Failed(_)), "{got:?}");
+        assert_eq!(got[1].1, Refusal::Waiting);
+        assert!(node.invalidated().is_empty(), "nothing was refused");
+    }
+
+    /// The engine's code for a header it never saw is what counts, not its
+    /// wording: a later engine that rewords "Block not found" must not strand
+    /// every node that never heard of B on the dead branch.
+    #[tokio::test]
+    async fn not_found_is_the_code_not_the_words() {
+        let node = PerHashNode::new(&[], &[]).reworded(&[B]);
+        let got = refuse_held(&node).await;
+        assert_eq!(got[0].1, Refusal::NotKnownYet);
+        assert_eq!(got[1].1, Refusal::Refused);
+    }
+
+    /// A lift the node does not answer for is a failure, asked again, not a
+    /// root the node never held.
+    #[tokio::test]
+    async fn an_unanswered_lookup_is_a_failed_lift() {
+        let node = PerHashNode::new(&[], &[]).silent(&[DEAD]);
+        let got = lift_roots(&node, &[DEAD]).await;
+        assert!(matches!(got[0].1, Lift::Failed(_)), "{got:?}");
     }
 
     /// Lifting is reconsiderblock, asked only of a node that knows the root.
