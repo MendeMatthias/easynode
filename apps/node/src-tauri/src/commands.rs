@@ -2123,8 +2123,20 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                             eprintln!("[node-app] {msg}");
                             setup_log(&node_datadir(), &msg);
                         }
-                        keep_catch_up_report(&catch_up_slot, &gen_counter, gen, catch_up.report())
-                            .await;
+                        // A stop or restart that came while the help was out
+                        // asking has superseded this refresher: nothing below
+                        // (the watchdog's slot, its redial) is this run's to
+                        // do any more.
+                        if !keep_catch_up_report(
+                            &catch_up_slot,
+                            &gen_counter,
+                            gen,
+                            catch_up.report(),
+                        )
+                        .await
+                        {
+                            return;
+                        }
                     }
 
                     // ── Trusted-mirror stall watchdog tick ──────────────────
@@ -2489,16 +2501,19 @@ fn catch_up_tick<'a>(
 /// write would carry the old run's conclusion over the reset. The stop bumps
 /// the generation before it resets the slot, and the generation is read here
 /// under the slot's lock, so a write this lets through lands before the reset.
+/// `false` when superseded: the refresher then goes no further this tick.
 async fn keep_catch_up_report(
     slot: &tokio::sync::Mutex<btx_core::catchup_assist::CatchUpReport>,
     gen_counter: &std::sync::atomic::AtomicU64,
     gen: u64,
     report: btx_core::catchup_assist::CatchUpReport,
-) {
+) -> bool {
     let mut kept = slot.lock().await;
-    if gen_counter.load(Ordering::SeqCst) == gen {
+    let current = gen_counter.load(Ordering::SeqCst) == gen;
+    if current {
         *kept = report;
     }
+    current
 }
 
 /// The status card's stall sentence. The catch-up help's conclusion
@@ -5264,7 +5279,9 @@ mod tests {
 
     /// A tick that was still asking peers when the stop came must not write
     /// its run's report over the stop's reset: the next run, or a stopped
-    /// node, would show the old run's old-blocks sentence.
+    /// node, would show the old run's old-blocks sentence. And it tells the
+    /// refresher it was overtaken, so that refresher goes no further (the
+    /// watchdog below it could redial on the new run's node).
     #[tokio::test]
     async fn a_tick_the_stop_overtook_does_not_write_its_report_back() {
         let state = super::AppState::new();
@@ -5273,13 +5290,29 @@ mod tests {
             .refresher_gen
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
-        super::keep_catch_up_report(&state.catch_up_help, &state.refresher_gen, gen, concluded())
-            .await;
+        assert!(
+            super::keep_catch_up_report(
+                &state.catch_up_help,
+                &state.refresher_gen,
+                gen,
+                concluded()
+            )
+            .await,
+            "still this run's refresher"
+        );
         assert_eq!(*state.catch_up_help.lock().await, concluded());
 
         super::stop_node_inner(&state).await;
-        super::keep_catch_up_report(&state.catch_up_help, &state.refresher_gen, gen, concluded())
-            .await;
+        assert!(
+            !super::keep_catch_up_report(
+                &state.catch_up_help,
+                &state.refresher_gen,
+                gen,
+                concluded()
+            )
+            .await,
+            "overtaken by the stop"
+        );
         assert_eq!(*state.catch_up_help.lock().await, Default::default());
     }
 
