@@ -24,7 +24,7 @@ set -euo pipefail
 VERSION="0.34.12"
 TARBALL_URL="https://github.com/btxchain/btx/releases/download/v${VERSION}/btx-${VERSION}-x86_64-linux-gnu.tar.gz"
 # From the release's SHA256SUMS. Upstream has re-generated release assets in
-# place before — a silent swap must FAIL here, never ship unnoticed. v0.34.12
+# place before, and a silent swap must FAIL here, never ship unnoticed. v0.34.12
 # publishes that file UNSIGNED (no SHA256SUMS.asc), so this pins the bytes, not
 # a signature.
 TARBALL_SHA256="933c4c1ab34726fe0a5f4d85c7ee76e88ddd272b89ce85ccdb7bb5c23b20ace8"

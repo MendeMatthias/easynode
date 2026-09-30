@@ -39,7 +39,7 @@ assert_matches_engine_pin "$APP_DIR" "$VERSION"
 
 TARBALL_URL="https://github.com/btxchain/btx/releases/download/v${VERSION}/btx-${VERSION}-arm64-apple-darwin.tar.gz"
 # From the release's SHA256SUMS. Upstream has re-generated release assets in
-# place before — a silent swap must FAIL here, never ship unnoticed. v0.34.12
+# place before, and a silent swap must FAIL here, never ship unnoticed. v0.34.12
 # publishes that file UNSIGNED (no SHA256SUMS.asc, as for v0.34.9), so this
 # pins the bytes, not a signature.
 TARBALL_SHA256="d90d1adf2ae1d9a29decc97423db258459674a08c35e0bef60dc82467983d72e"
