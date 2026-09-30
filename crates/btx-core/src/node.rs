@@ -1856,6 +1856,39 @@ pub const RPC_BIND_FAILED_MARKER: &str = "Unable to bind all endpoints for RPC s
 /// what `node_has_reorg_policy` reads, says older.
 pub const REORG_POLICY_CONFLICT_MARKER: &str = "conflicts with -reorgpolicy";
 
+/// Engine v0.34.12's refusal when the durable MatMul attestation archive
+/// (`matmul_attestations.dat`, its `.db` LevelDB and its `.wal`) does not
+/// pass its own load, init.cpp:2888-2900:
+///
+/// ```text
+/// Failed to load the durable MatMul attestation archive: %s. The archive and
+/// WAL were preserved; repair or explicitly replace them before restarting.
+/// ```
+///
+/// `OpenPersistence` (node/matmul_trusted_attestations.cpp:2019-2068) verifies
+/// the signature of EVERY stored record on every start, and any record that
+/// fails for a reason other than an untrusted signer ends the start. It runs
+/// only when the node has a pin or a signer key, which both of this app's
+/// launch arms give it, and it runs BEFORE StartLogging (init.cpp:2924), so
+/// debug.log says nothing and the only trace is this line on stderr. It is
+/// the one piece of state that grows with runtime and is read before RPC
+/// (the pre-RPC audit of 2026-10-01), which makes it a candidate for "fine for
+/// 50 minutes, then never starts again".
+pub const ATTESTATION_ARCHIVE_REFUSED_MARKER: &str =
+    "Failed to load the durable MatMul attestation archive";
+
+/// init.cpp:2271 at v0.34.12, when another process holds `<datadir>/.lock`:
+/// `Cannot obtain a lock on directory %s. %s is probably already running.`
+/// The lock is a non-blocking fcntl F_SETLK, so btxd exits in well under a
+/// second; the kernel drops it when its owner dies, so it is never stale.
+pub const DATADIR_LOCK_REFUSED_MARKER: &str = "Cannot obtain a lock on directory";
+
+/// init.cpp:3103 at v0.34.12: `AppInitServers` failed. Its usual cause is the
+/// RPC bind, whose own line ([`RPC_BIND_FAILED_MARKER`]) is the sharper one
+/// and is checked first; this one alone is what stderr carries when the
+/// debug.log lines around it are not in the tail.
+pub const HTTP_SERVER_REFUSED_MARKER: &str = "Unable to start HTTP server";
+
 pub fn launch_failure_hint(text: &str) -> Option<&'static str> {
     if text.contains(PRUNED_DATADIR_REFUSED_MARKER) {
         return Some(
@@ -1892,7 +1925,114 @@ pub fn launch_failure_hint(text: &str) -> Option<&'static str> {
              folder is newer than its name says; nothing in the node folder is damaged.",
         );
     }
+    if text.contains(ATTESTATION_ARCHIVE_REFUSED_MARKER) {
+        return Some(
+            "the node's saved record of block signatures did not pass its own start-up \
+             check, so the engine refused to start. Nothing in the chain is damaged. The \
+             record is the files whose names start with matmul_attestations.dat in the \
+             node folder. Open the data folder from Tools, move those files to another \
+             folder, and press Retry. Or use Copy diagnostics in Tools and ask for help \
+             first.",
+        );
+    }
+    if text.contains(DATADIR_LOCK_REFUSED_MARKER) {
+        return Some(
+            "another node is already using this node folder, so the engine could not \
+             lock it. That is most likely the easyBTX miner's node, a second copy of this \
+             app, or a btxd started by hand. Stop the other one and press Retry; nothing \
+             here is broken and nothing needs removing.",
+        );
+    }
+    if text.contains(HTTP_SERVER_REFUSED_MARKER) {
+        return Some(
+            "the engine could not open its local connection for this app, usually because \
+             another program already holds port 19334. Close that program and press \
+             Retry; nothing in the node folder is damaged.",
+        );
+    }
     None
+}
+
+/// The engine's own last error line in a log tail, for an exit
+/// [`launch_failure_hint`] does not recognise.
+///
+/// btxd's noui handler prints every InitError on stderr as `Error: <message>`
+/// (noui.cpp:30-46 at v0.34.12), which lands in easybtx-node.log, and it
+/// logs its own failures with "(Error: ...)" in the line. So the last line
+/// that starts with `Error:`, or carries `InitError` or `Error: `, is the
+/// engine's own account of why it stopped. Quoting it beats "not
+/// recognised": the person reading it, or the person they send it to, then
+/// has the cause in the engine's own words.
+///
+/// Trimmed, one line, at most 200 characters (cut on a character).
+pub fn engine_error_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .rfind(|l| l.starts_with("Error:") || l.contains("InitError") || l.contains("Error: "))
+        .map(|l| cap_chars(l, LOG_QUOTE_MAX_CHARS))
+}
+
+/// The cause to show for a launch that died: the recognised sentence when
+/// there is one, else the engine's own last error line, quoted. `None` only
+/// when the tail carries neither, so the caller can say it does not know.
+pub fn launch_failure_cause(text: &str) -> Option<String> {
+    if let Some(hint) = launch_failure_hint(text) {
+        return Some(hint.to_string());
+    }
+    engine_error_line(text).map(|line| format!("the engine said: \"{line}\"."))
+}
+
+/// How much of a log line the app quotes back to a person.
+const LOG_QUOTE_MAX_CHARS: usize = 200;
+
+fn cap_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// The last non-empty line of a log text, trimmed and at most 200
+/// characters. For saying what a launch that never reached RPC was last
+/// doing.
+pub fn last_log_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .map(|l| cap_chars(l, LOG_QUOTE_MAX_CHARS))
+}
+
+/// debug.log's length now, 0 when it is missing. A launch records this just
+/// before it spawns btxd so it can later read only its own lines
+/// ([`debug_log_since`]).
+pub fn debug_log_len(datadir: &Path) -> u64 {
+    std::fs::metadata(datadir.join("debug.log"))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// What debug.log gained since `offset` (from [`debug_log_len`] before the
+/// spawn), at most the last 64 KiB of it.
+///
+/// Empty is a real answer: the engine buffers every log line in memory until
+/// `init::StartLogging` (init.cpp:2924 at v0.34.12, logging.cpp:437-449), so
+/// a btxd stuck before that point has written nothing to debug.log at all.
+///
+/// A file now SHORTER than `offset` was shrunk by `ShrinkDebugFile`, which
+/// runs inside this launch's StartLogging, so everything in it past the
+/// shrink is this launch's own and the plain tail is the right read.
+pub fn debug_log_since(datadir: &Path, offset: u64) -> String {
+    const MAX: u64 = 64 * 1024;
+    let path = datadir.join("debug.log");
+    let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let want = if len < offset {
+        MAX
+    } else {
+        (len - offset).min(MAX)
+    };
+    if want == 0 {
+        return String::new();
+    }
+    read_tail(&path, want)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default()
 }
 
 /// Sticky per-datadir record that consensus mode was refused on this machine.
@@ -3775,6 +3915,73 @@ impl NodeController {
         }
     }
 
+    /// The pid of the child this controller spawned, while it has one.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.as_ref().and_then(|c| c.id())
+    }
+
+    /// Stop a child that has no RPC to ask: SIGTERM, wait up to `grace`, then
+    /// kill. Returns whether it exited on its own inside the grace.
+    ///
+    /// For a btxd still alive when the startup RPC wait gave up without ever
+    /// getting an answer (2026-10-01). [`NodeController::stop`] is the wrong
+    /// tool there: its `btx-cli stop` needs the RPC this process never
+    /// opened, and its 90 s grace, extended while the log moves or the CPU is
+    /// busy, exists to protect a chainstate flush that has not started yet.
+    /// Everything before `AppInitServers` (init.cpp:3100-3104 at v0.34.12) is
+    /// argument checks, the attestation archive open (LevelDB, crash-safe)
+    /// and GPU readiness; the chainstate is loaded only after the cookie. So
+    /// a short grace is enough, and a kill here cannot cost the shielded
+    /// rebuild `stop` guards against.
+    ///
+    /// btxd installs its SIGTERM handler in AppInitBasicSetup, before any of
+    /// that, so a process that is merely slow asks itself to shut down. One
+    /// wedged in the GPU driver does not act on it, which is what the kill
+    /// is for. A process stuck in uninterruptible sleep survives even the
+    /// kill; nothing in user space can change that, and the caller says what
+    /// the engine was last doing so the person can look.
+    ///
+    /// Windows has no SIGTERM; there it is a kill at once.
+    pub async fn stop_without_rpc(&mut self, grace: std::time::Duration) -> bool {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(200);
+        let Some(mut child) = self.child.take() else {
+            return true;
+        };
+        let mut exited = matches!(child.try_wait(), Ok(Some(_)));
+        #[cfg(unix)]
+        if !exited {
+            if let Some(pid) = child.id() {
+                // SAFETY: kill(2) on a pid we spawned and have not reaped
+                // (try_wait just said it is running); it only sends a signal.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+                let started = std::time::Instant::now();
+                while started.elapsed() < grace {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        exited = true;
+                        break;
+                    }
+                    tokio::time::sleep(POLL).await;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = grace;
+        if !exited {
+            // Not `kill().await`: that waits for the exit without a bound, and
+            // a process in uninterruptible sleep inside a GPU driver never
+            // exits, which would hang this start forever. Dropping the handle
+            // afterwards leaves the reaping to tokio.
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+        }
+        if let Some(cfg) = &self.config {
+            let _ = std::fs::remove_file(pidfile_path(&cfg.datadir));
+        }
+        exited
+    }
+
     /// How many times [`NodeController::restart`] will re-spawn before it stops
     /// and says so. A node that dies three times in a row is not a node a
     /// fourth spawn fixes; it is a fault whose cause is still there, and the
@@ -5108,6 +5315,205 @@ consensus-validator service.";
         assert!(
             !matmul.contains("Remove node data"),
             "wrong cause: {matmul}"
+        );
+    }
+
+    /// No new launch sentence may use an em-dash, and none may send the user
+    /// at Remove node data: every cause below leaves the chain intact.
+    fn assert_calm(hint: &str) {
+        assert!(!hint.contains('\u{2014}'), "em-dash in: {hint}");
+        assert!(
+            !hint.to_lowercase().contains("remove node data"),
+            "not a reason to wipe: {hint}"
+        );
+    }
+
+    /// Engine v0.34.12, init.cpp:2896-2898, as btxd's noui handler prints an
+    /// InitError on stderr ("Error: " + message, noui.cpp:30-46). The inner
+    /// reason is one of mta.cpp's, here the record-rejected one.
+    #[test]
+    fn a_refused_attestation_archive_is_named_and_the_files_are_named() {
+        let log = "Error: Failed to load the durable MatMul attestation archive: durable \
+                   attestation database record rejected: bad signature. The archive and WAL \
+                   were preserved; repair or explicitly replace them before restarting.";
+        let hint = launch_failure_hint(log).expect("an archive refusal must be named");
+        assert!(hint.contains("matmul_attestations.dat"), "{hint}");
+        assert!(
+            hint.to_lowercase()
+                .contains("nothing in the chain is damaged"),
+            "{hint}"
+        );
+        assert_calm(hint);
+    }
+
+    /// init.cpp:2271 at v0.34.12, with CLIENT_NAME = "BTX".
+    #[test]
+    fn a_held_datadir_lock_is_named_as_another_node() {
+        let log = "Error: Cannot obtain a lock on directory /home/zan/.easybtx. BTX is \
+                   probably already running.";
+        let hint = launch_failure_hint(log).expect("a held lock must be named");
+        assert!(hint.contains("another node"), "{hint}");
+        assert!(hint.contains("easyBTX miner"), "{hint}");
+        assert_calm(hint);
+    }
+
+    /// init.cpp:3103 at v0.34.12, alone: the bind lines that say why are in
+    /// debug.log, which this tail may not carry.
+    #[test]
+    fn an_http_server_refusal_without_the_bind_line_names_the_port() {
+        let log = "Error: Unable to start HTTP server. See debug log for details.";
+        let hint = launch_failure_hint(log).expect("an HTTP server refusal must be named");
+        assert!(hint.contains("19334"), "{hint}");
+        assert_calm(hint);
+        // With the bind line present, the sharper bind sentence still wins.
+        let both = "Unable to bind all endpoints for RPC server\n\
+                    Error: Unable to start HTTP server. See debug log for details.";
+        assert!(launch_failure_hint(both)
+            .unwrap()
+            .contains("another node is already running"));
+    }
+
+    /// Nothing recognised: quote the engine's own last error line instead of
+    /// saying only "not recognised".
+    #[test]
+    fn an_unrecognised_exit_quotes_the_engines_last_error_line() {
+        let log = "2026-10-01T01:00:00Z Startup time: 2026-10-01T01:00:00Z\n\
+                   Error: first thing\n\
+                   2026-10-01T01:00:01Z InitError: something odd about the frobnicator\n\
+                   2026-10-01T01:00:01Z Shutdown: done\n";
+        assert_eq!(
+            engine_error_line(log).as_deref(),
+            Some("2026-10-01T01:00:01Z InitError: something odd about the frobnicator")
+        );
+        let cause = launch_failure_cause(log).expect("an error line is a cause");
+        assert_eq!(
+            cause,
+            "the engine said: \"2026-10-01T01:00:01Z InitError: something odd about the \
+             frobnicator\"."
+        );
+        // A recognised cause still gives its own sentence.
+        let known =
+            launch_failure_cause("Error: Unable to start HTTP server. See debug log for details.")
+                .unwrap();
+        assert!(known.contains("19334"), "{known}");
+        // No error line at all: nothing to say, and the caller says so.
+        assert!(engine_error_line("2026 Shutdown: done").is_none());
+        assert!(launch_failure_cause("2026 Shutdown: done").is_none());
+        assert!(launch_failure_cause("").is_none());
+    }
+
+    #[test]
+    fn a_quoted_error_line_is_one_short_line() {
+        let long = format!("Error: {}\r\n", "x".repeat(500));
+        let line = engine_error_line(&long).unwrap();
+        assert!(line.chars().count() <= 200, "{}", line.len());
+        assert!(!line.contains('\n') && !line.contains('\r'));
+        assert!(line.starts_with("Error: xxx"));
+        // Multi-byte text is cut on a character, not a byte.
+        let wide = format!("Error: {}", "é".repeat(300));
+        assert!(engine_error_line(&wide).unwrap().chars().count() <= 200);
+        // A line that merely mentions an error word is not an error line.
+        assert!(engine_error_line("checking for errors in blk00001.dat").is_none());
+        // btxd's own "(Error: ...)" wording inside a log line counts.
+        assert!(engine_error_line(
+            "Binding RPC on address 127.0.0.1 port 19334 failed (Error: Address already in use (98))."
+        )
+        .is_some());
+    }
+
+    // ── What a launch that never reached RPC was last doing ────────────────
+
+    #[test]
+    fn the_last_log_line_is_the_last_non_empty_one_and_is_short() {
+        assert_eq!(
+            last_log_line("a\n\n  MatMul RC production canary: begin  \n\n").as_deref(),
+            Some("MatMul RC production canary: begin")
+        );
+        assert!(last_log_line("").is_none());
+        assert!(last_log_line("\n \n\t\n").is_none());
+        let long = "y".repeat(400);
+        assert!(last_log_line(&long).unwrap().chars().count() <= 200);
+    }
+
+    /// Only THIS launch's lines: debug.log is appended across runs, so the
+    /// launch records its length before the spawn and reads from there.
+    #[test]
+    fn debug_log_since_reads_only_what_this_launch_added() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(debug_log_len(dir.path()), 0, "a missing log is empty");
+        let log = dir.path().join("debug.log");
+        std::fs::write(&log, "old run line 1\nold run line 2\n").unwrap();
+        let offset = debug_log_len(dir.path());
+        assert!(
+            debug_log_since(dir.path(), offset).is_empty(),
+            "nothing new yet"
+        );
+
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        use std::io::Write;
+        f.write_all(b"new run line\n").unwrap();
+        assert_eq!(debug_log_since(dir.path(), offset), "new run line\n");
+
+        // The engine shrinks debug.log at StartLogging (init.cpp:2924). A file
+        // now SHORTER than the offset was shrunk by this launch, so everything
+        // in it past the shrink is this launch's: read the tail.
+        std::fs::write(&log, "kept tail\nthis launch\n").unwrap();
+        assert_eq!(
+            last_log_line(&debug_log_since(dir.path(), 10_000)).as_deref(),
+            Some("this launch")
+        );
+    }
+
+    /// A btxd alive at the end of the RPC wait with no RPC to ask: SIGTERM
+    /// ends an ordinary process within the grace, and nothing is left behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_without_rpc_ends_a_child_that_honours_sigterm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut controller = start_shim(tmp.path(), "exec sleep 30").await;
+        let started = std::time::Instant::now();
+        let graceful = controller
+            .stop_without_rpc(std::time::Duration::from_secs(10))
+            .await;
+        assert!(graceful, "sleep dies on SIGTERM");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(controller.child_has_exited(), None, "the handle is gone");
+        assert!(!pidfile_path(tmp.path()).exists(), "the pidfile is gone");
+    }
+
+    /// A btxd wedged in the GPU driver does not act on SIGTERM. After the
+    /// grace it is killed, never left running behind an error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_without_rpc_kills_a_child_that_ignores_sigterm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut controller = start_shim(
+            tmp.path(),
+            "trap '' TERM\ntouch \"$0.ready\"\nwhile :; do sleep 1; done",
+        )
+        .await;
+        let pid = controller.child_pid().expect("a live child has a pid");
+        // The shell must reach its trap before the signal. A fixed sleep lost
+        // that race under the full suite's load; the shim says when it is.
+        let ready = tmp.path().join("btxd.ready");
+        let waited = std::time::Instant::now();
+        while !ready.exists() && waited.elapsed() < std::time::Duration::from_secs(10) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ready.exists(), "the shim never reached its trap");
+        let started = std::time::Instant::now();
+        let graceful = controller
+            .stop_without_rpc(std::time::Duration::from_secs(1))
+            .await;
+        assert!(
+            !graceful,
+            "it had to be killed; log: {}",
+            node_log_tail(tmp.path(), 4096)
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(6));
+        assert!(
+            !crate::platform::process_is_alive(pid),
+            "the wedged child must be gone"
         );
     }
 
