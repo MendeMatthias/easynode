@@ -2035,6 +2035,143 @@ pub fn debug_log_since(datadir: &Path, offset: u64) -> String {
         .unwrap_or_default()
 }
 
+/// The line `init::StartLogging` writes once debug.log is open
+/// (init/common.cpp:121 at v0.34.12: `Using data directory %s`). Every line
+/// the engine held in memory before it lands just ahead of it, so its
+/// presence in a launch's own part of debug.log means that launch got past
+/// StartLogging (init.cpp:2924).
+pub const START_LOGGING_MARKER: &str = "Using data directory";
+
+/// The line the engine prints at the END of its GPU readiness step,
+/// `InitializeMatMulRCReadinessPostDaemon` (init.cpp:2717-2727 at v0.34.12):
+/// `MatMul RC execution policy: %s provider=%s ready=%d ...`. It prints in
+/// every mode, a mirror's included, so a launch that got past StartLogging
+/// without it is inside that step.
+pub const RC_EXECUTION_POLICY_MARKER: &str = "MatMul RC execution policy:";
+
+/// Where a btxd that never opened its RPC was, as far as its own part of
+/// debug.log tells ([`pre_rpc_stage`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreRpcStage {
+    /// Nothing from this launch reached debug.log: it never got to
+    /// StartLogging. Arguments, the datadir lock or the attestation archive
+    /// open (init.cpp:2888-2900), not the GPU.
+    BeforeLogging,
+    /// Past StartLogging, and the GPU step's closing policy line is not
+    /// there: inside the CUDA or Metal probe, the self-qualification
+    /// episodes or the canary (init.cpp:2928, which has no timeout).
+    GpuCheck,
+    /// The GPU step finished; whatever held it came later.
+    PastGpuCheck,
+}
+
+/// Pure: read [`PreRpcStage`] from THIS launch's part of debug.log
+/// ([`debug_log_since`]).
+///
+/// Only what follows the LAST [`START_LOGGING_MARKER`] counts. A debug.log
+/// the engine shrank at this StartLogging is read as a plain tail
+/// (`debug_log_since`), which can still hold an older run's policy line
+/// above this launch's own start.
+pub fn pre_rpc_stage(launch_log: &str) -> PreRpcStage {
+    let Some(at) = launch_log.rfind(START_LOGGING_MARKER) else {
+        return PreRpcStage::BeforeLogging;
+    };
+    if launch_log[at..].contains(RC_EXECUTION_POLICY_MARKER) {
+        PreRpcStage::PastGpuCheck
+    } else {
+        PreRpcStage::GpuCheck
+    }
+}
+
+/// Did the engine run its GPU readiness step before RPC on a launch with
+/// these arguments? Pure, over the arguments the launch actually passed
+/// ([`NodeController::launch_args`]).
+///
+/// The step probes a device only in consensus mode under the strict-device
+/// policy (init.cpp:2618-2622 at v0.34.12). Both are the engine's defaults on
+/// mainnet (`-matmulvalidation` defaults to consensus, init.cpp:2596, and
+/// `-matmulrcexecution` to strict-device on a chain with an RC height), which
+/// is why a Mac that passes neither still runs it. The last value on the
+/// command line is the one the engine reads. A host with no graphics card
+/// has no GPU to hang in.
+pub fn launch_runs_gpu_check(backend: Backend, args: &[String]) -> bool {
+    if !matches!(backend, Backend::Cuda | Backend::Metal) {
+        return false;
+    }
+    let last = |flag: &str| {
+        args.iter()
+            .rev()
+            .find_map(|a| a.strip_prefix(flag).map(str::to_string))
+    };
+    let validation = last("-matmulvalidation=").unwrap_or_else(|| "consensus".to_string());
+    let execution = last("-matmulrcexecution=").unwrap_or_else(|| "strict-device".to_string());
+    validation == "consensus" && execution == "strict-device"
+}
+
+/// The evidence for "this validating start is stuck in the engine's GPU
+/// check", both halves required: the launch ran the check
+/// ([`launch_runs_gpu_check`]) and its log stops inside it
+/// ([`PreRpcStage::GpuCheck`]). A launch whose log is still empty is not
+/// enough: that is the attestation archive or earlier, and following
+/// signatures would not get past it.
+///
+/// Why this exists (2026-10-01). Zan's two NVIDIA Linux nodes, Full check on
+/// engine 0.34.12, both stopped about 50 minutes into catch-up and never
+/// started again: every start ended on "no .cookie yet". The leading
+/// reading is a card that hung on a block and now hangs the engine's start
+/// every time, in a step that has no timeout. A mirror launch does no GPU
+/// work before RPC, so the same machine can still start and follow
+/// signatures.
+pub fn stuck_in_gpu_check(gpu_check_launch: bool, launch_log: &str) -> bool {
+    gpu_check_launch && pre_rpc_stage(launch_log) == PreRpcStage::GpuCheck
+}
+
+/// Sticky per-datadir record that a validating start hung in the engine's
+/// GPU check ([`stuck_in_gpu_check`]) and the app moved the node to
+/// following signatures. The twin of the Mac's refusal marker below, for a
+/// card that does not refuse but never answers.
+///
+/// Sticky so the next start does not spend three minutes, and possibly a
+/// process the driver will not let go, finding out again. Cleared on a node
+/// engine upgrade, which may handle the card differently, and when the owner
+/// chooses to check blocks again (Settings, or Full check at setup): that is
+/// the way back, one click.
+fn gpu_start_hung_path(datadir: &Path) -> std::path::PathBuf {
+    datadir.join(".gpu-start-hung")
+}
+
+/// Has a validating start on this datadir's host hung in the GPU check?
+pub fn gpu_start_hung(datadir: &Path) -> bool {
+    gpu_start_hung_path(datadir).exists()
+}
+
+/// Record the hang so the next launch follows signatures. Best-effort, like
+/// the refusal marker: an unwritable datadir costs one more slow start.
+pub fn record_gpu_start_hung(datadir: &Path) {
+    let path = gpu_start_hung_path(datadir);
+    if let Err(e) = std::fs::write(
+        &path,
+        "This machine's graphics card did not finish the node engine's start-up\n\
+         check: the engine waited on the card and never opened its connection\n\
+         for the app. So the app starts this node following signatures instead\n\
+         of checking blocks. Choosing \"check blocks\" in Settings deletes this\n\
+         file and tries the card again, and so does an engine update.\n",
+    ) {
+        eprintln!("[node] could not write {}: {e}", path.display());
+    }
+}
+
+/// Drop the record, so the next launch tries the card again.
+pub fn clear_gpu_start_hung(datadir: &Path) {
+    let path = gpu_start_hung_path(datadir);
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            eprintln!("[node] could not clear {}: {e}", path.display());
+        }
+        _ => {}
+    }
+}
+
 /// Sticky per-datadir record that consensus mode was refused on this machine.
 ///
 /// Sticky on purpose: the verdict is a property of this host's silicon against
@@ -2147,6 +2284,11 @@ pub fn apply_start_choice(
     choice: StartChoice,
     may_check_blocks: bool,
 ) -> std::io::Result<()> {
+    // Full check is the owner asking the card to check blocks, so it gets
+    // its next try, the way Settings' "check blocks" gives it one.
+    if choice == StartChoice::FullCheck {
+        clear_gpu_start_hung(datadir);
+    }
     set_follows_signatures_by_choice(
         datadir,
         choice == StartChoice::QuickStart && may_check_blocks,
@@ -2188,7 +2330,8 @@ pub fn trusted_mirror_required(backend: Backend, datadir: &Path) -> bool {
 /// Metal with a clear marker validates. Only on an engine that allows a
 /// degraded start; before 0.34.5 the split does not apply. The owner's choice
 /// to follow signatures ([`follows_signatures_by_choice`]) makes any host a
-/// mirror, unless the operator's word is `=0`.
+/// mirror, unless the operator's word is `=0`, and so does the record of a
+/// validating start that hung in the GPU check ([`gpu_start_hung`]).
 pub fn launches_as_mirror(btxd: &Path, datadir: &Path, backend: Backend) -> bool {
     // A validating node's one mirror launch, to load a signed snapshot.
     if mirror_load_marker_applies(
@@ -2210,9 +2353,14 @@ pub fn mirror_load_marker_applies(fresh_marker: bool, operator_word: Option<bool
 /// [`launches_as_mirror`] without the one-time mirror launch: does this host
 /// follow signatures, or does it check blocks itself?
 pub fn host_follows_signatures(btxd: &Path, datadir: &Path, backend: Backend) -> bool {
-    // The owner's choice outranks the backend split, a Cuda host included,
-    // and yields only to the operator's explicit =0.
-    if follows_signatures_by_choice(datadir) && trusted_mirror_override() != Some(false) {
+    // The owner's choice, and the record of a start that hung in the GPU
+    // check, outrank the backend split, a Cuda host included, and yield only
+    // to the operator's explicit =0.
+    if follows_by_record(
+        follows_signatures_by_choice(datadir),
+        gpu_start_hung(datadir),
+        trusted_mirror_override(),
+    ) {
         return true;
     }
     let degraded_start = node_allows_degraded_matmul_start(btxd);
@@ -2220,6 +2368,14 @@ pub fn host_follows_signatures(btxd: &Path, datadir: &Path, backend: Backend) ->
         && matches!(backend, Backend::Cuda)
         && trusted_mirror_override() != Some(true);
     trusted_mirror_required(backend, datadir) && !cuda_validates_here
+}
+
+/// Pure half of [`host_follows_signatures`]'s first rule: the owner's choice
+/// or the GPU-hang record ([`gpu_start_hung`]) makes the host follow
+/// signatures, unless the operator's word ([`trusted_mirror_override`]) is
+/// "never a mirror".
+pub fn follows_by_record(by_choice: bool, gpu_hung: bool, operator_word: Option<bool>) -> bool {
+    (by_choice || gpu_hung) && operator_word != Some(false)
 }
 
 /// Does the conf hand the engine a signing key? The app's start path writes
@@ -3688,10 +3844,25 @@ struct LaunchConfig {
     btx_cli: PathBuf,
 }
 
+/// How [`NodeController::stop_without_rpc_outcome`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoRpcStop {
+    /// It exited on SIGTERM inside the grace, or was already gone.
+    OnSigterm,
+    /// It had to be killed, and the kill ended it.
+    Killed,
+    /// It outlived even the kill. A process stuck in the graphics driver in
+    /// uninterruptible sleep does that, and nothing short of a restart of
+    /// the computer frees it. It still holds the datadir lock.
+    StillRunning,
+}
+
 pub struct NodeController {
     child: Option<Child>,
     /// Last-used launch parameters, populated by `start` and reused by `restart`.
     config: Option<LaunchConfig>,
+    /// The arguments of the last `start` ([`NodeController::launch_args`]).
+    args: Vec<String>,
     /// Consecutive [`NodeController::restart`] calls, reset by a `start` that
     /// the caller drove itself. The crash-loop guard counts on this.
     restarts: u32,
@@ -3702,6 +3873,7 @@ impl NodeController {
         Self {
             child: None,
             config: None,
+            args: Vec::new(),
             restarts: 0,
         }
     }
@@ -3870,6 +4042,7 @@ impl NodeController {
         }
 
         self.child = Some(child);
+        self.args = args;
         // A start the CALLER asked for clears the crash-loop counter: the
         // operator (or a fresh launch) has intervened, so the next fault gets
         // the full budget again. `restart` puts its own running total back
@@ -3943,9 +4116,17 @@ impl NodeController {
     ///
     /// Windows has no SIGTERM; there it is a kill at once.
     pub async fn stop_without_rpc(&mut self, grace: std::time::Duration) -> bool {
+        self.stop_without_rpc_outcome(grace).await == NoRpcStop::OnSigterm
+    }
+
+    /// [`NodeController::stop_without_rpc`], saying which way it ended. The
+    /// GPU-hang retry needs the third answer: a btxd that outlives even the
+    /// kill still holds the datadir lock, and a mirror spawned beside it
+    /// would only be refused the lock.
+    pub async fn stop_without_rpc_outcome(&mut self, grace: std::time::Duration) -> NoRpcStop {
         const POLL: std::time::Duration = std::time::Duration::from_millis(200);
         let Some(mut child) = self.child.take() else {
-            return true;
+            return NoRpcStop::OnSigterm;
         };
         let mut exited = matches!(child.try_wait(), Ok(Some(_)));
         #[cfg(unix)]
@@ -3968,18 +4149,42 @@ impl NodeController {
         }
         #[cfg(not(unix))]
         let _ = grace;
-        if !exited {
+        let outcome = if exited {
+            NoRpcStop::OnSigterm
+        } else {
             // Not `kill().await`: that waits for the exit without a bound, and
             // a process in uninterruptible sleep inside a GPU driver never
             // exits, which would hang this start forever. Dropping the handle
             // afterwards leaves the reaping to tokio.
+            let pid = child.id();
             let _ = child.start_kill();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+            match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+                Ok(Ok(_)) => NoRpcStop::Killed,
+                // Not reaped five seconds after SIGKILL: the kernel has not
+                // let it go.
+                Err(_) => NoRpcStop::StillRunning,
+                // The wait itself failed; ask the system instead.
+                Ok(Err(_)) => match pid {
+                    Some(pid) if crate::platform::process_is_alive(pid) => NoRpcStop::StillRunning,
+                    _ => NoRpcStop::Killed,
+                },
+            }
+        };
+        // A btxd that is still there keeps its pidfile, so the next start
+        // still finds the holder instead of racing it for the lock.
+        if outcome != NoRpcStop::StillRunning {
+            if let Some(cfg) = &self.config {
+                let _ = std::fs::remove_file(pidfile_path(&cfg.datadir));
+            }
         }
-        if let Some(cfg) = &self.config {
-            let _ = std::fs::remove_file(pidfile_path(&cfg.datadir));
-        }
-        exited
+        outcome
+    }
+
+    /// The arguments this controller last launched btxd with, empty before
+    /// its first `start`. The launch loop reads them to know whether this
+    /// launch ran the engine's GPU check ([`launch_runs_gpu_check`]).
+    pub fn launch_args(&self) -> &[String] {
+        &self.args
     }
 
     /// How many times [`NodeController::restart`] will re-spawn before it stops
@@ -5464,6 +5669,188 @@ consensus-validator service.";
         );
     }
 
+    // ── A validating start stuck in the engine's GPU check (0.7.1) ─────────
+
+    /// What StartLogging writes first, then a launch's own arguments, as the
+    /// engine at v0.34.12 prints them (init/common.cpp:118-148,
+    /// common/args.cpp:1048).
+    const STARTED_LOGGING: &str = "\
+2026-10-01T08:00:00Z BTX version v0.34.12 (release build)
+2026-10-01T08:00:00Z Default data directory /home/zan/.btx
+2026-10-01T08:00:00Z Using data directory /home/zan/.easybtx/node
+2026-10-01T08:00:00Z Config file: /home/zan/.easybtx/node/faststart.conf
+2026-10-01T08:00:00Z R/W Config file: /home/zan/.easybtx/node/btx_rw.conf (not found, skipping)
+2026-10-01T08:00:00Z Command-line arg: matmulrcexecution=\"strict-device\"
+2026-10-01T08:00:00Z Command-line arg: matmulvalidation=\"consensus\"
+";
+
+    /// The line the GPU step prints last (init.cpp:2717-2727 at v0.34.12),
+    /// as docs/gpu-qualification-rtx3060.md read it from a live RTX 3060.
+    const POLICY_LINE: &str = "2026-10-01T08:01:40Z MatMul RC execution policy: strict-device \
+provider=cuda_rc_exact_fused_extract ready=1 \
+reason=generic_exactgemm_and_rc_self_qualified:canary=missing_golden \
+workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_catchup=0\n";
+
+    #[test]
+    fn the_pre_rpc_stage_is_read_from_this_launchs_log() {
+        // Nothing new in debug.log: the engine never reached StartLogging, so
+        // it is stuck in the attestation archive open or earlier, not the GPU.
+        assert_eq!(pre_rpc_stage(""), PreRpcStage::BeforeLogging);
+        assert_eq!(pre_rpc_stage("\n\n"), PreRpcStage::BeforeLogging);
+
+        // Past StartLogging, no policy line: inside the GPU step.
+        assert_eq!(pre_rpc_stage(STARTED_LOGGING), PreRpcStage::GpuCheck);
+        // The canary's own lines come before the policy line, and a hang
+        // after them is still the GPU step.
+        let canary = format!(
+            "{STARTED_LOGGING}2026-10-01T08:00:02Z MatMul RC production canary: build \
+             provenance is advisory (matches=0 dirty=0 fingerprint=a7bf4bd7). Continuing \
+             to runtime ExactGemm self-qualification and digest check; this is not a \
+             startup refusal.\n"
+        );
+        assert_eq!(pre_rpc_stage(&canary), PreRpcStage::GpuCheck);
+
+        // The policy line is there: the GPU step finished.
+        let past = format!("{STARTED_LOGGING}{POLICY_LINE}");
+        assert_eq!(pre_rpc_stage(&past), PreRpcStage::PastGpuCheck);
+
+        // A debug.log the engine shrank at this StartLogging reads as a tail
+        // that can hold an older run's policy line. Only what follows this
+        // launch's own StartLogging counts.
+        let shrunk = format!("{STARTED_LOGGING}{POLICY_LINE}{STARTED_LOGGING}");
+        assert_eq!(pre_rpc_stage(&shrunk), PreRpcStage::GpuCheck);
+    }
+
+    #[test]
+    fn only_a_validating_gpu_launch_runs_the_gpu_check() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let cuda_consensus = args(&[
+            "-datadir=/dd",
+            "-matmulrcexecution=strict-device",
+            "-matmulvalidation=consensus",
+        ]);
+        assert!(launch_runs_gpu_check(Backend::Cuda, &cuda_consensus));
+        // A Mac passes neither flag and the engine defaults to consensus and
+        // strict-device on mainnet (init.cpp:2596, --help).
+        assert!(launch_runs_gpu_check(
+            Backend::Metal,
+            &args(&["-datadir=/dd"])
+        ));
+        // A mirror launch probes nothing before RPC.
+        let mirror = args(&[
+            "-matmulrcexecution=strict-device",
+            "-matmulvalidation=trusted",
+        ]);
+        assert!(!launch_runs_gpu_check(Backend::Cuda, &mirror));
+        assert!(!launch_runs_gpu_check(Backend::Metal, &mirror));
+        // auto-fallback skips the probe (init.cpp:2619-2622).
+        let fallback = args(&[
+            "-matmulrcexecution=auto-fallback",
+            "-matmulvalidation=consensus",
+        ]);
+        assert!(!launch_runs_gpu_check(Backend::Cuda, &fallback));
+        // No graphics card, no GPU check.
+        assert!(!launch_runs_gpu_check(Backend::Cpu, &cuda_consensus));
+        // The last value on the command line is the one the engine uses.
+        let last_wins = args(&["-matmulvalidation=trusted", "-matmulvalidation=consensus"]);
+        assert!(launch_runs_gpu_check(Backend::Cuda, &last_wins));
+    }
+
+    #[test]
+    fn a_gpu_hang_needs_a_gpu_launch_and_a_log_that_stops_inside_the_check() {
+        assert!(stuck_in_gpu_check(true, STARTED_LOGGING));
+        assert!(
+            !stuck_in_gpu_check(false, STARTED_LOGGING),
+            "not a GPU launch"
+        );
+        assert!(!stuck_in_gpu_check(true, ""), "never reached StartLogging");
+        let past = format!("{STARTED_LOGGING}{POLICY_LINE}");
+        assert!(!stuck_in_gpu_check(true, &past), "the GPU step finished");
+    }
+
+    /// The record makes a Cuda host, which validates by default, follow
+    /// signatures, exactly like the owner's choice; clearing it gives the
+    /// card its next try.
+    #[test]
+    fn a_hung_gpu_start_makes_the_host_follow_signatures_until_cleared() {
+        let tmp = tempfile::tempdir().expect("temp datadir");
+        let dir = tmp.path();
+        let btxd = Path::new("/x/btx/v0.34.12/linux/btxd");
+        assert!(!gpu_start_hung(dir));
+        assert!(!host_follows_signatures(btxd, dir, Backend::Cuda));
+
+        record_gpu_start_hung(dir);
+        assert!(gpu_start_hung(dir));
+        let text = std::fs::read_to_string(dir.join(".gpu-start-hung")).unwrap();
+        assert!(text.contains("graphics card"), "{text}");
+        assert!(!text.contains('\u{2014}'), "no em-dash: {text}");
+        for backend in [Backend::Cuda, Backend::Metal] {
+            assert!(host_follows_signatures(btxd, dir, backend), "{backend:?}");
+            assert!(launches_as_mirror(btxd, dir, backend), "{backend:?}");
+        }
+        let (_, args, _) = build_node_command(btxd, dir, &dir.join("btx.conf"), Backend::Cuda);
+        assert!(
+            args.iter().any(|a| a == "-matmulvalidation=trusted"),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|a| a == "-matmulvalidation=consensus"));
+
+        // Not the owner's choice, and not the Mac's refusal marker.
+        assert!(!follows_signatures_by_choice(dir));
+        assert!(!matmul_consensus_was_refused(dir));
+
+        clear_gpu_start_hung(dir);
+        assert!(!gpu_start_hung(dir));
+        assert!(!host_follows_signatures(btxd, dir, Backend::Cuda));
+        // Clearing a clear folder is not an error.
+        clear_gpu_start_hung(dir);
+    }
+
+    /// The record outranks the backend split and yields only to the
+    /// operator's explicit "never a mirror".
+    #[test]
+    fn the_hung_record_yields_only_to_the_operators_zero() {
+        assert!(follows_by_record(false, true, None));
+        assert!(follows_by_record(false, true, Some(true)));
+        assert!(!follows_by_record(false, true, Some(false)));
+        assert!(follows_by_record(true, false, None));
+        assert!(!follows_by_record(true, false, Some(false)));
+        assert!(!follows_by_record(false, false, None));
+        assert!(!follows_by_record(false, false, Some(true)));
+    }
+
+    /// Full check on the setup screen tries the card again, as Settings'
+    /// "check blocks" does.
+    #[test]
+    fn full_check_at_setup_clears_the_hung_record() {
+        let tmp = tempfile::tempdir().expect("temp datadir");
+        record_gpu_start_hung(tmp.path());
+        apply_start_choice(tmp.path(), StartChoice::FullCheck, true).unwrap();
+        assert!(!gpu_start_hung(tmp.path()));
+    }
+
+    /// The launch keeps the arguments it passed, so the app can ask whether
+    /// this launch ran the GPU check.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_started_controller_keeps_its_launch_arguments() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(NodeController::new().launch_args().is_empty());
+        let mut controller = start_shim(tmp.path(), "exec sleep 30").await;
+        let args = controller.launch_args().to_vec();
+        assert!(
+            args.iter()
+                .any(|a| a == &format!("-datadir={}", tmp.path().display())),
+            "{args:?}"
+        );
+        assert_eq!(
+            controller
+                .stop_without_rpc_outcome(std::time::Duration::from_secs(10))
+                .await,
+            NoRpcStop::OnSigterm
+        );
+    }
+
     /// A btxd alive at the end of the RPC wait with no RPC to ask: SIGTERM
     /// ends an ordinary process within the grace, and nothing is left behind.
     #[cfg(unix)]
@@ -5514,6 +5901,31 @@ consensus-validator service.";
         assert!(
             !crate::platform::process_is_alive(pid),
             "the wedged child must be gone"
+        );
+    }
+
+    /// The outcome says a killed child is gone, so the launch can take its
+    /// next attempt; only one that outlives the kill is `StillRunning`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_without_rpc_outcome_says_killed_for_a_child_that_ignores_sigterm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut controller = start_shim(
+            tmp.path(),
+            "trap '' TERM\ntouch \"$0.ready\"\nwhile :; do sleep 1; done",
+        )
+        .await;
+        let ready = tmp.path().join("btxd.ready");
+        let waited = std::time::Instant::now();
+        while !ready.exists() && waited.elapsed() < std::time::Duration::from_secs(10) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ready.exists(), "the shim never reached its trap");
+        assert_eq!(
+            controller
+                .stop_without_rpc_outcome(std::time::Duration::from_secs(1))
+                .await,
+            NoRpcStop::Killed
         );
     }
 
