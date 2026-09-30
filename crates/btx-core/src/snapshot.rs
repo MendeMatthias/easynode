@@ -655,8 +655,9 @@ pub enum SnapshotOutcome {
 /// What [`load_signed`] came to. The strings are for the log only.
 enum Signed {
     Loaded(u64),
-    /// A snapshot chainstate turned up while the headers were being waited
-    /// for: nothing was loaded here.
+    /// A snapshot chainstate was there before the load began, or turned up
+    /// while the headers were being waited for: nothing was loaded here. On
+    /// a signed-only load, only once [`vouch_for_found`] passed.
     AlreadyLoaded,
     NotLoaded(String),
     /// `LoadError::restore_chain_data`: the caller sets the chain data aside.
@@ -707,6 +708,20 @@ async fn load_signed(
         )
         .await,
     )
+}
+
+/// A snapshot chainstate a signed-only load finds already there, before it
+/// loads anything or while it waits for headers. On a validating node's
+/// mirror launch that is one a relaunch (a self-update, a crash, a
+/// force-quit) left the engine holding, from a run that never got to the
+/// check after the load (section 7, step 6). It counts as loaded only once
+/// that check finds no refused block on the node's chain; a node that does
+/// not say counts as one that has one (`LoadError::restore_chain_data`).
+async fn vouch_for_found(rpc: &dyn Rpc, holds: &crate::confirmed_load::Holds<'_>) -> Signed {
+    match crate::confirmed_load::check_holds_after_load(rpc, holds).await {
+        Ok(()) => Signed::AlreadyLoaded,
+        Err(e) => Signed::HeldRootOnChain(e.to_string()),
+    }
 }
 
 /// A signed load's result. Every error after which the engine may hold a
@@ -917,12 +932,17 @@ pub fn ensure_snapshot_loaded_with(
             return SnapshotOutcome::AlreadyLoaded;
         }
         // Already have a snapshot chainstate? Nothing to do — but persist the
-        // loaded flag so later reclaim runs can safely drop snapshot.dat.
+        // loaded flag so later reclaim runs can safely drop snapshot.dat. A
+        // signed-only load counts it only once the check after a load passes.
         match get_chainstates(&rpc).await {
             Ok(cs) if cs.snapshot().is_some() => {
-                flags.mark_loaded();
-                mark_snapshot_marker(&datadir);
-                return SnapshotOutcome::AlreadyLoaded;
+                let found = if signed == SignedLoad::SignedOnly {
+                    vouch_for_found(&rpc, &crate::confirmed_load::Holds::compiled()).await
+                } else {
+                    Signed::AlreadyLoaded
+                };
+                return after_signed_load(found, signed, &*flags, &datadir)
+                    .unwrap_or(SnapshotOutcome::AlreadyLoaded);
             }
             Ok(_) => {}
             Err(e) => {
@@ -932,7 +952,10 @@ pub fn ensure_snapshot_loaded_with(
         }
 
         if signed != SignedLoad::None {
-            let got = load_signed(&rpc, &btx_cli, &datadir, anchor_height).await;
+            let mut got = load_signed(&rpc, &btx_cli, &datadir, anchor_height).await;
+            if signed == SignedLoad::SignedOnly && matches!(got, Signed::AlreadyLoaded) {
+                got = vouch_for_found(&rpc, &crate::confirmed_load::Holds::compiled()).await;
+            }
             if let Some(outcome) = after_signed_load(got, signed, &*flags, &datadir) {
                 return outcome;
             }
@@ -1446,6 +1469,14 @@ mod tests {
         );
     }
 
+    /// A mock node's answer to one method, matched on the JSON-RPC body.
+    fn method(name: &str) -> mockito::Matcher {
+        mockito::Matcher::PartialJson(serde_json::json!({ "method": name }))
+    }
+
+    /// `getblockhash` for a height above the tip, as btxd answers it.
+    const OUT_OF_RANGE: &str = r#"{"result":null,"error":{"code":-8,"message":"Block height out of range"},"id":"easybtx"}"#;
+
     /// A signed-only load (a validating node's mirror launch, Fast-forward)
     /// does not take the flag's word that a snapshot is loaded: Fast-forward
     /// sets the chain aside under a flag that still says so. It asks the node.
@@ -1453,9 +1484,16 @@ mod tests {
     async fn a_signed_only_load_asks_the_node_whatever_the_flag_says() {
         let mut server = mockito::Server::new_async().await;
         let asked = server
-            .mock("POST", mockito::Matcher::Any)
+            .mock("POST", "/")
+            .match_body(method("getchainstates"))
             .with_body(CHAINSTATES_WITH_SNAPSHOT)
             .expect(1)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/")
+            .match_body(method("getblockhash"))
+            .with_body(OUT_OF_RANGE)
             .create_async()
             .await;
         let dir = tempfile::tempdir().unwrap();
@@ -1471,6 +1509,85 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, SnapshotOutcome::AlreadyLoaded);
         asked.assert_async().await;
+    }
+
+    /// Final review I1: a relaunch during a validating node's mirror launch
+    /// (a self-update, a crash, a force-quit) can leave the engine holding
+    /// the snapshot that launch loaded, without the check after the load
+    /// (section 7, step 6) ever having run. A signed-only load that finds a
+    /// snapshot chainstate already there counts it only once that check
+    /// passes; one with a refused block on the chain is refused as a signed
+    /// load that put it there, and is not marked loaded.
+    #[tokio::test]
+    async fn a_signed_only_load_checks_a_snapshot_it_finds_before_it_counts() {
+        let refused = crate::known_invalid::KNOWN_INVALID_BLOCKS[0].hash;
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .match_body(method("getchainstates"))
+            .with_body(CHAINSTATES_WITH_SNAPSHOT)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/")
+            .match_body(method("getblockhash"))
+            .with_body(format!(
+                r#"{{"result":"{refused}","error":null,"id":"easybtx"}}"#
+            ))
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let flag = Arc::new(Flag(AtomicBool::new(false)));
+        let outcome = ensure_snapshot_loaded_with(
+            RpcClient::new(server.url(), "u", "p"),
+            PathBuf::from("/nonexistent/btx-cli"),
+            dir.path().to_path_buf(),
+            219_000,
+            flag.clone(),
+            SignedLoad::SignedOnly,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&outcome, SnapshotOutcome::HeldRootOnChain(why) if why.contains(refused)),
+            "{outcome:?}"
+        );
+        assert!(!flag.loaded());
+        assert!(!snapshot_marker_present(dir.path()));
+    }
+
+    /// The same check, as a snapshot found while the headers were waited
+    /// for reaches it: clean counts, a refused block on the chain or a node
+    /// that does not say is refused.
+    #[tokio::test]
+    async fn a_snapshot_found_is_vouched_for_only_after_the_held_root_check() {
+        let found = Some((BASE_219000, 219_000));
+        let clean = AfterLoad {
+            snapshot: found,
+            ..Default::default()
+        };
+        assert!(matches!(
+            vouch_for_found(&clean, &test_holds()).await,
+            Signed::AlreadyLoaded
+        ));
+        let held = AfterLoad {
+            snapshot: found,
+            at_held: Some(TEST_ROOT),
+            ..Default::default()
+        };
+        assert!(matches!(
+            vouch_for_found(&held, &test_holds()).await,
+            Signed::HeldRootOnChain(why) if why.contains(TEST_ROOT)
+        ));
+        let silent = AfterLoad {
+            snapshot: found,
+            silent: &["getblockhash"],
+            ..Default::default()
+        };
+        assert!(matches!(
+            vouch_for_found(&silent, &test_holds()).await,
+            Signed::HeldRootOnChain(_)
+        ));
     }
 
     #[tokio::test]

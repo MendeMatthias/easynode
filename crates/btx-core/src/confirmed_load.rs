@@ -467,7 +467,12 @@ const POST_LOAD_PAUSE: Duration = if cfg!(test) {
 /// Section 7, step 6: the block at each refused height is not the refused
 /// block. A question the node leaves unanswered is asked again, up to
 /// [`POST_LOAD_ATTEMPTS`] times; then [`LoadError::PostLoadCheckUnavailable`].
-async fn check_holds_after_load(rpc: &dyn Rpc, holds: &Holds<'_>) -> Result<(), LoadError> {
+/// `crate::snapshot` also asks it of a snapshot a signed-only load finds
+/// already there, which the run that loaded it may never have checked.
+pub(crate) async fn check_holds_after_load(
+    rpc: &dyn Rpc,
+    holds: &Holds<'_>,
+) -> Result<(), LoadError> {
     for (height, root) in holds.roots() {
         let mut attempt = 1;
         loop {
