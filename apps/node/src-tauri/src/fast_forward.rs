@@ -753,6 +753,18 @@ fn set_aside_for_run(datadir: &Path, height: u64, now_unix: u64) -> Result<Recor
     set
 }
 
+/// Step 2 on disk: [`set_aside_for_run`], and only once the chain data is
+/// aside, the snapshot pairs other than the run's are pruned (review N4): a
+/// run refused before anything moved keeps them. The loader prunes them too
+/// when it loads the run's pair, so a roll-back still finds them gone.
+fn set_aside_then_prune(datadir: &Path, height: u64, now_unix: u64) -> Result<Record, MoveError> {
+    let set = set_aside_for_run(datadir, height, now_unix);
+    if set.is_ok() {
+        btx_core::attested_snapshot::prune_others(datadir, height);
+    }
+    set
+}
+
 /// The engine's own lock on the data folder, held for a move of chain data
 /// (review I5): while it is held, no btxd starts on the folder, whichever
 /// app launches it (the easyBTX miner shares it). One that cannot be had
@@ -1128,7 +1140,6 @@ async fn run(app: &AppHandle, state: &State<'_, AppState>) {
         );
         return not_started(&datadir, why).await;
     }
-    btx_core::attested_snapshot::prune_others(&datadir, pair.height);
     log(
         &datadir,
         &format!(
@@ -1157,7 +1168,7 @@ async fn run(app: &AppHandle, state: &State<'_, AppState>) {
         return;
     }
     let (dd, height, at) = (datadir.clone(), pair.height, now());
-    match on_disk(move || set_aside_for_run(&dd, height, at)).await {
+    match on_disk(move || set_aside_then_prune(&dd, height, at)).await {
         Some(Ok(record)) => log(
             &datadir,
             &format!(
@@ -2547,6 +2558,42 @@ mod tests {
         assert_eq!(*stuck.lock().unwrap(), Some(not_back.said));
         assert!(underway(d));
         assert!(folder.join("indexes/old").exists());
+    }
+
+    /// Review N4: the pairs other than the run's are pruned only once the
+    /// chain data is set aside. A refusal before that (a set-aside note
+    /// waiting, here; the quit, the start under way and the node that did
+    /// not stop come earlier still, in `run`) keeps them.
+    #[test]
+    fn the_other_pairs_are_pruned_only_once_the_chain_data_is_aside() {
+        let tmp = datadir_with_chain(Before::default());
+        let d = tmp.path();
+        let pair = |h: u64| {
+            let (file, manifest) = btx_core::attested_snapshot::pair_paths(d, h);
+            [file, manifest]
+        };
+        for h in [219_000, 232_000] {
+            for p in pair(h) {
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, b"pair").unwrap();
+            }
+        }
+        std::fs::write(d.join(crate::commands::SET_ASIDE_PENDING_FILE), b"{}").unwrap();
+        assert!(matches!(
+            set_aside_then_prune(d, 232_000, 100),
+            Err(MoveError::Untouched(_))
+        ));
+        for p in pair(219_000).iter().chain(&pair(232_000)) {
+            assert!(p.exists(), "{} kept", p.display());
+        }
+        std::fs::remove_file(d.join(crate::commands::SET_ASIDE_PENDING_FILE)).unwrap();
+        set_aside_then_prune(d, 232_000, 100).unwrap();
+        for p in pair(232_000) {
+            assert!(p.exists(), "{} is the run's", p.display());
+        }
+        for p in pair(219_000) {
+            assert!(!p.exists(), "{} pruned", p.display());
+        }
     }
 
     /// Review I3: the snapshot must still be above the node's tip once step
