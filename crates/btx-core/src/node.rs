@@ -835,6 +835,36 @@ pub fn build_node_command(
     // default: the most-work chain, with the fork detector (btx_core::fork)
     // saying out loud when a longer chain exists that this node cannot get.
     args.push("-parkdeepreorg=0".to_string());
+    // ...and on engine v0.34.12 and newer, legacy reorg mode beside it, so the
+    // node keeps the reorg behaviour it had on 0.34.9. 0.34.12 added
+    // `-reorgpolicy` with `bounded` as the default, and under bounded an
+    // explicit `-parkdeepreorg=0` is an init error: "-parkdeepreorg=0
+    // conflicts with -reorgpolicy=bounded. Use -reorgpolicy=legacy to follow a
+    // deeper chain without the recovery ceiling."
+    // (node/chainstatemanager_args.cpp:182-186 at v0.34.12, turned into
+    // InitError at init.cpp:2214-2216). Legacy skips the bounded decision
+    // (validation.cpp:10600) and keeps the park action `-parkdeepreorg` chooses
+    // (chainstatemanager_args.cpp:138-141), and with it at 0 the node never
+    // parks (kernel/chainstatemanager_opts.h:212-222). Bounded on a trusted
+    // mirror can also spin at 100% CPU holding cs_main when a signed competing
+    // prefix is deeper than 6 (upstream PR 211, not merged on 2026-09-30), and
+    // most easyNode nodes are trusted mirrors.
+    //
+    // The command line outranks a `reorgpolicy=` in the conf and in the
+    // datadir's btx_rw.conf, the same as every flag here (common/settings.cpp
+    // MergeSettings, v0.34.12). Measured 2026-09-30 on the v0.34.12 binary,
+    // regtest: with `reorgpolicy=bounded`, `parkdeepreorg=0` and
+    // `deepforkautoresolve=0` in the conf and `reorgpolicy=bounded` in
+    // btx_rw.conf, this launch started and logged `Command-line arg:
+    // reorgpolicy="legacy"`.
+    //
+    // Gated on the version in the install path like the flags below: v0.34.9
+    // refuses the argument outright ("Error parsing command line arguments:
+    // Invalid parameter -reorgpolicy=legacy", measured the same day), and the
+    // app launches the previous engine when provisioning a new one fails.
+    if node_has_reorg_policy(btxd) {
+        args.push("-reorgpolicy=legacy".to_string());
+    }
     // The prune posture must be EXPLICIT, for the same reason
     // -matmulvalidation is below: btxd loads the datadir's btx_rw.conf on every
     // start regardless of -conf, and a READ-WRITE setting outranks a config
@@ -1469,6 +1499,25 @@ fn node_allows_degraded_matmul_start(btxd: &Path) -> bool {
     (major, minor, patch) >= (0, 34, 5)
 }
 
+/// Whether the btxd at `path` has `-reorgpolicy`, i.e. is v0.34.12 or newer.
+/// v0.34.12 added it (init.cpp:694) with `bounded` as the default, which
+/// refuses the `-parkdeepreorg=0` every launch passes, so a launch of this
+/// engine must say `-reorgpolicy=legacy`. Older engines reject the unknown
+/// argument FATALLY, so this fails safe to `false` for any older, unknown or
+/// tag-less path, like the gates above.
+fn node_has_reorg_policy(btxd: &Path) -> bool {
+    let Some(tag) = release_tag_from_btxd_path(btxd) else {
+        return false;
+    };
+    let Some(v) = parse_tag_version(&tag) else {
+        return false;
+    };
+    let major = v.first().copied().unwrap_or(0);
+    let minor = v.get(1).copied().unwrap_or(0);
+    let patch = v.get(2).copied().unwrap_or(0);
+    (major, minor, patch) >= (0, 34, 12)
+}
+
 /// The `-matmulrcexecution` mode this host should run, or `None` to leave
 /// btxd's own default in place.
 ///
@@ -1795,6 +1844,18 @@ pub const PRUNED_DATADIR_REFUSED_MARKER: &str = "Block files have previously bee
 /// node up.
 pub const RPC_BIND_FAILED_MARKER: &str = "Unable to bind all endpoints for RPC server";
 
+/// Shared by engine v0.34.12's two init refusals under its default
+/// `-reorgpolicy=bounded`: an explicit `-parkdeepreorg=0` or
+/// `-deepforkautoresolve=0` (node/chainstatemanager_args.cpp:182-190). btxd
+/// prints it on stderr and exits before RPC binds.
+///
+/// It cannot come from a conf while the launch passes `-reorgpolicy=legacy`,
+/// because the command line outranks every conf (measured, see
+/// `build_node_command`). So it means this start did not pass it: the btxd in
+/// the install folder is 0.34.12 or newer while the folder's name, which is
+/// what `node_has_reorg_policy` reads, says older.
+pub const REORG_POLICY_CONFLICT_MARKER: &str = "conflicts with -reorgpolicy";
+
 pub fn launch_failure_hint(text: &str) -> Option<&'static str> {
     if text.contains(PRUNED_DATADIR_REFUSED_MARKER) {
         return Some(
@@ -1821,6 +1882,14 @@ pub fn launch_failure_hint(text: &str) -> Option<&'static str> {
             "the engine refused to validate on this Mac's graphics chip. The app retries \
              as a trusted mirror on its own, so reaching this message means that retry \
              did not start either.",
+        );
+    }
+    if text.contains(REORG_POLICY_CONFLICT_MARKER) {
+        return Some(
+            "the node engine refused its reorg settings because it is 0.34.12 or newer and \
+             this start did not put it in legacy reorg mode, which easyNode does only when \
+             the engine's install folder is named for 0.34.12 or newer, so the engine in that \
+             folder is newer than its name says; nothing in the node folder is damaged.",
         );
     }
     None
@@ -4978,6 +5047,29 @@ consensus-validator service.";
         );
     }
 
+    /// Verbatim from the v0.34.12 binary on 2026-09-30, regtest, started with
+    /// `-parkdeepreorg=0` and no `-reorgpolicy`: it prints this on stderr
+    /// (easybtx-node.log) and exits 1 before debug.log says anything. The
+    /// second is its sibling for `-deepforkautoresolve=0`
+    /// (chainstatemanager_args.cpp:187-190).
+    #[test]
+    fn a_reorg_policy_refusal_is_named_and_is_not_a_reason_to_wipe() {
+        for log in [
+            "Error: -parkdeepreorg=0 conflicts with -reorgpolicy=bounded. Use \
+             -reorgpolicy=legacy to follow a deeper chain without the recovery ceiling.",
+            "Error: -deepforkautoresolve=0 conflicts with -reorgpolicy=bounded. Bounded mode \
+             replaces that bypass; use -reorgpolicy=legacy to keep it.",
+        ] {
+            let hint = launch_failure_hint(log).expect("a reorg policy refusal must be named");
+            assert!(hint.contains("0.34.12"), "{hint}");
+            assert!(
+                !hint.to_lowercase().contains("remove node data"),
+                "a refused setting must never read as a reason to wipe: {hint}"
+            );
+            assert!(!hint.contains('\u{2014}'), "{hint}");
+        }
+    }
+
     #[test]
     fn a_pruned_datadir_refusal_is_named_and_an_unknown_exit_is_not_guessed_at() {
         const REAL_PRUNED_REFUSAL: &str = "2026-08-30T21:17:13Z LoadBlockIndexDB: last block \
@@ -5961,6 +6053,47 @@ consensus-validator service.";
             Backend::Cpu,
         );
         assert!(!args.iter().any(|a| a.starts_with("-matmulrcexecution")));
+    }
+
+    /// Both sides of the 0.34.12 line, on every backend. v0.34.12 refuses
+    /// `-parkdeepreorg=0` under its default `-reorgpolicy=bounded`, and
+    /// v0.34.9 refuses `-reorgpolicy` as an unknown argument (measured on both
+    /// binaries, regtest, 2026-09-30). So the flag goes to 0.34.12 and newer
+    /// only, and `-parkdeepreorg=0` stays on both sides.
+    #[test]
+    fn legacy_reorg_mode_goes_only_to_an_engine_that_has_it() {
+        let dd = Path::new("/dd");
+        let conf = Path::new("/dd/btx.conf");
+        for backend in [Backend::Metal, Backend::Cuda, Backend::Cpu] {
+            for tag in ["v0.34.12", "v0.34.12-5f32c4c4", "v0.34.13", "v0.35.0"] {
+                let btxd = PathBuf::from(format!("/x/btx/{tag}/plat/bin/btxd"));
+                let (_, args, _) = build_node_command(&btxd, dd, conf, backend);
+                assert!(
+                    args.iter().any(|a| a == "-reorgpolicy=legacy"),
+                    "{tag} {backend:?}: {args:?}"
+                );
+                assert!(
+                    args.iter().any(|a| a == "-parkdeepreorg=0"),
+                    "{tag} {backend:?}: {args:?}"
+                );
+            }
+            for btxd in [
+                "/x/btx/v0.34.9/plat/bin/btxd",
+                "/x/btx/v0.34.6-3013c2c2/plat/bin/btxd",
+                "/x/btx/v0.34.11/plat/bin/btxd",
+                "/data/bin/btxd",
+            ] {
+                let (_, args, _) = build_node_command(Path::new(btxd), dd, conf, backend);
+                assert!(
+                    !args.iter().any(|a| a.starts_with("-reorgpolicy")),
+                    "{btxd} {backend:?}: {args:?}"
+                );
+                assert!(
+                    args.iter().any(|a| a == "-parkdeepreorg=0"),
+                    "{btxd} {backend:?}: {args:?}"
+                );
+            }
+        }
     }
 
     #[test]
