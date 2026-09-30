@@ -584,7 +584,10 @@ fn in_flight_elsewhere(peers: &[PeerInfo], tip: u64, ours: Option<(u64, u64)>) -
 }
 
 /// The chain to follow: toward the signed frontier when the node reads one,
-/// else its best header that is not refused (as the Tools button does).
+/// else its best header the node has not marked invalid
+/// (`stuck_blocks::target_tip`, as the Tools button does). That can be a
+/// held branch the node has not refused yet; [`refused_on_path`] then stops
+/// the help before it asks for any of it.
 pub fn choose_target(
     frontier: Option<(u64, String)>,
     tips: &[ChainTip],
@@ -662,12 +665,18 @@ fn times_in_words(n: u32) -> String {
     }
 }
 
-/// What the refresher already read this tick.
+/// What the refresher already read: each field its last good read, never a
+/// failed one handed on as empty.
 #[derive(Debug, Clone, Copy)]
 pub struct Tick<'a> {
+    /// This tick's `getblockchaininfo`: the tip's height.
     pub blocks: u64,
+    /// The same answer's best header height.
     pub headers: u64,
+    /// The last `getchaintips` that answered. The refresher reads it every
+    /// tenth tick, so it may be up to about 30 seconds old.
     pub tips: &'a [ChainTip],
+    /// This tick's `getpeerinfo`.
     pub peers: &'a [PeerInfo],
     /// The refresher's `signed_frontier` slot: its last good
     /// `getmatmulattestedtip` answer this run, read on every node every tick
