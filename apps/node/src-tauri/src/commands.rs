@@ -1339,13 +1339,27 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
             let _ =
                 btx_core::setup::set_managed_whitelist_block(&paths.faststart_conf, &whitelist_ips);
         }
+        let fast_forward = crate::fast_forward::underway(&datadir);
         let signed = signed_load_for(
             mirror_load_launch,
             !signer_applies_here,
             SIGNED_LOAD_FAILED.load(Ordering::SeqCst),
-            crate::fast_forward::underway(&datadir),
+            fast_forward,
         );
-        load_watch = Some((signed, mirror_load_launch));
+        if run_load_missed(
+            fast_forward,
+            !signer_applies_here,
+            mirror_load_launch,
+            NodeAppSettings::load(&datadir).snapshot_loaded,
+        ) {
+            let msg = "Fast-forward: this node checks blocks and its one mirror launch did not \
+                       run, so nothing loads the run's snapshot; the driver undoes the run";
+            eprintln!("[node-app] {msg}");
+            setup_log(&datadir, msg);
+            crate::fast_forward::report_failure(crate::fast_forward::WHY_NOT_LOADED.into());
+        } else {
+            load_watch = Some((signed, mirror_load_launch));
+        }
     }
 
     set_phase(app, state, NodePhase::LoadingSnapshot).await;
@@ -4008,7 +4022,10 @@ pub(crate) static SIGNED_LOAD_FAILED: std::sync::atomic::AtomicBool =
 /// Which signed load a launch makes. Pure, so every case has a test. During
 /// Fast-forward (`fast_forward`, `crate::fast_forward::underway`) a node
 /// that follows signatures loads the signed pair or nothing: the driver
-/// rolls back on nothing, and the compiled snapshot is below the run's.
+/// rolls back on nothing, and the compiled snapshot is below the run's. A
+/// node that checks blocks loads the run's pair in its mirror launch, and
+/// its ordinary launch after one that was skipped loads nothing at all
+/// ([`run_load_missed`]).
 fn signed_load_for(
     mirror_load_launch: bool,
     follows_signatures: bool,
@@ -4023,6 +4040,26 @@ fn signed_load_for(
     } else {
         SignedLoad::None
     }
+}
+
+/// Pure: during a Fast-forward run (`fast_forward`), has this ordinary
+/// launch of a node that checks blocks (not `follows_signatures`) nothing to
+/// load the run's snapshot with? Such a node loads a run's snapshot only in
+/// its one mirror launch, signed-only as a node that follows signatures
+/// loads it. When that launch was skipped (no signed pair was ready within
+/// five minutes, say) and nothing is loaded (`loaded`, the setting the run
+/// resets and only the loader sets), the launch would load the compiled
+/// snapshot, far below the run's, for minutes, only to be rolled back: it
+/// loads nothing, and the driver is told at once (review M5). The launch
+/// after a mirror launch that loaded finds `loaded` set, and goes on as
+/// before: the snapshot is there.
+fn run_load_missed(
+    fast_forward: bool,
+    follows_signatures: bool,
+    mirror_load_launch: bool,
+    loaded: bool,
+) -> bool {
+    fast_forward && !follows_signatures && !mirror_load_launch && !loaded
 }
 
 /// The signer decision for one launch, as `(applies_here, key_in_conf)`.
@@ -7202,11 +7239,11 @@ mod signed_start_tests {
         honour_pending_set_aside_at, key_line_goes_back, mark_first_load_if_fresh,
         mark_set_aside_pending, mirror_launch_available, mirror_launch_failed,
         mirror_load_end_message, mirror_load_step, mirror_load_wanted_here, nominal_btxd_path,
-        prepared_within, refused_load_message, run_failure_reason, runs_mirror_load,
-        set_aside_pending, set_aside_refused_snapshot_at, set_aside_waits, set_aside_will_move,
-        settle_first_load, signed_load_failed, signed_load_for, signer_after_chip_refusal,
-        signer_for_launch, signing_key_the_app_does_not_manage, snapshot_base,
-        write_signer_key_line, AfterLoad, AfterRefusal, AttachedTo, MirrorLoadStep,
+        prepared_within, refused_load_message, run_failure_reason, run_load_missed,
+        runs_mirror_load, set_aside_pending, set_aside_refused_snapshot_at, set_aside_waits,
+        set_aside_will_move, settle_first_load, signed_load_failed, signed_load_for,
+        signer_after_chip_refusal, signer_for_launch, signing_key_the_app_does_not_manage,
+        snapshot_base, write_signer_key_line, AfterLoad, AfterRefusal, AttachedTo, MirrorLoadStep,
         MIRROR_LOAD_ENABLED, PREPARE_START_DEADLINE, SET_ASIDE_STUCK,
     };
     use crate::state::NodeAppSettings;
@@ -7248,6 +7285,41 @@ mod signed_start_tests {
             SignedLoad::SignedOnly
         );
         assert_eq!(signed_load_for(false, false, false, true), SignedLoad::None);
+    }
+
+    /// Review M5: a run's loads are signed-only for both host kinds. The
+    /// ordinary launch of a node that checks blocks, during a run whose
+    /// mirror launch was skipped and with nothing loaded, loads nothing (not
+    /// the compiled snapshot) and hands the driver the failure at once. The
+    /// launch after a mirror launch that loaded, a mirror launch itself, a
+    /// node that follows signatures (its signed-only load decides), and any
+    /// launch outside a run go on as before.
+    #[test]
+    fn a_run_whose_mirror_launch_was_skipped_fails_at_once() {
+        assert!(run_load_missed(true, false, false, false));
+        assert!(
+            !run_load_missed(true, false, false, true),
+            "after the mirror launch"
+        );
+        assert!(
+            !run_load_missed(true, false, true, false),
+            "the mirror launch"
+        );
+        assert!(
+            !run_load_missed(true, true, false, false),
+            "follows signatures"
+        );
+        for (follows, mirror, loaded) in [
+            (false, false, false),
+            (false, false, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            assert!(
+                !run_load_missed(false, follows, mirror, loaded),
+                "no run: {follows} {mirror} {loaded}"
+            );
+        }
     }
 
     /// During Fast-forward every load that comes to nothing, or to a
