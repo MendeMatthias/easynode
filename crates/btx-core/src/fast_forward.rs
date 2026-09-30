@@ -711,17 +711,33 @@ fn all_waiting(datadir: &Path, record: &Record) -> bool {
 
 /// The run a previous start left, to be watched again: one at
 /// [`Phase::Running`] gets a fresh watch window from `now_unix` (time the
-/// app was closed does not count against it), kept on disk. A record at any
-/// other phase comes back as it is; [`judge`] says what to do with it.
+/// app was closed does not count against it), kept on disk. When that
+/// window cannot be written (a disk a failed load filled), the run keeps
+/// the window it had and is watched with it, so the start is not held up
+/// and a roll-back, whose mark needs no space, still comes. A record at any
+/// other phase comes back as it is; [`judge`] says what to do with it. An
+/// error only when the record cannot be read.
 pub fn resume(datadir: &Path, now_unix: u64) -> io::Result<Option<Record>> {
-    let Some(mut record) = read_record(datadir)? else {
+    let Some(record) = read_record(datadir)? else {
         return Ok(None);
     };
-    if record.phase == Phase::Running {
-        record.watch_started_at = now_unix;
-        write_record(datadir, &record)?;
+    if record.phase != Phase::Running {
+        return Ok(Some(record));
     }
-    Ok(Some(record))
+    let fresh = Record {
+        watch_started_at: now_unix,
+        ..record.clone()
+    };
+    match write_record(datadir, &fresh) {
+        Ok(()) => Ok(Some(fresh)),
+        Err(e) => {
+            eprintln!(
+                "[fast-forward] the run's fresh watch window could not be written, so it keeps \
+                 the one it had: {e}"
+            );
+            Ok(Some(record))
+        }
+    }
 }
 
 /// Only this module writes the record, so its phases follow the steps.
@@ -1876,6 +1892,39 @@ mod tests {
             "a clock set back"
         );
         assert!(MAX_TOTAL_SECS > MAX_RUN_SECS);
+    }
+
+    /// Review M1: a resume that cannot write the fresh watch window (on a
+    /// disk a failed load filled, say) keeps the window it had and carries
+    /// on: the run is still watched, and rolled back once that window ends
+    /// (the undo's mark needs no space). Only a record that cannot be read
+    /// is an error.
+    #[cfg(unix)]
+    #[test]
+    fn a_resume_that_cannot_write_keeps_the_window_it_had() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = datadir_with_chain();
+        let d = tmp.path();
+        let r = set_aside(d, 232_000, Before::default(), 1_000).unwrap();
+        attempt_made_chain(d);
+        let mode = |m| std::fs::set_permissions(d, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o555);
+        if std::fs::write(d.join("probe"), b"").is_ok() {
+            mode(0o755);
+            eprintln!("skipped: this user can write a read-only folder");
+            return;
+        }
+        let got = resume(d, 50_000);
+        let kept = read_record(d);
+        mode(0o755);
+        assert_eq!(got.unwrap(), Some(r.clone()), "the window it had");
+        assert_eq!(kept.unwrap(), Some(r.clone()));
+        assert!(matches!(
+            judge(&r, &Look::default(), 50_000),
+            Verdict::RollBack(_)
+        ));
+        restore(d).unwrap();
+        assert_as_before(d, "rolled back with the window it had");
     }
 
     #[test]

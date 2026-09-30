@@ -1611,6 +1611,36 @@ mod tests {
         assert!(active_in(d));
     }
 
+    /// Review M1: a start that cannot write the run's fresh watch window (a
+    /// full disk, say) carries the run on with the window it had, rather
+    /// than calling the record unreadable and keeping the node stopped,
+    /// where the watch that would roll it back never begins.
+    #[cfg(unix)]
+    #[test]
+    fn a_start_that_cannot_write_the_watch_window_carries_the_run_on() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = datadir_with_chain(Before::default());
+        let d = tmp.path();
+        let record = set_aside_for_run(d, 232_000, 100).unwrap();
+        attempt(d);
+        let mode = |m| std::fs::set_permissions(d, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o555);
+        if std::fs::write(d.join("probe"), b"").is_ok() {
+            mode(0o755);
+            eprintln!("skipped: this user can write a read-only folder");
+            return;
+        }
+        let started = at_start(d, 50_000, true);
+        mode(0o755);
+        assert_eq!(started, Ok(()));
+        assert_eq!(
+            ff::read_record(d).unwrap(),
+            Some(record),
+            "the window it had"
+        );
+        assert!(underway(d));
+    }
+
     /// Controller notes 1 (a0, c): a run recorded done is finished at the
     /// start: the new chain stays, the old one goes, nothing is left.
     #[test]
