@@ -2114,9 +2114,13 @@ pub fn signs_here(conf: &Path) -> bool {
 ///
 /// The key is read from the file the conf line names (relative to the
 /// datadir, as the engine resolves it on mainnet). `None` when there is no
-/// line, the key cannot be read, or the conf already pins that key: the
-/// engine refuses a duplicate `-matmultrustedpubkey`, and a hand-managed conf
-/// may already carry it.
+/// line, the key cannot be read, or the conf or the datadir's `btx_rw.conf`
+/// already pins that key: the engine refuses a duplicate
+/// `-matmultrustedpubkey`, and a hand-managed conf, or a mirror-era leftover
+/// pin in `btx_rw.conf` (final review O1), may already carry it. `btxd`
+/// loads `btx_rw.conf` on every start regardless of `-conf` and merges its
+/// list settings with the command line, so a key it already pins must count
+/// here the same as a key `conf` pins.
 pub fn signing_key_self_pin(conf: &Path, datadir: &Path) -> Option<String> {
     let named = crate::setup::conf_kv(conf, crate::signer::SIGNER_KEY_CONF_KEY)?;
     let named = named.trim();
@@ -2130,7 +2134,9 @@ pub fn signing_key_self_pin(conf: &Path, datadir: &Path) -> Option<String> {
     };
     let wif = std::fs::read_to_string(key_path).ok()?;
     let pubkey = crate::signer::wif_to_pubkey_hex(&wif).ok()?;
-    let already_pinned = conf_pins(conf)
+    let mut already_pinned = conf_pins(conf);
+    already_pinned.extend(rw_conf_pins(&datadir.join("btx_rw.conf")));
+    let already_pinned = already_pinned
         .iter()
         .any(|v| v.eq_ignore_ascii_case(&pubkey));
     (!already_pinned).then_some(pubkey)
@@ -5758,6 +5764,41 @@ consensus-validator service.";
             let (_, args, _) = build_node_command(btxd, &dir, conf, Backend::Cuda);
             assert!(pins(&args).is_empty(), "{}: {args:?}", conf.display());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Final review O1: `btx_rw.conf` is loaded on every start regardless of
+    /// `-conf` and merges into the same list as the command line
+    /// (`common/config.cpp`, `common/settings.cpp` `GetSettingsList`), so a
+    /// signer's own key already pinned there must count too. Without this,
+    /// a host carrying a mirror-era leftover pin of its own key in
+    /// `btx_rw.conf` gets the engine's duplicate-pin refusal at init
+    /// (init.cpp:1591-1596 at 84b998b4).
+    #[test]
+    fn a_signer_already_pinned_in_btx_rw_conf_is_not_pinned_again() {
+        let dir = std::env::temp_dir().join(format!("easynode-self-pin-rw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wif = crate::signer::generate_wif();
+        let pubkey = crate::signer::wif_to_pubkey_hex(&wif).unwrap();
+        std::fs::write(dir.join(crate::signer::SIGNER_KEY_FILE), format!("{wif}\n")).unwrap();
+        let conf = dir.join("signing.conf");
+        std::fs::write(
+            &conf,
+            "server=1\nmatmulattestationsignerkeyfile=attestation-signer.key\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("btx_rw.conf"),
+            format!("matmultrustedpubkey={pubkey}\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            signing_key_self_pin(&conf, &dir),
+            None,
+            "btx_rw.conf already pins the signer's own key"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
