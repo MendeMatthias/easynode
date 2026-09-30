@@ -404,8 +404,8 @@ fn undo_set_aside(datadir: &Path, record: &Record, error: io::Error) -> MoveErro
 /// is there to replace it; then the undo is marked ([`Phase::Undoing`]), so
 /// the next start rolls the run back rather than watching it again; then the
 /// chain data the attempt made goes, then the old data comes back. Called
-/// again after any failure or crash, it carries on. Call only with the node stopped, and start the node only
-/// after it returns `Ok`.
+/// again after any failure or crash, it carries on. Call only with the node
+/// stopped, and start the node only after it returns `Ok`.
 pub fn restore(datadir: &Path) -> Result<Option<Record>, MoveError> {
     restore_with(datadir, &mut || Ok(()))
 }
@@ -828,7 +828,10 @@ pub fn judge(record: &Record, look: &Look, now_unix: u64) -> Verdict {
                 "the app stopped while it was setting the chain data aside".into(),
             )
         }
-        Phase::Restoring | Phase::Undoing => {
+        Phase::Undoing => {
+            return Verdict::RollBack("the app stopped while it was undoing Fast-forward".into())
+        }
+        Phase::Restoring => {
             return Verdict::RollBack(
                 "the app stopped while it was putting the old chain data back".into(),
             )
@@ -2029,14 +2032,19 @@ mod tests {
             Verdict::Done
         );
         // A record left between two steps of a move is undone, whatever the
-        // node shows.
-        for phase in [Phase::SettingAside, Phase::Undoing, Phase::Restoring] {
+        // node shows, and the reason names the step (review M9).
+        for (phase, step) in [
+            (Phase::SettingAside, "setting the chain data aside"),
+            (Phase::Undoing, "undoing Fast-forward"),
+            (Phase::Restoring, "putting the old chain data back"),
+        ] {
             let r = Record {
                 phase,
                 ..running_record(1_000)
             };
-            assert!(
-                matches!(judge(&r, &on_it, 2_000), Verdict::RollBack(_)),
+            assert_eq!(
+                judge(&r, &on_it, 2_000),
+                Verdict::RollBack(format!("the app stopped while it was {step}")),
                 "{phase:?}"
             );
         }
