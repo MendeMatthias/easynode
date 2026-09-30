@@ -31,6 +31,7 @@ pub mod error;
 pub mod esplora;
 pub mod esplora_freshness;
 pub mod esplora_sidecar;
+pub mod fast_forward;
 pub mod fork;
 pub mod frontier;
 pub mod fsx;

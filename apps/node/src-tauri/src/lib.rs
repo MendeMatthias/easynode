@@ -9,6 +9,7 @@
 
 mod ask;
 mod commands;
+mod fast_forward;
 mod state;
 mod tools;
 mod tray;
@@ -52,6 +53,9 @@ pub fn run() {
             tools::tools_fetch_stuck_blocks,
             tools::tools_restart_check,
             tools::tools_restart_node,
+            tools::tools_fast_forward_check,
+            tools::tools_fast_forward_run,
+            tools::tools_fast_forward_status,
             commands::set_keep_awake,
             commands::set_node_profile,
             commands::set_follow_signatures,
