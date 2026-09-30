@@ -123,6 +123,10 @@ retainshieldedcommitmentindex=1
 # counts, and the fork detector in the app says out loud when a longer chain
 # exists that the node cannot obtain. The warn depth stays: a deep reorg is
 # still worth a log line. docs/incident-2026-09-05-fork.md has both days.
+# Engine 0.34.12 and newer refuse parkdeepreorg=0 under their default
+# reorgpolicy=bounded, so the app also passes -reorgpolicy=legacy to them,
+# which honours this line. It is not written here: the app states it only to
+# an engine that has the option.
 parkdeepreorg=0
 maxreorgdepthwarn=3
 ";
@@ -160,7 +164,8 @@ retainshieldedcommitmentindex=1
 # Serve signed confirmations — the point of the profile.
 matmulattestationserve=1
 # Deep-reorg parking OFF, same posture and same reason as the full-node preset
-# (the 2026-09-05 split; see NODE_FASTSTART_CONF).
+# (the 2026-09-05 split; see NODE_FASTSTART_CONF), and on engine 0.34.12 and
+# newer the app adds -reorgpolicy=legacy on the command line beside it.
 parkdeepreorg=0
 maxreorgdepthwarn=3
 ";
@@ -1892,5 +1897,26 @@ mod keeper_profile_tests {
             NODE_KEEPER_CONF.contains("rpcbind=127.0.0.1"),
             "rpc stays local"
         );
+    }
+
+    /// Engine 0.34.12 and newer refuse `parkdeepreorg=0` under their default
+    /// bounded policy, and the launch answers with `-reorgpolicy=legacy` on the
+    /// command line, only to an engine that has the option
+    /// (`node::build_node_command`). The confs keep `parkdeepreorg=0`, which
+    /// legacy honours, and name no reorg policy: the launch states it in the
+    /// one layer that outranks every conf. (An older engine would not refuse
+    /// such a line; 0.34.9 logs "Ignoring unknown configuration value
+    /// reorgpolicy", measured 2026-09-30.)
+    #[test]
+    fn the_confs_keep_parking_off_and_leave_the_reorg_policy_to_the_launch() {
+        for conf in [NODE_FASTSTART_CONF, NODE_KEEPER_CONF] {
+            assert!(conf.lines().any(|l| l == "parkdeepreorg=0"), "{conf}");
+            assert!(
+                !conf
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("reorgpolicy")),
+                "{conf}"
+            );
+        }
     }
 }
