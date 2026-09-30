@@ -1180,8 +1180,25 @@ pub fn build_node_command(
         }
         if mirror_here {
             args.push("-matmulvalidation=trusted".to_string());
+            // btxd also loads <datadir>/btx_rw.conf on every start regardless
+            // of -conf, and MERGES its list settings with the command line
+            // (common/config.cpp, common/settings.cpp GetSettingsList), so a
+            // key already pinned THERE, or in -conf, must not be pushed again
+            // here either: much of the fleet carries a leftover pin from the
+            // mirror era in btx_rw.conf, and this is also the exact arm a
+            // validating node's one-time mirror load launch goes through
+            // (mirror_load_pending above), which pushes every key. Pushing a
+            // key already pinned gets the engine's "Duplicate
+            // -matmultrustedpubkey" refusal at init (init.cpp ~1591-1597).
+            let mut already_pinned = conf_pins(conf);
+            already_pinned.extend(conf_pins(&datadir.join("btx_rw.conf")));
             for pubkey in BTX_TRUSTED_ATTESTATION_PUBKEYS {
-                args.push(format!("-matmultrustedpubkey={pubkey}"));
+                if !already_pinned
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(pubkey))
+                {
+                    args.push(format!("-matmultrustedpubkey={pubkey}"));
+                }
             }
             args.push(format!(
                 "-matmultrustedthreshold={BTX_TRUSTED_ATTESTATION_THRESHOLD}"
@@ -6649,5 +6666,119 @@ matmul: metal runtime_probe_ok, selecting metal\n\
             !mirror_load_wanted(true, false, false, false, true),
             "the operator said =0"
         );
+    }
+
+    // ── The mirror arm does not repeat a key the engine already reads ──
+
+    /// btxd loads `<datadir>/btx_rw.conf` on every start and MERGES its list
+    /// settings with the command line (init.cpp ~1591-1597), so a leftover
+    /// pin from the mirror era there must not be pushed again on the mirror
+    /// arm either, or the engine refuses at init on "Duplicate
+    /// -matmultrustedpubkey".
+    #[test]
+    fn a_mirror_launch_does_not_repeat_a_key_btx_rw_conf_already_pins() {
+        let dir = signed_snapshot_datadir("mirror-rw-conf-pin");
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        let leftover = BTX_TRUSTED_ATTESTATION_PUBKEYS[0];
+        std::fs::write(
+            dir.join("btx_rw.conf"),
+            format!("matmultrustedpubkey={leftover}\n"),
+        )
+        .unwrap();
+        let btxd = Path::new("/x/btx/v0.34.9/lin/btxd");
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Cpu);
+        assert_eq!(validation_modes(&args), vec!["trusted"], "{args:?}");
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == &format!("-matmultrustedpubkey={leftover}")),
+            "leftover already pinned by btx_rw.conf, pushed again: {args:?}"
+        );
+        for pubkey in BTX_TRUSTED_ATTESTATION_PUBKEYS {
+            if pubkey == leftover {
+                continue;
+            }
+            assert!(
+                args.iter()
+                    .any(|a| a == &format!("-matmultrustedpubkey={pubkey}")),
+                "the other keys still belong: {args:?}"
+            );
+        }
+        assert!(args.iter().any(|a| a == "-matmultrustedthreshold=1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same as above, with the key stated in the `-conf` file itself, in the
+    /// engine's own syntax: spaces around `=` and a trailing `#` comment.
+    #[test]
+    fn a_mirror_launch_does_not_repeat_a_key_the_conf_file_pins_with_the_engines_syntax() {
+        let dir = signed_snapshot_datadir("mirror-conf-pin-syntax");
+        let leftover = BTX_TRUSTED_ATTESTATION_PUBKEYS[0];
+        let conf = dir.join("keyless.conf");
+        std::fs::write(
+            &conf,
+            format!("server=1\nmatmultrustedpubkey = {leftover} # note\n"),
+        )
+        .unwrap();
+        let btxd = Path::new("/x/btx/v0.34.9/lin/btxd");
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Cpu);
+        assert_eq!(validation_modes(&args), vec!["trusted"], "{args:?}");
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == &format!("-matmultrustedpubkey={leftover}")),
+            "{args:?}"
+        );
+        for pubkey in BTX_TRUSTED_ATTESTATION_PUBKEYS {
+            if pubkey == leftover {
+                continue;
+            }
+            assert!(
+                args.iter()
+                    .any(|a| a == &format!("-matmultrustedpubkey={pubkey}")),
+                "{args:?}"
+            );
+        }
+        assert!(args.iter().any(|a| a == "-matmultrustedthreshold=1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// This task's mirror load launch (the marker from `begin_mirror_load`)
+    /// sends a validating node through exactly this arm, so a validating
+    /// datadir carrying the fleet's leftover `btx_rw.conf` pin must not get a
+    /// duplicate either.
+    #[test]
+    fn a_mirror_load_launch_does_not_repeat_a_key_btx_rw_conf_already_pins() {
+        let dir = signed_snapshot_datadir("mirror-load-rw-conf-pin");
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        let leftover = BTX_TRUSTED_ATTESTATION_PUBKEYS[1];
+        std::fs::write(
+            dir.join("btx_rw.conf"),
+            format!("matmultrustedpubkey={leftover}\n"),
+        )
+        .unwrap();
+        let btxd = Path::new("/x/btx/v0.34.9/mac/btxd");
+        begin_mirror_load(&dir, 232_000).unwrap();
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Metal);
+        assert_eq!(validation_modes(&args), vec!["trusted"], "{args:?}");
+        let mut seen = std::collections::HashSet::new();
+        for a in args
+            .iter()
+            .filter(|a| a.starts_with("-matmultrustedpubkey="))
+        {
+            assert!(
+                seen.insert(a.to_ascii_lowercase()),
+                "pinned twice: {args:?}"
+            );
+        }
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == &format!("-matmultrustedpubkey={leftover}")),
+            "{args:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
