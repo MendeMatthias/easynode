@@ -134,9 +134,19 @@ env:
   # binary: upstream made its sm_100 path opt-in (cmake/BTXCudaSm100.cmake), and
   # it was never in the requested set. The install key is plain `v0.34.9` now,
   # equal to what the binary reports.
-  PROVEN_BTXD_RUN_ID: "35867387801"
-  PROVEN_BTXD_ARTIFACT: "btxd-linux-84b998b4f3272775aaf8c241ac11dc683f4c4e23"
-  PROVEN_BTXD_COMMIT: "84b998b4f3272775aaf8c241ac11dc683f4c4e23"
+  #
+  # MOVED 2026-09-30 to the upstream TAG v0.34.12 = 5f32c4c4, built with
+  # -DWITH_MODELNET=OFF as before (commands.rs has why 0.34.12 runs in legacy
+  # reorg mode). All three pins move together because the ref changed. Run
+  # 36723618840, dispatched on main with btxchain_ref=5f32c4c4: completed
+  # success, log proved `tree pristine at 5f32c4c4...`, `native model network
+  # ... OFF`, architectures present sm_120 sm_75 sm_86 sm_89, `BTX daemon
+  # version v0.34.12`, SMOKE PASSED, and the artifact carries libcublasLt.so.13.
+  # Artifact 394140055 bytes. The install key is plain `v0.34.12`, equal to what
+  # the binary reports.
+  PROVEN_BTXD_RUN_ID: "36723618840"
+  PROVEN_BTXD_ARTIFACT: "btxd-linux-5f32c4c4d1cb033180bcd40a461deae2c1bc1ee1"
+  PROVEN_BTXD_COMMIT: "5f32c4c4d1cb033180bcd40a461deae2c1bc1ee1"
 
 jobs:
   build-node-linux:

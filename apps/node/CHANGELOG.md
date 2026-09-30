@@ -8,6 +8,20 @@ root).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-30
+
+**A node that fell behind catches up again, and a new node starts near the tip.**
+Nodes far behind had been gaining a block only every few minutes, because the
+three discovery relays held on to their block requests. Now the relays only
+hand out addresses, and when the chain still stands still, the app asks peers
+that keep the full history for the next blocks by name. Setup asks one
+question, Quick start or Full check. A new node starts from a snapshot near the
+tip that two operators signed, and once a newer confirmed snapshot is out,
+Tools can fast-forward a node that has fallen far behind to it. Tools also puts
+restart, Copy diagnostics and a small command window behind one button. A .deb
+install now updates itself. And the node engine moves to BTX 0.34.12. The
+details follow.
+
 **Tools: the things support used to need a terminal for, behind one button.**
 A new wrench button at the top opens Tools. From there you can restart the
 node, ask good peers for a block your node is stuck on, open the data folder,
