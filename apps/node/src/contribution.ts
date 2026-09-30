@@ -154,7 +154,7 @@ export function contributionView(s: ContributionInput): ContributionView {
   if (s.attestationsServedPeers !== null && s.attestationsServedPeers > 0) {
     parts.push(
       `you have passed signed block confirmations to ${s.attestationsServedPeers} ` +
-        `${s.attestationsServedPeers === 1 ? "node" : "nodes"} — the thing the ` +
+        `${s.attestationsServedPeers === 1 ? "node" : "nodes"}, the thing the ` +
         "network is shortest of right now"
     );
   }

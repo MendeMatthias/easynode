@@ -63,7 +63,7 @@ export function checkFailureMessage(
       `to install. ${staying} Downloads for every platform are at ${downloadsAt}.`
     );
   }
-  return `Couldn't check right now — are you online? (${failure.detail.slice(0, 80)})`;
+  return `Couldn't check right now, are you online? (${failure.detail.slice(0, 80)})`;
 }
 
 // ── What a check ended as, written down ─────────────────────────────────────
@@ -306,7 +306,7 @@ export function plainOutcome(outcome: string, detail: string, downloadsAt: strin
     case "found":
       return v ? `found ${v}` : "found an update";
     case "install-failed":
-      return `${v ?? "an update"} couldn't install — get it from ${downloadsAt}`;
+      return `${v ?? "an update"} couldn't install, get it from ${downloadsAt}`;
     case "installed":
       return `${v ?? "an update"} installed`;
     default:
@@ -322,5 +322,5 @@ export function plainOutcome(outcome: string, detail: string, downloadsAt: strin
 export function lastCheckLine(last: LastUpdateCheck, now: Date, downloadsAt: string): string {
   if (!last.at || !last.outcome) return "Last check: none yet";
   const when = describeWhen(new Date(last.at), now);
-  return `Last check: ${when} — ${plainOutcome(last.outcome, last.detail, downloadsAt)}`;
+  return `Last check: ${when} · ${plainOutcome(last.outcome, last.detail, downloadsAt)}`;
 }

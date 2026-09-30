@@ -152,9 +152,9 @@ const esc = (s: string) =>
 function askMessage(st: Exclude<Ask<unknown>, { state: "ready" }>): string {
   switch (st.state) {
     case "stopped":
-      return "Start your node first — it does the work.";
+      return "Start your node first, it does the work.";
     case "warming":
-      return "Your node is still getting ready — try again in a moment.";
+      return "Your node is still getting ready, try again in a moment.";
     case "unavailable":
       return st.data.message;
   }
@@ -347,7 +347,7 @@ export function initWallet(): void {
     $("wallet-confirm-amt").textContent = `${fmtExact(amt)} BTX`;
     $("wallet-confirm-to").textContent = sendTo.value.trim();
     $("wallet-confirm-note").textContent = maxMode
-      ? "This is your whole spendable balance, so the network fee comes out of it — the receiver gets slightly less than the number above."
+      ? "This is your whole spendable balance, so the network fee comes out of it, the receiver gets slightly less than the number above."
       : "The network fee is added on top, and your node picks it.";
     $("wallet-send-form").hidden = true;
     $("wallet-confirm").hidden = false;
@@ -516,7 +516,7 @@ export function initWallet(): void {
     caveat.hidden = !d.backfilling;
     if (d.backfilling) {
       caveat.textContent =
-        "Your node is still backfilling older history in the background — the balance and list may still be filling in, so hold off on sending your whole balance until it settles.";
+        "Your node is still backfilling older history in the background, the balance and list may still be filling in, so hold off on sending your whole balance until it settles.";
     }
     if (!$("wallet-pane-send").hidden) {
       $("wallet-send-avail").textContent = `${fmtExact(spendable)} BTX ready to spend.`;
@@ -573,7 +573,7 @@ export function initWallet(): void {
         st.state === "stopped"
           ? "Start your node to see your wallet."
           : st.state === "warming"
-            ? "Your node is still getting ready — your wallet appears when it's up."
+            ? "Your node is still getting ready, your wallet appears when it's up."
             : askMessage(st);
     } catch (e) {
       if (soft || keepSent) return;
@@ -600,7 +600,7 @@ export function initWallet(): void {
     try {
       const res = await invoke<Ask<CreateResult>>("wallet_create");
       if (res.state === "ready") {
-        note.textContent = `Wallet created. Its .btxwallet file is on your Desktop — that file IS your money, keep it safe.`;
+        note.textContent = `Wallet created. Its .btxwallet file is on your Desktop: that file IS your money, keep it safe.`;
         soundBaseline = false; // re-seed silently for the new wallet
         txConfs.clear();
         await refresh();

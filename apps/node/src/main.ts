@@ -1087,10 +1087,10 @@ function renderStatus(status: NodeStatusInfo) {
         // Headers phase (pre-sync/sync): the chain itself hasn't started —
         // show the header count doing the moving.
         badge.textContent = `FETCHING HEADERS ${(p.progress * 100).toFixed(0)}%`;
-        sub.textContent = `Counting the chain — ${fmtInt(p.headers)} block headers so far`;
+        sub.textContent = `Counting the chain: ${fmtInt(p.headers)} block headers so far`;
       } else {
         badge.textContent = `SYNCING ${(p.progress * 100).toFixed(1)}%`;
-        sub.textContent = `Catching up — headers at ${fmtInt(p.headers)}`;
+        sub.textContent = `Catching up: headers at ${fmtInt(p.headers)}`;
       }
       height = p.height;
       $("stat-peers").textContent = fmtInt(p.peers);
@@ -1102,7 +1102,7 @@ function renderStatus(status: NodeStatusInfo) {
       break;
     case "warming":
       badge.textContent = "GETTING READY";
-      sub.textContent = `${p.message} — nothing is wrong, your node is checking its data. This can take a while after a hard shutdown.`;
+      sub.textContent = `${p.message}: nothing is wrong, your node is checking its data. This can take a while after a hard shutdown.`;
       break;
     case "stopped":
       badge.textContent = "STOPPED";
@@ -1145,7 +1145,7 @@ function renderStatus(status: NodeStatusInfo) {
     warn.hidden = false;
     warn.classList.add("is-critical");
     warn.textContent =
-      "Very low disk space — the node may stop. Free some space or use Reclaim in Settings.";
+      "Very low disk space: the node may stop. Free some space or use Reclaim in Settings.";
   } else if (status.disk_free_mb > 0 && status.disk_free_mb < status.disk_warn_mb) {
     warn.hidden = false;
     warn.classList.remove("is-critical");
@@ -1287,7 +1287,7 @@ $("settings-btn").addEventListener("click", async () => {
         const desc = awakeRow.querySelector(".setting-desc");
         if (desc) {
             desc.textContent =
-                "Not available on this system — set your computer's own sleep settings to Never";
+                "Not available on this system: set your computer's own sleep settings to Never";
         }
     }
     $<HTMLInputElement>("serve-toggle").checked = lastStatus.attestation_serve_enabled;
@@ -1527,7 +1527,7 @@ function reflectWitnessRow(status: NodeStatusInfo): void {
     desc.textContent = status.witness_message;
     desc.classList.add("needs-attention");
   } else {
-    desc.textContent = "Saved — it starts with the node";
+    desc.textContent = "Saved: it starts with the node";
   }
 
   const listenDesc = $("witness-listen-desc");
@@ -1575,7 +1575,7 @@ function reflectSnapshotServeRow(status: NodeStatusInfo): void {
     desc.textContent = status.snapshot_serve.message;
     desc.classList.toggle("needs-attention", status.snapshot_serve.needs_attention);
   } else {
-    desc.textContent = "Saved — it starts with the node";
+    desc.textContent = "Saved: it starts with the node";
   }
 }
 
@@ -1612,7 +1612,7 @@ function reflectEsploraRow(status: NodeStatusInfo): void {
         : "";
     const fresh = status.esplora_freshness ?? "not judged yet";
     desc.textContent =
-      `Serving on ${where}${pending} — freshness: ${fresh}` +
+      `Serving on ${where}${pending} · freshness: ${fresh}` +
       (status.esplora_message ? ` (${status.esplora_message})` : "");
     if (status.esplora_freshness !== "fresh") desc.classList.add("needs-attention");
   } else if (status.esplora_message) {
@@ -1626,7 +1626,7 @@ function reflectEsploraRow(status: NodeStatusInfo): void {
       "On, but electrs and the front are not running. Stop and start the node to try again; the log is in the esplora folder inside your data folder.";
     desc.classList.add("needs-attention");
   } else {
-    desc.textContent = "Saved — electrs and the front start with the node";
+    desc.textContent = "Saved: electrs and the front start with the node";
   }
 }
 
@@ -1678,7 +1678,7 @@ function reflectNickname(status: NodeStatusInfo): void {
     wire.textContent = status.subversion; // textContent: this came off the node
     desc.append(wire);
     if (status.node_nickname && !status.subversion.includes(`(${status.node_nickname})`)) {
-      desc.append(" — your new name applies the next time the node starts");
+      desc.append(" · your new name applies the next time the node starts");
     }
   } else {
     desc.textContent =
@@ -1941,7 +1941,7 @@ function reflectKeeperRow(status: NodeStatusInfo) {
   const desc = $("keeper-desc");
   if (status.node_profile === "keeper" && !status.keeper_engine_ready) {
     desc.textContent =
-      "Saved — Keeper mode switches on with the next node engine update (this engine cannot yet prune + serve safely)";
+      "Saved: Keeper mode switches on with the next node engine update (this engine cannot yet prune + serve safely)";
   } else if (status.node_profile === "keeper") {
     desc.textContent =
       "Small node (~10 GB) serving signed confirmations. Applies fully at the next node start";
@@ -1955,7 +1955,7 @@ function reflectKeeperRow(status: NodeStatusInfo) {
       "This folder already deleted old blocks in an earlier run, so it stays small whatever this switch says. Getting every block back means downloading the chain again. It can still help wallets check the chain: that needs the list of blocks, not the blocks";
   } else {
     desc.textContent =
-      "Small node (~10 GB) that serves signed confirmations — the network's scarcest service";
+      "Small node (~10 GB) that serves signed confirmations, the network's scarcest service";
   }
 }
 
@@ -2019,8 +2019,8 @@ $<HTMLInputElement>("serve-toggle").addEventListener("change", (e) => {
     .then(() =>
       showToast(
         on
-          ? "Serving on — applies the next time the node starts"
-          : "Serving off — applies the next time the node starts",
+          ? "Serving on: applies the next time the node starts"
+          : "Serving off: applies the next time the node starts",
       ),
     )
     .catch((err) => showToast(String(err)));
@@ -2058,7 +2058,7 @@ $("remove-node-btn").addEventListener("click", async () => {
     const report = await invoke<ReclaimReport>("remove_node_data_now");
     const out = $("remove-node-result");
     out.hidden = false;
-    out.textContent = `Freed ${fmtGB(report.freed_mb)}. Your node is removed — set it up again anytime.`;
+    out.textContent = `Freed ${fmtGB(report.freed_mb)}. Your node is removed, set it up again anytime.`;
     setupDone = false; // back to the wizard on the next poll
     overlay.hidden = true;
   } catch (e) {
@@ -2330,19 +2330,19 @@ function paintLastUpdateCheck(last: LastUpdateCheck): void {
 function paintUpdateProgress(outcome: string, version: string, error: string): void {
   switch (outcome) {
     case "found":
-      showUpdateBanner(`Update available: v${version}`, "— downloading…");
-      setUpdateResult(`Update available: v${version} — downloading…`);
+      showUpdateBanner(`Update available: v${version}`, "· downloading…");
+      setUpdateResult(`Update available: v${version} · downloading…`);
       break;
     case "install-failed":
       // Always visible, manual or not, and never worded as a network problem:
       // the common cause is a package format this updater cannot replace.
-      showUpdateBanner(`Update v${version} couldn't install`, `— download it from ${MANUAL_DOWNLOAD}`);
+      showUpdateBanner(`Update v${version} couldn't install`, `· download it from ${MANUAL_DOWNLOAD}`);
       setUpdateResult(
-        `Automatic update failed — get v${version} from ${MANUAL_DOWNLOAD} (${error.slice(0, 80)})`
+        `Automatic update failed: get v${version} from ${MANUAL_DOWNLOAD} (${error.slice(0, 80)})`
       );
       break;
     case "installed":
-      showUpdateBanner(`v${version} ready`, "— restarting…");
+      showUpdateBanner(`v${version} ready`, "· restarting…");
       break;
     default:
       break;
@@ -2499,7 +2499,7 @@ async function updateCheck(manual = false): Promise<void> {
   try {
     await relaunch();
   } catch (e) {
-    showUpdateBanner(`v${update.version} is installed`, "— restart the app to finish");
+    showUpdateBanner(`v${update.version} is installed`, "· restart the app to finish");
     setUpdateResult(`Installed. Restart to finish. (${String(e).slice(0, 80)})`);
     void recordUpdateCheck({ branch: "relaunch-failed", version: update.version, error: e }, manual);
   }

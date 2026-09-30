@@ -123,7 +123,7 @@ function stateHtml(a: Ask<unknown>): string | null {
     case "stopped":
       return `<div class="ask-line">Start your node to ask it questions.</div>`;
     case "warming":
-      return `<div class="ask-line">Your node is still catching up — ask again in a moment.</div>`;
+      return `<div class="ask-line">Your node is still catching up, ask again in a moment.</div>`;
     case "unavailable":
       return `<div class="ask-line">${esc(a.data.message)}</div>`;
     default:
@@ -139,11 +139,11 @@ function renderChain(a: Ask<ChainProgress>): string {
   const d = (a as { state: "ready"; data: ChainProgress }).data;
   const pct = Math.min(100, d.progress * 100);
   const head = d.near_tip
-    ? `Block ${fmtInt(d.height)} — at the tip`
+    ? `Block ${fmtInt(d.height)} · at the tip`
     : `Block ${fmtInt(d.height)} of ~${fmtInt(d.headers)}`;
   const line = d.near_tip
     ? `Your copy of the chain is current, connected to ${fmtInt(d.peers)} peer${d.peers === 1 ? "" : "s"}.`
-    : `Catching up — about ${pct.toFixed(1)}% verified so far.`;
+    : `Catching up: about ${pct.toFixed(1)}% verified so far.`;
   return answerHtml(head, line, "getblockchaininfo + getchainstates");
 }
 
@@ -153,7 +153,7 @@ function renderSupply(a: Ask<SupplyAnswer>): string {
   const d = (a as { state: "ready"; data: SupplyAnswer }).data;
   return answerHtml(
     `${fmtBtx(d.mined_btx)} BTX`,
-    `Mined so far, of the ${fmtBtx(d.cap_btx)} cap — ${(d.pct * 100).toFixed(1)}%, from the subsidy schedule at block ${fmtInt(d.height)}.`,
+    `Mined so far, of the ${fmtBtx(d.cap_btx)} cap: ${(d.pct * 100).toFixed(1)}%, from the subsidy schedule at block ${fmtInt(d.height)}.`,
     "block height × subsidy schedule"
   );
 }
@@ -164,7 +164,7 @@ function renderHalving(a: Ask<HalvingAnswer>): string {
   const d = (a as { state: "ready"; data: HalvingAnswer }).data;
   return answerHtml(
     `${fmtInt(d.blocks_remaining)} blocks to go`,
-    `At block ${fmtInt(d.at_height)} the reward goes ${fmtBtx(d.from_reward_btx)} → ${fmtBtx(d.to_reward_btx)} BTX — around ${fmtEta(d.est_secs)} at 90-second blocks.`,
+    `At block ${fmtInt(d.at_height)} the reward goes ${fmtBtx(d.from_reward_btx)} → ${fmtBtx(d.to_reward_btx)} BTX, around ${fmtEta(d.est_secs)} at 90-second blocks.`,
     "block height math"
   );
 }
@@ -177,7 +177,7 @@ function renderFees(a: Ask<FeesAnswer>): string {
     return answerHtml(
       d.mempool_txs === 0 ? "Quiet right now" : `${fmtInt(d.mempool_txs)} waiting`,
       d.mempool_txs === 0
-        ? "The mempool is empty — not enough recent activity for a fee estimate."
+        ? "The mempool is empty: not enough recent activity for a fee estimate."
         : `Not enough recent activity for an estimate; the mempool holds ${fmtInt(d.mempool_txs)} transactions (${fmtInt(d.mempool_vsize)} vB).`,
       "getmempoolinfo"
     );
@@ -223,7 +223,7 @@ function renderTx(a: Ask<TxLookup>): string {
     case "found": {
       const conf =
         d.confirmations === 0
-          ? "In the mempool — not confirmed yet"
+          ? "In the mempool, not confirmed yet"
           : `${fmtInt(d.confirmations)} confirmation${d.confirmations === 1 ? "" : "s"}`;
       const where = d.block_height !== null ? ` · block ${fmtInt(d.block_height)}` : "";
       const when = d.block_time !== null ? ` · ${fmtWhen(d.block_time)}` : "";
@@ -234,7 +234,7 @@ function renderTx(a: Ask<TxLookup>): string {
       );
     }
     case "building":
-      return `<div class="ask-line">Building the transaction index… ${(d.pct * 100).toFixed(0)}% — your node stays running; this works when it finishes.</div>`;
+      return `<div class="ask-line">Building the transaction index… ${(d.pct * 100).toFixed(0)}%, your node stays running; this works when it finishes.</div>`;
     case "needs_index":
       return (
         `<div class="ask-line">Historical lookups need <strong>Explorer mode</strong>: your node builds a one-time transaction index in the background (extra disk, node stays usable). Mempool transactions work without it.</div>` +
@@ -330,10 +330,10 @@ export function initAsk(): void {
         if (st.state !== "ready") return;
         if (st.data.synced) {
           stopIndexPoll();
-          body.innerHTML = `<div class="ask-line">Explorer mode is ready — paste a transaction id below and Look up.</div>`;
+          body.innerHTML = `<div class="ask-line">Explorer mode is ready, paste a transaction id below and Look up.</div>`;
           return;
         }
-        body.innerHTML = `<div class="ask-line">Building the transaction index… ${(st.data.pct * 100).toFixed(0)}% — your node stays running.</div>`;
+        body.innerHTML = `<div class="ask-line">Building the transaction index… ${(st.data.pct * 100).toFixed(0)}%, your node stays running.</div>`;
       } catch {
         /* keep polling; transient during the restart */
       }
