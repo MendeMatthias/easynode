@@ -310,6 +310,34 @@ pub fn is_dissent(st: &Statement) -> bool {
     st.file_size() == 0 && st.file_hash().is_null() && st.chunk_size() == 0 && st.chunk_count() == 0
 }
 
+/// [`dissent_statement`]'s 229 bytes, `height` already the engine's
+/// `int32`: no fallible conversion, so this never fails. The one place the
+/// byte layout is written.
+#[allow(clippy::too_many_arguments)]
+fn dissent_raw(
+    height: i32,
+    block_hash: &Hash32,
+    hash_serialized: &Hash32,
+    coins: u64,
+    chain_tx: u64,
+    chain_id: &Hash32,
+    replay_context: &Hash32,
+    shielded: &Hash32,
+) -> [u8; STATEMENT_LEN] {
+    let mut raw = [0u8; STATEMENT_LEN];
+    raw[0] = STATEMENT_VERSION;
+    raw[1..33].copy_from_slice(&chain_id.0);
+    raw[33..65].copy_from_slice(&block_hash.0);
+    raw[65..69].copy_from_slice(&height.to_le_bytes());
+    raw[69..101].copy_from_slice(&hash_serialized.0);
+    raw[101..109].copy_from_slice(&coins.to_le_bytes());
+    raw[109..117].copy_from_slice(&chain_tx.to_le_bytes());
+    raw[117..149].copy_from_slice(&shielded.0);
+    raw[149..181].copy_from_slice(&replay_context.0);
+    // 181..229: file size, file hash, chunk size and chunk count stay zero.
+    raw
+}
+
 /// The 229 bytes of the version-2 statement a dissent signs: the chain
 /// facts given, and file size 0, file hash 32 zero bytes, chunk size 0,
 /// chunk count 0. Pure; wrap it with [`Statement::from_raw`]. The confirmer
@@ -331,39 +359,38 @@ pub fn dissent_statement(
     replay_context: &Hash32,
     shielded: &Hash32,
 ) -> Option<[u8; STATEMENT_LEN]> {
-    let height = i32::try_from(height).ok()?;
-    let mut raw = [0u8; STATEMENT_LEN];
-    raw[0] = STATEMENT_VERSION;
-    raw[1..33].copy_from_slice(&chain_id.0);
-    raw[33..65].copy_from_slice(&block_hash.0);
-    raw[65..69].copy_from_slice(&height.to_le_bytes());
-    raw[69..101].copy_from_slice(&hash_serialized.0);
-    raw[101..109].copy_from_slice(&coins.to_le_bytes());
-    raw[109..117].copy_from_slice(&chain_tx.to_le_bytes());
-    raw[117..149].copy_from_slice(&shielded.0);
-    raw[149..181].copy_from_slice(&replay_context.0);
-    // 181..229: file size, file hash, chunk size and chunk count stay zero.
-    Some(raw)
+    i32::try_from(height).ok().map(|height| {
+        dissent_raw(
+            height,
+            block_hash,
+            hash_serialized,
+            coins,
+            chain_tx,
+            chain_id,
+            replay_context,
+            shielded,
+        )
+    })
 }
 
 impl ChainFacts {
     /// The dissent carrying these facts, as a [`Statement`]. `self.height`
-    /// is already the engine's `int32` (it was read from one), so the
-    /// round trip through `dissent_statement` always fits.
+    /// is already the engine's `int32` (however it got there: read
+    /// straight from statement bytes, it can be negative or any other
+    /// value that field allows), so this calls [`dissent_raw`] directly
+    /// rather than going through `dissent_statement`'s `u64` parameter and
+    /// its `i32::try_from`, which a negative height would fail.
     pub fn dissent(&self) -> Statement {
-        Statement::from_raw(
-            dissent_statement(
-                self.height as u64,
-                &self.block_hash,
-                &self.hash_serialized,
-                self.coins,
-                self.chain_tx,
-                &self.chain_id,
-                &self.replay_context,
-                &self.shielded,
-            )
-            .expect("self.height is already an i32"),
-        )
+        Statement::from_raw(dissent_raw(
+            self.height,
+            &self.block_hash,
+            &self.hash_serialized,
+            self.coins,
+            self.chain_tx,
+            &self.chain_id,
+            &self.replay_context,
+            &self.shielded,
+        ))
     }
 }
 
@@ -652,11 +679,11 @@ pub fn check(
 /// The running node is on the statement's chain and, when it reports one,
 /// has the statement's replay context. A node with no pin and no key
 /// reports no context; the compiled one then decides alone. A missing
-/// genesis or replay context here means nobody asked a running node yet, as
-/// in the pre-launch check (`attested_snapshot::prepare_start`, called
-/// before the node exists to ask); the loader refuses a running node that
-/// did not answer (`confirmed_load::recheck`, "the node did not say which
-/// chain it is on").
+/// genesis here means nobody asked a running node yet, as in the
+/// pre-launch check (`attested_snapshot::prepare_start`, called before the
+/// node exists to ask); the loader refuses a running node that did not
+/// answer (`confirmed_load::recheck`, "the node did not say which chain it
+/// is on").
 pub fn node_agrees(st: &Statement, node: &NodeView) -> Result<(), Refusal> {
     if let Some(g) = &node.genesis {
         if Hash32::from_display_hex(g) != Some(st.chain_id()) {
@@ -1493,6 +1520,21 @@ mod tests {
         };
         assert!(args(i32::MAX as u64).is_some());
         assert_eq!(args(i32::MAX as u64 + 1), None);
+    }
+
+    /// `ChainFacts::height` is an `i32` read straight from statement bytes
+    /// (`Statement::height`), so it can be negative on crafted bytes, not
+    /// only on real chain data. `ChainFacts::dissent` must still produce
+    /// the dissent, not panic: it never goes through a `u64` round trip.
+    #[test]
+    fn a_dissent_with_a_negative_height_does_not_panic() {
+        let facts = ChainFacts {
+            height: -1,
+            ..parse(R_P).unwrap().statement.chain_facts()
+        };
+        let d = facts.dissent();
+        assert_eq!(d.height(), -1);
+        assert!(is_dissent(&d));
     }
 
     /// A dissent is never loaded, however many operators sign it, and its
