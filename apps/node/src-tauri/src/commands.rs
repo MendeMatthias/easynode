@@ -504,6 +504,39 @@ const RPC_WAIT_WARMUP_POLLS: u32 = 57_600; // × 500 ms = 8 h
 /// seconds. See `NodeController::stop_without_rpc`.
 const NO_RPC_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Extra no-answer polls for a launch still inside the engine's GPU check
+/// when the ordinary budget runs out (Task A review M3): 840 × 500 ms = 7
+/// min, so ten minutes in all before the node is stopped or moved to
+/// following signatures.
+///
+/// The step (`InitializeMatMulRCReadinessPostDaemon`, init.cpp:2928 at
+/// v0.34.12) runs before RPC and has no timeout. On a Mac its canary runs one
+/// full production episode, measured at 102, 172 and 218 s on an M2 Pro, and
+/// self-qualification runs a medium episode on the CPU and the device on top.
+/// So three minutes is not "stuck" there, and Task A's stop at three minutes
+/// would have killed a slow but healthy start every time. Ten minutes is the
+/// same bound validation.ts gives its "Checking…" copy, comfortably past
+/// twice the slowest measurement, and still bounded: a card that never
+/// answers ends in the GPU fallback, not an endless "Starting".
+const GPU_CHECK_EXTRA_POLLS: u32 = 840;
+
+/// What the window says during that extension.
+const GPU_CHECK_WARMING: &str = "Your node is checking this machine's graphics card before it \
+                                 opens. On some machines this takes several minutes.";
+
+/// Whether the launch loop gives this launch [`GPU_CHECK_EXTRA_POLLS`]: its
+/// wait ran out without an answer, the node is still in the slot, and its
+/// own part of debug.log stops inside the GPU check. Pure, pinned by a test.
+fn extends_for_gpu_check(
+    wait: &RpcWait,
+    slot_empty: bool,
+    stage: btx_core::node::PreRpcStage,
+) -> bool {
+    !slot_empty
+        && matches!(wait, RpcWait::TimedOut { warming: false, .. })
+        && stage == btx_core::node::PreRpcStage::GpuCheck
+}
+
 /// What the launch loop does once a watched RPC wait ends.
 #[derive(Debug, PartialEq, Eq)]
 enum AfterRpcWait {
@@ -1750,7 +1783,7 @@ async fn spawn_node_with_lock_retry(
             // reads as still there.
             let node_slot = state.node.clone();
             let child_gone = move || slot_child_gone(&node_slot);
-            let wait = wait_for_node_rpc_watching(
+            let mut wait = wait_for_node_rpc_watching(
                 datadir,
                 &rpc_url(),
                 RPC_WAIT_POLLS,
@@ -1759,7 +1792,45 @@ async fn spawn_node_with_lock_retry(
                 child_gone,
             )
             .await;
-            let slot_empty = state.node.lock().await.is_none();
+            let mut slot_empty = state.node.lock().await.is_none();
+            let mut waited_secs = RPC_WAIT_POLLS as u64 * RPC_WAIT_POLL_MS / 1000;
+            // Slow in the GPU check is not stuck in it (Task A review M3):
+            // one bounded extension, said on screen, before anything is
+            // stopped or moved.
+            let stage = btx_core::node::pre_rpc_stage(&btx_core::node::debug_log_since(
+                datadir, log_offset,
+            ));
+            if extends_for_gpu_check(&wait, slot_empty, stage) {
+                let extra_secs = GPU_CHECK_EXTRA_POLLS as u64 * RPC_WAIT_POLL_MS / 1000;
+                let msg = format!(
+                    "the node engine is still in its graphics card check after {waited_secs}s; \
+                     waiting up to {extra_secs}s more before deciding"
+                );
+                eprintln!("[node-app] {msg}");
+                setup_log(datadir, &msg);
+                let note = NodePhase::Warming {
+                    message: GPU_CHECK_WARMING.to_string(),
+                };
+                set_phase(app, state, note.clone()).await;
+                let node_slot = state.node.clone();
+                wait = wait_for_node_rpc_watching(
+                    datadir,
+                    &rpc_url(),
+                    GPU_CHECK_EXTRA_POLLS,
+                    RPC_WAIT_POLL_MS,
+                    RPC_WAIT_WARMUP_POLLS,
+                    move || slot_child_gone(&node_slot),
+                )
+                .await;
+                slot_empty = state.node.lock().await.is_none();
+                waited_secs += extra_secs;
+                // Back to Starting only if nothing else (a stop, the warmup
+                // watcher) has taken the phase meanwhile.
+                let still_ours = *state.phase.lock().await == note;
+                if still_ours {
+                    set_phase(app, state, NodePhase::Starting).await;
+                }
+            }
             match (after_rpc_wait(&wait, slot_empty), wait) {
                 (AfterRpcWait::Ready, RpcWait::Ready(client)) => return Ok(client),
                 (AfterRpcWait::StoppedMeanwhile, _) => {
@@ -1787,8 +1858,8 @@ async fn spawn_node_with_lock_retry(
                     } else {
                         let outcome = c.stop_without_rpc_outcome(NO_RPC_STOP_GRACE).await;
                         eprintln!(
-                            "[node-app] btxd never opened its RPC in {}s; stopped it ({})",
-                            RPC_WAIT_POLLS as u64 * RPC_WAIT_POLL_MS / 1000,
+                            "[node-app] btxd never opened its RPC in {waited_secs}s; stopped it \
+                             ({})",
                             match outcome {
                                 btx_core::node::NoRpcStop::OnSigterm => "it exited on SIGTERM",
                                 btx_core::node::NoRpcStop::Killed => "it had to be killed",
@@ -1834,11 +1905,10 @@ async fn spawn_node_with_lock_retry(
                         AfterNoRpcTimeout::RetryAsMirror => {
                             let msg = format!(
                                 "This machine's graphics card did not finish the node \
-                                 engine's start-up check in {}s, so the node was stopped and \
-                                 now starts following signatures (attempt \
+                                 engine's start-up check in {waited_secs}s, so the node was \
+                                 stopped and now starts following signatures (attempt \
                                  {attempt}/{LAUNCH_ATTEMPTS}). Check blocks in Settings tries \
-                                 the card again.",
-                                RPC_WAIT_POLLS as u64 * RPC_WAIT_POLL_MS / 1000,
+                                 the card again."
                             );
                             eprintln!("[node-app] {msg}");
                             setup_log(datadir, &msg);
@@ -9032,8 +9102,9 @@ mod signed_start_tests {
 #[cfg(test)]
 mod launch_wait_tests {
     use super::{
-        after_no_rpc_timeout, after_rpc_wait, apply_follow_signatures_choice, rpc_timeout_error,
-        AfterNoRpcTimeout, AfterRpcWait, GPU_HOLDS_NODE_ERROR,
+        after_no_rpc_timeout, after_rpc_wait, apply_follow_signatures_choice,
+        extends_for_gpu_check, rpc_timeout_error, AfterNoRpcTimeout, AfterRpcWait,
+        GPU_HOLDS_NODE_ERROR,
     };
     use btx_core::node::NoRpcStop;
     use btx_core::setup::RpcWait;
@@ -9159,6 +9230,73 @@ mod launch_wait_tests {
         assert!(!spawn_fn.contains("let taken = state.node.lock().await.take();"));
         assert!(spawn_fn.contains("let mut slot = state.node.lock().await;"));
         assert!(spawn_fn.contains("launch_failure_cause(&tail)"));
+    }
+
+    // ── Task A review M3: slow in the GPU check is not stuck in it ────────
+
+    /// A node only SLOW in the engine's GPU check (a Mac's canary runs one
+    /// full episode: 102 to 218 s on an M2 Pro) gets a bounded extension of
+    /// the no-answer budget, and only then is it stopped or moved.
+    #[test]
+    fn a_start_inside_the_gpu_check_gets_a_bounded_extension() {
+        use btx_core::node::PreRpcStage;
+        assert!(extends_for_gpu_check(
+            &timed_out(false),
+            false,
+            PreRpcStage::GpuCheck
+        ));
+        // Not before StartLogging (the archive or earlier), not after the
+        // GPU step, not for a node whose RPC was up, not for an exit or a
+        // stop.
+        assert!(!extends_for_gpu_check(
+            &timed_out(false),
+            false,
+            PreRpcStage::BeforeLogging
+        ));
+        assert!(!extends_for_gpu_check(
+            &timed_out(false),
+            false,
+            PreRpcStage::PastGpuCheck
+        ));
+        assert!(!extends_for_gpu_check(
+            &timed_out(true),
+            false,
+            PreRpcStage::GpuCheck
+        ));
+        assert!(!extends_for_gpu_check(
+            &exited(),
+            false,
+            PreRpcStage::GpuCheck
+        ));
+        assert!(!extends_for_gpu_check(
+            &timed_out(false),
+            true,
+            PreRpcStage::GpuCheck
+        ));
+
+        // Bounded: ten minutes in all, past twice the slowest measured
+        // episode, and never open-ended.
+        let total_secs = (super::RPC_WAIT_POLLS + super::GPU_CHECK_EXTRA_POLLS) as u64
+            * super::RPC_WAIT_POLL_MS
+            / 1000;
+        assert_eq!(total_secs, 600);
+        assert!(total_secs >= 2 * 218);
+    }
+
+    /// The wiring: the extension is one more watched wait, before the
+    /// outcome is decided, so the GPU fallback runs only once it is used up.
+    #[test]
+    fn the_extension_runs_before_the_outcome_is_decided() {
+        let src = include_str!("commands.rs");
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let ext = spawn_fn.find("extends_for_gpu_check(").unwrap();
+        let extra = spawn_fn.find("GPU_CHECK_EXTRA_POLLS,").unwrap();
+        let decide = spawn_fn.find("after_rpc_wait(&wait, slot_empty)").unwrap();
+        assert!(ext < extra && extra < decide);
     }
 
     // ── 0.7.1 Task B: a validating start stuck in the engine's GPU check ──

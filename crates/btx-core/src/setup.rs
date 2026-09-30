@@ -725,6 +725,11 @@ pub async fn wait_for_node_rpc_watching<F: FnMut() -> bool>(
                 Ok(_) => return RpcWait::Ready(client),
                 Err(AppError::Rpc { code: -28, message }) => {
                     last = format!("node is warming up: {message}");
+                    // Its RPC is up from here on, so the polls spent waiting
+                    // for the cookie do not count against a later blip.
+                    if warmup_polls == 0 {
+                        unreachable_polls = 0;
+                    }
                     warmup_polls += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
                     continue;
@@ -1714,6 +1719,45 @@ maxreorgdepthwarn=9
             }
             _ => panic!("expected the warmup budget to expire"),
         }
+    }
+
+    /// The polls spent before the node first answered warmup do not count
+    /// against it afterwards (Task A review M3): once it answers -28 its RPC
+    /// is up, and a later blip gets the whole no-answer budget again.
+    #[tokio::test]
+    async fn the_first_warmup_answer_resets_the_no_answer_budget() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"result":null,"error":{"code":-28,"message":"Loading block index…"},"id":"easybtx"}"#,
+            )
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cookie = dir.path().join(".cookie");
+        let mut probes = 0u32;
+        // Polls 1 and 2: no cookie. Poll 3: the cookie appears and the node
+        // answers -28 once. Poll 4 on: the cookie is gone again. With the
+        // reset the no-answer budget of 3 starts over at poll 4 and ends
+        // after poll 6; without it, it ended at poll 4.
+        let probe = || {
+            probes += 1;
+            match probes {
+                3 => std::fs::write(&cookie, "__cookie__:secret").unwrap(),
+                4 => std::fs::remove_file(&cookie).unwrap(),
+                _ => {}
+            }
+            false
+        };
+        let got = wait_for_node_rpc_watching(dir.path(), &server.url(), 3, 10, 100, probe).await;
+        assert!(
+            matches!(got, RpcWait::TimedOut { warming: true, .. }),
+            "expected a timeout after warmup"
+        );
+        assert!(probes >= 6, "the budget started over: {probes} probes");
     }
 
     /// A ready node is ready whatever the probe would say later.
