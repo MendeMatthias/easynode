@@ -574,15 +574,13 @@ pub async fn prepare_confirmed(
         .map_err(NotReady::why)
 }
 
-/// [`prepare_confirmed`], saying whether `latest` could be read at all.
-async fn confirmed_pair(
+/// GET `pointer_url` and read its answer, capped by [`read_pointer_body`]:
+/// the one path to `latest`, shared by [`confirmed_pair`] and
+/// [`peek_confirmed`] so they cannot drift apart.
+async fn fetch_pointer_body(
     client: &reqwest::Client,
     pointer_url: &str,
-    datadir: &Path,
-    view: &NodeView,
-    regtest_env: Option<&str>,
-    url_ok: fn(&str) -> bool,
-) -> Result<ReadyPair, NotReady> {
+) -> Result<Vec<u8>, NotReady> {
     let resp = client
         .get(pointer_url)
         .send()
@@ -598,7 +596,19 @@ async fn confirmed_pair(
     if status.as_u16() != 200 {
         return Err(format!("no confirmed snapshot (HTTP {})", status.as_u16()).into());
     }
-    let body = read_pointer_body(resp).await?;
+    read_pointer_body(resp).await
+}
+
+/// [`prepare_confirmed`], saying whether `latest` could be read at all.
+async fn confirmed_pair(
+    client: &reqwest::Client,
+    pointer_url: &str,
+    datadir: &Path,
+    view: &NodeView,
+    regtest_env: Option<&str>,
+    url_ok: fn(&str) -> bool,
+) -> Result<ReadyPair, NotReady> {
+    let body = fetch_pointer_body(client, pointer_url).await?;
     let p = match parse_latest(&body)? {
         Latest::Confirmed(p) => p,
         disputed @ Latest::Disputed(_) => {
@@ -730,12 +740,15 @@ async fn fetch_capped(client: &reqwest::Client, url: &str, cap: usize) -> Result
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status().as_u16()));
     }
+    if let Some(len) = resp.content_length().filter(|&n| n > cap as u64) {
+        return Err(format!("declares {len} bytes, more than {cap}"));
+    }
     let mut body = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(|e| format!("read: {e}"))? {
-        body.extend_from_slice(&chunk);
-        if body.len() > cap {
+        if body.len() + chunk.len() > cap {
             return Err(format!("larger than {cap} bytes"));
         }
+        body.extend_from_slice(&chunk);
     }
     Ok(body)
 }
@@ -757,10 +770,10 @@ pub enum Peek {
 /// downloading the file; or the dispute it answers instead. For deciding
 /// what the Fast-forward section shows.
 ///
-/// Reuses [`read_pointer_body`] to read `latest` (capped at
+/// Reuses [`fetch_pointer_body`] to read `latest` (capped at
 /// [`MAX_POINTER_BYTES`]) and [`parse_latest`] to read it, the same as
-/// [`prepare_confirmed`]; a peek never opens a second path to the pointer or
-/// a second parser for it.
+/// [`confirmed_pair`]; a peek never opens a second path to the pointer or a
+/// second parser for it.
 pub async fn peek_confirmed(
     client: &reqwest::Client,
     pointer_url: &str,
@@ -768,18 +781,9 @@ pub async fn peek_confirmed(
     regtest_env: Option<&str>,
     url_ok: fn(&str) -> bool,
 ) -> Result<Peek, String> {
-    let resp = client
-        .get(pointer_url)
-        .send()
+    let body = fetch_pointer_body(client, pointer_url)
         .await
-        .map_err(|e| format!("pointer unreachable: {e}"))?;
-    if resp.status().as_u16() != 200 {
-        return Err(format!(
-            "no confirmed snapshot (HTTP {})",
-            resp.status().as_u16()
-        ));
-    }
-    let body = read_pointer_body(resp).await.map_err(NotReady::why)?;
+        .map_err(NotReady::why)?;
     let p = match parse_latest(&body)? {
         Latest::Confirmed(p) => p,
         disputed @ Latest::Disputed(_) => {
@@ -1428,6 +1432,67 @@ mod tests {
             Ok(Peek::Disputed { newest: 233_800 })
         );
         anything_else.assert_async().await;
+    }
+
+    /// Review: `fetch_capped` must cap the manifest the same way
+    /// `read_pointer_body` caps the pointer: a declared size over the cap is
+    /// refused before anything is read.
+    #[tokio::test]
+    async fn peeking_refuses_a_manifest_whose_declared_size_is_over_the_cap_before_reading_it() {
+        let mut server = mockito::Server::new_async().await;
+        let p = regtest_pointer(&server.url(), R_PC, R_DAT);
+        server
+            .mock("GET", "/latest")
+            .with_body(serde_json::to_vec(&p).unwrap())
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/m")
+            .with_body(vec![b' '; cs::MAX_MANIFEST_BYTES + 1])
+            .create_async()
+            .await;
+        let env = format!("producer={P};confirmer={C}");
+        let url = format!("{}/latest", server.url());
+        let err = peek_confirmed(&reqwest::Client::new(), &url, &view(), Some(&env), any_url)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains(&format!("declares {} bytes", cs::MAX_MANIFEST_BYTES + 1)),
+            "{err}"
+        );
+    }
+
+    /// Review: a manifest with no declared size (chunked) is still cut off
+    /// once it grows past the cap, checked before each chunk is buffered so
+    /// the body never holds more than `cap` bytes at once.
+    #[tokio::test]
+    async fn peeking_a_streamed_manifest_with_no_declared_size_is_cut_off_past_the_cap() {
+        let mut server = mockito::Server::new_async().await;
+        let p = regtest_pointer(&server.url(), R_PC, R_DAT);
+        server
+            .mock("GET", "/latest")
+            .with_body(serde_json::to_vec(&p).unwrap())
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/m")
+            .with_chunked_body(|w| {
+                for _ in 0..(cs::MAX_MANIFEST_BYTES / 1024 + 2) {
+                    w.write_all(&[b' '; 1024])?;
+                }
+                Ok(())
+            })
+            .create_async()
+            .await;
+        let env = format!("producer={P};confirmer={C}");
+        let url = format!("{}/latest", server.url());
+        let err = peek_confirmed(&reqwest::Client::new(), &url, &view(), Some(&env), any_url)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains(&format!("larger than {} bytes", cs::MAX_MANIFEST_BYTES)),
+            "{err}"
+        );
     }
 
     #[tokio::test]
