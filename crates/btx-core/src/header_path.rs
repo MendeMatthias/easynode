@@ -596,4 +596,102 @@ mod tests {
         assert_eq!(p.status(390, &side_hash(390)), PathStatus::Ready);
         assert_walked_chain(&p, &node, 390, 520);
     }
+
+    /// Random retargets, tips, rollbacks, budgets, deadlines and failed
+    /// reads over three branches, from a fixed seed: whenever the path says
+    /// `Ready` or `OtherBranch`, every height it holds from the tip up to
+    /// the target is the target's true ancestor, and `Ready` means the tip
+    /// is one of them. Ported from the final review's probe (2026-09-30),
+    /// which checked 3,856 such states on the code this guards.
+    #[tokio::test]
+    async fn ready_and_other_branch_are_true_ancestry_under_random_walks() {
+        // main 1..=600; B forks off it at 300 up to 620; C forks off B at 450
+        // up to 640.
+        let mut node = Headers::new(600, Some((300, 620)));
+        let c = |h: u64| format!("c{h:063x}");
+        for h in 451..=640u64 {
+            let prev = if h == 451 { side_hash(450) } else { c(h - 1) };
+            node.by_hash.insert(c(h), (h, prev));
+        }
+        // Sorted: a HashMap's order changes from run to run, the seed must not.
+        let mut blocks: Vec<(u64, String)> = node
+            .by_hash
+            .iter()
+            .map(|(k, (h, _))| (*h, k.clone()))
+            .collect();
+        blocks.sort();
+        let ancestry = |node: &Headers, top: &str| -> HashMap<u64, String> {
+            let mut m = HashMap::new();
+            let mut cur = top.to_string();
+            while let Some((h, prev)) = node.by_hash.get(&cur) {
+                m.insert(*h, cur.clone());
+                cur = prev.clone();
+            }
+            m
+        };
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rnd = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let pick = |i: u64| blocks[i as usize].clone();
+        let n = blocks.len() as u64;
+        let (mut ready, mut other) = (0usize, 0usize);
+        for _run in 0..30 {
+            let mut p = HeaderPath::new();
+            for _step in 0..40 {
+                if rnd(10) < 3 {
+                    let (h, hash) = pick(rnd(n));
+                    p.retarget(h, &hash);
+                }
+                let (th, thash) = pick(rnd(n));
+                if rnd(8) == 0 {
+                    *node.fail_on.lock().unwrap() = Some(pick(rnd(n)).1);
+                }
+                let _ = if rnd(4) == 0 {
+                    let stop_at = node.reads() + 1 + rnd(200) as usize;
+                    p.walk_until(&node, th, usize::MAX, &|| node.reads() >= stop_at)
+                        .await
+                } else {
+                    let budget = if rnd(3) == 0 {
+                        usize::MAX
+                    } else {
+                        1 + rnd(300) as usize
+                    };
+                    p.walk(&node, th, budget).await
+                };
+                *node.fail_on.lock().unwrap() = None;
+                let Some((top_h, top_hash)) = p.target().map(|(h, s)| (h, s.to_string())) else {
+                    continue;
+                };
+                assert!(
+                    p.blocks().all(|(h, _)| h <= top_h),
+                    "a key above the target"
+                );
+                let st = p.status(th, &thash);
+                if st != PathStatus::Ready && st != PathStatus::OtherBranch {
+                    continue;
+                }
+                let truth = ancestry(&node, &top_hash);
+                for h in th..=top_h {
+                    assert_eq!(
+                        p.hash_at(h),
+                        truth.get(&h).map(String::as_str),
+                        "{st:?} but height {h} is not the target's ancestor (tip {th}, \
+                         target {top_h})"
+                    );
+                }
+                if st == PathStatus::Ready {
+                    ready += 1;
+                    assert_eq!(truth.get(&th), Some(&thash));
+                } else {
+                    other += 1;
+                    assert_ne!(truth.get(&th), Some(&thash));
+                }
+            }
+        }
+        assert!(ready > 20 && other > 20, "ready {ready}, other {other}");
+    }
 }
