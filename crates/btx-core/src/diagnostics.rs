@@ -247,7 +247,7 @@ pub fn render(i: &DiagnosticsInput) -> String {
             if c.median_time > 0 {
                 if let Some(now) = parse_generated_at(&i.generated_at) {
                     o.push(format!(
-                        "  tip time {}, {}",
+                        "  tip median time {}, {}",
                         format_utc_minute(c.median_time),
                         relative_ago(now, c.median_time)
                     ));
@@ -1501,7 +1501,7 @@ mod tests {
             "the existing chain line must stay byte identical:\n{r}"
         );
         assert!(
-            r.contains("  tip time 2026-09-29 13:50 UTC, about 15 minutes ago"),
+            r.contains("  tip median time 2026-09-29 13:50 UTC, about 15 minutes ago"),
             "missing the tip's age:\n{r}"
         );
     }
@@ -1520,7 +1520,7 @@ mod tests {
         };
         let r = render(&input);
         assert!(
-            r.contains("  tip time 2026-09-29 11:05 UTC, about 3 hours ago"),
+            r.contains("  tip median time 2026-09-29 11:05 UTC, about 3 hours ago"),
             "{r}"
         );
     }
@@ -1542,7 +1542,7 @@ mod tests {
         };
         let r = render(&input);
         assert!(
-            !r.contains("tip time"),
+            !r.contains("tip median time"),
             "an unknown median time must not be shown as an age:\n{r}"
         );
     }
