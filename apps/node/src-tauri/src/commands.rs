@@ -3866,7 +3866,9 @@ fn mark_first_load_if_fresh(datadir: &Path) {
 /// Is the first load on a fresh chain settled by this outcome? Any final
 /// one: loaded, superseded (`AlreadyLoaded`), refused, and nothing loaded
 /// after the one mirror launch. Nothing loaded on an ordinary launch (no
-/// pair was ready, headers stalled, the engine said no) leaves it to come.
+/// pair was ready, headers stalled, the engine said no) leaves it to come,
+/// unless the chain has outgrown it ([`chain_outgrew_first_load`], asked in
+/// [`after_snapshot_load`]).
 /// When a stop, a quit or another restart got there first (`superseded`),
 /// only a load settles it: a refused one is set aside before the next
 /// launch, which leaves the chain fresh again, and an unanswered one says
@@ -3884,6 +3886,17 @@ fn first_load_settled(
         );
     }
     mirror_load_launch || !matches!(outcome, O::NotLoaded(_))
+}
+
+/// Has a fresh chain outgrown its first load? When an ordinary launch loaded
+/// nothing (no pair was ready, headers stalled) and the node's own chain
+/// (`blocks`, its `getblockcount`; `None` when it did not answer) already
+/// reaches the highest start a load could give it
+/// (`btx_core::attested_snapshot::fallback_start`): a mirror launch then would
+/// load nothing the chain lacks, and would only run a synced validator as a
+/// mirror for a few minutes.
+fn chain_outgrew_first_load(blocks: Option<u64>, anchor_height: u64) -> bool {
+    blocks.is_some_and(|b| b >= btx_core::attested_snapshot::fallback_start(anchor_height))
 }
 
 /// Clear [`NodeAppSettings::first_load_pending`] when this outcome settles
@@ -4518,6 +4531,31 @@ async fn after_snapshot_load(
         || state.rpc.lock().await.is_none()
         || state.quitting.load(Ordering::SeqCst);
     settle_first_load(&datadir, mirror_load_launch, &outcome, superseded);
+    if !mirror_load_launch
+        && !superseded
+        && matches!(outcome, btx_core::snapshot::SnapshotOutcome::NotLoaded(_))
+        && NodeAppSettings::load(&datadir).first_load_pending
+    {
+        use btx_core::rpc::Rpc as _;
+        let rpc = state.rpc.lock().await.clone();
+        let blocks = match rpc {
+            Some(rpc) => rpc
+                .call("getblockcount", serde_json::json!([]))
+                .await
+                .ok()
+                .and_then(|v| v.as_u64()),
+            None => None,
+        };
+        if chain_outgrew_first_load(blocks, snapshot_spec().anchor_height) {
+            NodeAppSettings::update(&datadir, |s| s.first_load_pending = false);
+            let msg = format!(
+                "the node's chain already reaches block {}, so it needs no first snapshot load",
+                blocks.unwrap_or_default()
+            );
+            eprintln!("[node-app] {msg}");
+            setup_log(&datadir, &msg);
+        }
+    }
     let plan = after_load_plan(
         mirror_load_launch,
         &outcome,
@@ -6444,15 +6482,15 @@ pub async fn open_global_stats() -> Result<(), String> {
 #[cfg(test)]
 mod signed_start_tests {
     use super::{
-        abandon_mirror_load, after_load_plan, clear_mirror_marker, ends_orphaned_mirror_launch,
-        first_load_settled, honour_pending_set_aside, honour_pending_set_aside_at,
-        key_line_goes_back, mark_first_load_if_fresh, mark_set_aside_pending, mirror_launch_failed,
-        mirror_load_end_message, mirror_load_step, mirror_load_wanted_here, nominal_btxd_path,
-        refused_load_message, runs_mirror_load, set_aside_pending, set_aside_refused_snapshot_at,
-        set_aside_waits, set_aside_will_move, settle_first_load, signed_load_failed,
-        signed_load_for, signer_for_launch, signing_key_the_app_does_not_manage, snapshot_base,
-        write_signer_key_line, AfterLoad, AfterRefusal, AttachedTo, MirrorLoadStep,
-        SET_ASIDE_STUCK,
+        abandon_mirror_load, after_load_plan, chain_outgrew_first_load, clear_mirror_marker,
+        ends_orphaned_mirror_launch, first_load_settled, honour_pending_set_aside,
+        honour_pending_set_aside_at, key_line_goes_back, mark_first_load_if_fresh,
+        mark_set_aside_pending, mirror_launch_failed, mirror_load_end_message, mirror_load_step,
+        mirror_load_wanted_here, nominal_btxd_path, refused_load_message, runs_mirror_load,
+        set_aside_pending, set_aside_refused_snapshot_at, set_aside_waits, set_aside_will_move,
+        settle_first_load, signed_load_failed, signed_load_for, signer_for_launch,
+        signing_key_the_app_does_not_manage, snapshot_base, write_signer_key_line, AfterLoad,
+        AfterRefusal, AttachedTo, MirrorLoadStep, SET_ASIDE_STUCK,
     };
     use crate::state::NodeAppSettings;
     use btx_core::backend::Backend;
@@ -7337,11 +7375,32 @@ mod signed_start_tests {
         let stop = after.find("stop_node_inner(state)").unwrap();
         for call in [
             "settle_first_load(&datadir",
+            "chain_outgrew_first_load(",
             "set_aside_waits(plan, superseded)",
             "attached_node_is_ours_to_stop(",
         ] {
             assert!(after.find(call).unwrap() < stop, "{call}");
         }
+    }
+
+    /// Final review M2: a fresh chain whose ordinary launches loaded
+    /// nothing (no pair reachable, headers stalled) and that then synced on
+    /// its own settles its first load once its chain reaches the highest
+    /// start a load could give it: a mirror launch then would load nothing
+    /// the chain lacks, and only run a synced validator as a mirror.
+    #[test]
+    fn a_chain_that_reaches_the_fallback_start_settles_its_first_load() {
+        let anchor = super::snapshot_spec().anchor_height;
+        let fallback = btx_core::attested_snapshot::fallback_start(anchor);
+        assert_eq!(fallback, 225_927);
+        assert!(!chain_outgrew_first_load(None, anchor), "no answer");
+        assert!(!chain_outgrew_first_load(Some(0), anchor));
+        assert!(!chain_outgrew_first_load(Some(fallback - 1), anchor));
+        assert!(chain_outgrew_first_load(Some(fallback), anchor));
+        assert!(chain_outgrew_first_load(Some(fallback + 5_000), anchor));
+        // An engine that compiles a higher base moves the bar with it.
+        assert!(!chain_outgrew_first_load(Some(227_000), 228_000));
+        assert!(chain_outgrew_first_load(Some(228_000), 228_000));
     }
 
     /// Final review I1, the review's probe turned around: a relaunch (a
