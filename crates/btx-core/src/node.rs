@@ -1894,10 +1894,17 @@ pub fn trusted_mirror_required(backend: Backend, datadir: &Path) -> bool {
     trusted_mirror_enabled(backend) || matmul_consensus_was_refused(datadir)
 }
 
-/// Will this host be launched as a trusted mirror (follows signatures) rather
-/// than a validator (may make them)? The one rule, used by `build_node_command`
-/// for the `-matmulvalidation` arm and by the app's start path to decide
-/// whether a signing key belongs in the conf at all.
+/// Will THIS launch run as a trusted mirror (follows signatures) rather than
+/// a validator (may make them)? The one rule for one launch, used by
+/// `build_node_command` for the `-matmulvalidation` arm and by the app's
+/// start path to decide whether a signing key goes in the conf for it.
+///
+/// It includes a validating node's one-time mirror launch, which loads a
+/// signed snapshot ([`mirror_load_pending`]): that launch is a mirror, so it
+/// holds no key, although the host checks blocks itself before and after.
+/// A question about the host's lasting role (can it sign, what does the
+/// window say, should the signer be switched on for it) asks
+/// [`host_follows_signatures`] instead.
 ///
 /// The operator's explicit word (`EASYBTX_NODE_TRUSTED_MIRROR`) outranks the
 /// backend split in both directions: `=1` puts a Cuda host on the mirror, `=0`

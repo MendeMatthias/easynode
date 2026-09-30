@@ -282,6 +282,9 @@ pub fn remove_node_data(datadir: &Path) -> ReclaimReport {
             report.items.push(format!("debug.log ({} MB)", bytes / MB));
         }
     }
+    // A mirror-load marker beside a datadir with no blocks would make its
+    // header bootstrap launch a mirror: the load it named is gone with them.
+    crate::node::end_mirror_load(datadir);
     report.freed_mb = freed_bytes / MB;
     report
 }
@@ -810,6 +813,18 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A marker left beside a fresh datadir would make its header bootstrap
+    /// launch a mirror (the next start begins one, since `blocks/` is gone).
+    #[test]
+    fn remove_node_data_clears_a_mirror_load_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("blocks")).unwrap();
+        crate::node::begin_mirror_load(dir.path(), 225_927).unwrap();
+        assert!(crate::node::mirror_load_marker_exists(dir.path()));
+        remove_node_data(dir.path());
+        assert!(!crate::node::mirror_load_marker_exists(dir.path()));
     }
 
     #[test]

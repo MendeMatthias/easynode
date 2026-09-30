@@ -637,15 +637,19 @@ pub enum SnapshotOutcome {
     CompiledLoaded,
     /// Nothing was loaded, and why. The chainstate is as it was.
     NotLoaded(String),
-    /// The engine may hold a snapshot the app refuses or cannot vouch for:
-    /// a signed load put a refused block on the chain, the check after it
-    /// went unanswered, a signed load that btx-cli brought back no answer
-    /// for is not then active and clean on the node, or a compiled one is
-    /// followed by a snapshot chainstate that is not active and clean, or
-    /// by a node that does not say
+    /// After a signed load the engine may hold a snapshot the app refuses or
+    /// cannot vouch for: it put a refused block on the chain, the check
+    /// after it went unanswered, or btx-cli brought back no answer and the
+    /// snapshot is not then active and clean on the node
     /// (`crate::confirmed_load::LoadError::restore_chain_data`). The caller
     /// stops the node and sets the snapshot chainstate aside.
     HeldRootOnChain(String),
+    /// The same after the compiled snapshot: a `loadtxoutset` btx-cli
+    /// brought back no answer for is followed by a snapshot chainstate that
+    /// is not active and clean, or by a node that does not say. The caller
+    /// acts as on [`SnapshotOutcome::HeldRootOnChain`], and does not count
+    /// it as a failed signed load.
+    CompiledHeldRootOnChain(String),
 }
 
 /// What [`load_signed`] came to. The strings are for the log only.
@@ -791,7 +795,7 @@ async fn record_engine_start(rpc: &dyn Rpc, datadir: &Path, anchor_height: u64) 
 /// node shows no snapshot chainstate at all loaded nothing
 /// (`crate::confirmed_load::unanswered_compiled_load`); otherwise the engine
 /// may hold a snapshot the app cannot vouch for, and the caller sets the
-/// chain data aside.
+/// chain data aside ([`SnapshotOutcome::CompiledHeldRootOnChain`]).
 async fn after_compiled_load(
     rpc: &dyn Rpc,
     datadir: &Path,
@@ -839,7 +843,7 @@ async fn after_compiled_load(
                 }
                 Err(e) if e.restore_chain_data() => {
                     eprintln!("[snapshot] {e}");
-                    SnapshotOutcome::HeldRootOnChain(e.to_string())
+                    SnapshotOutcome::CompiledHeldRootOnChain(e.to_string())
                 }
                 // Cannot run: every error `unanswered_compiled_load` returns
                 // has `restore_chain_data` (`EngineUnanswered`, or the
@@ -882,7 +886,8 @@ async fn compiled_loaded(
 /// launch, which loads nothing else; a failed signed load leaves the
 /// chainstate untouched, so that path is still open. A signed load the
 /// engine may hold and the app refuses never falls through: it ends in
-/// [`SnapshotOutcome::HeldRootOnChain`].
+/// [`SnapshotOutcome::HeldRootOnChain`], and a compiled one in
+/// [`SnapshotOutcome::CompiledHeldRootOnChain`].
 pub fn ensure_snapshot_loaded_with(
     rpc: RpcClient,
     btx_cli: PathBuf,
@@ -1838,8 +1843,10 @@ mod tests {
                 no_answer(),
             )
             .await;
+            // Its own variant: the caller acts on it as on a signed one, and
+            // must not call it a failed signed load.
             assert!(
-                matches!(outcome, SnapshotOutcome::HeldRootOnChain(_)),
+                matches!(outcome, SnapshotOutcome::CompiledHeldRootOnChain(_)),
                 "{case}: {outcome:?}"
             );
             assert!(!flag.loaded(), "{case}");
