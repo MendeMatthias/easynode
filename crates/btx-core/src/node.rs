@@ -1891,6 +1891,16 @@ pub fn trusted_mirror_required(backend: Backend, datadir: &Path) -> bool {
 /// to follow signatures ([`follows_signatures_by_choice`]) makes any host a
 /// mirror, unless the operator's word is `=0`.
 pub fn launches_as_mirror(btxd: &Path, datadir: &Path, backend: Backend) -> bool {
+    // A validating node's one mirror launch, to load a signed snapshot.
+    if mirror_load_pending(datadir).is_some() && trusted_mirror_override() != Some(false) {
+        return true;
+    }
+    host_follows_signatures(btxd, datadir, backend)
+}
+
+/// [`launches_as_mirror`] without the one-time mirror launch: does this host
+/// follow signatures, or does it check blocks itself?
+pub fn host_follows_signatures(btxd: &Path, datadir: &Path, backend: Backend) -> bool {
     // The owner's choice outranks the backend split, a Cuda host included,
     // and yields only to the operator's explicit =0.
     if follows_signatures_by_choice(datadir) && trusted_mirror_override() != Some(false) {
@@ -2035,6 +2045,95 @@ pub fn validating_snapshot_pin_args(
         "-matmultrustedthreshold={BTX_TRUSTED_ATTESTATION_THRESHOLD}"
     ));
     args
+}
+
+/// The one-time marker that makes the next launch of a validating node a
+/// mirror launch, so it can load a signed snapshot (section 7, step 5): the
+/// engine allows `loadtxoutsetattested` only in mirror mode. The same
+/// pattern as the header bootstrap's `.header-bootstrap`: written before the
+/// launch, read by [`launches_as_mirror`], cleared by the app after the load
+/// with a restart as a validating node.
+fn mirror_load_path(datadir: &Path) -> PathBuf {
+    datadir.join(".load-snapshot-as-mirror")
+}
+
+/// A marker older than this is left from a run that died, and is ignored:
+/// a load takes minutes, and a validating node must never stay a mirror for
+/// longer than one.
+pub const MIRROR_LOAD_MAX_AGE_SECS: u64 = 6 * 60 * 60;
+
+/// What the marker holds: the base being loaded, and when it was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MirrorLoad {
+    pub height: u64,
+    pub written_at: u64,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Pure half of [`mirror_load_pending`]: young enough, and not from the
+/// future by more than a clock step.
+pub fn mirror_load_is_fresh(m: &MirrorLoad, now: u64) -> bool {
+    m.written_at <= now + 300 && now.saturating_sub(m.written_at) < MIRROR_LOAD_MAX_AGE_SECS
+}
+
+/// Mark the next launch of this datadir as the mirror launch that loads the
+/// snapshot at `height`.
+pub fn begin_mirror_load(datadir: &Path, height: u64) -> std::io::Result<()> {
+    let m = MirrorLoad {
+        height,
+        written_at: unix_now(),
+    };
+    std::fs::write(
+        mirror_load_path(datadir),
+        serde_json::to_string(&m).map_err(std::io::Error::other)?,
+    )
+}
+
+/// The pending mirror launch, if a fresh marker says so.
+pub fn mirror_load_pending(datadir: &Path) -> Option<MirrorLoad> {
+    let raw = std::fs::read_to_string(mirror_load_path(datadir)).ok()?;
+    let m: MirrorLoad = serde_json::from_str(&raw).ok()?;
+    mirror_load_is_fresh(&m, unix_now()).then_some(m)
+}
+
+/// A marker file is there, fresh or not.
+pub fn mirror_load_marker_exists(datadir: &Path) -> bool {
+    mirror_load_path(datadir).exists()
+}
+
+/// Clear the marker, so the next launch is the node's ordinary one.
+pub fn end_mirror_load(datadir: &Path) {
+    let path = mirror_load_path(datadir);
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            eprintln!("[node] could not clear {}: {e}", path.display());
+        }
+    }
+}
+
+/// Should this start launch a validating node once as a mirror, to load a
+/// signed snapshot? Only for a node that checks blocks itself, has never
+/// loaded a snapshot, holds no snapshot chainstate, is not in its header
+/// bootstrap (the load waits for the launch after it), and whose operator has
+/// not said "never a mirror" (`EASYBTX_NODE_TRUSTED_MIRROR=0`).
+pub fn mirror_load_wanted(
+    host_validates: bool,
+    header_bootstrap_pending: bool,
+    snapshot_loaded: bool,
+    has_snapshot_chainstate: bool,
+    operator_forbids_mirror: bool,
+) -> bool {
+    host_validates
+        && !header_bootstrap_pending
+        && !snapshot_loaded
+        && !has_snapshot_chainstate
+        && !operator_forbids_mirror
 }
 
 /// macOS SIGKILLs a downloaded binary with "Code Signature Invalid" at exec when
@@ -6462,5 +6561,93 @@ matmul: metal runtime_probe_ok, selecting metal\n\
         );
         assert!(!pins.iter().any(|p| p.ends_with(the_3060)), "{got:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Section 7, step 5: the marker makes exactly the load launch a mirror
+    /// (and takes the signing key out of it), and clearing it gives the
+    /// validating launch back.
+    #[test]
+    fn a_mirror_load_marker_makes_only_the_load_launch_a_mirror() {
+        let dir = signed_snapshot_datadir("mirror-load");
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        let btxd = Path::new("/x/btx/v0.34.9/lin/btxd");
+        assert!(!launches_as_mirror(btxd, &dir, Backend::Cuda));
+        assert_eq!(mirror_load_pending(&dir), None);
+
+        begin_mirror_load(&dir, 232_000).unwrap();
+        assert_eq!(mirror_load_pending(&dir).map(|m| m.height), Some(232_000));
+        assert!(launches_as_mirror(btxd, &dir, Backend::Cuda));
+        assert!(!host_follows_signatures(btxd, &dir, Backend::Cuda));
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Cuda);
+        assert_eq!(validation_modes(&args), vec!["trusted"], "{args:?}");
+
+        end_mirror_load(&dir);
+        end_mirror_load(&dir); // idempotent
+        assert!(!mirror_load_marker_exists(&dir));
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Cuda);
+        assert_eq!(validation_modes(&args), vec!["consensus"], "{args:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_or_broken_mirror_load_marker_is_ignored() {
+        let now = 1_790_000_000;
+        let m = |written_at| MirrorLoad {
+            height: 232_000,
+            written_at,
+        };
+        assert!(mirror_load_is_fresh(&m(now), now));
+        assert!(mirror_load_is_fresh(
+            &m(now - MIRROR_LOAD_MAX_AGE_SECS + 1),
+            now
+        ));
+        assert!(!mirror_load_is_fresh(
+            &m(now - MIRROR_LOAD_MAX_AGE_SECS),
+            now
+        ));
+        assert!(
+            !mirror_load_is_fresh(&m(now + 3_600), now),
+            "from the future"
+        );
+
+        let dir = signed_snapshot_datadir("mirror-load-stale");
+        let btxd = Path::new("/x/btx/v0.34.9/lin/btxd");
+        std::fs::write(
+            dir.join(".load-snapshot-as-mirror"),
+            r#"{"height":232000,"written_at":1}"#,
+        )
+        .unwrap();
+        assert!(mirror_load_marker_exists(&dir));
+        assert_eq!(mirror_load_pending(&dir), None);
+        assert!(!launches_as_mirror(btxd, &dir, Backend::Cuda));
+        std::fs::write(dir.join(".load-snapshot-as-mirror"), "not json").unwrap();
+        assert_eq!(mirror_load_pending(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_fresh_validating_node_gets_a_mirror_launch() {
+        assert!(mirror_load_wanted(true, false, false, false, false));
+        assert!(
+            !mirror_load_wanted(false, false, false, false, false),
+            "a mirror loads in place"
+        );
+        assert!(
+            !mirror_load_wanted(true, true, false, false, false),
+            "header bootstrap first"
+        );
+        assert!(
+            !mirror_load_wanted(true, false, true, false, false),
+            "already loaded one"
+        );
+        assert!(
+            !mirror_load_wanted(true, false, false, true, false),
+            "a snapshot chainstate"
+        );
+        assert!(
+            !mirror_load_wanted(true, false, false, false, true),
+            "the operator said =0"
+        );
     }
 }
