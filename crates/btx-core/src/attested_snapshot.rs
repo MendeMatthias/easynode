@@ -717,6 +717,98 @@ fn marked_pair_on_disk(datadir: &Path, marked: Option<(PairKind, u64)>) -> Optio
     })
 }
 
+/// Fetch `url` into memory, refusing more than `cap` bytes: the manifest's
+/// share of [`download_verified`], streamed and size-checked the same way,
+/// but kept in memory rather than written to disk. What [`peek_confirmed`]
+/// uses to read the manifest without keeping it.
+async fn fetch_capped(client: &reqwest::Client, url: &str, cap: usize) -> Result<Vec<u8>, String> {
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("unreachable: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status().as_u16()));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("read: {e}"))? {
+        body.extend_from_slice(&chunk);
+        if body.len() > cap {
+            return Err(format!("larger than {cap} bytes"));
+        }
+    }
+    Ok(body)
+}
+
+/// What `latest` says, checked as [`prepare_confirmed`] checks it, without
+/// the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Peek {
+    /// A confirmed snapshot at `height`, and the operators whose signatures
+    /// this app verified, in the list's order. The pointer's own list is
+    /// never used.
+    Confirmed { height: u64, operators: Vec<String> },
+    /// The operators disagree (section 6a); the newest disputed height.
+    Disputed { newest: u64 },
+}
+
+/// The confirmed snapshot `latest` names, after the same checks
+/// [`prepare_confirmed`] makes on the answer and the manifest, and without
+/// downloading the file; or the dispute it answers instead. For deciding
+/// what the Fast-forward section shows.
+///
+/// Reuses [`read_pointer_body`] to read `latest` (capped at
+/// [`MAX_POINTER_BYTES`]) and [`parse_latest`] to read it, the same as
+/// [`prepare_confirmed`]; a peek never opens a second path to the pointer or
+/// a second parser for it.
+pub async fn peek_confirmed(
+    client: &reqwest::Client,
+    pointer_url: &str,
+    view: &NodeView,
+    regtest_env: Option<&str>,
+    url_ok: fn(&str) -> bool,
+) -> Result<Peek, String> {
+    let resp = client
+        .get(pointer_url)
+        .send()
+        .await
+        .map_err(|e| format!("pointer unreachable: {e}"))?;
+    if resp.status().as_u16() != 200 {
+        return Err(format!(
+            "no confirmed snapshot (HTTP {})",
+            resp.status().as_u16()
+        ));
+    }
+    let body = read_pointer_body(resp).await.map_err(NotReady::why)?;
+    let p = match parse_latest(&body)? {
+        Latest::Confirmed(p) => p,
+        disputed @ Latest::Disputed(_) => {
+            return Ok(Peek::Disputed {
+                newest: disputed.newest_disputed().unwrap_or(0),
+            })
+        }
+    };
+    check_pointer(&p, url_ok)?;
+    let bytes = fetch_capped(client, &p.manifest_url, cs::MAX_MANIFEST_BYTES)
+        .await
+        .map_err(|e| format!("manifest: {e}"))?;
+    let sha = {
+        use sha2::{Digest, Sha256};
+        crate::operators::hex(&Sha256::digest(&bytes))
+    };
+    if bytes.len() as u64 != p.manifest_size || !sha.eq_ignore_ascii_case(&p.manifest_sha256) {
+        return Err("the manifest is not the one the pointer names".into());
+    }
+    let confirmed = cs::parse(&bytes)
+        .and_then(|m| cs::check(&m, view, regtest_env))
+        .map_err(|e| format!("not confirmed: {e}"))?;
+    pointer_matches(&p, &confirmed)?;
+    Ok(Peek::Confirmed {
+        height: confirmed.height,
+        operators: confirmed.operators,
+    })
+}
+
 /// The pair this node should start from, verified on disk, or `None` for the
 /// compiled snapshot: a confirmed pair, else the pinned one (section 9). Best
 /// effort and quiet about it: every failure is logged and falls through.
@@ -1279,6 +1371,63 @@ mod tests {
         assert!(err.contains("disagree about block 100"), "{err}");
         manifest.assert_async().await;
         assert!(!pair_dir(tmp.path()).exists(), "nothing written");
+    }
+
+    #[tokio::test]
+    async fn peeking_checks_the_manifest_and_never_fetches_the_file() {
+        let mut server = mockito::Server::new_async().await;
+        let p = regtest_pointer(&server.url(), R_PC, R_DAT);
+        server
+            .mock("GET", "/latest")
+            .with_body(serde_json::to_vec(&p).unwrap())
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/m")
+            .with_body(R_PC)
+            .create_async()
+            .await;
+        let file = server.mock("GET", "/f").expect(0).create_async().await;
+        let env = format!("producer={P};confirmer={C}");
+        let url = format!("{}/latest", server.url());
+        let client = reqwest::Client::new();
+        assert_eq!(
+            peek_confirmed(&client, &url, &view(), Some(&env), any_url).await,
+            Ok(Peek::Confirmed {
+                height: 100,
+                operators: vec!["producer".into(), "confirmer".into()],
+            }),
+            "the names are the verified signers, not the pointer's"
+        );
+        let one = format!("producer={P}");
+        assert!(peek_confirmed(&client, &url, &view(), Some(&one), any_url)
+            .await
+            .unwrap_err()
+            .contains("two are needed"));
+        file.assert_async().await;
+    }
+
+    /// Section 6a: a dispute is an answer, not an error. Fast-forward says
+    /// it is off and names the newest disputed height; nothing is fetched.
+    #[tokio::test]
+    async fn peeking_a_dispute_names_its_newest_height_and_fetches_nothing() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/latest")
+            .with_body(r#"{"disputed":[233700,233800]}"#)
+            .create_async()
+            .await;
+        let anything_else = server
+            .mock("GET", mockito::Matcher::Regex("^/(m|f)".into()))
+            .expect(0)
+            .create_async()
+            .await;
+        let url = format!("{}/latest", server.url());
+        assert_eq!(
+            peek_confirmed(&reqwest::Client::new(), &url, &view(), None, any_url).await,
+            Ok(Peek::Disputed { newest: 233_800 })
+        );
+        anything_else.assert_async().await;
     }
 
     #[tokio::test]
