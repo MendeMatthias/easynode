@@ -1,0 +1,18 @@
+# Every key BTX_TRUSTED_ATTESTATION_PUBKEYS (crates/btx-core/src/node.rs) has
+# ever shipped, one per line, with the release that added it, and the highest
+# threshold the mirrors have ever used.
+#
+# A key is never removed from the pins. The engine re-checks a stored
+# snapshot manifest at every start against the pins of that moment, so a
+# mirror on a snapshot signed by a removed key stops starting (measured on
+# regtest, 2026-09-29). Retire a key with -matmulattestationblocklist, which
+# the engine tolerates at restart. The same holds for the threshold: raise it
+# above the pinned signatures a stored manifest carries and the node stops.
+#
+# Adding a key: add it to the list in node.rs and append a line here.
+# The test `pins_only_grow_and_the_threshold_stays` compares the two.
+03d90c148db37da28ce47ce15bade88a177728d663da4bc9ba765943b7d4e4f0aa first release
+0224e80df33697385b54b3c69bae1f097f533c0c43e93c29f73ee97319d4a5e04c first release
+028995b25c887ee03eb53a41312d33c8eccf48f261ecf9e91fe2b1e8e50373258a first release
+02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675 0.6.30
+threshold 1

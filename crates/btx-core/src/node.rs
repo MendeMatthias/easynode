@@ -6781,4 +6781,58 @@ matmul: metal runtime_probe_ok, selecting metal\n\
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Section 12. `Err` names what broke the rule.
+    fn pins_only_grow(ever: &[&str], now: &[&str]) -> Result<(), String> {
+        let has = |list: &[&str], k: &str| list.iter().any(|x| x.eq_ignore_ascii_case(k));
+        let removed: Vec<&str> = ever.iter().copied().filter(|k| !has(now, k)).collect();
+        if !removed.is_empty() {
+            return Err(format!("removed from the pins: {}", removed.join(", ")));
+        }
+        let unrecorded: Vec<&str> = now.iter().copied().filter(|k| !has(ever, k)).collect();
+        if !unrecorded.is_empty() {
+            return Err(format!(
+                "pinned but not in pins_ever_shipped.txt: {}",
+                unrecorded.join(", ")
+            ));
+        }
+        Ok(())
+    }
+
+    fn pins_file() -> (Vec<&'static str>, u32) {
+        let text = include_str!("pins_ever_shipped.txt");
+        let mut keys = Vec::new();
+        let mut threshold = 0;
+        for line in text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            if let Some(t) = line.strip_prefix("threshold ") {
+                threshold = t.trim().parse().unwrap();
+            } else {
+                keys.push(line.split_whitespace().next().unwrap());
+            }
+        }
+        (keys, threshold)
+    }
+
+    #[test]
+    fn pins_only_grow_and_the_threshold_stays() {
+        let (ever, threshold) = pins_file();
+        assert_eq!(ever.len(), 4, "the file lost a line");
+        pins_only_grow(&ever, &BTX_TRUSTED_ATTESTATION_PUBKEYS).unwrap();
+        assert!(
+            BTX_TRUSTED_ATTESTATION_THRESHOLD <= threshold,
+            "the mirrors' threshold rose to {BTX_TRUSTED_ATTESTATION_THRESHOLD}"
+        );
+        // Sabotage: a release that drops the 3060's key.
+        let dropped: Vec<&str> = BTX_TRUSTED_ATTESTATION_PUBKEYS[..3].to_vec();
+        let err = pins_only_grow(&ever, &dropped).unwrap_err();
+        assert!(err.contains("02d5efca"), "{err}");
+        // A key added without its line in the file.
+        let mut added = BTX_TRUSTED_ATTESTATION_PUBKEYS.to_vec();
+        added.push("0343faebbc3a28f2e452132477192cb5455f0c0f2cfdab01c9217c43c2cbc3e464");
+        assert!(pins_only_grow(&ever, &added).is_err());
+    }
 }
