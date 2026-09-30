@@ -13,6 +13,19 @@
 //!
 //! Wallets, keys, the conf, settings, peers, bans and the diary stay where
 //! they are: only [`CHAIN_DATA`] moves.
+//!
+//! The old chain can always be put back, whenever the app stops. The record
+//! (`<datadir>/.fast-forward.json`) is written before anything moves and
+//! says which step the run is at ([`Phase`]), so every step after it can be
+//! cut off by a crash and carried on from the record at the next start:
+//!
+//! * [`set_aside`]: the record ([`Phase::SettingAside`], listing what is to
+//!   move), the dated folder, the moves, then [`Phase::Running`]. Only then
+//!   may the node start on new chain data.
+//! * [`restore`]: from `Running`, the chain data the attempt made is removed,
+//!   then [`Phase::Restoring`], then the old data goes back, then the dated
+//!   folder, and the record last. From `SettingAside` or `Restoring` nothing
+//!   is removed: what is still in the dated folder goes back.
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -48,16 +61,33 @@ fn result_path(datadir: &Path) -> PathBuf {
     datadir.join(".fast-forward-result.json")
 }
 
+/// Which step a run is at. Written before the step it names begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    /// The chain data is moving into the dated folder; `moved` is what is to
+    /// move. The node has not run since.
+    SettingAside,
+    /// Everything in `moved` is in the dated folder and the node runs on new
+    /// chain data: the run is watched ([`judge`]).
+    Running,
+    /// The chain data the attempt made is gone and the old data is going
+    /// back: some of `moved` may be back in place already.
+    Restoring,
+}
+
 /// A run in progress, on disk, so a quit in the middle can be finished or
-/// undone at the next start.
+/// undone at the next start. Only this module writes it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     /// The confirmed snapshot's base.
     pub height: u64,
-    /// The dated folder, relative to the datadir.
+    /// The dated folder, relative to the datadir: always [`aside_name`]'s.
     pub aside: String,
-    /// What was moved into it, so exactly that comes back.
+    /// What moves (while [`Phase::SettingAside`]) or moved into it, so
+    /// exactly that comes back. Only [`CHAIN_DATA`] names.
     pub moved: Vec<String>,
+    pub phase: Phase,
     /// The app's "a snapshot was loaded" setting before the run.
     pub snapshot_loaded_before: bool,
     /// The app's "first load still to come" setting before the run. With
@@ -73,6 +103,38 @@ pub struct Record {
 pub struct Before {
     pub snapshot_loaded: bool,
     pub first_load_pending: bool,
+}
+
+/// Why [`set_aside`] or [`restore`] stopped.
+#[derive(Debug)]
+pub enum MoveError {
+    /// This call changed nothing in the datadir.
+    Untouched(io::Error),
+    /// Not all of the old chain data is back in place; what is not is in
+    /// `folder`. The record stays, so [`restore`] carries on from where this
+    /// stopped (at the next start at the latest).
+    Stranded { folder: PathBuf, error: io::Error },
+}
+
+impl std::fmt::Display for MoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MoveError::Untouched(e) => write!(f, "{e}"),
+            MoveError::Stranded { folder, error } => write!(
+                f,
+                "{error}; the old chain data that is not back in place is in {}",
+                folder.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MoveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            MoveError::Untouched(e) | MoveError::Stranded { error: e, .. } => Some(e),
+        }
+    }
 }
 
 /// How the last run ended, for the Tools overlay.
@@ -183,76 +245,202 @@ fn remove_any(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Move every [`CHAIN_DATA`] entry that exists into a new dated folder and
-/// return the record. On any failure, what was moved goes back and the
-/// error is returned: the datadir is as it was. Call only with the node
-/// stopped.
+/// Between two steps that change the disk. The app always goes on; a test
+/// stops a call here, as a crash would: nothing after it runs, not even a
+/// clean-up.
+type Pause<'a> = &'a mut dyn FnMut() -> io::Result<()>;
+
+/// Move every [`CHAIN_DATA`] entry that exists into a new dated folder, and
+/// keep the record of it on disk. Refused while a run is recorded. On a
+/// failure, what moved goes back ([`MoveError::Untouched`]); if that fails
+/// too, the record stays and the error says where the old data is
+/// ([`MoveError::Stranded`]). Call only with the node stopped.
 pub fn set_aside(
     datadir: &Path,
     height: u64,
     before: Before,
     now_unix: u64,
-) -> std::io::Result<Record> {
-    set_aside_names(datadir, CHAIN_DATA, height, before, now_unix)
+) -> Result<Record, MoveError> {
+    set_aside_with(
+        datadir,
+        CHAIN_DATA,
+        height,
+        before,
+        now_unix,
+        &mut || Ok(()),
+    )
 }
 
-fn set_aside_names(
+fn set_aside_with(
     datadir: &Path,
     names: &[&str],
     height: u64,
     before: Before,
     now_unix: u64,
-) -> std::io::Result<Record> {
+    pause: Pause,
+) -> Result<Record, MoveError> {
+    use MoveError::Untouched;
+    if read_record(datadir).map_err(Untouched)?.is_some() {
+        return Err(Untouched(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "a Fast-forward run is already recorded",
+        )));
+    }
+    let mut moved = Vec::new();
+    for name in names {
+        if present(&datadir.join(name)).map_err(Untouched)? {
+            moved.push(name.to_string());
+        }
+    }
     let aside = aside_name(now_unix);
     let dir = datadir.join(&aside);
-    std::fs::create_dir(&dir)?;
-    let mut moved: Vec<String> = Vec::new();
-    for name in names {
-        let from = datadir.join(name);
-        if !present(&from)? {
-            continue;
-        }
-        if let Err(e) = std::fs::rename(&from, dir.join(name)) {
-            for back in moved.iter().rev() {
-                let _ = std::fs::rename(dir.join(back), datadir.join(back));
-            }
-            let _ = std::fs::remove_dir(&dir);
-            return Err(e);
-        }
-        moved.push(name.to_string());
+    if present(&dir).map_err(Untouched)? {
+        return Err(Untouched(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} is in the way", dir.display()),
+        )));
     }
-    Ok(Record {
+    let mut record = Record {
         height,
         aside,
         moved,
+        phase: Phase::SettingAside,
         snapshot_loaded_before: before.snapshot_loaded,
         first_load_pending_before: before.first_load_pending,
         started_at: now_unix,
-    })
-}
-
-/// Undo a run: the chain data the failed attempt made is removed, and what
-/// was set aside goes back. The aside folder is checked first, so nothing is
-/// removed unless its original is there to replace it. Call only with the
-/// node stopped.
-pub fn restore(datadir: &Path, record: &Record) -> std::io::Result<()> {
-    check(record)?;
-    let dir = datadir.join(&record.aside);
+    };
+    pause().map_err(Untouched)?;
+    write_record(datadir, &record).map_err(Untouched)?;
+    pause().map_err(Untouched)?;
+    if let Err(e) = std::fs::create_dir(&dir) {
+        return Err(undo_set_aside(datadir, &record, e));
+    }
     for name in &record.moved {
-        if !present(&dir.join(name))? {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("{} is missing from {}", name, dir.display()),
-            ));
+        pause().map_err(Untouched)?;
+        if let Err(e) = std::fs::rename(datadir.join(name), dir.join(name)) {
+            return Err(undo_set_aside(datadir, &record, e));
         }
     }
-    for name in CHAIN_DATA {
-        remove_any(&datadir.join(name))?;
+    pause().map_err(Untouched)?;
+    record.phase = Phase::Running;
+    if let Err(e) = write_record(datadir, &record) {
+        record.phase = Phase::SettingAside;
+        return Err(undo_set_aside(datadir, &record, e));
     }
+    Ok(record)
+}
+
+/// Setting aside failed with `error`: put back what moved, and drop the
+/// record.
+fn undo_set_aside(datadir: &Path, record: &Record, error: io::Error) -> MoveError {
+    match put_back(datadir, record, &mut || Ok(())) {
+        Ok(()) => MoveError::Untouched(error),
+        Err(MoveError::Stranded { folder, error: e }) => MoveError::Stranded {
+            folder,
+            error: io::Error::new(
+                error.kind(),
+                format!("{error}, and putting back what had moved failed: {e}"),
+            ),
+        },
+        Err(untouched) => untouched,
+    }
+}
+
+/// Undo the run on disk, from whichever step it is at, and return its
+/// record (its settings from before the run are for the caller to put
+/// back); `Ok(None)` when no run is recorded. From [`Phase::Running`], the
+/// dated folder is checked first, so nothing is removed unless its original
+/// is there to replace it; then the chain data the attempt made goes, then
+/// the old data comes back. Called again after any failure or crash, it
+/// carries on. Call only with the node stopped, and start the node only
+/// after it returns `Ok`.
+pub fn restore(datadir: &Path) -> Result<Option<Record>, MoveError> {
+    restore_with(datadir, &mut || Ok(()))
+}
+
+fn restore_with(datadir: &Path, pause: Pause) -> Result<Option<Record>, MoveError> {
+    let Some(mut record) = read_record(datadir).map_err(MoveError::Untouched)? else {
+        return Ok(None);
+    };
+    let folder = datadir.join(&record.aside);
+    let stranded = |error| MoveError::Stranded {
+        folder: folder.clone(),
+        error,
+    };
+    if record.phase == Phase::Running {
+        for name in &record.moved {
+            if !present(&folder.join(name)).map_err(stranded)? {
+                return Err(stranded(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{name} is missing from {}", folder.display()),
+                )));
+            }
+        }
+        for name in CHAIN_DATA {
+            let fresh = datadir.join(name);
+            if present(&fresh).map_err(stranded)? {
+                pause().map_err(stranded)?;
+                remove_any(&fresh).map_err(stranded)?;
+            }
+        }
+        pause().map_err(stranded)?;
+        record.phase = Phase::Restoring;
+        write_record(datadir, &record).map_err(stranded)?;
+    }
+    put_back(datadir, &record, pause)?;
+    Ok(Some(record))
+}
+
+/// Move what of `record.moved` is still in the dated folder back to its
+/// place, then remove the folder and, last, the record. Nothing is removed
+/// and nothing overwritten on the way: an entry both in the folder and in
+/// its place, or in neither, stops it. Chain data left in the folder stops
+/// the folder's removal; anything else there (a `.DS_Store`) goes with it.
+fn put_back(datadir: &Path, record: &Record, pause: Pause) -> Result<(), MoveError> {
+    let folder = datadir.join(&record.aside);
+    let stranded = |error| MoveError::Stranded {
+        folder: folder.clone(),
+        error,
+    };
     for name in &record.moved {
-        std::fs::rename(dir.join(name), datadir.join(name))?;
+        let old = folder.join(name);
+        let place = datadir.join(name);
+        let waiting = present(&old).map_err(stranded)?;
+        let placed = present(&place).map_err(stranded)?;
+        match (waiting, placed) {
+            (true, false) => {
+                pause().map_err(stranded)?;
+                std::fs::rename(&old, &place).map_err(stranded)?;
+            }
+            (false, true) => {} // back already
+            (true, true) => {
+                return Err(stranded(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{name} is in {} and in its place too", folder.display()),
+                )))
+            }
+            (false, false) => {
+                return Err(stranded(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{name} is neither in its place nor in {}", folder.display()),
+                )))
+            }
+        }
     }
-    std::fs::remove_dir(&dir)
+    if present(&folder).map_err(stranded)? {
+        for name in CHAIN_DATA {
+            if present(&folder.join(name)).map_err(stranded)? {
+                return Err(stranded(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{name} is still in {}", folder.display()),
+                )));
+            }
+        }
+        pause().map_err(stranded)?;
+        std::fs::remove_dir_all(&folder).map_err(stranded)?;
+    }
+    pause().map_err(stranded)?;
+    clear_record(datadir).map_err(stranded)
 }
 
 /// A finished run: the set-aside chain data is no longer needed.
@@ -261,7 +449,8 @@ pub fn discard(datadir: &Path, record: &Record) -> std::io::Result<()> {
     remove_any(&datadir.join(&record.aside))
 }
 
-pub fn write_record(datadir: &Path, record: &Record) -> std::io::Result<()> {
+/// Only this module writes the record, so its phases follow the steps.
+fn write_record(datadir: &Path, record: &Record) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(record).map_err(io::Error::other)?;
     crate::fsx::atomic_write(&record_path(datadir), &bytes)
 }
@@ -281,7 +470,7 @@ pub fn read_record(datadir: &Path) -> io::Result<Option<Record>> {
     Ok(Some(record))
 }
 
-pub fn clear_record(datadir: &Path) -> io::Result<()> {
+fn clear_record(datadir: &Path) -> io::Result<()> {
     match std::fs::remove_file(record_path(datadir)) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
@@ -324,7 +513,9 @@ pub enum Verdict {
     RollBack(String),
 }
 
-/// Pure: is the run done, still going, or to be rolled back? Done means a
+/// Pure: is the run done, still going, or to be rolled back? A record left
+/// between two steps of a move ([`Phase::SettingAside`],
+/// [`Phase::Restoring`]) is rolled back, whatever the node shows. Done means a
 /// snapshot at or above the run's is loaded (the start path may have found a
 /// newer confirmed one) and the node runs its ordinary launch again: no
 /// mirror launch and no header bootstrap pending. A snapshot below the run's
@@ -332,6 +523,19 @@ pub enum Verdict {
 /// operators began to disagree after the check, or the pair was refused):
 /// rolled back at once.
 pub fn judge(record: &Record, look: &Look, now_unix: u64) -> Verdict {
+    match record.phase {
+        Phase::Running => {}
+        Phase::SettingAside => {
+            return Verdict::RollBack(
+                "the app stopped while it was setting the chain data aside".into(),
+            )
+        }
+        Phase::Restoring => {
+            return Verdict::RollBack(
+                "the app stopped while it was putting the old chain data back".into(),
+            )
+        }
+    }
     if let Some(why) = &look.load_failed {
         return Verdict::RollBack(why.clone());
     }
@@ -445,6 +649,14 @@ mod tests {
         "shielded_state",
     ];
 
+    const KEPT: [&str; 5] = [
+        "wallets/main/wallet.dat",
+        "attestation-signer.key",
+        "peers.dat",
+        "banlist.json",
+        "snapshot-diary.json",
+    ];
+
     fn datadir_with_chain() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         fill_datadir(tmp.path());
@@ -463,6 +675,70 @@ mod tests {
         std::fs::write(d.join("peers.dat"), b"peers").unwrap();
         std::fs::write(d.join("banlist.json"), b"[]").unwrap();
         std::fs::write(d.join("snapshot-diary.json"), b"[]").unwrap();
+    }
+
+    /// New chain data, as an attempt that went wrong leaves it.
+    fn attempt_made_chain(d: &Path) {
+        for name in ["blocks", "chainstate", "indexes"] {
+            std::fs::create_dir_all(d.join(name)).unwrap();
+            std::fs::write(d.join(name).join("new"), b"new").unwrap();
+        }
+        std::fs::write(d.join("snapshot-start.json"), b"new start").unwrap();
+    }
+
+    /// The datadir exactly as [`fill_datadir`] made it, and no run left.
+    fn assert_as_before(d: &Path, when: &str) {
+        for name in CHAIN_DIRS {
+            let entries: Vec<String> = std::fs::read_dir(d.join(name))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(entries, ["old"], "{name}, {when}");
+            assert_eq!(
+                std::fs::read_to_string(d.join(name).join("old")).unwrap(),
+                name,
+                "{when}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(d.join("snapshot-start.json")).unwrap(),
+            "old start",
+            "the start record comes back with the chain it describes, {when}"
+        );
+        for kept in KEPT {
+            assert!(d.join(kept).exists(), "{kept}, {when}");
+        }
+        let left: Vec<String> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("fast-forward-") || n.starts_with(".fast-forward"))
+            .collect();
+        assert!(left.is_empty(), "{left:?} left, {when}");
+    }
+
+    /// A pause that stops the call at its `k`th stop, as a crash would.
+    fn crash_at(k: usize) -> impl FnMut() -> io::Result<()> {
+        let mut n = 0;
+        move || {
+            n += 1;
+            if n == k {
+                Err(io::Error::other("crash"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn running_record(started_at: u64) -> Record {
+        Record {
+            height: 232_000,
+            aside: aside_name(started_at),
+            moved: vec![],
+            phase: Phase::Running,
+            snapshot_loaded_before: false,
+            first_load_pending_before: false,
+            started_at,
+        }
     }
 
     #[test]
@@ -539,40 +815,25 @@ mod tests {
             ]
         );
         assert!(r.snapshot_loaded_before && r.first_load_pending_before);
+        assert_eq!(r.phase, Phase::Running);
+        assert_eq!(
+            read_record(d).unwrap(),
+            Some(r.clone()),
+            "set_aside keeps its own record"
+        );
         for name in CHAIN_DATA {
-            assert!(!d.join(name).exists(), "{name} still in place");
+            assert!(!present(&d.join(name)).unwrap(), "{name} still in place");
         }
-        for kept in [
-            "wallets/main/wallet.dat",
-            "attestation-signer.key",
-            "peers.dat",
-            "banlist.json",
-            "snapshot-diary.json",
-        ] {
+        for kept in KEPT {
             assert!(d.join(kept).exists(), "{kept} moved");
         }
         // The failed attempt made new chain data and a new start record;
         // restoring replaces them.
-        std::fs::create_dir_all(d.join("blocks")).unwrap();
-        std::fs::write(d.join("blocks/new"), b"new").unwrap();
-        std::fs::create_dir_all(d.join("indexes")).unwrap();
-        std::fs::write(d.join("indexes/new"), b"new").unwrap();
-        std::fs::write(d.join("snapshot-start.json"), b"new start").unwrap();
-        restore(d, &r).unwrap();
-        for name in CHAIN_DIRS {
-            assert_eq!(
-                std::fs::read_to_string(d.join(name).join("old")).unwrap(),
-                name
-            );
-        }
-        assert!(!d.join("blocks/new").exists());
-        assert!(!d.join("indexes/new").exists());
-        assert_eq!(
-            std::fs::read_to_string(d.join("snapshot-start.json")).unwrap(),
-            "old start",
-            "the start record comes back with the chain it describes"
-        );
-        assert!(!d.join(&r.aside).exists());
+        attempt_made_chain(d);
+        let undone = restore(d).unwrap().expect("a run to undo");
+        assert_eq!(undone.height, 232_000);
+        assert!(undone.snapshot_loaded_before && undone.first_load_pending_before);
+        assert_as_before(d, "restored");
     }
 
     /// Chain data the node had none of before the run, made by the attempt,
@@ -586,7 +847,7 @@ mod tests {
         assert!(!r.moved.contains(&"indexes".to_string()));
         std::fs::create_dir_all(d.join("indexes")).unwrap();
         std::fs::write(d.join("indexes/new"), b"new").unwrap();
-        restore(d, &r).unwrap();
+        restore(d).unwrap();
         assert!(
             !d.join("indexes").exists(),
             "made by the attempt, gone with it"
@@ -609,7 +870,7 @@ mod tests {
         assert!(std::fs::symlink_metadata(d.join("blocks")).is_err());
         // The attempt made a real `blocks`; the link comes back in its place.
         std::fs::create_dir_all(d.join("blocks")).unwrap();
-        restore(d, &r).unwrap();
+        restore(d).unwrap();
         let back = std::fs::symlink_metadata(d.join("blocks")).unwrap();
         assert!(back.file_type().is_symlink());
     }
@@ -619,11 +880,14 @@ mod tests {
         let tmp = datadir_with_chain();
         let d = tmp.path();
         let r = set_aside(d, 232_000, Before::default(), 7).unwrap();
-        std::fs::create_dir_all(d.join("blocks")).unwrap();
-        std::fs::write(d.join("blocks/new"), b"new").unwrap();
+        attempt_made_chain(d);
         std::fs::remove_dir_all(d.join(&r.aside).join("chainstate")).unwrap();
-        assert!(restore(d, &r).is_err());
+        match restore(d) {
+            Err(MoveError::Stranded { folder, .. }) => assert_eq!(folder, d.join(&r.aside)),
+            other => panic!("{other:?}"),
+        }
         assert!(d.join("blocks/new").exists(), "nothing removed");
+        assert_eq!(read_record(d).unwrap(), Some(r), "the run stays recorded");
     }
 
     #[test]
@@ -633,18 +897,202 @@ mod tests {
         // A second entry whose move fails (its parent does not exist in the
         // dated folder), after `blocks` has already moved.
         std::fs::create_dir_all(d.join("nested/data")).unwrap();
-        assert!(
-            set_aside_names(d, &["blocks", "nested/data"], 232_000, Before::default(), 9).is_err()
+        let got = set_aside_with(
+            d,
+            &["blocks", "nested/data"],
+            232_000,
+            Before::default(),
+            9,
+            &mut || Ok(()),
         );
+        assert!(matches!(got, Err(MoveError::Untouched(_))), "{got:?}");
         assert!(d.join("blocks/old").exists(), "blocks came back");
         assert!(d.join("nested/data").exists());
         assert!(!d.join(aside_name(9)).exists(), "the dated folder is gone");
+        assert_eq!(read_record(d).unwrap(), None, "and so is its record");
         // And a dated folder in the way stops it before anything moves.
         std::fs::write(d.join(aside_name(9)), b"in the way").unwrap();
-        assert!(set_aside(d, 232_000, Before::default(), 9).is_err());
-        for name in CHAIN_DIRS {
-            assert!(d.join(name).join("old").exists(), "{name}");
+        let got = set_aside(d, 232_000, Before::default(), 9);
+        assert!(matches!(got, Err(MoveError::Untouched(_))), "{got:?}");
+        std::fs::remove_file(d.join(aside_name(9))).unwrap();
+        assert_as_before(d, "nothing moved");
+    }
+
+    /// When a move fails and putting back what had moved fails too, the
+    /// error says where the old chain data is, never that all is as it was;
+    /// the record stays, so a later restore finishes the job.
+    #[test]
+    fn a_failed_put_back_says_where_the_old_chain_is() {
+        let tmp = datadir_with_chain();
+        let d = tmp.path();
+        let folder = d.join(aside_name(9));
+        // Stops 1 and 2 are the record and the dated folder, 3 is before
+        // `blocks` moves and 4 before `chainstate` does. At 4, something
+        // takes `chainstate`'s place in the folder, so its move fails, and
+        // something takes `blocks`' place in the datadir, so putting
+        // `blocks` back fails too.
+        let mut stop = 0;
+        let mut pause = || {
+            stop += 1;
+            if stop == 4 {
+                std::fs::create_dir_all(folder.join("chainstate/x")).unwrap();
+                std::fs::create_dir_all(d.join("blocks/x")).unwrap();
+            }
+            Ok(())
+        };
+        let got = set_aside_with(d, CHAIN_DATA, 232_000, Before::default(), 9, &mut pause);
+        match &got {
+            Err(MoveError::Stranded { folder: f, .. }) => assert_eq!(f, &folder),
+            other => panic!("{other:?}"),
         }
+        let said = got.unwrap_err().to_string();
+        assert!(said.contains(&folder.display().to_string()), "{said}");
+        assert!(!said.contains("as it was"), "{said}");
+        assert!(folder.join("blocks/old").exists(), "the old blocks wait");
+        assert!(d.join("blocks/x").exists(), "nothing was overwritten");
+        let left = read_record(d).unwrap().expect("the run stays recorded");
+        assert_eq!(left.phase, Phase::SettingAside);
+        // Once the way is clear, the next start puts it all back.
+        std::fs::remove_dir_all(d.join("blocks")).unwrap();
+        std::fs::remove_dir_all(folder.join("chainstate")).unwrap();
+        restore(d).unwrap();
+        assert_as_before(d, "after the way was cleared");
+    }
+
+    #[test]
+    fn a_run_is_never_set_aside_over_another() {
+        let tmp = datadir_with_chain();
+        let d = tmp.path();
+        let r = set_aside(d, 232_000, Before::default(), 20).unwrap();
+        attempt_made_chain(d);
+        let again = set_aside(d, 232_000, Before::default(), 21);
+        assert!(
+            matches!(&again, Err(MoveError::Untouched(e)) if e.kind() == io::ErrorKind::AlreadyExists),
+            "{again:?}"
+        );
+        assert!(d.join("blocks/new").exists());
+        assert!(!d.join(aside_name(21)).exists());
+        assert_eq!(read_record(d).unwrap(), Some(r));
+        restore(d).unwrap();
+        assert_as_before(d, "the first run undone");
+    }
+
+    /// A crash between any two steps of setting aside: the next start finds
+    /// the run half set aside and undoes it. Nothing is removed (the node
+    /// never ran on new data) and what moved comes back.
+    #[test]
+    fn a_crash_while_setting_aside_is_undone_at_the_next_start() {
+        let mut crashed = 0;
+        for k in 1.. {
+            let tmp = datadir_with_chain();
+            let d = tmp.path();
+            let got = set_aside_with(
+                d,
+                CHAIN_DATA,
+                232_000,
+                Before::default(),
+                9,
+                &mut crash_at(k),
+            );
+            if got.is_ok() {
+                break;
+            }
+            crashed += 1;
+            if let Some(r) = read_record(d).unwrap() {
+                assert_eq!(r.phase, Phase::SettingAside, "a crash at stop {k}");
+                assert!(
+                    matches!(judge(&r, &Look::default(), 9), Verdict::RollBack(_)),
+                    "a crash at stop {k}"
+                );
+            }
+            restore(d).unwrap();
+            assert_as_before(d, &format!("a crash at stop {k}"));
+        }
+        // The record, the dated folder, six moves, the record again.
+        assert_eq!(crashed, 9);
+    }
+
+    /// A crash between any two steps of a restore: the next start carries
+    /// on from the record and the datadir ends as it was before the run. A
+    /// second restore after that finds nothing to do.
+    #[test]
+    fn a_crash_while_restoring_is_finished_at_the_next_start() {
+        let mut crashed = 0;
+        for k in 1.. {
+            let tmp = datadir_with_chain();
+            let d = tmp.path();
+            set_aside(d, 232_000, Before::default(), 9).unwrap();
+            attempt_made_chain(d);
+            if restore_with(d, &mut crash_at(k)).is_ok() {
+                assert_as_before(d, "no crash");
+                break;
+            }
+            crashed += 1;
+            assert!(
+                read_record(d).unwrap().is_some(),
+                "the run stays recorded until the end, a crash at stop {k}"
+            );
+            let undone = restore(d).unwrap();
+            assert_eq!(undone.map(|u| u.height), Some(232_000), "stop {k}");
+            assert_as_before(d, &format!("a crash at stop {k}"));
+            assert!(restore(d).unwrap().is_none(), "called twice, stop {k}");
+            assert_as_before(d, &format!("restored twice, stop {k}"));
+        }
+        // Four removals (blocks, chainstate, indexes, the start record), the
+        // record, six moves back, the folder, the record.
+        assert_eq!(crashed, 13);
+    }
+
+    /// Stopped with the attempt's data gone, the record saying so, and two
+    /// of six entries back: the next restore moves the other four.
+    #[test]
+    fn restore_carries_on_when_some_of_the_old_data_is_back() {
+        let tmp = datadir_with_chain();
+        let d = tmp.path();
+        let r = set_aside(d, 232_000, Before::default(), 9).unwrap();
+        attempt_made_chain(d);
+        assert!(restore_with(d, &mut crash_at(8)).is_err());
+        let left = read_record(d).unwrap().unwrap();
+        assert_eq!(left.phase, Phase::Restoring);
+        let folder = d.join(&r.aside);
+        let waiting = r
+            .moved
+            .iter()
+            .filter(|n| present(&folder.join(n)).unwrap())
+            .count();
+        assert_eq!(waiting, 4);
+        assert!(d.join("blocks/old").exists() && d.join("chainstate/old").exists());
+        assert!(!d.join("indexes").exists(), "the attempt's is gone");
+        restore(d).unwrap();
+        assert_as_before(d, "carried on");
+    }
+
+    #[test]
+    fn a_stray_file_in_the_dated_folder_does_not_stop_the_restore() {
+        let tmp = datadir_with_chain();
+        let d = tmp.path();
+        let r = set_aside(d, 232_000, Before::default(), 9).unwrap();
+        attempt_made_chain(d);
+        std::fs::write(d.join(&r.aside).join(".DS_Store"), b"finder").unwrap();
+        restore(d).unwrap();
+        assert_as_before(d, "a .DS_Store in the folder");
+    }
+
+    /// Chain data in the dated folder that the record does not list is not
+    /// the run's to delete: the folder stays and the restore says where.
+    #[test]
+    fn chain_data_the_record_does_not_list_is_never_deleted() {
+        let tmp = datadir_with_chain();
+        let d = tmp.path();
+        std::fs::remove_dir_all(d.join("indexes")).unwrap();
+        let r = set_aside(d, 232_000, Before::default(), 9).unwrap();
+        let folder = d.join(&r.aside);
+        std::fs::create_dir_all(folder.join("indexes")).unwrap();
+        std::fs::write(folder.join("indexes/old"), b"indexes").unwrap();
+        let got = restore(d);
+        assert!(matches!(got, Err(MoveError::Stranded { .. })), "{got:?}");
+        assert!(folder.join("indexes/old").exists());
+        assert!(d.join("blocks/old").exists(), "the listed data is back");
     }
 
     #[test]
@@ -665,12 +1113,10 @@ mod tests {
         let d = tmp.path();
         assert_eq!(read_record(d).unwrap(), None);
         let r = Record {
-            height: 232_000,
-            aside: aside_name(1),
             moved: vec!["blocks".into()],
             snapshot_loaded_before: true,
             first_load_pending_before: true,
-            started_at: 1,
+            ..running_record(1)
         };
         write_record(d, &r).unwrap();
         assert_eq!(read_record(d).unwrap(), Some(r.clone()));
@@ -685,7 +1131,7 @@ mod tests {
         // One written before the first-load setting was kept reads as false.
         std::fs::write(
             d.join(".fast-forward.json"),
-            r#"{"height":232000,"aside":"fast-forward-1","moved":["blocks"],"snapshot_loaded_before":true,"started_at":1}"#,
+            r#"{"height":232000,"aside":"fast-forward-1","moved":["blocks"],"phase":"running","snapshot_loaded_before":true,"started_at":1}"#,
         )
         .unwrap();
         assert!(!read_record(d).unwrap().unwrap().first_load_pending_before);
@@ -715,14 +1161,7 @@ mod tests {
 
     #[test]
     fn a_run_is_done_only_when_the_node_runs_ordinarily_on_the_snapshot() {
-        let r = Record {
-            height: 232_000,
-            aside: aside_name(1_000),
-            moved: vec![],
-            snapshot_loaded_before: false,
-            first_load_pending_before: false,
-            started_at: 1_000,
-        };
+        let r = running_record(1_000);
         let on_it = Look {
             snapshot_base_height: Some(232_000),
             running: true,
@@ -791,6 +1230,18 @@ mod tests {
             Verdict::Done,
             "on the snapshot is done, however long it took"
         );
+        // A record left between two steps of a move is undone, whatever the
+        // node shows.
+        for phase in [Phase::SettingAside, Phase::Restoring] {
+            let r = Record {
+                phase,
+                ..running_record(1_000)
+            };
+            assert!(
+                matches!(judge(&r, &on_it, 2_000), Verdict::RollBack(_)),
+                "{phase:?}"
+            );
+        }
     }
 
     /// Paths in the record come from a file: the dated folder must be one
@@ -803,12 +1254,8 @@ mod tests {
         let d = &tmp.path().join("root/node");
         fill_datadir(d);
         let good = Record {
-            height: 232_000,
-            aside: aside_name(5),
             moved: vec!["blocks".into()],
-            snapshot_loaded_before: false,
-            first_load_pending_before: false,
-            started_at: 5,
+            ..running_record(5)
         };
         let outside = tmp.path().join("root/outside");
         std::fs::create_dir_all(outside.join("blocks")).unwrap();
@@ -839,7 +1286,7 @@ mod tests {
             write_record(d, &r).unwrap();
             let e = read_record(d).unwrap_err();
             assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{r:?}");
-            assert!(restore(d, &r).is_err(), "{r:?}");
+            assert!(matches!(restore(d), Err(MoveError::Untouched(_))), "{r:?}");
             assert!(discard(d, &r).is_err(), "{r:?}");
             assert!(d.join("wallets/main/wallet.dat").exists(), "{r:?}");
             assert!(d.join("blocks/old").exists(), "{r:?}");
