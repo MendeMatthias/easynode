@@ -104,12 +104,14 @@ The fork and "behind the signers" messages keep their place after the stale
 sentence, as today.
 
 As built, three rules sit under the table. A node that is still syncing is
-judged by the blocks it adds, read over the last 20 minutes, not by the gap,
-because its headers can run far ahead of its blocks: amber only when it adds
-fewer than the chain's 40 an hour. The header fetch (height 0) always shows
-the calm line, so a fresh install is never amber while it counts headers. And
-"behind" means two or more headers beyond the tip, as on the role card: one
-is a block in flight.
+judged by the blocks it adds, not by the gap, because its headers can run far
+ahead of its blocks: amber when it added no blocks in the last 20 minutes, or
+when over the last hour it added fewer than the chain's 40 an hour by more
+than one block, and then amber until its hour is back at 40 or more, so a
+node at about the chain's own rate does not blink. The header fetch (height
+0) always shows the calm line, so a fresh install is never amber while it
+counts headers. And "behind" means two or more headers beyond the tip, as on
+the role card: one is a block in flight.
 
 ### 4. What stays
 
