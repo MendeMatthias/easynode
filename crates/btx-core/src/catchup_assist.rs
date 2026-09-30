@@ -45,6 +45,14 @@ pub const BATCH: u64 = 100;
 pub const ROTATE_AFTER: Duration = Duration::from_secs(180);
 /// Headers read per tick while walking down to the tip (`crate::header_path`).
 pub const WALK_PER_TICK: usize = 1_000;
+/// About how long one tick may keep asking the node, checked between two
+/// calls, so a tick ends at most one call past it. Every `getblockheader`
+/// takes the engine's `cs_main`, which a busy engine holds for a while, and
+/// the refresher (status card, watchdog, "stopped responding") waits for the
+/// tick.
+pub const TICK_BUDGET: Duration = Duration::from_millis(1_500);
+/// A tick slower than this says so in the log, once until one is quick again.
+pub const SLOW_TICK: Duration = Duration::from_secs(1);
 /// A NETWORK_LIMITED peer keeps its last 288 blocks
 /// (`NODE_NETWORK_LIMITED_MIN_BLOCKS`, engine `src/net_processing.cpp:512` at
 /// 84b998b4). A block further below the height a peer announced is old for it
@@ -636,6 +644,8 @@ pub struct CatchUp {
     /// The chain the last good read chose to follow (height, hash), kept
     /// through a read that fails.
     target: Option<(u64, String)>,
+    /// The last tick took longer than [`SLOW_TICK`].
+    slow: bool,
 }
 
 /// What the shell keeps of the help between ticks (`AppState::catch_up_help`,
@@ -656,6 +666,7 @@ impl CatchUp {
             helper: Helper::new(archive),
             path: HeaderPath::new(),
             target: None,
+            slow: false,
         }
     }
 
@@ -711,12 +722,51 @@ impl CatchUp {
 
 /// One refresher tick. Returns the lines for the log: a drop over old blocks
 /// ([`dropped_once_line`] or [`refuses_old_line`]), then the batch it asked
-/// for, or the stop or pause. Reads nothing from the node while no header it
-/// knows is [`MIN_BEHIND`] above the tip. A failed read is no answer, so it
-/// neither stops the help nor asks for anything: an unread frontier header
-/// keeps the chain the last good read chose, and an unread tip, walk or own
-/// chain lets the tick pass without a decision.
+/// for, or the stop or pause, then [`slow_tick_line`] when the tick took
+/// longer than [`SLOW_TICK`]. Reads nothing from the node while no header it
+/// knows is [`MIN_BEHIND`] above the tip, and neither headers nor the node's
+/// own chain while the engine fetches on its own and no batch of ours is out.
+/// Asks the node for things for about [`TICK_BUDGET`]: the walk and the
+/// requests stop at that deadline, between two calls, and go on next tick.
+/// A failed read is no answer, so it neither stops the help nor asks for
+/// anything: an unread frontier header keeps the chain the last good read
+/// chose, and an unread tip, walk or own chain lets the tick pass without a
+/// decision.
 pub async fn tick(rpc: &dyn Rpc, cu: &mut CatchUp, t: &Tick<'_>, now: Instant) -> Vec<String> {
+    tick_timed(rpc, cu, t, now, &Instant::now).await
+}
+
+/// [`tick`] with the deadline measured on `clock`. Not an outer timeout
+/// around the tick: cancelling the walk mid-header or the requests before
+/// `sent` would lose what the help knows. Every step stops at a point where
+/// its state is whole.
+async fn tick_timed(
+    rpc: &dyn Rpc,
+    cu: &mut CatchUp,
+    t: &Tick<'_>,
+    now: Instant,
+    clock: &(dyn Fn() -> Instant + Sync),
+) -> Vec<String> {
+    let started = clock();
+    let deadline = started + TICK_BUDGET;
+    let mut lines = tick_until(rpc, cu, t, now, &|| clock() >= deadline).await;
+    let took = clock().saturating_duration_since(started);
+    let slow = took > SLOW_TICK;
+    if slow && !cu.slow {
+        lines.push(slow_tick_line(took));
+    }
+    cu.slow = slow;
+    lines
+}
+
+/// The tick itself; `enough` says the deadline has passed.
+async fn tick_until(
+    rpc: &dyn Rpc,
+    cu: &mut CatchUp,
+    t: &Tick<'_>,
+    now: Instant,
+    enough: &(dyn Fn() -> bool + Sync),
+) -> Vec<String> {
     let was_helping = cu.helper.helping();
     let mut seen = Seen {
         now,
@@ -730,20 +780,30 @@ pub async fn tick(rpc: &dyn Rpc, cu: &mut CatchUp, t: &Tick<'_>, now: Instant) -
         let d = cu.helper.decide(&seen);
         return said(cu, was_helping, &d);
     }
-    let Ok(tip_hash) = rpc.call("getbestblockhash", json!([])).await else {
-        return Vec::new();
-    };
-    let Some(tip_hash) = tip_hash.as_str().map(str::to_string) else {
-        return Vec::new();
-    };
+    // The engine fetches on its own and no batch of ours is out: the
+    // decision is `EngineFetching` whatever the headers say, so none are
+    // read, nor the node's own chain. That is when the engine is busiest.
+    cu.helper.observe(t.blocks, now);
+    let on_its_own = !cu.helper.helping() && cu.helper.engine_fetching(t.peers, t.blocks, now);
     if let Ok(frontier) = known_frontier(rpc, t.frontier, &cu.path).await {
         cu.target = choose_target(frontier, t.tips, t.blocks);
     }
     let target = cu.target.clone();
     let mut next = Vec::new();
-    if let Some((height, hash)) = &target {
+    if let Some((height, hash)) = target.as_ref().filter(|_| !on_its_own) {
+        let Ok(tip_hash) = rpc.call("getbestblockhash", json!([])).await else {
+            return Vec::new();
+        };
+        let Some(tip_hash) = tip_hash.as_str().map(str::to_string) else {
+            return Vec::new();
+        };
         cu.path.retarget(*height, hash);
-        if cu.path.walk(rpc, t.blocks, WALK_PER_TICK).await.is_err() {
+        if cu
+            .path
+            .walk_until(rpc, t.blocks, WALK_PER_TICK, enough)
+            .await
+            .is_err()
+        {
             return Vec::new();
         }
         // Only a walk that sits on the tip names the next blocks. One that
@@ -779,8 +839,13 @@ pub async fn tick(rpc: &dyn Rpc, cu: &mut CatchUp, t: &Tick<'_>, now: Instant) -
     // net_processing.cpp FetchBlock, at 84b998b4).
     let (mut accepted, mut have) = (0, 0);
     let mut last_taken = None;
-    let mut unanswered = false;
-    for (height, hash) in blocks {
+    let (mut unanswered, mut cut) = (false, false);
+    for (i, (height, hash)) in blocks.iter().enumerate() {
+        // The deadline, between two requests: what went out is the batch.
+        if i > 0 && enough() {
+            cut = true;
+            break;
+        }
         match rpc.call("getblockfrompeer", json!([hash, peer_id])).await {
             Ok(_) => accepted += 1,
             Err(AppError::Rpc { message, .. }) if message.contains("already downloaded") => {
@@ -810,11 +875,13 @@ pub async fn tick(rpc: &dyn Rpc, cu: &mut CatchUp, t: &Tick<'_>, now: Instant) -
     let Some(first) = blocks.first().map(|b| b.0) else {
         return lines;
     };
-    if unanswered && last_taken.is_none() {
+    if last_taken.is_none() && (unanswered || cut) {
         // No rotation, no new quiet wait: the next tick asks the same peer.
-        lines.push(format!(
-            "the node did not answer while asking {addr}; asking again later"
-        ));
+        if unanswered {
+            lines.push(format!(
+                "the node did not answer while asking {addr}; asking again later"
+            ));
+        }
         return lines;
     }
     cu.helper.sent(&d, now, last_taken);
@@ -831,6 +898,15 @@ pub async fn tick(rpc: &dyn Rpc, cu: &mut CatchUp, t: &Tick<'_>, now: Instant) -
         ),
     });
     lines
+}
+
+/// The log line for a tick that took longer than [`SLOW_TICK`].
+pub fn slow_tick_line(took: Duration) -> String {
+    format!(
+        "the node is answering slowly (this tick took {:.1} s), so the help asks it for less \
+         each tick until it is quick again",
+        took.as_secs_f64()
+    )
 }
 
 /// The log lines one decision earns: a drop over old blocks, once or the
@@ -1901,6 +1977,9 @@ mod tests {
         /// `getblockfrompeer` fails that way from this height up: the node
         /// stops answering partway through a batch.
         unreachable_from: Option<u64>,
+        /// How long each call takes on the test's clock ([`FakeNode::clock`]).
+        per_call: Duration,
+        elapsed: Mutex<Duration>,
         calls: Mutex<Vec<(String, Value)>>,
     }
 
@@ -1920,6 +1999,8 @@ mod tests {
                 answers: Vec::new(),
                 failing: Vec::new(),
                 unreachable_from: None,
+                per_call: Duration::ZERO,
+                elapsed: Mutex::new(Duration::ZERO),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -1961,6 +2042,11 @@ mod tests {
                 .map(|(_, p)| (p[0].as_str().unwrap().to_string(), p[1].as_i64().unwrap()))
                 .collect()
         }
+        /// A clock that starts at `t0` and moves only while this node answers,
+        /// [`FakeNode::per_call`] a call: no real sleeps.
+        fn clock(&self, t0: Instant) -> impl Fn() -> Instant + Sync + '_ {
+            move || t0 + *self.elapsed.lock().unwrap()
+        }
         /// What the refresher's `signed_frontier` slot holds for this node.
         fn attested(&self) -> Option<AttestedTip> {
             self.frontier.map(|f| AttestedTip {
@@ -1979,6 +2065,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((method.to_string(), params.clone()));
+            *self.elapsed.lock().unwrap() += self.per_call;
             // No getmatmulattestedtip: the frontier comes in through the
             // Tick, from the refresher's slot. Asking again panics below.
             // (`failing` names only methods the help may send.)
@@ -2628,6 +2715,165 @@ mod tests {
         tick(&node, &mut cu, &t, t0 + QUIET).await;
         assert_eq!(node.asked().len(), 100);
         assert_eq!(node.count("getblockheader"), 2_900);
+    }
+
+    #[tokio::test]
+    async fn a_node_that_answers_slowly_gets_short_ticks_and_the_walk_resumes_on_the_next() {
+        // Every call takes 10 ms (a busy engine holding cs_main): a tick
+        // stops reading headers at its deadline, long before the 1,000 of its
+        // budget, and says once that the node is slow. The next ticks go on
+        // where it stopped, each as short, until the help asks.
+        let mut node = FakeNode::new(3_000, 100, None);
+        node.per_call = Duration::from_millis(10);
+        let per_call = node.per_call;
+        let (tips, peers) = ([tip(3_000, "headers-only")], [peer(7, A, 3_000)]);
+        let t = tick_of(100, 3_000, &tips, &peers);
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        let clock = node.clock(t0);
+        let started = clock();
+        let lines = tick_timed(&node, &mut cu, &t, t0, &clock).await;
+        let took = clock() - started;
+        assert!(took <= TICK_BUDGET + per_call, "{took:?}");
+        let first = node.count("getblockheader");
+        assert!((100..WALK_PER_TICK).contains(&first), "{first} headers");
+        assert_eq!(lines, [slow_tick_line(took)]);
+        let mut n = 0;
+        let asked = loop {
+            n += 1;
+            assert!(n < 60, "never asked");
+            let started = clock();
+            let lines = tick_timed(&node, &mut cu, &t, t0 + secs(3 * n), &clock).await;
+            assert!(clock() - started <= TICK_BUDGET + per_call, "tick {n}");
+            if let Some(line) = lines.iter().find(|l| l.starts_with("asked ")) {
+                break line.clone();
+            }
+            assert!(lines.is_empty(), "tick {n}: {lines:?}");
+        };
+        assert_eq!(
+            node.count("getblockheader"),
+            2_900,
+            "every header read once"
+        );
+        assert!(asked.starts_with("asked 109.199.124.187:19335 for blocks 101 to "));
+    }
+
+    #[tokio::test]
+    async fn a_slow_node_is_said_once_until_a_tick_is_quick_again() {
+        let mut node = FakeNode::new(3_000, 100, None);
+        let (tips, peers) = ([tip(3_000, "headers-only")], [peer(7, A, 3_000)]);
+        let t = tick_of(100, 3_000, &tips, &peers);
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        let mut said = Vec::new();
+        for (n, per_call) in [2_000, 2_000, 0, 0, 2_000].into_iter().enumerate() {
+            node.per_call = Duration::from_millis(per_call);
+            let clock = node.clock(t0);
+            let lines = tick_timed(&node, &mut cu, &t, t0 + secs(3 * n as u64), &clock).await;
+            said.push(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("the node is answering slowly")),
+            );
+        }
+        assert_eq!(said, [true, false, false, false, true]);
+        assert!(slow_tick_line(Duration::from_millis(2_345)).contains("took 2.3 s"));
+        assert!(!slow_tick_line(Duration::from_secs(2)).contains('\u{2014}'));
+    }
+
+    #[tokio::test]
+    async fn a_node_that_answers_slowly_while_asked_keeps_the_part_of_the_batch_that_went_out() {
+        let mut node = FakeNode::new(300, 100, None);
+        let (tips, peers) = ([tip(300, "headers-only")], [peer(7, A, 300)]);
+        let t = tick_of(100, 300, &tips, &peers);
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        tick(&node, &mut cu, &t, t0).await;
+        // Every call takes 20 ms from here: the requests stop at the deadline.
+        node.per_call = Duration::from_millis(20);
+        let per_call = node.per_call;
+        let clock = node.clock(t0);
+        let started = clock();
+        let lines = tick_timed(&node, &mut cu, &t, t0 + QUIET, &clock).await;
+        let took = clock() - started;
+        assert!(took <= TICK_BUDGET + per_call, "{took:?}");
+        let sent = node.count("getblockfrompeer") as u64;
+        assert!((1..BATCH).contains(&sent), "{sent} sent");
+        let to = 100 + sent;
+        assert_eq!(
+            lines,
+            [
+                format!("asked {A} for blocks 101 to {to} ({sent} sent, 0 already here)"),
+                slow_tick_line(took)
+            ]
+        );
+        assert_eq!(
+            cu.diagnostics(),
+            [format!("asking {A} for blocks 101 to {to}")]
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_read_while_the_engine_connects_blocks_on_its_own() {
+        // The engine fetches from a full-history peer that is not an archive
+        // peer: the tip moves every tick and the next blocks are in flight.
+        // The help reads no header and nothing of the node's own chain while
+        // that lasts, and walks on once its blocks stop coming.
+        let mut node = FakeNode::new(5_000, 100, None);
+        let tips = [tip(5_000, "headers-only")];
+        let engine = |tip: u64| {
+            let mut p = recorded(30, "5.6.7.8:19335", FULL, 5_000);
+            p.connection_type = "outbound-full-relay".into();
+            p.inflight = (tip as i64 + 1..=tip as i64 + 16).collect();
+            [peer(7, A, 5_000), p]
+        };
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        let peers = engine(100);
+        tick(&node, &mut cu, &tick_of(100, 5_000, &tips, &peers), t0).await;
+        assert_eq!(
+            node.count("getblockheader"),
+            WALK_PER_TICK,
+            "the first look walks"
+        );
+        let read = node.calls.lock().unwrap().len();
+        let mut tip = 100;
+        for n in 1..=10 {
+            tip += 16;
+            node.tip = tip;
+            let peers = engine(tip);
+            let t = tick_of(tip, 5_000, &tips, &peers);
+            let lines = tick(&node, &mut cu, &t, t0 + secs(3 * n)).await;
+            assert!(lines.is_empty(), "{lines:?}");
+        }
+        assert_eq!(
+            node.calls.lock().unwrap().len(),
+            read,
+            "read while it fetched"
+        );
+        // Its blocks stop; its requests hang. For 30 seconds after its newest
+        // block it still counts as fetching; then the walk goes on where it
+        // was, and the help asks once it reaches the tip.
+        let peers = engine(tip);
+        let t = tick_of(tip, 5_000, &tips, &peers);
+        for n in 11..20 {
+            assert!(tick(&node, &mut cu, &t, t0 + secs(3 * n)).await.is_empty());
+        }
+        assert_eq!(node.calls.lock().unwrap().len(), read, "read within 30 s");
+        for n in 20..23 {
+            assert!(tick(&node, &mut cu, &t, t0 + secs(3 * n)).await.is_empty());
+        }
+        assert_eq!(
+            tick(&node, &mut cu, &t, t0 + secs(3 * 23)).await,
+            [format!(
+                "asked {A} for blocks 261 to 360 (100 sent, 0 already here)"
+            )]
+        );
+        assert_eq!(
+            node.count("getblockheader"),
+            5_000 - 260,
+            "each header once"
+        );
     }
 
     #[tokio::test]

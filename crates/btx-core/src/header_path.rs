@@ -94,9 +94,24 @@ impl HeaderPath {
     /// Read at most `budget` headers toward `tip`. Returns how many were read.
     /// On an error the walk stays where it was, so the next call resumes.
     pub async fn walk(&mut self, rpc: &dyn Rpc, tip: u64, budget: usize) -> AppResult<usize> {
+        self.walk_until(rpc, tip, budget, &|| false).await
+    }
+
+    /// [`walk`](Self::walk), stopping early, between two headers, once
+    /// `enough` says so (the catch-up help's deadline). It reads one header
+    /// at least, so a slow node is still walked a little on every call. The
+    /// walk is whole after every header, so the next call resumes where this
+    /// one stopped.
+    pub async fn walk_until(
+        &mut self,
+        rpc: &dyn Rpc,
+        tip: u64,
+        budget: usize,
+        enough: &(dyn Fn() -> bool + Sync),
+    ) -> AppResult<usize> {
         self.forget_below(tip);
         let mut read = 0;
-        while read < budget {
+        while read < budget && (read == 0 || !enough()) {
             if let Some((height, hash)) = self.up.take() {
                 if self.hash_at(height) == Some(hash.as_str()) {
                     continue; // met the chain read before
@@ -338,6 +353,31 @@ mod tests {
         assert_eq!(p.walk(&node, 100, 150).await.unwrap(), 100);
         assert_eq!(p.status(100, &main_hash(100)), PathStatus::Ready);
         assert_eq!(node.reads(), 400);
+    }
+
+    #[tokio::test]
+    async fn a_walk_told_it_has_had_enough_stops_between_headers_and_resumes() {
+        let node = Headers::new(500, None);
+        let mut p = HeaderPath::new();
+        p.retarget(500, &main_hash(500));
+        let enough = || node.reads() >= 150;
+        assert_eq!(
+            p.walk_until(&node, 100, usize::MAX, &enough).await.unwrap(),
+            150
+        );
+        assert_eq!(p.status(100, &main_hash(100)), PathStatus::Walking);
+        // Told so from the start, it still reads one header, so a slow node
+        // is walked a little on every call.
+        assert_eq!(
+            p.walk_until(&node, 100, usize::MAX, &|| true)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(p.walk(&node, 100, usize::MAX).await.unwrap(), 249);
+        assert_eq!(p.status(100, &main_hash(100)), PathStatus::Ready);
+        assert_eq!(node.reads(), 400, "every header read once");
+        assert_walked_chain(&p, &node, 100, 500);
     }
 
     #[tokio::test]
