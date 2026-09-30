@@ -752,6 +752,11 @@ pub struct Look {
     pub running: bool,
     /// The load path reported a failure for this run.
     pub load_failed: Option<String>,
+    /// The loader's own after-load check passed: the app's "a snapshot was
+    /// loaded" setting, which the run resets before anything moves and only
+    /// the loader sets again, once its check after the load has passed. The
+    /// engine shows the snapshot chainstate before that check ends.
+    pub loaded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -766,7 +771,8 @@ pub enum Verdict {
 /// ([`Phase::SettingAside`], [`Phase::Restoring`]) is rolled back, whatever
 /// the node shows. The limit counts from `watch_started_at`. Done means a
 /// snapshot at or above the run's is loaded (the start path may have found a
-/// newer confirmed one) and the node runs its ordinary launch again: no
+/// newer confirmed one), the loader's own check after the load has passed
+/// ([`Look::loaded`]), and the node runs its ordinary launch again: no
 /// mirror launch and no header bootstrap pending. A snapshot below the run's
 /// on that ordinary launch means the start path took a fallback (the
 /// operators began to disagree after the check, or the pair was refused):
@@ -795,7 +801,10 @@ pub fn judge(record: &Record, look: &Look, now_unix: u64) -> Verdict {
     }
     let ordinary = look.running && !look.mirror_load_pending && !look.header_bootstrap_pending;
     match look.snapshot_base_height {
-        Some(h) if ordinary && h >= record.height => return Verdict::Done,
+        // Only once the loader's check after the load has passed: until
+        // then a refusal can still come, and the old chain must be there.
+        Some(h) if ordinary && h >= record.height && look.loaded => return Verdict::Done,
+        Some(h) if ordinary && h >= record.height => {}
         Some(h) if ordinary => {
             return Verdict::RollBack(format!(
                 "the node started from block {} instead of the confirmed snapshot at block {}",
@@ -996,6 +1005,7 @@ mod tests {
         Look {
             snapshot_base_height: Some(232_000),
             running: true,
+            loaded: true,
             ..Look::default()
         }
     }
@@ -1508,6 +1518,7 @@ mod tests {
         let on_it = Look {
             snapshot_base_height: Some(232_000),
             running: true,
+            loaded: true,
             ..Look::default()
         };
         let mut crashed = 0;
@@ -1793,9 +1804,26 @@ mod tests {
         let on_it = Look {
             snapshot_base_height: Some(232_000),
             running: true,
+            loaded: true,
             ..Look::default()
         };
         assert_eq!(judge(&r, &on_it, 2_000), Verdict::Done);
+        // Review I2: the engine shows the snapshot chainstate before the
+        // loader's own check after the load has passed, and a refusal can
+        // still come then. Not done until the loader says it loaded, on a
+        // newer snapshot too; the limit still applies meanwhile.
+        for height in [232_000, 232_200] {
+            let checking = Look {
+                snapshot_base_height: Some(height),
+                loaded: false,
+                ..on_it.clone()
+            };
+            assert_eq!(judge(&r, &checking, 2_000), Verdict::Continue, "{height}");
+            assert!(matches!(
+                judge(&r, &checking, 1_000 + MAX_RUN_SECS),
+                Verdict::RollBack(_)
+            ));
+        }
         let mirror_launch = Look {
             mirror_load_pending: true,
             ..on_it.clone()
