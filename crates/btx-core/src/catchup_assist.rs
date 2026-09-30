@@ -23,9 +23,13 @@
 
 use std::time::{Duration, Instant};
 
+use serde_json::json;
+
+use crate::error::{AppError, AppResult};
 use crate::fork::ChainTip;
-use crate::header_path::HeaderPath;
-use crate::node_api::{serves_full_history, PeerInfo};
+use crate::header_path::{HeaderPath, PathStatus};
+use crate::node_api::{serves_full_history, AttestedTip, PeerInfo};
+use crate::rpc::Rpc;
 
 /// The one switch. Off, the help sends nothing at all.
 pub const ENABLED: bool = true;
@@ -556,9 +560,258 @@ fn times_in_words(n: u32) -> String {
     }
 }
 
+/// What the refresher already read this tick.
+#[derive(Debug, Clone, Copy)]
+pub struct Tick<'a> {
+    pub blocks: u64,
+    pub headers: u64,
+    pub tips: &'a [ChainTip],
+    pub peers: &'a [PeerInfo],
+    /// The refresher's `signed_frontier` slot: its last good
+    /// `getmatmulattestedtip` answer this run, read on every node every tick
+    /// since 0.7.0 (#160). The help follows it and asks the node for it no
+    /// second time.
+    pub frontier: Option<&'a AttestedTip>,
+}
+
+/// The help's memory for one node run.
+#[derive(Debug, Clone)]
+pub struct CatchUp {
+    helper: Helper,
+    path: HeaderPath,
+    /// The chain the last good read chose to follow (height, hash), kept
+    /// through a read that fails.
+    target: Option<(u64, String)>,
+}
+
+/// What the shell keeps of the help between ticks (`AppState::catch_up_help`,
+/// written by the refresher every tick, reset on every start and stop): the
+/// Copy diagnostics lines, and the conclusion the status card and the
+/// Fast-forward offer read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct CatchUpReport {
+    /// [`CatchUp::diagnostics`].
+    pub lines: Vec<String>,
+    /// [`CatchUp::no_archive_serves_old_blocks`].
+    pub no_archive_serves_old_blocks: bool,
+}
+
+impl CatchUp {
+    pub fn new(archive: Vec<String>) -> Self {
+        Self {
+            helper: Helper::new(archive),
+            path: HeaderPath::new(),
+            target: None,
+        }
+    }
+
+    /// For this app's nodes: the peers it dials that can serve a block
+    /// (`crate::node::block_source_peers`), in that order.
+    pub fn for_this_app() -> Self {
+        Self::new(
+            crate::node::block_source_peers()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+
+    /// No archive peer will serve old blocks to this node
+    /// ([`Helper::no_archive_serves_old_blocks`]): the owner's decision 1
+    /// pauses the help, says so, and lets Fast-forward be offered below its
+    /// 1,000-block line.
+    pub fn no_archive_serves_old_blocks(&self) -> bool {
+        self.helper.no_archive_serves_old_blocks()
+    }
+
+    /// What the refresher puts in `AppState::catch_up_help` each tick.
+    pub fn report(&self) -> CatchUpReport {
+        CatchUpReport {
+            lines: self.diagnostics(),
+            no_archive_serves_old_blocks: self.no_archive_serves_old_blocks(),
+        }
+    }
+
+    /// What Copy diagnostics says about the help this run, one line each:
+    /// the batch out, if any, the conclusion that no archive peer serves old
+    /// blocks while it holds, then every peer that dropped this node when
+    /// asked for old blocks, once or [`DROPS_TO_MARK`] times.
+    pub fn diagnostics(&self) -> Vec<String> {
+        let mut out = vec![match &self.helper.batch {
+            Some(b) => format!("asking {} for blocks {} to {}", b.addr, b.from, b.to),
+            None => "not asking any peer for blocks right now".to_string(),
+        }];
+        if self.no_archive_serves_old_blocks() {
+            out.push(NO_ARCHIVE_SERVES_OLD_BLOCKS.to_string());
+        }
+        out.extend(self.helper.drops.iter().map(|(a, n)| {
+            if *n >= DROPS_TO_MARK {
+                refuses_old_line(a)
+            } else {
+                dropped_once_line(a)
+            }
+        }));
+        out
+    }
+}
+
+/// One refresher tick. Returns the lines for the log: a drop over old blocks
+/// ([`dropped_once_line`] or [`refuses_old_line`]), then the batch it asked
+/// for, or the stop or pause. Reads nothing from the node while no header it
+/// knows is [`MIN_BEHIND`] above the tip. A failed read is no answer, so it
+/// neither stops the help nor asks for anything: an unread frontier header
+/// keeps the chain the last good read chose, and an unread tip, walk or own
+/// chain lets the tick pass without a decision.
+pub async fn tick(rpc: &dyn Rpc, cu: &mut CatchUp, t: &Tick<'_>, now: Instant) -> Vec<String> {
+    let was_helping = cu.helper.helping();
+    let mut seen = Seen {
+        now,
+        tip: t.blocks,
+        target: None,
+        next: &[],
+        peers: t.peers,
+        refused: None,
+    };
+    if !cu.helper.enabled || t.blocks == 0 || t.headers < t.blocks.saturating_add(MIN_BEHIND) {
+        let d = cu.helper.decide(&seen);
+        return said(cu, was_helping, &d);
+    }
+    let Ok(tip_hash) = rpc.call("getbestblockhash", json!([])).await else {
+        return Vec::new();
+    };
+    let Some(tip_hash) = tip_hash.as_str().map(str::to_string) else {
+        return Vec::new();
+    };
+    if let Ok(frontier) = known_frontier(rpc, t.frontier, &cu.path).await {
+        cu.target = choose_target(frontier, t.tips, t.blocks);
+    }
+    let target = cu.target.clone();
+    let mut next = Vec::new();
+    if let Some((height, hash)) = &target {
+        cu.path.retarget(*height, hash);
+        if cu.path.walk(rpc, t.blocks, WALK_PER_TICK).await.is_err() {
+            return Vec::new();
+        }
+        // Only a walk that sits on the tip names the next blocks. One that
+        // reached the tip's height on another block names blocks from
+        // `tip + 1` too, but they are not the tip's children.
+        if cu.path.status(t.blocks, &tip_hash) == PathStatus::Ready {
+            next = cu.path.next(t.blocks, BATCH as usize);
+            seen.refused = refused_on_path(&cu.path);
+        }
+        // The walk keeps nothing below the tip, so a refused block the node's
+        // own chain already holds is read from that chain.
+        if seen.refused.is_none() {
+            match refused_on_own_chain(rpc, t.blocks).await {
+                Ok(r) => seen.refused = r,
+                Err(_) => return Vec::new(),
+            }
+        }
+    }
+    seen.target = target.as_ref().map(|(h, _)| *h);
+    seen.next = &next;
+    let d = cu.helper.decide(&seen);
+    let Decision::Ask {
+        peer_id,
+        addr,
+        blocks,
+        ..
+    } = &d
+    else {
+        return said(cu, was_helping, &d);
+    };
+    // `accepted`: the requests now out at that peer. The engine's refusals
+    // are RPC_MISC_ERROR texts (rpc/blockchain.cpp getblockfrompeer and
+    // net_processing.cpp FetchBlock, at 84b998b4).
+    let (mut accepted, mut have) = (0, 0);
+    for (_, hash) in blocks {
+        match rpc.call("getblockfrompeer", json!([hash, peer_id])).await {
+            Ok(_) => accepted += 1,
+            Err(AppError::Rpc { message, .. }) if message.contains("already downloaded") => {
+                have += 1
+            }
+            // Still in flight at this same peer, from this help asking it
+            // before: out there as this batch, so the next tick reads it as
+            // ours and not as the engine fetching on its own.
+            Err(AppError::Rpc { message, .. })
+                if message.contains("Already requested from this peer") =>
+            {
+                accepted += 1
+            }
+            Err(_) => {}
+        }
+    }
+    cu.helper.sent(&d, now, accepted, have);
+    let mut lines = said(cu, false, &d);
+    if let (Some(first), Some(last)) = (blocks.first(), blocks.last()) {
+        let (first, last) = (first.0, last.0);
+        lines.push(if accepted + have == 0 {
+            format!(
+                "{addr} took none of blocks {first} to {last}; the next archive peer is asked \
+                 later"
+            )
+        } else {
+            format!(
+                "asked {addr} for blocks {first} to {last} ({accepted} sent, {have} already here)"
+            )
+        });
+    }
+    lines
+}
+
+/// The log lines one decision earns: a drop over old blocks, once or the
+/// one that marks the peer, the conclusion that no archive peer serves them,
+/// then the stop or pause [`note`] names.
+fn said(cu: &mut CatchUp, was_helping: bool, d: &Decision) -> Vec<String> {
+    let mut lines = cu.helper.take_news();
+    lines.extend(note(was_helping, d));
+    lines
+}
+
+/// The signed frontier the refresher read, when it names a hash and the node
+/// knows that header; `None` when there is none or the node answers that it
+/// has no such header. `Err` when the read fails.
+async fn known_frontier(
+    rpc: &dyn Rpc,
+    slot: Option<&AttestedTip>,
+    path: &HeaderPath,
+) -> AppResult<Option<(u64, String)>> {
+    let Some((height, hash)) = slot.and_then(|t| Some((t.height?, t.hash.clone()?))) else {
+        return Ok(None);
+    };
+    if path.target() == Some((height, hash.as_str())) {
+        return Ok(Some((height, hash)));
+    }
+    match rpc.call("getblockheader", json!([hash, true])).await {
+        Ok(_) => Ok(Some((height, hash))),
+        // RPC_INVALID_ADDRESS_OR_KEY, "Block not found".
+        Err(AppError::Rpc { code: -5, .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// A refused block the node's own chain already contains, at or below `tip`.
+/// `Err` when a read fails.
+async fn refused_on_own_chain(rpc: &dyn Rpc, tip: u64) -> AppResult<Option<&'static str>> {
+    for (height, hash) in crate::known_invalid::refused_blocks() {
+        if height > tip {
+            continue;
+        }
+        let v = rpc.call("getblockhash", json!([height])).await?;
+        if v.as_str() == Some(hash) {
+            return Ok(Some(hash));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::AppResult;
+    use async_trait::async_trait;
+    use serde_json::Value;
+    use std::sync::Mutex;
 
     const A: &str = "109.199.124.187:19335";
     const B: &str = "20.86.181.203:19338";
@@ -1442,5 +1695,645 @@ mod tests {
         assert_eq!(asked_of(&step(&mut h, &s)), (5, 233_232, 233_331));
         assert_eq!(h.dropped(A), 0);
         assert!(h.take_news().is_empty());
+    }
+
+    /// A node with one chain up to `top`, at `tip`, that refuses to run any
+    /// command the help must never send.
+    struct FakeNode {
+        top: u64,
+        tip: u64,
+        frontier: Option<u64>,
+        special: Vec<(u64, &'static str)>,
+        /// A second branch off the one chain: from `.0 + 1` up to `.1`, its
+        /// hashes [`side`]'s.
+        branch: Option<(u64, u64)>,
+        /// What `getblockfrompeer` answers for the block at a height instead
+        /// of taking it: the engine's RPC_MISC_ERROR text.
+        answers: Vec<(u64, &'static str)>,
+        /// Methods that fail the way a lost connection or a timeout does.
+        failing: Vec<&'static str>,
+        calls: Mutex<Vec<(String, Value)>>,
+    }
+
+    /// A block hash on [`FakeNode::branch`]: never one of `hash`'s.
+    fn side(h: u64) -> String {
+        format!("f{h:063x}")
+    }
+
+    impl FakeNode {
+        fn new(top: u64, tip: u64, frontier: Option<u64>) -> Self {
+            Self {
+                top,
+                tip,
+                frontier,
+                special: Vec::new(),
+                branch: None,
+                answers: Vec::new(),
+                failing: Vec::new(),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn hash(&self, h: u64) -> String {
+            self.special
+                .iter()
+                .find(|(x, _)| *x == h)
+                .map_or_else(|| hash(h), |(_, s)| s.to_string())
+        }
+        fn height_of(&self, hash: &str) -> Option<u64> {
+            if let Some((h, _)) = self.special.iter().find(|(_, s)| *s == hash) {
+                return Some(*h);
+            }
+            if let Some((fork, top)) = self.branch {
+                let h = hash
+                    .strip_prefix('f')
+                    .and_then(|x| u64::from_str_radix(x, 16).ok());
+                if let Some(h) = h.filter(|h| (fork + 1..=top).contains(h)) {
+                    return Some(h);
+                }
+            }
+            let h = u64::from_str_radix(hash, 16).ok()?;
+            (h <= self.top && self.hash(h) == hash).then_some(h)
+        }
+        fn count(&self, method: &str) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, _)| m == method)
+                .count()
+        }
+        fn asked(&self) -> Vec<(String, i64)> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, _)| m == "getblockfrompeer")
+                .map(|(_, p)| (p[0].as_str().unwrap().to_string(), p[1].as_i64().unwrap()))
+                .collect()
+        }
+        /// What the refresher's `signed_frontier` slot holds for this node.
+        fn attested(&self) -> Option<AttestedTip> {
+            self.frontier.map(|f| AttestedTip {
+                height: Some(f),
+                blocks_behind: Some((f - self.tip) as i64),
+                on_active_chain: Some(true),
+                hash: Some(self.hash(f)),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Rpc for FakeNode {
+        async fn call(&self, method: &str, params: Value) -> AppResult<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.to_string(), params.clone()));
+            // No getmatmulattestedtip: the frontier comes in through the
+            // Tick, from the refresher's slot. Asking again panics below.
+            // (`failing` names only methods the help may send.)
+            if self.failing.contains(&method) {
+                return Err(AppError::Http("connection reset".into()));
+            }
+            match method {
+                "getbestblockhash" => Ok(json!(self.hash(self.tip))),
+                "getblockheader" => {
+                    let h = self
+                        .height_of(params[0].as_str().unwrap())
+                        .ok_or(AppError::Rpc {
+                            code: -5,
+                            message: "Block not found".into(),
+                        })?;
+                    let on_branch = self
+                        .branch
+                        .is_some_and(|(fork, _)| h > fork + 1 && params[0] == side(h));
+                    let prev = if on_branch {
+                        side(h - 1)
+                    } else {
+                        self.hash(h - 1)
+                    };
+                    Ok(json!({"height": h, "previousblockhash": prev}))
+                }
+                "getblockhash" => Ok(json!(self.hash(params[0].as_u64().unwrap()))),
+                "getblockfrompeer" => {
+                    let h = self.height_of(params[0].as_str().unwrap());
+                    match self.answers.iter().find(|(x, _)| Some(*x) == h) {
+                        Some((_, message)) => Err(AppError::Rpc {
+                            code: -1,
+                            message: message.to_string(),
+                        }),
+                        None => Ok(json!({})),
+                    }
+                }
+                other => panic!("the catch-up help must never call {other}"),
+            }
+        }
+    }
+
+    fn tick_of<'a>(
+        blocks: u64,
+        headers: u64,
+        tips: &'a [ChainTip],
+        peers: &'a [PeerInfo],
+    ) -> Tick<'a> {
+        Tick {
+            blocks,
+            headers,
+            tips,
+            peers,
+            frontier: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tick_asks_the_archive_peer_for_the_next_hundred_by_name() {
+        let node = FakeNode::new(300, 100, None);
+        let (tips, peers) = ([tip(300, "headers-only")], [peer(7, A, 300)]);
+        let t = tick_of(100, 300, &tips, &peers);
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        assert!(tick(&node, &mut cu, &t, t0).await.is_empty());
+        assert!(node.asked().is_empty());
+        assert_eq!(
+            tick(&node, &mut cu, &t, t0 + QUIET).await,
+            ["asked 109.199.124.187:19335 for blocks 101 to 200 (100 sent, 0 already here)"]
+        );
+        let asked = node.asked();
+        assert_eq!(asked.len(), 100);
+        assert_eq!(asked[0], (hash(101), 7));
+        assert_eq!(asked[99], (hash(200), 7));
+    }
+
+    #[tokio::test]
+    async fn the_headers_are_read_once_and_kept() {
+        let node = FakeNode::new(300, 100, None);
+        let (tips, peers) = ([tip(300, "headers-only")], [peer(7, A, 300)]);
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        tick(&node, &mut cu, &tick_of(100, 300, &tips, &peers), t0).await;
+        tick(
+            &node,
+            &mut cu,
+            &tick_of(100, 300, &tips, &peers),
+            t0 + QUIET,
+        )
+        .await;
+        assert_eq!(node.count("getblockheader"), 200);
+        let moved = FakeNode::new(300, 150, None);
+        let t = tick_of(150, 300, &tips, &peers);
+        tick(&moved, &mut cu, &t, t0 + QUIET + secs(3)).await;
+        assert_eq!(moved.count("getblockheader"), 0);
+    }
+
+    #[tokio::test]
+    async fn nothing_is_read_while_no_header_is_twenty_ahead() {
+        let node = FakeNode::new(300, 281, None);
+        let (tips, peers) = ([tip(300, "headers-only")], [peer(7, A, 300)]);
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        for i in 0..20 {
+            tick(
+                &node,
+                &mut cu,
+                &tick_of(281, 300, &tips, &peers),
+                t0 + secs(3 * i),
+            )
+            .await;
+        }
+        assert!(node.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn follows_the_signed_frontier_the_node_reads() {
+        let node = FakeNode::new(300, 100, Some(160));
+        let (tips, peers) = ([tip(300, "headers-only")], [peer(7, A, 300)]);
+        let slot = node.attested();
+        let t = Tick {
+            frontier: slot.as_ref(),
+            ..tick_of(100, 300, &tips, &peers)
+        };
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        tick(&node, &mut cu, &t, t0).await;
+        tick(&node, &mut cu, &t, t0 + QUIET).await;
+        let asked = node.asked();
+        assert_eq!(asked.len(), 60);
+        assert_eq!(asked.last().unwrap().0, hash(160));
+    }
+
+    #[tokio::test]
+    async fn a_chain_through_a_refused_block_is_never_asked_for() {
+        let root = crate::known_invalid::HELD_BRANCHES[0];
+        let mut node = FakeNode::new(root.height + 150, root.height - 50, None);
+        node.special.push((root.height, root.root));
+        let top = root.height + 150;
+        let tips = [ChainTip {
+            height: top,
+            hash: hash(top),
+            branchlen: 1,
+            status: "headers-only".into(),
+        }];
+        let peers = [peer(7, A, top as i64)];
+        let t = tick_of(root.height - 50, top, &tips, &peers);
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        tick(&node, &mut cu, &t, t0).await;
+        tick(&node, &mut cu, &t, t0 + QUIET).await;
+        tick(&node, &mut cu, &t, t0 + QUIET * 2).await;
+        assert!(node.asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_tick_says_each_drop_once_and_marks_a_peer_on_the_second() {
+        let node = FakeNode::new(600, 100, None);
+        let tips = [tip(600, "headers-only")];
+        let first = [recorded(7, A, LIMITED, 600)];
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        let asked = "asked 109.199.124.187:19335 for blocks 101 to 200 (100 sent, 0 already here)";
+        tick(&node, &mut cu, &tick_of(100, 600, &tips, &first), t0).await;
+        assert_eq!(
+            tick(
+                &node,
+                &mut cu,
+                &tick_of(100, 600, &tips, &first),
+                t0 + QUIET
+            )
+            .await,
+            [asked]
+        );
+        // Back under a new connection id, nothing connected: the first drop.
+        // A is the only archive peer, so it is asked again at once.
+        let back = [recorded(8, A, LIMITED, 600)];
+        let t1 = t0 + QUIET + secs(3);
+        assert_eq!(
+            tick(&node, &mut cu, &tick_of(100, 600, &tips, &back), t1).await,
+            [dropped_once_line(A), asked.to_string()]
+        );
+        // The second drop: marked.
+        let again = [recorded(9, A, LIMITED, 600)];
+        let t2 = t1 + secs(3);
+        let lines = tick(&node, &mut cu, &tick_of(100, 600, &tips, &again), t2).await;
+        assert_eq!(
+            lines,
+            [
+                refuses_old_line(A),
+                NO_ARCHIVE_SERVES_OLD_BLOCKS.to_string()
+            ]
+        );
+        let later = tick(
+            &node,
+            &mut cu,
+            &tick_of(100, 600, &tips, &again),
+            t2 + QUIET,
+        )
+        .await;
+        assert!(later.is_empty(), "said once: {later:?}");
+        assert_eq!(node.asked().len(), 200, "never asked for old blocks again");
+        // What the refresher hands the shell: the lines and the conclusion.
+        assert!(cu.no_archive_serves_old_blocks());
+        assert_eq!(
+            cu.report(),
+            CatchUpReport {
+                lines: vec![
+                    "not asking any peer for blocks right now".to_string(),
+                    NO_ARCHIVE_SERVES_OLD_BLOCKS.to_string(),
+                    refuses_old_line(A),
+                ],
+                no_archive_serves_old_blocks: true,
+            }
+        );
+        // A new archive peer: the conclusion ends on the next tick.
+        let b = [
+            recorded(9, A, LIMITED, 600),
+            recorded(11, "20.86.181.203:19338", LIMITED, 600),
+        ];
+        tick(
+            &node,
+            &mut cu,
+            &tick_of(100, 600, &tips, &b),
+            t2 + QUIET * 2,
+        )
+        .await;
+        assert!(!cu.report().no_archive_serves_old_blocks);
+    }
+
+    #[test]
+    fn copy_diagnostics_says_what_the_help_is_doing() {
+        let mut cu = CatchUp::new(vec![A.into()]);
+        assert_eq!(
+            cu.diagnostics(),
+            ["not asking any peer for blocks right now"]
+        );
+        let t0 = Instant::now();
+        let next = next_from(225_927);
+        let a = [recorded(4, A, LIMITED, 233_481)];
+        cu.helper.decide(&seen(t0, 225_927, &next, &a));
+        step(&mut cu.helper, &seen(t0 + QUIET, 225_927, &next, &a));
+        let asking = "asking 109.199.124.187:19335 for blocks 225928 to 226027";
+        assert_eq!(cu.diagnostics(), [asking]);
+        // One drop, and nobody left for now.
+        cu.helper.decide(&seen(t0 + secs(33), 225_927, &next, &[]));
+        assert_eq!(
+            cu.diagnostics(),
+            [
+                "not asking any peer for blocks right now".to_string(),
+                dropped_once_line(A)
+            ]
+        );
+        // A is back and asked again; then it drops us a second time.
+        let a5 = [recorded(5, A, LIMITED, 233_481)];
+        step(&mut cu.helper, &seen(t0 + secs(36), 225_927, &next, &a5));
+        assert_eq!(cu.diagnostics(), [asking.to_string(), dropped_once_line(A)]);
+        cu.helper.decide(&seen(t0 + secs(39), 225_927, &next, &[]));
+        let lines = cu.diagnostics();
+        assert_eq!(
+            lines,
+            [
+                "not asking any peer for blocks right now".to_string(),
+                refuses_old_line(A)
+            ]
+        );
+        assert!(lines.iter().all(|l| !l.contains('\u{2014}')));
+    }
+
+    const ASKED_101_TO_200: &str =
+        "asked 109.199.124.187:19335 for blocks 101 to 200 (100 sent, 0 already here)";
+
+    /// A, the only archive peer, dropping us twice over blocks 101 to 200 of
+    /// a chain up to 600: marked, and the conclusion drawn. The last tick's
+    /// time; A's connection id is 9 by then.
+    async fn mark_a(
+        node: &FakeNode,
+        cu: &mut CatchUp,
+        tips: &[ChainTip],
+        frontier: Option<&AttestedTip>,
+    ) -> Instant {
+        let mut now = Instant::now();
+        for (id, dt) in [(7, secs(0)), (7, QUIET), (8, secs(3)), (9, secs(3))] {
+            now += dt;
+            let peers = [recorded(id, A, LIMITED, 600)];
+            let t = Tick {
+                frontier,
+                ..tick_of(100, 600, tips, &peers)
+            };
+            tick(node, cu, &t, now).await;
+        }
+        assert!(cu.no_archive_serves_old_blocks());
+        now
+    }
+
+    #[tokio::test]
+    async fn blocks_still_asked_of_the_same_peer_stay_in_its_batch() {
+        // A, the only archive peer, stays connected and sends none of its
+        // batch for three minutes, so it is asked again while those requests
+        // are still in flight there. The engine answers "Already requested
+        // from this peer" (FetchBlock, net_processing.cpp at 84b998b4): they
+        // are this batch's, not the engine fetching on its own.
+        let mut node = FakeNode::new(300, 100, None);
+        let tips = [tip(300, "headers-only")];
+        let idle = [peer(7, A, 300)];
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        tick(&node, &mut cu, &tick_of(100, 300, &tips, &idle), t0).await;
+        assert_eq!(
+            tick(&node, &mut cu, &tick_of(100, 300, &tips, &idle), t0 + QUIET).await,
+            [ASKED_101_TO_200]
+        );
+        let ours: Vec<i64> = (101..=200).collect();
+        let busy = [with_inflight(peer(7, A, 300), &ours)];
+        node.answers = (101..=200)
+            .map(|h| (h, "Already requested from this peer"))
+            .collect();
+        let t1 = t0 + QUIET + ROTATE_AFTER;
+        assert_eq!(
+            tick(&node, &mut cu, &tick_of(100, 300, &tips, &busy), t1).await,
+            [ASKED_101_TO_200]
+        );
+        let later = tick(
+            &node,
+            &mut cu,
+            &tick_of(100, 300, &tips, &busy),
+            t1 + secs(3),
+        )
+        .await;
+        assert!(later.is_empty(), "{later:?}");
+        assert_eq!(
+            cu.diagnostics(),
+            ["asking 109.199.124.187:19335 for blocks 101 to 200"]
+        );
+        // Still the help's batch three minutes on: A is asked once more.
+        assert_eq!(
+            tick(
+                &node,
+                &mut cu,
+                &tick_of(100, 300, &tips, &busy),
+                t1 + ROTATE_AFTER
+            )
+            .await,
+            [ASKED_101_TO_200]
+        );
+        assert_eq!(node.asked().len(), 300);
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_keeps_the_batch_and_the_chain_it_follows() {
+        // Following the signed frontier at 160 with a batch out, below a best
+        // header at 300 that is not signed. The frontier moves to 170 and the
+        // node does not answer for its header: a lost read is no answer, so
+        // the help keeps following 160.
+        let mut node = FakeNode::new(300, 100, Some(160));
+        let (tips, peers) = ([tip(300, "headers-only")], [peer(7, A, 300)]);
+        let slot = node.attested();
+        let t = Tick {
+            frontier: slot.as_ref(),
+            ..tick_of(100, 300, &tips, &peers)
+        };
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        tick(&node, &mut cu, &t, t0).await;
+        tick(&node, &mut cu, &t, t0 + QUIET).await;
+        let asking = ["asking 109.199.124.187:19335 for blocks 101 to 160"];
+        assert_eq!(cu.diagnostics(), asking);
+        node.frontier = Some(170);
+        node.failing = vec!["getblockheader"];
+        let moved = node.attested();
+        let t = Tick {
+            frontier: moved.as_ref(),
+            ..t
+        };
+        let lines = tick(&node, &mut cu, &t, t0 + QUIET + secs(3)).await;
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(cu.path.target(), Some((160, hash(160).as_str())));
+        assert_eq!(cu.diagnostics(), asking);
+        // Nothing answers at all: the tick changes nothing.
+        node.failing = vec![
+            "getbestblockhash",
+            "getblockheader",
+            "getblockhash",
+            "getblockfrompeer",
+        ];
+        let lines = tick(&node, &mut cu, &t, t0 + QUIET + secs(6)).await;
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(cu.diagnostics(), asking);
+        // It answers again: the help follows 170, and the batch stays out.
+        node.failing.clear();
+        let lines = tick(&node, &mut cu, &t, t0 + QUIET + secs(9)).await;
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(cu.path.target(), Some((170, hash(170).as_str())));
+        assert_eq!(cu.diagnostics(), asking);
+        assert_eq!(node.asked().len(), 60);
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_keeps_the_conclusion() {
+        // With no best header to fall back on, a lost read of the frontier's
+        // header would leave nothing to follow, stop the help and end the
+        // conclusion that no archive peer serves old blocks.
+        let mut node = FakeNode::new(600, 100, Some(500));
+        let slot = node.attested();
+        let mut cu = CatchUp::for_this_app();
+        let now = mark_a(&node, &mut cu, &[], slot.as_ref()).await;
+        node.frontier = Some(510);
+        node.failing = vec!["getblockheader"];
+        let moved = node.attested();
+        let peers = [recorded(9, A, LIMITED, 600)];
+        let t = Tick {
+            frontier: moved.as_ref(),
+            ..tick_of(100, 600, &[], &peers)
+        };
+        let lines = tick(&node, &mut cu, &t, now + QUIET).await;
+        assert!(lines.is_empty(), "{lines:?}");
+        assert!(cu.no_archive_serves_old_blocks());
+        assert_eq!(node.asked().len(), 200);
+    }
+
+    #[tokio::test]
+    async fn a_frontier_the_node_has_no_header_for_is_not_followed() {
+        // The node answers that it does not know the frontier's header: it
+        // follows its best header, as with no frontier at all.
+        let node = FakeNode::new(300, 100, Some(400));
+        let (tips, peers) = ([tip(300, "headers-only")], [peer(7, A, 300)]);
+        let slot = node.attested();
+        let t = Tick {
+            frontier: slot.as_ref(),
+            ..tick_of(100, 300, &tips, &peers)
+        };
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        tick(&node, &mut cu, &t, t0).await;
+        assert_eq!(
+            tick(&node, &mut cu, &t, t0 + QUIET).await,
+            [ASKED_101_TO_200]
+        );
+        assert_eq!(cu.path.target(), Some((300, hash(300).as_str())));
+    }
+
+    #[tokio::test]
+    async fn headers_on_another_branch_than_the_tip_are_never_asked_for() {
+        // The best header is on a branch that left the node's chain at 90, so
+        // the walk down from it reaches the tip's height on another block. Its
+        // blocks from 101 up are not the tip's children.
+        let mut node = FakeNode::new(300, 100, None);
+        node.branch = Some((90, 320));
+        let tips = [ChainTip {
+            height: 320,
+            hash: side(320),
+            branchlen: 230,
+            status: "headers-only".into(),
+        }];
+        let peers = [peer(7, A, 320)];
+        let t = tick_of(100, 320, &tips, &peers);
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        for n in 0..3 {
+            let lines = tick(&node, &mut cu, &t, t0 + QUIET * n).await;
+            assert!(lines.is_empty(), "{lines:?}");
+        }
+        assert_eq!(cu.path.status(100, &hash(100)), PathStatus::OtherBranch);
+        assert!(node.asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_block_below_the_tip_is_seen_on_the_node_s_own_chain() {
+        // The node's own chain already holds a refused block (one run with
+        // EASYBTX_NODE_REFUSE_KNOWN_INVALID=0 can connect it). The walk keeps
+        // nothing below the tip, so the help reads the node's own chain.
+        let bad = crate::known_invalid::KNOWN_INVALID_BLOCKS[0];
+        let (low, top) = (bad.height + 50, bad.height + 300);
+        let mut node = FakeNode::new(top, low, None);
+        node.special.push((bad.height, bad.hash));
+        let (tips, peers) = ([tip(top, "headers-only")], [peer(7, A, top as i64)]);
+        let t = tick_of(low, top, &tips, &peers);
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        for n in 0..3 {
+            tick(&node, &mut cu, &t, t0 + QUIET * n).await;
+        }
+        assert!(cu.path.hash_at(bad.height).is_none(), "not on the walk");
+        assert!(node.asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn nothing_is_asked_while_the_node_s_own_chain_cannot_be_read() {
+        let bad = crate::known_invalid::KNOWN_INVALID_BLOCKS[0];
+        let (low, top) = (bad.height + 50, bad.height + 300);
+        let mut node = FakeNode::new(top, low, None);
+        node.failing = vec!["getblockhash"];
+        let (tips, peers) = ([tip(top, "headers-only")], [peer(7, A, top as i64)]);
+        let t = tick_of(low, top, &tips, &peers);
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        for n in 0..3 {
+            tick(&node, &mut cu, &t, t0 + QUIET * n).await;
+        }
+        assert!(node.asked().is_empty());
+        // Read again: asked after the quiet wait.
+        node.failing.clear();
+        let t1 = t0 + QUIET * 3;
+        tick(&node, &mut cu, &t, t1).await;
+        tick(&node, &mut cu, &t, t1 + QUIET).await;
+        assert_eq!(node.asked().len(), 100);
+    }
+
+    #[tokio::test]
+    async fn a_long_walk_reads_at_most_a_thousand_headers_a_tick() {
+        let node = FakeNode::new(3_000, 100, None);
+        let (tips, peers) = ([tip(3_000, "headers-only")], [peer(7, A, 3_000)]);
+        let t = tick_of(100, 3_000, &tips, &peers);
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        for (n, read) in [(0, 1_000), (1, 2_000), (2, 2_900)] {
+            tick(&node, &mut cu, &t, t0 + secs(3 * n)).await;
+            assert_eq!(node.count("getblockheader"), read, "tick {n}");
+        }
+        tick(&node, &mut cu, &t, t0 + QUIET).await;
+        assert_eq!(node.asked().len(), 100);
+        assert_eq!(node.count("getblockheader"), 2_900);
+    }
+
+    #[tokio::test]
+    async fn a_new_run_asks_again_a_peer_the_last_run_marked() {
+        // The refresher makes a new CatchUp on every node start and restart,
+        // so nothing of one run's marks, drops or conclusion reaches the next.
+        let node = FakeNode::new(600, 100, None);
+        let tips = [tip(600, "headers-only")];
+        let mut cu = CatchUp::for_this_app();
+        let now = mark_a(&node, &mut cu, &tips, None).await;
+        let mut cu = CatchUp::for_this_app();
+        assert_eq!(
+            cu.report(),
+            CatchUpReport {
+                lines: vec!["not asking any peer for blocks right now".to_string()],
+                no_archive_serves_old_blocks: false,
+            }
+        );
+        let a = [recorded(10, A, LIMITED, 600)];
+        let t = tick_of(100, 600, &tips, &a);
+        tick(&node, &mut cu, &t, now + secs(3)).await;
+        assert_eq!(
+            tick(&node, &mut cu, &t, now + secs(3) + QUIET).await,
+            [ASKED_101_TO_200]
+        );
     }
 }
