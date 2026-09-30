@@ -2093,46 +2093,96 @@ pub fn rw_conf_pins(rw_conf: &Path) -> Vec<String> {
     pins_read(rw_conf, true)
 }
 
-/// The engine's `InterpretBool` (`common/args.cpp:65-70` at `84b998b4`): an
-/// empty value reads true; otherwise it is the value's leading integer,
-/// atoi-style (non-numeric text reads as 0), compared to zero.
+/// The engine's `InterpretBool` (`common/args.cpp:65-70` at `84b998b4`),
+/// backed by `LocaleIndependentAtoi<int>` (`util/strencodings.h:119-144`):
+/// an empty value reads true. Otherwise, leading whitespace and a single
+/// leading `+` are skipped (a `+` directly followed by `-` is the engine's
+/// own special case and reads 0), then the leading `-`-or-digits run is
+/// atoi'd, C-`int`-style: no digit run at all reads 0, and a number too
+/// big or small for `int` does NOT read 0, it saturates to `i32::MAX` or
+/// `i32::MIN`. Since we only need "zero or not," and a saturated value is
+/// never zero, this only has to know whether that digit run holds any
+/// digit other than `0` - never how big the number actually is, so no
+/// parse can overflow here.
 fn interpret_bool(value: &str) -> bool {
     if value.is_empty() {
         return true;
     }
-    let value = value.trim_start();
-    let end = value
+    let s = value.trim_start();
+    let s = match s.strip_prefix('+') {
+        Some(rest) if rest.starts_with('-') => return false,
+        Some(rest) => rest,
+        None => s,
+    };
+    let end = s
         .char_indices()
-        .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
-        .map_or(value.len(), |(i, _)| i);
-    value[..end].parse::<i64>().unwrap_or(0) != 0
+        .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && c == '-')))
+        .map_or(s.len(), |(i, _)| i);
+    s[..end].bytes().any(|b| b.is_ascii_digit() && b != b'0')
 }
 
-/// The two readers' one parser. `sections_dropped`: every section counts.
+/// The two readers' one parser.
+///
+/// `sections_dropped` (`btx_rw.conf`): the engine reads it as one span,
+/// every section merged into the same list regardless of where a line
+/// sits (`common/config.cpp` ~111, `settings_target`). Otherwise (a
+/// general conf file) mainnet reads it as the engine does: `[main]`/
+/// `main.` and the default section are the engine's own two SEPARATE
+/// lists (`common/config.cpp:112`,
+/// `m_settings.ro_config[key.section][key.name].push_back(...)`, at
+/// `84b998b4`, keyed first by the section `InterpretKey` computes, so a
+/// pin under `[test]` or with the `test.` prefix is in neither list and is
+/// not read here); a `[main]`/`main.` line and a same-named default-
+/// section line do not share one list even though they end up in the same
+/// pin count.
 ///
 /// Negation follows the engine's `InterpretValue` (`common/args.cpp:113-
-/// 128` at `84b998b4`, reached for every conf line through
-/// `InterpretKey` and `ReadConfigStream`, `common/config.cpp:102-106`):
-/// `nomatmultrustedpubkey=`, with an empty value or one that reads true
-/// per [`interpret_bool`] (so a bare `nomatmultrustedpubkey=1` and, on the
-/// engine's command line, a bare `-nomatmultrustedpubkey`, though a conf
-/// file itself requires the `=`), clears every pin read from this file so
-/// far, at that point in it; `nomatmultrustedpubkey=0` is the documented
-/// double negative and does not clear. This is scoped to one file: the
-/// engine actually merges list settings across sources in the order
-/// forced settings, the command line, `btx_rw.conf`
-/// (`Source::CONFIG_FILE_RW`), then a conf file's `[main]` section and
-/// default section (`common/settings.cpp:24-31,42-70`, `GetSettingsList`
-/// at `216-262`), each with its own such clearing and a "zombie" rule that
-/// can revive a lower-priority source; this app only needs each file's own
-/// surviving pins, to avoid asking the engine to pin one twice, so it does
-/// not model that cross-source revival.
+/// 128` at `84b998b4`, reached for every conf line through `InterpretKey`
+/// and `ReadConfigStream`, `common/config.cpp:98-106`): a
+/// `nomatmultrustedpubkey=` line, with an empty value or one that reads
+/// true per [`interpret_bool`], clears every pin read so far for its own
+/// list only (`SettingsSpan::negated`, `common/settings.cpp:281-287`).
+/// `nomatmultrustedpubkey=0` is the documented double negative and does
+/// NOT clear - though it is not harmless: that line becomes a bogus `true`
+/// entry in the pin list itself (`GetArgs`, `common/args.cpp:369-375`,
+/// `value.isTrue() ? "1" : ...`), and the engine refuses to start on it
+/// ("Invalid compressed public key in -matmultrustedpubkey: 1",
+/// `init.cpp:1577-1583`).
+///
+/// The two lists are not merged independently: `GetSettingsList`
+/// (`common/settings.cpp:216-259`) merges `[main]`'s list before the
+/// default section's (source order in `MergeSettings`,
+/// `common/settings.cpp:24-31,42-72`), and normally brings the default
+/// section's pins back even after `[main]` clears its own list (the
+/// "zombie" rule) - UNLESS `[main]`'s list ends up empty specifically
+/// because its OWN last entry was the negation
+/// (`SettingsSpan::last_negated`, `settings.cpp:280`), in which case the
+/// default section's pins are dropped too. That is the one cross-list rule
+/// this function follows.
+///
+/// What it does NOT follow, since this function reads one file at a time
+/// and the app only takes the union of [`conf_pins`] and [`rw_conf_pins`]
+/// to avoid asking the engine to pin a key twice (never which file's value
+/// "wins"): the engine reads `btx_rw.conf` (`Source::CONFIG_FILE_RW`)
+/// and the command line BEFORE either conf-file list, in that same merge.
+/// A `btx_rw.conf` whose own list ends in a negation, with nothing pinned
+/// on the command line, makes the engine drop the conf file's two lists
+/// too, by the same "zombie" rule, one level up; `rw_conf_pins` and
+/// `conf_pins` are read independently here and do not know about each
+/// other, so this app would still report the conf file's pins as live.
 fn pins_read(conf: &Path, sections_dropped: bool) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(conf) else {
         return Vec::new();
     };
     let mut prefix = String::new();
-    let mut pins = Vec::new();
+    // `sections_dropped`: `default_pins` is the file's one flat list.
+    // Otherwise: `main_pins` is `[main]`/`main.`'s own list, `default_pins`
+    // is the default section's, and `main_ends_in_negation` is whether the
+    // LAST relevant `main` line was a real (clearing) negation - the one
+    // fact the cross-list merge below needs from `main`'s own list.
+    let mut default_pins = Vec::new();
+    let mut main_pins = Vec::new();
+    let mut main_ends_in_negation = false;
     for raw in text.lines() {
         let l = raw.split('#').next().unwrap_or("").trim();
         if l.len() >= 2 && l.starts_with('[') && l.ends_with(']') {
@@ -2147,18 +2197,52 @@ fn pins_read(conf: &Path, sections_dropped: bool) -> Vec<String> {
             Some((section, key)) => (Some(section), key),
             None => (None, full.as_str()),
         };
-        let mainnet_reads = sections_dropped || matches!(section, None | Some("main"));
-        if !mainnet_reads {
+        let value = value.trim();
+        if sections_dropped {
+            if key == "matmultrustedpubkey" && !value.is_empty() {
+                default_pins.push(value.to_ascii_lowercase());
+            } else if key == "nomatmultrustedpubkey" && interpret_bool(value) {
+                default_pins.clear();
+            }
             continue;
         }
-        let value = value.trim();
-        if key == "matmultrustedpubkey" && !value.is_empty() {
-            pins.push(value.to_ascii_lowercase());
-        } else if key == "nomatmultrustedpubkey" && interpret_bool(value) {
-            pins.clear();
+        let is_main = match section {
+            Some("main") => true,
+            None => false,
+            _ => continue, // [test]/[regtest]/etc.: mainnet does not read it.
+        };
+        let pins = if is_main {
+            &mut main_pins
+        } else {
+            &mut default_pins
+        };
+        if key == "matmultrustedpubkey" {
+            // A real pin, kept: whatever `main` owed a prior negation, it
+            // does not end there anymore.
+            if is_main {
+                main_ends_in_negation = false;
+            }
+            if !value.is_empty() {
+                pins.push(value.to_ascii_lowercase());
+            }
+        } else if key == "nomatmultrustedpubkey" {
+            let negates = interpret_bool(value);
+            if is_main {
+                main_ends_in_negation = negates;
+            }
+            if negates {
+                pins.clear();
+            }
         }
     }
-    pins
+    if sections_dropped {
+        return default_pins;
+    }
+    if main_ends_in_negation {
+        main_pins
+    } else {
+        main_pins.into_iter().chain(default_pins).collect()
+    }
 }
 
 /// The engine's record that this node runs on a signed snapshot whose
@@ -6869,7 +6953,10 @@ matmul: metal runtime_probe_ok, selecting metal\n\
     /// a commented line and a longer name ending in the option's do not. In
     /// `btx_rw.conf` the engine drops the section (`config.cpp` ~111,
     /// `settings_target`), so every section counts there, and a `test.`
-    /// line applies on mainnet.
+    /// line applies on mainnet. `conf_pins`'s two survivors come back
+    /// `[main]`'s pins first, then the default section's, the engine's own
+    /// merge order (`GetSettingsList`, `settings.cpp:216-259`), not file
+    /// order.
     #[test]
     fn conf_pins_counts_only_what_mainnet_reads_and_btx_rw_conf_drops_sections() {
         let dir = signed_snapshot_datadir("conf-pins-sections");
@@ -6902,7 +6989,11 @@ matmul: metal runtime_probe_ok, selecting metal\n\
             ),
         )
         .unwrap();
-        assert_eq!(conf_pins(&conf), vec![k(1), k(5), k(8)]);
+        assert_eq!(
+            conf_pins(&conf),
+            vec![k(5), k(8), k(1)],
+            "[main]'s pins (k5, k8) come before the default section's (k1), engine order"
+        );
         assert_eq!(
             rw_conf_pins(&conf),
             vec![k(1), k(3), k(5), k(6), k(7), k(8)],
@@ -6917,10 +7008,18 @@ matmul: metal runtime_probe_ok, selecting metal\n\
     /// 128` at `84b998b4`, called for every conf line by
     /// `ReadConfigStream`, `common/config.cpp:98-106`). `nomatmultrustedpubkey=0`
     /// is the documented double negative and does NOT clear
-    /// (`InterpretValue`'s `value && !InterpretBool(*value)` arm). A
-    /// negation under `[test]` or `test.` does not touch mainnet's list,
-    /// same as a pin there is not read; one under `[main]` or `main.`
-    /// does, same as the section tests above.
+    /// (`InterpretValue`'s `value && !InterpretBool(*value)` arm) - though
+    /// it is not harmless: the engine reads that line as a bogus `"1"` pin
+    /// value (`GetArgs`, `common/args.cpp:369-375`) and refuses to start
+    /// ("Invalid compressed public key in -matmultrustedpubkey: 1",
+    /// `init.cpp:1577-1583`), so a conf with it never actually reaches the
+    /// app's pin-reading code in practice; this test only checks that
+    /// `pins_read` itself does not treat the line as a clear. A negation
+    /// under `[test]` or `test.` does not touch mainnet's list, same as a
+    /// pin there is not read; one under `[main]` or `main.` does, same as
+    /// the section tests above (also see
+    /// `pins_read_keeps_the_conf_files_two_sections_separate` for how a
+    /// `[main]`/default-section pair actually merges).
     #[test]
     fn a_no_line_clears_the_pins_read_so_far_in_that_file() {
         let dir = signed_snapshot_datadir("conf-pins-negation");
@@ -6940,7 +7039,9 @@ matmul: metal runtime_probe_ok, selecting metal\n\
         .unwrap();
         assert_eq!(conf_pins(&conf), vec![k(2)]);
 
-        // nomatmultrustedpubkey=0 is the double negative: it does not clear.
+        // nomatmultrustedpubkey=0 is the double negative: it does not
+        // clear (the engine would still refuse to start on this conf; see
+        // the doc comment above).
         std::fs::write(
             &conf,
             format!(
@@ -7001,6 +7102,109 @@ matmul: metal runtime_probe_ok, selecting metal\n\
         assert_eq!(rw_conf_pins(&conf), vec![k(1)]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The engine keeps a conf file's `[main]`/`main.` pins and its default
+    /// section's pins as two separate lists (`common/config.cpp:112`,
+    /// `m_settings.ro_config[key.section][key.name]`, at `84b998b4`): a
+    /// negation clears only its own section's list
+    /// (`SettingsSpan::negated`, `common/settings.cpp:281-287`), and
+    /// `GetSettingsList` (`common/settings.cpp:216-259`) merges `[main]`'s
+    /// list before the default section's, bringing the default section's
+    /// pins back even after `[main]` clears its own - UNLESS `[main]`'s
+    /// list ends up empty specifically because ITS OWN last entry was the
+    /// negation (`SettingsSpan::last_negated`, `settings.cpp:280`), in
+    /// which case the default section's pins are dropped too.
+    #[test]
+    fn pins_read_keeps_the_conf_files_two_sections_separate() {
+        let dir = signed_snapshot_datadir("conf-pins-sections-separate");
+        let k = |n: u8| format!("02{}", format!("{n:02x}").repeat(32));
+        let conf = dir.join("sections-separate.conf");
+
+        // Scenario A: a default pin, then [main] clears and re-pins. The
+        // default pin is not cleared by [main]'s own negation: it comes
+        // back after [main]'s surviving pin, engine order.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\n[main]\nnomatmultrustedpubkey=1\nmatmultrustedpubkey={}\n",
+                k(1),
+                k(2)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            conf_pins(&conf),
+            vec![k(2), k(1)],
+            "K2 then K1, engine order"
+        );
+
+        // Scenario B: a main.-prefixed pin (still the [main] section, no
+        // header needed), then the DEFAULT section's own negation. The
+        // default section's negation cannot reach [main]'s span: it only
+        // clears its own (empty) list.
+        std::fs::write(
+            &conf,
+            format!(
+                "main.matmultrustedpubkey={}\nnomatmultrustedpubkey=1\n",
+                k(3)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(3)]);
+
+        // The main. prefix form of Scenario A, no [main] header at all:
+        // same rule, same result.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\nmain.nomatmultrustedpubkey=1\nmain.matmultrustedpubkey={}\n",
+                k(4),
+                k(5)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            conf_pins(&conf),
+            vec![k(5), k(4)],
+            "K5 then K4, engine order"
+        );
+
+        // [main]'s own list ending in a negation (nothing survives past
+        // it) DOES drop the default section's pins too.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\n[main]\nmatmultrustedpubkey={}\nnomatmultrustedpubkey=1\n",
+                k(6),
+                k(7)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            conf_pins(&conf),
+            Vec::<String>::new(),
+            "[main] ends in a negation, so even the default section's pin is dropped"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `LocaleIndependentAtoi<int>` (`util/strencodings.h:119-144` at
+    /// `84b998b4`) saturates an out-of-range number to `i32::MAX` rather
+    /// than failing, so it is never zero: `interpret_bool` must read it as
+    /// true, not fall back to 0 on the overflow the way a plain
+    /// `str::parse` would.
+    #[test]
+    fn interpret_bool_reads_an_overflowing_number_as_true_not_zero() {
+        assert!(interpret_bool("99999999999999999999"));
+        assert!(interpret_bool("1"));
+        assert!(!interpret_bool("0"));
+        assert!(!interpret_bool("00000"));
+        assert!(interpret_bool(""));
+        assert!(!interpret_bool("abc"));
+        assert!(interpret_bool("+5"));
+        assert!(!interpret_bool("+-5"), "the engine's own +- special case");
     }
 
     /// Final review M7, the scenario: a hand-edited conf that pins the
