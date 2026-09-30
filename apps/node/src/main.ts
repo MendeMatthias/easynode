@@ -1102,7 +1102,7 @@ function renderStatus(status: NodeStatusInfo) {
       break;
     case "warming":
       badge.textContent = "GETTING READY";
-      sub.textContent = `${p.message}: nothing is wrong, your node is checking its data. This can take a while after a hard shutdown.`;
+      sub.textContent = `${p.message} Nothing is wrong. Your node is checking its data. This can take a while after a hard shutdown.`;
       break;
     case "stopped":
       badge.textContent = "STOPPED";
