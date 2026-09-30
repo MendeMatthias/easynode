@@ -709,35 +709,55 @@ fn all_waiting(datadir: &Path, record: &Record) -> bool {
         .all(|name| matches!(present(&folder.join(name)), Ok(true)))
 }
 
+/// What [`resume`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resumed {
+    pub record: Record,
+    /// A run at [`Phase::Running`] whose fresh watch window could not be
+    /// written, so it keeps the one it had. A disk too full for the record
+    /// is too full for the node to start on (btxd refuses below 50 MiB
+    /// free), so no watch would ever judge it: the app rolls it back before
+    /// the launch, whose mark needs no space.
+    pub window_not_written: bool,
+}
+
 /// The run a previous start left, to be watched again: one at
 /// [`Phase::Running`] gets a fresh watch window from `now_unix` (time the
 /// app was closed does not count against it), kept on disk. When that
 /// window cannot be written (a disk a failed load filled), the run keeps
-/// the window it had and is watched with it, so the start is not held up
-/// and a roll-back, whose mark needs no space, still comes. A record at any
-/// other phase comes back as it is; [`judge`] says what to do with it. An
-/// error only when the record cannot be read.
-pub fn resume(datadir: &Path, now_unix: u64) -> io::Result<Option<Record>> {
+/// the window it had and says so ([`Resumed::window_not_written`]). A
+/// record at any other phase comes back as it is; [`judge`] says what to do
+/// with it. An error only when the record cannot be read.
+pub fn resume(datadir: &Path, now_unix: u64) -> io::Result<Option<Resumed>> {
     let Some(record) = read_record(datadir)? else {
         return Ok(None);
     };
     if record.phase != Phase::Running {
-        return Ok(Some(record));
+        return Ok(Some(Resumed {
+            record,
+            window_not_written: false,
+        }));
     }
     let fresh = Record {
         watch_started_at: now_unix,
         ..record.clone()
     };
-    match write_record(datadir, &fresh) {
-        Ok(()) => Ok(Some(fresh)),
+    Ok(Some(match write_record(datadir, &fresh) {
+        Ok(()) => Resumed {
+            record: fresh,
+            window_not_written: false,
+        },
         Err(e) => {
             eprintln!(
                 "[fast-forward] the run's fresh watch window could not be written, so it keeps \
                  the one it had: {e}"
             );
-            Ok(Some(record))
+            Resumed {
+                record,
+                window_not_written: true,
+            }
         }
-    }
+    }))
 }
 
 /// Only this module writes the record, so its phases follow the steps.
@@ -1059,7 +1079,7 @@ mod tests {
     /// run it finds, watched again.
     fn next_start(d: &Path, now_unix: u64) -> Option<Record> {
         sweep(d);
-        resume(d, now_unix).unwrap()
+        resume(d, now_unix).unwrap().map(|r| r.record)
     }
 
     /// The node looks fine on the snapshot: only the phase can keep a run
@@ -1613,7 +1633,7 @@ mod tests {
             // The next start: the sweep, then the run is watched again and
             // judged done.
             sweep(d);
-            if let Some(left) = resume(d, 20).unwrap() {
+            if let Some(Resumed { record: left, .. }) = resume(d, 20).unwrap() {
                 assert_eq!(judge(&left, &on_it, 20), Verdict::Done, "stop {k}");
                 finish(d).unwrap();
             }
@@ -1808,6 +1828,8 @@ mod tests {
             Verdict::RollBack(_)
         ));
         let resumed = resume(d, four_hours_later).unwrap().unwrap();
+        assert!(!resumed.window_not_written);
+        let resumed = resumed.record;
         assert_eq!(resumed.watch_started_at, four_hours_later);
         assert_eq!(resumed.started_at, 1_000);
         assert_eq!(read_record(d).unwrap(), Some(resumed.clone()), "kept");
@@ -1841,7 +1863,7 @@ mod tests {
         )
         .is_err());
         let left = read_record(d).unwrap();
-        assert_eq!(resume(d, 99_999).unwrap(), left);
+        assert_eq!(resume(d, 99_999).unwrap().map(|r| r.record), left);
         restore(d).unwrap();
         // And so is a run whose undo has begun.
         set_aside(d, 232_000, Before::default(), 30).unwrap();
@@ -1849,7 +1871,7 @@ mod tests {
         assert!(restore_with(d, &mut crash_at(1)).is_err());
         let left = read_record(d).unwrap();
         assert_eq!(left.as_ref().map(|r| r.phase), Some(Phase::Undoing));
-        assert_eq!(resume(d, 99_999).unwrap(), left);
+        assert_eq!(resume(d, 99_999).unwrap().map(|r| r.record), left);
         assert_eq!(read_record(d).unwrap(), left, "nothing written");
     }
 
@@ -1894,10 +1916,10 @@ mod tests {
     }
 
     /// Review M1: a resume that cannot write the fresh watch window (on a
-    /// disk a failed load filled, say) keeps the window it had and carries
-    /// on: the run is still watched, and rolled back once that window ends
-    /// (the undo's mark needs no space). Only a record that cannot be read
-    /// is an error.
+    /// disk a failed load filled, say) keeps the window it had, and says so,
+    /// for the app's start to roll the run back before the launch (review
+    /// N1; the undo's mark needs no space). Only a record that cannot be
+    /// read is an error.
     #[cfg(unix)]
     #[test]
     fn a_resume_that_cannot_write_keeps_the_window_it_had() {
@@ -1916,7 +1938,14 @@ mod tests {
         let got = resume(d, 50_000);
         let kept = read_record(d);
         mode(0o755);
-        assert_eq!(got.unwrap(), Some(r.clone()), "the window it had");
+        assert_eq!(
+            got.unwrap(),
+            Some(Resumed {
+                record: r.clone(),
+                window_not_written: true
+            }),
+            "the window it had"
+        );
         assert_eq!(kept.unwrap(), Some(r.clone()));
         assert!(matches!(
             judge(&r, &Look::default(), 50_000),

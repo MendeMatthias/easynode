@@ -119,6 +119,9 @@ const WHY_NO_TIP: &str = "the node did not say which block it had reached";
 pub(crate) const WHY_NOT_LOADED: &str = "the node could not load the confirmed snapshot";
 /// A load during a run that the app refuses.
 pub(crate) const WHY_REFUSED: &str = "the snapshot the node loaded did not pass easyNode's checks";
+/// A running run whose fresh watch window could not be written at a start
+/// ([`roll_back_before_launch`]).
+const WHY_NOT_SAVED: &str = "easyNode could not save the run's progress before starting the node";
 
 /// At a start, when the run's record cannot be read: one sentence, and
 /// nothing is touched.
@@ -508,8 +511,9 @@ fn start_gate(
 /// gate ([`start_gate`]), then, with no driver at work, the sweep and the run
 /// a previous start left ([`at_start`]). An undo needs the node down: a
 /// record cut off while its chain data moved refuses the start while a node
-/// is using the datadir, and a roll-back decided before the app stopped is
-/// left to the watch then, which can stop the node. An `Err` is a plain
+/// is using the datadir, and a running run's roll-back (decided before the
+/// app stopped, or one no watch would judge) is left to the watch then,
+/// which can stop the node. An `Err` is a plain
 /// sentence, and the node is not started. A roll-back whose restore cannot
 /// begin keeps the node from starting in this run of the app.
 pub(crate) async fn before_start(datadir: &Path) -> Result<(), String> {
@@ -531,8 +535,10 @@ pub(crate) async fn before_start(datadir: &Path) -> Result<(), String> {
         record,
         OnRecord::At(Phase::SettingAside | Phase::Undoing | Phase::Restoring)
     );
-    let decided = record == OnRecord::At(Phase::Running) && rolling_back;
-    let node_down = (moved || decided) && node_is_down(datadir).await;
+    // A running run may be rolled back here too: one decided before the app
+    // stopped, and one no watch would judge (`roll_back_before_launch`).
+    let running = record == OnRecord::At(Phase::Running);
+    let node_down = (moved || running) && node_is_down(datadir).await;
     if moved && !node_down {
         log(
             datadir,
@@ -558,8 +564,9 @@ pub(crate) async fn before_start(datadir: &Path) -> Result<(), String> {
 
 /// [`before_start`]'s part on disk. The sweep first; then a run at
 /// [`Phase::Running`] gets a fresh watch window and carries on, unless its
-/// roll-back was decided before the app stopped ([`rolled_back`]): then,
-/// with the node down (`node_down`), it is rolled back here. One at
+/// roll-back was decided before the app stopped ([`rolled_back`]), or no
+/// watch would ever judge it ([`roll_back_before_launch`]): then, with the
+/// node down (`node_down`), it is rolled back here. One at
 /// [`Phase::Done`] is finished, and one cut off while its chain data moved
 /// ([`Phase::SettingAside`], [`Phase::Undoing`], [`Phase::Restoring`]) is
 /// rolled back here, before any launch; call with the node down then. A
@@ -571,8 +578,8 @@ fn at_start(datadir: &Path, now_unix: u64, node_down: bool) -> Result<(), NotBac
             &format!("removed {}, which no run needs", gone.display()),
         );
     }
-    let record = match ff::resume(datadir, now_unix) {
-        Ok(Some(r)) => r,
+    let (record, window_not_written) = match ff::resume(datadir, now_unix) {
+        Ok(Some(r)) => (r.record, r.window_not_written),
         Ok(None) => return Ok(()),
         Err(e) => {
             log(
@@ -598,16 +605,28 @@ fn at_start(datadir: &Path, now_unix: u64, node_down: bool) -> Result<(), NotBac
             );
             Ok(())
         }
-        Phase::Running => {
-            log(
-                datadir,
-                &format!(
-                    "the run to block {} is watched again from this start",
-                    record.height
-                ),
-            );
-            Ok(())
-        }
+        Phase::Running => match roll_back_before_launch(&record, window_not_written, now_unix) {
+            Some(why) if node_down => {
+                ff::write_outcome(
+                    datadir,
+                    &Outcome::RolledBack {
+                        reason: why.clone(),
+                    },
+                );
+                log(datadir, &format!("rolling back before the launch: {why}"));
+                undo(datadir)
+            }
+            _ => {
+                log(
+                    datadir,
+                    &format!(
+                        "the run to block {} is watched again from this start",
+                        record.height
+                    ),
+                );
+                Ok(())
+            }
+        },
         Phase::Done => {
             // The new chain is kept either way; a finish cut off again is
             // carried on at the next start.
@@ -638,6 +657,26 @@ fn at_start(datadir: &Path, now_unix: u64, node_down: bool) -> Result<(), NotBac
             log(datadir, &format!("rolling back before the launch: {why}"));
             undo(datadir)
         }
+    }
+}
+
+/// Pure: a run at [`Phase::Running`] that a start with the node down rolls
+/// back before the launch instead of launching on it, and why (review N1).
+/// The watch begins only once the node is up, so a node that cannot start
+/// on the new chain is never judged: one past its day (`ff::judge`'s total
+/// cap, or the window it kept), and one whose fresh watch window could not
+/// be written (`window_not_written`): a disk too full for the record is too
+/// full for btxd, which refuses to start below 50 MiB free. `None`: carry
+/// it on.
+fn roll_back_before_launch(
+    record: &Record,
+    window_not_written: bool,
+    now_unix: u64,
+) -> Option<String> {
+    match ff::judge(record, &Look::default(), now_unix) {
+        Verdict::RollBack(why) => Some(why),
+        _ if window_not_written => Some(WHY_NOT_SAVED.into()),
+        _ => None,
     }
 }
 
@@ -1606,9 +1645,10 @@ mod tests {
     }
 
     /// Review M1: a start that cannot write the run's fresh watch window (a
-    /// full disk, say) carries the run on with the window it had, rather
-    /// than calling the record unreadable and keeping the node stopped,
-    /// where the watch that would roll it back never begins.
+    /// full disk, say) never calls the record unreadable. With a node up
+    /// (one this app did not start), the run is carried on with the window
+    /// it had, for the watch; with the node down it is rolled back before
+    /// the launch (review N1, [`roll_back_before_launch`]).
     #[cfg(unix)]
     #[test]
     fn a_start_that_cannot_write_the_watch_window_carries_the_run_on() {
@@ -1624,7 +1664,7 @@ mod tests {
             eprintln!("skipped: this user can write a read-only folder");
             return;
         }
-        let started = at_start(d, 50_000, true);
+        let started = at_start(d, 50_000, false);
         mode(0o755);
         assert_eq!(started, Ok(()));
         assert_eq!(
@@ -1633,6 +1673,69 @@ mod tests {
             "the window it had"
         );
         assert!(underway(d));
+    }
+
+    /// Review N1: a run whose node cannot start on the new chain is never
+    /// judged, since the watch begins only once the node is up. So a start
+    /// with the node down rolls a running run back before the launch when
+    /// it is past its day (`ff::judge`'s total cap), and when its fresh
+    /// watch window could not be written: a disk too full for the record is
+    /// too full for btxd, which refuses to start below 50 MiB free. Anything
+    /// else is carried on.
+    #[test]
+    fn a_run_no_watch_would_judge_is_rolled_back_before_the_launch() {
+        let at = |started_at: u64, watch_started_at: u64| Record {
+            height: 232_000,
+            aside: ff::aside_name(started_at),
+            moved: vec!["blocks".into()],
+            phase: Phase::Running,
+            snapshot_loaded_before: false,
+            first_load_pending_before: false,
+            started_at,
+            watch_started_at,
+        };
+        let now = 1_000_000;
+        assert_eq!(
+            roll_back_before_launch(&at(now - 60, now), false, now),
+            None
+        );
+        assert_eq!(
+            roll_back_before_launch(&at(now - ff::MAX_TOTAL_SECS, now), false, now),
+            Some("it had not finished 24 hours after it started".into())
+        );
+        assert_eq!(
+            roll_back_before_launch(&at(now - 120, now - 60), true, now),
+            Some(WHY_NOT_SAVED.into()),
+            "the window it had is not over yet"
+        );
+        assert_eq!(
+            roll_back_before_launch(&at(now - 5 * 60 * 60, now - 4 * 60 * 60), true, now),
+            Some("it did not finish within 3 hours".into())
+        );
+
+        // On disk, at the start: past its day with the node down, the old
+        // chain is back before any launch and the window says why; with a
+        // node up, the watch rolls it back at its first look.
+        let before = Before {
+            snapshot_loaded: true,
+            first_load_pending: false,
+        };
+        let tmp = datadir_with_chain(before);
+        let d = tmp.path();
+        set_aside_for_run(d, 232_000, 100).unwrap();
+        attempt(d);
+        let a_day_later = 100 + ff::MAX_TOTAL_SECS;
+        assert_eq!(at_start(d, a_day_later, false), Ok(()), "a node is up");
+        assert!(underway(d));
+        assert_eq!(at_start(d, a_day_later, true), Ok(()));
+        assert_old_chain_back(d, "past its day");
+        assert_eq!(run_settings(d), before);
+        assert_eq!(
+            ff::read_outcome(d),
+            Some(Outcome::RolledBack {
+                reason: "it had not finished 24 hours after it started".into()
+            })
+        );
     }
 
     /// Controller notes 1 (a0, c): a run recorded done is finished at the
@@ -2129,7 +2232,9 @@ mod tests {
 
         let tmp = datadir_with_chain(Before::default());
         let d = tmp.path();
-        let record = set_aside_for_run(d, 232_000, 100).unwrap();
+        // Set aside now: before_start judges by the real clock, and a run
+        // past its day would be rolled back before the launch (review N1).
+        let record = set_aside_for_run(d, 232_000, now()).unwrap();
         let folder = d.join(&record.aside);
         attempt(d);
         ff::write_outcome(
