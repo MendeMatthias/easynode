@@ -1234,7 +1234,35 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
         // that follows signatures loads one in place, else the compiled one;
         // an ordinary validating launch loads the compiled one.
         let attached = *state.attached_to.lock().await;
-        let mirror_load_launch = runs_mirror_load(mirror_load_marked, began_mirror_load, attached);
+        let mut mirror_load_launch =
+            runs_mirror_load(mirror_load_marked, began_mirror_load, attached);
+        if !mirror_load_launch
+            && attached.is_some()
+            && attached_node_is_ours_to_stop(attached)
+            && signer_applies_here
+        {
+            // A mirror launch an earlier run left running is ended here, or
+            // this host would stay a mirror until something else restarts it.
+            let engine_says_mirror = btx_core::node_api::get_matmul_trusted_status(&rpc)
+                .await
+                .ok()
+                .map(|s| s.trusted_mirror);
+            if ends_orphaned_mirror_launch(
+                attached,
+                signer_applies_here,
+                engine_says_mirror,
+                ORPHANED_MIRROR_ENDED.load(Ordering::SeqCst),
+            ) {
+                ORPHANED_MIRROR_ENDED.store(true, Ordering::SeqCst);
+                let msg = "the node this start attached to runs as a mirror on a computer that \
+                           checks blocks itself, a mirror launch an earlier run did not finish; \
+                           ending it as one: its snapshot is checked, then the node restarts to \
+                           check new blocks itself";
+                eprintln!("[node-app] {msg}");
+                setup_log(&datadir, msg);
+                mirror_load_launch = true;
+            }
+        }
         if mirror_load_marked && !mirror_load_launch {
             // The node serving now never read the marker (this start attached
             // to it after writing one), or is another app's and not ours to
@@ -3810,8 +3838,8 @@ fn mirror_load_step(
 /// not a header bootstrap (the marker, or a datadir with no blocks that is
 /// about to get one), it never loaded a snapshot, it holds no snapshot
 /// chainstate (`chainstate_snapshot/`, not the `chainstate/` every node has;
-/// one with a set-aside note goes before the launch, [`honour_pending_set_aside`],
-/// so it counts as gone), and the operator has not said "never a mirror".
+/// one a set-aside note moves before the launch, [`set_aside_will_move`],
+/// counts as gone), and the operator has not said "never a mirror".
 fn mirror_load_wanted_here(btxd: &Path, datadir: &Path, backend: Backend) -> bool {
     use btx_core::node;
     let settings = NodeAppSettings::load(datadir);
@@ -3820,7 +3848,7 @@ fn mirror_load_wanted_here(btxd: &Path, datadir: &Path, backend: Backend) -> boo
             !node::host_follows_signatures(btxd, datadir, backend),
             node::header_bootstrap_pending(datadir) || node::header_bootstrap_wanted(datadir),
             settings.snapshot_loaded,
-            datadir.join("chainstate_snapshot").exists() && !set_aside_pending(datadir),
+            datadir.join("chainstate_snapshot").exists() && !set_aside_will_move(datadir),
             node::trusted_mirror_override() == Some(false),
         )
 }
@@ -4063,6 +4091,37 @@ fn runs_mirror_load(marked: bool, began_this_start: bool, attached: Option<Attac
     marked && attached_node_is_ours_to_stop(attached) && !(began_this_start && attached.is_some())
 }
 
+/// Set once a start in this run ended a mirror launch an earlier run left
+/// running ([`ends_orphaned_mirror_launch`]), so a node that does not stop
+/// cannot restart in a loop.
+static ORPHANED_MIRROR_ENDED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Is the node this start attached to a validating node's mirror launch an
+/// earlier run of the app did not finish? A relaunch (a self-update, which
+/// leaves btxd running on purpose, a crash, a force-quit) after the engine
+/// began the load leaves btxd running as a mirror, and the new run neither
+/// resumes the launch (a snapshot chainstate is there, so the marker goes)
+/// nor would ever restart it validating. When the node is ours to stop
+/// (`attached_node_is_ours_to_stop`), the host checks blocks itself
+/// (`host_validates`, the lasting role), and the engine says it runs as a
+/// trusted mirror (`engine_says_mirror`, `getmatmultrustedstatus`
+/// `trusted_mirror`; `None` when it did not answer), this launch ends as a
+/// mirror launch does: the signed-only path, then a restart as a validating
+/// node. At most once per run (`ended_one_this_run`).
+fn ends_orphaned_mirror_launch(
+    attached: Option<AttachedTo>,
+    host_validates: bool,
+    engine_says_mirror: Option<bool>,
+    ended_one_this_run: bool,
+) -> bool {
+    attached.is_some()
+        && attached_node_is_ours_to_stop(attached)
+        && host_validates
+        && engine_says_mirror == Some(true)
+        && !ended_one_this_run
+}
+
 /// What the log says when a validating node's mirror launch ends.
 fn mirror_load_end_message(outcome: &btx_core::snapshot::SnapshotOutcome) -> String {
     use btx_core::snapshot::SnapshotOutcome as O;
@@ -4235,9 +4294,37 @@ fn mark_set_aside_pending(datadir: &Path) {
     }
 }
 
-/// Is a set-aside written down for the next launch?
+/// Is a set-aside written down for the next launch, whatever it names? The
+/// start path asks [`set_aside_will_move`] instead.
+#[cfg(test)]
 fn set_aside_pending(datadir: &Path) -> bool {
     datadir.join(SET_ASIDE_PENDING_FILE).exists()
+}
+
+/// The base a set-aside note names: `None` when there is no note or it
+/// cannot be read, `Some(None)` for one that names no base (written with no
+/// snapshot chainstate to name, or one nothing can parse).
+fn set_aside_note_base(datadir: &Path) -> Option<Option<String>> {
+    let raw = std::fs::read_to_string(datadir.join(SET_ASIDE_PENDING_FILE)).ok()?;
+    Some(
+        serde_json::from_str::<SetAsideNote>(&raw)
+            .ok()
+            .and_then(|n| n.base_blockhash),
+    )
+}
+
+/// Will the set-aside written down move the snapshot chainstate there now?
+/// When the note is there and can be read, and names no base or the base of
+/// that chainstate ([`snapshot_base`]). The one rule for both the wanted
+/// check ([`mirror_load_wanted_here`], which counts that chainstate as gone)
+/// and the set-aside itself ([`honour_pending_set_aside`]): a note about
+/// another chainstate leaves the one there in place.
+fn set_aside_will_move(datadir: &Path) -> bool {
+    match set_aside_note_base(datadir) {
+        None => false,
+        Some(None) => true,
+        Some(Some(named)) => snapshot_base(datadir).as_deref() == Some(named.as_str()),
+    }
 }
 
 /// Remove [`SET_ASIDE_PENDING_FILE`].
@@ -4252,9 +4339,11 @@ fn clear_set_aside_note(datadir: &Path) {
 /// written down earlier, the way the normal path does it
 /// ([`set_aside_refused_snapshot`]), then clear the note. `Ok(true)` when it
 /// did (the chainstate moved, or there was none left to move), `Ok(false)`
-/// when there was nothing to do: no note, or a note about another chainstate
-/// than the one there now, which stays where it is (the note goes). `Err` is [`SET_ASIDE_STUCK`]: the move
-/// failed again, the note stays, and the node is not started on it.
+/// when there was nothing to do: no note, a note that cannot be read, or a
+/// note about another chainstate than the one there now, which stays where
+/// it is (the note goes; [`set_aside_will_move`] decides). `Err` is
+/// [`SET_ASIDE_STUCK`]: the move failed again, the note stays, and the node
+/// is not started on it.
 fn honour_pending_set_aside(datadir: &Path) -> Result<bool, String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4265,27 +4354,21 @@ fn honour_pending_set_aside(datadir: &Path) -> Result<bool, String> {
 
 /// [`honour_pending_set_aside`] at a given time, which names the folder.
 fn honour_pending_set_aside_at(datadir: &Path, now_unix: u64) -> Result<bool, String> {
-    let Ok(raw) = std::fs::read_to_string(datadir.join(SET_ASIDE_PENDING_FILE)) else {
+    // No note, or one that cannot be read: nothing to do.
+    let Some(named) = set_aside_note_base(datadir) else {
         return Ok(false);
     };
-    // A note nothing can read names no base, like one written with no
-    // snapshot chainstate to name.
-    let named = serde_json::from_str::<SetAsideNote>(&raw)
-        .ok()
-        .and_then(|n| n.base_blockhash);
-    let there = snapshot_base(datadir);
-    if let Some(named) = &named {
-        if there.as_ref() != Some(named) {
-            let msg = format!(
-                "a set-aside was written down for the snapshot chainstate based at {named}, but \
-                 the one here now is {}; leaving it where it is",
-                there.as_deref().unwrap_or("none")
-            );
-            eprintln!("[node-app] {msg}");
-            setup_log(datadir, &msg);
-            clear_set_aside_note(datadir);
-            return Ok(false);
-        }
+    if !set_aside_will_move(datadir) {
+        let msg = format!(
+            "a set-aside was written down for the snapshot chainstate based at {}, but the one \
+             here now is {}; leaving it where it is",
+            named.as_deref().unwrap_or("none"),
+            snapshot_base(datadir).as_deref().unwrap_or("none")
+        );
+        eprintln!("[node-app] {msg}");
+        setup_log(datadir, &msg);
+        clear_set_aside_note(datadir);
+        return Ok(false);
     }
     let msg = "setting aside a snapshot chainstate refused before this launch";
     eprintln!("[node-app] {msg}");
@@ -6361,14 +6444,15 @@ pub async fn open_global_stats() -> Result<(), String> {
 #[cfg(test)]
 mod signed_start_tests {
     use super::{
-        abandon_mirror_load, after_load_plan, clear_mirror_marker, first_load_settled,
-        honour_pending_set_aside, honour_pending_set_aside_at, key_line_goes_back,
-        mark_first_load_if_fresh, mark_set_aside_pending, mirror_launch_failed,
+        abandon_mirror_load, after_load_plan, clear_mirror_marker, ends_orphaned_mirror_launch,
+        first_load_settled, honour_pending_set_aside, honour_pending_set_aside_at,
+        key_line_goes_back, mark_first_load_if_fresh, mark_set_aside_pending, mirror_launch_failed,
         mirror_load_end_message, mirror_load_step, mirror_load_wanted_here, nominal_btxd_path,
         refused_load_message, runs_mirror_load, set_aside_pending, set_aside_refused_snapshot_at,
-        set_aside_waits, settle_first_load, signed_load_failed, signed_load_for, signer_for_launch,
-        signing_key_the_app_does_not_manage, snapshot_base, write_signer_key_line, AfterLoad,
-        AfterRefusal, AttachedTo, MirrorLoadStep, SET_ASIDE_STUCK,
+        set_aside_waits, set_aside_will_move, settle_first_load, signed_load_failed,
+        signed_load_for, signer_for_launch, signing_key_the_app_does_not_manage, snapshot_base,
+        write_signer_key_line, AfterLoad, AfterRefusal, AttachedTo, MirrorLoadStep,
+        SET_ASIDE_STUCK,
     };
     use crate::state::NodeAppSettings;
     use btx_core::backend::Backend;
@@ -7258,5 +7342,136 @@ mod signed_start_tests {
         ] {
             assert!(after.find(call).unwrap() < stop, "{call}");
         }
+    }
+
+    /// Final review I1, the review's probe turned around: a relaunch (a
+    /// self-update, a crash, a force-quit) during a validating node's one
+    /// mirror launch, once the engine began the load, leaves btxd running as
+    /// a trusted mirror. The new run finds a snapshot chainstate, so it
+    /// neither resumes the launch nor keeps the marker, and attaches to its
+    /// own orphan. The engine's own answer (`getmatmultrustedstatus`) then
+    /// says the node is a mirror on a host that checks blocks itself: this
+    /// launch ends as a mirror launch does, with the signed-only path and a
+    /// restart as a validating node, once per run.
+    #[test]
+    fn a_relaunch_mid_load_restarts_the_orphan_validating() {
+        let btxd = nominal_btxd_path();
+        let dir = fresh_validating_datadir();
+        let d = dir.path();
+        assert!(mirror_load_wanted_here(&btxd, d, Backend::Metal));
+        node::begin_mirror_load(d, 232_000).unwrap();
+        assert!(node::launches_as_mirror(&btxd, d, Backend::Metal));
+        std::fs::create_dir_all(d.join("chainstate_snapshot")).unwrap();
+        let wanted = mirror_load_wanted_here(&btxd, d, Backend::Metal);
+        let step = mirror_load_step(wanted, false, false, node::mirror_load_pending(d).is_some());
+        assert_eq!(step, MirrorLoadStep::Skip);
+        clear_mirror_marker(d).unwrap();
+        let launches_mirror = node::launches_as_mirror(&btxd, d, Backend::Metal);
+        let (applies, _) = signer_for_launch(
+            true,
+            node::host_follows_signatures(&btxd, d, Backend::Metal),
+            launches_mirror,
+        );
+        let marked = launches_mirror && applies;
+        let attached = Some(AttachedTo::OurOrphan);
+        assert!(!runs_mirror_load(marked, false, attached));
+        let runs = ends_orphaned_mirror_launch(attached, applies, Some(true), false);
+        assert!(runs);
+        assert_eq!(
+            signed_load_for(runs, !applies, false),
+            SignedLoad::SignedOnly
+        );
+        assert_eq!(
+            after_load_plan(runs, &SnapshotOutcome::AlreadyLoaded, false, true),
+            AfterLoad::Restart { set_aside: false }
+        );
+
+        // Our node of unknown origin counts as ours, as everywhere else.
+        assert!(ends_orphaned_mirror_launch(
+            Some(AttachedTo::Unknown),
+            true,
+            Some(true),
+            false
+        ));
+        for (attached, host_validates, engine_says_mirror, ended_one) in [
+            (attached, true, Some(false), false),
+            (attached, true, None, false),
+            (attached, false, Some(true), false),
+            (attached, true, Some(true), true),
+            (Some(AttachedTo::AnotherApp), true, Some(true), false),
+            (None, true, Some(true), false),
+        ] {
+            assert!(
+                !ends_orphaned_mirror_launch(
+                    attached,
+                    host_validates,
+                    engine_says_mirror,
+                    ended_one
+                ),
+                "{attached:?} {host_validates} {engine_says_mirror:?} {ended_one}"
+            );
+        }
+    }
+
+    /// Final review I1, in the code: the start asks the engine only once it
+    /// knows it attached, and before it decides which load to make.
+    #[test]
+    fn the_start_asks_the_engine_about_an_orphaned_mirror_before_the_load() {
+        let src = include_str!("commands.rs");
+        let start = src
+            .split("pub(crate) async fn start_node_inner(")
+            .nth(1)
+            .and_then(|s| s.split("\nasync fn spawn_node_with_lock_retry(").next())
+            .unwrap();
+        let asked = start.find("get_matmul_trusted_status(&rpc)").unwrap();
+        let ends = start.find("ends_orphaned_mirror_launch(").unwrap();
+        let load = start.find("let signed = signed_load_for(").unwrap();
+        let key = start.find("if key_line_goes_back(").unwrap();
+        assert!(
+            start
+                .find("*state.attached_to.lock().await = Some(")
+                .unwrap()
+                < asked
+        );
+        assert!(asked < ends && ends < key && key < load);
+    }
+
+    /// Final review M1, the review's probe turned around: a set-aside note
+    /// about another chainstate than the one there now moves nothing (the
+    /// note goes), so that chainstate does not count as gone and no mirror
+    /// launch begins over it. The wanted check and the set-aside ask the one
+    /// predicate.
+    #[test]
+    fn a_note_about_another_chainstate_begins_no_mirror_launch() {
+        let btxd = nominal_btxd_path();
+        let dir = fresh_validating_datadir();
+        let d = dir.path();
+        let snap = d.join("chainstate_snapshot");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("base_blockhash"), [0xabu8; 32]).unwrap();
+        assert!(!set_aside_will_move(d), "no note");
+        mark_set_aside_pending(d);
+        assert!(set_aside_will_move(d));
+        assert!(mirror_load_wanted_here(&btxd, d, Backend::Metal));
+        std::fs::write(snap.join("base_blockhash"), [0xcdu8; 32]).unwrap();
+        assert!(!set_aside_will_move(d));
+        assert!(!mirror_load_wanted_here(&btxd, d, Backend::Metal));
+        assert_eq!(honour_pending_set_aside_at(d, 1000), Ok(false));
+        assert!(snap.exists());
+
+        // A note that names no base, and one nothing can parse: whatever is
+        // there goes, and the wanted check counts it as gone.
+        for note in [r#"{"base_blockhash":null,"note":"x"}"#, "not json"] {
+            std::fs::write(d.join(".set-aside-snapshot"), note).unwrap();
+            assert!(set_aside_will_move(d), "{note}");
+            assert!(mirror_load_wanted_here(&btxd, d, Backend::Metal), "{note}");
+        }
+        // A note that cannot be read moves nothing.
+        std::fs::remove_file(d.join(".set-aside-snapshot")).unwrap();
+        std::fs::create_dir_all(d.join(".set-aside-snapshot")).unwrap();
+        assert!(!set_aside_will_move(d));
+        assert!(!mirror_load_wanted_here(&btxd, d, Backend::Metal));
+        assert_eq!(honour_pending_set_aside_at(d, 1000), Ok(false));
+        assert!(snap.exists());
     }
 }
