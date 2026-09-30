@@ -34,9 +34,14 @@ The node versions and ships **independently of the easyBTX miner**, on its own
 
 ## The feed
 
-**Endpoint, baked into the app at build time:**
+**Endpoints, baked into the app at build time, in this order:**
+`https://easybtx.com/updater/node-{{bundle_type}}.json`, then
 `https://easybtx.com/updater/latest-node.json`
-(`apps/node/src-tauri/tauri.conf.json` → `plugins.updater.endpoints`)
+(`apps/node/src-tauri/tauri.conf.json`, `plugins.updater.endpoints`). The
+plugin puts the install type in the first (`deb`, `appimage`, `app`, `nsis`,
+`msi`, `rpm` or `unknown`). Only `node-deb.json` exists; every other name
+answers 404 and the plugin moves on to `latest-node.json`. 0.6.32 and older
+read `latest-node.json` only. See "The .deb feed" below.
 
 Deliberately **not** `releases/latest/download/…`: the node shares the
 `EasyBTX-releases` repo with the miner, and GitHub's "latest" pointer is
@@ -111,7 +116,33 @@ correct, because they already have the build you wanted them to have. A mac on
 |---|---|
 | `darwin-aarch64` | `.app.tar.gz` (**not** the .dmg — that is manual-install only) |
 | `linux-x86_64` | the `.AppImage` (same file users download) |
+| `linux-x86_64-deb` | the `.deb`, in `node-deb.json` ONLY, never in `latest-node.json` |
 | `windows-x86_64` | the `-setup.exe` (v2 reuses it; not a `.nsis.zip`) |
+
+### The .deb feed, `node-deb.json` (from 0.7.0)
+
+A `.deb` install reads `https://easybtx.com/updater/node-deb.json` first. It is
+the same schema as `latest-node.json` with exactly one platform key,
+`linux-x86_64-deb`; its url is `.../node-v<V>/BTX-Node_<V>_amd64.deb` and its
+signature is that file's `.sig`, signed under that name. The app installs it
+with `pkexec dpkg -i`, after one password prompt. The design is
+`docs/decisions/2026-09-28-deb-installs-update-themselves.md`.
+
+- **`linux-x86_64-deb` never goes into `latest-node.json`.** easyNode 0.6.32
+  refuses a whole release that lists a key it does not know, so that one key
+  would stop every 0.6.32 install from updating, on every platform.
+  `gen-node-feed.py` refuses to write it there, and the website's
+  `scripts/check-node-links.py` fails the site PR.
+- **`node-deb.json` moves with the Linux download**: its version is
+  `REL_LINUX` and the `.deb` link on `/node`, in the same site PR as
+  `latest-node.json`.
+- **No other `node-*.json` is ever published, and nothing but a static file
+  answers under `/updater`.** An install reads its typed feed instead of
+  `latest-node.json`; a 204 there, or a 200 page that is not a feed, stops its
+  updates.
+- **A missing `node-deb.json` is safe, and removing it is the rollback.** A
+  `.deb` install then reads `latest-node.json`, declines the AppImage without
+  downloading it, and shows the command to install by hand.
 
 ---
 
@@ -981,18 +1012,21 @@ anything is signed, published or flipped live:
    platforms this release actually ships:
    ```bash
    bash apps/node/scripts/build-node-feed.sh --version <ver> \
-     [--mac <mac.app.tar.gz>] [--linux <linux.AppImage>] [--win <win-setup.exe>] \
-     [--notes "<notes>"]
+     [--mac <mac.app.tar.gz>] [--linux <linux.AppImage>] [--deb <linux.deb>] \
+     [--win <win-setup.exe>] [--notes "<notes>"]
    ```
-   It **writes** `site/public/updater/latest-node.json`. Never hand-edit that file.
-   Every platform key it emits points at an asset at `<ver>`, so those assets
-   must be attached to the release in step 7 before this feed is deployed in
-   step 8.
+   It **writes** `latest-node.json` into `$FEED_OUT_DIR` (default
+   `apps/node/dist-feed`), and with `--deb` also `node-deb.json` beside it. A
+   Linux release always passes both `--linux` and `--deb`. Never hand-edit
+   either file. Every platform key they emit points at an asset at `<ver>`, so
+   those assets and their `.sig` files must be attached to the release in
+   step 7 before the feeds are deployed in step 8.
 
 7. **Publish.** This is now a script, `apps/node/scripts/publish-node-release.sh`,
    and you should use it rather than the commands below. It does the draft ->
    upload -> re-download -> verify -> flip sequence in the right order, refuses
-   an artifact with no signature, refuses one whose signature does not verify
+   an artifact with no signature (the `.tar.gz`, the `.AppImage`, the
+   `-setup.exe` and, since 0.7.0, the `.deb`), refuses one whose signature does not verify
    against the pubkey in `tauri.conf.json`, and checks afterwards that the
    repo-global Latest pointer did not move.
 
@@ -1058,9 +1092,21 @@ anything is signed, published or flipped live:
    embedded pubkey, and `sha256sum -c` the published `SHA256SUMS`. A signature
    that only ever verified locally proves nothing about what users will fetch.
 
-8. **Merge the site PR** so Vercel deploys the new feed — and only AFTER the
+8. **Merge the site PR** so Vercel deploys the new feed, and only AFTER the
    GitHub release is live with every asset returning 200, or easybtx.com serves
-   download buttons that 404.
+   download buttons that 404. The PR copies `latest-node.json` into
+   `site/public/updater/`, and on a Linux release `node-deb.json` too, in the
+   same commit as the `REL_LINUX` bump; `scripts/check-node-links.py` fails
+   the PR when they disagree.
+
+   On the 0.7.0 site PR only: the `/node` paragraph that begins "One exception
+   on Linux: a .deb install is told, not updated" stops being true. Replace it
+   with: "<strong>On Linux, a .deb install updates too, from 0.7.0 on.</strong>
+   It asks for your password once, the way installing any system package does.
+   A .deb copy older than 0.7.0 is told about the new version, and you install
+   it by hand one last time with the command on this page. On a machine with no
+   desktop to show the prompt, a .deb copy tries once, then shows the command to
+   install it by hand. The AppImage updates itself without asking."
 
    Pins live in `site/src/pages/node.astro`: `REL_CURRENT` + `relPage` +
    `dl.mac` + `dl.win` move on a **mac/windows** release, `REL_LINUX` +
@@ -1083,6 +1129,12 @@ anything is signed, published or flipped live:
 ## Verifying before you trust it
 
 - `curl -s https://easybtx.com/updater/latest-node.json | jq .version`
+- On a Linux release: `curl -s https://easybtx.com/updater/node-deb.json | jq '.version, (.platforms | keys)'`
+  prints the new version and `["linux-x86_64-deb"]`, nothing else.
+- `for t in appimage app nsis; do curl -s -o /dev/null -w "node-$t.json %{http_code}\n" https://easybtx.com/updater/node-$t.json; done`
+  prints `404` for each: the AppImage's, the Mac app's and the Windows
+  installer's typed feeds. Anything in 2xx or 3xx for one of them stops every
+  0.7.0+ copy of that kind from updating.
 - Confirm the released asset bytes match what was signed (sha256 the downloaded
   file against the local build).
 - Observe a real upgrade: quit and reopen an older app — the check fires on

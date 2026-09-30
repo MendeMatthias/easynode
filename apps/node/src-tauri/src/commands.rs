@@ -3953,6 +3953,31 @@ pub async fn record_update_check(outcome: String, detail: String) -> Result<(), 
     )
 }
 
+/// Remember a version whose verified download then failed to install, so the
+/// automatic checks do not download it again (`update_binding::decide_here`).
+/// The front end calls this only after `download()` resolved and `install()`
+/// failed; the six-hourly timer calls `update_binding::remember_failed_install`
+/// itself. Anything that is not a version is refused unwritten.
+#[tauri::command]
+pub async fn remember_failed_update(version: String) -> Result<(), String> {
+    crate::update_binding::remember_failed_install(&node_datadir(), &version)
+}
+
+/// Forget that version before a "Check now", so a press always tries.
+#[tauri::command]
+pub async fn forget_failed_update() -> Result<(), String> {
+    crate::update_binding::forget_failed_install(&node_datadir());
+    Ok(())
+}
+
+/// Why the last check declined or refused what it was offered, without taking
+/// it: the front end shows it, and `record_update_check`, called right after,
+/// takes it for the record.
+#[tauri::command]
+pub async fn peek_update_refusal() -> Result<Option<String>, String> {
+    Ok(crate::update_binding::peek_refusal())
+}
+
 /// The record for a "no update" that was really a refusal, or `None` to keep
 /// the front end's own. Pure half of [`record_update_check`].
 fn refused_record(

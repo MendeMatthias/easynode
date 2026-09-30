@@ -175,6 +175,42 @@ pub fn rfc3339_utc(secs: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
+/// The seconds [`rfc3339_utc`] wrote `text` from, or `None` for anything it
+/// would never write. The six-hourly timer reads the last record's time back
+/// with this (`update_timer::skip_reason`). The inverse of the conversion
+/// above (Hinnant's `days_from_civil`), and a date that does not exist, such
+/// as February 30th, is refused by writing the result back out and comparing.
+pub fn parse_rfc3339_utc(text: &str) -> Option<u64> {
+    let b = text.as_bytes();
+    let shape = b.len() == 20
+        && b.iter().enumerate().all(|(i, &c)| match i {
+            4 | 7 => c == b'-',
+            10 => c == b'T',
+            13 | 16 => c == b':',
+            19 => c == b'Z',
+            _ => c.is_ascii_digit(),
+        });
+    if !shape {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> i64 { text[from..to].parse().unwrap_or(-1) };
+    let (year, month, day) = (num(0, 4), num(5, 7), num(8, 10));
+    let (hh, mm, ss) = (num(11, 13), num(14, 16), num(17, 19));
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hh > 23 || mm > 59 || ss > 59 {
+        return None;
+    }
+
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = u64::try_from(days * 86_400 + hh * 3_600 + mm * 60 + ss).ok()?;
+    (rfc3339_utc(secs) == text).then_some(secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,19 +225,59 @@ mod tests {
     }
 
     /// Pinned against `date -u -d @N +%Y-%m-%dT%H:%M:%SZ` on 2026-09-15.
+    const GNU_DATE: [(u64, &str); 8] = [
+        (0, "1970-01-01T00:00:00Z"),
+        (951_782_400, "2000-02-29T00:00:00Z"),
+        (1_709_251_199, "2024-02-29T23:59:59Z"),
+        (1_757_894_400, "2025-09-15T00:00:00Z"),
+        (1_789_481_002, "2026-09-15T14:03:22Z"),
+        (2_147_483_647, "2038-01-19T03:14:07Z"),
+        (4_102_444_800, "2100-01-01T00:00:00Z"),
+        (4_107_542_400, "2100-03-01T00:00:00Z"),
+    ];
+
     #[test]
     fn the_timestamp_matches_gnu_date() {
-        for (secs, want) in [
-            (0, "1970-01-01T00:00:00Z"),
-            (951_782_400, "2000-02-29T00:00:00Z"),
-            (1_709_251_199, "2024-02-29T23:59:59Z"),
-            (1_757_894_400, "2025-09-15T00:00:00Z"),
-            (1_789_481_002, "2026-09-15T14:03:22Z"),
-            (2_147_483_647, "2038-01-19T03:14:07Z"),
-            (4_102_444_800, "2100-01-01T00:00:00Z"),
-            (4_107_542_400, "2100-03-01T00:00:00Z"),
-        ] {
+        for (secs, want) in GNU_DATE {
             assert_eq!(rfc3339_utc(secs), want, "at {secs}");
+        }
+    }
+
+    /// The six-hourly timer reads the last record's time back
+    /// (`update_timer::skip_reason`), so the parser must return exactly the
+    /// seconds `rfc3339_utc` was given.
+    #[test]
+    fn the_timestamp_reads_back_as_the_seconds_it_was_written_from() {
+        for (secs, text) in GNU_DATE {
+            assert_eq!(parse_rfc3339_utc(text), Some(secs), "{text}");
+        }
+        for secs in [1, 59, 3_599, 86_399, 86_400, 1_789_481_002 - 61 * 60] {
+            assert_eq!(parse_rfc3339_utc(&rfc3339_utc(secs)), Some(secs), "{secs}");
+        }
+    }
+
+    /// Anything `rfc3339_utc` would never write is not a time, so a settings
+    /// file edited by hand cannot make the timer wait on a date it made up.
+    #[test]
+    fn anything_else_is_not_a_time() {
+        for text in [
+            "",
+            "yesterday",
+            "2026-09-15 14:03:22Z",
+            "2026-09-15T14:03:22",
+            "2026-09-15T14:03:22+00:00",
+            "2026-09-15T14:03:22.5Z",
+            "2026-9-15T14:03:22Z",
+            "2026-02-30T00:00:00Z",
+            "2025-02-29T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-09-15T24:00:00Z",
+            "2026-09-15T14:60:00Z",
+            "+026-09-15T14:03:22Z",
+            "1969-12-31T23:59:59Z",
+            " 2026-09-15T14:03:22Z",
+        ] {
+            assert_eq!(parse_rfc3339_utc(text), None, "{text:?}");
         }
     }
 
