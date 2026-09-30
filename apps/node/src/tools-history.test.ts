@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   History,
   ReportCopy,
   RestartArm,
+  ARM_DOUBLE_CLICK_GUARD_MS,
   capForDisplay,
   DISPLAY_LIMIT,
   FAST_FORWARD_ARM_MS,
@@ -38,12 +39,18 @@ describe("History", () => {
 
 describe("RestartArm", () => {
   it("arms on the first click and restarts on the second", () => {
-    const arm = new RestartArm();
-    expect(arm.armed).toBe(false);
-    expect(arm.click()).toBe(false);
-    expect(arm.armed).toBe(true);
-    expect(arm.click()).toBe(true);
-    expect(arm.armed).toBe(false);
+    vi.useFakeTimers();
+    try {
+      const arm = new RestartArm();
+      expect(arm.armed).toBe(false);
+      expect(arm.click()).toBe(false);
+      expect(arm.armed).toBe(true);
+      vi.advanceTimersByTime(ARM_DOUBLE_CLICK_GUARD_MS);
+      expect(arm.click()).toBe(true);
+      expect(arm.armed).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
   it("disarms by timeout, so the next click only arms again", () => {
     const arm = new RestartArm();
@@ -51,6 +58,20 @@ describe("RestartArm", () => {
     arm.disarm(); // the 5s timer fired
     expect(arm.armed).toBe(false);
     expect(arm.click()).toBe(false);
+  });
+  it("ignores a second click inside the double-click guard, so a double-click cannot both arm and run it", () => {
+    vi.useFakeTimers();
+    try {
+      const arm = new RestartArm();
+      expect(arm.click()).toBe(false); // arms
+      vi.advanceTimersByTime(ARM_DOUBLE_CLICK_GUARD_MS - 1);
+      expect(arm.click()).toBe(false); // still inside the guard: ignored, still armed
+      expect(arm.armed).toBe(true);
+      vi.advanceTimersByTime(1);
+      expect(arm.click()).toBe(true); // a real second click now runs it
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -94,11 +115,17 @@ describe("Fast-forward arm", () => {
     expect(FAST_FORWARD_ARM_MS).toBe(10_000);
   });
   it("runs only on the second click, and a disarm starts over", () => {
-    const arm = new RestartArm();
-    expect(arm.click()).toBe(false); // shows what will happen
-    arm.disarm(); // ten seconds passed
-    expect(arm.click()).toBe(false);
-    expect(arm.click()).toBe(true); // runs
+    vi.useFakeTimers();
+    try {
+      const arm = new RestartArm();
+      expect(arm.click()).toBe(false); // shows what will happen
+      arm.disarm(); // ten seconds passed
+      expect(arm.click()).toBe(false);
+      vi.advanceTimersByTime(ARM_DOUBLE_CLICK_GUARD_MS);
+      expect(arm.click()).toBe(true); // runs
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

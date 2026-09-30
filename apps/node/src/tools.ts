@@ -100,6 +100,9 @@ export function initTools(): void {
   let ffPoll: ReturnType<typeof setInterval> | undefined;
   let ffOffer: Extract<FastForwardCheck, { kind: "offer" }> | null = null;
   let ffNote = FF_NOTE;
+  /** Bumped when Tools closes, so a check, a run or a poll still in flight
+   * then (mirrors reportRun) touches nothing once it lands. */
+  let ffRun = 0;
 
   /** Back to one click away, as the section says. */
   const resetFfArm = () => {
@@ -121,26 +124,51 @@ export function initTools(): void {
     }
     if (status?.running) $("tools-ff").hidden = false;
   };
-  /** While a run is going: ask every few seconds, stop when it ends. */
+  /** A fresh offer or dispute is about to replace what the section says;
+   * the last run's leftover message no longer describes it. */
+  const clearFfResult = () => {
+    const result = $("tools-ff-result");
+    result.textContent = "";
+    result.hidden = true;
+  };
+  /** While a run is going: ask every few seconds, stop when it ends or the
+   * overlay closes. A poll must not outlive a closed overlay. */
   const pollFf = () => {
     stopFfPoll();
+    const run = ffRun;
     ffPoll = setInterval(async () => {
+      if (overlay.hidden || run !== ffRun) {
+        stopFfPoll();
+        return;
+      }
       const status = await invoke<FastForwardStatus>("tools_fast_forward_status").catch(() => null);
+      if (overlay.hidden || run !== ffRun) {
+        stopFfPoll(); // closed while that call was in flight
+        return;
+      }
       showFfStatus(status);
       if (status && !status.running) stopFfPoll();
     }, FAST_FORWARD_POLL_MS);
   };
   const refreshFastForward = async () => {
+    const run = ffRun;
     const btn = $<HTMLButtonElement>("tools-ff-btn");
     const status = await invoke<FastForwardStatus>("tools_fast_forward_status").catch(() => null);
-    showFfStatus(status);
+    if (run !== ffRun) return; // Tools closed meanwhile
     if (status?.running) {
+      showFfStatus(status);
       btn.hidden = true;
       pollFf();
       return;
     }
     const check = await invoke<FastForwardCheck>("tools_fast_forward_check").catch(() => null);
+    if (run !== ffRun) return; // Tools closed meanwhile
     ffOffer = check?.kind === "offer" ? check : null;
+    // A fresh offer or dispute replaces whatever the last run said; only a
+    // "none" check (nothing new to show) keeps that message in view, which
+    // is what keeps the section open on its own between checks.
+    if (check?.kind === "offer" || check?.kind === "off") clearFfResult();
+    else showFfStatus(status);
     const view = fastForwardView(check, status);
     ffNote = view.note;
     btn.hidden = view.button === null;
@@ -178,6 +206,7 @@ export function initTools(): void {
     resetRestartArm();
     resetFfArm();
     stopFfPoll();
+    ffRun += 1;
     pendingToken = null;
     $("tools-confirm").hidden = true;
     resetReport();
@@ -242,13 +271,19 @@ export function initTools(): void {
     }
     clearTimeout(ffArmTimer);
     ffArmTimer = undefined;
+    const run = ffRun;
     btn.disabled = true;
     btn.hidden = true;
     $("tools-ff-note").textContent = ffNote;
     const msg = await invoke<string>("tools_fast_forward_run").catch((e) => String(e));
+    if (run !== ffRun) return; // Tools closed meanwhile
     const result = $("tools-ff-result");
     result.textContent = msg;
     result.hidden = false;
+    // Hiding the button left focus nowhere; the result line is the next
+    // stable thing for a keyboard user to land on (tabindex="-1" in
+    // index.html), as tools-fetch and buildReport refocus their own button.
+    if (!overlay.hidden) result.focus();
     pollFf();
   });
 

@@ -42,13 +42,20 @@ export class History {
   }
 }
 
+/** A double-click's two `click` events land closer together than this;
+ * `RestartArm.click` ignores the second one, so a double-click gesture
+ * cannot both arm and run a two-click control in the same movement. */
+export const ARM_DOUBLE_CLICK_GUARD_MS = 400;
+
 /**
  * Restart node's two-click arm/disarm state, pulled out of the DOM glue so it
  * has a test. The actual 5-second timer and the "overlay just closed" event
  * both live in tools.ts; either one calls `disarm()` to cancel the arm.
+ * Fast-forward's ten-second arm (tools.ts) uses the same class.
  */
 export class RestartArm {
   private armedFlag = false;
+  private armedAt = 0;
 
   get armed(): boolean {
     return this.armedFlag;
@@ -56,15 +63,21 @@ export class RestartArm {
 
   /**
    * A click on Restart node. The first click only arms it (returns false);
-   * a second click while armed returns true, meaning "actually restart now",
-   * and disarms so a third click starts over.
+   * a second click while armed, at least ARM_DOUBLE_CLICK_GUARD_MS after the
+   * first, returns true, meaning "actually restart now", and disarms so a
+   * third click starts over. A second click sooner than that is a
+   * double-click, not two deliberate clicks, and is ignored: still armed,
+   * waiting for a real second click.
    */
   click(): boolean {
+    const now = Date.now();
     if (this.armedFlag) {
+      if (now - this.armedAt < ARM_DOUBLE_CLICK_GUARD_MS) return false;
       this.armedFlag = false;
       return true;
     }
     this.armedFlag = true;
+    this.armedAt = now;
     return false;
   }
 
