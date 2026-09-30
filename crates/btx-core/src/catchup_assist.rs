@@ -253,8 +253,8 @@ impl Helper {
     /// The help's conclusion that no archive peer will serve old blocks to
     /// this node: every archive peer connected with the next block dropped us
     /// over old blocks [`DROPS_TO_MARK`] times this run, full-history ones
-    /// included, and the next block is old for each. What the status card,
-    /// Copy diagnostics and the Fast-forward offer read (through
+    /// included, and the next block is old for each. What the status card
+    /// and Copy diagnostics read (through
     /// [`CatchUp::no_archive_serves_old_blocks`]).
     pub fn no_archive_serves_old_blocks(&self) -> bool {
         self.no_old_blocks
@@ -688,8 +688,7 @@ pub struct CatchUp {
 
 /// What the shell keeps of the help between ticks (`AppState::catch_up_help`,
 /// written by the refresher every tick, reset on every start and stop): the
-/// Copy diagnostics lines, and the conclusion the status card and the
-/// Fast-forward offer read.
+/// Copy diagnostics lines, and the conclusion the status card reads.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct CatchUpReport {
     /// [`CatchUp::diagnostics`].
@@ -721,8 +720,8 @@ impl CatchUp {
 
     /// No archive peer will serve old blocks to this node
     /// ([`Helper::no_archive_serves_old_blocks`]): the owner's decision 1
-    /// pauses the help, says so, and lets Fast-forward be offered below its
-    /// 1,000-block line.
+    /// pauses the help and says so, in the log, in Copy diagnostics and on
+    /// the status card.
     pub fn no_archive_serves_old_blocks(&self) -> bool {
         self.helper.no_archive_serves_old_blocks()
     }

@@ -653,8 +653,8 @@ pub struct AppState {
     /// What the catch-up help (`btx_core::catchup_assist`) is doing this run,
     /// as the refresher's last tick left it (`CatchUp::report`): the Copy
     /// diagnostics lines, and whether it concluded that no archive peer serves
-    /// old blocks to this node. The status card and the Fast-forward offer
-    /// read that flag. Reset on every stop/start like the others.
+    /// old blocks to this node, which the status card reads. Reset on every
+    /// stop/start like the others.
     pub catch_up_help: Arc<Mutex<btx_core::catchup_assist::CatchUpReport>>,
     /// Who signed the newest hundred blocks, from the node's own attestation
     /// store, kept current by the refresher only while the engine reports a

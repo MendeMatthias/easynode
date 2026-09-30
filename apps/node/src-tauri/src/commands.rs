@@ -5267,8 +5267,8 @@ mod tests {
     }
 
     /// A stopped node has no catch-up help: what the last run concluded (the
-    /// card's old-blocks sentence, the Fast-forward offer's flag, the Copy
-    /// diagnostics lines) goes with it, as the other refresher slots do.
+    /// card's old-blocks sentence, the Copy diagnostics lines) goes with it,
+    /// as the other refresher slots do.
     #[tokio::test]
     async fn a_stop_forgets_what_the_catch_up_help_concluded() {
         let state = super::AppState::new();
