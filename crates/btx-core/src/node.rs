@@ -2124,11 +2124,24 @@ fn mirror_load_path(datadir: &Path) -> PathBuf {
 /// longer than one.
 pub const MIRROR_LOAD_MAX_AGE_SECS: u64 = 6 * 60 * 60;
 
-/// What the marker holds: the base being loaded, and when it was written.
+/// What the marker holds: the pair being loaded (its kind and base), and
+/// when it was written. `kind` is `None` on a marker written before it was
+/// kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MirrorLoad {
     pub height: u64,
     pub written_at: u64,
+    #[serde(default)]
+    pub kind: Option<crate::attested_snapshot::PairKind>,
+}
+
+impl MirrorLoad {
+    /// The pair this launch is for, kind and height, when the marker says.
+    /// The load takes it from disk when the website cannot be read
+    /// (`crate::attested_snapshot::prepare_start_marked`).
+    pub fn pair(&self) -> Option<(crate::attested_snapshot::PairKind, u64)> {
+        self.kind.map(|k| (k, self.height))
+    }
 }
 
 fn unix_now() -> u64 {
@@ -2150,11 +2163,16 @@ pub fn mirror_load_is_fresh(m: &MirrorLoad, now: u64) -> bool {
 }
 
 /// Mark the next launch of this datadir as the mirror launch that loads the
-/// snapshot at `height`.
-pub fn begin_mirror_load(datadir: &Path, height: u64) -> std::io::Result<()> {
+/// pair of `kind` at `height`.
+pub fn begin_mirror_load(
+    datadir: &Path,
+    kind: crate::attested_snapshot::PairKind,
+    height: u64,
+) -> std::io::Result<()> {
     let m = MirrorLoad {
         height,
         written_at: unix_now(),
+        kind: Some(kind),
     };
     std::fs::write(
         mirror_load_path(datadir),
@@ -3699,6 +3717,7 @@ impl NodeController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attested_snapshot::PairKind;
     use std::path::PathBuf;
 
     // ── Orphaned-holder detection (the 0.6.3 upgrade-restart guard) ─────────
@@ -6726,7 +6745,7 @@ matmul: metal runtime_probe_ok, selecting metal\n\
         assert!(!launches_as_mirror(btxd, &dir, Backend::Cuda));
         assert_eq!(mirror_load_pending(&dir), None);
 
-        begin_mirror_load(&dir, 232_000).unwrap();
+        begin_mirror_load(&dir, PairKind::Confirmed, 232_000).unwrap();
         assert_eq!(mirror_load_pending(&dir).map(|m| m.height), Some(232_000));
         assert!(launches_as_mirror(btxd, &dir, Backend::Cuda));
         assert!(!host_follows_signatures(btxd, &dir, Backend::Cuda));
@@ -6741,6 +6760,34 @@ matmul: metal runtime_probe_ok, selecting metal\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Final review M4: the marker names the pair the launch is for, kind and
+    /// height, so the load can take that pair from disk when the website
+    /// cannot be read. A marker written before it said the kind still reads,
+    /// and names no pair.
+    #[test]
+    fn the_mirror_load_marker_names_its_pair() {
+        let dir = signed_snapshot_datadir("mirror-load-kind");
+        begin_mirror_load(&dir, PairKind::Confirmed, 232_000).unwrap();
+        let m = mirror_load_pending(&dir).unwrap();
+        assert_eq!(m.pair(), Some((PairKind::Confirmed, 232_000)));
+        let raw = std::fs::read_to_string(dir.join(".load-snapshot-as-mirror")).unwrap();
+        assert!(raw.contains(r#""kind":"confirmed""#), "{raw}");
+        begin_mirror_load(&dir, PairKind::Pinned, 225_927).unwrap();
+        assert_eq!(
+            mirror_load_pending(&dir).and_then(|m| m.pair()),
+            Some((PairKind::Pinned, 225_927))
+        );
+        let now = unix_now();
+        std::fs::write(
+            dir.join(".load-snapshot-as-mirror"),
+            format!(r#"{{"height":232000,"written_at":{now}}}"#),
+        )
+        .unwrap();
+        let old = mirror_load_pending(&dir).unwrap();
+        assert_eq!((old.height, old.pair()), (232_000, None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The operator's "never a mirror" (`EASYBTX_NODE_TRUSTED_MIRROR=0`)
     /// outranks a fresh mirror-load marker: the launch is not a mirror, and
     /// no mirror launch is wanted. The env half is read by
@@ -6748,7 +6795,7 @@ matmul: metal runtime_probe_ok, selecting metal\n\
     #[test]
     fn never_a_mirror_outranks_a_fresh_mirror_load_marker() {
         let dir = signed_snapshot_datadir("mirror-load-never");
-        begin_mirror_load(&dir, 232_000).unwrap();
+        begin_mirror_load(&dir, PairKind::Confirmed, 232_000).unwrap();
         let fresh = mirror_load_pending(&dir).is_some();
         assert!(fresh);
         let never = parse_trusted_mirror_override("0");
@@ -6768,6 +6815,7 @@ matmul: metal runtime_probe_ok, selecting metal\n\
         let m = |written_at| MirrorLoad {
             height: 232_000,
             written_at,
+            kind: None,
         };
         assert!(mirror_load_is_fresh(&m(now), now));
         assert!(mirror_load_is_fresh(
@@ -6919,7 +6967,7 @@ matmul: metal runtime_probe_ok, selecting metal\n\
         )
         .unwrap();
         let btxd = Path::new("/x/btx/v0.34.9/mac/btxd");
-        begin_mirror_load(&dir, 232_000).unwrap();
+        begin_mirror_load(&dir, PairKind::Confirmed, 232_000).unwrap();
         let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Metal);
         assert_eq!(validation_modes(&args), vec!["trusted"], "{args:?}");
         let mut seen = std::collections::HashSet::new();

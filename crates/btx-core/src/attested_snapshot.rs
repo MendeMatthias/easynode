@@ -508,27 +508,51 @@ pub struct ReadyPair {
 /// The body of `latest`'s answer, read no further than [`MAX_POINTER_BYTES`]:
 /// a server that says it is sending more is refused before the body is
 /// read, and one that streams more without saying so is cut off at the cap.
-async fn read_pointer_body(mut resp: reqwest::Response) -> Result<Vec<u8>, String> {
+async fn read_pointer_body(mut resp: reqwest::Response) -> Result<Vec<u8>, NotReady> {
     if let Some(len) = resp
         .content_length()
         .filter(|&n| n > MAX_POINTER_BYTES as u64)
     {
-        return Err(format!("the pointer says {len} bytes, not a pointer"));
+        return Err(format!("the pointer says {len} bytes, not a pointer").into());
     }
     let mut body = Vec::new();
     while let Some(chunk) = resp
         .chunk()
         .await
-        .map_err(|e| format!("pointer read: {e}"))?
+        .map_err(|e| NotReady::PointerUnread(format!("pointer read: {e}")))?
     {
         if body.len() + chunk.len() > MAX_POINTER_BYTES {
             return Err(format!(
                 "the pointer is more than {MAX_POINTER_BYTES} bytes, not a pointer"
-            ));
+            )
+            .into());
         }
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// Why no confirmed pair is ready. `latest` could not be read at all (no
+/// answer, a server error, a body cut off), or anything else, which is an
+/// answer: a 404, a dispute, a refusal, a failed download. The strings are
+/// for the log.
+enum NotReady {
+    PointerUnread(String),
+    Answered(String),
+}
+
+impl From<String> for NotReady {
+    fn from(why: String) -> Self {
+        NotReady::Answered(why)
+    }
+}
+
+impl NotReady {
+    fn why(self) -> String {
+        match self {
+            NotReady::PointerUnread(why) | NotReady::Answered(why) => why,
+        }
+    }
 }
 
 /// Read `latest` at `pointer_url`, then download and check the pair it
@@ -545,16 +569,34 @@ pub async fn prepare_confirmed(
     regtest_env: Option<&str>,
     url_ok: fn(&str) -> bool,
 ) -> Result<ReadyPair, String> {
+    confirmed_pair(client, pointer_url, datadir, view, regtest_env, url_ok)
+        .await
+        .map_err(NotReady::why)
+}
+
+/// [`prepare_confirmed`], saying whether `latest` could be read at all.
+async fn confirmed_pair(
+    client: &reqwest::Client,
+    pointer_url: &str,
+    datadir: &Path,
+    view: &NodeView,
+    regtest_env: Option<&str>,
+    url_ok: fn(&str) -> bool,
+) -> Result<ReadyPair, NotReady> {
     let resp = client
         .get(pointer_url)
         .send()
         .await
-        .map_err(|e| format!("pointer unreachable: {e}"))?;
-    if resp.status().as_u16() != 200 {
-        return Err(format!(
-            "no confirmed snapshot (HTTP {})",
-            resp.status().as_u16()
-        ));
+        .map_err(|e| NotReady::PointerUnread(format!("pointer unreachable: {e}")))?;
+    let status = resp.status();
+    if status.is_server_error() {
+        return Err(NotReady::PointerUnread(format!(
+            "the pointer did not answer (HTTP {})",
+            status.as_u16()
+        )));
+    }
+    if status.as_u16() != 200 {
+        return Err(format!("no confirmed snapshot (HTTP {})", status.as_u16()).into());
     }
     let body = read_pointer_body(resp).await?;
     let p = match parse_latest(&body)? {
@@ -563,7 +605,8 @@ pub async fn prepare_confirmed(
             return Err(format!(
                 "the snapshot operators disagree about block {}",
                 crate::snapshot_start::block_number(disputed.newest_disputed().unwrap_or(0))
-            ))
+            )
+            .into())
         }
     };
     check_pointer(&p, url_ok)?;
@@ -614,11 +657,61 @@ pub async fn prepare_confirmed(
     };
     if !cs::file_matches(st, st.file_size(), &double) {
         let _ = std::fs::remove_file(&file);
-        return Err("the file is not the one the statement signs".into());
+        return Err(String::from("the file is not the one the statement signs").into());
     }
     Ok(ReadyPair {
         kind: PairKind::Confirmed,
         height: confirmed.height,
+        file,
+        manifest,
+    })
+}
+
+/// [`prepare_confirmed`] for a validating node's mirror launch, whose marker
+/// names the pair it checked before it launched (`marked`, from
+/// `crate::node::MirrorLoad`). When `latest` cannot be read at all, the
+/// confirmed pair the marker names is taken from disk rather than lost
+/// ([`marked_pair_on_disk`]); an answer decides as always.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_confirmed_or_marked(
+    client: &reqwest::Client,
+    pointer_url: &str,
+    datadir: &Path,
+    view: &NodeView,
+    regtest_env: Option<&str>,
+    url_ok: fn(&str) -> bool,
+    marked: Option<(PairKind, u64)>,
+) -> Result<ReadyPair, String> {
+    match confirmed_pair(client, pointer_url, datadir, view, regtest_env, url_ok).await {
+        Ok(pair) => Ok(pair),
+        Err(NotReady::PointerUnread(why)) => match marked_pair_on_disk(datadir, marked) {
+            Some(pair) => {
+                eprintln!(
+                    "[attested] {why}; loading the confirmed pair {} this launch checked before \
+                     it started",
+                    pair.height
+                );
+                Ok(pair)
+            }
+            None => Err(why),
+        },
+        Err(NotReady::Answered(why)) => Err(why),
+    }
+}
+
+/// The confirmed pair a mirror-load marker names, when both its files are
+/// on disk. Not checked here: `crate::confirmed_load::load` checks it again
+/// in full (statement, operators, pins, chain, file hash) before the engine
+/// sees it. A marker for the pinned pair needs none of this: that pair on
+/// disk is found without the network ([`prepare_start`]).
+fn marked_pair_on_disk(datadir: &Path, marked: Option<(PairKind, u64)>) -> Option<ReadyPair> {
+    let (PairKind::Confirmed, height) = marked? else {
+        return None;
+    };
+    let (file, manifest) = pair_paths(datadir, height);
+    (file.is_file() && manifest.is_file()).then_some(ReadyPair {
+        kind: PairKind::Confirmed,
+        height,
         file,
         manifest,
     })
@@ -632,6 +725,18 @@ pub async fn prepare_start(
     view: &NodeView,
     compiled_anchor: u64,
 ) -> Option<ReadyPair> {
+    prepare_start_marked(datadir, view, compiled_anchor, None).await
+}
+
+/// [`prepare_start`] on a validating node's mirror launch, whose marker names
+/// the pair it checked before it launched (`marked`: kind and height, see
+/// [`prepare_confirmed_or_marked`]).
+pub async fn prepare_start_marked(
+    datadir: &Path,
+    view: &NodeView,
+    compiled_anchor: u64,
+    marked: Option<(PairKind, u64)>,
+) -> Option<ReadyPair> {
     let client = match http_client() {
         Ok(c) => c,
         Err(e) => {
@@ -640,13 +745,14 @@ pub async fn prepare_start(
         }
     };
     let regtest_env = crate::operators::regtest_env();
-    match prepare_confirmed(
+    match prepare_confirmed_or_marked(
         &client,
         CONFIRMED_POINTER_URL,
         datadir,
         view,
         regtest_env.as_deref(),
         confirmed_url_allowed,
+        marked,
     )
     .await
     {
@@ -1218,6 +1324,108 @@ mod tests {
             "{streamed}"
         );
         assert!(!pair_dir(tmp.path()).exists(), "nothing written");
+    }
+
+    /// Final review M4: a validating node's mirror launch checked its pair
+    /// before it launched, and its marker names that pair. When `latest`
+    /// cannot be read at all (no answer, or a server error), the launch
+    /// loads the confirmed pair its marker names from disk instead of losing
+    /// its signed start (the loader checks it again in full). An answer (a
+    /// 404, a dispute) decides as always, and so does a marker that names
+    /// the pinned pair or a pair that is not on disk.
+    #[tokio::test]
+    async fn an_unreadable_pointer_falls_back_to_the_marked_pair_on_disk() {
+        let env = format!("producer={P};confirmer={C}");
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/down")
+            .with_status(503)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/none")
+            .with_status(404)
+            .with_body(r#"{"version":1,"confirmed":null}"#)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/disputed")
+            .with_body(r#"{"disputed":[100]}"#)
+            .create_async()
+            .await;
+        let unreachable = "http://127.0.0.1:9/latest".to_string();
+        let on_disk = |dir: &Path| {
+            let (f, m) = pair_paths(dir, 100);
+            std::fs::create_dir_all(pair_dir(dir)).unwrap();
+            std::fs::write(&f, R_DAT).unwrap();
+            std::fs::write(&m, R_PC).unwrap();
+        };
+        let marked = Some((PairKind::Confirmed, 100));
+        let get = |url: String, dir: std::path::PathBuf, marked: Option<(PairKind, u64)>| {
+            let env = env.clone();
+            async move {
+                prepare_confirmed_or_marked(
+                    &reqwest::Client::new(),
+                    &url,
+                    &dir,
+                    &view(),
+                    Some(&env),
+                    any_url,
+                    marked,
+                )
+                .await
+            }
+        };
+        for url in [unreachable.clone(), format!("{}/down", server.url())] {
+            let tmp = tempfile::tempdir().unwrap();
+            on_disk(tmp.path());
+            let ready = get(url.clone(), tmp.path().to_path_buf(), marked)
+                .await
+                .unwrap();
+            assert_eq!(
+                (ready.kind, ready.height),
+                (PairKind::Confirmed, 100),
+                "{url}"
+            );
+            assert_eq!(ready.file, pair_paths(tmp.path(), 100).0);
+            assert!(
+                get(url.clone(), tmp.path().to_path_buf(), None)
+                    .await
+                    .is_err(),
+                "no marker: {url}"
+            );
+            assert!(
+                get(
+                    url.clone(),
+                    tmp.path().to_path_buf(),
+                    Some((PairKind::Pinned, 100))
+                )
+                .await
+                .is_err(),
+                "the pinned pair has its own way back: {url}"
+            );
+            let empty = tempfile::tempdir().unwrap();
+            assert!(
+                get(url.clone(), empty.path().to_path_buf(), marked)
+                    .await
+                    .is_err(),
+                "not on disk: {url}"
+            );
+        }
+        for answered in ["/none", "/disputed"] {
+            let tmp = tempfile::tempdir().unwrap();
+            on_disk(tmp.path());
+            assert!(
+                get(
+                    format!("{}{answered}", server.url()),
+                    tmp.path().to_path_buf(),
+                    marked
+                )
+                .await
+                .is_err(),
+                "{answered} is an answer"
+            );
+        }
     }
 
     /// Before a release: the pinned pair is still published byte for byte.

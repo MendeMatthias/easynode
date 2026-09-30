@@ -878,7 +878,12 @@ mod tests {
     fn remove_node_data_clears_a_mirror_load_marker() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("blocks")).unwrap();
-        crate::node::begin_mirror_load(dir.path(), 225_927).unwrap();
+        crate::node::begin_mirror_load(
+            dir.path(),
+            crate::attested_snapshot::PairKind::Pinned,
+            225_927,
+        )
+        .unwrap();
         assert!(crate::node::mirror_load_marker_exists(dir.path()));
         remove_node_data(dir.path());
         assert!(!crate::node::mirror_load_marker_exists(dir.path()));

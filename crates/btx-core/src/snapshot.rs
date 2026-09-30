@@ -676,7 +676,11 @@ async fn load_signed(
     let start = crate::attested_snapshot::fallback_start(anchor_height);
     let pins = crate::node::BTX_TRUSTED_ATTESTATION_PUBKEYS;
     let view = confirmed_load::node_view(rpc, &pins, start).await;
-    let Some(pair) = crate::attested_snapshot::prepare_start(datadir, &view, anchor_height).await
+    // On a validating node's mirror launch, the pair it checked before it
+    // launched, in case the website cannot be read now.
+    let marked = crate::node::mirror_load_pending(datadir).and_then(|m| m.pair());
+    let Some(pair) =
+        crate::attested_snapshot::prepare_start_marked(datadir, &view, anchor_height, marked).await
     else {
         return Signed::NotLoaded("no signed snapshot is available".into());
     };

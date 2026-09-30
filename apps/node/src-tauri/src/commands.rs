@@ -4070,7 +4070,7 @@ async fn prepare_mirror_load(
         ..Default::default()
     };
     match btx_core::attested_snapshot::prepare_start(datadir, &view, anchor).await {
-        Some(pair) => match node::begin_mirror_load(datadir, pair.height) {
+        Some(pair) => match node::begin_mirror_load(datadir, pair.kind, pair.height) {
             Ok(()) => {
                 setup_log(
                     datadir,
@@ -6495,6 +6495,7 @@ mod signed_start_tests {
         AfterRefusal, AttachedTo, MirrorLoadStep, SET_ASIDE_STUCK,
     };
     use crate::state::NodeAppSettings;
+    use btx_core::attested_snapshot::PairKind;
     use btx_core::backend::Backend;
     use btx_core::confirmed_load::LoadError;
     use btx_core::node;
@@ -6665,7 +6666,7 @@ mod signed_start_tests {
         std::fs::create_dir_all(&snap).unwrap();
         std::fs::write(snap.join("attested_assumeutxo"), b"x").unwrap();
         NodeAppSettings::update(dir.path(), |s| s.snapshot_loaded = true);
-        node::begin_mirror_load(dir.path(), 232_000).unwrap();
+        node::begin_mirror_load(dir.path(), PairKind::Confirmed, 232_000).unwrap();
         super::finish_load(dir.path(), true).unwrap();
         assert!(!snap.exists(), "the refused chainstate is set aside");
         let aside: Vec<_> = std::fs::read_dir(dir.path())
@@ -6730,7 +6731,7 @@ mod signed_start_tests {
     #[test]
     fn a_marker_that_will_not_go_stops_the_restart() {
         let dir = fresh_validating_datadir();
-        node::begin_mirror_load(dir.path(), 232_000).unwrap();
+        node::begin_mirror_load(dir.path(), PairKind::Confirmed, 232_000).unwrap();
         super::finish_load(dir.path(), false).unwrap();
         assert!(!node::mirror_load_marker_exists(dir.path()));
 
@@ -6766,7 +6767,7 @@ mod signed_start_tests {
             // as root, the folder's mode does not stop the removal, and there
             // is nothing to check.)
             let stuck = fresh_validating_datadir();
-            node::begin_mirror_load(stuck.path(), 232_000).unwrap();
+            node::begin_mirror_load(stuck.path(), PairKind::Confirmed, 232_000).unwrap();
             let set = |mode| {
                 std::fs::set_permissions(stuck.path(), std::fs::Permissions::from_mode(mode))
                     .unwrap()
@@ -6799,7 +6800,7 @@ mod signed_start_tests {
             )
         };
         assert_eq!(decide(dir.path()), (true, true), "an ordinary launch");
-        node::begin_mirror_load(dir.path(), 232_000).unwrap();
+        node::begin_mirror_load(dir.path(), PairKind::Confirmed, 232_000).unwrap();
         assert_eq!(decide(dir.path()), (true, false), "the load launch");
         // A host that follows signatures: never a key, and the window says so.
         assert_eq!(signer_for_launch(true, true, true), (false, false));
@@ -6953,7 +6954,7 @@ mod signed_start_tests {
         );
 
         let dir = tempfile::tempdir().unwrap();
-        node::begin_mirror_load(dir.path(), 232_000).unwrap();
+        node::begin_mirror_load(dir.path(), PairKind::Confirmed, 232_000).unwrap();
         assert!(node::mirror_load_pending(dir.path()).is_some());
         // No blocks: the next launch is a header bootstrap.
         assert!(!mirror_load_wanted_here(
@@ -7118,7 +7119,7 @@ mod signed_start_tests {
     #[test]
     fn a_marked_launch_that_fails_to_start_is_not_repeated() {
         let dir = fresh_validating_datadir();
-        node::begin_mirror_load(dir.path(), 232_000).unwrap();
+        node::begin_mirror_load(dir.path(), PairKind::Confirmed, 232_000).unwrap();
         let failed = AtomicBool::new(false);
         abandon_mirror_load(dir.path(), &failed, true);
         assert!(!node::mirror_load_marker_exists(dir.path()));
@@ -7135,7 +7136,7 @@ mod signed_start_tests {
         assert!(!mirror_launch_failed(true, true), "a quit");
         assert!(!mirror_launch_failed(false, false), "nothing was launched");
         let dir = fresh_validating_datadir();
-        node::begin_mirror_load(dir.path(), 232_000).unwrap();
+        node::begin_mirror_load(dir.path(), PairKind::Confirmed, 232_000).unwrap();
         let failed = AtomicBool::new(false);
         abandon_mirror_load(dir.path(), &failed, false);
         assert!(!node::mirror_load_marker_exists(dir.path()), "always ended");
@@ -7420,7 +7421,7 @@ mod signed_start_tests {
         let dir = fresh_validating_datadir();
         let d = dir.path();
         assert!(mirror_load_wanted_here(&btxd, d, Backend::Metal));
-        node::begin_mirror_load(d, 232_000).unwrap();
+        node::begin_mirror_load(d, PairKind::Confirmed, 232_000).unwrap();
         assert!(node::launches_as_mirror(&btxd, d, Backend::Metal));
         std::fs::create_dir_all(d.join("chainstate_snapshot")).unwrap();
         let wanted = mirror_load_wanted_here(&btxd, d, Backend::Metal);
