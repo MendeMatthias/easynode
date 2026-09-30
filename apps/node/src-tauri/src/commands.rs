@@ -398,8 +398,8 @@ pub(crate) fn offer_status(
 }
 
 /// A btxd path that carries this build's engine tag and nothing else, for the
-/// rules that read only the tag (`btx_core::node::launches_as_mirror` and the
-/// degraded-start gate behind it) before the real install path is resolved.
+/// rules that read only the tag (`btx_core::node::host_follows_signatures` and
+/// the degraded-start gate behind it) before the real install path is resolved.
 /// The same shape node.rs's own tests use.
 pub fn nominal_btxd_path() -> PathBuf {
     PathBuf::from(format!("/nominal/btx/{NODE_RELEASE_TAG}/bin/btxd"))
@@ -821,19 +821,35 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
                     .collect()
             });
 
+    // A validating node that has never loaded a snapshot loads a signed one
+    // in one mirror launch (the confirmed-snapshot decision, section 7 step
+    // 5). Decided here, before the signing key goes in or out of the conf,
+    // because that launch is a mirror and a mirror holds no key.
+    let began_mirror_load = prepare_mirror_load(app, state, &paths.btxd, &datadir).await?;
+
     // ── The signer role (btx_core::signer) ──────────────────────────────────
     // Decided here, before the conf is finished, from the same rule the
-    // launch uses for the -matmulvalidation arm: a host that will follow
+    // launch uses for the -matmulvalidation arm: a launch that will follow
     // signatures cannot make them, so it gets no key line whatever the
-    // setting says, and the UI is told so. A host that validates gets the
-    // key (generated once, adopted if already there) in the conf, the mirror
-    // it feeds in the whitelist (the mirror asks for attestations in bursts
-    // while catching up, and the engine bans aggressive askers), and its
-    // public key kept where the status poll can show it.
-    let signer_applies_here =
-        !btx_core::node::launches_as_mirror(&paths.btxd, &datadir, node_backend());
+    // setting says. A host that validates gets the key (generated once,
+    // adopted if already there) in the conf, the mirror it feeds in the
+    // whitelist (the mirror asks for attestations in bursts while catching
+    // up, and the engine bans aggressive askers), and its public key kept
+    // where the status poll can show it. The UI is told the host's lasting
+    // role, so a validating node's one mirror launch still reads as a host
+    // that can sign (`signer_for_launch`).
+    let launches_mirror = btx_core::node::launches_as_mirror(&paths.btxd, &datadir, node_backend());
+    let (signer_applies_here, signs_here) = signer_for_launch(
+        settings.signer_enabled,
+        btx_core::node::host_follows_signatures(&paths.btxd, &datadir, node_backend()),
+        launches_mirror,
+    );
     *state.signer_applies_here.lock().await = Some(signer_applies_here);
-    let signs_here = settings.signer_enabled && signer_applies_here;
+    // This launch is a validating node's one mirror launch. Read here, where
+    // the key decision is made, and not after the RPC wait, which can
+    // outlast the marker's age limit and would then leave a mirror running
+    // with nothing to restart it validating.
+    let mirror_load_marked = launches_mirror && signer_applies_here;
     let mut signer_pubkey = None;
     if signs_here {
         match btx_core::signer::ensure_signer_key(&datadir) {
@@ -1233,24 +1249,31 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     // is fetching and would run at the moment the refresher restarts the
     // node, so it waits for the ordinary launch, which finds the headers
     // already past the anchor and loads at once.
+    let mut load_watch = None;
     if bootstrap_launch {
         eprintln!(
             "[snapshot] header bootstrap launch: the snapshot loads after the restart that ends it"
         );
     } else {
-        // A node that follows signatures starts from the newest snapshot this
-        // project's signer has signed, a few hundred blocks from the tip,
-        // instead of the compiled one thousands below it
-        // (btx_core::attested_snapshot; the owner's decision of 2026-09-26).
-        // One that checks blocks itself cannot load a signed snapshot, the
-        // engine refuses it, so it keeps the compiled one. Same rule as the
-        // -matmulvalidation arm, through `signer_applies_here`.
-        let signed = if signer_applies_here {
-            btx_core::snapshot::SignedLoad::None
-        } else {
-            btx_core::snapshot::SignedLoad::Mirror
-        };
-        drop(btx_core::snapshot::ensure_snapshot_loaded_with(
+        // Where this node starts (the confirmed-snapshot decision, sections 7
+        // and 9): a validating node's one mirror launch loads a confirmed or
+        // the pinned pair and is then restarted as a validating node; a node
+        // that follows signatures loads one in place, else the compiled one;
+        // an ordinary validating launch loads the compiled one.
+        let attached = *state.attached_to.lock().await;
+        let mirror_load_launch = runs_mirror_load(mirror_load_marked, began_mirror_load, attached);
+        if mirror_load_marked && !mirror_load_launch {
+            // The node serving now never read the marker (this start attached
+            // to it after writing one), or is another app's and not ours to
+            // restart.
+            btx_core::node::end_mirror_load(&datadir);
+        }
+        let signed = signed_load_for(
+            mirror_load_launch,
+            !signer_applies_here,
+            SIGNED_LOAD_FAILED.load(Ordering::SeqCst),
+        );
+        let handle = btx_core::snapshot::ensure_snapshot_loaded_with(
             rpc.clone(),
             paths.btx_cli.clone(),
             datadir.clone(),
@@ -1259,11 +1282,18 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
                 datadir: datadir.clone(),
             }),
             signed,
-        ));
+        );
+        load_watch = Some((handle, mirror_load_launch));
     }
 
     set_phase(app, state, NodePhase::LoadingSnapshot).await;
     spawn_status_refresher(app.clone(), state, bootstrap_launch);
+    if let Some((handle, mirror_load_launch)) = load_watch {
+        // This run's generation: a stop or restart moves it, and then the
+        // outcome is no longer this run's to act on.
+        let gen = state.refresher_gen.load(Ordering::SeqCst);
+        spawn_load_watch(app.clone(), handle, gen, mirror_load_launch);
+    }
     // Esplora mode, if chosen: electrs and the front start beside the node.
     // Re-gated against the LIVE node, and any refusal is recorded for the
     // Settings row rather than logged away.
@@ -3615,6 +3645,469 @@ fn header_bootstrap_end_message(
     }
 }
 
+/// Set when a signed load failed on this node in this run of the app: no
+/// further mirror launch and no further signed load until the app restarts,
+/// so a pair that fails cannot restart the node in a loop.
+static SIGNED_LOAD_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Which signed load a launch makes. Pure, so every case has a test.
+fn signed_load_for(
+    mirror_load_launch: bool,
+    follows_signatures: bool,
+    failed_this_run: bool,
+) -> btx_core::snapshot::SignedLoad {
+    use btx_core::snapshot::SignedLoad;
+    if mirror_load_launch {
+        SignedLoad::SignedOnly
+    } else if follows_signatures && !failed_this_run {
+        SignedLoad::Mirror
+    } else {
+        SignedLoad::None
+    }
+}
+
+/// The signer decision for one launch, as `(applies_here, key_in_conf)`.
+/// `applies_here` is the host's lasting role, what the window and the
+/// welcome panel say: it checks blocks itself, so it can sign
+/// (`btx_core::node::host_follows_signatures`). `key_in_conf` is this
+/// launch's: a mirror holds no key, a validating node's one-time load launch
+/// included, or the engine refuses to start (v0.34.9 `init.cpp:1729-1731`),
+/// so it follows `btx_core::node::launches_as_mirror`.
+fn signer_for_launch(
+    signer_enabled: bool,
+    host_follows_signatures: bool,
+    launches_as_mirror: bool,
+) -> (bool, bool) {
+    (
+        !host_follows_signatures,
+        signer_enabled && !launches_as_mirror,
+    )
+}
+
+/// What a start does about a validating node's one mirror launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MirrorLoadStep {
+    /// None this start, and any marker goes, so none waits beside a header
+    /// bootstrap (a fresh one would make that launch a mirror).
+    Skip,
+    /// None, because a signing key the app does not manage would stop a
+    /// mirror at init. Any marker goes; the node starts validating and
+    /// loads the compiled snapshot.
+    KeyElsewhere,
+    /// A stopped run's mirror launch, still fresh: this launch runs it again.
+    Resume,
+    /// Look for a pair and, when one is ready, mark this launch.
+    Begin,
+}
+
+/// Pure half of [`prepare_mirror_load`]. `refused_this_run`: a signed load
+/// failed ([`SIGNED_LOAD_FAILED`]), or a refused load was set aside
+/// (`AppState::load_failure_restarted`), in this run of the app.
+fn mirror_load_step(
+    wanted: bool,
+    refused_this_run: bool,
+    key_elsewhere: bool,
+    fresh_marker: bool,
+) -> MirrorLoadStep {
+    if !wanted || refused_this_run {
+        MirrorLoadStep::Skip
+    } else if key_elsewhere {
+        MirrorLoadStep::KeyElsewhere
+    } else if fresh_marker {
+        MirrorLoadStep::Resume
+    } else {
+        MirrorLoadStep::Begin
+    }
+}
+
+/// [`btx_core::node::mirror_load_wanted`], asked of this datadir: the host
+/// checks blocks itself, its next launch is not a header bootstrap (the
+/// marker, or a datadir with no blocks that is about to get one), it never
+/// loaded a snapshot, it holds no snapshot chainstate (`chainstate_snapshot/`,
+/// not the `chainstate/` every node has), and the operator has not said
+/// "never a mirror".
+fn mirror_load_wanted_here(btxd: &Path, datadir: &Path, backend: Backend) -> bool {
+    use btx_core::node;
+    node::mirror_load_wanted(
+        !node::host_follows_signatures(btxd, datadir, backend),
+        node::header_bootstrap_pending(datadir) || node::header_bootstrap_wanted(datadir),
+        NodeAppSettings::load(datadir).snapshot_loaded,
+        datadir.join("chainstate_snapshot").exists(),
+        node::trusted_mirror_override() == Some(false),
+    )
+}
+
+/// The engine's names for a local signing key. It refuses every one of them
+/// on a node that does not run in consensus mode (v0.34.9 `init.cpp:1729-1731`).
+const SIGNING_KEY_OPTIONS: [&str; 3] = [
+    btx_core::signer::SIGNER_KEY_CONF_KEY,
+    "matmulattestationsignerkey",
+    "matmulattestationsignerpqfile",
+];
+
+/// Does a conf the engine reads name a signing key that the start path does
+/// not take out for a mirror launch? Any of [`SIGNING_KEY_OPTIONS`] in
+/// `btx_rw.conf` (the engine loads it on every start, and the app never
+/// writes a key there), or one other than the app's own line in
+/// faststart.conf (the start path removes that one).
+fn signing_key_the_app_does_not_manage(datadir: &Path) -> bool {
+    let conf = datadir.join("faststart").join("faststart.conf");
+    conf_names_any(&datadir.join("btx_rw.conf"), &SIGNING_KEY_OPTIONS)
+        || conf_names_any(&conf, &SIGNING_KEY_OPTIONS[1..])
+}
+
+/// Does `conf` set any of `names` to a value? Read as the engine reads a
+/// conf, the way `btx_core::node::conf_pins` does: a line is cut at the
+/// first `#`, then split at the first `=`, both halves trimmed; the bare
+/// name and the `main.` prefix both count; an empty value sets nothing.
+fn conf_names_any(conf: &Path, names: &[&str]) -> bool {
+    std::fs::read_to_string(conf).is_ok_and(|text| {
+        text.lines().any(|l| {
+            let l = l.split('#').next().unwrap_or("");
+            let Some((name, value)) = l.split_once('=') else {
+                return false;
+            };
+            let name = name.trim();
+            let name = name.strip_prefix("main.").unwrap_or(name);
+            names.contains(&name) && !value.trim().is_empty()
+        })
+    })
+}
+
+/// What the window says when the mirror-load marker cannot be removed. The
+/// node is not started then: the marker would make it run as a mirror.
+const MIRROR_MARKER_STUCK: &str = "easyNode could not remove the file \
+     .load-snapshot-as-mirror from its data folder, so it is not starting the node. Make sure \
+     the data folder can be written to, then start the node again.";
+
+/// Clear the mirror-load marker, or say plainly why the node must not
+/// start: a marker that is still there makes the next launch a mirror.
+fn clear_mirror_marker(datadir: &Path) -> Result<(), String> {
+    btx_core::node::end_mirror_load(datadir);
+    if btx_core::node::mirror_load_marker_exists(datadir) {
+        eprintln!("[node-app] the mirror-load marker could not be removed; not starting the node");
+        setup_log(
+            datadir,
+            "could not remove .load-snapshot-as-mirror; the node is not started",
+        );
+        return Err(MIRROR_MARKER_STUCK.to_string());
+    }
+    Ok(())
+}
+
+/// Before a launch: begin a validating node's one mirror launch when it has
+/// never loaded a snapshot and a signed pair is ready (confirmed, else the
+/// pinned one). Resumes a load a stopped run began; drops any marker when no
+/// mirror launch is wanted. `Ok(true)` when this start wrote the marker. An
+/// `Err` is a plain sentence for the window: a marker that must go and is
+/// still there, which would make this launch a mirror.
+async fn prepare_mirror_load(
+    app: &AppHandle,
+    state: &AppState,
+    btxd: &Path,
+    datadir: &Path,
+) -> Result<bool, String> {
+    use btx_core::node;
+    let step = mirror_load_step(
+        mirror_load_wanted_here(btxd, datadir, node_backend()),
+        SIGNED_LOAD_FAILED.load(Ordering::SeqCst)
+            || state.load_failure_restarted.load(Ordering::SeqCst),
+        signing_key_the_app_does_not_manage(datadir),
+        node::mirror_load_pending(datadir).is_some(),
+    );
+    match step {
+        MirrorLoadStep::Resume => return Ok(false),
+        MirrorLoadStep::Skip => return clear_mirror_marker(datadir).map(|()| false),
+        MirrorLoadStep::KeyElsewhere => {
+            let msg = "a signing key easyNode does not manage is set in btx_rw.conf or \
+                       faststart.conf, and a mirror launch cannot start with it; the node \
+                       starts validating and loads the compiled snapshot";
+            eprintln!("[node-app] {msg}");
+            setup_log(datadir, msg);
+            return clear_mirror_marker(datadir).map(|()| false);
+        }
+        // A marker still there now is stale.
+        MirrorLoadStep::Begin => clear_mirror_marker(datadir)?,
+    }
+    set_phase(
+        app,
+        state,
+        NodePhase::Warming {
+            message: "Looking for a recent snapshot to start from…".to_string(),
+        },
+    )
+    .await;
+    let anchor = snapshot_spec().anchor_height;
+    let view = btx_core::confirmed_snapshot::NodeView {
+        start_height: btx_core::attested_snapshot::fallback_start(anchor),
+        pinned: btx_core::confirmed_snapshot::pinned_keys(&node::BTX_TRUSTED_ATTESTATION_PUBKEYS),
+        ..Default::default()
+    };
+    match btx_core::attested_snapshot::prepare_start(datadir, &view, anchor).await {
+        Some(pair) => match node::begin_mirror_load(datadir, pair.height) {
+            Ok(()) => {
+                setup_log(
+                    datadir,
+                    &format!(
+                        "signed snapshot {} ready: this launch runs as a mirror once to load it",
+                        pair.height
+                    ),
+                );
+                Ok(true)
+            }
+            Err(e) => {
+                eprintln!("[node-app] could not mark the mirror launch: {e}");
+                Ok(false)
+            }
+        },
+        None => {
+            setup_log(
+                datadir,
+                "no signed snapshot to start from; the node starts from the one compiled into its engine",
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// Is this launch the validating node's mirror launch? Only when it was
+/// marked as one (`marked`, read where the key decision was made) and the
+/// node serving now read the marker: one this start launched, or our own
+/// that a stopped run launched with it. A node this start attached to after
+/// writing a new marker never read it, and another app's node is not ours
+/// to restart.
+fn runs_mirror_load(marked: bool, began_this_start: bool, attached: Option<AttachedTo>) -> bool {
+    marked && attached_node_is_ours_to_stop(attached) && !(began_this_start && attached.is_some())
+}
+
+/// What the log says when a validating node's mirror launch ends.
+fn mirror_load_end_message(outcome: &btx_core::snapshot::SnapshotOutcome) -> String {
+    use btx_core::snapshot::SnapshotOutcome as O;
+    match outcome {
+        O::SignedLoaded { height } => format!(
+            "signed snapshot {height} loaded; restarting the node to check new blocks itself"
+        ),
+        O::AlreadyLoaded => {
+            "a snapshot was already loaded; restarting the node to check new blocks itself".into()
+        }
+        O::HeldRootOnChain(why) => format!(
+            "{why}; setting the signed snapshot aside and restarting the node to start from the \
+             compiled one"
+        ),
+        O::CompiledHeldRootOnChain(why) => format!(
+            "{why}; setting the compiled snapshot aside and restarting the node to check new \
+             blocks itself"
+        ),
+        O::NotLoaded(why) => format!(
+            "no signed snapshot loaded ({why}); restarting the node to start from the compiled one"
+        ),
+        O::CompiledLoaded => "restarting the node to check new blocks itself".into(),
+    }
+}
+
+/// What the log says when an ordinary launch loaded a snapshot the app
+/// refuses or cannot vouch for, naming which kind of load it was: the node
+/// restarts (`restart`), or keeps running because a load was already set
+/// aside once in this run. `None` for any other outcome.
+fn refused_load_message(
+    outcome: &btx_core::snapshot::SnapshotOutcome,
+    restart: bool,
+) -> Option<String> {
+    use btx_core::snapshot::SnapshotOutcome as O;
+    let (kind, why, next) = match outcome {
+        O::HeldRootOnChain(why) => (
+            "signed",
+            why,
+            "restarting the node to start from the compiled snapshot",
+        ),
+        O::CompiledHeldRootOnChain(why) => ("compiled", why, "restarting the node"),
+        _ => return None,
+    };
+    Some(if restart {
+        format!("{kind} snapshot load not accepted ({why}); setting it aside and {next}")
+    } else {
+        format!(
+            "{kind} snapshot load not accepted ({why}); a load was already set aside once in \
+             this run, so the node keeps running as it is"
+        )
+    })
+}
+
+/// Move a snapshot chainstate the app refuses aside, and forget it was loaded.
+fn set_aside_refused_snapshot(datadir: &Path) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match btx_core::confirmed_load::set_aside_snapshot_chainstate(datadir, now) {
+        Ok(Some(to)) => setup_log(
+            datadir,
+            &format!("refused snapshot chainstate moved to {}", to.display()),
+        ),
+        Ok(None) => {}
+        Err(e) => eprintln!("[node-app] could not set the refused snapshot aside: {e}"),
+    }
+    NodeAppSettings::update(datadir, |s| s.snapshot_loaded = false);
+    btx_core::snapshot::clear_snapshot_marker(datadir);
+}
+
+/// The datadir half of ending a load, with the node stopped: set a refused
+/// snapshot aside when `set_aside`, then clear the mirror-load marker. An
+/// `Err` is a plain sentence: the marker is still there, and a node started
+/// now would run as a mirror.
+fn finish_load(datadir: &Path, set_aside: bool) -> Result<(), String> {
+    if set_aside {
+        set_aside_refused_snapshot(datadir);
+    }
+    clear_mirror_marker(datadir)
+}
+
+/// What the app does once a background load has come to its outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterLoad {
+    /// Nothing: the node runs on.
+    Nothing,
+    /// Stop the node and start it again as what it is, setting the snapshot
+    /// chainstate aside first when `set_aside`.
+    Restart { set_aside: bool },
+    /// A load the app refuses, after one was already set aside in this run:
+    /// the log says so and the node keeps running as it is (a slow sync).
+    LeaveRunning,
+}
+
+/// Pure half of [`after_snapshot_load`]. A validating node's mirror launch
+/// always ends in a restart, so it never stays a mirror; and
+/// [`prepare_mirror_load`] begins none after a set-aside, so this too is at
+/// most once per run. Any other launch acts only on a load the app refuses,
+/// and at most once per app run (`restarted_this_run`, controller note 3).
+fn after_load_plan(
+    mirror_load_launch: bool,
+    outcome: &btx_core::snapshot::SnapshotOutcome,
+    restarted_this_run: bool,
+) -> AfterLoad {
+    use btx_core::snapshot::SnapshotOutcome as O;
+    let set_aside = matches!(
+        outcome,
+        O::HeldRootOnChain(_) | O::CompiledHeldRootOnChain(_)
+    );
+    if mirror_load_launch {
+        AfterLoad::Restart { set_aside }
+    } else if !set_aside {
+        AfterLoad::Nothing
+    } else if restarted_this_run {
+        AfterLoad::LeaveRunning
+    } else {
+        AfterLoad::Restart { set_aside: true }
+    }
+}
+
+/// Does this outcome end signed loads for this run ([`SIGNED_LOAD_FAILED`])?
+/// A mirror launch that loaded nothing, and a signed load the app refuses on
+/// any launch. Not a compiled load the app refuses: that was no signed load.
+fn signed_load_failed(
+    mirror_load_launch: bool,
+    outcome: &btx_core::snapshot::SnapshotOutcome,
+) -> bool {
+    use btx_core::snapshot::SnapshotOutcome as O;
+    matches!(outcome, O::HeldRootOnChain(_))
+        || (mirror_load_launch && !matches!(outcome, O::SignedLoaded { .. } | O::AlreadyLoaded))
+}
+
+/// Wait for a background load and act on it ([`after_snapshot_load`]). A
+/// plain function, as `spawn_status_refresher` is, so the task it spawns can
+/// restart the node without the start path's future containing itself.
+fn spawn_load_watch(
+    app: AppHandle,
+    handle: tokio::task::JoinHandle<btx_core::snapshot::SnapshotOutcome>,
+    gen: u64,
+    mirror_load_launch: bool,
+) {
+    tauri::async_runtime::spawn(async move {
+        let outcome = handle.await.unwrap_or_else(|e| {
+            btx_core::snapshot::SnapshotOutcome::NotLoaded(format!("the load task ended: {e}"))
+        });
+        let state = app.state::<AppState>();
+        if let Err(e) = after_snapshot_load(&app, &state, gen, mirror_load_launch, outcome).await {
+            eprintln!("[node-app] the restart after a snapshot load failed: {e}");
+        }
+    });
+}
+
+/// After a background load: end a validating node's mirror launch with a
+/// restart as a validating node, or discard a snapshot the app refuses (a
+/// signed or a compiled one) and restart, at most once per app run.
+/// Nothing, when a stop or another restart got here first: the marker then
+/// waits for the next start, which clears it or resumes the load.
+///
+/// The ORDER is the header bootstrap's: stop, then clear the marker, then
+/// start. An app that dies in between leaves the marker, and the next start
+/// resumes the load rather than running a mirror with nothing to say so.
+async fn after_snapshot_load(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    gen: u64,
+    mirror_load_launch: bool,
+    outcome: btx_core::snapshot::SnapshotOutcome,
+) -> Result<(), String> {
+    if signed_load_failed(mirror_load_launch, &outcome) {
+        SIGNED_LOAD_FAILED.store(true, Ordering::SeqCst);
+    }
+    let plan = after_load_plan(
+        mirror_load_launch,
+        &outcome,
+        state.load_failure_restarted.load(Ordering::SeqCst),
+    );
+    let datadir = node_datadir();
+    let set_aside = match plan {
+        AfterLoad::Nothing => return Ok(()),
+        AfterLoad::LeaveRunning => {
+            if let Some(msg) = refused_load_message(&outcome, false) {
+                eprintln!("[node-app] {msg}");
+                setup_log(&datadir, &msg);
+            }
+            return Ok(());
+        }
+        AfterLoad::Restart { set_aside } => set_aside,
+    };
+    if state.refresher_gen.load(Ordering::SeqCst) != gen
+        || state.rpc.lock().await.is_none()
+        || state.quitting.load(Ordering::SeqCst)
+    {
+        let msg = format!(
+            "a snapshot load ended after the node was stopped or restarted, so nothing is \
+             restarted now ({outcome:?})"
+        );
+        eprintln!("[node-app] {msg}");
+        setup_log(&datadir, &msg);
+        return Ok(());
+    }
+    let msg = if mirror_load_launch {
+        mirror_load_end_message(&outcome)
+    } else {
+        refused_load_message(&outcome, true).unwrap_or_default()
+    };
+    eprintln!("[node-app] {msg}");
+    setup_log(&datadir, &msg);
+    if set_aside {
+        state.load_failure_restarted.store(true, Ordering::SeqCst);
+    }
+    stop_node_inner(state).await;
+    set_phase(app, state, NodePhase::Stopped).await;
+    if let Err(message) = finish_load(&datadir, set_aside) {
+        set_phase(
+            app,
+            state,
+            NodePhase::Error {
+                message: message.clone(),
+            },
+        )
+        .await;
+        return Err(message);
+    }
+    start_node_projected(app, state).await
+}
+
 #[tauri::command]
 pub async fn start_node(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     if state.rpc.lock().await.is_some() {
@@ -5466,4 +5959,430 @@ pub async fn remove_node_data_now(
 pub async fn open_global_stats() -> Result<(), String> {
     const URL: &str = "https://btxprice.com/stats";
     btx_core::platform::open_url(URL).map_err(|e| format!("couldn't open the stats page: {e}"))
+}
+
+#[cfg(test)]
+mod signed_start_tests {
+    use super::{
+        after_load_plan, clear_mirror_marker, mirror_load_end_message, mirror_load_step,
+        mirror_load_wanted_here, nominal_btxd_path, refused_load_message, runs_mirror_load,
+        signed_load_failed, signed_load_for, signer_for_launch,
+        signing_key_the_app_does_not_manage, AfterLoad, AttachedTo, MirrorLoadStep,
+    };
+    use crate::state::NodeAppSettings;
+    use btx_core::backend::Backend;
+    use btx_core::confirmed_load::LoadError;
+    use btx_core::node;
+    use btx_core::snapshot::{SignedLoad, SnapshotOutcome};
+
+    #[test]
+    fn each_launch_makes_the_signed_load_its_node_can_make() {
+        assert_eq!(signed_load_for(true, false, false), SignedLoad::SignedOnly);
+        assert_eq!(signed_load_for(true, true, true), SignedLoad::SignedOnly);
+        assert_eq!(signed_load_for(false, true, false), SignedLoad::Mirror);
+        assert_eq!(
+            signed_load_for(false, true, true),
+            SignedLoad::None,
+            "a mirror whose signed load failed this run takes the compiled one"
+        );
+        assert_eq!(signed_load_for(false, false, false), SignedLoad::None);
+    }
+    #[test]
+    fn the_end_of_a_mirror_launch_says_what_happens_next() {
+        let loaded = mirror_load_end_message(&SnapshotOutcome::SignedLoaded { height: 232_000 });
+        assert!(
+            loaded.contains("232000") && loaded.contains("check new blocks itself"),
+            "{loaded}"
+        );
+        let none = mirror_load_end_message(&SnapshotOutcome::NotLoaded("HTTP 404".into()));
+        assert!(
+            none.contains("HTTP 404") && none.contains("compiled"),
+            "{none}"
+        );
+        let held = mirror_load_end_message(&SnapshotOutcome::HeldRootOnChain("block x".into()));
+        assert!(held.contains("aside"), "{held}");
+        for m in [loaded, none, held] {
+            assert!(!m.contains('\u{2014}'), "no em-dash: {m}");
+        }
+    }
+
+    fn held() -> SnapshotOutcome {
+        SnapshotOutcome::HeldRootOnChain(
+            LoadError::HeldRootOnChain {
+                height: 227_313,
+                root: "ab".repeat(32),
+            }
+            .to_string(),
+        )
+    }
+
+    fn compiled_held() -> SnapshotOutcome {
+        SnapshotOutcome::CompiledHeldRootOnChain(
+            LoadError::EngineUnanswered("error: Could not connect to the server".into())
+                .to_string(),
+        )
+    }
+
+    /// A datadir that has run its header bootstrap: `blocks/` and
+    /// `chainstate/` exist (every node has both), no snapshot yet.
+    fn fresh_validating_datadir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("blocks")).unwrap();
+        std::fs::create_dir_all(dir.path().join("chainstate")).unwrap();
+        dir
+    }
+
+    /// Controller note 3: at most one stop, set-aside and restart for a
+    /// refused load per app run. A second refused load is logged and the
+    /// node keeps running; and after one, no mirror launch begins either, so
+    /// no later launch in the run can need another.
+    #[test]
+    fn a_second_refused_load_in_one_run_does_not_restart_the_node() {
+        for refused in [held(), compiled_held()] {
+            assert_eq!(
+                after_load_plan(false, &refused, false),
+                AfterLoad::Restart { set_aside: true },
+                "{refused:?}"
+            );
+            assert_eq!(
+                after_load_plan(false, &refused, true),
+                AfterLoad::LeaveRunning,
+                "{refused:?}"
+            );
+            let m = refused_load_message(&refused, false).unwrap();
+            assert!(m.contains("keeps running"), "{m}");
+            assert!(!m.contains('\u{2014}'), "no em-dash: {m}");
+        }
+        assert_eq!(
+            refused_load_message(&SnapshotOutcome::CompiledLoaded, false),
+            None
+        );
+        for fresh_marker in [false, true] {
+            assert_eq!(
+                mirror_load_step(true, true, false, fresh_marker),
+                MirrorLoadStep::Skip
+            );
+        }
+    }
+
+    /// Controller note 2: a compiled load the engine may hold and the app
+    /// cannot vouch for is stopped and set aside exactly like a signed one,
+    /// but it is not a failed signed load, and the log says which it was.
+    #[test]
+    fn a_refused_compiled_load_is_set_aside_but_not_called_a_signed_one() {
+        assert_eq!(
+            after_load_plan(false, &compiled_held(), false),
+            after_load_plan(false, &held(), false)
+        );
+        assert!(signed_load_failed(false, &held()));
+        assert!(!signed_load_failed(false, &compiled_held()));
+        for restart in [true, false] {
+            let signed = refused_load_message(&held(), restart).unwrap();
+            assert!(signed.starts_with("signed snapshot load"), "{signed}");
+            let compiled = refused_load_message(&compiled_held(), restart).unwrap();
+            assert!(compiled.starts_with("compiled snapshot load"), "{compiled}");
+            assert!(!compiled.contains("signed"), "{compiled}");
+            for m in [signed, compiled] {
+                assert!(!m.contains('\u{2014}'), "no em-dash: {m}");
+            }
+        }
+        // A validating node's mirror launch makes only a signed load, and
+        // says so.
+        let end = mirror_load_end_message(&held());
+        assert!(end.contains("signed snapshot aside"), "{end}");
+    }
+
+    /// Controller note 1: a check after the load that went unanswered is
+    /// treated as a refused block on the chain: same plan, and the chain
+    /// data goes aside the same way.
+    #[test]
+    fn a_post_load_check_unavailable_sets_the_chain_data_aside_like_a_held_root() {
+        let unavailable = SnapshotOutcome::HeldRootOnChain(
+            LoadError::PostLoadCheckUnavailable {
+                height: 227_313,
+                root: "ab".repeat(32),
+                why: "connection refused".into(),
+            }
+            .to_string(),
+        );
+        for mirror_load_launch in [true, false] {
+            assert_eq!(
+                after_load_plan(mirror_load_launch, &unavailable, false),
+                after_load_plan(mirror_load_launch, &held(), false)
+            );
+            assert_eq!(
+                after_load_plan(mirror_load_launch, &unavailable, false),
+                AfterLoad::Restart { set_aside: true }
+            );
+            assert_eq!(
+                signed_load_failed(mirror_load_launch, &unavailable),
+                signed_load_failed(mirror_load_launch, &held())
+            );
+        }
+        let dir = fresh_validating_datadir();
+        let snap = dir.path().join("chainstate_snapshot");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("attested_assumeutxo"), b"x").unwrap();
+        NodeAppSettings::update(dir.path(), |s| s.snapshot_loaded = true);
+        node::begin_mirror_load(dir.path(), 232_000).unwrap();
+        super::finish_load(dir.path(), true).unwrap();
+        assert!(!snap.exists(), "the refused chainstate is set aside");
+        let aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("chainstate_snapshot.refused-")
+            })
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert!(!NodeAppSettings::load(dir.path()).snapshot_loaded);
+        assert!(!node::mirror_load_marker_exists(dir.path()));
+    }
+
+    /// A validating node never stays a mirror: its one mirror launch ends
+    /// in a restart whatever the load came to, and setting aside only what
+    /// the app refuses. Anything but a load on that launch is a failed
+    /// signed load, so nothing tries again until the app restarts.
+    #[test]
+    fn a_mirror_launch_always_ends_with_a_validating_restart() {
+        let outcomes = [
+            (
+                SnapshotOutcome::SignedLoaded { height: 232_000 },
+                false,
+                false,
+            ),
+            (SnapshotOutcome::AlreadyLoaded, false, false),
+            (SnapshotOutcome::NotLoaded("HTTP 404".into()), false, true),
+            (held(), true, true),
+        ];
+        for (outcome, set_aside, failed) in outcomes {
+            for restarted_this_run in [false, true] {
+                assert_eq!(
+                    after_load_plan(true, &outcome, restarted_this_run),
+                    AfterLoad::Restart { set_aside },
+                    "{outcome:?}"
+                );
+            }
+            assert_eq!(signed_load_failed(true, &outcome), failed, "{outcome:?}");
+        }
+        // An ordinary launch acts only on what it must set aside.
+        for outcome in [
+            SnapshotOutcome::SignedLoaded { height: 232_000 },
+            SnapshotOutcome::AlreadyLoaded,
+            SnapshotOutcome::CompiledLoaded,
+            SnapshotOutcome::NotLoaded("no snapshot.dat".into()),
+        ] {
+            assert_eq!(after_load_plan(false, &outcome, false), AfterLoad::Nothing);
+            assert!(!signed_load_failed(false, &outcome), "{outcome:?}");
+        }
+    }
+
+    /// Controller note 4 (e): a marker that cannot be removed stops the
+    /// restart with a plain sentence, so the node is never started again as
+    /// a mirror by mistake.
+    #[test]
+    fn a_marker_that_will_not_go_stops_the_restart() {
+        let dir = fresh_validating_datadir();
+        node::begin_mirror_load(dir.path(), 232_000).unwrap();
+        super::finish_load(dir.path(), false).unwrap();
+        assert!(!node::mirror_load_marker_exists(dir.path()));
+
+        // A directory where the marker should be: removing it as a file fails.
+        let stuck = fresh_validating_datadir();
+        let marker = stuck.path().join(".load-snapshot-as-mirror");
+        std::fs::create_dir_all(marker.join("held")).unwrap();
+        assert!(node::mirror_load_marker_exists(stuck.path()));
+        let e = super::finish_load(stuck.path(), false).unwrap_err();
+        assert!(e.contains("data folder"), "{e}");
+        assert!(!e.contains('\u{2014}'), "no em-dash: {e}");
+        assert_eq!(clear_mirror_marker(stuck.path()), Err(e));
+    }
+
+    /// Controller note 4 (a) and (b): the load launch takes the key out of
+    /// the conf (a mirror holding a key dies at init), but the host's
+    /// lasting role stays "checks blocks itself", so the window never says
+    /// it cannot sign.
+    #[test]
+    fn the_load_launch_takes_the_key_out_but_keeps_the_role() {
+        let dir = fresh_validating_datadir();
+        let btxd = nominal_btxd_path();
+        let decide = |dir: &std::path::Path| {
+            signer_for_launch(
+                true,
+                node::host_follows_signatures(&btxd, dir, Backend::Metal),
+                node::launches_as_mirror(&btxd, dir, Backend::Metal),
+            )
+        };
+        assert_eq!(decide(dir.path()), (true, true), "an ordinary launch");
+        node::begin_mirror_load(dir.path(), 232_000).unwrap();
+        assert_eq!(decide(dir.path()), (true, false), "the load launch");
+        // A host that follows signatures: never a key, and the window says so.
+        assert_eq!(signer_for_launch(true, true, true), (false, false));
+        // The switch off: no key anywhere.
+        assert_eq!(signer_for_launch(false, false, false), (true, false));
+    }
+
+    /// Controller note 4 (a) and (b), in the code: the marker is decided
+    /// before the signer block reads `launches_as_mirror` and writes the key
+    /// line, and the lasting-role callers ask `host_follows_signatures`.
+    #[test]
+    fn the_mirror_launch_is_decided_before_the_signing_key_goes_in_or_out() {
+        let src = include_str!("commands.rs");
+        let body = src
+            .split("pub(crate) async fn start_node_inner(")
+            .nth(1)
+            .and_then(|s| s.split("\nasync fn spawn_node_with_lock_retry(").next())
+            .unwrap();
+        let prepare = body.find("prepare_mirror_load(app, state").unwrap();
+        let mirror = body.find("node::launches_as_mirror(&paths.btxd").unwrap();
+        let key_line = body.find("signer::SIGNER_KEY_CONF_KEY").unwrap();
+        assert!(prepare < mirror && prepare < key_line);
+        let role = body
+            .find("node::host_follows_signatures(&paths.btxd")
+            .unwrap();
+        assert!(
+            role < body
+                .find("*state.signer_applies_here.lock().await =")
+                .unwrap()
+        );
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("node::host_follows_signatures("));
+        assert!(!lib.contains("node::launches_as_mirror("));
+    }
+
+    /// Controller note 4 (a): a signing key the app does not manage (one in
+    /// btx_rw.conf, or a kind the app never writes) would stop the mirror
+    /// launch at init, so there is none: the node starts validating.
+    #[test]
+    fn a_signing_key_the_app_does_not_manage_keeps_the_node_off_the_mirror_launch() {
+        let dir = fresh_validating_datadir();
+        let rw = dir.path().join("btx_rw.conf");
+        let conf = dir.path().join("faststart").join("faststart.conf");
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        assert!(!signing_key_the_app_does_not_manage(dir.path()));
+        // The app's own line in its own conf: the start path takes it out.
+        std::fs::write(
+            &conf,
+            "matmulattestationsignerkeyfile=attestation-signer.key\n",
+        )
+        .unwrap();
+        assert!(!signing_key_the_app_does_not_manage(dir.path()));
+        for (file, text, found) in [
+            (&rw, "matmulattestationsignerkeyfile=k.key\n", true),
+            (
+                &rw,
+                "  main.matmulattestationsignerkey = L1abc # hand-set\n",
+                true,
+            ),
+            (&rw, "matmulattestationsignerpqfile=pq.key\n", true),
+            (&rw, "# matmulattestationsignerkeyfile=k.key\n", false),
+            (&rw, "matmulattestationsignerkeyfile= # none yet\n", false),
+            (&rw, "matmulattestationsignerkeyfile=\n", false),
+            (&conf, "matmulattestationsignerpqfile=pq.key\n", true),
+            (&conf, "matmulattestationsignerkey=L1abc\n", true),
+        ] {
+            std::fs::write(file, text).unwrap();
+            assert_eq!(
+                signing_key_the_app_does_not_manage(dir.path()),
+                found,
+                "{}: {text:?}",
+                file.display()
+            );
+            std::fs::write(file, "").unwrap();
+        }
+        // Even a stopped run's launch does not resume.
+        assert_eq!(
+            mirror_load_step(true, false, true, true),
+            MirrorLoadStep::KeyElsewhere
+        );
+    }
+
+    /// Controller note 4 (c): wanted only on a host that checks blocks
+    /// itself, past its header bootstrap, that never loaded a snapshot and
+    /// holds no snapshot chainstate (`chainstate_snapshot/`, not the
+    /// `chainstate/` every node has).
+    #[test]
+    fn the_mirror_launch_is_wanted_only_on_a_fresh_validating_node() {
+        let btxd = nominal_btxd_path();
+        let dir = fresh_validating_datadir();
+        let d = dir.path();
+        assert!(mirror_load_wanted_here(&btxd, d, Backend::Metal));
+        assert!(
+            !mirror_load_wanted_here(&btxd, d, Backend::Cpu),
+            "follows signatures"
+        );
+
+        std::fs::create_dir_all(d.join("chainstate_snapshot")).unwrap();
+        assert!(!mirror_load_wanted_here(&btxd, d, Backend::Metal));
+        std::fs::remove_dir_all(d.join("chainstate_snapshot")).unwrap();
+
+        node::begin_header_bootstrap(d);
+        assert!(!mirror_load_wanted_here(&btxd, d, Backend::Metal));
+        node::end_header_bootstrap(d);
+
+        std::fs::remove_dir_all(d.join("blocks")).unwrap();
+        assert!(
+            !mirror_load_wanted_here(&btxd, d, Backend::Metal),
+            "bootstrap next"
+        );
+        std::fs::create_dir_all(d.join("blocks")).unwrap();
+
+        NodeAppSettings::update(d, |s| s.snapshot_loaded = true);
+        assert!(!mirror_load_wanted_here(&btxd, d, Backend::Metal));
+    }
+
+    /// Controller note 4 (d): whenever no mirror launch is wanted, any
+    /// marker goes, so none ever sits beside `.header-bootstrap`; and a
+    /// fresh one of a stopped run resumes only when one is still wanted.
+    #[test]
+    fn a_marker_never_waits_beside_a_header_bootstrap() {
+        for fresh_marker in [false, true] {
+            assert_eq!(
+                mirror_load_step(false, false, false, fresh_marker),
+                MirrorLoadStep::Skip
+            );
+            assert_eq!(
+                mirror_load_step(true, true, false, fresh_marker),
+                MirrorLoadStep::Skip,
+                "a signed load failed or a load was set aside this run"
+            );
+        }
+        assert_eq!(
+            mirror_load_step(true, false, false, true),
+            MirrorLoadStep::Resume
+        );
+        assert_eq!(
+            mirror_load_step(true, false, false, false),
+            MirrorLoadStep::Begin
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        node::begin_mirror_load(dir.path(), 232_000).unwrap();
+        assert!(node::mirror_load_pending(dir.path()).is_some());
+        // No blocks: the next launch is a header bootstrap.
+        assert!(!mirror_load_wanted_here(
+            &nominal_btxd_path(),
+            dir.path(),
+            Backend::Metal
+        ));
+        assert_eq!(clear_mirror_marker(dir.path()), Ok(()));
+        assert!(!node::mirror_load_marker_exists(dir.path()));
+    }
+
+    /// Only a node that read the marker runs the mirror load: one this start
+    /// launched, or our own that a stopped run launched with it. A node this
+    /// start attached to after writing a new marker never read it, and
+    /// another app's node is not ours to restart.
+    #[test]
+    fn only_a_node_that_read_the_marker_runs_the_mirror_load() {
+        assert!(runs_mirror_load(true, true, None), "launched by this start");
+        assert!(runs_mirror_load(true, false, None));
+        assert!(runs_mirror_load(true, false, Some(AttachedTo::OurOrphan)));
+        assert!(runs_mirror_load(true, false, Some(AttachedTo::Unknown)));
+        assert!(!runs_mirror_load(true, true, Some(AttachedTo::OurOrphan)));
+        assert!(!runs_mirror_load(true, false, Some(AttachedTo::AnotherApp)));
+        assert!(!runs_mirror_load(false, false, None));
+    }
 }

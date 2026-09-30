@@ -140,14 +140,16 @@ pub fn run() {
             }
             // And the signer role, for the same population and the same
             // reason, with one more fact in hand: whether this host can sign
-            // at all. The rule is the launch's own (`launches_as_mirror`),
-            // asked of the engine tag this build ships, since the binary's
-            // real path is not known until the start path resolves it and the
-            // rule reads only the tag. On 2026-09-16 every mirror on the
-            // network was following one key on one home computer; this is
-            // what asks every node with a capable card to do the same job.
-            // See `NodeAppSettings::migrate_signer`.
-            let applies_here = !btx_core::node::launches_as_mirror(
+            // at all. The rule is the host's lasting role
+            // (`host_follows_signatures`, the launch's own rule without a
+            // validating node's one-time mirror launch, which says nothing
+            // about whether the host can sign), asked of the engine tag this
+            // build ships, since the binary's real path is not known until
+            // the start path resolves it and the rule reads only the tag. On
+            // 2026-09-16 every mirror on the network was following one key on
+            // one home computer; this is what asks every node with a capable
+            // card to do the same job. See `NodeAppSettings::migrate_signer`.
+            let applies_here = !btx_core::node::host_follows_signatures(
                 &commands::nominal_btxd_path(),
                 &node_datadir(),
                 btx_core::backend::node_host_backend(),

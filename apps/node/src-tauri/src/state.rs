@@ -425,8 +425,8 @@ impl NodeAppSettings {
 
     /// Turn signing on for an install that was never asked, once.
     ///
-    /// `applies_here` is whether this host will launch as a validator (the
-    /// only place a key signs anything, `btx_core::node::launches_as_mirror`
+    /// `applies_here` is whether this host checks blocks itself (the only
+    /// place a key signs anything, `btx_core::node::host_follows_signatures`
     /// negated). The setting is recorded either way, so a machine that later
     /// gains a card signs without being asked again; the welcome panel is
     /// armed only where the change means something today, because a panel
@@ -611,6 +611,13 @@ pub struct AppState {
     /// the async shutdown already ran and can let the exit proceed instead of
     /// blocking the main thread a second time (the old force-quit-inducing hang).
     pub quitting: Arc<AtomicBool>,
+    /// Set when the start path's load watch stopped the node, set a snapshot
+    /// it refuses aside and restarted it (`commands::after_snapshot_load`).
+    /// Once per run of the app, so a load that keeps failing cannot restart
+    /// the node in a loop: a second refused load in the same run is logged
+    /// and the node keeps running as it is, and no mirror launch begins after
+    /// one. Never reset; the next run of the app starts with a new state.
+    pub load_failure_restarted: Arc<AtomicBool>,
     /// btxd's MatMul RC execution verdict for the CURRENT node run, remembered
     /// once observed: `(policy, stalled)`.
     ///
@@ -662,7 +669,9 @@ pub struct AppState {
     /// point from a file every second. `None` when there is no readable key.
     pub signer_pubkey: Arc<Mutex<Option<String>>>,
     /// Whether the last start decided this host validates (a key can sign)
-    /// or mirrors (it cannot), from `btx_core::node::launches_as_mirror`.
+    /// or mirrors (it cannot), from `btx_core::node::host_follows_signatures`:
+    /// the host's lasting role, so a validating node's one-time mirror launch
+    /// that loads a signed snapshot still reads as a host that can sign.
     /// `None` before the first start of this app run.
     pub signer_applies_here: Arc<Mutex<Option<bool>>>,
     /// What happened to the last attempt to offer this node's public signing
@@ -781,6 +790,7 @@ impl AppState {
             attached_to: Arc::new(Mutex::new(None)),
             refresher_gen: Arc::new(AtomicU64::new(0)),
             quitting: Arc::new(AtomicBool::new(false)),
+            load_failure_restarted: Arc::new(AtomicBool::new(false)),
             rc_status_cache: Arc::new(Mutex::new(None)),
             stall_verdict: Arc::new(Mutex::new(None)),
             archive_service: Arc::new(Mutex::new(None)),
