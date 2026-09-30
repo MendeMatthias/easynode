@@ -639,8 +639,10 @@ pub enum SnapshotOutcome {
     NotLoaded(String),
     /// The engine may hold a snapshot the app refuses or cannot vouch for:
     /// a signed load put a refused block on the chain, the check after it
-    /// went unanswered, or a load (signed or compiled) that btx-cli brought
-    /// back no answer for is not then active and clean on the node
+    /// went unanswered, a signed load that btx-cli brought back no answer
+    /// for is not then active and clean on the node, or a compiled one is
+    /// followed by a snapshot chainstate that is not active and clean, or
+    /// by a node that does not say
     /// (`crate::confirmed_load::LoadError::restore_chain_data`). The caller
     /// stops the node and sets the snapshot chainstate aside.
     HeldRootOnChain(String),
@@ -785,10 +787,11 @@ async fn record_engine_start(rpc: &dyn Rpc, datadir: &Path, anchor_height: u64) 
 }
 
 /// What a compiled `loadtxoutset` came to. A load btx-cli brought back no
-/// answer for counts only the way a signed one does
-/// (`crate::confirmed_load::unanswered_compiled_load_counts`); otherwise the
-/// engine may hold a snapshot the app cannot vouch for, and the caller sets
-/// the chain data aside.
+/// answer for counts only the way a signed one does, and one after which the
+/// node shows no snapshot chainstate at all loaded nothing
+/// (`crate::confirmed_load::unanswered_compiled_load`); otherwise the engine
+/// may hold a snapshot the app cannot vouch for, and the caller sets the
+/// chain data aside.
 async fn after_compiled_load(
     rpc: &dyn Rpc,
     datadir: &Path,
@@ -815,26 +818,36 @@ async fn after_compiled_load(
             eprintln!("[snapshot] loadtxoutset failed (non-fatal): {e}");
             SnapshotOutcome::NotLoaded(e)
         }
-        LoadOutcome::NoAnswer(e) => {
-            match crate::confirmed_load::unanswered_compiled_load_counts(
-                rpc,
-                anchor_height,
-                holds,
-                e,
-            )
-            .await
-            {
-                Ok(()) => {
+        LoadOutcome::NoAnswer(lost) => {
+            use crate::confirmed_load::{unanswered_compiled_load, UnansweredCompiledLoad};
+            match unanswered_compiled_load(rpc, anchor_height, holds, &lost).await {
+                Ok(UnansweredCompiledLoad::Loaded) => {
                     eprintln!(
                         "[snapshot] loadtxoutset gave no answer, but the node shows the \
                          snapshot active and clean"
                     );
                     compiled_loaded(rpc, datadir, anchor_height, flags).await
                 }
+                Ok(UnansweredCompiledLoad::NothingLoaded) => {
+                    eprintln!(
+                        "[snapshot] compiled snapshot load got no answer and nothing was \
+                         loaded; syncing normally (btx-cli: {lost})"
+                    );
+                    SnapshotOutcome::NotLoaded(format!(
+                        "compiled snapshot load got no answer and nothing was loaded: {lost}"
+                    ))
+                }
                 Err(e) if e.restore_chain_data() => {
                     eprintln!("[snapshot] {e}");
                     SnapshotOutcome::HeldRootOnChain(e.to_string())
                 }
+                // Cannot run: every error `unanswered_compiled_load` returns
+                // has `restore_chain_data` (`EngineUnanswered`, or the
+                // held-root check's `HeldRootOnChain` and
+                // `PostLoadCheckUnavailable`), so the arm above takes it. It
+                // is here because that guard does not make the match
+                // exhaustive. A `LoadError` without `restore_chain_data`
+                // leaves the chainstate as it was, which is `NotLoaded`.
                 Err(e) => {
                     eprintln!("[snapshot] loadtxoutset failed (non-fatal): {e}");
                     SnapshotOutcome::NotLoaded(e.to_string())
@@ -1578,14 +1591,16 @@ mod tests {
         why: "a test hold",
     }];
 
-    /// A node just after a compiled `loadtxoutset` btx-cli brought back no
-    /// answer for.
+    /// A node just after a compiled `loadtxoutset`.
+    #[derive(Default)]
     struct AfterLoad {
         /// The snapshot chainstate it shows: its base, and the height its
         /// header says that base is at.
         snapshot: Option<(&'static str, u64)>,
         /// The block its chain has at the held height, if it reaches it.
         at_held: Option<&'static str>,
+        /// Methods it does not answer, as a node that went away.
+        silent: &'static [&'static str],
     }
 
     #[async_trait::async_trait]
@@ -1597,6 +1612,9 @@ mod tests {
         ) -> crate::error::AppResult<serde_json::Value> {
             use crate::error::AppError;
             use serde_json::json;
+            if self.silent.contains(&method) {
+                return Err(AppError::Http("connection refused".into()));
+            }
             match method {
                 "getchainstates" => {
                     let mut states = vec![json!({"blocks": 0, "validated": true})];
@@ -1644,6 +1662,66 @@ mod tests {
         )
     }
 
+    /// A compiled load the engine answered for marks the snapshot loaded for
+    /// reclaim (the flag and the shared marker) and records where the node
+    /// started: the base the engine names, as the engine's, with no names.
+    #[tokio::test]
+    async fn a_compiled_load_marks_the_flag_and_records_the_engines_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let flag = Flag(AtomicBool::new(false));
+        let node = AfterLoad {
+            snapshot: Some((BASE_219000, 219_000)),
+            ..Default::default()
+        };
+        let outcome = after_compiled_load(
+            &node,
+            dir.path(),
+            219_000,
+            &flag,
+            &test_holds(),
+            LoadOutcome::Loaded,
+        )
+        .await;
+        assert_eq!(outcome, SnapshotOutcome::CompiledLoaded);
+        assert!(flag.loaded());
+        assert!(snapshot_marker_present(dir.path()));
+        assert_eq!(
+            crate::snapshot_start::read(dir.path()),
+            Some(crate::snapshot_start::StartRecord {
+                height: 219_000,
+                block_hash: BASE_219000.into(),
+                source: crate::snapshot_start::StartSource::Engine,
+                operators: vec![],
+            })
+        );
+    }
+
+    /// A signed load, or a snapshot chainstate that turned up while one was
+    /// waiting for its headers, marks the snapshot loaded for reclaim, on
+    /// either launch that loads a signed one.
+    #[test]
+    fn a_signed_load_and_a_snapshot_found_mark_the_flag() {
+        for mode in [SignedLoad::Mirror, SignedLoad::SignedOnly] {
+            for (signed, want) in [
+                (
+                    Signed::Loaded(233_800),
+                    SnapshotOutcome::SignedLoaded { height: 233_800 },
+                ),
+                (Signed::AlreadyLoaded, SnapshotOutcome::AlreadyLoaded),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let flag = Flag(AtomicBool::new(false));
+                assert_eq!(
+                    after_signed_load(signed, mode, &flag, dir.path()),
+                    Some(want.clone()),
+                    "{mode:?}"
+                );
+                assert!(flag.loaded(), "{mode:?} {want:?}");
+                assert!(snapshot_marker_present(dir.path()), "{mode:?} {want:?}");
+            }
+        }
+    }
+
     /// A compiled load nobody answered for counts only the way a signed one
     /// does: the node then shows the snapshot based at the anchor, and no
     /// refused block is on its chain. Then it is loaded, and recorded as the
@@ -1654,7 +1732,7 @@ mod tests {
         let flag = Flag(AtomicBool::new(false));
         let node = AfterLoad {
             snapshot: Some((BASE_219000, 219_000)),
-            at_held: None,
+            ..Default::default()
         };
         let outcome = after_compiled_load(
             &node,
@@ -1674,25 +1752,53 @@ mod tests {
         );
     }
 
-    /// Otherwise the engine may hold a snapshot the app cannot vouch for: the
-    /// caller stops the node and sets the chain data aside, as after a signed
-    /// load that put a refused block on the chain, and nothing says it
-    /// loaded.
+    /// A compiled load nobody answered for, on a node that answers and shows
+    /// no snapshot chainstate at all, loaded nothing: the node syncs
+    /// normally, and nothing is set aside. Otherwise a btx-cli that never
+    /// reaches the engine (a refused login, "Could not connect") would have
+    /// the node stopped, set aside and restarted on every launch. The
+    /// compiled snapshot is the engine's own, below every refused block
+    /// (`the_compiled_base_is_below_every_refused_block`).
+    #[tokio::test]
+    async fn an_unanswered_compiled_load_with_no_snapshot_chainstate_loaded_nothing() {
+        let refused_login = LoadOutcome::NoAnswer(
+            "error: Authorization failed: Incorrect rpcuser or rpcpassword".into(),
+        );
+        for lost in [no_answer(), refused_login] {
+            let dir = tempfile::tempdir().unwrap();
+            let flag = Flag(AtomicBool::new(false));
+            let outcome = after_compiled_load(
+                &AfterLoad::default(),
+                dir.path(),
+                219_000,
+                &flag,
+                &test_holds(),
+                lost,
+            )
+            .await;
+            assert!(
+                matches!(&outcome, SnapshotOutcome::NotLoaded(why) if why.contains("nothing was loaded")),
+                "{outcome:?}"
+            );
+            assert!(!flag.loaded());
+            assert!(!snapshot_marker_present(dir.path()));
+            assert_eq!(crate::snapshot_start::read(dir.path()), None);
+        }
+    }
+
+    /// Otherwise the engine may hold a snapshot the app cannot vouch for: a
+    /// snapshot chainstate based somewhere else, one with a refused block on
+    /// its chain, or a node that does not say. The caller stops the node and
+    /// sets the chain data aside, as after a signed load that put a refused
+    /// block on the chain, and nothing says it loaded.
     #[tokio::test]
     async fn an_unanswered_compiled_load_the_node_does_not_vouch_for_sets_the_chain_aside() {
         let another = "1111111111111111111111111111111111111111111111111111111111111111";
         for (node, case) in [
             (
                 AfterLoad {
-                    snapshot: None,
-                    at_held: None,
-                },
-                "no snapshot chainstate",
-            ),
-            (
-                AfterLoad {
                     snapshot: Some((another, 203_000)),
-                    at_held: None,
+                    ..Default::default()
                 },
                 "a snapshot based somewhere else",
             ),
@@ -1700,8 +1806,25 @@ mod tests {
                 AfterLoad {
                     snapshot: Some((BASE_219000, 219_000)),
                     at_held: Some(TEST_ROOT),
+                    ..Default::default()
                 },
                 "a refused block on the chain",
+            ),
+            (
+                AfterLoad {
+                    snapshot: Some((BASE_219000, 219_000)),
+                    silent: &["getchainstates"],
+                    ..Default::default()
+                },
+                "getchainstates unanswered",
+            ),
+            (
+                AfterLoad {
+                    snapshot: Some((BASE_219000, 219_000)),
+                    silent: &["getblockheader"],
+                    ..Default::default()
+                },
+                "the snapshot's base unanswered",
             ),
         ] {
             let dir = tempfile::tempdir().unwrap();
@@ -1731,13 +1854,9 @@ mod tests {
     async fn a_compiled_load_the_engine_refused_is_not_loaded() {
         let dir = tempfile::tempdir().unwrap();
         let flag = Flag(AtomicBool::new(false));
-        let node = AfterLoad {
-            snapshot: None,
-            at_held: None,
-        };
         let refused = "error code: -32603\nerror message:\nUnable to load UTXO snapshot";
         let outcome = after_compiled_load(
-            &node,
+            &AfterLoad::default(),
             dir.path(),
             219_000,
             &flag,
@@ -1748,6 +1867,39 @@ mod tests {
         assert_eq!(outcome, SnapshotOutcome::NotLoaded(refused.into()));
         assert!(!flag.loaded());
         assert!(!snapshot_marker_present(dir.path()));
+    }
+
+    /// A compiled load the engine answered for gets no refused-block check
+    /// after it (`after_compiled_load`'s `Loaded` arm), and one nobody
+    /// answered for with no snapshot chainstate to show loaded nothing. Both
+    /// are safe only while the compiled base sits below every block the app
+    /// refuses (the lists `Holds::compiled()` hands the loader): right after
+    /// the load the chain reaches none of them. An engine bump whose compiled
+    /// anchor is at or above one of them fails here, and in the app's
+    /// `the_pinned_compiled_base_is_below_every_refused_block`, until someone
+    /// adds a check for refused blocks after the compiled load, as a signed
+    /// load has.
+    #[test]
+    fn the_compiled_base_is_below_every_refused_block() {
+        use crate::known_invalid::{HELD_BRANCHES, KNOWN_INVALID_BLOCKS};
+        let refused: Vec<u64> = KNOWN_INVALID_BLOCKS
+            .iter()
+            .map(|b| b.height)
+            .chain(HELD_BRANCHES.iter().map(|h| h.height))
+            .collect();
+        assert!(
+            !refused.is_empty(),
+            "no refused blocks: this test checks nothing"
+        );
+        let anchor = v0_34_9_spec().anchor_height;
+        assert_eq!(anchor, 219_000);
+        for height in refused {
+            assert!(
+                anchor < height,
+                "the compiled base {anchor} is not below the refused block at {height}: \
+                 check for refused blocks after a compiled load before moving the pin"
+            );
+        }
     }
 
     #[tokio::test]

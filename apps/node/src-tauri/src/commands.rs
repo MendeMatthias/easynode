@@ -5298,6 +5298,36 @@ mod tests {
         );
     }
 
+    /// `btx_core::snapshot` does not check for refused blocks after a
+    /// compiled load the engine answered for, and takes one nobody answered
+    /// for with no snapshot chainstate to show as loading nothing. Both are
+    /// safe only while the pinned base sits below every block the app
+    /// refuses: right after the load the chain reaches none of them. An
+    /// engine bump that moves the pin to or past one of them fails here until
+    /// the compiled load checks for refused blocks after it, as a signed load
+    /// does.
+    #[test]
+    fn the_pinned_compiled_base_is_below_every_refused_block() {
+        use btx_core::known_invalid::{HELD_BRANCHES, KNOWN_INVALID_BLOCKS};
+        let refused: Vec<u64> = KNOWN_INVALID_BLOCKS
+            .iter()
+            .map(|b| b.height)
+            .chain(HELD_BRANCHES.iter().map(|h| h.height))
+            .collect();
+        assert!(
+            !refused.is_empty(),
+            "no refused blocks: this test checks nothing"
+        );
+        let anchor = snapshot_spec().anchor_height;
+        for height in refused {
+            assert!(
+                anchor < height,
+                "the pinned base {anchor} is not below the refused block at {height}: \
+                 check for refused blocks after a compiled load before moving the pin"
+            );
+        }
+    }
+
     /// First-run setup aborts when the snapshot download fails, so the file the
     /// pin names has to stay where the pin says for as long as a release that
     /// carries the pin is installed. Upstream published 219000 only on a

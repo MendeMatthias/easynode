@@ -531,45 +531,90 @@ async fn snapshot_active(rpc: &dyn Rpc, base: &str) -> bool {
     false
 }
 
+/// What a compiled `loadtxoutset` btx-cli brought back no answer for came
+/// to, when the app can say. See [`unanswered_compiled_load`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnansweredCompiledLoad {
+    /// The snapshot based at the anchor is active and no refused block is on
+    /// the chain: it loaded.
+    Loaded,
+    /// The node answers and shows no snapshot chainstate at all: nothing was
+    /// loaded, and there is nothing to set aside.
+    NothingLoaded,
+}
+
 /// A compiled `loadtxoutset` btx-cli brought back no answer for
 /// (`LoadOutcome::NoAnswer`). It has no manifest, so it never comes through
 /// [`load`], but it counts the same way: only if the node then shows the
 /// snapshot active, the one based at `base_height` (the app does not compile
 /// the engine's base hash, so the base's own header says where it is), and
-/// step 6 finds no refused block on its chain. Every error here has
-/// [`LoadError::restore_chain_data`]: the engine may hold a snapshot the app
-/// cannot vouch for.
-pub(crate) async fn unanswered_compiled_load_counts(
+/// step 6 finds no refused block on its chain.
+///
+/// Unlike a signed load, a node that answers and shows no snapshot chainstate
+/// at all loaded nothing ([`UnansweredCompiledLoad::NothingLoaded`]): a
+/// btx-cli that never reaches the engine (a refused login, "Could not
+/// connect") would otherwise have the node set aside and restarted on every
+/// launch. That is safe because the compiled snapshot is the engine's own and
+/// its base sits below every refused block (a test in `crate::snapshot`
+/// holds the pin to that). A snapshot chainstate based anywhere else, a
+/// refused block on the chain, or a node that does not say is an error, and
+/// every error here has [`LoadError::restore_chain_data`]: the engine may hold
+/// a snapshot the app cannot vouch for.
+pub(crate) async fn unanswered_compiled_load(
     rpc: &dyn Rpc,
     base_height: u64,
     holds: &Holds<'_>,
-    why: String,
-) -> Result<(), LoadError> {
-    if !snapshot_active_at(rpc, base_height).await {
-        return Err(LoadError::EngineUnanswered(why));
+    why: &str,
+) -> Result<UnansweredCompiledLoad, LoadError> {
+    match compiled_snapshot_seen(rpc, base_height).await {
+        Seen::Active => {
+            check_holds_after_load(rpc, holds).await?;
+            Ok(UnansweredCompiledLoad::Loaded)
+        }
+        Seen::NoSnapshot => Ok(UnansweredCompiledLoad::NothingLoaded),
+        Seen::Unvouched(what) => Err(LoadError::EngineUnanswered(format!("{why}; {what}"))),
     }
-    check_holds_after_load(rpc, holds).await
 }
 
-/// [`snapshot_active`] for a snapshot known only by its base height.
-async fn snapshot_active_at(rpc: &dyn Rpc, base_height: u64) -> bool {
+/// What the node shows after a compiled load, for [`unanswered_compiled_load`].
+enum Seen {
+    /// A snapshot chainstate based at the anchor.
+    Active,
+    /// The node answers, and shows no snapshot chainstate.
+    NoSnapshot,
+    /// Anything else, and what it was, for the log.
+    Unvouched(String),
+}
+
+/// Asked up to [`POST_LOAD_ATTEMPTS`] times until the node shows the snapshot
+/// based at `base_height`, since the load may still be finishing. Short of
+/// that, the last answer stands.
+async fn compiled_snapshot_seen(rpc: &dyn Rpc, base_height: u64) -> Seen {
+    let mut seen = Seen::Unvouched("the node was not asked".into());
     for attempt in 1..=POST_LOAD_ATTEMPTS {
-        let base = crate::node_api::get_chainstates(rpc)
-            .await
-            .ok()
-            .and_then(|s| s.snapshot().and_then(|c| c.snapshot_blockhash.clone()));
-        if let Some(base) = base {
-            if let Ok(header) = rpc.call("getblockheader", json!([base, true])).await {
-                if header["height"].as_u64() == Some(base_height) {
-                    return true;
-                }
-            }
-        }
+        seen = match crate::node_api::get_chainstates(rpc).await {
+            Err(e) => Seen::Unvouched(format!("getchainstates did not answer: {e}")),
+            Ok(states) => match states.snapshot().and_then(|c| c.snapshot_blockhash.clone()) {
+                None => Seen::NoSnapshot,
+                Some(base) => match rpc.call("getblockheader", json!([base, true])).await {
+                    Ok(header) if header["height"].as_u64() == Some(base_height) => {
+                        return Seen::Active
+                    }
+                    Ok(header) => Seen::Unvouched(format!(
+                        "the snapshot chainstate is based on {base} at height {}, not at {base_height}",
+                        header["height"]
+                    )),
+                    Err(e) => Seen::Unvouched(format!(
+                        "the node did not say where the snapshot base {base} is: {e}"
+                    )),
+                },
+            },
+        };
         if attempt < POST_LOAD_ATTEMPTS {
             tokio::time::sleep(POST_LOAD_PAUSE).await;
         }
     }
-    false
+    seen
 }
 
 /// Section 7, step 3: refuse every block the app refuses, invalid blocks
