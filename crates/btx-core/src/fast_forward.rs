@@ -26,6 +26,13 @@
 //!   then [`Phase::Restoring`], then the old data goes back, then the dated
 //!   folder, and the record last. From `SettingAside` or `Restoring` nothing
 //!   is removed: what is still in the dated folder goes back.
+//! * [`finish`]: [`Phase::Done`] first, so nothing puts old data back once
+//!   any of it may be gone; then the dated folder takes a name [`restore`]
+//!   never accepts, the record goes, and the folder last.
+//! * [`sweep`]: at the next start, and in Remove node data, a dated folder
+//!   that no recorded run needs is removed.
+//! * [`resume`]: a run the app was closed on is watched again from the start
+//!   of the app that resumes it.
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -74,6 +81,9 @@ pub enum Phase {
     /// The chain data the attempt made is gone and the old data is going
     /// back: some of `moved` may be back in place already.
     Restoring,
+    /// The run is done and its dated folder is being removed: nothing may
+    /// put it back ([`finish`]).
+    Done,
 }
 
 /// A run in progress, on disk, so a quit in the middle can be finished or
@@ -96,6 +106,9 @@ pub struct Record {
     #[serde(default)]
     pub first_load_pending_before: bool,
     pub started_at: u64,
+    /// When the current watch began: the run's start, or the start of the
+    /// app that resumed it ([`resume`]). [`MAX_RUN_SECS`] counts from here.
+    pub watch_started_at: u64,
 }
 
 /// The app's settings before a run, kept in its record for a roll-back.
@@ -308,6 +321,7 @@ fn set_aside_with(
         snapshot_loaded_before: before.snapshot_loaded,
         first_load_pending_before: before.first_load_pending,
         started_at: now_unix,
+        watch_started_at: now_unix,
     };
     pause().map_err(Untouched)?;
     write_record(datadir, &record).map_err(Untouched)?;
@@ -362,6 +376,12 @@ fn restore_with(datadir: &Path, pause: Pause) -> Result<Option<Record>, MoveErro
     let Some(mut record) = read_record(datadir).map_err(MoveError::Untouched)? else {
         return Ok(None);
     };
+    if record.phase == Phase::Done {
+        return Err(MoveError::Untouched(io::Error::other(format!(
+            "the run to block {} is done; its old chain data is being removed",
+            copy::height(record.height)
+        ))));
+    }
     let folder = datadir.join(&record.aside);
     let stranded = |error| MoveError::Stranded {
         folder: folder.clone(),
@@ -443,10 +463,114 @@ fn put_back(datadir: &Path, record: &Record, pause: Pause) -> Result<(), MoveErr
     clear_record(datadir).map_err(stranded)
 }
 
-/// A finished run: the set-aside chain data is no longer needed.
-pub fn discard(datadir: &Path, record: &Record) -> std::io::Result<()> {
-    check(record)?;
-    remove_any(&datadir.join(&record.aside))
+/// A run judged done: the set-aside chain data is no longer needed. Phase
+/// done is written first; then the dated folder is renamed to a name
+/// [`restore`] never accepts, the record goes, and the folder is removed
+/// last. An `Err` leaves the record, and a later call (or the next start)
+/// carries on; if only the removal fails, the run is finished and [`sweep`]
+/// removes the folder at the next start. Refused while a run is being set
+/// aside or undone. `Ok` when no run is recorded.
+pub fn finish(datadir: &Path) -> io::Result<()> {
+    finish_with(datadir, &mut || Ok(()))
+}
+
+fn finish_with(datadir: &Path, pause: Pause) -> io::Result<()> {
+    let Some(mut record) = read_record(datadir)? else {
+        return Ok(());
+    };
+    match record.phase {
+        Phase::Done => {}
+        Phase::Running => {
+            pause()?;
+            record.phase = Phase::Done;
+            write_record(datadir, &record)?;
+        }
+        Phase::SettingAside | Phase::Restoring => {
+            return Err(io::Error::other(
+                "the Fast-forward run is being undone, not finished",
+            ))
+        }
+    }
+    let folder = datadir.join(&record.aside);
+    let doomed = datadir.join(discard_name(&record.aside));
+    if present(&folder)? {
+        pause()?;
+        // A leftover under the same name: nothing ever reads one.
+        remove_any(&doomed)?;
+        std::fs::rename(&folder, &doomed)?;
+    }
+    pause()?;
+    clear_record(datadir)?;
+    pause()?;
+    if let Err(e) = remove_any(&doomed) {
+        eprintln!(
+            "[fast-forward] could not remove {} (the next start sweeps it): {e}",
+            doomed.display()
+        );
+    }
+    Ok(())
+}
+
+const DISCARD_SUFFIX: &str = ".discard";
+
+/// The name a done run's folder takes before it is removed.
+fn discard_name(aside: &str) -> String {
+    format!("{aside}{DISCARD_SUFFIX}")
+}
+
+/// Remove every dated folder no recorded run needs (`fast-forward-<digits>`
+/// and its `.discard` name), and nothing else: never a file or a link, and
+/// nothing at all while a run is recorded or its record cannot be read.
+/// Call with the node stopped: at start, before [`resume`], and in Remove
+/// node data. What it removed.
+pub fn sweep(datadir: &Path) -> Vec<PathBuf> {
+    match read_record(datadir) {
+        Ok(None) => {}
+        Ok(Some(_)) => return Vec::new(),
+        Err(e) => {
+            eprintln!("[fast-forward] not sweeping: the run's record cannot be read ({e})");
+            return Vec::new();
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(datadir) else {
+        return Vec::new();
+    };
+    let mut removed = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let ours =
+            is_aside_name(name) || name.strip_suffix(DISCARD_SUFFIX).is_some_and(is_aside_name);
+        // `file_type` does not follow a link.
+        if !ours || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => removed.push(entry.path()),
+            Err(e) => eprintln!(
+                "[fast-forward] could not remove {} (non-fatal): {e}",
+                entry.path().display()
+            ),
+        }
+    }
+    removed
+}
+
+/// The run a previous start left, to be watched again: one at
+/// [`Phase::Running`] gets a fresh watch window from `now_unix` (time the
+/// app was closed does not count against it), kept on disk. A record at any
+/// other phase comes back as it is; [`judge`] says what to do with it.
+pub fn resume(datadir: &Path, now_unix: u64) -> io::Result<Option<Record>> {
+    let Some(mut record) = read_record(datadir)? else {
+        return Ok(None);
+    };
+    if record.phase == Phase::Running {
+        record.watch_started_at = now_unix;
+        write_record(datadir, &record)?;
+    }
+    Ok(Some(record))
 }
 
 /// Only this module writes the record, so its phases follow the steps.
@@ -513,17 +637,23 @@ pub enum Verdict {
     RollBack(String),
 }
 
-/// Pure: is the run done, still going, or to be rolled back? A record left
-/// between two steps of a move ([`Phase::SettingAside`],
-/// [`Phase::Restoring`]) is rolled back, whatever the node shows. Done means a
+/// Pure: is the run done, still going, or to be rolled back? A record at
+/// [`Phase::Done`] is done; one left between two steps of a move
+/// ([`Phase::SettingAside`], [`Phase::Restoring`]) is rolled back, whatever
+/// the node shows. The limit counts from `watch_started_at`. Done means a
 /// snapshot at or above the run's is loaded (the start path may have found a
 /// newer confirmed one) and the node runs its ordinary launch again: no
 /// mirror launch and no header bootstrap pending. A snapshot below the run's
 /// on that ordinary launch means the start path took a fallback (the
 /// operators began to disagree after the check, or the pair was refused):
 /// rolled back at once.
+///
+/// Follow-up, not done here: done compares heights only. The base block's
+/// hash (the confirmed snapshot's, or the start record's for a newer one)
+/// is for the driver to check as well before it calls [`finish`].
 pub fn judge(record: &Record, look: &Look, now_unix: u64) -> Verdict {
     match record.phase {
+        Phase::Done => return Verdict::Done,
         Phase::Running => {}
         Phase::SettingAside => {
             return Verdict::RollBack(
@@ -551,7 +681,7 @@ pub fn judge(record: &Record, look: &Look, now_unix: u64) -> Verdict {
         }
         _ => {}
     }
-    if now_unix.saturating_sub(record.started_at) >= MAX_RUN_SECS {
+    if now_unix.saturating_sub(record.watch_started_at) >= MAX_RUN_SECS {
         return Verdict::RollBack(format!(
             "it did not finish within {} hours",
             MAX_RUN_SECS / 3600
@@ -738,7 +868,31 @@ mod tests {
             snapshot_loaded_before: false,
             first_load_pending_before: false,
             started_at,
+            watch_started_at: started_at,
         }
+    }
+
+    /// The new chain an attempt that worked leaves, and nothing of the run
+    /// beside it.
+    fn assert_new_chain_kept(d: &Path, when: &str) {
+        for name in ["blocks", "chainstate", "indexes"] {
+            assert!(d.join(name).join("new").exists(), "{name}, {when}");
+            assert!(!d.join(name).join("old").exists(), "{name}, {when}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(d.join("snapshot-start.json")).unwrap(),
+            "new start",
+            "{when}"
+        );
+        for kept in KEPT {
+            assert!(d.join(kept).exists(), "{kept}, {when}");
+        }
+        let left: Vec<String> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("fast-forward-") || n.starts_with(".fast-forward"))
+            .collect();
+        assert!(left.is_empty(), "{left:?} left, {when}");
     }
 
     #[test]
@@ -1096,15 +1250,188 @@ mod tests {
     }
 
     #[test]
-    fn discard_removes_only_the_dated_folder() {
+    fn finish_removes_only_the_dated_folder() {
         let tmp = datadir_with_chain();
         let d = tmp.path();
-        let r = set_aside(d, 232_000, Before::default(), 11).unwrap();
-        std::fs::create_dir_all(d.join("blocks")).unwrap();
-        discard(d, &r).unwrap();
-        assert!(!d.join(&r.aside).exists());
-        assert!(d.join("blocks").exists());
-        assert!(d.join("wallets/main/wallet.dat").exists());
+        set_aside(d, 232_000, Before::default(), 11).unwrap();
+        attempt_made_chain(d);
+        finish(d).unwrap();
+        assert_new_chain_kept(d, "finished");
+        assert!(restore(d).unwrap().is_none(), "nothing left to put back");
+        assert_new_chain_kept(d, "a restore after the finish");
+        finish(d).unwrap();
+    }
+
+    /// Once a run may have lost any of its old chain data, nothing puts
+    /// the rest back: phase done is written before anything is deleted, the
+    /// folder then takes a name restore never accepts, and the sweep at the
+    /// next start removes whatever a crash left.
+    #[test]
+    fn a_crash_while_finishing_never_brings_the_old_chain_back() {
+        let on_it = Look {
+            snapshot_base_height: Some(232_000),
+            running: true,
+            ..Look::default()
+        };
+        let mut crashed = 0;
+        for k in 1.. {
+            let tmp = datadir_with_chain();
+            let d = tmp.path();
+            let r = set_aside(d, 232_000, Before::default(), 9).unwrap();
+            attempt_made_chain(d);
+            if finish_with(d, &mut crash_at(k)).is_ok() {
+                assert_new_chain_kept(d, "no crash");
+                break;
+            }
+            crashed += 1;
+            match read_record(d).unwrap() {
+                Some(left) if left.phase == Phase::Running => {
+                    for name in &r.moved {
+                        assert!(d.join(&r.aside).join(name).exists(), "{name}, stop {k}");
+                    }
+                }
+                Some(left) => {
+                    assert_eq!(left.phase, Phase::Done, "stop {k}");
+                    assert!(
+                        matches!(restore(d), Err(MoveError::Untouched(_))),
+                        "a finished run is not undone, stop {k}"
+                    );
+                }
+                None => assert!(restore(d).unwrap().is_none(), "stop {k}"),
+            }
+            // The next start: the sweep, then the run is watched again and
+            // judged done.
+            sweep(d);
+            if let Some(left) = resume(d, 20).unwrap() {
+                assert_eq!(judge(&left, &on_it, 20), Verdict::Done, "stop {k}");
+                finish(d).unwrap();
+            }
+            assert_new_chain_kept(d, &format!("a crash at stop {k}"));
+        }
+        // Phase done, the rename, the record, the folder.
+        assert_eq!(crashed, 4);
+    }
+
+    #[test]
+    fn a_run_being_undone_is_never_finished() {
+        let tmp = datadir_with_chain();
+        let d = tmp.path();
+        // Stopped after the record, the folder and two moves.
+        assert!(set_aside_with(
+            d,
+            CHAIN_DATA,
+            232_000,
+            Before::default(),
+            9,
+            &mut crash_at(5)
+        )
+        .is_err());
+        assert!(finish(d).is_err());
+        assert!(d.join(aside_name(9)).join("blocks/old").exists());
+        restore(d).unwrap();
+        assert_as_before(d, "setting aside undone");
+        // Stopped with phase restoring written, before anything went back.
+        set_aside(d, 232_000, Before::default(), 10).unwrap();
+        attempt_made_chain(d);
+        assert!(restore_with(d, &mut crash_at(6)).is_err());
+        assert_eq!(read_record(d).unwrap().unwrap().phase, Phase::Restoring);
+        assert!(finish(d).is_err());
+        assert!(d.join(aside_name(10)).join("blocks/old").exists());
+        restore(d).unwrap();
+        assert_as_before(d, "restore carried on");
+    }
+
+    #[test]
+    fn the_sweep_removes_only_folders_no_run_needs() {
+        let tmp = datadir_with_chain();
+        let d = tmp.path();
+        for dir in [
+            "fast-forward-5/blocks",
+            "fast-forward-6.discard/chainstate",
+            "fast-forward-x",
+            "fast-forward-8.old",
+            "chainstate_snapshot.refused-9",
+        ] {
+            std::fs::create_dir_all(d.join(dir)).unwrap();
+        }
+        std::fs::write(d.join("fast-forward-7"), b"a file, not ours").unwrap();
+        let others = [
+            "fast-forward-x",
+            "fast-forward-8.old",
+            "chainstate_snapshot.refused-9",
+            "fast-forward-7",
+        ];
+        // While a run is recorded, or a record cannot be read, nothing goes.
+        set_aside(d, 232_000, Before::default(), 11).unwrap();
+        assert!(sweep(d).is_empty());
+        assert!(d.join(aside_name(11)).join("blocks/old").exists());
+        restore(d).unwrap();
+        std::fs::write(d.join(".fast-forward.json"), b"not json").unwrap();
+        assert!(sweep(d).is_empty());
+        assert!(d.join("fast-forward-5/blocks").exists());
+        std::fs::remove_file(d.join(".fast-forward.json")).unwrap();
+        // With no run, the dated folders go and nothing else.
+        let mut swept = sweep(d);
+        swept.sort();
+        assert_eq!(
+            swept,
+            vec![d.join("fast-forward-5"), d.join("fast-forward-6.discard")]
+        );
+        for other in others {
+            assert!(d.join(other).exists(), "{other}");
+            remove_any(&d.join(other)).unwrap();
+        }
+        assert_as_before(d, "swept");
+    }
+
+    /// The owner's decision: time the app was closed does not count against
+    /// a run. Resumed, it is watched for the full limit again.
+    #[test]
+    fn a_resumed_run_gets_a_fresh_watch_window() {
+        let tmp = datadir_with_chain();
+        let d = tmp.path();
+        let r = set_aside(d, 232_000, Before::default(), 1_000).unwrap();
+        assert_eq!(r.watch_started_at, 1_000);
+        let four_hours_later = 1_000 + 4 * 60 * 60;
+        assert!(matches!(
+            judge(&r, &Look::default(), four_hours_later),
+            Verdict::RollBack(_)
+        ));
+        let resumed = resume(d, four_hours_later).unwrap().unwrap();
+        assert_eq!(resumed.watch_started_at, four_hours_later);
+        assert_eq!(resumed.started_at, 1_000);
+        assert_eq!(read_record(d).unwrap(), Some(resumed.clone()), "kept");
+        assert_eq!(
+            judge(&resumed, &Look::default(), four_hours_later),
+            Verdict::Continue,
+            "the first look after a resume"
+        );
+        assert_eq!(
+            judge(
+                &resumed,
+                &Look::default(),
+                four_hours_later + MAX_RUN_SECS - 1
+            ),
+            Verdict::Continue
+        );
+        assert!(matches!(
+            judge(&resumed, &Look::default(), four_hours_later + MAX_RUN_SECS),
+            Verdict::RollBack(_)
+        ));
+        restore(d).unwrap();
+        assert_eq!(resume(d, 5).unwrap(), None, "no run, nothing to resume");
+        // A run stopped mid-move is left as it is, for judge to roll back.
+        assert!(set_aside_with(
+            d,
+            CHAIN_DATA,
+            232_000,
+            Before::default(),
+            9,
+            &mut crash_at(4)
+        )
+        .is_err());
+        let left = read_record(d).unwrap();
+        assert_eq!(resume(d, 99_999).unwrap(), left);
     }
 
     #[test]
@@ -1131,7 +1458,7 @@ mod tests {
         // One written before the first-load setting was kept reads as false.
         std::fs::write(
             d.join(".fast-forward.json"),
-            r#"{"height":232000,"aside":"fast-forward-1","moved":["blocks"],"phase":"running","snapshot_loaded_before":true,"started_at":1}"#,
+            r#"{"height":232000,"aside":"fast-forward-1","moved":["blocks"],"phase":"running","snapshot_loaded_before":true,"started_at":1,"watch_started_at":1}"#,
         )
         .unwrap();
         assert!(!read_record(d).unwrap().unwrap().first_load_pending_before);
@@ -1230,6 +1557,19 @@ mod tests {
             Verdict::Done,
             "on the snapshot is done, however long it took"
         );
+        // A run recorded done is done, whatever the node shows now.
+        let finished = Record {
+            phase: Phase::Done,
+            ..running_record(1_000)
+        };
+        let gone_wrong = Look {
+            load_failed: Some("late".into()),
+            ..Look::default()
+        };
+        assert_eq!(
+            judge(&finished, &gone_wrong, 1_000 + MAX_RUN_SECS),
+            Verdict::Done
+        );
         // A record left between two steps of a move is undone, whatever the
         // node shows.
         for phase in [Phase::SettingAside, Phase::Restoring] {
@@ -1287,7 +1627,8 @@ mod tests {
             let e = read_record(d).unwrap_err();
             assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{r:?}");
             assert!(matches!(restore(d), Err(MoveError::Untouched(_))), "{r:?}");
-            assert!(discard(d, &r).is_err(), "{r:?}");
+            assert!(finish(d).is_err(), "{r:?}");
+            assert!(sweep(d).is_empty(), "{r:?}");
             assert!(d.join("wallets/main/wallet.dat").exists(), "{r:?}");
             assert!(d.join("blocks/old").exists(), "{r:?}");
             assert!(outside.join("blocks").exists(), "{r:?}");
