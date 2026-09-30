@@ -10,7 +10,7 @@ import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { AmbientLine } from "./ambient";
-import { followRowVisible, stalledFollowOffer, validationView } from "./validation";
+import { followRowVisible, followToggleOn, stalledFollowOffer, validationView } from "./validation";
 import {
   CHAIN_BLOCKS_PER_HOUR,
   type CatchupSample,
@@ -234,6 +234,10 @@ interface NodeStatusInfo {
   /** The engine refused this Mac's graphics chip, so the node follows
    *  signatures. The status screen says so once per engine. */
   chip_refused: boolean;
+  /** A validating start hung in the engine's GPU check, so the app moved the
+   *  node to following signatures (validation.ts says why; Settings' switch
+   *  tries the card again). */
+  gpu_start_hung: boolean;
   /** How far the background check of the snapshot's older history has got;
    *  null when there is none running. */
   history_check: HistoryCheck | null;
@@ -892,11 +896,11 @@ function reflectFollowOffer(status: NodeStatusInfo): void {
 
 function reflectFollowRow(status: NodeStatusInfo): void {
   // Only where it is a choice: a machine that checks blocks, one whose chip
-  // failed the check, or one whose owner already chose. A machine that
-  // follows signatures anyway has none.
+  // failed the check, one whose card hung the start-up check, or one whose
+  // owner already chose. A machine that follows signatures anyway has none.
   $("follow-row").hidden = !followRowVisible(status);
   const t = $<HTMLInputElement>("follow-toggle");
-  if (document.activeElement !== t) t.checked = status.follow_signatures;
+  if (document.activeElement !== t) t.checked = followToggleOn(status);
 }
 
 async function setFollowSignatures(on: boolean): Promise<void> {

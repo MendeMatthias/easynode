@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   followRowVisible,
+  followToggleOn,
   stalledFollowOffer,
   validationView,
   type FollowInput,
@@ -289,5 +290,54 @@ describe("the way out for a machine whose chip cannot check blocks", () => {
       follow_signatures: false,
     };
     expect(followRowVisible(mirror)).toBe(false);
+  });
+});
+
+describe("a machine whose graphics card hung the engine's start-up check (0.7.1)", () => {
+  const hungMirror: FollowInput = {
+    rc_stalled: false,
+    rc_trusted_mirror: true,
+    rc_validates_independently: false,
+    follow_signatures: false,
+    gpu_start_hung: true,
+  };
+
+  it("says why the node follows signatures, and the way back", () => {
+    const v = validationView({
+      ...base,
+      rc_mode: "strict-device",
+      rc_trusted_mirror: true,
+      gpu_start_hung: true,
+    });
+    expect(v.state).toBe("Mirror");
+    expect(v.note).toMatch(/graphics card did not finish the engine's start-up check/);
+    expect(v.note).toMatch(/follows signatures for now/);
+    expect(v.note).toMatch(/Check blocks in Settings tries the card again/);
+    expect(v.note).not.toMatch(/—/);
+  });
+
+  it("keeps the plain mirror note where the card did not hang", () => {
+    const v = validationView({ ...base, rc_mode: "strict-device", rc_trusted_mirror: true });
+    expect(v.note).not.toMatch(/start-up check/);
+  });
+
+  it("still says so first when no source hands over confirmations", () => {
+    const v = validationView({
+      ...base,
+      rc_mode: "strict-device",
+      rc_trusted_mirror: true,
+      gpu_start_hung: true,
+      archive_authority: 0,
+    });
+    expect(v.state).toBe("Mirror: waiting for a source");
+  });
+
+  it("shows the Settings switch, switched on, so one click tries the card again", () => {
+    expect(followRowVisible(hungMirror)).toBe(true);
+    expect(followToggleOn(hungMirror)).toBe(true);
+    expect(followToggleOn({ ...hungMirror, gpu_start_hung: false })).toBe(false);
+    expect(
+      followToggleOn({ ...hungMirror, gpu_start_hung: false, follow_signatures: true }),
+    ).toBe(true);
   });
 });

@@ -551,6 +551,61 @@ fn rpc_timeout_error(last: &str, doing: Option<&str>, datadir: &Path) -> String 
     )
 }
 
+/// What the launch loop does after it stopped a btxd that never opened its
+/// RPC (0.7.1).
+#[derive(Debug, PartialEq, Eq)]
+enum AfterNoRpcTimeout {
+    /// Report the timeout ([`rpc_timeout_error`]), no retry.
+    Fail,
+    /// The start was stuck in the engine's GPU check: record it, take the
+    /// key line out, and take the next attempt, which is a mirror.
+    RetryAsMirror,
+    /// Stuck in the GPU check, and the btxd outlived even the kill, so it
+    /// still holds the datadir lock: record it, spawn nothing, and ask for a
+    /// restart of the computer ([`GPU_HOLDS_NODE_ERROR`]).
+    RestartComputer,
+}
+
+/// Pure so the choice is pinned by a test. `stuck_in_gpu` is
+/// `btx_core::node::stuck_in_gpu_check` for this launch; `stopped` is how
+/// `stop_without_rpc_outcome` ended, `None` when the node answered warmup and
+/// got the graceful stop instead (its RPC was up, so it was not stuck before
+/// it). `operator_word` is `EASYBTX_NODE_TRUSTED_MIRROR`: at `=0` the record
+/// would not make the next launch a mirror, so a retry would hang the same
+/// way.
+fn after_no_rpc_timeout(
+    stuck_in_gpu: bool,
+    stopped: Option<btx_core::node::NoRpcStop>,
+    operator_word: Option<bool>,
+) -> AfterNoRpcTimeout {
+    use btx_core::node::NoRpcStop;
+    if !stuck_in_gpu || operator_word == Some(false) {
+        return AfterNoRpcTimeout::Fail;
+    }
+    match stopped {
+        Some(NoRpcStop::StillRunning) => AfterNoRpcTimeout::RestartComputer,
+        Some(NoRpcStop::OnSigterm | NoRpcStop::Killed) => AfterNoRpcTimeout::RetryAsMirror,
+        None => AfterNoRpcTimeout::Fail,
+    }
+}
+
+/// The error for [`AfterNoRpcTimeout::RestartComputer`]. One sentence, on
+/// purpose: nothing in the app can free a process the graphics driver holds,
+/// and the next start after a restart follows signatures by itself.
+const GPU_HOLDS_NODE_ERROR: &str = "the graphics card stopped answering and is holding the node, \
+                                    so restart the computer, then press Start.";
+
+/// Record or withdraw the owner's choice to follow signatures, as Settings
+/// sends it. Withdrawing it ("check blocks") also clears the record of a
+/// start that hung in the GPU check (`btx_core::node::gpu_start_hung`): that
+/// is the owner asking the card to try again, and it must take one click.
+fn apply_follow_signatures_choice(datadir: &Path, on: bool) -> std::io::Result<()> {
+    if !on {
+        btx_core::node::clear_gpu_start_hung(datadir);
+    }
+    btx_core::node::set_follows_signatures_by_choice(datadir, on)
+}
+
 /// Post-stop wait for an unmanaged btxd to actually free the datadir lock
 /// before we spawn (force-kill fallback only after this): btxd's flush after
 /// `stop` ran 90–120 s on the dev M2 Pro at height ~185k, so this is the
@@ -849,6 +904,10 @@ pub(crate) async fn start_node_held(app: &AppHandle, state: &AppState) -> Result
                         // future upgrade, silently declining to be the
                         // independent validator it had become capable of being.
                         btx_core::node::clear_matmul_consensus_refused(&datadir);
+                        // Its twin for a card that hung the GPU check: a new
+                        // engine may drive the card differently, so it gets
+                        // a try.
+                        btx_core::node::clear_gpu_start_hung(&datadir);
                         // The persisted tag flips only after the new-tag node
                         // actually RUNS (end of this function). If this start
                         // dies half-way (quit mid-stop, lost lock race), the
@@ -1610,6 +1669,10 @@ async fn spawn_node_with_lock_retry(
             )
             .await
             .map_err(|e| format!("couldn't start the node: {e}"))?;
+        // Did this launch run the engine's GPU check before RPC? Read from the
+        // arguments it actually passed, for the GPU-hang fallback below.
+        let gpu_check_launch =
+            btx_core::node::launch_runs_gpu_check(node_backend(), controller.launch_args());
         // Park the controller in the shared slot BEFORE the survival watch so
         // a quit landing inside the watch still finds — and gracefully stops —
         // the child instead of orphaning it.
@@ -1684,26 +1747,85 @@ async fn spawn_node_with_lock_retry(
                     // Never leave a live btxd behind the error, and never
                     // leave the slot holding a start that did not happen.
                     let taken = state.node.lock().await.take();
+                    let mut stopped = None;
                     if let Some(mut c) = taken {
                         if graceful {
                             // It answered warmup, so its RPC is up and the
                             // graceful stop (btx-cli, flush grace) reaches it.
                             let _ = c.stop(&paths.btx_cli, datadir).await;
                         } else {
-                            let clean = c.stop_without_rpc(NO_RPC_STOP_GRACE).await;
+                            let outcome = c.stop_without_rpc_outcome(NO_RPC_STOP_GRACE).await;
                             eprintln!(
                                 "[node-app] btxd never opened its RPC in {}s; stopped it \
                                  ({})",
                                 RPC_WAIT_POLLS as u64 * RPC_WAIT_POLL_MS / 1000,
-                                if clean {
-                                    "it exited on SIGTERM"
-                                } else {
-                                    "it had to be killed"
+                                match outcome {
+                                    btx_core::node::NoRpcStop::OnSigterm => "it exited on SIGTERM",
+                                    btx_core::node::NoRpcStop::Killed => "it had to be killed",
+                                    btx_core::node::NoRpcStop::StillRunning => {
+                                        "it is still there after the kill"
+                                    }
                                 },
                             );
+                            stopped = Some(outcome);
                         }
                     }
                     let since = btx_core::node::debug_log_since(datadir, log_offset);
+                    // A validating start stuck in the engine's GPU check
+                    // (0.7.1, the leading reading of Zan's two NVIDIA nodes):
+                    // the step has no timeout, and a card that hung once can
+                    // hang it on every start. A mirror launch does no GPU
+                    // work before RPC, so the same machine can still start
+                    // and follow signatures. The record keeps it that way
+                    // until an engine upgrade or the owner's "check blocks".
+                    let stuck =
+                        !graceful && btx_core::node::stuck_in_gpu_check(gpu_check_launch, &since);
+                    let next = after_no_rpc_timeout(
+                        stuck,
+                        stopped,
+                        btx_core::node::trusted_mirror_override(),
+                    );
+                    if next != AfterNoRpcTimeout::Fail {
+                        btx_core::node::record_gpu_start_hung(datadir);
+                        // The next launch is a mirror, and a mirror holds no
+                        // key: the key line written for the validating
+                        // launch comes out, as after the Mac's refusal.
+                        let (applies_here, pubkey) = signer_after_chip_refusal(
+                            &paths.btxd,
+                            datadir,
+                            &paths.faststart_conf,
+                            node_backend(),
+                            NodeAppSettings::load(datadir).signer_enabled,
+                        );
+                        *state.signer_applies_here.lock().await = Some(applies_here);
+                        *state.signer_pubkey.lock().await = pubkey;
+                    }
+                    match next {
+                        AfterNoRpcTimeout::RetryAsMirror => {
+                            let msg = format!(
+                                "This machine's graphics card did not finish the node \
+                                 engine's start-up check in {}s, so the node was stopped and \
+                                 now starts following signatures (attempt \
+                                 {attempt}/{LAUNCH_ATTEMPTS}). Check blocks in Settings tries \
+                                 the card again.",
+                                RPC_WAIT_POLLS as u64 * RPC_WAIT_POLL_MS / 1000,
+                            );
+                            eprintln!("[node-app] {msg}");
+                            setup_log(datadir, &msg);
+                            continue;
+                        }
+                        AfterNoRpcTimeout::RestartComputer => {
+                            let msg = "This machine's graphics card did not finish the node \
+                                       engine's start-up check, and the stopped node is still \
+                                       held by the graphics driver, so nothing new was started. \
+                                       After a restart of the computer the node follows \
+                                       signatures.";
+                            eprintln!("[node-app] {msg}");
+                            setup_log(datadir, msg);
+                            return Err(GPU_HOLDS_NODE_ERROR.to_string());
+                        }
+                        AfterNoRpcTimeout::Fail => {}
+                    }
                     let doing = btx_core::node::last_log_line(&since);
                     return Err(rpc_timeout_error(&last, doing.as_deref(), datadir));
                 }
@@ -3326,6 +3448,11 @@ pub struct NodeStatusInfo {
     /// (`btx_core::node::matmul_consensus_was_refused`). The status screen
     /// says so once.
     pub chip_refused: bool,
+    /// A validating start hung in the engine's GPU check and the app moved
+    /// the node to following signatures (`btx_core::node::gpu_start_hung`).
+    /// The Block checking card says why, and the Settings switch shows so the
+    /// owner can try the card again.
+    pub gpu_start_hung: bool,
     /// Bytes this node has uploaded to peers this run (`getnettotals`).
     ///
     /// Feeds the "Helping the network" card: chain data other people actually
@@ -3871,6 +3998,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         full_check_possible: full_check_possible(),
         full_check_first: full_check_first(),
         chip_refused: btx_core::node::matmul_consensus_was_refused(&datadir),
+        gpu_start_hung: btx_core::node::gpu_start_hung(&datadir),
         archive_peers,
         stall,
         node_profile: settings.node_profile.clone(),
@@ -5616,7 +5744,7 @@ pub async fn set_follow_signatures(
     state: State<'_, AppState>,
     on: bool,
 ) -> Result<(), String> {
-    btx_core::node::set_follows_signatures_by_choice(&node_datadir(), on)
+    apply_follow_signatures_choice(&node_datadir(), on)
         .map_err(|e| format!("could not record the choice: {e}"))?;
     eprintln!(
         "[node-app] the owner chose to {} on this machine",
@@ -8873,7 +9001,11 @@ mod signed_start_tests {
 
 #[cfg(test)]
 mod launch_wait_tests {
-    use super::{after_rpc_wait, rpc_timeout_error, AfterRpcWait};
+    use super::{
+        after_no_rpc_timeout, after_rpc_wait, apply_follow_signatures_choice, rpc_timeout_error,
+        AfterNoRpcTimeout, AfterRpcWait, GPU_HOLDS_NODE_ERROR,
+    };
+    use btx_core::node::NoRpcStop;
     use btx_core::setup::RpcWait;
     use std::path::Path;
 
@@ -8971,9 +9103,154 @@ mod launch_wait_tests {
         assert!(!spawn_fn.contains("wait_for_node_rpc("));
         let offset = spawn_fn.find("debug_log_len(datadir)").unwrap();
         assert!(offset < spawn_fn.find(".start(").unwrap());
-        let stop = spawn_fn.find(".stop_without_rpc(").unwrap();
+        // `stop_without_rpc_outcome` since 0.7.1 Task B: the GPU-hang retry
+        // needs to know whether the kill freed the lock.
+        let stop = spawn_fn.find(".stop_without_rpc_outcome(").unwrap();
         let timeout = spawn_fn.find("rpc_timeout_error(").unwrap();
         assert!(stop < timeout, "stop first, then report");
         assert!(spawn_fn.contains("launch_failure_cause(&tail)"));
+    }
+
+    // ── 0.7.1 Task B: a validating start stuck in the engine's GPU check ──
+
+    /// ZAN'S NODES, 2026-10-01, the leading reading: the card hung during
+    /// catch-up and now hangs every consensus start inside the engine's GPU
+    /// check. With the evidence, the stopped btxd is followed by a mirror
+    /// attempt, which does no GPU work before RPC.
+    #[test]
+    fn a_start_stuck_in_the_gpu_check_retries_as_a_mirror() {
+        for stop in [NoRpcStop::OnSigterm, NoRpcStop::Killed] {
+            assert_eq!(
+                after_no_rpc_timeout(true, Some(stop), None),
+                AfterNoRpcTimeout::RetryAsMirror,
+                "{stop:?}"
+            );
+        }
+        // EASYBTX_NODE_TRUSTED_MIRROR=1 already asks for a mirror.
+        assert_eq!(
+            after_no_rpc_timeout(true, Some(NoRpcStop::Killed), Some(true)),
+            AfterNoRpcTimeout::RetryAsMirror
+        );
+    }
+
+    /// A btxd stuck in the graphics driver outlives even the kill and still
+    /// holds the datadir lock: a mirror spawned beside it would only be
+    /// refused the lock. So nothing is spawned, and the person is told the
+    /// one thing that frees it.
+    #[test]
+    fn a_card_that_holds_the_node_asks_for_a_restart_and_spawns_nothing() {
+        assert_eq!(
+            after_no_rpc_timeout(true, Some(NoRpcStop::StillRunning), None),
+            AfterNoRpcTimeout::RestartComputer
+        );
+        let msg = GPU_HOLDS_NODE_ERROR;
+        assert!(msg.contains("graphics card"), "{msg}");
+        assert!(msg.contains("restart the computer"), "{msg}");
+        assert!(msg.contains("press Start"), "{msg}");
+        assert_eq!(msg.matches(". ").count(), 0, "one sentence: {msg}");
+        assert!(!msg.contains('\u{2014}'), "em-dash in: {msg}");
+    }
+
+    /// No evidence, no change of role: a timeout that is not the GPU check
+    /// (nothing in debug.log yet, the policy line already there, a mirror
+    /// launch, or a node whose RPC was up) is only reported, as in Task A.
+    #[test]
+    fn without_the_gpu_evidence_a_timeout_is_only_reported() {
+        for stop in [
+            None,
+            Some(NoRpcStop::OnSigterm),
+            Some(NoRpcStop::Killed),
+            Some(NoRpcStop::StillRunning),
+        ] {
+            assert_eq!(
+                after_no_rpc_timeout(false, stop, None),
+                AfterNoRpcTimeout::Fail,
+                "{stop:?}"
+            );
+        }
+    }
+
+    /// The operator's EASYBTX_NODE_TRUSTED_MIRROR=0 means never a mirror, and
+    /// the record yields to it, so a retry would hang the same way.
+    #[test]
+    fn the_operators_zero_keeps_the_plain_timeout() {
+        assert_eq!(
+            after_no_rpc_timeout(true, Some(NoRpcStop::Killed), Some(false)),
+            AfterNoRpcTimeout::Fail
+        );
+    }
+
+    /// "Check blocks" in Settings is the way back, in one click: it clears
+    /// the owner's choice and the GPU-hang record together.
+    #[test]
+    fn check_blocks_in_settings_clears_the_hung_record_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        btx_core::node::record_gpu_start_hung(dir);
+        apply_follow_signatures_choice(dir, false).unwrap();
+        assert!(!btx_core::node::gpu_start_hung(dir));
+        assert!(!btx_core::node::follows_signatures_by_choice(dir));
+
+        // Choosing to follow signatures leaves the record alone and adds the
+        // choice.
+        btx_core::node::record_gpu_start_hung(dir);
+        apply_follow_signatures_choice(dir, true).unwrap();
+        assert!(btx_core::node::gpu_start_hung(dir));
+        assert!(btx_core::node::follows_signatures_by_choice(dir));
+    }
+
+    /// The wiring, in the code: the launch reads its own arguments after the
+    /// spawn, and on the evidence records the hang, takes the key line out
+    /// for the mirror and goes round the loop. An engine upgrade clears the
+    /// record next to the Mac's refusal marker, and Settings' switch goes
+    /// through the one helper.
+    #[test]
+    fn the_launch_loop_follows_signatures_after_a_gpu_hang() {
+        let src = include_str!("commands.rs");
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let start = spawn_fn.find(".start(").unwrap();
+        let args = spawn_fn
+            .find("launch_runs_gpu_check(node_backend(), controller.launch_args())")
+            .unwrap();
+        assert!(start < args, "the arguments exist once the launch ran");
+        let stuck = spawn_fn
+            .find("stuck_in_gpu_check(gpu_check_launch, &since)")
+            .unwrap();
+        let record = spawn_fn.find("record_gpu_start_hung(datadir)").unwrap();
+        assert!(stuck < record);
+        let signer = spawn_fn[record..]
+            .find("signer_after_chip_refusal(")
+            .unwrap();
+        let retry = spawn_fn[record..].find("continue;").unwrap();
+        assert!(
+            signer < retry,
+            "the key line leaves before the mirror attempt"
+        );
+        assert!(spawn_fn.contains("GPU_HOLDS_NODE_ERROR"));
+
+        let start_fn = src
+            .split("pub(crate) async fn start_node_inner(")
+            .nth(1)
+            .and_then(|s| s.split("\nasync fn spawn_node_with_lock_retry(").next())
+            .unwrap();
+        let refused = start_fn
+            .find("clear_matmul_consensus_refused(&datadir);")
+            .unwrap();
+        let hung = start_fn.find("clear_gpu_start_hung(&datadir);").unwrap();
+        assert!(
+            hung > refused && hung - refused < 400,
+            "cleared on upgrade, beside the refusal marker"
+        );
+
+        let settings_fn = src
+            .split("pub async fn set_follow_signatures(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(settings_fn.contains("apply_follow_signatures_choice(&node_datadir(), on)"));
     }
 }

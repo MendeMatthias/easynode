@@ -32,6 +32,12 @@ export type ValidationInput = {
   /** Following the chain via an attestation quorum instead of local replay. */
   rc_trusted_mirror: boolean;
   /**
+   * A validating start hung in the engine's GPU check and the app moved the
+   * node to following signatures (btx_core::node::gpu_start_hung). Absent
+   * from an older backend, which reads as false.
+   */
+  gpu_start_hung?: boolean;
+  /**
    * Archive peers passing the trusted-mirror authority gate (manual or noban),
    * or null when unknown (node stopped / didn't answer / older backend). On a
    * mirror, 0 here is the root cause of the silent-stall class: the node will
@@ -160,6 +166,20 @@ export function validationView(status: ValidationInput): ValidationView {
         cls: "is-stalled",
       };
     }
+    // A card that can check blocks but hung the engine's start-up check
+    // (0.7.1): the plain note would tell its owner the machine cannot check
+    // the proof of work at all, which is not what happened, and not say the
+    // way back.
+    if (status.gpu_start_hung) {
+      return {
+        state: "Mirror",
+        note:
+          "This machine's graphics card did not finish the engine's start-up check, so this " +
+          "node follows signatures for now: it keeps up using signed confirmations from a node " +
+          "that does check the proof of work. Check blocks in Settings tries the card again.",
+        cls: "is-degraded",
+      };
+    }
     return {
       state: "Mirror",
       // "Two independent operators" stopped being true at the 23 September
@@ -205,6 +225,9 @@ export type FollowInput = {
   rc_validates_independently: boolean;
   /** The owner already chose to follow signatures on this machine. */
   follow_signatures: boolean;
+  /** The app moved the node to following signatures after its graphics card
+   *  hung the engine's start-up check. Absent from an older backend. */
+  gpu_start_hung?: boolean;
 };
 
 /**
@@ -238,7 +261,18 @@ export function stalledFollowOffer(status: FollowInput): string | null {
 export function followRowVisible(status: FollowInput): boolean {
   return (
     status.follow_signatures ||
+    status.gpu_start_hung === true ||
     status.rc_validates_independently ||
     (status.rc_stalled && !status.rc_trusted_mirror)
   );
+}
+
+/**
+ * Whether the Settings switch reads "on" (follows signatures). On for the
+ * owner's own choice, and on after the card hung the start-up check, because
+ * the node does follow signatures then: switching it off is "check blocks",
+ * which clears both and tries the card again, in one click.
+ */
+export function followToggleOn(status: FollowInput): boolean {
+  return status.follow_signatures || status.gpu_start_hung === true;
 }
