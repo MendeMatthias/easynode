@@ -673,6 +673,34 @@ pub fn sweep(datadir: &Path) -> Vec<PathBuf> {
     removed
 }
 
+/// Give up a run whose old chain data cannot come back (an original is
+/// missing from its dated folder, or cannot be checked, so [`restore`]
+/// cannot begin), for Remove node data, which removes the new chain with
+/// the rest: the record and the undo copy go, and [`sweep`] then removes the
+/// dated folder. Only a run at [`Phase::Running`], the one phase such a run
+/// is left at, and only when its old chain is not all there; any other is
+/// refused and nothing changes.
+pub fn abandon(datadir: &Path) -> io::Result<()> {
+    match read_record(datadir)? {
+        None => Ok(()),
+        Some(r) if r.phase == Phase::Running && !all_waiting(datadir, &r) => clear_record(datadir),
+        Some(r) => Err(io::Error::other(format!(
+            "the run to block {} is not one to give up now",
+            copy::height(r.height)
+        ))),
+    }
+}
+
+/// Every entry of `record.moved` is in the dated folder, as [`restore`]
+/// needs before it removes anything from a running run.
+fn all_waiting(datadir: &Path, record: &Record) -> bool {
+    let folder = datadir.join(&record.aside);
+    record
+        .moved
+        .iter()
+        .all(|name| matches!(present(&folder.join(name)), Ok(true)))
+}
+
 /// The run a previous start left, to be watched again: one at
 /// [`Phase::Running`] gets a fresh watch window from `now_unix` (time the
 /// app was closed does not count against it), kept on disk. A record at any
@@ -1685,6 +1713,50 @@ mod tests {
         assert!(std::fs::symlink_metadata(d.join("fast-forward-12")).is_ok());
         assert!(std::fs::symlink_metadata(d.join("fast-forward-13.discard")).is_ok());
         assert!(elsewhere.join("blocks").exists());
+    }
+
+    /// Review M6: a run whose old chain cannot come back is given up with
+    /// the rest of the node's data: its record and undo copy go, and the
+    /// sweep takes its dated folder. A running run whose old chain is all
+    /// there can still be rolled back, and a run at any other phase is on
+    /// its way somewhere: both are refused, and nothing changes.
+    #[test]
+    fn a_run_whose_old_chain_cannot_come_back_can_be_given_up() {
+        let tmp = datadir_with_chain();
+        let d = tmp.path();
+        let r = set_aside(d, 232_000, Before::default(), 9).unwrap();
+        attempt_made_chain(d);
+        assert!(abandon(d).is_err(), "the old chain can still come back");
+        assert_eq!(read_record(d).unwrap(), Some(r.clone()));
+        assert!(d.join(".fast-forward-undo.json").exists());
+        std::fs::remove_dir_all(d.join(&r.aside).join("chainstate")).unwrap();
+        assert!(matches!(restore(d), Err(MoveError::Stranded { .. })));
+        abandon(d).unwrap();
+        assert_eq!(read_record(d).unwrap(), None);
+        assert!(!d.join(".fast-forward-undo.json").exists());
+        let mut swept = sweep(d);
+        swept.sort();
+        assert_eq!(swept, vec![d.join(&r.aside)]);
+        assert!(
+            d.join("blocks/new").exists(),
+            "the rest is Remove node data's"
+        );
+        abandon(d).unwrap();
+
+        for phase in [
+            Phase::SettingAside,
+            Phase::Undoing,
+            Phase::Restoring,
+            Phase::Done,
+        ] {
+            let tmp = datadir_with_chain();
+            let d = tmp.path();
+            let r = set_aside(d, 232_000, Before::default(), 9).unwrap();
+            let at = Record { phase, ..r };
+            write_record(d, &at).unwrap();
+            assert!(abandon(d).is_err(), "{phase:?}");
+            assert_eq!(read_record(d).unwrap(), Some(at), "{phase:?}");
+        }
     }
 
     /// The owner's decision: time the app was closed does not count against
