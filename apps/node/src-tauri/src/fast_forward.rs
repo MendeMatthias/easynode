@@ -353,28 +353,31 @@ fn rolled_back(datadir: &Path) -> bool {
 /// restore begins, so it may be shown only once no run is recorded at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ToolsPhase {
-    /// Not running, and never called "running": the driver's own plain
-    /// sentence, with the folder path. Set by [`STUCK`] and by a record
-    /// nobody can read.
+    /// Not running, and never called "running": a plain sentence. The
+    /// driver's own, with the folder path, from [`STUCK`]; the one for a
+    /// record nobody can read; or [`NOT_FINISHED`] for a run recorded with
+    /// no driver at work, which waits for the next start.
     Halted(String),
-    /// A run is genuinely under way: a record exists, whatever its phase, or
-    /// the driver is already at work before it has written one (checking
-    /// and downloading the confirmed pair, section 10 step 1).
+    /// A run is genuinely under way: this app's driver is at work, before it
+    /// has written a record (checking and downloading the confirmed pair,
+    /// section 10 step 1) or at any phase after.
     Running,
     /// No run recorded and no driver at work: the last outcome, if any,
     /// says what happened.
     Idle,
 }
 
-/// Pure half of [`tools_status_phase`].
+/// Pure half of [`tools_status_phase`]. Only a driver at work moves a run
+/// on; with none, a record at any phase waits for the next start, which
+/// carries it on or puts the old chain data back (review I4).
 fn tools_phase(driving: bool, stuck: Option<&str>, record: OnRecord, datadir: &Path) -> ToolsPhase {
     if let Some(said) = stuck {
         return ToolsPhase::Halted(said.into());
     }
     match record {
         OnRecord::Unreadable => ToolsPhase::Halted(unreadable_sentence(datadir)),
-        OnRecord::At(_) => ToolsPhase::Running,
-        OnRecord::Nothing if driving => ToolsPhase::Running,
+        _ if driving => ToolsPhase::Running,
+        OnRecord::At(_) => ToolsPhase::Halted(NOT_FINISHED.into()),
         OnRecord::Nothing => ToolsPhase::Idle,
     }
 }
@@ -1820,56 +1823,71 @@ mod tests {
 
     /// Controller note 1: Task 4's Tools status reads the phase before any
     /// outcome. `STUCK` always wins; then an unreadable record is the same
-    /// kind of plain sentence; then any record at all, whatever its phase
-    /// (a roll-back's outcome may sit beside a still-`Running` one, and is
-    /// not shown while the record is there), or the driver at work before it
-    /// has written one, means a run is genuinely under way; with neither,
-    /// there is nothing recorded to call "running".
+    /// kind of plain sentence. A run is "running" only while this app's
+    /// driver is at work: before it has written a record (checking and
+    /// downloading), and at every phase after. With no driver at work
+    /// nothing moves the run on until the next start (review I4): a record
+    /// at any phase then (a put-back that stopped part-way, a set-aside that
+    /// could not put back, a roll-back decided beside a `Running` record, a
+    /// start that failed before the watch resumed) says so, never
+    /// "running"; with no record either, the last outcome speaks.
     #[test]
     fn the_tools_phase_decides_every_combination() {
         let d = Path::new("/Users/someone/.easybtx");
         let stuck = "the roll-back could not begin.";
+        let records = [
+            OnRecord::Nothing,
+            OnRecord::Unreadable,
+            OnRecord::At(Phase::SettingAside),
+            OnRecord::At(Phase::Running),
+            OnRecord::At(Phase::Undoing),
+            OnRecord::At(Phase::Restoring),
+            OnRecord::At(Phase::Done),
+        ];
+        let mut seen = 0;
         for driving in [false, true] {
-            assert_eq!(
-                tools_phase(driving, Some(stuck), OnRecord::Nothing, d),
-                ToolsPhase::Halted(stuck.into())
-            );
-            assert_eq!(
-                tools_phase(driving, Some(stuck), OnRecord::At(Phase::Running), d),
-                ToolsPhase::Halted(stuck.into())
-            );
+            for stuck in [None, Some(stuck)] {
+                for record in records {
+                    seen += 1;
+                    let want = match (stuck, record) {
+                        (Some(said), _) => ToolsPhase::Halted(said.into()),
+                        (None, OnRecord::Unreadable) => ToolsPhase::Halted(unreadable_sentence(d)),
+                        (None, _) if driving => ToolsPhase::Running,
+                        (None, OnRecord::Nothing) => ToolsPhase::Idle,
+                        (None, OnRecord::At(_)) => ToolsPhase::Halted(NOT_FINISHED.into()),
+                    };
+                    assert_eq!(
+                        tools_phase(driving, stuck, record, d),
+                        want,
+                        "driving {driving}, stuck {stuck:?}, {record:?}"
+                    );
+                }
+            }
         }
-        assert_eq!(
-            tools_phase(false, None, OnRecord::Unreadable, d),
-            ToolsPhase::Halted(unreadable_sentence(d))
-        );
-        assert_eq!(
-            tools_phase(true, None, OnRecord::Unreadable, d),
-            ToolsPhase::Halted(unreadable_sentence(d))
-        );
+        assert_eq!(seen, 28);
+        // The ones the review named: no driver, and the run stuck part-way
+        // or waiting for the next start.
         for phase in [
             Phase::SettingAside,
             Phase::Running,
             Phase::Undoing,
             Phase::Restoring,
-            Phase::Done,
         ] {
-            for driving in [false, true] {
-                assert_eq!(
-                    tools_phase(driving, None, OnRecord::At(phase), d),
-                    ToolsPhase::Running,
-                    "{phase:?}, driving {driving}"
-                );
-            }
+            assert_eq!(
+                tools_phase(false, None, OnRecord::At(phase), d),
+                ToolsPhase::Halted(NOT_FINISHED.into()),
+                "{phase:?}"
+            );
+            assert_eq!(
+                tools_phase(true, None, OnRecord::At(phase), d),
+                ToolsPhase::Running,
+                "{phase:?}, the driver at work"
+            );
         }
         assert_eq!(
             tools_phase(true, None, OnRecord::Nothing, d),
             ToolsPhase::Running,
             "checking and downloading, before a record exists"
-        );
-        assert_eq!(
-            tools_phase(false, None, OnRecord::Nothing, d),
-            ToolsPhase::Idle
         );
     }
 
@@ -1965,9 +1983,12 @@ mod tests {
             None,
             "not the one that could not begin"
         );
-        // Task 4's Tools status: a record is still there, so it is
-        // "running", not the driver's stuck sentence.
-        assert_eq!(tools_status_phase(d), ToolsPhase::Running);
+        // Task 4's Tools status: no driver is at work and the put-back
+        // waits for the next start, so never "running" (review I4).
+        assert_eq!(
+            tools_status_phase(d),
+            ToolsPhase::Halted(NOT_FINISHED.into())
+        );
         // Clear what stood in the way: the attempt's entries in the places
         // the old ones go back to.
         for name in ["blocks", "chainstate", "chainstate_snapshot"] {
@@ -2008,7 +2029,11 @@ mod tests {
         *STUCK.lock().unwrap() = None;
         assert_eq!(before_start(d).await, Ok(()), "the next opening");
         assert!(underway(d), "watched again");
-        assert_eq!(tools_status_phase(d), ToolsPhase::Running, "watched again");
+        assert_eq!(
+            tools_status_phase(d),
+            ToolsPhase::Halted(NOT_FINISHED.into()),
+            "until the watch resumes, once the node is up"
+        );
     }
 
     /// Review I2: the watch reads the one fact the loader sets once its

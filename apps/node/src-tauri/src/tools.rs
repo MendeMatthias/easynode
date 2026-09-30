@@ -1089,9 +1089,10 @@ pub struct FastForwardStatus {
 
 /// The run's phase decides first (controller note 1): a `RolledBack`
 /// outcome is written before its restore begins, so it may be shown only
-/// once no run is recorded at all; while the driver is stuck, or its record
-/// cannot be read, the driver's own plain sentence is shown, never
-/// "running" (`crate::fast_forward::tools_status_phase`).
+/// once no run is recorded at all; while the driver is stuck, its record
+/// cannot be read, or a run is recorded with no driver at work (it waits
+/// for the next start), a plain sentence is shown, never "running"
+/// (`crate::fast_forward::tools_status_phase`).
 #[tauri::command]
 pub async fn tools_fast_forward_status() -> Result<FastForwardStatus, String> {
     use crate::fast_forward::ToolsPhase;
