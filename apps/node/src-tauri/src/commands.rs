@@ -4157,6 +4157,14 @@ static ORPHANED_MIRROR_ENDED: std::sync::atomic::AtomicBool =
 /// `trusted_mirror`; `None` when it did not answer), this launch ends as a
 /// mirror launch does: the signed-only path, then a restart as a validating
 /// node. At most once per run (`ended_one_this_run`).
+///
+/// Two known edges, both left as they are: any orphan the engine reports as
+/// a trusted mirror on a host that now checks blocks itself is ended this
+/// way, including a mirror whose owner switched off following signatures
+/// just before a relaunch (validating is the right end state; it may cost a
+/// pair download, or a set-aside if a held root were on that chain). And a
+/// node that does not answer `getmatmultrustedstatus` (`None`) is not ended;
+/// v0.34.9 answers it.
 fn ends_orphaned_mirror_launch(
     attached: Option<AttachedTo>,
     host_validates: bool,
