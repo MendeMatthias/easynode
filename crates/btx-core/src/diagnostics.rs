@@ -74,7 +74,8 @@ pub struct DiagnosticsInput {
     pub log_warnings: Vec<String>,
 }
 
-fn group(n: u64) -> String {
+/// 229400 as "229,400", the way the report writes heights.
+pub(crate) fn group(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
@@ -1173,11 +1174,11 @@ mod tests {
             assert!(!out.contains(gone), "{gone} survived end to end:\n{out}");
         }
         assert!(
-            out.contains("  [peer address] does not serve old blocks to us"),
+            out.contains("  [peer address] does not serve old blocks to this node"),
             "a catch-up line about someone else's node keeps its sentence, not the address:\n{out}"
         );
         assert!(
-            out.contains("  109.199.124.187:19335 does not serve old blocks to us"),
+            out.contains("  109.199.124.187:19335 does not serve old blocks to this node"),
             "the app's own archive peer is named:\n{out}"
         );
         for kept in [

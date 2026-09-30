@@ -25,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::json;
 
+use crate::diagnostics::group;
 use crate::error::{AppError, AppResult};
 use crate::fork::ChainTip;
 use crate::header_path::{HeaderPath, PathStatus};
@@ -633,10 +634,11 @@ pub fn note(was_helping: bool, d: &Decision) -> Option<String> {
 /// The line for the log, and for Copy diagnostics, about a peer that dropped
 /// this node once when asked for old blocks.
 pub fn dropped_once_line(addr: &str) -> String {
+    let times = times_in_words(DROPS_TO_MARK);
     format!(
         "{addr} dropped the connection once when asked for old blocks, so the other archive \
-         peers are asked first; after a second time it is asked only for newer blocks until \
-         the node restarts"
+         peers are asked first; after it has done so {times}, it is asked only for blocks \
+         within {LIMITED_SERVES} of its newest until the app or the node restarts"
     )
 }
 
@@ -645,9 +647,9 @@ pub fn dropped_once_line(addr: &str) -> String {
 pub fn refuses_old_line(addr: &str) -> String {
     let times = times_in_words(DROPS_TO_MARK);
     format!(
-        "{addr} does not serve old blocks to us: it dropped the connection {times} when asked \
-         for them, so until the node restarts it is asked only for blocks within \
-         {LIMITED_SERVES} of its newest"
+        "{addr} does not serve old blocks to this node: it dropped the connection {times} when \
+         asked for them, so until the app or the node restarts it is asked only for blocks \
+         within {LIMITED_SERVES} of its newest"
     )
 }
 
@@ -740,7 +742,12 @@ impl CatchUp {
     /// asked for old blocks, once or [`DROPS_TO_MARK`] times.
     pub fn diagnostics(&self) -> Vec<String> {
         let mut out = vec![match &self.helper.batch {
-            Some(b) => format!("asking {} for blocks {} to {}", b.addr, b.from, b.to),
+            Some(b) => format!(
+                "asking {} for blocks {} to {}",
+                b.addr,
+                group(b.from),
+                group(b.to)
+            ),
             None => "not asking any peer for blocks right now".to_string(),
         }];
         if self.no_archive_serves_old_blocks() {
@@ -874,10 +881,12 @@ async fn tick_until(
     else {
         return said(cu, was_helping, &d);
     };
-    // `accepted`: the requests now out at that peer. The engine's refusals
-    // are RPC_MISC_ERROR texts (rpc/blockchain.cpp getblockfrompeer and
+    // `accepted`: new requests now out at that peer; `asked_before`: ones
+    // still out there from this help asking it before; `have`: blocks the
+    // node already has. All three are taken. The engine's refusals are
+    // RPC_MISC_ERROR texts (rpc/blockchain.cpp getblockfrompeer and
     // net_processing.cpp FetchBlock, at 84b998b4).
-    let (mut accepted, mut have) = (0, 0);
+    let (mut accepted, mut asked_before, mut have) = (0, 0, 0);
     let mut last_taken = None;
     let (mut unanswered, mut cut) = (false, false);
     for (i, (height, hash)) in blocks.iter().enumerate() {
@@ -897,7 +906,7 @@ async fn tick_until(
             Err(AppError::Rpc { message, .. })
                 if message.contains("Already requested from this peer") =>
             {
-                accepted += 1
+                asked_before += 1
             }
             // The engine refused this one; the rest may still go out.
             Err(AppError::Rpc { .. }) => continue,
@@ -925,17 +934,26 @@ async fn tick_until(
         return lines;
     }
     cu.helper.sent(&d, now, last_taken);
+    let first = group(first);
     lines.push(match last_taken {
         None => {
-            let last = blocks.last().map_or(first, |b| b.0);
+            let last = group(blocks.last().map_or(0, |b| b.0));
             format!(
                 "{addr} took none of blocks {first} to {last}; the next archive peer is asked \
                  later"
             )
         }
-        Some(last) => format!(
-            "asked {addr} for blocks {first} to {last} ({accepted} sent, {have} already here)"
-        ),
+        Some(last) => {
+            let last = group(last);
+            let before = match asked_before {
+                0 => String::new(),
+                n => format!(", {n} already asked"),
+            };
+            format!(
+                "asked {addr} for blocks {first} to {last} ({accepted} sent{before}, {have} \
+                 already here)"
+            )
+        }
     });
     lines
 }
@@ -1824,11 +1842,16 @@ mod tests {
                 .contains('\u{2014}'));
         }
         let line = refuses_old_line(A);
-        assert!(line.starts_with("109.199.124.187:19335 does not serve old blocks to us"));
+        assert!(line.starts_with("109.199.124.187:19335 does not serve old blocks to this node"));
         assert!(!line.contains('\u{2014}'));
         let once = dropped_once_line(A);
         assert!(once.starts_with("109.199.124.187:19335 dropped the connection once"));
         assert!(!once.contains('\u{2014}'));
+        // Both say what is still asked in the same words, and until when.
+        for l in [&line, &once] {
+            assert!(l.contains("blocks within 288 of its newest"), "{l}");
+            assert!(l.contains("until the app or the node restarts"), "{l}");
+        }
     }
 
     #[test]
@@ -1838,6 +1861,12 @@ mod tests {
         assert_eq!(times_in_words(3), "3 times");
         assert!(refuses_old_line(A).contains(&format!(
             "it dropped the connection {} when asked for them",
+            times_in_words(DROPS_TO_MARK)
+        )));
+        // The line about one drop says when the mark comes, from the same
+        // number.
+        assert!(dropped_once_line(A).contains(&format!(
+            "after it has done so {}",
             times_in_words(DROPS_TO_MARK)
         )));
     }
@@ -2264,7 +2293,7 @@ mod tests {
         }
         assert_eq!(
             tick(&node, &mut cu, &t, t0 + QUIET).await,
-            ["asked 109.199.124.187:19335 for blocks 225933 to 226032 (100 sent, 0 already here)"]
+            ["asked 109.199.124.187:19335 for blocks 225,933 to 226,032 (100 sent, 0 already here)"]
         );
         // The batch connects, and the relays have the next three out and
         // hung again: the next batch goes out at once.
@@ -2276,7 +2305,7 @@ mod tests {
         };
         assert_eq!(
             tick(&node, &mut cu, &t, t0 + QUIET + secs(6)).await,
-            ["asked 109.199.124.187:19335 for blocks 226033 to 226132 (100 sent, 0 already here)"]
+            ["asked 109.199.124.187:19335 for blocks 226,033 to 226,132 (100 sent, 0 already here)"]
         );
         let asked = node.asked();
         assert_eq!(asked.len(), 200);
@@ -2467,7 +2496,7 @@ mod tests {
         let a = [recorded(4, A, LIMITED, 233_481)];
         cu.helper.decide(&seen(t0, 225_927, &next, &a));
         step(&mut cu.helper, &seen(t0 + QUIET, 225_927, &next, &a));
-        let asking = "asking 109.199.124.187:19335 for blocks 225928 to 226027";
+        let asking = "asking 109.199.124.187:19335 for blocks 225,928 to 226,027";
         assert_eq!(cu.diagnostics(), [asking]);
         // One drop, and nobody left for now.
         cu.helper.decide(&seen(t0 + secs(33), 225_927, &next, &[]));
@@ -2609,9 +2638,11 @@ mod tests {
             .map(|h| (h, "Already requested from this peer"))
             .collect();
         let t1 = t0 + QUIET + ROTATE_AFTER;
+        let again = "asked 109.199.124.187:19335 for blocks 101 to 200 (0 sent, 100 already \
+                     asked, 0 already here)";
         assert_eq!(
             tick(&node, &mut cu, &tick_of(100, 300, &tips, &busy), t1).await,
-            [ASKED_101_TO_200]
+            [again]
         );
         let later = tick(
             &node,
@@ -2634,7 +2665,7 @@ mod tests {
                 t1 + ROTATE_AFTER
             )
             .await,
-            [ASKED_101_TO_200]
+            [again]
         );
         assert_eq!(node.asked().len(), 300);
     }

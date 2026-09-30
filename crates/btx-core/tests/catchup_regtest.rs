@@ -17,7 +17,7 @@
 //! - When A grants nothing, A drops B on the first of them (engine
 //!   `src/net_processing.cpp:9384-9391` at 84b998b4), each time it is asked.
 //!   The help must say the first drop and ask A again, then on the second
-//!   drop say once that A does not serve old blocks to us, never ask it for
+//!   drop say once that A does not serve old blocks to B, never ask it for
 //!   them again, and conclude that no archive peer serves old blocks to B.
 //!
 //! Either way it must send no command but the ones it is allowed.

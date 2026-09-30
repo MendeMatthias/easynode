@@ -246,7 +246,7 @@ pub fn discriminate(f: &StallFacts) -> Option<StallVerdict> {
         return Some(StallVerdict {
             class: StallClass::BlockFetchGated,
             summary: "this node can see the next blocks and is not asking any peer for them \
-                      (a known upstream scheduler bug), so adding or redialling peers will NOT \
+                      (a known upstream scheduler bug), so adding or redialling peers will not \
                       help. While it is 20 or more blocks behind, this app asks its own \
                       archive peers for the next blocks by name; closer than that, Tools > \
                       Fetch a stuck block asks for them once. If the tip still does not move, \
@@ -582,7 +582,8 @@ mod tests {
         assert_eq!(v.class, StallClass::BlockFetchGated);
         // The operator-facing half of the lesson: this must not send anyone
         // back to the peer list, because that is where 75 minutes went.
-        assert!(v.summary.contains("will NOT"));
+        assert!(v.summary.contains("will not help"));
+        assert!(!v.summary.contains("NOT"), "no shouting");
         // It names the help that now exists (crate::catchup_assist), and only
         // what that help does: it asks, and peers may not answer. The copy once
         // ended "which the guardian does automatically" while nothing did.
