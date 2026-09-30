@@ -21,8 +21,11 @@ import {
 import {
   classifyCheckFailure,
   checkFailureMessage,
+  handInstallBanner,
+  handInstallNotice,
   installErrorFromDetail,
   lastCheckLine,
+  noUpdateMessage,
   updateCheckRecord,
   type LastUpdateCheck,
   type UpdateCheckBranch,
@@ -2120,8 +2123,9 @@ function setUpdateResult(text: string): void {
 
 // Failing to CHECK and failing to INSTALL are different events and must not
 // share a catch. A failed check is usually just being offline, and there is
-// nothing for the user to do about it. A failed INSTALL is permanent for that
-// build — a Linux .deb cannot be replaced by the updater at all — and the old
+// nothing for the user to do about it. A failed INSTALL is usually permanent
+// for that build on that machine (a .deb copy that cannot show the password
+// prompt, a folder the app cannot write to), and the old
 // single catch swallowed it on the automatic path, leaving the banner reading
 // "Update available: vX — downloading…" indefinitely, repainted identically at
 // every launch and every six-hour tick. That is worse than silence: it is an
@@ -2188,13 +2192,29 @@ function paintUpdateProgress(outcome: string, version: string, error: string): v
   }
 }
 
+/**
+ * An update this copy will not download on its own (update_binding.rs): a
+ * .deb copy offered only the AppImage, or a version whose install already
+ * failed here. The banner says so and the sentence beside "Check now" gives
+ * the steps. `text` is what update_binding kept or a recorded detail; for
+ * anything else this paints nothing.
+ */
+function paintHandInstall(text: string): void {
+  const notice = handInstallNotice(text);
+  if (!notice) return;
+  const banner = handInstallBanner(notice);
+  showUpdateBanner(banner.head, banner.tail);
+  setUpdateResult(notice);
+}
+
 // A check the Rust timer ran has settled (src-tauri/src/update_timer.rs). The
 // backend has already written the record; this paints what updateCheck()
-// would have painted had the check run here, through the same two functions,
+// would have painted had the check run here, through the same functions,
 // and the "Last check" line from the record itself rather than waiting for
 // the next status tick to read it back.
 function onUpdateCheckEvent(ev: UpdateCheckEvent): void {
   paintUpdateProgress(ev.outcome, ev.version, installErrorFromDetail(ev.detail));
+  paintHandInstall(ev.detail);
   paintLastUpdateCheck({ at: ev.at, outcome: ev.outcome, detail: ev.detail });
 }
 
@@ -2213,7 +2233,27 @@ function recordUpdateCheck(branch: UpdateCheckBranch, manual: boolean): Promise<
   );
 }
 
+// What update_binding kept about the check that just ran: why it declined or
+// refused the offer, or null. Read before recordUpdateCheck, which takes it.
+// A failure to read it is a console warning and a null, never a reason for
+// the check to fail.
+function peekUpdateRefusal(): Promise<string | null> {
+  return invoke<string | null>("peek_update_refusal").catch((e) => {
+    console.warn("update-check: could not read the refusal", e);
+    return null;
+  });
+}
+
 async function updateCheck(manual = false): Promise<void> {
+  // "Check now" always tries. The automatic checks leave alone a version whose
+  // install already failed here (update_binding.rs); a press forgets that
+  // first. Awaited, so the check below sees it cleared; a failure to clear is
+  // a console warning and the check goes ahead.
+  if (manual) {
+    await invoke("forget_failed_update").catch((e) =>
+      console.warn("update-check: could not clear the failed version", e),
+    );
+  }
   let update: Awaited<ReturnType<typeof checkForUpdate>>;
   try {
     update = await checkForUpdate();
@@ -2235,10 +2275,13 @@ async function updateCheck(manual = false): Promise<void> {
   }
 
   if (!update) {
+    // To the plugin a declined or refused offer is "no update". Read why
+    // before the record below takes it, so the screen says what the record
+    // will: the steps for an update to install by hand, or the refusal.
+    const declined = await peekUpdateRefusal();
+    paintHandInstall(declined ?? "");
     if (manual) {
-      setUpdateResult(
-        appVersion ? `You're on the latest version (v${appVersion}).` : "You're on the latest version."
-      );
+      setUpdateResult(noUpdateMessage(declined, appVersion, MANUAL_DOWNLOAD));
     }
     void recordUpdateCheck({ branch: "no-update", currentVersion: appVersion }, manual);
     return;
@@ -2246,12 +2289,41 @@ async function updateCheck(manual = false): Promise<void> {
 
   paintUpdateProgress("found", update.version, "");
   // Recorded before the download, so a check that found something and then
-  // died mid-download still left the finding behind.
+  // died mid-download still left the finding behind. The six-hourly timer
+  // reads it too: while the last record is a `found` under an hour old it
+  // leaves this check alone (update_timer.rs), so a .deb copy waiting in its
+  // password prompt is not sent a second download and a second prompt.
   void recordUpdateCheck({ branch: "found", version: update.version }, manual);
 
+  // Downloaded and verified first, then installed, so a failure knows which
+  // half it was. A download that broke off is retried at the next check, as
+  // before. A verified download that would not install is remembered, and the
+  // automatic checks leave that version alone, so a copy that cannot install
+  // it does not fetch it again every six hours. "Check now" still tries.
+  //
+  // On a .deb copy the install waits in the password prompt until someone
+  // answers it. That wait happens inside the plugin: its install command runs
+  // the blocking install on one of the backend's async workers, and that is
+  // the plugin's code, left alone here. The six-hourly timer runs its own
+  // install on the blocking pool instead (update_timer.rs).
+  let downloaded = false;
   try {
-    await update.downloadAndInstall();
+    await update.download();
+    downloaded = true;
+    await update.install();
   } catch (e) {
+    // The plugin frees the downloaded package only after an install that
+    // succeeded, so a failed one would hold it (150-470 MB) until the app
+    // quits. Freed here, fire-and-forget: a failure to free is a console
+    // warning and changes nothing else.
+    void update.close().catch((err) =>
+      console.warn("update-check: could not free the downloaded package", err),
+    );
+    if (downloaded) {
+      void invoke("remember_failed_update", { version: update.version }).catch((err) =>
+        console.warn("update-check: could not remember the failed version", err),
+      );
+    }
     paintUpdateProgress("install-failed", update.version, String(e));
     void recordUpdateCheck({ branch: "install-failed", version: update.version, error: e }, manual);
     return;
