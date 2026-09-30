@@ -24,6 +24,14 @@ from everyone, or left on a branch the others have moved on from, knows of no
 newer blocks either. Now a newest block more than two hours old, or signed
 blocks the node does not have, overrule it, and the line says which one it is.
 
+**A node that starts far behind no longer waits on peers that cannot send
+blocks.** The app kept a steady connection to three introducer nodes that only
+know other nodes' addresses, and the node engine kept asking them for its next
+blocks and waiting. A node that started from a snapshot gained a block only
+every few minutes. Now the app asks them for addresses and lets them go. On 30
+September a test node gained one block in three and a half minutes with them,
+and 561 blocks in the five and a half minutes after they were gone.
+
 ## [0.6.32] - 2026-09-28
 
 **Every node is held off two branches until BTX's developers rule on them.**
