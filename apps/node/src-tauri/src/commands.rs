@@ -2519,13 +2519,16 @@ async fn keep_catch_up_report(
 /// The status card's stall sentence. The catch-up help's conclusion
 /// (btx_core::catchup_assist) outranks the watchdog's verdict: it holds on
 /// any node while the tip trickles in from the engine's rescue, and it says
-/// what to do. The watchdog's slot is left as it is, so its progress rule
-/// and its redial are unchanged.
+/// what to do. Not while the engine warns that it cannot check blocks
+/// (`cannot_verify`): that is the cause, and the card shows that warning
+/// only when no stall is shown. The watchdog's slot is left as it is, so its
+/// progress rule and its redial are unchanged.
 fn shown_stall(
     no_archive_serves_old_blocks: bool,
+    cannot_verify: bool,
     watchdog: Option<btx_core::watchdog::StallVerdict>,
 ) -> Option<btx_core::watchdog::StallVerdict> {
-    if no_archive_serves_old_blocks {
+    if no_archive_serves_old_blocks && !cannot_verify {
         Some(btx_core::watchdog::old_blocks_refused_verdict())
     } else {
         watchdog
@@ -3367,14 +3370,19 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
             .unwrap_or(&settings.witness_listen),
     );
     // The catch-up help's conclusion that no archive peer serves old blocks
-    // outranks the watchdog's verdict (`shown_stall`). Read here, so neither
-    // lock is held while the rest of the answer is gathered.
+    // outranks the watchdog's verdict, unless the engine cannot check blocks
+    // (`shown_stall`). Read here, so neither lock is held while the rest of
+    // the answer is gathered.
     let old_blocks_refused = state
         .catch_up_help
         .lock()
         .await
         .no_archive_serves_old_blocks;
-    let stall = shown_stall(old_blocks_refused, state.stall_verdict.lock().await.clone());
+    let stall = shown_stall(
+        old_blocks_refused,
+        cannot_verify.is_some(),
+        state.stall_verdict.lock().await.clone(),
+    );
 
     Ok(NodeStatusInfo {
         running,
@@ -5382,7 +5390,10 @@ mod tests {
     /// The owner's decision 1: while the help concludes that no archive peer
     /// serves old blocks, the card says so on any node, ahead of the
     /// watchdog's own verdict. Otherwise the watchdog's verdict shows as
-    /// before.
+    /// before. Not while the engine warns that it cannot check blocks (a
+    /// chip quarantined mid-run): that is the cause, and the card shows it
+    /// (validation.ts puts `stall` first, so the old-blocks sentence would
+    /// hide it).
     #[test]
     fn the_card_says_no_archive_peer_serves_old_blocks_while_the_help_concludes_it() {
         use btx_core::watchdog::{old_blocks_refused_verdict, StallClass, StallVerdict};
@@ -5391,10 +5402,14 @@ mod tests {
             summary: "the watchdog's own sentence",
         });
         let refused = Some(old_blocks_refused_verdict());
-        assert_eq!(super::shown_stall(true, watchdog.clone()), refused);
-        assert_eq!(super::shown_stall(true, None), refused);
-        assert_eq!(super::shown_stall(false, watchdog.clone()), watchdog);
-        assert_eq!(super::shown_stall(false, None), None);
+        assert_eq!(super::shown_stall(true, false, watchdog.clone()), refused);
+        assert_eq!(super::shown_stall(true, false, None), refused);
+        assert_eq!(super::shown_stall(false, false, watchdog.clone()), watchdog);
+        assert_eq!(super::shown_stall(false, false, None), None);
+        // The engine cannot check blocks: its warning stands, as before.
+        assert_eq!(super::shown_stall(true, true, watchdog.clone()), watchdog);
+        assert_eq!(super::shown_stall(true, true, None), None);
+        assert_eq!(super::shown_stall(false, true, None), None);
     }
 
     /// The refresher awaits the tick on its spawned task, so the tick's
