@@ -83,9 +83,11 @@ pub const FAILED_READS_TO_LOG: u32 = 20;
 /// The one plain line for the log when a read has failed
 /// [`FAILED_READS_TO_LOG`] ticks in a row: nothing else marks a help that
 /// silently cannot read the node's chain, and from outside that looks like a
-/// help that froze.
+/// help that froze. No "catch-up help:" prefix here: `commands.rs` already
+/// adds it to every line this module returns (final review M1), so a prefix
+/// here would print twice.
 pub const FAILED_TO_READ_THE_CHAIN: &str =
-    "Catch-up help: could not read the node's chain for 20 checks in a row. It keeps trying.";
+    "could not read the node's chain for 20 checks in a row. It keeps trying.";
 
 /// Why a tick asked for nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
