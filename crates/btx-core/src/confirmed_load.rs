@@ -531,6 +531,47 @@ async fn snapshot_active(rpc: &dyn Rpc, base: &str) -> bool {
     false
 }
 
+/// A compiled `loadtxoutset` btx-cli brought back no answer for
+/// (`LoadOutcome::NoAnswer`). It has no manifest, so it never comes through
+/// [`load`], but it counts the same way: only if the node then shows the
+/// snapshot active, the one based at `base_height` (the app does not compile
+/// the engine's base hash, so the base's own header says where it is), and
+/// step 6 finds no refused block on its chain. Every error here has
+/// [`LoadError::restore_chain_data`]: the engine may hold a snapshot the app
+/// cannot vouch for.
+pub(crate) async fn unanswered_compiled_load_counts(
+    rpc: &dyn Rpc,
+    base_height: u64,
+    holds: &Holds<'_>,
+    why: String,
+) -> Result<(), LoadError> {
+    if !snapshot_active_at(rpc, base_height).await {
+        return Err(LoadError::EngineUnanswered(why));
+    }
+    check_holds_after_load(rpc, holds).await
+}
+
+/// [`snapshot_active`] for a snapshot known only by its base height.
+async fn snapshot_active_at(rpc: &dyn Rpc, base_height: u64) -> bool {
+    for attempt in 1..=POST_LOAD_ATTEMPTS {
+        let base = crate::node_api::get_chainstates(rpc)
+            .await
+            .ok()
+            .and_then(|s| s.snapshot().and_then(|c| c.snapshot_blockhash.clone()));
+        if let Some(base) = base {
+            if let Ok(header) = rpc.call("getblockheader", json!([base, true])).await {
+                if header["height"].as_u64() == Some(base_height) {
+                    return true;
+                }
+            }
+        }
+        if attempt < POST_LOAD_ATTEMPTS {
+            tokio::time::sleep(POST_LOAD_PAUSE).await;
+        }
+    }
+    false
+}
+
 /// Section 7, step 3: refuse every block the app refuses, invalid blocks
 /// first, then the held branches in order, as `crate::known_invalid` does
 /// for the fork check. Stricter than the fork check: only "Block not found"

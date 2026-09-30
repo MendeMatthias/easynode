@@ -1245,7 +1245,12 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
         // One that checks blocks itself cannot load a signed snapshot, the
         // engine refuses it, so it keeps the compiled one. Same rule as the
         // -matmulvalidation arm, through `signer_applies_here`.
-        btx_core::snapshot::ensure_snapshot_loaded_with(
+        let signed = if signer_applies_here {
+            btx_core::snapshot::SignedLoad::None
+        } else {
+            btx_core::snapshot::SignedLoad::Mirror
+        };
+        drop(btx_core::snapshot::ensure_snapshot_loaded_with(
             rpc.clone(),
             paths.btx_cli.clone(),
             datadir.clone(),
@@ -1253,8 +1258,8 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
             Arc::new(NodeAppSnapshotFlags {
                 datadir: datadir.clone(),
             }),
-            !signer_applies_here,
-        );
+            signed,
+        ));
     }
 
     set_phase(app, state, NodePhase::LoadingSnapshot).await;
