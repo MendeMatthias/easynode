@@ -32,7 +32,9 @@ use sha2::{Digest, Sha256};
 
 pub const STATEMENT_VERSION: u8 = 2;
 pub const STATEMENT_LEN: usize = 229;
-/// The engine's cap on a manifest.
+/// The engine's cap on a manifest, and so on any manifest this app parses
+/// or a confirmed pointer names. `crate::attested_snapshot::MAX_MANIFEST_BYTES`
+/// (4 KiB) is a different, smaller cap: the pinned pair's download only.
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 /// Far more than any list will hold; a count above it is not a manifest.
 pub const MAX_SIGNATURES: u64 = 64;

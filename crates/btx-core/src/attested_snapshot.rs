@@ -38,7 +38,10 @@ pub const MAX_POINTER_BYTES: usize = 16 * 1024;
 /// this is refused before anything is downloaded.
 pub const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 
-/// A manifest with one signature is 335 bytes. The pinned pair's is that.
+/// The cap on the PINNED pair's manifest download: a manifest with one
+/// signature is 335 bytes, and the pinned pair's is that. Not the cap on a
+/// manifest in general: that is [`cs::MAX_MANIFEST_BYTES`] (64 KiB, the
+/// engine's), which a confirmed pointer's `manifest_size` must stay under.
 pub const MAX_MANIFEST_BYTES: u64 = 4 * 1024;
 
 /// Where the website serves the newest confirmed snapshot. The contract is
@@ -135,7 +138,9 @@ pub fn check(pair: &AttestedPair, compiled_anchor: u64) -> Result<(), String> {
 ///
 /// * HTTP 200, `Content-Type: application/json`, at most 16 KB, this object.
 /// * HTTP 200 with exactly `{"disputed": [<height>, ...]}` while any dispute
-///   stands (section 6a); [`Latest::Disputed`]. The app then falls back.
+///   stands (section 6a); [`Latest::Disputed`]. The heights are in ascending
+///   order and there is at least one; the app refuses an empty list. The app
+///   then falls back.
 /// * HTTP 404 when no snapshot is confirmed, body `{"version":1,"confirmed":null}`.
 ///   The app treats every status other than 200 as "none" and falls back.
 /// * `Cache-Control: public, max-age=60`.
@@ -158,6 +163,10 @@ pub fn check(pair: &AttestedPair, compiled_anchor: u64) -> Result<(), String> {
 ///   "confirmed_at": "2026-10-01T12:00:00Z"
 /// }
 /// ```
+///
+/// `manifest_url` and `file_url` are HTTPS on `easybtx.com` or a
+/// `<store>.public.blob.vercel-storage.com` host, with no port and no user
+/// info ([`confirmed_url_allowed`]); the app downloads from nowhere else.
 ///
 /// The manifest served is the merged one, every signature the website
 /// accepted; the app checks it and keeps only what its node pins. Nothing
@@ -470,7 +479,7 @@ async fn download_pair(
         &file,
         Some(pair.file_size),
         &pair.sha256,
-        MAX_SNAPSHOT_BYTES,
+        pair.file_size,
     )
     .await
     .map_err(|e| format!("snapshot: {e}"))?;
@@ -570,7 +579,7 @@ pub async fn prepare_confirmed(
             &manifest,
             Some(p.manifest_size),
             &p.manifest_sha256,
-            cs::MAX_MANIFEST_BYTES as u64,
+            p.manifest_size,
         )
         .await
         .map_err(|e| format!("manifest: {e}"))?;
@@ -582,7 +591,9 @@ pub async fn prepare_confirmed(
             let _ = std::fs::remove_file(&manifest);
             format!("not confirmed: {e}")
         })?;
-    pointer_matches(&p, &confirmed)?;
+    pointer_matches(&p, &confirmed).inspect_err(|_| {
+        let _ = std::fs::remove_file(&manifest);
+    })?;
 
     let st = &confirmed.manifest.statement;
     let double = if file_matches(&file, st.file_size(), &p.file_sha256) {
@@ -596,7 +607,7 @@ pub async fn prepare_confirmed(
             &file,
             Some(st.file_size()),
             &p.file_sha256,
-            MAX_SNAPSHOT_BYTES,
+            st.file_size(),
         )
         .await
         .map_err(|e| format!("snapshot: {e}"))?
@@ -1063,6 +1074,57 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("does not describe"), "{err}");
+        assert!(
+            !pair_paths(tmp.path(), 100).1.exists(),
+            "the checked manifest is not kept for a pointer that misdescribes it"
+        );
+    }
+
+    /// Final review triage (T3): each download stops at the size the pointer
+    /// and the statement give it, not at the largest size any pair may have.
+    #[tokio::test]
+    async fn a_download_stops_at_the_size_it_was_given() {
+        let env = format!("producer={P};confirmer={C}");
+        for longer in ["/m", "/f"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut server = mockito::Server::new_async().await;
+            let p = regtest_pointer(&server.url(), R_PC, R_DAT);
+            server
+                .mock("GET", "/latest")
+                .with_body(serde_json::to_vec(&p).unwrap())
+                .create_async()
+                .await;
+            for (path, body) in [("/m", R_PC), ("/f", R_DAT)] {
+                let mut body = body.to_vec();
+                if path == longer {
+                    body.extend_from_slice(&[0u8; 4096]);
+                }
+                server
+                    .mock("GET", path)
+                    .with_body(body)
+                    .create_async()
+                    .await;
+            }
+            let err = prepare_confirmed(
+                &reqwest::Client::new(),
+                &format!("{}/latest", server.url()),
+                tmp.path(),
+                &view(),
+                Some(&env),
+                any_url,
+            )
+            .await
+            .unwrap_err();
+            let (what, size) = if longer == "/m" {
+                ("manifest", R_PC.len())
+            } else {
+                ("snapshot", R_DAT.len())
+            };
+            assert!(
+                err.contains(&format!("{what}: larger than {size} bytes")),
+                "{longer}: {err}"
+            );
+        }
     }
 
     #[tokio::test]
