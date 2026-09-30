@@ -205,6 +205,16 @@ fn fetch_error(e: AppError) -> String {
     e.to_string()
 }
 
+/// [`fetch_error`] for the header walk, whose own check of a header (its
+/// height, its parent) fails as `AppError::Decode`: a plain sentence instead
+/// of the decoder's text. A correct engine never sends such a header.
+fn walk_error(e: AppError) -> String {
+    match e {
+        AppError::Decode(_) => "The node sent a header this app could not read.".into(),
+        e => fetch_error(e),
+    }
+}
+
 /// The role and engine lines of a report the node could not answer for.
 /// The rest of the report (the phase, with the engine's own warm-up line,
 /// and the debug.log lines) does not need the node and is always there.
@@ -381,10 +391,14 @@ async fn missing_blocks(
     path.retarget(target.height, &target.hash);
     path.walk(rpc, tip_height, usize::MAX)
         .await
-        .map_err(fetch_error)?;
+        .map_err(walk_error)?;
     match path.status(tip_height, tip_hash) {
         PathStatus::Ready => Ok(path.next(tip_height, usize::MAX)),
         PathStatus::OtherBranch => Err("The newest headers are on another branch than your node's tip. The node decides that on its own.".into()),
+        // Not reached: the target is above the tip (`stuck_blocks::target_tip`
+        // picks only such), and a walk with no budget returns Ok only once it
+        // has reached the tip. Kept as "nothing to ask for" rather than a
+        // panic.
         PathStatus::Nothing | PathStatus::Walking => Ok(Vec::new()),
     }
 }
@@ -772,6 +786,26 @@ mod tests {
         }
     }
 
+    mod fetch_a_stuck_block {
+        use super::super::*;
+
+        /// A header the walk cannot read (no height where it should be, no
+        /// parent) gets a plain sentence, not the decoder's own text.
+        #[test]
+        fn a_header_the_walk_cannot_read_gets_a_plain_sentence() {
+            let e = AppError::Decode("header 00ab is not at height 5".into());
+            assert_eq!(
+                walk_error(e),
+                "The node sent a header this app could not read."
+            );
+            let other = || AppError::Rpc {
+                code: -5,
+                message: "Block not found".into(),
+            };
+            assert_eq!(walk_error(other()), fetch_error(other()));
+        }
+    }
+
     mod a_node_that_is_still_starting {
         use super::super::*;
         use btx_core::engine_warnings::Notice;
@@ -845,6 +879,7 @@ mod tests {
                 "Start your node first."
             );
             assert_eq!(fetch_error(in_warmup()), STARTING);
+            assert_eq!(walk_error(in_warmup()), STARTING);
         }
 
         /// The report is still produced, with the phase and the log lines,
