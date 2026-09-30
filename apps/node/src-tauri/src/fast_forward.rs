@@ -48,9 +48,9 @@ use btx_core::snapshot_start::{StartRecord, StartSource};
 use tauri::{AppHandle, Manager, State};
 
 use crate::commands::{
-    destructive_allowed, node_ownership, rpc_already_answering, set_phase, setup_log,
-    snapshot_spec, start_node_inner, stop_node_inner, ALREADY_STARTING, SET_ASIDE_PENDING_FILE,
-    SIGNED_LOAD_FAILED,
+    destructive_allowed, node_ownership, nominal_btxd_path, rpc_already_answering, set_phase,
+    setup_log, snapshot_spec, start_node_inner, stop_node_inner, ALREADY_STARTING,
+    SET_ASIDE_PENDING_FILE, SIGNED_LOAD_FAILED,
 };
 use crate::state::{node_datadir, AppState, NodeAppSettings, NodePhase};
 
@@ -855,6 +855,35 @@ async fn not_started(datadir: &Path, why: &str) {
     on_disk(move || ff::write_outcome(&dd, &Outcome::RolledBack { reason })).await;
 }
 
+/// Does this host follow signatures, or check blocks itself? Its lasting
+/// role, as the start path reads it.
+pub(crate) fn follows_signatures_here(datadir: &Path) -> bool {
+    btx_core::node::host_follows_signatures(
+        &nominal_btxd_path(),
+        datadir,
+        btx_core::backend::node_host_backend(),
+    )
+}
+
+/// What the confirmed snapshot is judged with before a run, by Tools' check
+/// and by step 1: the view the run's load will have
+/// (`confirmed_load::launch_view`). A node that follows signatures loads in
+/// place, with its own engine's pins; a node that checks blocks loads in its
+/// one mirror launch, which pins every compiled key, while its running
+/// engine may pin none.
+pub(crate) async fn run_view(
+    rpc: &btx_core::rpc::RpcClient,
+    follows_signatures: bool,
+) -> btx_core::confirmed_snapshot::NodeView {
+    btx_core::confirmed_load::launch_view(
+        rpc,
+        &btx_core::node::BTX_TRUSTED_ATTESTATION_PUBKEYS,
+        btx_core::attested_snapshot::fallback_start(snapshot_spec().anchor_height),
+        follows_signatures,
+    )
+    .await
+}
+
 /// Step 1: the confirmed pair, checked as the loader checks it and on disk.
 /// A disputed `latest` stops here. The error is for the log.
 async fn prepare(
@@ -862,13 +891,7 @@ async fn prepare(
     datadir: &Path,
 ) -> Result<btx_core::attested_snapshot::ReadyPair, String> {
     use btx_core::attested_snapshot as attested;
-    let anchor = snapshot_spec().anchor_height;
-    let view = btx_core::confirmed_load::node_view(
-        rpc,
-        &btx_core::node::BTX_TRUSTED_ATTESTATION_PUBKEYS,
-        attested::fallback_start(anchor),
-    )
-    .await;
+    let view = run_view(rpc, follows_signatures_here(datadir)).await;
     let client = attested::http_client()?;
     let regtest_env = btx_core::operators::regtest_env();
     tokio::time::timeout(
@@ -1999,6 +2022,37 @@ mod tests {
         assert!(started_elsewhere(crate::commands::ALREADY_STARTING));
         assert!(!started_elsewhere("couldn't start the node: no btxd"));
         assert!(!started_elsewhere(MOVING));
+    }
+
+    /// Review I1, in the code: Tools' check and step 1 judge the confirmed
+    /// snapshot with the view the run's load will have (`run_view`, whose
+    /// pins `confirmed_load::launch_view`'s own test holds for both host
+    /// kinds), never with the running engine's pins alone.
+    #[test]
+    fn the_check_and_step_one_judge_with_the_pins_of_the_runs_load() {
+        let body = |src: &'static str, start: &str, end: &str| -> &'static str {
+            src.split(start)
+                .nth(1)
+                .and_then(|s| s.split(end).next())
+                .unwrap()
+        };
+        let check = body(
+            include_str!("tools.rs"),
+            "pub async fn tools_fast_forward_check(",
+            "\npub async fn tools_fast_forward_run(",
+        );
+        let prepare = body(
+            include_str!("fast_forward.rs"),
+            "\nasync fn prepare(",
+            "\nasync fn run(",
+        );
+        for (what, src) in [("the check", check), ("step 1", prepare)] {
+            assert!(
+                src.contains("run_view(&rpc") || src.contains("run_view(rpc"),
+                "{what}"
+            );
+            assert!(!src.contains("node_view("), "{what}");
+        }
     }
 
     /// Everything the driver says: plain, no em-dash; the sentences end in

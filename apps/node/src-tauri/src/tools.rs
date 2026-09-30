@@ -20,8 +20,7 @@ use btx_core::stuck_blocks::{self, FetchPlan};
 
 use crate::ask::{degrade, Ask};
 use crate::commands::{
-    destructive_allowed, mirror_launch_available, node_ownership, nominal_btxd_path,
-    restart_node_projected,
+    destructive_allowed, mirror_launch_available, node_ownership, restart_node_projected,
 };
 use crate::state::{node_datadir, AppState, NodePhase};
 
@@ -1021,7 +1020,8 @@ fn fast_forward_check(
 pub async fn tools_fast_forward_check(
     state: State<'_, AppState>,
 ) -> Result<FastForwardCheck, String> {
-    let owned = destructive_allowed(node_ownership(&state, &node_datadir()).await).is_ok();
+    let datadir = node_datadir();
+    let owned = destructive_allowed(node_ownership(&state, &datadir).await).is_ok();
     if !owned || crate::fast_forward::active() {
         return Ok(FastForwardCheck::None);
     }
@@ -1032,13 +1032,11 @@ pub async fn tools_fast_forward_check(
         Ok(info) => info.blocks,
         Err(_) => return Ok(FastForwardCheck::None),
     };
-    let anchor = crate::commands::snapshot_spec().anchor_height;
-    let view = btx_core::confirmed_load::node_view(
-        &rpc,
-        &btx_core::node::BTX_TRUSTED_ATTESTATION_PUBKEYS,
-        btx_core::attested_snapshot::fallback_start(anchor),
-    )
-    .await;
+    // Judged with the pins the run's load will have, not the running
+    // engine's: a node that checks blocks may pin none until its one mirror
+    // launch (`crate::fast_forward::run_view`).
+    let follows_signatures = crate::fast_forward::follows_signatures_here(&datadir);
+    let view = crate::fast_forward::run_view(&rpc, follows_signatures).await;
     // A client that fails to build (never in practice) is nothing to show,
     // like every other soft failure above: no raw error text reaches the
     // window from a background check nobody asked for yet.
@@ -1062,16 +1060,11 @@ pub async fn tools_fast_forward_check(
         .await
         .no_archive_serves_old_blocks;
     let check = fast_forward_check(owned, peek, tip, old_blocks_refused);
-    if matches!(check, FastForwardCheck::Offer { .. }) {
-        let datadir = node_datadir();
-        let validating = !btx_core::node::host_follows_signatures(
-            &nominal_btxd_path(),
-            &datadir,
-            btx_core::backend::node_host_backend(),
-        );
-        if validating && !mirror_launch_available(&datadir) {
-            return Ok(FastForwardCheck::None);
-        }
+    if matches!(check, FastForwardCheck::Offer { .. })
+        && !follows_signatures
+        && !mirror_launch_available(&datadir)
+    {
+        return Ok(FastForwardCheck::None);
     }
     Ok(check)
 }
