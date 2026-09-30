@@ -197,6 +197,12 @@ pub struct Helper {
     no_old_blocks: bool,
     /// While `no_old_blocks` holds: the last tick saw a peer the help may ask.
     askable_last_tick: bool,
+    /// The node did not answer at all for a batch's first request, so
+    /// nothing was recorded: not the peer's turn ending (Decision 20), so
+    /// the very next [`decide`](Self::decide) may ask again without waiting
+    /// out [`QUIET`]. Read and cleared at the top of `decide`, so it applies
+    /// only there, once.
+    retry_at_once: bool,
     /// The connection ids the last tick saw, and its wall clock: what tells
     /// this Mac losing its connections from a peer dropping us.
     last_peers: Vec<i64>,
@@ -224,6 +230,7 @@ impl Helper {
             news: Vec::new(),
             no_old_blocks: false,
             askable_last_tick: false,
+            retry_at_once: false,
             last_peers: Vec::new(),
             last_wall: None,
         }
@@ -317,6 +324,9 @@ impl Helper {
 
     pub fn decide(&mut self, s: &Seen) -> Decision {
         self.observe(s.tip, s.now);
+        // Consumed here, once, whatever happens below: a pending retry
+        // applies only to the very next `decide`, never to one after it.
+        let retry_at_once = std::mem::take(&mut self.retry_at_once);
         let outage = self.local_outage(s);
         self.last_peers = s.peers.iter().map(|p| p.id).collect();
         self.last_wall = s.wall.or(self.last_wall);
@@ -390,6 +400,12 @@ impl Helper {
             }
             return self.ask(s);
         }
+        if retry_at_once {
+            // The node did not answer at all last time, so this is not the
+            // peer's turn ending: ask again now, without waiting out the
+            // quiet clock (Decision 20).
+            return self.ask(s);
+        }
         // `observe` has set it for this tip.
         let since = self.quiet_since.map_or(s.now, |(_, at)| at);
         if s.now.duration_since(since) < QUIET {
@@ -445,6 +461,14 @@ impl Helper {
         self.no_old_blocks = false;
         self.askable_last_tick = false;
         self.idle(why)
+    }
+
+    /// The node did not answer at all for a batch's first request: nothing
+    /// was recorded, so this is not the peer's turn ending. Marks that the
+    /// very next [`decide`](Self::decide) may ask again at once, instead of
+    /// waiting out [`QUIET`] (Decision 20).
+    fn retry_without_delay(&mut self) {
+        self.retry_at_once = true;
     }
 
     /// Rotate away from `addr`: the peers not tried since the last batch
@@ -699,6 +723,10 @@ pub struct CatchUp {
     target: Option<(u64, String)>,
     /// The last tick took longer than [`SLOW_TICK`].
     slow: bool,
+    /// The last tick's first request to the node went unanswered: the "did
+    /// not answer" line is said once for a spell of these, like
+    /// [`SLOW_TICK`]'s, not on every tick it lasts.
+    unanswered: bool,
 }
 
 /// What the shell keeps of the help between ticks (`AppState::catch_up_help`,
@@ -719,6 +747,7 @@ impl CatchUp {
             path: HeaderPath::new(),
             target: None,
             slow: false,
+            unanswered: false,
         }
     }
 
@@ -942,14 +971,20 @@ async fn tick_until(
         return lines;
     };
     if last_taken.is_none() && (unanswered || cut) {
-        // No rotation, no new quiet wait: the next tick asks the same peer.
+        // No rotation, no new quiet wait: the next tick asks the same peer,
+        // at once rather than after another quiet wait (Decision 20).
         if unanswered {
-            lines.push(format!(
-                "the node did not answer while asking {addr}; asking again later"
-            ));
+            cu.helper.retry_without_delay();
+            if !cu.unanswered {
+                lines.push(format!(
+                    "the node did not answer while asking {addr}; asking again later"
+                ));
+            }
+            cu.unanswered = true;
         }
         return lines;
     }
+    cu.unanswered = false;
     cu.helper.sent(&d, now, last_taken);
     let first = group(first);
     lines.push(match last_taken {
@@ -2595,6 +2630,80 @@ mod tests {
             [ASKED_101_TO_200]
         );
         assert!(node.asked().iter().all(|(_, id)| *id == 7));
+    }
+
+    #[tokio::test]
+    async fn the_did_not_answer_line_is_said_once_per_spell_not_every_tick() {
+        // m3: the node never answers getblockfrompeer while the tip stands
+        // still, so quiet_since never moves either and every tick asks
+        // again. The line should be said once per spell, the way
+        // slow_tick_line is said once per slow spell, not on every one of
+        // about 20 ticks in a minute at the refresher's 3-second cadence.
+        let mut node = FakeNode::new(300, 100, None);
+        node.failing = vec!["getblockfrompeer"];
+        let tips = [tip(300, "headers-only")];
+        let peers = [peer(7, A, 300)];
+        let t = tick_of(100, 300, &tips, &peers);
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        tick(&node, &mut cu, &t, t0).await;
+        let line = "the node did not answer while asking 109.199.124.187:19335; asking again \
+                    later";
+        assert_eq!(tick(&node, &mut cu, &t, t0 + QUIET).await, [line]);
+        for i in 1..20u64 {
+            assert_eq!(
+                tick(&node, &mut cu, &t, t0 + QUIET + secs(i * 3)).await,
+                Vec::<String>::new(),
+                "tick {i} after the first should stay quiet"
+            );
+        }
+        // A request taken again ends the spell: asked, and the batch waits
+        // to connect (the tip in `t` never moves), until it rotates and
+        // fails again, which is a new spell and is said once more.
+        node.failing.clear();
+        assert_eq!(
+            tick(&node, &mut cu, &t, t0 + QUIET + secs(60)).await,
+            [ASKED_101_TO_200]
+        );
+        node.failing = vec!["getblockfrompeer"];
+        assert_eq!(
+            tick(&node, &mut cu, &t, t0 + QUIET + secs(60) + ROTATE_AFTER).await,
+            [line]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_request_right_after_a_batch_connects_is_retried_next_tick() {
+        // m4 / Decision 20: the same peer is asked on the next tick, not
+        // after another 30-second wait. The first batch (101..200) connects,
+        // and the very next request the help sends gets no answer at all.
+        let mut node = FakeNode::new(300, 100, None);
+        let tips = [tip(300, "headers-only")];
+        let peers = [peer(7, A, 300)];
+        let t = tick_of(100, 300, &tips, &peers);
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        tick(&node, &mut cu, &t, t0).await;
+        assert_eq!(
+            tick(&node, &mut cu, &t, t0 + QUIET).await,
+            [ASKED_101_TO_200]
+        );
+        // The batch connects, and the next request (201..300) is unanswered.
+        node.tip = 200;
+        node.failing = vec!["getblockfrompeer"];
+        let t2 = tick_of(200, 300, &tips, &peers);
+        let t_connect = t0 + QUIET + secs(3);
+        assert_eq!(
+            tick(&node, &mut cu, &t2, t_connect).await,
+            ["the node did not answer while asking 109.199.124.187:19335; asking again later"]
+        );
+        node.failing.clear();
+        // Only one second later: without the fix this would still be
+        // waiting out the 30-second quiet clock instead of asking at once.
+        assert_eq!(
+            tick(&node, &mut cu, &t2, t_connect + secs(1)).await,
+            ["asked 109.199.124.187:19335 for blocks 201 to 300 (100 sent, 0 already here)"]
+        );
     }
 
     #[tokio::test]
