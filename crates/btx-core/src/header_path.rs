@@ -185,10 +185,9 @@ impl HeaderPath {
     /// tip has passed (left alone, either would dangle below everything the
     /// trim below just kept, and a later rollback would wrongly resume from
     /// it). A tip that then falls below the lowest header still held
-    /// resumes the walk from there, or, if nothing is held at all — the tip
-    /// having risen to or past everything held emptied the path via that
-    /// same trim, not a rollback by itself — starts it again from the
-    /// target.
+    /// resumes the walk from there. If nothing is held at all (the tip rose
+    /// to or past everything held and that same trim emptied the path; a
+    /// rollback alone does not), it starts again from the target.
     fn forget_below(&mut self, tip: u64) {
         let lowest = self.hashes.iter().next().map(|(h, s)| (*h, s.clone()));
         let below_everything = match &lowest {
