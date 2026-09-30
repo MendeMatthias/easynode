@@ -1916,10 +1916,20 @@ pub fn trusted_mirror_required(backend: Backend, datadir: &Path) -> bool {
 /// mirror, unless the operator's word is `=0`.
 pub fn launches_as_mirror(btxd: &Path, datadir: &Path, backend: Backend) -> bool {
     // A validating node's one mirror launch, to load a signed snapshot.
-    if mirror_load_pending(datadir).is_some() && trusted_mirror_override() != Some(false) {
+    if mirror_load_marker_applies(
+        mirror_load_pending(datadir).is_some(),
+        trusted_mirror_override(),
+    ) {
         return true;
     }
     host_follows_signatures(btxd, datadir, backend)
+}
+
+/// Pure half of [`launches_as_mirror`]'s first rule: a fresh mirror-load
+/// marker makes the launch a mirror, unless the operator's word
+/// ([`trusted_mirror_override`]) is "never a mirror".
+pub fn mirror_load_marker_applies(fresh_marker: bool, operator_word: Option<bool>) -> bool {
+    fresh_marker && operator_word != Some(false)
 }
 
 /// [`launches_as_mirror`] without the one-time mirror launch: does this host
@@ -2128,10 +2138,15 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// How far in the future a marker may say it was written and still count:
+/// a clock step (a clock a time sync set back), not more.
+pub const MIRROR_LOAD_CLOCK_STEP_SECS: u64 = 300;
+
 /// Pure half of [`mirror_load_pending`]: young enough, and not from the
-/// future by more than a clock step.
+/// future by more than a clock step ([`MIRROR_LOAD_CLOCK_STEP_SECS`]).
 pub fn mirror_load_is_fresh(m: &MirrorLoad, now: u64) -> bool {
-    m.written_at <= now + 300 && now.saturating_sub(m.written_at) < MIRROR_LOAD_MAX_AGE_SECS
+    m.written_at <= now + MIRROR_LOAD_CLOCK_STEP_SECS
+        && now.saturating_sub(m.written_at) < MIRROR_LOAD_MAX_AGE_SECS
 }
 
 /// Mark the next launch of this datadir as the mirror launch that loads the
@@ -6699,8 +6714,9 @@ matmul: metal runtime_probe_ok, selecting metal\n\
     }
 
     /// Section 7, step 5: the marker makes exactly the load launch a mirror
-    /// (and takes the signing key out of it), and clearing it gives the
-    /// validating launch back.
+    /// (the app's start path takes the signing key out of the conf for it;
+    /// `build_node_command` does not), and clearing it gives the validating
+    /// launch back.
     #[test]
     fn a_mirror_load_marker_makes_only_the_load_launch_a_mirror() {
         let dir = signed_snapshot_datadir("mirror-load");
@@ -6725,6 +6741,27 @@ matmul: metal runtime_probe_ok, selecting metal\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The operator's "never a mirror" (`EASYBTX_NODE_TRUSTED_MIRROR=0`)
+    /// outranks a fresh mirror-load marker: the launch is not a mirror, and
+    /// no mirror launch is wanted. The env half is read by
+    /// `trusted_mirror_override`; this is the rule it feeds.
+    #[test]
+    fn never_a_mirror_outranks_a_fresh_mirror_load_marker() {
+        let dir = signed_snapshot_datadir("mirror-load-never");
+        begin_mirror_load(&dir, 232_000).unwrap();
+        let fresh = mirror_load_pending(&dir).is_some();
+        assert!(fresh);
+        let never = parse_trusted_mirror_override("0");
+        assert_eq!(never, Some(false));
+        assert!(!mirror_load_marker_applies(fresh, never));
+        assert!(mirror_load_marker_applies(fresh, None));
+        assert!(mirror_load_marker_applies(fresh, Some(true)));
+        assert!(!mirror_load_marker_applies(false, None));
+        assert!(!mirror_load_wanted(true, false, false, false, true));
+        assert!(mirror_load_wanted(true, false, false, false, false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_stale_or_broken_mirror_load_marker_is_ignored() {
         let now = 1_790_000_000;
@@ -6745,6 +6782,10 @@ matmul: metal runtime_probe_ok, selecting metal\n\
             !mirror_load_is_fresh(&m(now + 3_600), now),
             "from the future"
         );
+        // A clock step of up to five minutes is forgiven, and no more.
+        assert_eq!(MIRROR_LOAD_CLOCK_STEP_SECS, 300);
+        assert!(mirror_load_is_fresh(&m(now + 300), now));
+        assert!(!mirror_load_is_fresh(&m(now + 301), now));
 
         let dir = signed_snapshot_datadir("mirror-load-stale");
         let btxd = Path::new("/x/btx/v0.34.9/lin/btxd");
