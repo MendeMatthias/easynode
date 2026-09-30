@@ -35,6 +35,23 @@ failed to install is not downloaded again by the automatic checks; Check now
 still tries. A .deb copy on 0.6.32 or older moves to this version by hand one
 last time, with the command on easybtx.com/node.
 
+**New nodes start closer to the tip, from a snapshot two operators confirmed.**
+When you set up a node, easyNode looks for the newest chain snapshot that at
+least two of the people on its operator list have signed (today Mende,
+Aleksander and jpp), checks every signature itself, and starts your node there
+instead of thousands of blocks back. A node that checks blocks itself loads it
+in one short extra start, then goes back to checking every new block, and it
+still checks its older history in the background. A node that checks blocks
+itself also lists the signing keys mirrors follow, which it needs to keep
+starting from that snapshot; they never replace its own checks, and it passes
+their signatures on to its peers, as mirrors do. The node remembers who
+confirmed its start point, and names them under the check of older history
+and in Copy diagnostics. If there is no such snapshot yet, or the operators
+disagree about one, your node starts from the snapshot easyNode already ships,
+at block 225,927. A node that checks blocks itself used to start further back,
+from the one built into the node engine, and now takes easyNode's in the same
+short extra start.
+
 **Setup asks one question: Quick start or Full check.** Both start from a
 recent signed snapshot and check the older history in the background. Quick
 start follows signatures and is ready in minutes. Full check also checks every
@@ -64,23 +81,6 @@ up...". If the gap is not closing, it turns amber and says how many blocks an
 hour your node adds against the network's 40. A node that is still syncing is
 judged by the blocks it adds, and a fresh install that is still counting the
 chain's headers stays calm.
-
-**New nodes start closer to the tip, from a snapshot two operators confirmed.**
-When you set up a node, easyNode looks for the newest chain snapshot that at
-least two of the people on its operator list have signed (today Mende,
-Aleksander and jpp), checks every signature itself, and starts your node there
-instead of thousands of blocks back. A node that checks blocks itself loads it
-in one short extra start, then goes back to checking every new block, and it
-still checks its older history in the background. A node that checks blocks
-itself also lists the signing keys mirrors follow, which it needs to keep
-starting from that snapshot; they never replace its own checks, and it passes
-their signatures on to its peers, as mirrors do. The node remembers who
-confirmed its start point, and names them under the check of older history
-and in Copy diagnostics. If there is no such snapshot yet, or the operators
-disagree about one, your node starts from the snapshot easyNode already ships,
-at block 225,927. A node that checks blocks itself used to start further back,
-from the one built into the node engine, and now takes easyNode's in the same
-short extra start.
 
 ## [0.6.32] - 2026-09-28
 
