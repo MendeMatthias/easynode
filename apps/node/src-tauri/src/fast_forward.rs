@@ -32,10 +32,14 @@
 //! Every sentence here can reach the window, so none carries an error's own
 //! text: that goes to the log.
 //!
-//! Residual risk, left as it is: another app sharing the datadir (the easyBTX
-//! miner) takes neither the lock nor the start guard. The driver checks that
-//! nothing holds the datadir right before it moves chain data, but a btxd the
-//! other app launches in the moment after that check would start on it.
+//! Another app sharing the datadir (the easyBTX miner) takes neither the lock
+//! nor the start guard, so every move of chain data (setting it aside, and a
+//! restore's removals and put-back) also holds the engine's own lock on the
+//! folder, `<datadir>/.lock` ([`engine_lock`]): a btxd any app launches
+//! meanwhile refuses to start, and a lock that cannot be had means a node
+//! holds the folder, so nothing moves. Residual, left as it is: between the
+//! set-aside and this app's own start, and between the put-back and the
+//! start after it, no lock is held (the start's btxd must take it).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -634,6 +638,7 @@ fn set_aside_for_run(datadir: &Path, height: u64, now_unix: u64) -> Result<Recor
             "a set-aside note is waiting for the next launch",
         )));
     }
+    let _engine = engine_lock(datadir).map_err(MoveError::Untouched)?;
     let before = run_settings(datadir);
     put_settings(datadir, Before::default());
     let set = ff::set_aside(datadir, height, before, now_unix);
@@ -643,9 +648,33 @@ fn set_aside_for_run(datadir: &Path, height: u64, now_unix: u64) -> Result<Recor
     set
 }
 
-/// Why the chain data was not set aside, for the Tools status.
-fn why_not_set_aside(datadir: &Path) -> &'static str {
-    if datadir.join(SET_ASIDE_PENDING_FILE).exists() {
+/// The engine's own lock on the data folder, held for a move of chain data
+/// (review I5): while it is held, no btxd starts on the folder, whichever
+/// app launches it (the easyBTX miner shares it). One that cannot be had
+/// means a node holds the folder: the node is not down, and nothing moves.
+/// That error's kind is `WouldBlock`. Not for [`ff::finish`], which runs
+/// beside this app's own node on the new chain (it holds the lock itself,
+/// so no other btxd starts then either) and touches only the dated folder,
+/// which no engine reads.
+fn engine_lock(datadir: &Path) -> std::io::Result<btx_core::fsx::EngineLock> {
+    use btx_core::fsx::{EngineLock, EngineLockError};
+    EngineLock::take(datadir).map_err(|e| {
+        log(datadir, &format!("not moving chain data: {e}"));
+        match e {
+            EngineLockError::Held => {
+                std::io::Error::new(std::io::ErrorKind::WouldBlock, e.to_string())
+            }
+            EngineLockError::Io(e) => e,
+        }
+    })
+}
+
+/// Why the chain data was not set aside (`error`, what
+/// [`set_aside_for_run`] said), for the Tools status.
+fn why_not_set_aside(datadir: &Path, error: &std::io::Error) -> &'static str {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        WHY_NOT_STOPPED
+    } else if datadir.join(SET_ASIDE_PENDING_FILE).exists() {
         WHY_NOTE_APPEARED
     } else {
         WHY_NOT_SET_ASIDE
@@ -692,7 +721,9 @@ fn remove_attempts_refused(datadir: &Path, since: u64) {
     }
 }
 
-/// Put the old chain data back, with the node stopped. The settings from
+/// Put the old chain data back, with the node stopped and the engine's own
+/// lock on the folder held throughout ([`engine_lock`]; not to be had, the
+/// run stands as it is and the sentence says so). The settings from
 /// before the run go back first, from the record, so a crash in the restore
 /// cannot lose them, and again once it returned `Ok` (controller notes 2 and
 /// 2c). Then the markers of the attempt's launches go (a mirror launch or a
@@ -712,6 +743,10 @@ fn undo(datadir: &Path) -> Result<(), NotBack> {
             log(datadir, &format!("the run's record cannot be read ({e})"));
             return Err(NotBack::plain(unreadable_sentence(datadir)));
         }
+    };
+    // Held until the old chain data is back, or the restore has stopped.
+    let Ok(_engine) = engine_lock(datadir) else {
+        return Err(NotBack::plain(NOT_STOPPED));
     };
     let during = run_settings(datadir);
     let before = settings_before(&record);
@@ -1038,7 +1073,7 @@ async fn run(app: &AppHandle, state: &State<'_, AppState>) {
                 &format!("the chain data could not be set aside: {e}"),
             );
             drop(no_starts);
-            not_started(&datadir, why_not_set_aside(&datadir)).await;
+            not_started(&datadir, why_not_set_aside(&datadir, &e)).await;
             let _ = start_node(app, state).await;
             return;
         }
@@ -2094,9 +2129,10 @@ mod tests {
         assert!(entries_named(d, "fast-forward-").is_empty());
         assert_eq!(run_settings(d), before);
         assert!(snapshot_marker_present(d));
-        assert_eq!(why_not_set_aside(d), WHY_NOTE_APPEARED);
+        let other = std::io::Error::other("x");
+        assert_eq!(why_not_set_aside(d, &other), WHY_NOTE_APPEARED);
         std::fs::remove_file(d.join(crate::commands::SET_ASIDE_PENDING_FILE)).unwrap();
-        assert_eq!(why_not_set_aside(d), WHY_NOT_SET_ASIDE);
+        assert_eq!(why_not_set_aside(d, &other), WHY_NOT_SET_ASIDE);
     }
 
     /// Review, minor 4: "remove what the attempt made" includes the
@@ -2126,6 +2162,108 @@ mod tests {
             ]
         );
         assert_old_chain_back(d, "after the refused chainstates");
+    }
+
+    /// What [`a_move_waits_for_the_engines_lock`] runs in another process:
+    /// this test binary again, with only this test. It takes the engine's
+    /// lock on `EASYNODE_FF_LOCK_DIR` and holds it until `release` appears
+    /// in `EASYNODE_FF_SIGNALS` (a bounded wait), writing `held` there once
+    /// it has it. Run on its own, with no folder named, it does nothing.
+    #[test]
+    fn engine_lock_holder() {
+        let (Some(dir), Some(signals)) = (
+            std::env::var_os("EASYNODE_FF_LOCK_DIR"),
+            std::env::var_os("EASYNODE_FF_SIGNALS"),
+        ) else {
+            return;
+        };
+        let signals = PathBuf::from(signals);
+        let lock = btx_core::fsx::EngineLock::take(Path::new(&dir)).unwrap();
+        std::fs::write(signals.join("held"), b"").unwrap();
+        for _ in 0..600 {
+            if signals.join("release").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        drop(lock);
+    }
+
+    /// Another process holding the engine's lock on `dir`, as a btxd does,
+    /// until [`Holder::release`].
+    struct Holder {
+        child: std::process::Child,
+        signals: tempfile::TempDir,
+    }
+
+    impl Holder {
+        fn on(dir: &Path) -> Self {
+            let signals = tempfile::tempdir().unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "fast_forward::tests::engine_lock_holder",
+                    "--nocapture",
+                ])
+                .env("EASYNODE_FF_LOCK_DIR", dir)
+                .env("EASYNODE_FF_SIGNALS", signals.path())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let held = signals.path().join("held");
+            for _ in 0..600 {
+                if held.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(held.exists(), "the holder took the lock");
+            Holder { child, signals }
+        }
+
+        fn release(mut self) {
+            std::fs::write(self.signals.path().join("release"), b"").unwrap();
+            assert!(self.child.wait().unwrap().success());
+        }
+    }
+
+    /// Review I5: every move of chain data holds the engine's own lock on
+    /// the folder, so no btxd, whichever app launches it, starts on it
+    /// meanwhile; and one that cannot be had means a node holds the folder,
+    /// so nothing moves. Setting aside says the node did not stop; a
+    /// roll-back leaves the run as it is and says so in the plain sentence.
+    #[test]
+    fn a_move_waits_for_the_engines_lock() {
+        let before = Before {
+            snapshot_loaded: true,
+            first_load_pending: false,
+        };
+        let tmp = datadir_with_chain(before);
+        let d = tmp.path();
+        let holder = Holder::on(d);
+        let e = match set_aside_for_run(d, 232_000, 100) {
+            Err(MoveError::Untouched(e)) => e,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(why_not_set_aside(d, &e), WHY_NOT_STOPPED);
+        assert!(ff::read_record(d).unwrap().is_none(), "nothing recorded");
+        assert!(d.join("blocks/old").exists(), "nothing moved");
+        assert!(entries_named(d, "fast-forward-").is_empty());
+        assert_eq!(run_settings(d), before, "nothing changed");
+        holder.release();
+
+        let record = set_aside_for_run(d, 232_000, 100).unwrap();
+        attempt(d);
+        let holder = Holder::on(d);
+        assert_eq!(undo(d), Err(NotBack::plain(NOT_STOPPED)));
+        assert_eq!(ff::read_record(d).unwrap(), Some(record), "the run stands");
+        assert!(d.join("blocks/new").exists(), "nothing removed");
+        assert_eq!(run_settings(d), Before::default(), "the run's own");
+        holder.release();
+        assert_eq!(undo(d), Ok(()));
+        assert_old_chain_back(d, "once the lock was free");
+        assert_eq!(run_settings(d), before);
     }
 
     /// Review I3: the snapshot must still be above the node's tip once step
