@@ -349,8 +349,12 @@ async fn a_peer_that_drops_us_twice_over_old_blocks_is_not_asked_for_them_again(
     let Some((_, sent_by_the_mark)) = marked else {
         panic!("the help never said A dropped us; it said {lines:?}");
     };
+    // The first batch starts at the next block. Where it ends depends on how
+    // many requests went out before A dropped us or the tick's time ran out:
+    // the batch is recorded up to the last block the node took (14 and 21 of
+    // them in two runs on the owner's Mac on 30 September).
     assert!(
-        lines[0].starts_with(&format!("asked {archive} for blocks 2 to 101 (")),
+        lines[0].starts_with(&format!("asked {archive} for blocks 2 to ")),
         "{lines:?}"
     );
     // Asked twice: once at first, once more after the first drop.
