@@ -4128,6 +4128,10 @@ impl NodeController {
         let Some(mut child) = self.child.take() else {
             return NoRpcStop::OnSigterm;
         };
+        // Taken now: tokio forgets the pid once the child is reaped.
+        let child_pid = child.id();
+        // Only the unix arm below assigns it again.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut exited = matches!(child.try_wait(), Ok(Some(_)));
         #[cfg(unix)]
         if !exited {
@@ -4156,25 +4160,33 @@ impl NodeController {
             // a process in uninterruptible sleep inside a GPU driver never
             // exits, which would hang this start forever. Dropping the handle
             // afterwards leaves the reaping to tokio.
-            let pid = child.id();
             let _ = child.start_kill();
             match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
                 Ok(Ok(_)) => NoRpcStop::Killed,
-                // Not reaped five seconds after SIGKILL: the kernel has not
+                // Not reaped five seconds after SIGKILL: look once more, in
+                // case it went in the same moment, else the kernel has not
                 // let it go.
+                Err(_) if matches!(child.try_wait(), Ok(Some(_))) => NoRpcStop::Killed,
                 Err(_) => NoRpcStop::StillRunning,
                 // The wait itself failed; ask the system instead.
-                Ok(Err(_)) => match pid {
+                Ok(Err(_)) => match child_pid {
                     Some(pid) if crate::platform::process_is_alive(pid) => NoRpcStop::StillRunning,
                     _ => NoRpcStop::Killed,
                 },
             }
         };
-        // A btxd that is still there keeps its pidfile, so the next start
-        // still finds the holder instead of racing it for the lock.
+        // The pidfile goes only when the child really exited and the file
+        // still names it. A btxd that is still there keeps it, so the next
+        // start finds the holder instead of racing it for the lock, and a
+        // file that names another process is not this controller's.
         if outcome != NoRpcStop::StillRunning {
-            if let Some(cfg) = &self.config {
-                let _ = std::fs::remove_file(pidfile_path(&cfg.datadir));
+            if let (Some(cfg), Some(pid)) = (&self.config, child_pid) {
+                let path = pidfile_path(&cfg.datadir);
+                let ours =
+                    std::fs::read_to_string(&path).is_ok_and(|s| s.trim() == pid.to_string());
+                if ours {
+                    let _ = std::fs::remove_file(&path);
+                }
             }
         }
         outcome
@@ -5901,6 +5913,27 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
         assert!(
             !crate::platform::process_is_alive(pid),
             "the wedged child must be gone"
+        );
+    }
+
+    /// The pidfile goes only when it is this child's: one that names another
+    /// process (a newer launch, written by hand) is not ours to remove
+    /// (Task A review I2).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_without_rpc_keeps_a_pidfile_that_is_not_its_childs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut controller = start_shim(tmp.path(), "exec sleep 30").await;
+        std::fs::write(pidfile_path(tmp.path()), "999999").unwrap();
+        assert_eq!(
+            controller
+                .stop_without_rpc_outcome(std::time::Duration::from_secs(10))
+                .await,
+            NoRpcStop::OnSigterm
+        );
+        assert_eq!(
+            std::fs::read_to_string(pidfile_path(tmp.path())).unwrap(),
+            "999999"
         );
     }
 

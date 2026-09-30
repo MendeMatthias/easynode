@@ -538,12 +538,25 @@ fn after_rpc_wait(wait: &RpcWait, slot_empty: bool) -> AfterRpcWait {
 /// debug.log; `None` when it wrote nothing, which is expected for a btxd
 /// stuck before `StartLogging` (init.cpp:2924 at v0.34.12, every line before
 /// it is held in memory).
-fn rpc_timeout_error(last: &str, doing: Option<&str>, datadir: &Path) -> String {
+///
+/// `stopped` is how the no-RPC stop ended (`None`: the graceful stop, for a
+/// node whose RPC was up). One that outlived the kill is not called stopped:
+/// the app could not end it, and only a restart of the computer does
+/// (Task A review I2).
+fn rpc_timeout_error(
+    last: &str,
+    doing: Option<&str>,
+    stopped: Option<btx_core::node::NoRpcStop>,
+    datadir: &Path,
+) -> String {
+    let stop = if stopped == Some(btx_core::node::NoRpcStop::StillRunning) {
+        "The app could not stop it, and restarting the computer clears it"
+    } else {
+        "The app stopped it"
+    };
     let doing = match doing {
-        Some(line) => format!("The app stopped it; its last log line was \"{line}\"."),
-        None => {
-            "The app stopped it; the engine had not written anything to its log yet.".to_string()
-        }
+        Some(line) => format!("{stop}; its last log line was \"{line}\"."),
+        None => format!("{stop}; the engine had not written anything to its log yet."),
     };
     format!(
         "the node didn't become ready: {last}. {doing} See easybtx-node.log in {} for details.",
@@ -1827,7 +1840,7 @@ async fn spawn_node_with_lock_retry(
                         AfterNoRpcTimeout::Fail => {}
                     }
                     let doing = btx_core::node::last_log_line(&since);
-                    return Err(rpc_timeout_error(&last, doing.as_deref(), datadir));
+                    return Err(rpc_timeout_error(&last, doing.as_deref(), stopped, datadir));
                 }
                 // `after_rpc_wait` maps each outcome to exactly one of these,
                 // so what is left is an exit: fall through to the exit path.
@@ -9066,7 +9079,12 @@ mod launch_wait_tests {
     fn the_timeout_error_says_what_the_engine_was_last_doing() {
         let dir = Path::new("/home/zan/.easybtx");
         let last = "the node's RPC never became reachable (no .cookie yet)";
-        let with = rpc_timeout_error(last, Some("MatMul RC production canary: begin"), dir);
+        let with = rpc_timeout_error(
+            last,
+            Some("MatMul RC production canary: begin"),
+            Some(NoRpcStop::Killed),
+            dir,
+        );
         assert!(with.starts_with("the node didn't become ready: "), "{with}");
         assert!(
             with.contains("\"MatMul RC production canary: begin\""),
@@ -9078,12 +9096,17 @@ mod launch_wait_tests {
             "{with}"
         );
 
-        let without = rpc_timeout_error(last, None, dir);
+        let without = rpc_timeout_error(last, None, Some(NoRpcStop::OnSigterm), dir);
         assert!(
             without.contains("had not written anything to its log yet"),
             "{without}"
         );
-        for s in [&with, &without] {
+        // One the kill did not end is not called stopped (Task A review I2).
+        let held = rpc_timeout_error(last, None, Some(NoRpcStop::StillRunning), dir);
+        assert!(!held.contains("stopped it"), "{held}");
+        assert!(held.contains("could not stop it"), "{held}");
+        assert!(held.contains("restarting the computer"), "{held}");
+        for s in [&with, &without, &held] {
             assert!(!s.contains('\u{2014}'), "em-dash in: {s}");
         }
     }
