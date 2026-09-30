@@ -829,7 +829,9 @@ async fn tick_until(
     let target = cu.target.clone();
     let mut next = Vec::new();
     if let Some((height, hash)) = target.as_ref().filter(|_| !on_its_own) {
-        let Ok(tip_hash) = rpc.call("getbestblockhash", json!([])).await else {
+        // By height, so the hash is the one at the height this tick uses
+        // even when a block connected since the refresher read it.
+        let Ok(tip_hash) = rpc.call("getblockhash", json!([t.blocks])).await else {
             return Vec::new();
         };
         let Some(tip_hash) = tip_hash.as_str().map(str::to_string) else {
@@ -2152,7 +2154,6 @@ mod tests {
                 return Err(AppError::Http("connection reset".into()));
             }
             match method {
-                "getbestblockhash" => Ok(json!(self.hash(self.tip))),
                 "getblockheader" => {
                     let h = self
                         .height_of(params[0].as_str().unwrap())
@@ -2280,6 +2281,24 @@ mod tests {
         let asked = node.asked();
         assert_eq!(asked.len(), 200);
         assert!(asked.iter().all(|(_, id)| *id == 6), "only A is asked");
+    }
+
+    #[tokio::test]
+    async fn the_tip_hash_is_read_at_the_height_the_tick_uses() {
+        // The refresher read the tip at 100, and one more block connected
+        // before the help read the tip's hash. Read by height, it is the hash
+        // at 100, so the walk sits on the tip and the help asks as usual.
+        let node = FakeNode::new(300, 101, None);
+        let (tips, peers) = ([tip(300, "headers-only")], [peer(7, A, 300)]);
+        let t = tick_of(100, 300, &tips, &peers);
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        tick(&node, &mut cu, &t, t0).await;
+        assert_eq!(
+            tick(&node, &mut cu, &t, t0 + QUIET).await,
+            [ASKED_101_TO_200]
+        );
+        assert_eq!(node.count("getbestblockhash"), 0);
     }
 
     #[tokio::test]
@@ -2651,12 +2670,7 @@ mod tests {
         assert_eq!(cu.path.target(), Some((160, hash(160).as_str())));
         assert_eq!(cu.diagnostics(), asking);
         // Nothing answers at all: the tick changes nothing.
-        node.failing = vec![
-            "getbestblockhash",
-            "getblockheader",
-            "getblockhash",
-            "getblockfrompeer",
-        ];
+        node.failing = vec!["getblockheader", "getblockhash", "getblockfrompeer"];
         let lines = tick(&node, &mut cu, &t, t0 + QUIET + secs(6)).await;
         assert!(lines.is_empty(), "{lines:?}");
         assert_eq!(cu.diagnostics(), asking);

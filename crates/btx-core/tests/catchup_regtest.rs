@@ -42,12 +42,7 @@ use serde_json::{json, Value};
 /// Every command the help may send. Anything else fails the test. The signed
 /// frontier reaches the help through the Tick, as the refresher's slot, so
 /// `getmatmulattestedtip` is not among them.
-const ALLOWED: &[&str] = &[
-    "getbestblockhash",
-    "getblockheader",
-    "getblockhash",
-    "getblockfrompeer",
-];
+const ALLOWED: &[&str] = &["getblockheader", "getblockhash", "getblockfrompeer"];
 
 struct Btxd {
     child: std::process::Child,
