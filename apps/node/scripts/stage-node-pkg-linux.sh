@@ -4,11 +4,15 @@
 # Mirrors stage-node-pkg.sh (macOS) but is far simpler: no .so vendoring or
 # rpath pass — download, verify the pinned sha256, copy, sanity-run.
 #
-# The upstream Linux binaries USED to be fully static ELFs. v0.34.9's are not:
-# libexec/btxd.real NEEDs libssl.so.3 and libcrypto.so.3 (OpenSSL 3.5, bundled
-# in the archive's top-level lib/), plus libzmq, libevent, sqlite and libgomp
-# from the host. bin/btxd, the wrapper, puts ../lib on LD_LIBRARY_PATH when it
-# finds libssl.so.3 there, so lib/ is staged beside bin/ and libexec/.
+# The upstream Linux binaries USED to be fully static ELFs. Since v0.34.9 they
+# are not: libexec/btxd.real NEEDs libssl.so.3 and libcrypto.so.3 (OpenSSL 3.5,
+# bundled in the archive's top-level lib/), plus libzmq, libevent, sqlite and
+# libgomp from the host. bin/btxd, the wrapper, puts ../lib on LD_LIBRARY_PATH
+# when it finds libssl.so.3 there, so those two are staged in lib/ beside bin/
+# and libexec/. From v0.34.12 the archive's lib/ also holds btx-qt's runtime
+# (Qt 6, libstdc++, libevent, libzmq, libgomp and about 90 more); staging all
+# of it would put those in front of the host's copies for btxd too, so only the
+# OpenSSL pair is taken, which is all v0.34.9's lib/ held.
 #
 # Source resolution order:
 #   1. $EASYBTX_NODE_PKG_SRC (explicit override: an extracted package dir)
@@ -17,13 +21,13 @@
 # Usage:  apps/node/scripts/stage-node-pkg-linux.sh
 set -euo pipefail
 
-VERSION="0.34.9"
+VERSION="0.34.12"
 TARBALL_URL="https://github.com/btxchain/btx/releases/download/v${VERSION}/btx-${VERSION}-x86_64-linux-gnu.tar.gz"
 # From the release's SHA256SUMS. Upstream has re-generated release assets in
-# place before — a silent swap must FAIL here, never ship unnoticed. v0.34.9
+# place before — a silent swap must FAIL here, never ship unnoticed. v0.34.12
 # publishes that file UNSIGNED (no SHA256SUMS.asc), so this pins the bytes, not
 # a signature.
-TARBALL_SHA256="cf7a68e5aad53aad80a8d8eb04d0ba552c319c466dcf34af4c62fc41b0c20f5f"
+TARBALL_SHA256="933c4c1ab34726fe0a5f4d85c7ee76e88ddd272b89ce85ccdb7bb5c23b20ace8"
 # NOTE: upstream publishes no `aarch64-linux-gnu` asset, so there is no ARM-Linux
 # node to stage. This script is x86_64-only by construction and always was; the
 # gap is called out here so nobody spends an afternoon looking for the tarball.
@@ -38,9 +42,10 @@ TARBALL_SHA256="cf7a68e5aad53aad80a8d8eb04d0ba552c319c466dcf34af4c62fc41b0c20f5f
 #
 # Two separate reasons this tarball is a developer convenience only:
 #
-#   1. No CUDA. Upstream also publishes -cuda12 and -cuda13 archives for that,
-#      which this deliberately does not fetch, because see (2). v0.34.9's CUDA
-#      fatbins are also Blackwell-only (sm_120), per its release notes.
+#   1. No CUDA. Upstream also publishes a -cuda13 archive for that (and a
+#      -cuda12 one up to v0.34.9), which this deliberately does not fetch,
+#      because see (2). v0.34.9's CUDA fatbins are also Blackwell-only
+#      (sm_120), per its release notes.
 #   2. glibc. The official Linux binaries need glibc 2.38, and Ubuntu LTS
 #      machines do not have it, so they will not run for most people anyway.
 #
@@ -85,14 +90,16 @@ fi
 
 rm -rf "$DEST"
 mkdir -p "$DEST"
-# Only the runtime tree: bin/ wrappers + libexec/ daemons, and lib/ when the
-# archive carries one (v0.34.9's bundled OpenSSL; see the header). contrib/ and
-# doc/ are source-repo extras the app never reads.
+# Only the runtime tree: bin/ wrappers + libexec/ daemons, and from lib/ only
+# the bundled OpenSSL when the archive carries it (see the header). contrib/
+# and doc/ are source-repo extras the app never reads.
 cp -R "$SRC/bin" "$DEST/bin"
 cp -R "$SRC/libexec" "$DEST/libexec"
-if [[ -d "$SRC/lib" ]]; then
-  cp -R "$SRC/lib" "$DEST/lib"
-fi
+for ssl in "$SRC"/lib/libssl.so* "$SRC"/lib/libcrypto.so*; do
+  [ -e "$ssl" ] || continue
+  mkdir -p "$DEST/lib"
+  cp -P "$ssl" "$DEST/lib/"
+done
 # Without the model plane, exactly as stage-node-pkg.sh does and for the same
 # reason: the archive is built WITH_MODELNET=ON, an ON btxd starts btx-modeld on
 # 0.0.0.0:29447 by itself, the release engine is built OFF, and the app calls
@@ -101,6 +108,10 @@ fi
 for helper in btx-modeld btx-modelcheck btx-open btx-capability btx-capabilityd btx-hcpd btx-hosted; do
   rm -f "$DEST/bin/$helper" "$DEST/libexec/$helper.real"
 done
+# ...and without the GUI v0.34.12 added (bin/btx-qt, libexec/btx-qt.real and
+# the qt.conf beside it). The app never starts it, and its Qt runtime in lib/
+# is not staged above.
+rm -f "$DEST/bin/btx-qt" "$DEST/libexec/btx-qt.real" "$DEST/libexec/qt.conf"
 chmod +x "$DEST"/bin/* "$DEST"/libexec/*
 
 echo "==> staged node package: $(du -sh "$DEST" | cut -f1) at $DEST"

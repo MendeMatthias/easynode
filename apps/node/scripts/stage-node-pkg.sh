@@ -2,9 +2,9 @@
 # Stage the bundled BTX node package for an easyBTX Node build — and make it
 # SELF-CONTAINED (no Homebrew on the user's machine).
 #
-# The app bundles the v0.34.9 release package tree (bin/ launcher wrappers +
+# The app bundles the v0.34.12 release package tree (bin/ launcher wrappers +
 # libexec/*.real Mach-O daemons + metal shader libs), minus the model-plane
-# helpers (see below), under
+# helpers and the btx-qt launcher (see below), under
 # src-tauri/resources/node-pkg/. The tree is gitignored (same rationale as the
 # miner's resources/bin + resources/node-bin: keep binaries out of the source
 # tree) and must be staged before `tauri build` / `tauri dev`.
@@ -31,7 +31,7 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="$APP_DIR/src-tauri/resources/node-pkg"
 
-VERSION="0.34.9"
+VERSION="0.34.12"
 # Refuse to stage a version the app will then refuse. See scripts/lib/engine-pin.sh.
 # shellcheck source=lib/engine-pin.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/engine-pin.sh"
@@ -39,10 +39,10 @@ assert_matches_engine_pin "$APP_DIR" "$VERSION"
 
 TARBALL_URL="https://github.com/btxchain/btx/releases/download/v${VERSION}/btx-${VERSION}-arm64-apple-darwin.tar.gz"
 # From the release's SHA256SUMS. Upstream has re-generated release assets in
-# place before — a silent swap must FAIL here, never ship unnoticed. v0.34.9
-# publishes that file UNSIGNED (no SHA256SUMS.asc; its notes say the signing
-# key was not on the build host), so this pins the bytes, not a signature.
-TARBALL_SHA256="3cfde53d3a2353c33f5487e530689bc65f30950c3104856d43b25fad0f20010b"
+# place before — a silent swap must FAIL here, never ship unnoticed. v0.34.12
+# publishes that file UNSIGNED (no SHA256SUMS.asc, as for v0.34.9), so this
+# pins the bytes, not a signature.
+TARBALL_SHA256="d90d1adf2ae1d9a29decc97423db258459674a08c35e0bef60dc82467983d72e"
 
 SRC="${EASYBTX_NODE_PKG_SRC:-}"
 if [[ -z "$SRC" && -x "$HOME/btx-node-research/btx-$VERSION/bin/btxd" ]]; then
@@ -96,6 +96,11 @@ cp -R "$SRC/libexec" "$DEST/libexec"
 for helper in btx-modeld btx-modelcheck btx-open btx-capability btx-capabilityd btx-hcpd btx-hosted; do
   rm -f "$DEST/bin/$helper" "$DEST/libexec/$helper.real"
 done
+# ...and without the GUI. From 0.34.12 the archive also carries btx-qt.app at
+# its top level plus a bin/btx-qt launcher that execs ../btx-qt.app. The .app
+# is not copied (only bin/ and libexec/ are), and the app never starts the GUI,
+# so the launcher goes too rather than pointing at nothing.
+rm -f "$DEST/bin/btx-qt"
 
 # ── Vendor non-system dylibs TRANSITIVELY (Homebrew) ────────────────────────
 # The upstream darwin build links some libs from Homebrew and a clean user Mac
