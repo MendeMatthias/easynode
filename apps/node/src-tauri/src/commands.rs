@@ -4023,6 +4023,21 @@ fn mirror_launch_failed(launched: bool, quitting: bool) -> bool {
     launched && !quitting
 }
 
+/// How long the first validating start waits for its signed pair (the
+/// pointer, the manifest, a file of up to 64 MiB) before it launches the
+/// node without one. The client's own timeouts only cut off a connection
+/// that stalls; a slow or dripping host would otherwise hold the node
+/// unstarted.
+const PREPARE_START_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// `fut`'s answer if it comes within `deadline`, else `None`.
+async fn prepared_within<T>(
+    deadline: std::time::Duration,
+    fut: impl std::future::Future<Output = Option<T>>,
+) -> Option<T> {
+    tokio::time::timeout(deadline, fut).await.ok().flatten()
+}
+
 /// Before a launch: begin a validating node's one mirror launch when it has
 /// never loaded a snapshot and a signed pair is ready (confirmed, else the
 /// pinned one). Resumes a load a stopped run began; drops any marker when no
@@ -4071,7 +4086,12 @@ async fn prepare_mirror_load(
         pinned: btx_core::confirmed_snapshot::pinned_keys(&node::BTX_TRUSTED_ATTESTATION_PUBKEYS),
         ..Default::default()
     };
-    match btx_core::attested_snapshot::prepare_start(datadir, &view, anchor).await {
+    let ready = prepared_within(
+        PREPARE_START_DEADLINE,
+        btx_core::attested_snapshot::prepare_start(datadir, &view, anchor),
+    )
+    .await;
+    match ready {
         Some(pair) => match node::begin_mirror_load(datadir, pair.kind, pair.height) {
             Ok(()) => {
                 setup_log(
@@ -4091,7 +4111,8 @@ async fn prepare_mirror_load(
         None => {
             setup_log(
                 datadir,
-                "no signed snapshot to start from; the node starts from the one compiled into its engine",
+                "no signed snapshot to start from (none was ready, or it took more than five \
+                 minutes); the node starts from the one compiled into its engine",
             );
             Ok(false)
         }
@@ -6496,11 +6517,12 @@ mod signed_start_tests {
         ends_orphaned_mirror_launch, first_load_settled, honour_pending_set_aside,
         honour_pending_set_aside_at, key_line_goes_back, mark_first_load_if_fresh,
         mark_set_aside_pending, mirror_launch_failed, mirror_load_end_message, mirror_load_step,
-        mirror_load_wanted_here, nominal_btxd_path, refused_load_message, runs_mirror_load,
-        set_aside_pending, set_aside_refused_snapshot_at, set_aside_waits, set_aside_will_move,
-        settle_first_load, signed_load_failed, signed_load_for, signer_for_launch,
-        signing_key_the_app_does_not_manage, snapshot_base, write_signer_key_line, AfterLoad,
-        AfterRefusal, AttachedTo, MirrorLoadStep, SET_ASIDE_STUCK,
+        mirror_load_wanted_here, nominal_btxd_path, prepared_within, refused_load_message,
+        runs_mirror_load, set_aside_pending, set_aside_refused_snapshot_at, set_aside_waits,
+        set_aside_will_move, settle_first_load, signed_load_failed, signed_load_for,
+        signer_for_launch, signing_key_the_app_does_not_manage, snapshot_base,
+        write_signer_key_line, AfterLoad, AfterRefusal, AttachedTo, MirrorLoadStep,
+        PREPARE_START_DEADLINE, SET_ASIDE_STUCK,
     };
     use crate::state::NodeAppSettings;
     use btx_core::attested_snapshot::PairKind;
@@ -7396,6 +7418,34 @@ mod signed_start_tests {
         ] {
             assert!(after.find(call).unwrap() < stop, "{call}");
         }
+    }
+
+    /// Final review M5: the first validating start waits for its signed
+    /// pair before btxd is launched, so a slow or dripping host must not hold
+    /// the node unstarted: past a few minutes the start goes on as if no
+    /// pair were ready.
+    #[tokio::test]
+    async fn a_pair_that_takes_too_long_counts_as_none() {
+        assert!(PREPARE_START_DEADLINE >= std::time::Duration::from_secs(120));
+        assert!(PREPARE_START_DEADLINE <= std::time::Duration::from_secs(600));
+        let short = std::time::Duration::from_millis(20);
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Some(1)
+        };
+        assert_eq!(prepared_within(short, slow).await, None);
+        assert_eq!(prepared_within(short, async { Some(2) }).await, Some(2));
+        assert_eq!(prepared_within(short, async { None::<u8> }).await, None);
+        let src = include_str!("commands.rs");
+        let prepare = src
+            .split("\nasync fn prepare_mirror_load(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(
+            prepare.contains("prepared_within(\n        PREPARE_START_DEADLINE,"),
+            "{prepare}"
+        );
     }
 
     /// Final review M9: a load task from a stopped run (a Stop and a Start
