@@ -491,9 +491,13 @@ Names are in the list's order: "Mende and jpp", "Mende, Aleksander and jpp".
   validating arm also pins the mirrors' keys, beside its own. In consensus
   mode the engine treats them as telemetry: they never skip a check and never
   steer which chain it follows. Without them it does not start.
-- The file goes away when the background check finishes and the engine retires
-  the snapshot. Whether dropping the pins then costs the node anything is to be
-  measured on a real data folder before it ships; if it does, they stay.
+- The file stays when the background check finishes. It is still under
+  `chainstate_snapshot/` at the node's next start, which re-checks the stored
+  manifest, pins and all. On that start the engine moves the folder to
+  `chainstate/`, and the file with it, where it no longer counts, so the pins
+  go from the start after. Whether dropping the pins then costs the node
+  anything is to be measured on a real data folder before it ships; if it
+  does, they stay.
 - It keeps signing blocks: a block signature vouches for the node's own proof
   check, which it does.
 - It keeps no diary, produces nothing and confirms nothing while
