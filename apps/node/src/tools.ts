@@ -105,14 +105,19 @@ export function initTools(): void {
    * then (mirrors reportRun) touches nothing once it lands. */
   let ffRun = 0;
 
+  /** The line above the button, hidden when it has nothing to say. */
+  const showFfNote = (note: string) => {
+    ffNote = note;
+    const line = $("tools-ff-note");
+    line.textContent = note;
+    line.hidden = note === "";
+  };
   /** Back to one click away, as the section says. */
   const resetFfArm = () => {
     clearTimeout(ffArmTimer);
     ffArmTimer = undefined;
     ffArm.disarm();
-    const note = $("tools-ff-note");
-    note.textContent = ffNote;
-    note.hidden = ffNote === "";
+    showFfNote(ffNote);
     if (ffOffer) $("tools-ff-btn").textContent = ffOffer.button;
   };
   const stopFfPoll = () => {
@@ -150,7 +155,11 @@ export function initTools(): void {
         return;
       }
       showFfStatus(status);
-      if (status && !status.running) stopFfPoll();
+      if (status && !status.running) {
+        stopFfPoll();
+        // The run ended: the note said why the button was there.
+        showFfNote(fastForwardView(null, status).note);
+      }
     }, FAST_FORWARD_POLL_MS);
   };
   const refreshFastForward = async () => {
@@ -160,6 +169,7 @@ export function initTools(): void {
     if (run !== ffRun) return; // Tools closed meanwhile
     if (status?.running) {
       showFfStatus(status);
+      showFfNote(fastForwardView(null, status).note);
       btn.hidden = true;
       pollFf();
       return;
@@ -277,7 +287,7 @@ export function initTools(): void {
     const run = ffRun;
     btn.disabled = true;
     btn.hidden = true;
-    $("tools-ff-note").textContent = ffNote;
+    showFfNote(ffNote);
     const { message, started } = await fastForwardRun(() => invoke<string>("tools_fast_forward_run"));
     if (run !== ffRun) return; // Tools closed meanwhile
     const result = $("tools-ff-result");
@@ -287,8 +297,12 @@ export function initTools(): void {
     // stable thing for a keyboard user to land on (tabindex="-1" in
     // index.html), as tools-fetch and buildReport refocus their own button.
     if (!overlay.hidden) result.focus();
-    // A refusal is no run: a poll would put the last run's outcome over it.
-    if (started) pollFf();
+    // A refusal is no run: a poll would put the last run's outcome over it,
+    // and the offer's note still says why the button was there.
+    if (started) {
+      showFfNote(fastForwardView(ffOffer, { running: true, message }).note);
+      pollFf();
+    }
   });
 
   $("tools-fetch").addEventListener("click", async () => {

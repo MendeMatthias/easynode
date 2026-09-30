@@ -172,6 +172,15 @@ describe("Fast-forward section", () => {
     expect(fastForwardView(offer, { running: true, message: "Fast-forward is running." }).note).toBe("");
     expect(fastForwardView(null, null).note).toBe("");
   });
+  it("drops the note when a run starts and when it ends, with Tools open throughout", () => {
+    // What the overlay asks at each step: the second click that started a
+    // run, a reopen during it, and the poll that sees it end.
+    const running = { running: true, message: "Fast-forward is running. Your node restarts a few times on the way." };
+    expect(fastForwardView(offer, running)).toEqual({ section: true, button: null, note: "" });
+    expect(fastForwardView(null, running)).toEqual({ section: true, button: null, note: "" });
+    const ended = { running: false, message: "Done. Your node now starts from block 233,800, confirmed by Mende and jpp." };
+    expect(fastForwardView(null, ended)).toEqual({ section: true, button: null, note: "" });
+  });
 });
 
 describe("Fast-forward second click", () => {
