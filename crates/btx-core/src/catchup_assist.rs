@@ -844,7 +844,12 @@ async fn tick_until(
     }
     let target = cu.target.clone();
     let mut next = Vec::new();
-    if let Some((height, hash)) = target.as_ref().filter(|_| !on_its_own) {
+    // Kept current even while the walk waits, so a frontier that moved is
+    // read once (`known_frontier` knows the path's target), not every tick.
+    if let Some((height, hash)) = &target {
+        cu.path.retarget(*height, hash);
+    }
+    if target.is_some() && !on_its_own {
         // By height, so the hash is the one at the height this tick uses
         // even when a block connected since the refresher read it.
         let Ok(tip_hash) = rpc.call("getblockhash", json!([t.blocks])).await else {
@@ -853,7 +858,6 @@ async fn tick_until(
         let Some(tip_hash) = tip_hash.as_str().map(str::to_string) else {
             return Vec::new();
         };
-        cu.path.retarget(*height, hash);
         if cu
             .path
             .walk_until(rpc, t.blocks, WALK_PER_TICK, enough)
@@ -3007,6 +3011,46 @@ mod tests {
             5_000 - 260,
             "each header once"
         );
+    }
+
+    #[tokio::test]
+    async fn a_signed_frontier_that_moves_while_the_engine_fetches_is_read_once() {
+        // While the engine fetches on its own the walk waits, but the chain
+        // to follow is still kept current: a new frontier's header is read
+        // once, not on every tick until the walk goes on.
+        let mut node = FakeNode::new(5_000, 100, Some(4_990));
+        let tips = [tip(5_000, "headers-only")];
+        let engine = |tip: u64| {
+            let mut p = recorded(30, "5.6.7.8:19335", FULL, 5_000);
+            p.connection_type = "outbound-full-relay".into();
+            p.inflight = (tip as i64 + 1..=tip as i64 + 16).collect();
+            [peer(7, A, 5_000), p]
+        };
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        let (slot, peers) = (node.attested(), engine(100));
+        let t = Tick {
+            frontier: slot.as_ref(),
+            ..tick_of(100, 5_000, &tips, &peers)
+        };
+        tick(&node, &mut cu, &t, t0).await;
+        let before = node.count("getblockheader");
+        let mut tip = 100;
+        for n in 1..=10 {
+            tip += 16;
+            node.tip = tip;
+            if n == 5 {
+                node.frontier = Some(4_995);
+            }
+            let (slot, peers) = (node.attested(), engine(tip));
+            let t = Tick {
+                frontier: slot.as_ref(),
+                ..tick_of(tip, 5_000, &tips, &peers)
+            };
+            assert!(tick(&node, &mut cu, &t, t0 + secs(3 * n)).await.is_empty());
+        }
+        assert_eq!(node.count("getblockheader") - before, 1, "once, for 4,995");
+        assert_eq!(cu.path.target(), Some((4_995, hash(4_995).as_str())));
     }
 
     #[tokio::test]
