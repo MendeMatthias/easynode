@@ -78,8 +78,8 @@ const HOLD_STARTS_TRIES: u32 = 600;
 // no full stop.
 
 pub(crate) const ALREADY_RUNNING: &str = "Fast-forward is already running.";
-pub(crate) const NOT_FINISHED: &str = "A Fast-forward has not finished yet. The next time \
-     easyNode starts the node, it first carries that run on or puts the old chain data back.";
+pub(crate) const NOT_FINISHED: &str = "A Fast-forward has not finished yet. When easyNode \
+     starts the node, it first carries that run on or puts the old chain data back.";
 pub(crate) const NOTE_WAITS: &str = "easyNode still has to move a snapshot it did not accept out \
      of the way, which it does the next time it starts the node. Restart the node, then try \
      Fast-forward again.";
@@ -113,7 +113,7 @@ const WHY_NOTE_APPEARED: &str =
 const WHY_NOT_CLEARED: &str = "the result of the last Fast-forward could not be cleared";
 const WHY_NOT_STARTED: &str = "the node did not start on the new chain data";
 const WHY_CAUGHT_UP: &str =
-    "the node had caught up with the confirmed snapshot by the time it was ready";
+    "the node had caught up with the confirmed snapshot by the time it was downloaded and checked";
 const WHY_NO_TIP: &str = "the node did not say which block it had reached";
 /// A load during a run that loaded nothing (`commands::run_failure_reason`).
 pub(crate) const WHY_NOT_LOADED: &str = "the node could not load the confirmed snapshot";
@@ -863,9 +863,16 @@ fn undo(datadir: &Path) -> Result<(), NotBack> {
             return Err(NotBack::plain(unreadable_sentence(datadir)));
         }
     };
-    // Held until the old chain data is back, or the restore has stopped.
-    let Ok(_engine) = engine_lock(datadir) else {
-        return Err(NotBack::plain(NOT_STOPPED));
+    // Held until the old chain data is back, or the restore has stopped. Not
+    // to be had: a node this app did not start holds the folder (nothing
+    // was stopped here, and an earlier put-back may have moved some of it
+    // already), or the lock file itself failed.
+    let _engine = match engine_lock(datadir) {
+        Ok(lock) => lock,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(NotBack::plain(NODE_IN_THE_WAY))
+        }
+        Err(_) => return Err(NotBack::plain(UNDO_FAILED)),
     };
     let during = run_settings(datadir);
     let before = settings_before(&record);
@@ -2463,7 +2470,10 @@ mod tests {
         let record = set_aside_for_run(d, 232_000, 100).unwrap();
         attempt(d);
         let holder = Holder::on(d);
-        assert_eq!(undo(d), Err(NotBack::plain(NOT_STOPPED)));
+        // Review N6: a node this app did not start holds the folder; nothing
+        // was stopped, and from a start an earlier put-back may have moved
+        // something already, so NOT_STOPPED would say both wrong.
+        assert_eq!(undo(d), Err(NotBack::plain(NODE_IN_THE_WAY)));
         assert_eq!(ff::read_record(d).unwrap(), Some(record), "the run stands");
         assert!(d.join("blocks/new").exists(), "nothing removed");
         assert_eq!(run_settings(d), Before::default(), "the run's own");
