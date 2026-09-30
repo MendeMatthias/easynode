@@ -645,9 +645,19 @@ pub fn ensure_snapshot_loaded_with(
         }
 
         if prefer_attested {
-            if let Some((pair, file, manifest)) =
-                crate::attested_snapshot::prepare(&datadir, anchor_height).await
+            // Interim until Task 5 replaces this block with the one loading
+            // path: the pair `prepare_start` checked, loaded as it is.
+            let view = crate::confirmed_snapshot::NodeView {
+                start_height: crate::attested_snapshot::fallback_start(anchor_height),
+                pinned: crate::confirmed_snapshot::pinned_keys(
+                    &crate::node::BTX_TRUSTED_ATTESTATION_PUBKEYS,
+                ),
+                ..Default::default()
+            };
+            if let Some(pair) =
+                crate::attested_snapshot::prepare_start(&datadir, &view, anchor_height).await
             {
+                let (file, manifest) = (pair.file.clone(), pair.manifest.clone());
                 if wait_for_headers(&rpc, &datadir, pair.height).await {
                     // A peer may have advanced past / loaded a snapshot during the wait.
                     if matches!(get_chainstates(&rpc).await, Ok(cs) if cs.snapshot().is_some()) {
