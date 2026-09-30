@@ -515,9 +515,9 @@ fn start_gate(
 /// record cut off while its chain data moved refuses the start while a node
 /// is using the datadir, and a running run's roll-back (decided before the
 /// app stopped, or one no watch would judge) is left to the watch then,
-/// which can stop the node. An `Err` is a plain
-/// sentence, and the node is not started. A roll-back whose restore cannot
-/// begin keeps the node from starting in this run of the app.
+/// which can stop the node. An `Err` is a plain sentence, and the node is
+/// not started. A roll-back whose restore cannot begin keeps the node from
+/// starting in this run of the app.
 pub(crate) async fn before_start(datadir: &Path) -> Result<(), String> {
     let stuck = STUCK.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let record = on_record(datadir);
