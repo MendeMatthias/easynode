@@ -94,6 +94,13 @@ pub struct NodeAppSettings {
     /// btx_core::snapshot (C3).
     #[serde(default)]
     pub snapshot_loaded: bool,
+    /// True from a start on a datadir that has never held a block until the
+    /// first load on it has a final outcome (`commands::settle_first_load`).
+    /// Only such a fresh chain gets the one mirror launch that loads a signed
+    /// snapshot: a datadir that already holds a chain is left alone (only
+    /// Fast-forward moves it), and one from 0.6.x never has this set.
+    #[serde(default)]
+    pub first_load_pending: bool,
     /// The BTX release tag whose binaries we launch (install dir key).
     #[serde(default)]
     pub btx_release_tag: Option<String>,
@@ -308,6 +315,7 @@ impl Default for NodeAppSettings {
             // this disagrees with the serde default.
             welcome_shown: false,
             snapshot_loaded: false,
+            first_load_pending: false,
             btx_release_tag: None,
             keep_awake: true,
             txindex_enabled: false,
