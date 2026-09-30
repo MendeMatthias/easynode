@@ -764,3 +764,98 @@ async fn the_engine_reports_the_compiled_mainnet_replay_context() {
         "{v}"
     );
 }
+
+/// Fast-forward's roll-back on a real engine's folder: set the chain aside,
+/// start on nothing, put it back, and the node is where it was.
+#[tokio::test]
+#[ignore]
+async fn fast_forward_puts_a_real_chain_back() {
+    let Some(btxd) = std::env::var_os("EASYNODE_TEST_BTXD").map(PathBuf::from) else {
+        eprintln!("EASYNODE_TEST_BTXD unset; nothing to test against");
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut n = Node::new(&btxd, root.path().join("f"), 29475);
+    let validating = args(&["-matmulvalidation=consensus", "-connect=0"]);
+    let r = n.start(&validating).await.unwrap();
+    mine_to(&r, 50).await;
+    let best = call(&r, "getbestblockhash", json!([])).await;
+    n.stop(&r).await;
+
+    let record = btx_core::fast_forward::set_aside(
+        &n.net(),
+        50,
+        btx_core::fast_forward::Before::default(),
+        1,
+    )
+    .unwrap();
+    assert!(record.moved.contains(&"blocks".to_string()), "{record:?}");
+    let r = n.start(&validating).await.unwrap();
+    assert_eq!(
+        call(&r, "getblockcount", json!([])).await,
+        json!(0),
+        "a fresh chain"
+    );
+    n.stop(&r).await;
+
+    btx_core::fast_forward::restore(&n.net()).unwrap();
+    let r = n.start(&validating).await.unwrap();
+    assert_eq!(call(&r, "getblockcount", json!([])).await, json!(50));
+    assert_eq!(call(&r, "getbestblockhash", json!([])).await, best);
+    n.stop(&r).await;
+}
+
+/// Fast-forward's other end on a real engine's folder: set the old chain
+/// aside, start fresh on a new one, and `finish` keeps the new chain and
+/// leaves no dated folder or record behind.
+#[tokio::test]
+#[ignore]
+async fn fast_forward_finish_keeps_a_real_new_chain() {
+    let Some(btxd) = std::env::var_os("EASYNODE_TEST_BTXD").map(PathBuf::from) else {
+        eprintln!("EASYNODE_TEST_BTXD unset; nothing to test against");
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut n = Node::new(&btxd, root.path().join("g"), 29476);
+    let validating = args(&["-matmulvalidation=consensus", "-connect=0"]);
+    let r = n.start(&validating).await.unwrap();
+    mine_to(&r, 20).await;
+    n.stop(&r).await;
+
+    let record = btx_core::fast_forward::set_aside(
+        &n.net(),
+        20,
+        btx_core::fast_forward::Before::default(),
+        2,
+    )
+    .unwrap();
+    let aside_dir = n.net().join(&record.aside);
+    assert!(aside_dir.is_dir(), "{}", aside_dir.display());
+
+    let r = n.start(&validating).await.unwrap();
+    assert_eq!(
+        call(&r, "getblockcount", json!([])).await,
+        json!(0),
+        "a fresh chain"
+    );
+    mine_to(&r, 5).await;
+    let new_best = call(&r, "getbestblockhash", json!([])).await;
+    n.stop(&r).await;
+
+    btx_core::fast_forward::finish(&n.net()).unwrap();
+    assert!(
+        !aside_dir.exists(),
+        "the dated folder should be gone: {}",
+        aside_dir.display()
+    );
+    assert_eq!(
+        btx_core::fast_forward::read_record(&n.net()).unwrap(),
+        None,
+        "no run should be recorded once finish is done"
+    );
+
+    let r = n.start(&validating).await.unwrap();
+    assert_eq!(call(&r, "getblockcount", json!([])).await, json!(5));
+    assert_eq!(call(&r, "getbestblockhash", json!([])).await, new_best);
+    n.stop(&r).await;
+}

@@ -116,6 +116,15 @@ blocks in 8 minutes, from a peer that serves old blocks to it. It never
 adds, bans or disconnects a peer, and never asks for a branch the app
 refuses.
 
+**Fast-forward, for a node that has fallen far behind.** When a confirmed
+snapshot is more than 1,000 blocks ahead of your node, or your node's peers
+are not sending the older blocks it needs, Tools offers to fast-forward to it
+and says who confirmed it. Your node stops for a few
+minutes to load it, then carries on from there; your wallets and keys stay
+where they are. If anything goes wrong on the way, the old chain data goes
+back and Tools says what happened. While the snapshot operators disagree
+about a snapshot, Fast-forward is off, and Tools says so.
+
 ## [0.6.32] - 2026-09-28
 
 **Every node is held off two branches until BTX's developers rule on them.**
