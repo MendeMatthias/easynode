@@ -274,7 +274,8 @@ pub fn old_blocks_refused_verdict() -> StallVerdict {
         summary: "this node is far behind and none of the archive peers connected now serves \
                   old blocks to it: each dropped the connection twice when asked for them. \
                   This app has stopped asking them, and the node keeps asking on its own, \
-                  which is slow. Copy diagnostics in Tools names the peers",
+                  which is slow. If Tools offers Fast-forward, it can take the node closer \
+                  to the tip; Copy diagnostics in Tools names the peers",
     }
 }
 
@@ -608,12 +609,17 @@ mod tests {
         let v = old_blocks_refused_verdict();
         assert_eq!(v.class, StallClass::OldBlocksRefused);
         assert_eq!(serde_json::to_value(v.class).unwrap(), "old_blocks_refused");
-        for part in ["none of the archive peers", "twice", "Copy diagnostics"] {
+        for part in [
+            "none of the archive peers",
+            "twice",
+            "Fast-forward",
+            // Offered only with a confirmed snapshot above the node, so the
+            // sentence says "if", never that it is there.
+            "If Tools offers Fast-forward",
+            "Copy diagnostics",
+        ] {
             assert!(v.summary.contains(part), "{part}");
         }
-        // This build has no Fast-forward, so the card does not name it; the
-        // Fast-forward branch adds the clause back with the button.
-        assert!(!v.summary.contains("Fast-forward"));
         assert!(!v.summary.contains('\u{2014}'), "no em-dashes in copy");
         assert!(
             !v.summary.contains("automatically") && !v.summary.contains("will fix"),
