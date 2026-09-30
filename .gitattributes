@@ -2,3 +2,7 @@
 # the canonical layout, so every checkout keeps LF, on Windows too (a Windows
 # runner checks text out with CRLF otherwise).
 crates/btx-core/snapshot-operators.json text eol=lf
+# Tests read Rust sources as text (include_str!) and match lines ending in
+# \n, so Rust sources keep LF on every checkout too (Windows installer run
+# 36730503368 failed five such tests on a CRLF checkout).
+*.rs text eol=lf
