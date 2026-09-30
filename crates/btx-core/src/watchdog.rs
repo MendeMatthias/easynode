@@ -274,8 +274,8 @@ pub fn old_blocks_refused_verdict() -> StallVerdict {
         summary: "this node is far behind and none of the archive peers connected now serves \
                   old blocks to it: each dropped the connection twice when asked for them. \
                   This app has stopped asking them, and the node keeps asking on its own, \
-                  which is slow. Fast-forward can take it closer to the tip; Copy \
-                  diagnostics in Tools names the peers",
+                  which is slow. If Tools offers Fast-forward, it can take the node closer \
+                  to the tip; Copy diagnostics in Tools names the peers",
     }
 }
 
@@ -612,6 +612,9 @@ mod tests {
             "none of the archive peers",
             "twice",
             "Fast-forward",
+            // Offered only with a confirmed snapshot above the node, so the
+            // sentence says "if", never that it is there.
+            "If Tools offers Fast-forward",
             "Copy diagnostics",
         ] {
             assert!(v.summary.contains(part), "{part}");
