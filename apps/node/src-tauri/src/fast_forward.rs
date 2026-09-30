@@ -137,14 +137,16 @@ fn unreadable_sentence(datadir: &Path) -> String {
 /// `nothing_removed`: the restore could not begin (an original is missing
 /// from the dated folder, or could not be checked), so the run stands as it
 /// was, and the node is not started again in this run of the app: one plain
-/// sentence (controller note 2b).
+/// sentence (controller note 2b). It names Remove node data, which goes
+/// ahead for exactly this run while this sentence stands ([`STUCK`],
+/// [`removal_goes_ahead`], review N5).
 fn stranded_sentence(folder: &Path, nothing_removed: bool) -> String {
     if nothing_removed {
         format!(
             "Fast-forward could not put the old chain data back, because part of it is missing \
-             from {} or could not be checked, so easyNode leaves the node stopped until you quit \
-             and reopen it, then starts the node on the new chain data and carries Fast-forward \
-             on.",
+             from {} or could not be checked, so easyNode leaves the node stopped: quit and \
+             reopen easyNode to start the node on the new chain data and carry Fast-forward on, \
+             or use Remove node data in Settings to set the node up again.",
             folder.display()
         )
     } else {
@@ -2528,6 +2530,11 @@ mod tests {
         std::fs::remove_dir_all(folder.join("indexes")).unwrap();
         let not_back = undo(d).unwrap_err();
         assert!(not_back.could_not_begin);
+        assert!(
+            not_back.said.contains("Remove node data in Settings"),
+            "the sentence names the way out it has (review N5): {}",
+            not_back.said
+        );
         let stuck = Mutex::new(Some(not_back.said.clone()));
         assert_eq!(clear_for_removal_with(d, true, &stuck), waits, "a driver");
         assert!(underway(d), "nothing changed");
@@ -2691,6 +2698,10 @@ mod tests {
                 "{s}"
             );
         }
+        // Review N5: Remove node data is named only beside the run it goes
+        // ahead for; a put-back that stopped part-way still waits.
+        assert!(stranded[0].contains("Remove node data in Settings"));
+        assert!(!stranded[1].contains("Remove node data"));
         // Controller note 2b: one plain sentence, like the unreadable one.
         for s in [
             &stranded[0],
