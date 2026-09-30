@@ -496,6 +496,32 @@ pub struct ReadyPair {
     pub manifest: PathBuf,
 }
 
+/// The body of `latest`'s answer, read no further than [`MAX_POINTER_BYTES`]:
+/// a server that says it is sending more is refused before the body is
+/// read, and one that streams more without saying so is cut off at the cap.
+async fn read_pointer_body(mut resp: reqwest::Response) -> Result<Vec<u8>, String> {
+    if let Some(len) = resp
+        .content_length()
+        .filter(|&n| n > MAX_POINTER_BYTES as u64)
+    {
+        return Err(format!("the pointer says {len} bytes, not a pointer"));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("pointer read: {e}"))?
+    {
+        if body.len() + chunk.len() > MAX_POINTER_BYTES {
+            return Err(format!(
+                "the pointer is more than {MAX_POINTER_BYTES} bytes, not a pointer"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Read `latest` at `pointer_url`, then download and check the pair it
 /// names (section 7, steps 1 and 2): the manifest first, checked in full by
 /// [`cs::check`], then the file, whose size and double SHA-256 must be the
@@ -521,10 +547,7 @@ pub async fn prepare_confirmed(
             resp.status().as_u16()
         ));
     }
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("pointer read: {e}"))?;
+    let body = read_pointer_body(resp).await?;
     let p = match parse_latest(&body)? {
         Latest::Confirmed(p) => p,
         disputed @ Latest::Disputed(_) => {
@@ -1088,6 +1111,51 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("HTTP 404"), "{err}");
+    }
+
+    /// Final review M6: the pointer body is read up to the cap and no
+    /// further. A server that says it is sending more is refused before the
+    /// body is read, and one that streams more without saying so is cut off
+    /// at the cap.
+    #[tokio::test]
+    async fn a_pointer_body_is_read_no_further_than_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/long")
+            .with_body(vec![b' '; MAX_POINTER_BYTES + 1])
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/stream")
+            .with_chunked_body(|w| {
+                for _ in 0..64 {
+                    w.write_all(&[b' '; 1024])?;
+                }
+                Ok(())
+            })
+            .create_async()
+            .await;
+        let fetch = |path: &'static str| {
+            let url = format!("{}{path}", server.url());
+            let dir = tmp.path().to_path_buf();
+            async move {
+                prepare_confirmed(&reqwest::Client::new(), &url, &dir, &view(), None, any_url)
+                    .await
+                    .unwrap_err()
+            }
+        };
+        let said = fetch("/long").await;
+        assert!(
+            said.contains(&format!("says {} bytes", MAX_POINTER_BYTES + 1)),
+            "{said}"
+        );
+        let streamed = fetch("/stream").await;
+        assert!(
+            streamed.contains(&format!("more than {MAX_POINTER_BYTES} bytes")),
+            "{streamed}"
+        );
+        assert!(!pair_dir(tmp.path()).exists(), "nothing written");
     }
 
     /// Before a release: the pinned pair is still published byte for byte.
