@@ -664,10 +664,16 @@ fn is_height_out_of_range(e: &AppError) -> bool {
     matches!(e, AppError::Rpc { code: -8, message } if message == "Block height out of range")
 }
 
+/// What a set-aside snapshot chainstate is called, before the time it was
+/// set aside (Unix seconds). `crate::disk` sweeps them.
+pub const REFUSED_CHAINSTATE_PREFIX: &str = "chainstate_snapshot.refused-";
+
 /// Move a snapshot chainstate the app refuses out of the engine's way, as the
 /// engine itself does with one that fails its background check. `network_dir`
 /// is the datadir on mainnet. Call only with the node stopped. `Ok(None)`
-/// when there was none.
+/// when there was none. It goes to [`REFUSED_CHAINSTATE_PREFIX`] and the
+/// time; the launch sweep removes it after a week, Remove node data at once
+/// (`crate::disk`).
 pub fn set_aside_snapshot_chainstate(
     network_dir: &Path,
     now_unix: u64,
@@ -676,7 +682,7 @@ pub fn set_aside_snapshot_chainstate(
     if !from.exists() {
         return Ok(None);
     }
-    let to = network_dir.join(format!("chainstate_snapshot.refused-{now_unix}"));
+    let to = network_dir.join(format!("{REFUSED_CHAINSTATE_PREFIX}{now_unix}"));
     std::fs::rename(&from, &to)?;
     Ok(Some(to))
 }
