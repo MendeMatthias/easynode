@@ -78,6 +78,9 @@ pub fn run() {
             commands::set_witness_listen,
             commands::set_snapshot_serve,
             commands::record_update_check,
+            commands::remember_failed_update,
+            commands::forget_failed_update,
+            commands::peek_update_refusal,
             ask::ask_chain_progress,
             ask::ask_supply,
             ask::ask_next_halving,
@@ -121,7 +124,7 @@ pub fn run() {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let state = handle.state::<AppState>();
-                    if let Err(message) = commands::guarded_setup(&handle, &state).await {
+                    if let Err(message) = commands::guarded_setup(&handle, &state, None).await {
                         eprintln!("[e2e] setup pipeline failed: {message}");
                     }
                 });

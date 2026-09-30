@@ -253,10 +253,22 @@ pub const BTX_ARCHIVE_PEERS: &[&str] = &[
 /// 10 to 17 MB in the same window. They introduce peers; they do not carry
 /// chain.
 ///
-/// WHY THEY ARE STILL DIALLED. An introducer is worth a manual slot on a
-/// network whose DNS seeds are unreliable: a fresh node has to reach somebody,
-/// and these answer. They come AFTER the archives in [`manual_peers`] so a peer
-/// that can serve a block always outranks one that cannot.
+/// WHY THEY ARE DIALLED AS SEED NODES, NOT MANUAL PEERS. An introducer is
+/// worth a slot on a network whose DNS seeds are unreliable: a fresh node has
+/// to reach somebody, and these answer. They used to be dialled as manual
+/// (`-addnode`) peers, last after the archives in [`manual_peers`], on the
+/// reasoning that a peer that can serve a block would always outrank one that
+/// cannot. That reasoning missed that the engine hands a MANUAL peer block
+/// requests regardless of whether it can ever answer them, and never
+/// disconnects one for slow delivery. Measured on mainnet 30 September 2026,
+/// on a fresh keeper mirror from the pinned pair: with the three relays as
+/// manual peers it gained one block in 3.5 minutes, three more still in
+/// flight at the relays when they were removed by hand; with them gone it
+/// gained 561 blocks in the following 5.5 minutes, the engine alone. They are
+/// dialled with `-seednode=<host>` instead (`build_node_command`), the
+/// engine's own introducer role: an ADDR_FETCH connection that fetches
+/// addresses and disconnects, excluded from block download by
+/// `net_processing.cpp` (`!pto->IsAddrFetchConn()`).
 ///
 /// WHAT THEY LOST. The `noban` grant in [`BTX_ARCHIVE_WHITELIST_IPS`], which is
 /// documented there as belonging to peers that can answer a deep body request.
@@ -328,24 +340,26 @@ pub fn block_source_peers() -> Vec<&'static str> {
 /// The manual (`-addnode`) peer set for one start: deduplicated, capped at
 /// [`MAX_MANUAL_PEERS`], live chain first.
 ///
-/// Order is inherited from the three lists, which is the whole design:
+/// Order is inherited from the two lists, which is the whole design:
 /// [`BTX_BOOTSTRAP_PEERS`] leads with the peers measured on the live chain,
-/// [`BTX_ARCHIVE_PEERS`] follows with the deep-history archives, and
-/// [`BTX_DISCOVERY_PEERS`] comes last because an introducer cannot serve a
-/// block. A node that can only dial eight peers should spend those eight on the
-/// chain it must follow, then the history it can fetch later, then the peers
-/// that merely point at other peers.
+/// and [`BTX_ARCHIVE_PEERS`] follows with the deep-history archives. A node
+/// that can only dial eight peers should spend those eight on the chain it
+/// must follow, then the history it can fetch later.
+///
+/// [`BTX_DISCOVERY_PEERS`] is deliberately NOT in this set. They advertise no
+/// NETWORK bit and cannot serve a block, but a MANUAL peer is asked for one
+/// anyway and the engine never disconnects it for slow delivery. Measured on
+/// mainnet 30 September 2026: dialled as manual peers, the three relays held
+/// a fresh mirror to one block in 3.5 minutes; with them gone the same node
+/// gained 561 blocks in the following 5.5 minutes. `build_node_command` dials
+/// them with `-seednode=` instead, the engine's own introducer role.
 ///
 /// Truncation is silent to btxd but not to us: anything past the cap is
 /// dropped here rather than handed to an engine that would ignore it, so the
 /// set this returns is the set the node actually dials.
 pub fn manual_peers() -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::with_capacity(MAX_MANUAL_PEERS);
-    for peer in BTX_BOOTSTRAP_PEERS
-        .iter()
-        .chain(BTX_ARCHIVE_PEERS.iter())
-        .chain(BTX_DISCOVERY_PEERS.iter())
-    {
+    for peer in BTX_BOOTSTRAP_PEERS.iter().chain(BTX_ARCHIVE_PEERS.iter()) {
         if out.len() >= MAX_MANUAL_PEERS {
             break;
         }
@@ -378,8 +392,9 @@ pub const BTX_ARCHIVE_WHITELIST_IPS: &[&str] = &[
     // They are node.btx.dev, node.btxchain.org and node.btx.tools, which are
     // discovery relays rather than archives (see BTX_DISCOVERY_PEERS), and this
     // list's grant is documented above as belonging to peers that can answer a
-    // deep body request. They still reach us as manual peers, which is the
-    // exemption that actually mattered.
+    // deep body request. They no longer reach us as manual peers either (see
+    // BTX_DISCOVERY_PEERS): they are dialled as seed nodes now, so this grant
+    // would buy them nothing even if it were restored.
 ];
 
 /// Live-chain BODY SOURCES that get the same `noban` grant as the archives.
@@ -656,10 +671,12 @@ pub fn header_bootstrap_verdict(
 /// listening. Everything else about the launch is the ordinary one.
 ///
 /// * `-connect` turns off addrman dialling (btxd `init.cpp`: "Do not initiate
-///   other outgoing connections when connecting to trusted nodes"). The manual
-///   `-addnode` set is still dialled, so the discovery relays still answer,
-///   and they hand out no headers: the three measured today returned empty
-///   `headers` messages.
+///   other outgoing connections when connecting to trusted nodes"). The
+///   discovery relays are not part of this launch at all: they are not manual
+///   peers (see [`BTX_DISCOVERY_PEERS`]) and `-seednode` is skipped on a
+///   bootstrap launch because `-connect` makes the engine ignore it
+///   (init.cpp:3906); they would hand out no headers anyway, the three
+///   measured returning empty `headers` messages.
 /// * `-whitelist=in,out,noban@<ip>` for every block source, `in,out` for the
 ///   reason [`BTX_ARCHIVE_WHITELIST_IPS`] gives: a `-connect` connection is
 ///   OUTGOING. This is where the bootstrap's grant lives, and only here: the
@@ -777,9 +794,24 @@ pub fn build_node_command(
     }
     // A datadir's first header sync: only the block sources, each noban on
     // this command line alone, until the app restarts it past the snapshot
-    // anchor. See HEADER BOOTSTRAP above for the measurements.
+    // anchor. See HEADER BOOTSTRAP above for the measurements. `-seednode` is
+    // skipped on that launch: it is ignored by the engine whenever `-connect`
+    // is present (init.cpp:3906), which the bootstrap overlay always adds, so
+    // passing it there would be a line with no effect.
     if header_bootstrap_pending(datadir) {
         args.extend(header_bootstrap_args());
+    } else {
+        // The discovery relays, dialled as the engine's own introducer role
+        // rather than as manual peers: `-seednode=<host>` opens an ADDR_FETCH
+        // connection that fetches addresses and disconnects, and
+        // net_processing excludes it from block download
+        // (`!pto->IsAddrFetchConn()`). Measured on mainnet 30 September 2026
+        // (see `BTX_DISCOVERY_PEERS`): dialled as manual peers these three
+        // held a fresh mirror to one block in 3.5 minutes; 561 blocks in the
+        // following 5.5 minutes once they were gone.
+        for peer in BTX_DISCOVERY_PEERS {
+            args.push(format!("-seednode={peer}"));
+        }
     }
     // BIP324 v2 transport, explicitly ON. Confirmed upstream 2026-08-31: every
     // archive peer on the network now prefers v2, and a v1 dial to one opens
@@ -1844,7 +1876,8 @@ pub fn clear_matmul_consensus_refused(datadir: &Path) {
 /// reach the tip (catchup-trend.ts; the owner's decision of 2026-09-26), or
 /// when the machine's graphics chip failed the engine's check and the node
 /// does not move at all (validation.ts `stalledFollowOffer`). It sets it only
-/// on the owner's click.
+/// on the owner's click, or when the owner picks Quick start on the setup
+/// screen ([`apply_start_choice`]).
 ///
 /// A file for the same reason as the refusal marker above: every path that
 /// decides the launch reads it through [`launches_as_mirror`], with nothing to
@@ -1867,8 +1900,8 @@ pub fn set_follows_signatures_by_choice(datadir: &Path, on: bool) -> std::io::Re
         std::fs::write(
             &path,
             "The owner chose, in the app, to follow signatures instead of checking\n\
-             blocks on this machine, which was adding fewer blocks an hour than\n\
-             the chain makes. Settings switches it back.\n",
+             blocks on this machine: Quick start at setup, or the offer on the\n\
+             status screen. Settings switches it back.\n",
         )
     } else {
         match std::fs::remove_file(&path) {
@@ -1876,6 +1909,54 @@ pub fn set_follows_signatures_by_choice(datadir: &Path, on: bool) -> std::io::Re
             _ => Ok(()),
         }
     }
+}
+
+/// What the owner picked on the setup screen
+/// (docs/decisions/2026-09-29-quick-start-full-check-and-progress.md). The
+/// window sends `"quick_start"` or `"full_check"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartChoice {
+    /// Follows signatures, ready in minutes.
+    QuickStart,
+    /// Validates every block, takes longer the first time.
+    FullCheck,
+}
+
+/// Record the setup choice before the node's first start, where
+/// [`launches_as_mirror`] reads it.
+///
+/// Quick start writes the follow-signatures marker on a machine that may check
+/// blocks (`Backend::may_check_blocks`), so Settings can take it back later.
+/// That includes a Mac, where Quick start is selected first: without the
+/// marker, [`launches_as_mirror`] would try the chip at the first start.
+/// Full check removes it. A machine that cannot check blocks gets no marker
+/// either way: it follows signatures anyway, and a marker there would show a
+/// Settings switch that changes nothing.
+pub fn apply_start_choice(
+    datadir: &Path,
+    choice: StartChoice,
+    may_check_blocks: bool,
+) -> std::io::Result<()> {
+    set_follows_signatures_by_choice(
+        datadir,
+        choice == StartChoice::QuickStart && may_check_blocks,
+    )
+}
+
+/// Does this node run on a signed snapshot? True while the engine's record of
+/// the snapshot's signed manifest is under `chainstate_snapshot/`
+/// ([`attested_snapshot_record`]; the decision of 2026-09-29, "every node
+/// starts near the tip", section 8).
+///
+/// The record outlives the background check of the older history by one
+/// start. It stays under `chainstate_snapshot/` until the first start after
+/// that check finishes, and that start moves it with the folder to
+/// `chainstate/`, where it no longer counts. So this says "signed", not
+/// "still being checked": for that, ask the engine
+/// (`node_api::HistoryProgress::unchecked`).
+pub fn on_signed_snapshot(datadir: &Path) -> bool {
+    attested_snapshot_record(datadir).exists()
 }
 
 /// Whether THIS launch should run as a trusted mirror.
@@ -4897,6 +4978,81 @@ consensus-validator service.";
         set_follows_signatures_by_choice(dir, false).unwrap();
     }
 
+    /// The setup screen's choice decides the first start: Quick start writes
+    /// the marker, Full check removes it, and a machine that cannot check
+    /// blocks gets no marker at all, since it follows signatures anyway and a
+    /// marker would put a Settings switch on screen that changes nothing.
+    #[test]
+    fn the_setup_choice_writes_or_removes_the_marker() {
+        let tmp = tempfile::tempdir().expect("temp datadir");
+        let dir = tmp.path();
+        let btxd = Path::new("/x/btx/v0.34.9/mac/btxd");
+
+        // A Mac that keeps the preselected Quick start: Metal may check
+        // blocks, so the marker is written and the node follows signatures
+        // from its first start instead of trying the chip. An NVIDIA machine
+        // that picks Quick start is the same.
+        let mac = Backend::Metal.may_check_blocks();
+        apply_start_choice(dir, StartChoice::QuickStart, mac).unwrap();
+        assert!(follows_signatures_by_choice(dir));
+        assert!(launches_as_mirror(btxd, dir, Backend::Metal));
+        assert!(launches_as_mirror(btxd, dir, Backend::Cuda));
+
+        // A Mac that picks Full check: no marker, the chip is tried.
+        apply_start_choice(dir, StartChoice::FullCheck, mac).unwrap();
+        assert!(!follows_signatures_by_choice(dir));
+        assert!(!launches_as_mirror(btxd, dir, Backend::Metal));
+
+        // No usable GPU: Quick start writes nothing, and the node follows
+        // signatures anyway.
+        let no_gpu = Backend::Cpu.may_check_blocks();
+        apply_start_choice(dir, StartChoice::QuickStart, no_gpu).unwrap();
+        assert!(!follows_signatures_by_choice(dir));
+        assert!(launches_as_mirror(btxd, dir, Backend::Cpu));
+
+        // Full check on a fresh folder is not an error.
+        let fresh = tempfile::tempdir().expect("temp datadir");
+        apply_start_choice(fresh.path(), StartChoice::FullCheck, true).unwrap();
+        assert!(!follows_signatures_by_choice(fresh.path()));
+    }
+
+    /// The window sends the choice by name, and an older window sends none,
+    /// which is setup as it was.
+    #[test]
+    fn the_window_names_the_choice() {
+        let quick: StartChoice = serde_json::from_value(serde_json::json!("quick_start")).unwrap();
+        let full: StartChoice = serde_json::from_value(serde_json::json!("full_check")).unwrap();
+        assert_eq!(quick, StartChoice::QuickStart);
+        assert_eq!(full, StartChoice::FullCheck);
+        assert!(serde_json::from_value::<StartChoice>(serde_json::json!("fast")).is_err());
+        let none: Option<StartChoice> = serde_json::from_value(serde_json::Value::Null).unwrap();
+        assert_eq!(none, None);
+    }
+
+    /// The engine keeps a signed snapshot's manifest beside the snapshot's
+    /// chain state until the first start after the background check, which
+    /// moves it to `chainstate/`, where it no longer counts.
+    #[test]
+    fn a_signed_snapshot_is_read_from_the_engines_own_file() {
+        let tmp = tempfile::tempdir().expect("temp datadir");
+        let dir = tmp.path();
+        assert!(!on_signed_snapshot(dir));
+        std::fs::create_dir_all(dir.join("chainstate_snapshot")).unwrap();
+        assert!(!on_signed_snapshot(dir), "an unsigned snapshot is not one");
+        std::fs::write(
+            dir.join("chainstate_snapshot").join("attested_assumeutxo"),
+            b"x",
+        )
+        .unwrap();
+        assert!(on_signed_snapshot(dir));
+        assert!(attested_snapshot_record(dir).exists(), "the one record");
+
+        // The first start after the check: the folder becomes chainstate/.
+        std::fs::rename(dir.join("chainstate_snapshot"), dir.join("chainstate")).unwrap();
+        assert!(dir.join("chainstate").join("attested_assumeutxo").exists());
+        assert!(!on_signed_snapshot(dir), "a retired snapshot's record");
+    }
+
     /// A non-Metal host is a mirror on the static rule alone, with or without
     /// the marker — the new signal only ever ADDS mirrors.
     #[test]
@@ -5883,7 +6039,9 @@ consensus-validator service.";
 
     /// A fresh datadir's launch talks to the block sources alone, each with a
     /// noban grant on the command line, and the same launch without the
-    /// marker is the ordinary one, byte for byte.
+    /// marker is the ordinary one, byte for byte, apart from `-seednode`,
+    /// which the bootstrap launch drops rather than carries, since `-connect`
+    /// makes the engine ignore it.
     ///
     /// Measured 2026-09-23 on five fresh v0.34.9 datadirs: with one noban block
     /// source and everyone else dialled, headers reached the tip in about 50 s
@@ -5956,12 +6114,33 @@ consensus-validator service.";
         assert!(bootstrap.iter().any(|a| a == "-dnsseed=0"));
         assert!(bootstrap.iter().any(|a| a == "-listen=0"));
 
-        // The overlay only adds: everything the ordinary launch says, the
-        // bootstrap launch says too, in the same order.
+        // -seednode is the one thing the bootstrap launch DROPS rather than
+        // adds: the ordinary launch dials the three discovery relays that
+        // way, and the bootstrap launch dials none of them, because -connect
+        // makes the engine ignore -seednode outright (init.cpp:3906).
+        assert!(
+            ordinary
+                .iter()
+                .filter_map(|a| a.strip_prefix("-seednode="))
+                .eq(BTX_DISCOVERY_PEERS.iter().copied()),
+            "{ordinary:?}"
+        );
+        assert!(
+            !bootstrap.iter().any(|a| a.starts_with("-seednode=")),
+            "{bootstrap:?}"
+        );
+
+        // Apart from that, the overlay only adds: everything else the
+        // ordinary launch says, the bootstrap launch says too, in the same
+        // order.
         let overlay = header_bootstrap_args();
+        let ordinary_without_seednodes: Vec<&String> = ordinary
+            .iter()
+            .filter(|a| !a.starts_with("-seednode="))
+            .collect();
         let without_overlay: Vec<&String> =
             bootstrap.iter().filter(|a| !overlay.contains(*a)).collect();
-        assert_eq!(without_overlay, ordinary.iter().collect::<Vec<_>>());
+        assert_eq!(without_overlay, ordinary_without_seednodes);
 
         // Cleared, the next launch is the ordinary one again, and the grants
         // went with the command line they were on.
@@ -6053,23 +6232,21 @@ consensus-validator service.";
         // Every entry comes from a list we ship; nothing is invented here.
         for p in &peers {
             assert!(
-                BTX_BOOTSTRAP_PEERS.contains(p)
-                    || BTX_ARCHIVE_PEERS.contains(p)
-                    || BTX_DISCOVERY_PEERS.contains(p),
-                "{p} is in none of the three shipped lists"
+                BTX_BOOTSTRAP_PEERS.contains(p) || BTX_ARCHIVE_PEERS.contains(p),
+                "{p} is in neither shipped list"
             );
         }
-        // A peer that can serve a block outranks one that cannot. Discovery
-        // relays introduce peers and carry no chain, so if the cap ever has to
-        // choose, it must drop an introducer before an archive.
-        let first_relay = peers.iter().position(|p| BTX_DISCOVERY_PEERS.contains(p));
-        let last_server = peers
-            .iter()
-            .rposition(|p| BTX_BOOTSTRAP_PEERS.contains(p) || BTX_ARCHIVE_PEERS.contains(p));
-        if let (Some(relay), Some(server)) = (first_relay, last_server) {
+        // Discovery relays are NOT manual peers. Measured on mainnet 30
+        // September 2026: dialled as manual peers, the three relays held a
+        // fresh mirror's block requests (one block in 3.5 minutes with them,
+        // 561 blocks in the following 5.5 minutes once they were removed):
+        // they advertise no NETWORK bit and cannot serve a block, but the
+        // engine hands a manual peer block requests anyway. They are dialled
+        // as seed nodes instead; see `build_node_command`.
+        for p in &peers {
             assert!(
-                server < relay,
-                "a discovery relay is dialled before a block source: {peers:?}"
+                !BTX_DISCOVERY_PEERS.contains(p),
+                "{p} is a discovery relay and must not be a manual peer: {peers:?}"
             );
         }
         // The archive list means what it says: everything in it must advertise
@@ -6107,6 +6284,74 @@ consensus-validator service.";
             3,
             "BTX_BOOTSTRAP_PEERS should have 3 entries"
         );
+    }
+
+    /// Discovery relays are dialled with `-seednode=`, never `-addnode=`: they
+    /// cannot serve a block and the engine never disconnects a manual peer for
+    /// slow delivery. Measured on mainnet 30 September 2026 (see
+    /// `BTX_DISCOVERY_PEERS`): one block in 3.5 minutes with them as manual
+    /// peers, 561 blocks in the following 5.5 minutes without them.
+    ///
+    /// `-seednode` is skipped on the header-bootstrap launch: the engine
+    /// ignores it whenever `-connect` is present (init.cpp:3906), which that
+    /// launch always adds, so passing it there would be a config line with no
+    /// effect and a false impression that the relays are reachable during
+    /// bootstrap.
+    #[test]
+    fn discovery_relays_are_seednodes_not_manual_peers() {
+        let dir = std::env::temp_dir().join(format!(
+            "easybtx-seednode-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp datadir");
+        let btxd = Path::new("/x/.local/btx/v0.34.9/macos-arm64/bin/btxd");
+        let conf = dir.join("btx.conf");
+
+        // An ordinary launch: a datadir that already has blocks, so no header
+        // bootstrap is wanted or pending.
+        std::fs::create_dir_all(dir.join("blocks")).expect("blocks dir");
+        assert!(!header_bootstrap_wanted(&dir));
+        assert!(!header_bootstrap_pending(&dir));
+        let (_, ordinary, _) = build_node_command(btxd, &dir, &conf, Backend::Metal);
+
+        let seednodes: Vec<&str> = ordinary
+            .iter()
+            .filter_map(|a| a.strip_prefix("-seednode="))
+            .collect();
+        assert_eq!(
+            seednodes,
+            BTX_DISCOVERY_PEERS.to_vec(),
+            "the three relays, in order: {ordinary:?}"
+        );
+        for relay in BTX_DISCOVERY_PEERS {
+            assert!(
+                !ordinary.iter().any(|a| a == &format!("-addnode={relay}")),
+                "{relay} dialled as a manual peer on the ordinary launch: {ordinary:?}"
+            );
+        }
+
+        // The header-bootstrap launch: neither -seednode nor -addnode for a
+        // relay, because -connect makes the engine ignore -seednode outright.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp datadir");
+        begin_header_bootstrap(&dir);
+        assert!(header_bootstrap_pending(&dir));
+        let (_, bootstrap, _) = build_node_command(btxd, &dir, &conf, Backend::Metal);
+
+        assert!(
+            !bootstrap.iter().any(|a| a.starts_with("-seednode=")),
+            "-seednode on the bootstrap launch: the engine ignores it under -connect: {bootstrap:?}"
+        );
+        for relay in BTX_DISCOVERY_PEERS {
+            assert!(
+                !bootstrap.iter().any(|a| a == &format!("-addnode={relay}")),
+                "{relay} dialled as a manual peer on the bootstrap launch: {bootstrap:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The 2026-08-31 starvation fix in one assertion: v2 transport must be ON.

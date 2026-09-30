@@ -281,6 +281,15 @@ pub struct NodeAppSettings {
     /// first launch that records it; never a pre-release.
     #[serde(default)]
     pub update_high_water: Option<String>,
+    /// A version whose verified download then failed to install here: a .deb
+    /// copy whose password prompt was cancelled or could not be shown, an
+    /// install that `dpkg` or the AppImage swap refused. The automatic checks
+    /// do not download it again (`update_binding::decide_here`), so a machine
+    /// that cannot install it does not fetch it every six hours; "Check now"
+    /// clears it first and tries. `None` until an install fails; a newer
+    /// release is a different version and is offered as usual.
+    #[serde(default)]
+    pub update_install_failed: Option<String>,
 }
 
 fn default_on_close() -> String {
@@ -348,6 +357,7 @@ impl Default for NodeAppSettings {
             last_update_check_outcome: None,
             last_update_check_detail: String::new(),
             update_high_water: None,
+            update_install_failed: None,
         }
     }
 }
@@ -739,6 +749,19 @@ pub struct AppState {
     /// `tip_median_time`: one lost answer is not the engine taking a warning
     /// back, and a warning that blinks on and off reads as a false alarm.
     pub engine_warnings: Arc<Mutex<Vec<btx_core::engine_warnings::EngineWarning>>>,
+    /// The background check of a snapshot's older history
+    /// (`btx_core::node_api::refresh_history_check`), from the refresher's
+    /// `getchainstates`: whether one is running (`unchecked`, for the role
+    /// sentence) and, once the snapshot's own height is read, how far it has
+    /// got (`check`, for the line and the bar). Kept through a failed read,
+    /// like `engine_warnings`; cleared on every stop/start like the others.
+    pub history_check: Arc<Mutex<btx_core::node_api::HistoryProgress>>,
+    /// Where the chain the node runs on started, and who confirmed it
+    /// (`btx_core::snapshot_start::started_from_current`), from the
+    /// refresher's `getchainstates`, for the history line's second sentence.
+    /// Kept through a failed read and cleared on every stop/start, like
+    /// `history_check`.
+    pub started_from: Arc<Mutex<Option<String>>>,
     /// The archive-peer census, computed ONCE per refresher tick from a single
     /// getpeerinfo and shared by the status snapshot, the watchdog and the
     /// service report. The UI poll used to run its own full getpeerinfo every
@@ -831,6 +854,8 @@ impl AppState {
             fork: Arc::new(Mutex::new(None)),
             tip_median_time: Arc::new(Mutex::new(None)),
             engine_warnings: Arc::new(Mutex::new(Vec::new())),
+            history_check: Arc::new(Mutex::new(Default::default())),
+            started_from: Arc::new(Mutex::new(None)),
             archive_peers_cache: Arc::new(Mutex::new(None)),
             peer_nicknames_cache: Arc::new(Mutex::new(Vec::new())),
             esplora: Arc::new(Mutex::new(None)),

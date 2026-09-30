@@ -182,6 +182,13 @@ pub struct NodeRole {
     /// Not serialised, for the same reason as `archive`.
     #[serde(skip)]
     signed_frontier: Option<AttestedTip>,
+    /// The node started from a snapshot, signed or the engine's compiled one,
+    /// whose older history is still being checked. Changes what the
+    /// validation line says, not its verdict: every new block is still this
+    /// node's own check. Not serialised, like `archive`: `role_lines` carries
+    /// the words, and the wire shape test below pins the object.
+    #[serde(skip)]
+    history_unchecked: bool,
 }
 
 /// Parse `getnetworkinfo.localservices` (16 hex chars, `0x` tolerated).
@@ -300,6 +307,7 @@ pub fn node_role(
         distinct_signers: None,
         tip_age_secs: None,
         signed_frontier: None,
+        history_unchecked: false,
     }
 }
 
@@ -320,6 +328,15 @@ impl NodeRole {
     /// because a mirror has no key of its own and still needs this number.
     pub fn with_distinct_signers(mut self, distinct_signers: Option<u64>) -> Self {
         self.distinct_signers = distinct_signers;
+        self
+    }
+
+    /// Attach whether the node started from a snapshot whose older history
+    /// is still being checked, as the engine reports it
+    /// (`node_api::HistoryProgress::unchecked`). Any snapshot: the engine's
+    /// compiled one leaves that history as unchecked as a signed one does.
+    pub fn with_unchecked_history(mut self, history_unchecked: bool) -> Self {
+        self.history_unchecked = history_unchecked;
         self
     }
 
@@ -378,6 +395,16 @@ impl NodeRole {
 
     fn validation_line(&self) -> RoleLine {
         let (value, helps, note) = match self.validation_mode {
+            // A snapshot, signed or not: every new block is checked here, the
+            // history below the snapshot is still being checked in the
+            // background, so "takes nobody's word for the chain" is not true
+            // yet.
+            ValidationMode::Consensus if self.advertises_consensus && self.history_unchecked => (
+                "Checking every block itself",
+                Some(true),
+                "Checks every new block itself. Its older history is still being checked."
+                    .to_string(),
+            ),
             ValidationMode::Consensus if self.advertises_consensus => (
                 "Checking every block itself",
                 Some(true),
@@ -935,6 +962,67 @@ mod tests {
         let v = line(&lines, "Validation");
         assert_eq!(v.value, "Checking every block itself");
         assert_eq!(v.helps, Some(true));
+    }
+
+    /// A node that checks blocks and started from a snapshot says so: every
+    /// new block is its own check, the history below the snapshot is not yet.
+    /// Any snapshot, a signed one or the engine's compiled one (integration
+    /// review M1): the sentence names no signer, and the status screen shows
+    /// "Checking older history" for both. Once that check is done the usual
+    /// sentence is back. A mirror and a degraded start are never told they
+    /// check blocks.
+    #[test]
+    fn a_validating_node_whose_older_history_is_unchecked_says_so() {
+        let validating = node_role(
+            Some(&status("consensus", true)),
+            CONSENSUS_BITS,
+            &[],
+            1,
+            600,
+            Some(0),
+            None,
+        );
+        let on_snapshot = validating.clone().with_unchecked_history(true).lines();
+        let v = line(&on_snapshot, "Validation");
+        assert_eq!(v.value, "Checking every block itself");
+        assert_eq!(v.helps, Some(true));
+        assert_eq!(
+            v.note,
+            "Checks every new block itself. Its older history is still being checked."
+        );
+
+        let done = validating.with_unchecked_history(false).lines();
+        assert!(line(&done, "Validation")
+            .note
+            .starts_with("Validates the proof of work on its own hardware"));
+
+        let mirror = node_role(
+            Some(&status("trusted", false)),
+            ARCHIVE_ONLY_BITS,
+            &[],
+            0,
+            600,
+            Some(0),
+            None,
+        )
+        .with_unchecked_history(true)
+        .lines();
+        assert!(!line(&mirror, "Validation")
+            .note
+            .contains("Checks every new block"));
+
+        let degraded = node_role(
+            Some(&status("consensus", false)),
+            PLAIN_BITS,
+            &[],
+            0,
+            600,
+            Some(0),
+            None,
+        )
+        .with_unchecked_history(true)
+        .lines();
+        assert_eq!(line(&degraded, "Validation").value, "Started degraded");
     }
 
     /// (c) The signer. Holds a key, validates, advertises the archive bit: the

@@ -18,7 +18,8 @@ use btx_core::node::{DatadirHolder, NodeController};
 use btx_core::node_api::{get_blockchain_info, get_chainstates};
 use btx_core::rpc::RpcClient;
 use btx_core::setup::{
-    enough_free_disk, ensure_addnodes_in_conf, free_disk_bytes, rpc_url, wait_for_node_rpc,
+    enough_free_disk, ensure_addnodes_in_conf, free_disk_bytes, remove_addnodes_in_conf, rpc_url,
+    wait_for_node_rpc,
 };
 use btx_core::snapshot::SnapshotSpec;
 use btx_core::snapshot_serve as snap;
@@ -349,6 +350,28 @@ pub fn snapshot_spec() -> SnapshotSpec {
 /// function's choice succeeded.
 fn node_backend() -> Backend {
     btx_core::backend::node_host_backend()
+}
+
+/// This machine's backend as the setup screen sees it, asked of the host once
+/// per app run. `node_host_backend` reads the loader cache on a PC and logs its
+/// answer, which is too much for a status poll every 1.5 s, and the hardware
+/// does not change while the app is open.
+fn setup_backend() -> Backend {
+    static BACKEND: std::sync::OnceLock<Backend> = std::sync::OnceLock::new();
+    *BACKEND.get_or_init(node_backend)
+}
+
+/// Whether this machine may check blocks itself (`Backend::may_check_blocks`):
+/// whether the setup screen lets the owner pick Full check.
+fn full_check_possible() -> bool {
+    setup_backend().may_check_blocks()
+}
+
+/// Whether the setup screen selects Full check first
+/// (`Backend::full_check_first`): on an NVIDIA machine, not on a Mac, where
+/// Quick start comes first (the owner's decision of 2026-09-29).
+fn full_check_first() -> bool {
+    setup_backend().full_check_first()
 }
 
 /// The Settings line for one attempt to offer the public signing key.
@@ -748,6 +771,23 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
         }
     }
 
+    // Discovery relays used to be dialled as manual (`-addnode`) peers, and an
+    // earlier version's conf may still carry those lines. They cannot serve a
+    // block. Measured on mainnet 30 September 2026, dialled that way they
+    // held a fresh mirror to one block in 3.5 minutes, and the same node
+    // gained 561 blocks in the following 5.5 minutes once they were removed:
+    // so this build dials them with `-seednode=` instead (`build_node_command`)
+    // and cleans up the stale lines here, ahead of the manual set below, so a
+    // returning conf converges on the new shape rather than keeping both.
+    let removed_relays =
+        remove_addnodes_in_conf(&paths.faststart_conf, btx_core::node::BTX_DISCOVERY_PEERS);
+    if removed_relays > 0 {
+        eprintln!(
+            "[node-app] conf: dropped {removed_relays} discovery-relay addnode line(s) left by \
+             an earlier version; they are dialled with -seednode now"
+        );
+    }
+
     // The manual peer set belongs in the conf on every start (idempotent) so
     // even a hand-started btxd against this datadir reaches the sparse BTX
     // network. It is the SAME set `build_node_command` passes on the CLI —
@@ -764,10 +804,14 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     // was just btxd dropping the tail instead of us. Say which ones out loud,
     // because the list order is now a decision and a decision nobody can see is
     // one nobody revisits.
+    //
+    // Discovery relays are deliberately excluded from this count: they are
+    // not past the cap, they are never manual peers at all (dialled instead
+    // with `-seednode=`, above), so listing them here would call a decision
+    // an eviction.
     let dropped: Vec<&str> = btx_core::node::BTX_BOOTSTRAP_PEERS
         .iter()
         .chain(btx_core::node::BTX_ARCHIVE_PEERS.iter())
-        .chain(btx_core::node::BTX_DISCOVERY_PEERS.iter())
         .copied()
         .filter(|p| !manual.contains(p))
         .collect();
@@ -1034,6 +1078,8 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     *state.fork.lock().await = None;
     *state.tip_median_time.lock().await = None;
     state.engine_warnings.lock().await.clear();
+    *state.history_check.lock().await = Default::default();
+    *state.started_from.lock().await = None;
 
     set_phase(app, state, NodePhase::Starting).await;
 
@@ -1500,6 +1546,18 @@ async fn spawn_node_with_lock_retry(
             && !btx_core::node::matmul_consensus_was_refused(datadir)
         {
             btx_core::node::record_matmul_consensus_refused(datadir);
+            // The retry is a mirror, and a mirror holds no key: without this
+            // the key line written for the consensus launch stays in the conf
+            // and attempts 2 and 3 exit too (`signer_after_chip_refusal`).
+            let (applies_here, pubkey) = signer_after_chip_refusal(
+                &paths.btxd,
+                datadir,
+                &paths.faststart_conf,
+                node_backend(),
+                NodeAppSettings::load(datadir).signer_enabled,
+            );
+            *state.signer_applies_here.lock().await = Some(applies_here);
+            *state.signer_pubkey.lock().await = pubkey;
             eprintln!(
                 "[node-app] this Mac has no reviewed ExactReplay golden in the bundled \
                  engine, so btxd refused to start as an independent consensus validator. \
@@ -1611,6 +1669,8 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
     let fork_slot = state.fork.clone();
     let tip_time_slot = state.tip_median_time.clone();
     let engine_warnings_slot = state.engine_warnings.clone();
+    let history_slot = state.history_check.clone();
+    let started_from_slot = state.started_from.clone();
     let anchor = snapshot_spec().anchor_height;
 
     tauri::async_runtime::spawn(async move {
@@ -1625,6 +1685,9 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         // truth before the first successful read.
         let mut last_peers: i64 = 0;
         let mut snapshot_swept = false;
+        // The snapshot block's own height, read from its header once per
+        // snapshot (btx_core::node_api::refresh_history_check).
+        let mut history_base = btx_core::node_api::HistoryBase::default();
         // Trusted-mirror stall watchdog state (Paper 3 §3, progress rule
         // refined — see btx_core::watchdog): while a connectable gap exists,
         // only BLOCK movement is progress; at the frontier and during
@@ -1782,6 +1845,29 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         get_chainstates(&rpc),
                         btx_core::node_api::get_peer_info(&rpc)
                     );
+                    // Whether a snapshot's older history is still being
+                    // checked, and how far that has got, for the role
+                    // sentence and the status screen's line and bar. A failed
+                    // getchainstates keeps the last answer (btx_core).
+                    let previous = *history_slot.lock().await;
+                    let history = btx_core::node_api::refresh_history_check(
+                        &rpc,
+                        &chainstates,
+                        &mut history_base,
+                        previous,
+                    )
+                    .await;
+                    *history_slot.lock().await = history;
+                    // Where the chain the node runs on started, and who
+                    // confirmed it, for the history line's second sentence:
+                    // from the start record, only while it describes this
+                    // chain (btx_core::snapshot_start). A failed
+                    // getchainstates keeps the last answer, as above.
+                    if let Ok(cs) = &chainstates {
+                        let dd = node_datadir();
+                        *started_from_slot.lock().await =
+                            btx_core::snapshot_start::started_from_current(&dd, cs);
+                    }
                     let chainstates = chainstates.unwrap_or_default();
                     let peer_infos = peer_infos.ok();
                     // A FAILED MEASUREMENT IS NOT ZERO PEERS. `peers` is an i64
@@ -2755,6 +2841,8 @@ pub async fn stop_node_inner(state: &AppState) {
     *state.fork.lock().await = None;
     *state.tip_median_time.lock().await = None;
     state.engine_warnings.lock().await.clear();
+    *state.history_check.lock().await = Default::default();
+    *state.started_from.lock().await = None;
     // Release the keep-awake assertion — the Mac may sleep again.
     *state.sleep_guard.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
@@ -2961,6 +3049,19 @@ pub struct NodeStatusInfo {
     /// Everything else btxd is warning about, one sentence each, those that
     /// ask for attention first. Empty when stopped or when there is nothing.
     pub engine_notes: Vec<btx_core::engine_warnings::EngineNote>,
+    /// How far the background check of the snapshot's older history has got
+    /// (`btx_core::node_api::HistoryCheck`), for the status screen's
+    /// "Checking older history" line and bar. `None` when the node is stopped,
+    /// never loaded a snapshot, or the engine reports the check done, and
+    /// while the snapshot's own height (the check's base) has not been read
+    /// yet: the line is never shown against a guessed base.
+    pub history_check: Option<btx_core::node_api::HistoryCheck>,
+    /// The history line's second sentence: where the chain the node runs on
+    /// started, and who confirmed it ("Started from block 233,800, confirmed
+    /// by Mende and jpp."), from the start record, and only while that record
+    /// describes this chain (`btx_core::snapshot_start::started_from_current`).
+    /// `None` when the node is stopped or there is no such record.
+    pub started_from: Option<String>,
     /// The nickname the user has chosen (empty = none). This is what WILL be
     /// broadcast; `subversion` below is what IS.
     pub node_nickname: String,
@@ -3018,6 +3119,20 @@ pub struct NodeStatusInfo {
     /// blocks itself (`btx_core::node::follows_signatures_by_choice`). Drives
     /// the Settings switch that takes it back.
     pub follow_signatures: bool,
+    /// Whether this machine may check blocks itself, as far as the app can
+    /// know before the engine's first start (`full_check_possible`). The setup
+    /// screen greys out Full check when it is false.
+    pub full_check_possible: bool,
+    /// Whether the setup screen selects Full check first (`full_check_first`):
+    /// true on an NVIDIA machine, false on a Mac, where Quick start comes
+    /// first and Full check can still be picked. Read only while
+    /// `full_check_possible` is true.
+    pub full_check_first: bool,
+    /// The engine refused this Mac's graphics chip at a start, and the app
+    /// moved the node to following signatures
+    /// (`btx_core::node::matmul_consensus_was_refused`). The status screen
+    /// says so once.
+    pub chip_refused: bool,
     /// Bytes this node has uploaded to peers this run (`getnettotals`).
     ///
     /// Feeds the "Helping the network" card: chain data other people actually
@@ -3349,6 +3464,17 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
     } else {
         None
     };
+    let history = if running {
+        *state.history_check.lock().await
+    } else {
+        Default::default()
+    };
+    let history_check = history.check;
+    let started_from = if running {
+        state.started_from.lock().await.clone()
+    } else {
+        None
+    };
     let role = net.as_ref().filter(|_| running).map(|n| {
         btx_core::role::node_role(
             matmul_trusted.as_ref(),
@@ -3363,6 +3489,14 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         .with_distinct_signers(distinct_signers)
         .with_tip_age(tip_age_secs)
         .with_signed_frontier(signed_frontier.as_ref())
+        // A validating node says its older history is still being checked
+        // for as long as the engine reports it unchecked, whichever snapshot
+        // it started from: the engine's compiled one leaves that history as
+        // unchecked as a signed one, and the status screen shows the check
+        // for both (btx_core::role). Not gated on the line's base height:
+        // the sentence needs none, and a getblockheader that keeps failing
+        // would hold it back.
+        .with_unchecked_history(history.unchecked)
     });
     let role_lines = role.as_ref().map(|r| r.lines()).unwrap_or_default();
     let signing_live = role.as_ref().is_some_and(|r| r.signs_for_mirrors());
@@ -3512,6 +3646,8 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         tip_stale_message,
         behind_signers_message,
         engine_notes,
+        history_check,
+        started_from,
         fork,
         node_nickname: settings.node_nickname.clone(),
         broadcast_nickname: subversion
@@ -3539,6 +3675,9 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         rc_unverifiable_message,
         rc_trusted_mirror: rc_policy.as_ref().is_some_and(|p| p.trusted_mirror),
         follow_signatures: btx_core::node::follows_signatures_by_choice(&datadir),
+        full_check_possible: full_check_possible(),
+        full_check_first: full_check_first(),
+        chip_refused: btx_core::node::matmul_consensus_was_refused(&datadir),
         archive_peers,
         stall,
         node_profile: settings.node_profile.clone(),
@@ -3579,9 +3718,15 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
 
 // ── First-run setup pipeline ────────────────────────────────────────────────
 
+/// `choice` is the setup screen's Quick start or Full check. `None` (an older
+/// window, the E2E seam) is setup as it was before the choice existed.
 #[tauri::command]
-pub async fn begin_setup(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    guarded_setup(&app, &state).await
+pub async fn begin_setup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    choice: Option<btx_core::node::StartChoice>,
+) -> Result<(), String> {
+    guarded_setup(&app, &state, choice).await
 }
 
 /// Append a timestamped line to `<datadir>/setup.log`. A GUI app has no
@@ -3607,6 +3752,7 @@ pub(crate) fn setup_log(datadir: &Path, msg: &str) {
 pub(crate) async fn guarded_setup(
     app: &AppHandle,
     state: &State<'_, AppState>,
+    choice: Option<btx_core::node::StartChoice>,
 ) -> Result<(), String> {
     if state
         .setup_running
@@ -3615,7 +3761,7 @@ pub(crate) async fn guarded_setup(
     {
         return Err("setup is already running".to_string());
     }
-    let result = run_setup_pipeline(app, state).await;
+    let result = run_setup_pipeline(app, state, choice).await;
     state.setup_running.store(false, Ordering::SeqCst);
     if let Err(msg) = &result {
         setup_log(&node_datadir(), &format!("ERROR: {msg}"));
@@ -3631,7 +3777,11 @@ pub(crate) async fn guarded_setup(
     result
 }
 
-async fn run_setup_pipeline(app: &AppHandle, state: &State<'_, AppState>) -> Result<(), String> {
+async fn run_setup_pipeline(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    choice: Option<btx_core::node::StartChoice>,
+) -> Result<(), String> {
     let datadir = node_datadir();
     std::fs::create_dir_all(&datadir)
         .map_err(|e| format!("couldn't create {}: {e}", datadir.display()))?;
@@ -3639,6 +3789,20 @@ async fn run_setup_pipeline(app: &AppHandle, state: &State<'_, AppState>) -> Res
         &datadir,
         &format!("setup started (app v{})", env!("CARGO_PKG_VERSION")),
     );
+
+    // 0. The owner's pick on the setup screen, recorded before the first start
+    //    reads it (`launches_as_mirror`). No pick leaves the marker as it is.
+    if let Some(choice) = choice {
+        btx_core::node::apply_start_choice(&datadir, choice, full_check_possible()).map_err(
+            |e| {
+                format!(
+                    "couldn't record your start choice in {}: {e}",
+                    datadir.display()
+                )
+            },
+        )?;
+        setup_log(&datadir, &format!("start choice: {choice:?}"));
+    }
 
     // 1. Disk preflight. A fresh install (no chain yet) must fit the whole
     //    un-pruned chain, so it gates on DISK_REQUIRED_FRESH; a resume needs only
@@ -3930,6 +4094,32 @@ fn write_signer_key_line(
             None
         }
     }
+}
+
+/// The signer decision again, after the engine refused this Mac's chip
+/// inside the start loop, as `(applies_here, public key)` for
+/// `AppState.signer_applies_here` and `AppState.signer_pubkey`.
+///
+/// The refusal marker is on disk now, so the host follows signatures and the
+/// retry is a mirror ([`signer_for_launch`], from the same two rules). A
+/// mirror holds no key: the engine refuses a signing key off consensus mode
+/// (btx 84b998b4 `init.cpp:1729-1731`), so a key line left from the consensus
+/// launch would end the retries the same way. The line comes out as it does
+/// for a mirror launch.
+fn signer_after_chip_refusal(
+    btxd: &Path,
+    datadir: &Path,
+    conf: &Path,
+    backend: Backend,
+    signer_enabled: bool,
+) -> (bool, Option<String>) {
+    let (applies_here, signs_here) = signer_for_launch(
+        signer_enabled,
+        btx_core::node::host_follows_signatures(btxd, datadir, backend),
+        btx_core::node::launches_as_mirror(btxd, datadir, backend),
+    );
+    let pubkey = write_signer_key_line(datadir, conf, signs_here, &mut Vec::new());
+    (applies_here, pubkey)
 }
 
 /// Does the key line go back in once the launch plan is known? When this
@@ -5156,6 +5346,31 @@ pub async fn record_update_check(outcome: String, detail: String) -> Result<(), 
         &outcome,
         &detail,
     )
+}
+
+/// Remember a version whose verified download then failed to install, so the
+/// automatic checks do not download it again (`update_binding::decide_here`).
+/// The front end calls this only after `download()` resolved and `install()`
+/// failed; the six-hourly timer calls `update_binding::remember_failed_install`
+/// itself. Anything that is not a version is refused unwritten.
+#[tauri::command]
+pub async fn remember_failed_update(version: String) -> Result<(), String> {
+    crate::update_binding::remember_failed_install(&node_datadir(), &version)
+}
+
+/// Forget that version before a "Check now", so a press always tries.
+#[tauri::command]
+pub async fn forget_failed_update() -> Result<(), String> {
+    crate::update_binding::forget_failed_install(&node_datadir());
+    Ok(())
+}
+
+/// Why the last check declined or refused what it was offered, without taking
+/// it: the front end shows it, and `record_update_check`, called right after,
+/// takes it for the record.
+#[tauri::command]
+pub async fn peek_update_refusal() -> Result<Option<String>, String> {
+    Ok(crate::update_binding::peek_refusal())
 }
 
 /// The record for a "no update" that was really a refusal, or `None` to keep
@@ -6989,10 +7204,10 @@ mod signed_start_tests {
         mirror_load_end_message, mirror_load_step, mirror_load_wanted_here, nominal_btxd_path,
         prepared_within, refused_load_message, run_failure_reason, runs_mirror_load,
         set_aside_pending, set_aside_refused_snapshot_at, set_aside_waits, set_aside_will_move,
-        settle_first_load, signed_load_failed, signed_load_for, signer_for_launch,
-        signing_key_the_app_does_not_manage, snapshot_base, write_signer_key_line, AfterLoad,
-        AfterRefusal, AttachedTo, MirrorLoadStep, MIRROR_LOAD_ENABLED, PREPARE_START_DEADLINE,
-        SET_ASIDE_STUCK,
+        settle_first_load, signed_load_failed, signed_load_for, signer_after_chip_refusal,
+        signer_for_launch, signing_key_the_app_does_not_manage, snapshot_base,
+        write_signer_key_line, AfterLoad, AfterRefusal, AttachedTo, MirrorLoadStep,
+        MIRROR_LOAD_ENABLED, PREPARE_START_DEADLINE, SET_ASIDE_STUCK,
     };
     use crate::state::NodeAppSettings;
     use btx_core::attested_snapshot::PairKind;
@@ -7812,6 +8027,113 @@ mod signed_start_tests {
         assert!(key(&text), "{text}");
         assert!(text.contains("prune=10000"), "{text}");
         assert!(!ips.is_empty(), "the mirrors it feeds are whitelisted");
+    }
+
+    /// Integration review M6: Full check on a Mac whose chip the engine
+    /// refuses. The consensus launch had the key line; once the refusal is
+    /// on disk the retry is a mirror, and the engine refuses a key off
+    /// consensus mode, so the line comes out and the host no longer counts
+    /// as a signer.
+    #[test]
+    fn a_mac_refused_in_the_start_loop_retries_without_the_signing_key() {
+        let dir = fresh_validating_datadir();
+        let conf = dir.path().join("faststart").join("faststart.conf");
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        std::fs::write(&conf, "prune=10000\n").unwrap();
+        let btxd = nominal_btxd_path();
+        assert!(write_signer_key_line(dir.path(), &conf, true, &mut Vec::new()).is_some());
+        assert!(node::signs_here(&conf), "the consensus launch had the key");
+
+        node::record_matmul_consensus_refused(dir.path());
+        assert_eq!(
+            signer_after_chip_refusal(&btxd, dir.path(), &conf, Backend::Metal, true),
+            (false, None)
+        );
+        assert!(!node::signs_here(&conf), "the retry holds no key");
+        let text = std::fs::read_to_string(&conf).unwrap();
+        assert!(text.contains("prune=10000"), "{text}");
+    }
+
+    /// Integration review M6, in the code: the loop takes the key line out
+    /// and tells the window, between recording the refusal and the retry.
+    #[test]
+    fn the_chip_refusal_retry_takes_the_key_line_out_first() {
+        let src = include_str!("commands.rs");
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let refused = spawn_fn
+            .find("node::record_matmul_consensus_refused(datadir);")
+            .unwrap();
+        let retry = refused + spawn_fn[refused..].find("continue;").unwrap();
+        let between = &spawn_fn[refused..retry];
+        for step in [
+            "signer_after_chip_refusal(",
+            "*state.signer_applies_here.lock().await = Some(",
+            "*state.signer_pubkey.lock().await =",
+        ] {
+            assert!(between.contains(step), "missing before the retry: {step}");
+        }
+    }
+
+    /// Integration review M1: a validating node on the engine's compiled
+    /// snapshot has no `attested_assumeutxo` file, and its older history is
+    /// just as unchecked. The role card follows the history check alone, so
+    /// it never says "takes nobody's word for the chain" while the status
+    /// screen shows "Checking older history".
+    #[test]
+    fn the_role_sentence_follows_the_history_check_alone() {
+        let src = include_str!("commands.rs");
+        let status = src
+            .split("\npub async fn get_node_status(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(
+            status.contains(".with_unchecked_history(history.unchecked)"),
+            "the role reads the history check"
+        );
+        assert!(
+            !status.contains("on_signed_snapshot("),
+            "and not the signed snapshot's file"
+        );
+    }
+
+    /// Integration review M2, in the code: the refresher reads where the
+    /// chain started beside each tick's getchainstates (the record only
+    /// when it describes that chain), the status carries it while the node
+    /// runs, and a stop or a start forgets it like the history check.
+    #[test]
+    fn the_start_point_rides_the_tick_to_the_status() {
+        let src = include_str!("commands.rs");
+        let refresher = src
+            .split("\nfn spawn_status_refresher(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let history = refresher.find("refresh_history_check(").unwrap();
+        let start = refresher
+            .find("snapshot_start::started_from_current(&dd, cs)")
+            .expect("the refresher reads the start record");
+        assert!(history < start);
+        assert!(refresher.contains("*started_from_slot.lock().await ="));
+
+        let status = src
+            .split("\npub async fn get_node_status(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(status.contains("state.started_from.lock().await.clone()"));
+        assert!(status.contains("        started_from,\n"));
+        // Built here, so this test's own text is not counted.
+        let cleared = ["*state.started_from", ".lock().await = None;"].concat();
+        assert_eq!(
+            src.matches(&cleared).count(),
+            2,
+            "cleared on start and on stop"
+        );
     }
 
     /// Minor 7: after a stop or another restart got there first, the log

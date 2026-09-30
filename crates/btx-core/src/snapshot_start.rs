@@ -11,7 +11,10 @@
 //!
 //! The history-check line and Fast-forward's last message read it through
 //! [`read`] and [`started_from`]. The record says what the last load did; a
-//! reader that shows it beside the running chain checks [`is_current`].
+//! reader that shows it beside the running chain checks [`is_current`], as
+//! [`started_from_current`] does for the status screen. Copy diagnostics keeps
+//! the start point after the check is done (the decision, section 7), so it
+//! prints the record either way and says when it is not current.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -135,6 +138,19 @@ pub fn started_from(record: &StartRecord) -> String {
         StartSource::Pinned => format!("Started from block {at}, built into this app."),
         StartSource::Engine => format!("Started from block {at}, built into the BTX engine."),
     }
+}
+
+/// [`started_from`] for the chain the node runs on now: the record in
+/// `datadir` when it describes the snapshot chainstate in `chainstates`
+/// ([`is_current`]), else `None` (no record, or one that outlived its chain).
+/// The status screen's history line reads it.
+pub fn started_from_current(
+    datadir: &Path,
+    chainstates: &crate::node_api::ChainStates,
+) -> Option<String> {
+    read(datadir)
+        .filter(|r| is_current(r, chainstates))
+        .map(|r| started_from(&r))
 }
 
 #[cfg(test)]
@@ -280,5 +296,39 @@ mod tests {
             assert_eq!(got, want);
             assert!(!got.contains('\u{2014}'), "no em-dash: {got}");
         }
+    }
+
+    /// Integration review M2: the status screen says where the running chain
+    /// started, from the record, and only beside the snapshot chainstate that
+    /// record describes. (Copy diagnostics keeps the record either way:
+    /// `diagnostics::start_note`.)
+    #[test]
+    fn the_second_sentence_is_said_only_for_the_chain_running_now() {
+        let states = |hash: Option<&str>| crate::node_api::ChainStates {
+            headers: 233_900,
+            chainstates: vec![crate::node_api::ChainstateEntry {
+                blocks: 233_900,
+                snapshot_blockhash: hash.map(str::to_string),
+                ..Default::default()
+            }],
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        assert_eq!(
+            started_from_current(d, &states(Some(BASE))),
+            None,
+            "no record"
+        );
+        write(d, &confirmed(&["Mende", "jpp"])).unwrap();
+        assert_eq!(
+            started_from_current(d, &states(Some(BASE))).as_deref(),
+            Some("Started from block 233,800, confirmed by Mende and jpp.")
+        );
+        assert_eq!(
+            started_from_current(d, &states(Some(&"00".repeat(32)))),
+            None,
+            "a record that outlived its chain"
+        );
+        assert_eq!(started_from_current(d, &states(None)), None, "no snapshot");
     }
 }

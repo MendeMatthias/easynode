@@ -24,6 +24,17 @@ from everyone, or left on a branch the others have moved on from, knows of no
 newer blocks either. Now a newest block more than two hours old, or signed
 blocks the node does not have, overrule it, and the line says which one it is.
 
+**A .deb install updates itself, after one password prompt.** Until now only
+the AppImage updated itself on Linux. A copy installed from the .deb downloaded
+the AppImage on every check, could not install it, and tried again six hours
+later. From this version on, a .deb copy reads a feed of its own and installs
+the new .deb after asking for your password once, the way any system package
+does. Where there is no .deb to install, it downloads nothing and shows the
+command to install it by hand. On every platform, an update that downloaded but
+failed to install is not downloaded again by the automatic checks; Check now
+still tries. A .deb copy on 0.6.32 or older moves to this version by hand one
+last time, with the command on easybtx.com/node.
+
 **New nodes start closer to the tip, from a snapshot two operators confirmed.**
 When you set up a node, easyNode looks for the newest chain snapshot that at
 least two of the people on its operator list have signed (today Mende,
@@ -34,11 +45,58 @@ still checks its older history in the background. A node that checks blocks
 itself also lists the signing keys mirrors follow, which it needs to keep
 starting from that snapshot; they never replace its own checks, and it passes
 their signatures on to its peers, as mirrors do. The node remembers who
-confirmed its start point. If there is no such snapshot yet, or the operators
+confirmed its start point, and names them under the check of older history
+and in Copy diagnostics. If there is no such snapshot yet, or the operators
 disagree about one, your node starts from the snapshot easyNode already ships,
 at block 225,927. A node that checks blocks itself used to start further back,
 from the one built into the node engine, and now takes easyNode's in the same
 short extra start.
+
+**Setup asks one question: Quick start or Full check.** Both start from a
+recent signed snapshot and check the older history in the background. Quick
+start follows signatures and is ready in minutes. Full check also checks every
+new block on this computer's graphics card, and takes longer the first time.
+On Linux with an NVIDIA graphics card, Full check is selected first. On a Mac,
+Quick start is selected first, because some Mac graphics chips don't pass the
+engine's check; you can still pick Full check. A computer without a graphics
+card the engine can use gets Quick start, and the screen says why. For now
+that includes every Windows PC: the Windows engine can't use a graphics card.
+Where Full check is possible, you can switch later in Settings. If the engine
+turns down a Mac's graphics chip and the app moves the node to following
+signatures, the status screen says so once.
+
+**The status screen shows the check of older history.** A node that starts
+from a snapshot, with either choice, checks the history below the snapshot in
+the background. One line and a thin bar under the status now show how far
+that has got, for example "Checking older history: 131,200 of 225,927 (58%)",
+and go away when it is done. There is no time estimate, because the engine
+sets the pace. A node that checks blocks on a signed snapshot says so on its
+role card.
+
+**A node that is catching up is no longer told it is not following the
+chain.** That sentence is kept for a node whose newest block is over two hours
+old and that knows of nothing newer. While the gap is closing, the card stays
+hidden. In the first minutes it says "Checking whether your node is catching
+up...". If the gap is not closing, it turns amber and says how many blocks an
+hour your node adds against the network's 40. A node that is still syncing is
+judged by the blocks it adds, and a fresh install that is still counting the
+chain's headers stays calm.
+
+**A slow node no longer leaves the dead branch before Branch B is refused.**
+Before a node leaves the dead branch it first refuses Branch B, so B cannot
+become the chain it follows. Until now, a node that took too long to say
+whether it had seen B's first block was treated as one that had never seen it,
+and the dead branch could be left with B still open. Now only the node saying
+it has never seen that block counts. No answer, or any other error, keeps the
+dead branch waiting and the app asks again.
+
+**A node that starts far behind no longer waits on peers that cannot send
+blocks.** The app kept a steady connection to three introducer nodes that only
+know other nodes' addresses, and the node engine kept asking them for its next
+blocks and waiting. A node that started from a snapshot gained a block only
+every few minutes. Now the app asks them for addresses and lets them go. On 30
+September a test node gained one block in three and a half minutes with them,
+and 561 blocks in the five and a half minutes after they were gone.
 
 **A node that is far behind now asks for its next blocks by name.** Most
 nodes on the network keep only recent blocks, and the node engine asks them

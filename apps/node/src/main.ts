@@ -14,15 +14,32 @@ import { followRowVisible, stalledFollowOffer, validationView } from "./validati
 import {
   CHAIN_BLOCKS_PER_HOUR,
   type CatchupSample,
+  type TrendReading,
   cannotCatchUp,
   catchupLine,
-  pushSample,
+  chainCardMessage,
+  recordReading,
+  staleCard,
+  trendReading,
 } from "./catchup-trend";
+import { type HistoryCheck, historyCheckView } from "./history-check";
+import {
+  NO_GPU_REASON,
+  type StartChoice,
+  announcer,
+  chipNoticeVisible,
+  setupArgs,
+  startChoiceView,
+  switchLaterShown,
+} from "./start-choice";
 import {
   classifyCheckFailure,
   checkFailureMessage,
+  handInstallBanner,
+  handInstallNotice,
   installErrorFromDetail,
   lastCheckLine,
+  noUpdateMessage,
   updateCheckRecord,
   type LastUpdateCheck,
   type UpdateCheckBranch,
@@ -208,6 +225,21 @@ interface NodeStatusInfo {
   rc_trusted_mirror: boolean;
   /** The owner chose to follow signatures on a machine that could validate. */
   follow_signatures: boolean;
+  /** This machine may check blocks itself, as far as the app can know before
+   *  the engine's first start. The setup screen greys out Full check when not. */
+  full_check_possible: boolean;
+  /** The setup screen selects Full check first: an NVIDIA machine. False on a
+   *  Mac, where Quick start comes first and Full check can still be picked. */
+  full_check_first: boolean;
+  /** The engine refused this Mac's graphics chip, so the node follows
+   *  signatures. The status screen says so once per engine. */
+  chip_refused: boolean;
+  /** How far the background check of the snapshot's older history has got;
+   *  null when there is none running. */
+  history_check: HistoryCheck | null;
+  /** The history line's second sentence: where the chain started and who
+   *  confirmed it, for the chain running now (btx_core::snapshot_start). */
+  started_from: string | null;
   /**
    * Bytes uploaded to peers this run. Null when stopped or when the node did
    * not answer `getnettotals` — the UI drops the claim rather than showing a
@@ -517,6 +549,49 @@ function setStep(active: number, downloadPct?: number) {
   }
 }
 
+/** The owner's pick on the setup screen, null until they touch it, so the
+ *  default can follow what the machine can do (start-choice.ts). */
+let pickedChoice: StartChoice | null = null;
+
+function reflectStartChoice(status: NodeStatusInfo, inProgress: boolean): void {
+  const view = startChoiceView(status.full_check_possible, status.full_check_first, pickedChoice);
+  const quick = $<HTMLInputElement>("choice-quick");
+  const full = $<HTMLInputElement>("choice-full");
+  quick.checked = view.selected === "quick_start";
+  full.checked = view.selected === "full_check";
+  // No changing course once setup has started; the choice is already recorded.
+  quick.disabled = inProgress;
+  full.disabled = inProgress || view.fullCheckDisabled;
+  $("choice-quick-label").classList.toggle("is-selected", quick.checked);
+  $("choice-full-label").classList.toggle("is-selected", full.checked);
+  $("choice-full-label").classList.toggle("is-disabled", view.fullCheckDisabled);
+  // Locked, not dimmed: the pick stays readable while setup runs.
+  $("choice-quick-label").classList.toggle("is-locked", inProgress);
+  $("choice-full-label").classList.toggle("is-locked", inProgress);
+  const reason = $("choice-full-reason");
+  reason.hidden = !view.fullCheckDisabled;
+  reason.textContent = view.fullCheckDisabled ? NO_GPU_REASON : "";
+  $("start-choice-switch").hidden = !switchLaterShown(status.full_check_possible);
+}
+
+/** What the setup button sends: the owner's pick, or the default for this
+ *  machine. */
+function currentChoice(): StartChoice {
+  return startChoiceView(
+    lastStatus?.full_check_possible ?? false,
+    lastStatus?.full_check_first ?? false,
+    pickedChoice,
+  ).selected;
+}
+
+for (const id of ["choice-quick", "choice-full"]) {
+  $<HTMLInputElement>(id).addEventListener("change", (e) => {
+    const box = e.target as HTMLInputElement;
+    if (box.checked) pickedChoice = box.value as StartChoice;
+    if (lastStatus) reflectStartChoice(lastStatus, setupInFlight);
+  });
+}
+
 function renderWizard(status: NodeStatusInfo) {
   showScreen("wizard");
   const p = status.phase;
@@ -527,6 +602,8 @@ function renderWizard(status: NodeStatusInfo) {
     p.phase === "starting" ||
     p.phase === "warming" ||
     p.phase === "loading_snapshot";
+
+  reflectStartChoice(status, inProgress);
 
   // The button IS the live readout while setting up; idle otherwise.
   if (inProgress) setSetupButton(true, setupPhaseLabel(p));
@@ -926,8 +1003,9 @@ function renderStatus(status: NodeStatusInfo) {
   const errCard = $("status-error");
 
   reflectPeerNames(status);
-  reflectFork(status);
   reflectEngineNotes(status);
+  reflectChipNotice(status);
+  reflectHistoryCheck(status);
   renderRole(status);
   reflectSignerRow(status);
   // The close dialog's warning follows the wire on every tick, so a dialog
@@ -951,21 +1029,16 @@ function renderStatus(status: NodeStatusInfo) {
   lastActive = mode === "ready" || mode === "syncing";
   core?.setActive(lastActive);
 
-  // Record the gap on every poll while the node claims to be ready, so the
-  // wording below can tell a closing gap from a pinned one. Cheap, bounded,
-  // and the only place the sample is available.
-  if (p.phase === "ready") {
-    catchupSamples = pushSample(
-      catchupSamples,
-      { at: Date.now(), behind: p.blocks_behind, height: p.height },
-      Date.now(),
-    );
-  } else if (p.phase !== "syncing") {
-    // A stop, an error or a fresh start invalidates the history: a gap
-    // measured before a restart says nothing about the one after it.
-    catchupSamples = [];
-  }
+  // Record the gap on every poll while the node runs, so the wording below
+  // can tell a closing gap from a pinned one, and a syncing node that adds
+  // blocks from one that has stopped. Cheap, bounded, and the only place the
+  // sample is available. Which phases feed it, with what gap, and which start
+  // it over is catchup-trend.ts `trendReading`.
+  const reading = trendReading(p, Date.now());
+  catchupSamples = recordReading(catchupSamples, reading, Date.now());
 
+  // After the sample above, so the stale card judges the trend as it is now.
+  reflectFork(status, reading);
   reflectFollowOffer(status);
 
   let height = 0;
@@ -1150,6 +1223,7 @@ async function beginSetup() {
   // Immediate feedback on the click: the button becomes a spinner + live label
   // and the "come back later" note appears, before any backend round-trip.
   setSetupButton(true, "Setting up your node…");
+  if (lastStatus) reflectStartChoice(lastStatus, true);
   $<HTMLButtonElement>("retry-btn").disabled = true;
   wizardProgress.hidden = false;
   setStep(0);
@@ -1161,7 +1235,7 @@ async function beginSetup() {
     // Completion truth comes from the polled status.setup_complete — a
     // resolved invoke is NOT proof (the backend rejects a duplicate run with
     // an error, and older builds resolved it silently).
-    await invoke("begin_setup");
+    await invoke("begin_setup", setupArgs(currentChoice()));
   } catch (e) {
     $("wizard-error-msg").textContent = String(e);
     wizardError.hidden = false;
@@ -1662,34 +1736,118 @@ function reflectArchiveService(status: NodeStatusInfo): void {
   el.classList.toggle("needs-attention", status.archive_service_needs_attention);
 }
 
+/** Whether the stale sentence was amber on a syncing node at the last poll.
+ *  A syncing node's card keeps amber until its hour's pace is back at the
+ *  chain's (catchup-trend.ts `staleCard`, `wasAmber`), so it does not blink. */
+let syncingStaleAmber = false;
+
 /**
- * A longer chain exists that this node cannot obtain blocks for. Shown in
- * amber beside the height and never guessed: the sentence is btx_core::fork's,
- * the facts are btxd's own getchaintips. Hidden the moment the verdict
- * clears, so a stale alarm never outlives the condition, and hidden on any
- * phase that is not running: a stopped node has no view of the chain to be
- * behind with.
+ * The chain card, one sentence about whether this node follows the chain:
+ * its newest block is hours old by the clock, a longer chain exists that it
+ * cannot obtain blocks for, or it is behind the signers. Amber, and never
+ * guessed: the sentences are Rust's (btx_core::fork, engine_warnings), the
+ * facts btxd's own. Before the catch-up trend is measured it can instead say
+ * "Checking whether your node is catching up..." in the quiet colours, which
+ * is not a verdict and yields to both of the others (catchup-trend.ts
+ * `staleCard` and `chainCardMessage`). Hidden the moment the verdict clears,
+ * so a stale alarm never outlives the condition, and hidden on any phase that
+ * is not running: a stopped node has no view of the chain to be behind with.
  */
-function reflectFork(status: NodeStatusInfo): void {
+function reflectFork(status: NodeStatusInfo, reading: TrendReading): void {
   const card = $("fork-card");
   const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
-  // A stale tip outranks a fork verdict. A fork says "there is a better chain
-  // we cannot reach"; a stale tip says "the newest block we have is hours old
-  // however healthy everything else reads", which is the condition every
-  // peer-derived signal in this app is blind to by construction.
-  //
-  // Behind the signers comes last because it is the earliest and the least
-  // specific: it fires minutes into a split the node cannot see, before the
-  // tip is old enough to be stale, and says less than either once they do.
-  const message =
-    status.tip_stale_message ?? status.fork_message ?? status.behind_signers_message;
-  if (!running || !message) {
+  const stale = staleCard(status.tip_stale_message, reading, catchupSamples, Date.now(), syncingStaleAmber);
+  syncingStaleAmber = reading.kind === "syncing" && stale?.tone === "amber";
+  const shown = chainCardMessage(stale, status.fork_message, status.behind_signers_message);
+  if (!running || !shown) {
     card.hidden = true;
     return;
   }
   card.hidden = false;
-  $("fork-msg").textContent = message;
+  card.classList.toggle("is-calm", shown.calm);
+  $("fork-msg").textContent = shown.message;
 }
+
+/** The background check of the snapshot's older history: one line and a thin
+ *  bar under the status line while it runs (history-check.ts). Hidden on a
+ *  node that is not running, and the moment the engine reports it done. */
+function reflectHistoryCheck(status: NodeStatusInfo): void {
+  const wrap = $("history-check");
+  const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
+  const view = running ? historyCheckView(status.history_check, status.started_from) : null;
+  if (!view) {
+    wrap.hidden = true;
+    return;
+  }
+  wrap.hidden = false;
+  $("history-line").textContent = view.line;
+  $("history-fill").style.width = `${view.pct}%`;
+  $("history-bar").setAttribute("aria-valuenow", String(view.pct));
+}
+
+/** The note after the engine turned this Mac's chip down, once per engine
+ *  (start-choice.ts `chipNoticeVisible`). Remembered in localStorage by engine
+ *  tag; where storage is unavailable it still closes for this run. */
+const CHIP_NOTICE_KEY = "ebtx-node.chip-notice-seen";
+let chipNoticeClosed = false;
+/** The always-present live region that says the notice, then lets it go. */
+const announceChip = announcer($("chip-announce"));
+
+function reflectChipNotice(status: NodeStatusInfo): void {
+  let seen: string | null = null;
+  try {
+    seen = localStorage.getItem(CHIP_NOTICE_KEY);
+  } catch {
+    // No storage: show it until OK is pressed in this run.
+  }
+  const card = $("chip-card");
+  const shown =
+    !chipNoticeClosed &&
+    chipNoticeVisible(status.chip_refused, status.rc_trusted_mirror, seen, status.node_tag);
+  // Spoken through the region that is always there, once, as the notice
+  // appears (a poll that rewrote the same text could repeat it), and cleared
+  // a few seconds later, since the card still shows it.
+  if (shown && card.hidden) announceChip($("chip-msg").textContent ?? "");
+  if (!shown && $("chip-announce").textContent) announceChip("");
+  card.hidden = !shown;
+}
+
+/** The element focus moves to when `leaving` is about to hide with focus in
+ *  it: the next one on the screen that can take focus, or the one before it
+ *  when there is none after. Without this a keyboard user is dropped back to
+ *  the top of the page. */
+function focusTargetAfter(leaving: HTMLElement, screen: HTMLElement): HTMLElement | null {
+  const candidates = Array.from(
+    screen.querySelectorAll<HTMLElement>(
+      'button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter(
+    (el) => !leaving.contains(el) && !el.matches(":disabled") && el.getClientRects().length > 0,
+  );
+  const after = candidates.find(
+    (el) => leaving.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING,
+  );
+  const before = candidates.filter(
+    (el) => leaving.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_PRECEDING,
+  );
+  return after ?? before[before.length - 1] ?? null;
+}
+
+$("chip-ok").addEventListener("click", () => {
+  chipNoticeClosed = true;
+  try {
+    if (lastStatus) localStorage.setItem(CHIP_NOTICE_KEY, lastStatus.node_tag);
+  } catch {
+    // Closed for this run; it may show again on the next.
+  }
+  const card = $("chip-card");
+  // Only when the card held focus (a keyboard press, or a browser that
+  // focuses a clicked button): hiding it would drop focus to the page.
+  const next = card.contains(document.activeElement) ? focusTargetAfter(card, screenStatus) : null;
+  card.hidden = true;
+  announceChip("");
+  next?.focus();
+});
 
 /**
  * What btxd itself is warning about, beyond what the Block checking and chain
@@ -2122,8 +2280,9 @@ function setUpdateResult(text: string): void {
 
 // Failing to CHECK and failing to INSTALL are different events and must not
 // share a catch. A failed check is usually just being offline, and there is
-// nothing for the user to do about it. A failed INSTALL is permanent for that
-// build — a Linux .deb cannot be replaced by the updater at all — and the old
+// nothing for the user to do about it. A failed INSTALL is usually permanent
+// for that build on that machine (a .deb copy that cannot show the password
+// prompt, a folder the app cannot write to), and the old
 // single catch swallowed it on the automatic path, leaving the banner reading
 // "Update available: vX — downloading…" indefinitely, repainted identically at
 // every launch and every six-hour tick. That is worse than silence: it is an
@@ -2190,13 +2349,29 @@ function paintUpdateProgress(outcome: string, version: string, error: string): v
   }
 }
 
+/**
+ * An update this copy will not download on its own (update_binding.rs): a
+ * .deb copy offered only the AppImage, or a version whose install already
+ * failed here. The banner says so and the sentence beside "Check now" gives
+ * the steps. `text` is what update_binding kept or a recorded detail; for
+ * anything else this paints nothing.
+ */
+function paintHandInstall(text: string): void {
+  const notice = handInstallNotice(text);
+  if (!notice) return;
+  const banner = handInstallBanner(notice);
+  showUpdateBanner(banner.head, banner.tail);
+  setUpdateResult(notice);
+}
+
 // A check the Rust timer ran has settled (src-tauri/src/update_timer.rs). The
 // backend has already written the record; this paints what updateCheck()
-// would have painted had the check run here, through the same two functions,
+// would have painted had the check run here, through the same functions,
 // and the "Last check" line from the record itself rather than waiting for
 // the next status tick to read it back.
 function onUpdateCheckEvent(ev: UpdateCheckEvent): void {
   paintUpdateProgress(ev.outcome, ev.version, installErrorFromDetail(ev.detail));
+  paintHandInstall(ev.detail);
   paintLastUpdateCheck({ at: ev.at, outcome: ev.outcome, detail: ev.detail });
 }
 
@@ -2215,7 +2390,27 @@ function recordUpdateCheck(branch: UpdateCheckBranch, manual: boolean): Promise<
   );
 }
 
+// What update_binding kept about the check that just ran: why it declined or
+// refused the offer, or null. Read before recordUpdateCheck, which takes it.
+// A failure to read it is a console warning and a null, never a reason for
+// the check to fail.
+function peekUpdateRefusal(): Promise<string | null> {
+  return invoke<string | null>("peek_update_refusal").catch((e) => {
+    console.warn("update-check: could not read the refusal", e);
+    return null;
+  });
+}
+
 async function updateCheck(manual = false): Promise<void> {
+  // "Check now" always tries. The automatic checks leave alone a version whose
+  // install already failed here (update_binding.rs); a press forgets that
+  // first. Awaited, so the check below sees it cleared; a failure to clear is
+  // a console warning and the check goes ahead.
+  if (manual) {
+    await invoke("forget_failed_update").catch((e) =>
+      console.warn("update-check: could not clear the failed version", e),
+    );
+  }
   let update: Awaited<ReturnType<typeof checkForUpdate>>;
   try {
     update = await checkForUpdate();
@@ -2237,10 +2432,13 @@ async function updateCheck(manual = false): Promise<void> {
   }
 
   if (!update) {
+    // To the plugin a declined or refused offer is "no update". Read why
+    // before the record below takes it, so the screen says what the record
+    // will: the steps for an update to install by hand, or the refusal.
+    const declined = await peekUpdateRefusal();
+    paintHandInstall(declined ?? "");
     if (manual) {
-      setUpdateResult(
-        appVersion ? `You're on the latest version (v${appVersion}).` : "You're on the latest version."
-      );
+      setUpdateResult(noUpdateMessage(declined, appVersion, MANUAL_DOWNLOAD));
     }
     void recordUpdateCheck({ branch: "no-update", currentVersion: appVersion }, manual);
     return;
@@ -2248,12 +2446,41 @@ async function updateCheck(manual = false): Promise<void> {
 
   paintUpdateProgress("found", update.version, "");
   // Recorded before the download, so a check that found something and then
-  // died mid-download still left the finding behind.
+  // died mid-download still left the finding behind. The six-hourly timer
+  // reads it too: while the last record is a `found` under an hour old it
+  // leaves this check alone (update_timer.rs), so a .deb copy waiting in its
+  // password prompt is not sent a second download and a second prompt.
   void recordUpdateCheck({ branch: "found", version: update.version }, manual);
 
+  // Downloaded and verified first, then installed, so a failure knows which
+  // half it was. A download that broke off is retried at the next check, as
+  // before. A verified download that would not install is remembered, and the
+  // automatic checks leave that version alone, so a copy that cannot install
+  // it does not fetch it again every six hours. "Check now" still tries.
+  //
+  // On a .deb copy the install waits in the password prompt until someone
+  // answers it. That wait happens inside the plugin: its install command runs
+  // the blocking install on one of the backend's async workers, and that is
+  // the plugin's code, left alone here. The six-hourly timer runs its own
+  // install on the blocking pool instead (update_timer.rs).
+  let downloaded = false;
   try {
-    await update.downloadAndInstall();
+    await update.download();
+    downloaded = true;
+    await update.install();
   } catch (e) {
+    // The plugin frees the downloaded package only after an install that
+    // succeeded, so a failed one would hold it (150-470 MB) until the app
+    // quits. Freed here, fire-and-forget: a failure to free is a console
+    // warning and changes nothing else.
+    void update.close().catch((err) =>
+      console.warn("update-check: could not free the downloaded package", err),
+    );
+    if (downloaded) {
+      void invoke("remember_failed_update", { version: update.version }).catch((err) =>
+        console.warn("update-check: could not remember the failed version", err),
+      );
+    }
     paintUpdateProgress("install-failed", update.version, String(e));
     void recordUpdateCheck({ branch: "install-failed", version: update.version, error: e }, manual);
     return;

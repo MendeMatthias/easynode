@@ -4,6 +4,7 @@
 
 use crate::fork::ChainTip;
 use crate::node_api::{AttestedTip, BlockchainInfo, ChainStates, PeerInfo};
+use crate::snapshot_start::{self, StartRecord};
 
 pub const LOG_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 pub const LOG_WARNING_LINES: usize = 20;
@@ -63,6 +64,11 @@ pub struct DiagnosticsInput {
     pub chain: Option<BlockchainInfo>,
     pub best_block_hash: Option<String>,
     pub chainstates: Option<ChainStates>,
+    /// The start record (`snapshot_start::read`): where the node's chain
+    /// started and who confirmed it. Kept after the check is done (the
+    /// confirmed-snapshot decision, section 7), so the report says it whether
+    /// or not the record describes the chain running now ([`start_note`]).
+    pub start_record: Option<StartRecord>,
     pub tips: Vec<ChainTip>,
     pub held: Vec<HeldBranchState>,
     pub peers: Vec<PeerInfo>,
@@ -94,6 +100,27 @@ fn history(p: &PeerInfo) -> &'static str {
         "recent history"
     } else {
         "no history"
+    }
+}
+
+/// What follows the start record in the report. Nothing beside the snapshot
+/// chainstate the record describes ([`snapshot_start::is_current`]).
+/// Otherwise what the chain states show: no snapshot chainstate and a chain
+/// at or past the start point means every block the node holds is its own
+/// check; anything else is another chain than the one the record describes.
+fn start_note(record: &StartRecord, chainstates: Option<&ChainStates>) -> &'static str {
+    let Some(cs) = chainstates else {
+        return " (Not compared with the node's chain: it did not answer.)";
+    };
+    if snapshot_start::is_current(record, cs) {
+        return "";
+    }
+    let checked_past =
+        cs.snapshot().is_none() && cs.active().is_some_and(|c| c.blocks >= record.height);
+    if checked_past {
+        " (The node has since finished checking its older history.)"
+    } else {
+        " (The node no longer runs on this snapshot.)"
     }
 }
 
@@ -147,6 +174,13 @@ pub fn render(i: &DiagnosticsInput) -> String {
                 None => o.push(format!("  history check at {}", group(c.blocks))),
             }
         }
+    }
+    if let Some(r) = &i.start_record {
+        o.push(format!(
+            "  {}{}",
+            snapshot_start::started_from(r),
+            start_note(r, i.chainstates.as_ref())
+        ));
     }
     let others: Vec<&ChainTip> = i
         .tips
@@ -1129,6 +1163,7 @@ mod tests {
             }),
             best_block_hash: Some("11bd18812b6afcd1".into()),
             chainstates: None,
+            start_record: None,
             tips: vec![],
             held: vec![],
             peers: vec![
@@ -1286,6 +1321,7 @@ mod tests {
             }),
             best_block_hash: Some("11bd18812b6afcd1".into()),
             chainstates: None,
+            start_record: None,
             tips: vec![],
             held: vec![HeldBranchState {
                 height: 228146,
@@ -1327,5 +1363,73 @@ mod tests {
             assert!(r.contains(part), "missing {part}:\n{r}");
         }
         assert!(!r.contains('\u{2014}'));
+    }
+
+    /// Integration review M2, and the confirmed-snapshot decision, section 7:
+    /// the report keeps the start point and who confirmed it after the check
+    /// is done, names intact after the redaction. Beside the snapshot it
+    /// describes it says nothing more; otherwise one plain note says what the
+    /// chain states show instead.
+    #[test]
+    fn the_report_keeps_where_the_chain_started() {
+        use crate::node_api::ChainstateEntry;
+        use crate::snapshot_start::{StartRecord, StartSource};
+        let base = "bd23c642be34c3a1f1a637d6352b8cfb390c801f2b873605b64986a1bc962c46";
+        let record = StartRecord {
+            height: 233_800,
+            block_hash: base.into(),
+            source: StartSource::Confirmed,
+            operators: vec!["Mende".into(), "jpp".into()],
+        };
+        let one = |c: ChainstateEntry| ChainStates {
+            headers: 240_000,
+            chainstates: vec![c],
+        };
+        let on_it = one(ChainstateEntry {
+            blocks: 233_900,
+            snapshot_blockhash: Some(base.into()),
+            ..Default::default()
+        });
+        let checked = one(ChainstateEntry {
+            blocks: 240_000,
+            validated: true,
+            ..Default::default()
+        });
+        let below = one(ChainstateEntry {
+            blocks: 120_000,
+            validated: true,
+            ..Default::default()
+        });
+        let other = one(ChainstateEntry {
+            blocks: 240_000,
+            snapshot_blockhash: Some("00".repeat(32)),
+            ..Default::default()
+        });
+        let started = "  Started from block 233,800, confirmed by Mende and jpp.";
+        for (chainstates, note) in [
+            (Some(on_it), ""),
+            (
+                Some(checked),
+                " (The node has since finished checking its older history.)",
+            ),
+            (Some(below), " (The node no longer runs on this snapshot.)"),
+            (Some(other), " (The node no longer runs on this snapshot.)"),
+            (
+                None,
+                " (Not compared with the node's chain: it did not answer.)",
+            ),
+        ] {
+            let input = DiagnosticsInput {
+                chainstates,
+                start_record: Some(record.clone()),
+                ..Default::default()
+            };
+            let out = report(&input, &ctx("unusedsecret"));
+            let want = format!("{started}{note}");
+            assert!(out.lines().any(|l| l == want), "want {want:?}:\n{out}");
+            assert!(!out.contains('\u{2014}'), "no em-dash:\n{out}");
+        }
+        let none = render(&DiagnosticsInput::default());
+        assert!(!none.contains("Started from"), "{none}");
     }
 }
