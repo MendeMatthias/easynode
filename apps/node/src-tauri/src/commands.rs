@@ -591,10 +591,28 @@ fn rpc_timeout_error(
         Some(line) => format!("{stop}; its last log line was \"{line}\"."),
         None => format!("{stop}; the engine had not written anything to its log yet."),
     };
+    // `last` may already end a sentence: btxd's warmup text ends in "…".
+    let stop_mark = if last.ends_with(['.', '…', '!', '?']) {
+        ""
+    } else {
+        "."
+    };
     format!(
-        "the node didn't become ready: {last}. {doing} See easybtx-node.log in {} for details.",
+        "the node didn't become ready: {last}{stop_mark} {doing} See easybtx-node.log in {} for \
+         details.",
         datadir.display()
     )
+}
+
+/// When a launch's btxd exited, for the log line: inside the launch watch,
+/// during the RPC wait before it ever answered, or after it had answered
+/// warmup, so with its RPC up (Task A review M6).
+fn exit_when(after_watch: bool, warming: bool) -> String {
+    match (after_watch, warming) {
+        (false, _) => format!("within {}s of spawning", LAUNCH_SURVIVAL_WATCH.as_secs()),
+        (true, false) => "before its RPC came up".to_string(),
+        (true, true) => "while it was warming up".to_string(),
+    }
 }
 
 /// The RPC wait's "is the child gone?" probe over the node slot: an empty
@@ -1779,6 +1797,7 @@ async fn spawn_node_with_lock_retry(
         // three minutes on a dead process each start and then said only "no
         // .cookie yet".
         let mut exited_after_watch = false;
+        let mut exited_warming = false;
         if survived {
             spawn_warmup_watcher(app.clone(), state, datadir.to_path_buf());
             // Asked once per poll; see `slot_child_gone` for why a held slot
@@ -1935,6 +1954,10 @@ async fn spawn_node_with_lock_retry(
                 }
                 // `after_rpc_wait` maps each outcome to exactly one of these,
                 // so what is left is an exit: fall through to the exit path.
+                (_, RpcWait::Exited { warming, .. }) => {
+                    exited_after_watch = true;
+                    exited_warming = warming;
+                }
                 _ => exited_after_watch = true,
             }
         }
@@ -1985,11 +2008,7 @@ async fn spawn_node_with_lock_retry(
             continue;
         }
 
-        let when = if exited_after_watch {
-            "before its RPC came up".to_string()
-        } else {
-            format!("within {}s of spawning", LAUNCH_SURVIVAL_WATCH.as_secs())
-        };
+        let when = exit_when(exited_after_watch, exited_warming);
         eprintln!(
             "[node-app] btxd exited {when}, attempt {attempt}/{LAUNCH_ATTEMPTS}. \
              Cause read from its log: {}",
@@ -9149,7 +9168,7 @@ mod signed_start_tests {
 #[cfg(test)]
 mod launch_wait_tests {
     use super::{
-        after_no_rpc_timeout, after_rpc_wait, apply_follow_signatures_choice,
+        after_no_rpc_timeout, after_rpc_wait, apply_follow_signatures_choice, exit_when,
         extends_for_gpu_check, rpc_timeout_error, stop_needs_no_rpc, AfterNoRpcTimeout,
         AfterRpcWait, GPU_HOLDS_NODE_ERROR,
     };
@@ -9160,6 +9179,7 @@ mod launch_wait_tests {
     fn exited() -> RpcWait {
         RpcWait::Exited {
             last: "the node's RPC never became reachable (no .cookie yet)".into(),
+            warming: false,
         }
     }
 
@@ -9279,6 +9299,32 @@ mod launch_wait_tests {
         // Task A review M4: with no hint and no error line, the exit status.
         assert!(spawn_fn.contains("launch_failure_cause_or_exit(&tail, last_exit.as_deref())"));
         assert!(spawn_fn.contains(".exit_status()"));
+    }
+
+    // ── Task A review M6: the wording of an exit and of a timeout ─────────
+
+    #[test]
+    fn an_exit_is_described_by_when_it_happened() {
+        assert_eq!(exit_when(false, false), "within 5s of spawning");
+        assert_eq!(exit_when(true, false), "before its RPC came up");
+        assert_eq!(exit_when(true, true), "while it was warming up");
+    }
+
+    /// The wait's own sentence may already end in a full stop or an ellipsis
+    /// (btxd's "Verifying blocks…"); the error does not add a second one.
+    #[test]
+    fn the_timeout_error_never_doubles_a_full_stop() {
+        let dir = Path::new("/dd");
+        for last in [
+            "node is warming up: Verifying blocks…",
+            "the RPC said no.",
+            "the node's RPC never became reachable (no .cookie yet)",
+        ] {
+            let e = rpc_timeout_error(last, None, Some(NoRpcStop::Killed), dir);
+            assert!(!e.contains("…."), "{e}");
+            assert!(!e.contains(".."), "{e}");
+            assert!(e.contains(&format!("{last}")), "{e}");
+        }
     }
 
     // ── Task A review M1: Stop and Quit on a start hung before RPC ────────

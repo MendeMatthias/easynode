@@ -665,7 +665,7 @@ pub async fn wait_for_node_rpc(
         .await
     {
         RpcWait::Ready(client) => Ok(client),
-        RpcWait::Exited { last } | RpcWait::TimedOut { last, .. } => Err(last),
+        RpcWait::Exited { last, .. } | RpcWait::TimedOut { last, .. } => Err(last),
     }
 }
 
@@ -676,8 +676,9 @@ pub enum RpcWait {
     Ready(RpcClient),
     /// The child exited while the wait ran. `last` is what the wait had seen
     /// so far, which for an init exit is nearly always "no .cookie yet": the
-    /// cause is in the child's own log, not here.
-    Exited { last: String },
+    /// cause is in the child's own log, not here. `warming` as for
+    /// `TimedOut`: it had answered RPC_IN_WARMUP, so it died with its RPC up.
+    Exited { last: String, warming: bool },
     /// A budget ran out with the child still there. `warming` is true when
     /// the node answered RPC_IN_WARMUP at least once, so its RPC is up and a
     /// graceful `stop` can reach it; false means it never answered at all.
@@ -718,7 +719,10 @@ pub async fn wait_for_node_rpc_watching<F: FnMut() -> bool>(
     let mut warmup_polls: u32 = 0;
     while unreachable_polls < max_polls && warmup_polls < warmup_max_polls {
         if child_gone() {
-            return RpcWait::Exited { last };
+            return RpcWait::Exited {
+                last,
+                warming: warmup_polls > 0,
+            };
         }
         if let Ok(client) = RpcClient::from_cookie(url, &cookie) {
             match crate::node_api::get_blockchain_info(&client).await {
@@ -743,7 +747,10 @@ pub async fn wait_for_node_rpc_watching<F: FnMut() -> bool>(
         tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
     }
     if child_gone() {
-        return RpcWait::Exited { last };
+        return RpcWait::Exited {
+            last,
+            warming: warmup_polls > 0,
+        };
     }
     RpcWait::TimedOut {
         last,
@@ -1758,6 +1765,38 @@ maxreorgdepthwarn=9
             "expected a timeout after warmup"
         );
         assert!(probes >= 6, "the budget started over: {probes} probes");
+    }
+
+    /// An exit says whether the node had answered warmup first, so the
+    /// caller does not call a node whose RPC was up one that died "before its
+    /// RPC came up" (Task A review M6).
+    #[tokio::test]
+    async fn an_exit_after_warmup_says_it_was_warming() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"result":null,"error":{"code":-28,"message":"Verifying blocks…"},"id":"easybtx"}"#,
+            )
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".cookie"), "__cookie__:secret").unwrap();
+        let mut probes = 0u32;
+        let probe = || {
+            probes += 1;
+            probes > 2
+        };
+        let got = wait_for_node_rpc_watching(dir.path(), &server.url(), 5, 10, 100, probe).await;
+        assert!(
+            matches!(got, RpcWait::Exited { warming: true, .. }),
+            "expected an exit after warmup"
+        );
+        let cold =
+            wait_for_node_rpc_watching(dir.path(), "http://127.0.0.1:1", 5, 10, 100, || true).await;
+        assert!(matches!(cold, RpcWait::Exited { warming: false, .. }));
     }
 
     /// A ready node is ready whatever the probe would say later.
