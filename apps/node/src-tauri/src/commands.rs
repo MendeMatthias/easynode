@@ -640,6 +640,33 @@ fn slot_child_gone(slot: &tokio::sync::Mutex<Option<NodeController>>) -> bool {
     }
 }
 
+/// Hold the spawned engine at normal priority for a step that must not be
+/// slowed by the background policy (`NodeController::hold_normal_priority`),
+/// with one log line. No child, no hold.
+async fn hold_engine_normal(slot: &tokio::sync::Mutex<Option<NodeController>>, why: &str) {
+    if let Some(c) = slot.lock().await.as_mut() {
+        if c.child_pid().is_none() {
+            return;
+        }
+        match c.hold_normal_priority() {
+            Ok(()) => eprintln!("[node-app] btxd runs at normal priority while {why}"),
+            Err(e) => eprintln!("[node-app] could not lift btxd's priority while {why}: {e}"),
+        }
+    }
+}
+
+/// End such a hold: back to the spawn policy, which the status refresher
+/// re-decides from the chain within 30 s. A no-op without a hold.
+async fn release_engine_hold(slot: &tokio::sync::Mutex<Option<NodeController>>) {
+    if let Some(c) = slot.lock().await.as_mut() {
+        if c.priority_held() {
+            if let Err(e) = c.release_priority_hold() {
+                eprintln!("[node-app] could not put btxd back under its policy: {e}");
+            }
+        }
+    }
+}
+
 /// What [`retune_spawned_engine`] found in the node slot.
 #[derive(Debug, PartialEq, Eq)]
 enum SpawnedRetune {
@@ -1819,6 +1846,11 @@ pub(crate) async fn start_node_held(app: &AppHandle, state: &AppState) -> Result
         // outcome is no longer this run's to act on, and a load the task has
         // not yet begun is not made at all.
         let gen = state.refresher_gen.load(Ordering::SeqCst);
+        // A load is heavy disk work: at normal priority, deterministically,
+        // not behind other programs' disk I/O in the background policy and
+        // not depending on whether a retune tick has seen the gap yet.
+        // `spawn_load_watch` releases it when the load task ends.
+        hold_engine_normal(&state.node, "the snapshot loads").await;
         let handle = btx_core::snapshot::ensure_snapshot_loaded_with(
             rpc.clone(),
             paths.btx_cli.clone(),
@@ -2034,6 +2066,13 @@ async fn spawn_node_with_lock_retry(
                     message: gpu_check_warming(gpu_word),
                 };
                 set_phase(app, state, note.clone()).await;
+                // The extension's ten minutes were sized at normal priority
+                // (2.75x the slowest measured check); the background policy
+                // makes the check 1.5-2.1x slower. So past the ordinary wait
+                // the engine gets the chip at normal priority, and a slow Mac
+                // is never moved to following signatures because of the
+                // policy (docs/mac-engine-priority.md).
+                hold_engine_normal(&state.node, "its GPU check runs past the ordinary wait").await;
                 let node_slot = state.node.clone();
                 wait = wait_for_node_rpc_watching(
                     datadir,
@@ -2054,7 +2093,12 @@ async fn spawn_node_with_lock_retry(
                 }
             }
             match (after_rpc_wait(&wait, slot_empty), wait) {
-                (AfterRpcWait::Ready, RpcWait::Ready(client)) => return Ok(client),
+                (AfterRpcWait::Ready, RpcWait::Ready(client)) => {
+                    // RPC is up: the GPU check is over, so a hold it took
+                    // ends here.
+                    release_engine_hold(&state.node).await;
+                    return Ok(client);
+                }
                 (AfterRpcWait::StoppedMeanwhile, _) => {
                     return Err("the node was stopped while it was starting".to_string())
                 }
@@ -5864,6 +5908,11 @@ fn spawn_load_watch(
             btx_core::snapshot::SnapshotOutcome::NotLoaded(format!("the load task ended: {e}"))
         });
         let state = app.state::<AppState>();
+        // The load's hold ends with it, on this run's node only: after a
+        // stop or restart the slot holds another start, without a hold.
+        if state.refresher_gen.load(Ordering::SeqCst) == gen {
+            release_engine_hold(&state.node).await;
+        }
         if let Err(e) = after_snapshot_load(&app, &state, gen, mirror_load_launch, outcome).await {
             eprintln!("[node-app] the restart after a snapshot load failed: {e}");
         }
@@ -10421,6 +10470,72 @@ mod slot_probe_tests {
         let _ = node.wait();
         assert_eq!(far, (Some((pid, Normal)), Some(false)));
         assert_eq!(tip, (Some((pid, Background)), Some(true)));
+    }
+
+    /// A hold lifts the spawned child to normal priority, the retune leaves
+    /// it there, and its release puts it back under the spawn policy.
+    #[tokio::test]
+    async fn a_hold_lifts_the_engine_until_it_is_released() {
+        use super::{hold_engine_normal, release_engine_hold};
+        use btx_core::engine_priority::engine_priority_at_spawn;
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = Mutex::new(Some(start_shim(tmp.path(), "sleep 30").await));
+        let read = |c: &NodeController| (c.engine_priority(), c.priority_held());
+        hold_engine_normal(&slot, "a test").await;
+        let held = read(slot.lock().await.as_ref().unwrap());
+        retune_spawned_engine(&slot, 0);
+        let after_retune = read(slot.lock().await.as_ref().unwrap());
+        release_engine_hold(&slot).await;
+        let released = read(slot.lock().await.as_ref().unwrap());
+        if let Some(c) = slot.lock().await.as_mut() {
+            c.stop_without_rpc(std::time::Duration::from_secs(2)).await;
+        }
+        assert_eq!(held, (EnginePriority::Normal, true));
+        assert_eq!(after_retune, (EnginePriority::Normal, true));
+        assert_eq!(released, (engine_priority_at_spawn(), false));
+        // Without a child there is nothing to hold.
+        hold_engine_normal(&Mutex::new(None), "a test").await;
+    }
+
+    /// The GPU-check extension takes the hold before its wait and RPC up
+    /// releases it; a snapshot load takes it before the load task and its
+    /// watch releases it for the same run only.
+    #[test]
+    fn the_gpu_check_extension_and_the_snapshot_load_run_at_normal_priority() {
+        let src = include_str!("commands.rs");
+        let launch = src
+            .split("async fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .unwrap();
+        let ext = launch.split("if extends_for_gpu_check(").nth(1).unwrap();
+        let hold = ext.find("hold_engine_normal(&state.node").unwrap();
+        let wait = ext.find("GPU_CHECK_EXTRA_POLLS,").unwrap();
+        assert!(hold < wait, "the hold comes before the extension's wait");
+        let ready = ext
+            .split("(AfterRpcWait::Ready, RpcWait::Ready(client)) => {")
+            .nth(1)
+            .unwrap();
+        assert!(
+            ready.find("release_engine_hold(&state.node)").unwrap()
+                < ready.find("return Ok(client)").unwrap()
+        );
+        let start = src
+            .split("pub(crate) async fn start_node_inner(")
+            .nth(1)
+            .unwrap();
+        assert!(
+            start
+                .find("hold_engine_normal(&state.node, \"the snapshot loads\")")
+                .unwrap()
+                < start.find("ensure_snapshot_loaded_with(").unwrap()
+        );
+        let watch = src.split("fn spawn_load_watch(").nth(1).unwrap();
+        let gen_check = watch
+            .find("refresher_gen.load(Ordering::SeqCst) == gen")
+            .unwrap();
+        let release = watch.find("release_engine_hold(&state.node)").unwrap();
+        let after = watch.find("after_snapshot_load(").unwrap();
+        assert!(gen_check < release && release < after);
     }
 
     /// The refresher asks for the adopted node only when the slot has no
