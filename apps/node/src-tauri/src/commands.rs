@@ -19,7 +19,7 @@ use btx_core::node_api::{get_blockchain_info, get_chainstates};
 use btx_core::rpc::RpcClient;
 use btx_core::setup::{
     enough_free_disk, ensure_addnodes_in_conf, free_disk_bytes, remove_addnodes_in_conf, rpc_url,
-    wait_for_node_rpc,
+    wait_for_node_rpc_watching, RpcWait,
 };
 use btx_core::snapshot::SnapshotSpec;
 use btx_core::snapshot_serve as snap;
@@ -483,8 +483,9 @@ pub fn nominal_btxd_path() -> PathBuf {
 
 /// Wait budget for a freshly-spawned node's RPC: 360 × 500 ms = 3 min covers a
 /// cold start / slow disk; a node that is ALIVE but warming (RPC_IN_WARMUP)
-/// keeps the wait going inside wait_for_node_rpc's poll loop, and a healthy
-/// node proceeds in 1–3 s.
+/// keeps the wait going inside wait_for_node_rpc_watching's poll loop, and a
+/// healthy node proceeds in 1–3 s. A child that exits ends the wait at the
+/// next poll (since 0.7.1), so this budget is only ever spent on a live one.
 const RPC_WAIT_POLLS: u32 = 360;
 const RPC_WAIT_POLL_MS: u64 = 500;
 /// Warmup budget: a node answering RPC_IN_WARMUP is ALIVE (an unclean
@@ -495,6 +496,281 @@ const RPC_WAIT_POLL_MS: u64 = 500;
 /// surfaces the calm Warming phase the whole time, so the long budget never
 /// leaves the user staring at a silent "Starting".
 const RPC_WAIT_WARMUP_POLLS: u32 = 57_600; // × 500 ms = 8 h
+
+/// SIGTERM-to-kill grace for a btxd that never opened its RPC in the whole
+/// wait. Short on purpose: before RPC there is no chainstate loaded to flush
+/// (it loads after the cookie, init.cpp:3414 at v0.34.12), and a process that
+/// ignored three minutes of polling is not about to finish in the next ten
+/// seconds. See `NodeController::stop_without_rpc`.
+const NO_RPC_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Extra no-answer polls for a launch still inside the engine's GPU check
+/// when the ordinary budget runs out (Task A review M3): 840 × 500 ms = 7
+/// min, so ten minutes in all before the node is stopped or moved to
+/// following signatures.
+///
+/// The step (`InitializeMatMulRCReadinessPostDaemon`, init.cpp:2928 at
+/// v0.34.12) runs before RPC and has no timeout. On a Mac its canary runs one
+/// full production episode, measured at 102, 172 and 218 s on an M2 Pro, and
+/// self-qualification runs a medium episode on the CPU and the device on top.
+/// So three minutes is not "stuck" there, and Task A's stop at three minutes
+/// would have killed a slow but healthy start every time. Ten minutes is the
+/// same bound validation.ts gives its "Checking…" copy, comfortably past
+/// twice the slowest measurement, and still bounded: a card that never
+/// answers ends in the GPU fallback, not an endless "Starting".
+const GPU_CHECK_EXTRA_POLLS: u32 = 840;
+
+/// What the window says during that extension. `word` is
+/// `btx_core::node::graphics_word`: chip on a Mac, card elsewhere.
+fn gpu_check_warming(word: &str) -> String {
+    format!(
+        "Your node is checking this machine's {word} before it opens. On some machines this \
+         takes several minutes."
+    )
+}
+
+/// Whether the launch loop gives this launch [`GPU_CHECK_EXTRA_POLLS`]: it
+/// runs the GPU check (`btx_core::node::launch_runs_gpu_check`, final review
+/// M6), its wait ran out without an answer, the node is still in the slot,
+/// and its own part of debug.log stops inside the GPU check. Pure, pinned by
+/// a test.
+fn extends_for_gpu_check(
+    gpu_check_launch: bool,
+    wait: &RpcWait,
+    slot_empty: bool,
+    stage: btx_core::node::PreRpcStage,
+) -> bool {
+    gpu_check_launch
+        && !slot_empty
+        && matches!(wait, RpcWait::TimedOut { warming: false, .. })
+        && stage == btx_core::node::PreRpcStage::GpuCheck
+}
+
+/// What the launch loop does once a watched RPC wait ends.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterRpcWait {
+    /// The node answered: the start succeeded.
+    Ready,
+    /// A stop or a quit took the node out of the slot while it was starting.
+    /// Nothing to retry and nothing to stop.
+    StoppedMeanwhile,
+    /// The child exited: read its log and take the next attempt, exactly as
+    /// for an exit inside the launch watch.
+    Exited,
+    /// The child is still alive at the end of the budget. It is stopped
+    /// before the error is returned; `graceful` when its RPC is up (it
+    /// answered warmup), so `btx-cli stop` can reach it.
+    StopAlive { graceful: bool },
+}
+
+/// Pure so the launch loop's choice is pinned by a test. `slot_empty` is
+/// whether `state.node` was emptied under the wait, which only a stop or a
+/// quit does.
+fn after_rpc_wait(wait: &RpcWait, slot_empty: bool) -> AfterRpcWait {
+    match wait {
+        RpcWait::Ready(_) => AfterRpcWait::Ready,
+        _ if slot_empty => AfterRpcWait::StoppedMeanwhile,
+        RpcWait::Exited { .. } => AfterRpcWait::Exited,
+        RpcWait::TimedOut { warming, .. } => AfterRpcWait::StopAlive { graceful: *warming },
+    }
+}
+
+/// The error for a start whose btxd was alive but never became ready, after
+/// the app stopped it. `doing` is the last line this launch wrote to
+/// debug.log; `None` when it wrote nothing, which is expected for a btxd
+/// stuck before `StartLogging` (init.cpp:2924 at v0.34.12, every line before
+/// it is held in memory).
+///
+/// `stopped` is how the no-RPC stop ended (`None`: the graceful stop, for a
+/// node whose RPC was up). One that outlived the kill is not called stopped:
+/// the app could not end it, and only a restart of the computer does
+/// (Task A review I2).
+fn rpc_timeout_error(
+    last: &str,
+    doing: Option<&str>,
+    stopped: Option<btx_core::node::NoRpcStop>,
+    datadir: &Path,
+) -> String {
+    let stop = if stopped == Some(btx_core::node::NoRpcStop::StillRunning) {
+        "The app could not stop it, and restarting the computer clears it"
+    } else {
+        "The app stopped it"
+    };
+    let doing = match doing {
+        Some(line) => format!("{stop}; its last log line was \"{line}\"."),
+        None => format!("{stop}; the engine had not written anything to its log yet."),
+    };
+    // `last` may already end a sentence: btxd's warmup text ends in "…".
+    let stop_mark = if last.ends_with(['.', '…', '!', '?']) {
+        ""
+    } else {
+        "."
+    };
+    format!(
+        "the node didn't become ready: {last}{stop_mark} {doing} See easybtx-node.log in {} for \
+         details.",
+        datadir.display()
+    )
+}
+
+/// When a launch's btxd exited, for the log line: inside the launch watch,
+/// during the RPC wait before it ever answered, or after it had answered
+/// warmup, so with its RPC up (Task A review M6).
+fn exit_when(after_watch: bool, warming: bool) -> String {
+    match (after_watch, warming) {
+        (false, _) => format!("within {}s of spawning", LAUNCH_SURVIVAL_WATCH.as_secs()),
+        (true, false) => "before its RPC came up".to_string(),
+        (true, true) => "while it was warming up".to_string(),
+    }
+}
+
+/// The RPC wait's "is the child gone?" probe over the node slot: an empty
+/// slot (a stop or a quit took it) or a child that exited is gone.
+///
+/// `try_lock`, not `lock().await`: the probe is a plain closure asked once
+/// per poll. A slot held elsewhere at that instant (the warmup watcher looks
+/// at it every 2 s) reads as "still there", the safe direction, and the next
+/// poll looks again.
+fn slot_child_gone(slot: &tokio::sync::Mutex<Option<NodeController>>) -> bool {
+    match slot.try_lock() {
+        Ok(mut guard) => guard
+            .as_mut()
+            .is_none_or(|c| c.child_has_exited() == Some(true)),
+        Err(_) => false,
+    }
+}
+
+/// What the launch loop does after it stopped a btxd that never opened its
+/// RPC (0.7.1).
+#[derive(Debug, PartialEq, Eq)]
+enum AfterNoRpcTimeout {
+    /// Report the timeout ([`rpc_timeout_error`]), no retry.
+    Fail,
+    /// The start was stuck in the engine's GPU check: record it, take the
+    /// key line out, and take the next attempt, which is a mirror.
+    RetryAsMirror,
+    /// Stuck in the GPU check, and the btxd outlived even the kill, so it
+    /// still holds the datadir lock: record it, spawn nothing, and ask for a
+    /// restart of the computer ([`GPU_HOLDS_NODE_ERROR`]).
+    RestartComputer,
+}
+
+/// Pure so the choice is pinned by a test. `stuck_in_gpu` is
+/// `btx_core::node::stuck_in_gpu_check` for this launch; `stopped` is how
+/// `stop_without_rpc_outcome` ended, `None` when the node answered warmup and
+/// got the graceful stop instead (its RPC was up, so it was not stuck before
+/// it). `operator_word` is `EASYBTX_NODE_TRUSTED_MIRROR`: at `=0` the record
+/// would not make the next launch a mirror, so a retry would hang the same
+/// way.
+fn after_no_rpc_timeout(
+    stuck_in_gpu: bool,
+    stopped: Option<btx_core::node::NoRpcStop>,
+    operator_word: Option<bool>,
+) -> AfterNoRpcTimeout {
+    use btx_core::node::NoRpcStop;
+    if !stuck_in_gpu || operator_word == Some(false) {
+        return AfterNoRpcTimeout::Fail;
+    }
+    match stopped {
+        Some(NoRpcStop::StillRunning) => AfterNoRpcTimeout::RestartComputer,
+        Some(NoRpcStop::OnSigterm | NoRpcStop::Killed) => AfterNoRpcTimeout::RetryAsMirror,
+        None => AfterNoRpcTimeout::Fail,
+    }
+}
+
+/// Did a stop arrive since the launch loop began? `stop_node_inner` moves
+/// `refresher_gen` first thing, and nothing else moves it during a start
+/// (the status refresher's own move comes only after the spawn returns). A
+/// retry the loop would take after stopping a btxd itself checks this, or a
+/// Stop pressed during that stop, which waited for the slot and found it
+/// empty, would be followed by a fresh mirror nobody asked for (final review
+/// M1).
+fn stopped_since(gen_at_start: u64, gen_now: u64) -> bool {
+    gen_now != gen_at_start
+}
+
+/// Is there an attempt left in the launch loop for the mirror that follows a
+/// GPU hang? Not on the last one (final review M9).
+fn mirror_attempt_left(attempt: u32) -> bool {
+    attempt < LAUNCH_ATTEMPTS
+}
+
+/// The error for a GPU hang on the last attempt: the record is written, so
+/// the next Start follows signatures; "kept exiting right after launch"
+/// would say something that did not happen.
+fn gpu_hung_on_last_attempt(word: &str) -> String {
+    format!(
+        "this machine's {word} did not finish the node engine's start-up check, so the node \
+         now follows signatures; press Start to start it that way."
+    )
+}
+
+/// The pid of a btxd this app run left held by the graphics driver
+/// ([`AfterNoRpcTimeout::RestartComputer`]), 0 for none. In memory on
+/// purpose: a restart of the computer, the only thing that frees it, also
+/// ends this app run.
+static GPU_HELD_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Is the process holding this datadir the btxd the graphics driver still
+/// holds? Then a Start without a reboot says the restart error again,
+/// rather than blaming "another easyBTX app" after half a minute of
+/// rechecks (final review M8). Pure, pinned by a test.
+fn holder_is_gpu_held(record: bool, holder: DatadirHolder, held_pid: Option<u32>) -> bool {
+    let pid = match holder {
+        DatadirHolder::ManagedBtxd { pid } | DatadirHolder::OrphanedBtxd { pid } => pid,
+        DatadirHolder::Free | DatadirHolder::Unidentifiable { .. } => return false,
+    };
+    record && held_pid == Some(pid)
+}
+
+/// How long a btxd that outlived the kill is watched before the app asks for
+/// a restart of the computer (final review I1). A wedged NVIDIA card can hold
+/// a killed process well past the kill's own 5 s while the driver tears down
+/// its context; a minute covers that without leaving the person waiting on
+/// a process that will never go.
+const DRIVER_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What the window says during that minute (`word` as for
+/// [`gpu_check_warming`]).
+fn driver_release_warming(word: &str) -> String {
+    format!(
+        "The {word} is slow to let go of the stopped node. Waiting up to a minute before \
+         starting it again."
+    )
+}
+
+/// After a start stuck in the GPU check whose btxd outlived the kill: gone
+/// by the end of [`DRIVER_RELEASE_WAIT`] is the mirror attempt, still there
+/// is the restart. Pure, pinned by a test.
+fn after_driver_wait(alive_after_kill: bool, alive_after_wait: bool) -> AfterNoRpcTimeout {
+    if alive_after_kill && alive_after_wait {
+        AfterNoRpcTimeout::RestartComputer
+    } else {
+        AfterNoRpcTimeout::RetryAsMirror
+    }
+}
+
+/// The error for [`AfterNoRpcTimeout::RestartComputer`]. One sentence, on
+/// purpose: nothing in the app can free a process the graphics driver holds,
+/// and the next start after a restart follows signatures by itself. `word`
+/// as for [`gpu_check_warming`].
+fn gpu_holds_node_error(word: &str) -> String {
+    format!(
+        "the {word} stopped answering and is holding the node, so restart the computer, then \
+         press Start."
+    )
+}
+
+/// Record or withdraw the owner's choice to follow signatures, as Settings
+/// sends it. Withdrawing it ("check blocks") also clears the record of a
+/// start that hung in the GPU check (`btx_core::node::gpu_start_hung`): that
+/// is the owner asking the card to try again, and it must take one click.
+fn apply_follow_signatures_choice(datadir: &Path, on: bool) -> std::io::Result<()> {
+    if !on {
+        btx_core::node::clear_gpu_start_hung(datadir);
+    }
+    btx_core::node::set_follows_signatures_by_choice(datadir, on)
+}
 
 /// Post-stop wait for an unmanaged btxd to actually free the datadir lock
 /// before we spawn (force-kill fallback only after this): btxd's flush after
@@ -794,6 +1070,10 @@ pub(crate) async fn start_node_held(app: &AppHandle, state: &AppState) -> Result
                         // future upgrade, silently declining to be the
                         // independent validator it had become capable of being.
                         btx_core::node::clear_matmul_consensus_refused(&datadir);
+                        // Its twin for a card that hung the GPU check: a new
+                        // engine may drive the card differently, so it gets
+                        // a try.
+                        btx_core::node::clear_gpu_start_hung(&datadir);
                         // The persisted tag flips only after the new-tag node
                         // actually RUNS (end of this function). If this start
                         // dies half-way (quit mid-stop, lost lock race), the
@@ -1155,6 +1435,21 @@ pub(crate) async fn start_node_held(app: &AppHandle, state: &AppState) -> Result
     let (plan, probe, holder) = loop {
         let probe = rpc_already_answering(&datadir).await;
         let holder = btx_core::node::datadir_holder(&datadir).await;
+        let held = match GPU_HELD_PID.load(Ordering::SeqCst) {
+            0 => None,
+            pid => Some(pid),
+        };
+        if holder_is_gpu_held(btx_core::node::gpu_start_hung(&datadir), holder, held) {
+            // Still the btxd the graphics driver would not let go of. Nothing
+            // the app can do frees it, and a Quit must not wait out a stop
+            // grace on it either, so the launch record is disarmed as for a
+            // node that is not ours.
+            *state.launch.lock().await = None;
+            eprintln!("[node-app] the btxd the graphics driver holds (pid {held:?}) still holds this datadir");
+            return Err(gpu_holds_node_error(btx_core::node::graphics_word(
+                node_backend(),
+            )));
+        }
         let plan = pre_launch_plan(
             probe.is_some(),
             upgraded_this_start,
@@ -1269,6 +1564,15 @@ pub(crate) async fn start_node_held(app: &AppHandle, state: &AppState) -> Result
     *state.rpc.lock().await = Some(rpc.clone());
     *state.started_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
     abort_mirror_load.armed = false;
+    // A retry inside the spawn (a start stuck in the GPU check, a Mac's chip
+    // refused) moved the host to following signatures and decided the signer
+    // again; everything below reads that, not the value from before the
+    // spawn (final review M3).
+    let signer_applies_here = state
+        .signer_applies_here
+        .lock()
+        .await
+        .unwrap_or(signer_applies_here);
 
     // The upgrade is DONE only now — a node launched from the new tag (or a
     // fresh spawn of it) is serving. Attach-mode never flips: the running node
@@ -1470,6 +1774,10 @@ async fn spawn_node_with_lock_retry(
     paths: &FaststartResult,
     launched: &std::sync::atomic::AtomicBool,
 ) -> Result<RpcClient, String> {
+    // How the last attempt's btxd ended, when it exited.
+    let mut last_exit: Option<String> = None;
+    // A Stop moves this; see `stopped_since`.
+    let start_gen = state.refresher_gen.load(Ordering::SeqCst);
     for attempt in 1..=LAUNCH_ATTEMPTS {
         // A quit that started mid-retry must win: spawning after the graceful
         // quit's stop pass has already run would orphan a fresh btxd.
@@ -1541,6 +1849,9 @@ async fn spawn_node_with_lock_retry(
         // A marked mirror launch counts as failed only from here on
         // (`mirror_launch_failed`): btxd is being started.
         launched.store(true, Ordering::SeqCst);
+        // debug.log is appended across runs; its length now marks where this
+        // launch's own lines begin, for the timeout's "last doing" sentence.
+        let log_offset = btx_core::node::debug_log_len(datadir);
         let mut controller = NodeController::new();
         controller
             .start(
@@ -1552,6 +1863,12 @@ async fn spawn_node_with_lock_retry(
             )
             .await
             .map_err(|e| format!("couldn't start the node: {e}"))?;
+        // Did this launch run the engine's GPU check before RPC? Read from the
+        // arguments it actually passed, for the GPU-hang fallback below.
+        let gpu_check_launch =
+            btx_core::node::launch_runs_gpu_check(node_backend(), controller.launch_args());
+        // "graphics chip" on a Mac, "graphics card" elsewhere (final review M7).
+        let gpu_word = btx_core::node::graphics_word(node_backend());
         // Park the controller in the shared slot BEFORE the survival watch so
         // a quit landing inside the watch still finds — and gracefully stops —
         // the child instead of orphaning it.
@@ -1583,25 +1900,234 @@ async fn spawn_node_with_lock_retry(
                 None => return Err("the node was stopped while it was starting".to_string()),
             }
         };
+        // Surviving the watch is not the same as starting. Engine v0.34.12
+        // runs its GPU readiness (init.cpp:2928) and opens the attestation
+        // archive (init.cpp:2888-2900) before it binds RPC (init.cpp:3102),
+        // which on a CUDA consensus host takes well over the 5 s watch. So
+        // the RPC wait watches the child too, and a btxd that dies inside it
+        // goes down the same path as one that died inside the watch: its log
+        // read, the chip-refusal fallback, the next attempt. Before
+        // 2026-10-01 the wait never looked, and Zan's two Linux nodes sat
+        // three minutes on a dead process each start and then said only "no
+        // .cookie yet".
+        let mut exited_after_watch = false;
+        let mut exited_warming = false;
         if survived {
             spawn_warmup_watcher(app.clone(), state, datadir.to_path_buf());
-            return wait_for_node_rpc(
+            // Asked once per poll; see `slot_child_gone` for why a held slot
+            // reads as still there.
+            let node_slot = state.node.clone();
+            let child_gone = move || slot_child_gone(&node_slot);
+            let mut wait = wait_for_node_rpc_watching(
                 datadir,
                 &rpc_url(),
                 RPC_WAIT_POLLS,
                 RPC_WAIT_POLL_MS,
                 RPC_WAIT_WARMUP_POLLS,
+                child_gone,
             )
-            .await
-            .map_err(|e| {
-                format!(
-                    "the node didn't become ready: {e}. \
-                     See easybtx-node.log in {} for details.",
-                    datadir.display()
+            .await;
+            let mut slot_empty = state.node.lock().await.is_none();
+            let mut waited_secs = RPC_WAIT_POLLS as u64 * RPC_WAIT_POLL_MS / 1000;
+            // Slow in the GPU check is not stuck in it (Task A review M3):
+            // one bounded extension, said on screen, before anything is
+            // stopped or moved.
+            let stage = btx_core::node::pre_rpc_stage(&btx_core::node::debug_log_since(
+                datadir, log_offset,
+            ));
+            if extends_for_gpu_check(gpu_check_launch, &wait, slot_empty, stage) {
+                let extra_secs = GPU_CHECK_EXTRA_POLLS as u64 * RPC_WAIT_POLL_MS / 1000;
+                let msg = format!(
+                    "the node engine is still in its {gpu_word} check after {waited_secs}s; \
+                     waiting up to {extra_secs}s more before deciding"
+                );
+                eprintln!("[node-app] {msg}");
+                setup_log(datadir, &msg);
+                let note = NodePhase::Warming {
+                    message: gpu_check_warming(gpu_word),
+                };
+                set_phase(app, state, note.clone()).await;
+                let node_slot = state.node.clone();
+                wait = wait_for_node_rpc_watching(
+                    datadir,
+                    &rpc_url(),
+                    GPU_CHECK_EXTRA_POLLS,
+                    RPC_WAIT_POLL_MS,
+                    RPC_WAIT_WARMUP_POLLS,
+                    move || slot_child_gone(&node_slot),
                 )
-            });
+                .await;
+                slot_empty = state.node.lock().await.is_none();
+                waited_secs += extra_secs;
+                // Back to Starting only if nothing else (a stop, the warmup
+                // watcher) has taken the phase meanwhile.
+                let still_ours = *state.phase.lock().await == note;
+                if still_ours {
+                    set_phase(app, state, NodePhase::Starting).await;
+                }
+            }
+            match (after_rpc_wait(&wait, slot_empty), wait) {
+                (AfterRpcWait::Ready, RpcWait::Ready(client)) => return Ok(client),
+                (AfterRpcWait::StoppedMeanwhile, _) => {
+                    return Err("the node was stopped while it was starting".to_string())
+                }
+                (AfterRpcWait::StopAlive { graceful }, RpcWait::TimedOut { last, .. }) => {
+                    // What the engine was doing, read BEFORE it is stopped:
+                    // afterwards the last line is its own "Shutdown: done"
+                    // (Task A review I1).
+                    let since = btx_core::node::debug_log_since(datadir, log_offset);
+                    // Never leave a live btxd behind the error, and never
+                    // leave the slot holding a start that did not happen.
+                    // Stopped while the slot is held (review M2): a Quit
+                    // meanwhile waits for this stop instead of finding the
+                    // slot empty and leaving the process behind.
+                    let mut slot = state.node.lock().await;
+                    let Some(c) = slot.as_mut() else {
+                        return Err("the node was stopped while it was starting".to_string());
+                    };
+                    let stopped = if graceful {
+                        // It answered warmup, so its RPC is up and the
+                        // graceful stop (btx-cli, flush grace) reaches it.
+                        let _ = c.stop(&paths.btx_cli, datadir).await;
+                        None
+                    } else {
+                        let outcome = c.stop_without_rpc_outcome(NO_RPC_STOP_GRACE).await;
+                        eprintln!(
+                            "[node-app] btxd never opened its RPC in {waited_secs}s; stopped it \
+                             ({})",
+                            match outcome {
+                                btx_core::node::NoRpcStop::OnSigterm => "it exited on SIGTERM",
+                                btx_core::node::NoRpcStop::Killed => "it had to be killed",
+                                btx_core::node::NoRpcStop::StillRunning => {
+                                    "it is still there after the kill"
+                                }
+                            },
+                        );
+                        Some(outcome)
+                    };
+                    // A validating start stuck in the engine's GPU check
+                    // (0.7.1, the leading reading of Zan's two NVIDIA nodes):
+                    // the step has no timeout, and a card that hung once can
+                    // hang it on every start. A mirror launch does no GPU
+                    // work before RPC, so the same machine can still start
+                    // and follow signatures. The record keeps it that way
+                    // until an engine upgrade or the owner's "check blocks".
+                    let stuck =
+                        !graceful && btx_core::node::stuck_in_gpu_check(gpu_check_launch, &since);
+                    let mut next = after_no_rpc_timeout(
+                        stuck,
+                        stopped,
+                        btx_core::node::trusted_mirror_override(),
+                    );
+                    if next == AfterNoRpcTimeout::RestartComputer {
+                        // Outlived the kill. A wedged NVIDIA card can take
+                        // well over 5 s to let a killed process go while the
+                        // driver tears its context down, so it is watched for
+                        // a minute, still from the slot, before a restart of
+                        // the computer is asked for (final review I1).
+                        let note = NodePhase::Warming {
+                            message: driver_release_warming(gpu_word),
+                        };
+                        set_phase(app, state, note.clone()).await;
+                        let gone = c.wait_after_kill(DRIVER_RELEASE_WAIT).await;
+                        if !gone {
+                            // Remembered so a Start without a reboot names
+                            // it again (final review M8).
+                            if let Some(pid) = c.child_pid() {
+                                GPU_HELD_PID.store(pid, Ordering::SeqCst);
+                            }
+                        }
+                        let still_ours = *state.phase.lock().await == note;
+                        if still_ours {
+                            set_phase(app, state, NodePhase::Starting).await;
+                        }
+                        eprintln!(
+                            "[node-app] the btxd that outlived the kill {} within {}s",
+                            if gone { "exited" } else { "is still there" },
+                            DRIVER_RELEASE_WAIT.as_secs()
+                        );
+                        next = after_driver_wait(true, !gone);
+                    }
+                    *slot = None;
+                    drop(slot);
+                    if next != AfterNoRpcTimeout::Fail {
+                        btx_core::node::record_gpu_start_hung(datadir, node_backend());
+                        // The next launch is a mirror, and a mirror holds no
+                        // key: the key line written for the validating
+                        // launch comes out, as after the Mac's refusal.
+                        let (applies_here, pubkey) = signer_after_chip_refusal(
+                            &paths.btxd,
+                            datadir,
+                            &paths.faststart_conf,
+                            node_backend(),
+                            NodeAppSettings::load(datadir).signer_enabled,
+                        );
+                        *state.signer_applies_here.lock().await = Some(applies_here);
+                        *state.signer_pubkey.lock().await = pubkey;
+                    }
+                    match next {
+                        AfterNoRpcTimeout::RetryAsMirror => {
+                            let msg = format!(
+                                "This machine's {gpu_word} did not finish the node engine's \
+                                 start-up check in {waited_secs}s, so the node was stopped and \
+                                 now starts following signatures (attempt \
+                                 {attempt}/{LAUNCH_ATTEMPTS}). Check blocks in Settings tries \
+                                 it again."
+                            );
+                            eprintln!("[node-app] {msg}");
+                            setup_log(datadir, &msg);
+                            if stopped_since(start_gen, state.refresher_gen.load(Ordering::SeqCst))
+                            {
+                                return Err(
+                                    "the node was stopped while it was starting".to_string()
+                                );
+                            }
+                            if !mirror_attempt_left(attempt) {
+                                return Err(gpu_hung_on_last_attempt(gpu_word));
+                            }
+                            // It did not exit on its own; no exit to quote.
+                            last_exit = None;
+                            continue;
+                        }
+                        AfterNoRpcTimeout::RestartComputer => {
+                            let msg = format!(
+                                "This machine's {gpu_word} did not finish the node engine's \
+                                 start-up check, and the stopped node is still held by the \
+                                 graphics driver, so nothing new was started. After a restart \
+                                 of the computer the node follows signatures."
+                            );
+                            eprintln!("[node-app] {msg}");
+                            setup_log(datadir, &msg);
+                            // Disarmed as on the pre-launch path above: a Stop or
+                            // Quit after this error must not wait out a stop grace
+                            // on a btxd nothing can free.
+                            *state.launch.lock().await = None;
+                            return Err(gpu_holds_node_error(gpu_word));
+                        }
+                        AfterNoRpcTimeout::Fail => {}
+                    }
+                    let doing = btx_core::node::last_log_line(&since);
+                    return Err(rpc_timeout_error(&last, doing.as_deref(), stopped, datadir));
+                }
+                // `after_rpc_wait` maps each outcome to exactly one of these,
+                // so what is left is an exit: fall through to the exit path.
+                (_, RpcWait::Exited { warming, .. }) => {
+                    exited_after_watch = true;
+                    exited_warming = warming;
+                }
+                _ => exited_after_watch = true,
+            }
         }
-        *state.node.lock().await = None;
+        // How it ended, kept for the cause sentence when its log names
+        // nothing (Task A review M4).
+        let exit = state
+            .node
+            .lock()
+            .await
+            .take()
+            .and_then(|mut c| c.exit_status())
+            .map(btx_core::node::describe_exit);
+        last_exit = exit;
 
         // Did the engine refuse to be an independent MatMul consensus
         // validator on this machine? That is not a lock race and retrying it
@@ -1636,14 +2162,18 @@ async fn spawn_node_with_lock_retry(
                  engine, so btxd refused to start as an independent consensus validator. \
                  Retrying as a trusted mirror (attempt {attempt}/{LAUNCH_ATTEMPTS})."
             );
+            if stopped_since(start_gen, state.refresher_gen.load(Ordering::SeqCst)) {
+                return Err("the node was stopped while it was starting".to_string());
+            }
             continue;
         }
 
+        let when = exit_when(exited_after_watch, exited_warming);
         eprintln!(
-            "[node-app] btxd exited within {}s of spawning, attempt \
-             {attempt}/{LAUNCH_ATTEMPTS}. Cause read from its log: {}",
-            LAUNCH_SURVIVAL_WATCH.as_secs(),
-            btx_core::node::launch_failure_hint(&tail).unwrap_or("not recognised"),
+            "[node-app] btxd exited {when}, attempt {attempt}/{LAUNCH_ATTEMPTS}. \
+             Cause read from its log: {}",
+            btx_core::node::launch_failure_cause_or_exit(&tail, last_exit.as_deref())
+                .unwrap_or_else(|| "not recognised, and it printed no error line".to_string()),
         );
     }
     // Report what btxd's own log says, not a guess.
@@ -1657,9 +2187,13 @@ async fn spawn_node_with_lock_retry(
     //
     // Re-read the tail here because the one inside the loop is scoped to the
     // attempt that produced it, and the last attempt is the one worth quoting.
+    //
+    // Nothing recognised no longer means nothing said: the engine's own last
+    // error line is quoted (`launch_failure_cause`), then how the last
+    // attempt ended, and only with none of those the sentence below.
     let tail = btx_core::node::node_log_tail(datadir, 64 * 1024);
-    let cause = btx_core::node::launch_failure_hint(&tail)
-        .unwrap_or("its log does not say why in a way this app recognises.");
+    let cause = btx_core::node::launch_failure_cause_or_exit(&tail, last_exit.as_deref())
+        .unwrap_or_else(|| "its log does not say why in a way this app recognises.".to_string());
     Err(format!(
         "the node kept exiting right after launch: {cause} \
          See easybtx-node.log in {} for details.",
@@ -2836,6 +3370,26 @@ async fn stop_with_note(
     }
 }
 
+/// Whether a stop signals the node (`stop_without_rpc_outcome`) instead of
+/// asking it through btx-cli: only when the app never armed its RPC and it
+/// does not answer now, which is a start hung before RPC. Pure, pinned by a
+/// test.
+fn stop_needs_no_rpc(rpc_armed: bool, rpc_answers: bool) -> bool {
+    !rpc_armed && !rpc_answers
+}
+
+/// Does the node's RPC answer at all right now, warmup (-28) included? One
+/// quick call with the cookie; no cookie or no answer is `false`.
+async fn rpc_answers_at_all(datadir: &Path) -> bool {
+    let Ok(client) = RpcClient::from_cookie(rpc_url(), &datadir.join(".cookie")) else {
+        return false;
+    };
+    matches!(
+        get_blockchain_info(&client).await,
+        Ok(_) | Err(AppError::Rpc { code: -28, .. })
+    )
+}
+
 /// Graceful stop shared by the command, the tray, and app exit.
 pub async fn stop_node_inner(state: &AppState) {
     // Kill the refresher first so it can't overwrite the Stopped phase.
@@ -2847,14 +3401,28 @@ pub async fn stop_node_inner(state: &AppState) {
     stop_snapshot_serve(state, false).await;
     let launch = state.launch.lock().await.clone();
     let attached = *state.attached_to.lock().await;
+    // Before the node slot is locked, never while it is held.
+    let rpc_armed = state.rpc.lock().await.is_some();
     {
         let mut guard = state.node.lock().await;
         if let Some(controller) = guard.as_mut() {
             if let Some((btx_cli, datadir)) = launch.as_ref() {
-                stop_with_note(state, STILL_STOPPING_AFTER, async {
-                    let _ = controller.stop(btx_cli, datadir).await;
-                })
-                .await;
+                let answers = rpc_armed || rpc_answers_at_all(datadir).await;
+                if stop_needs_no_rpc(rpc_armed, answers) {
+                    // A start hung before RPC (Task A review M1): btx-cli
+                    // stop cannot reach it, and waiting out the 90 s flush
+                    // grace for a node with nothing loaded left it running
+                    // behind a Quit.
+                    let outcome = controller.stop_without_rpc_outcome(NO_RPC_STOP_GRACE).await;
+                    eprintln!(
+                        "[node-app] stopped a node that had not opened its RPC ({outcome:?})"
+                    );
+                } else {
+                    stop_with_note(state, STILL_STOPPING_AFTER, async {
+                        let _ = controller.stop(btx_cli, datadir).await;
+                    })
+                    .await;
+                }
             }
             *guard = None;
         } else if let Some((btx_cli, datadir)) = launch.as_ref() {
@@ -3206,6 +3774,14 @@ pub struct NodeStatusInfo {
     /// (`btx_core::node::matmul_consensus_was_refused`). The status screen
     /// says so once.
     pub chip_refused: bool,
+    /// A validating start hung in the engine's GPU check and the app moved
+    /// the node to following signatures (`btx_core::node::gpu_start_hung`).
+    /// The Block checking card says why, and the Settings switch shows so the
+    /// owner can try the card again.
+    pub gpu_start_hung: bool,
+    /// How the window names this machine's GPU: "graphics chip" on a Mac,
+    /// "graphics card" elsewhere (`btx_core::node::graphics_word`).
+    pub graphics_word: String,
     /// Bytes this node has uploaded to peers this run (`getnettotals`).
     ///
     /// Feeds the "Helping the network" card: chain data other people actually
@@ -3751,6 +4327,8 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         full_check_possible: full_check_possible(),
         full_check_first: full_check_first(),
         chip_refused: btx_core::node::matmul_consensus_was_refused(&datadir),
+        gpu_start_hung: btx_core::node::gpu_start_hung(&datadir),
+        graphics_word: btx_core::node::graphics_word(setup_backend()).to_string(),
         archive_peers,
         stall,
         node_profile: settings.node_profile.clone(),
@@ -5496,7 +6074,7 @@ pub async fn set_follow_signatures(
     state: State<'_, AppState>,
     on: bool,
 ) -> Result<(), String> {
-    btx_core::node::set_follows_signatures_by_choice(&node_datadir(), on)
+    apply_follow_signatures_choice(&node_datadir(), on)
         .map_err(|e| format!("could not record the choice: {e}"))?;
     eprintln!(
         "[node-app] the owner chose to {} on this machine",
@@ -8748,5 +9326,693 @@ mod signed_start_tests {
         assert!(!mirror_load_wanted_here(&btxd, d, Backend::Metal));
         assert_eq!(honour_pending_set_aside_at(d, 1000), Ok(false));
         assert!(snap.exists());
+    }
+}
+
+#[cfg(test)]
+mod launch_wait_tests {
+    use super::{
+        after_driver_wait, after_no_rpc_timeout, after_rpc_wait, apply_follow_signatures_choice,
+        driver_release_warming, exit_when, extends_for_gpu_check, gpu_check_warming,
+        gpu_holds_node_error, gpu_hung_on_last_attempt, holder_is_gpu_held, mirror_attempt_left,
+        rpc_timeout_error, stop_needs_no_rpc, stopped_since, AfterNoRpcTimeout, AfterRpcWait,
+    };
+    use btx_core::node::NoRpcStop;
+    use btx_core::setup::RpcWait;
+    use std::path::Path;
+
+    fn exited() -> RpcWait {
+        RpcWait::Exited {
+            last: "the node's RPC never became reachable (no .cookie yet)".into(),
+            warming: false,
+        }
+    }
+
+    fn timed_out(warming: bool) -> RpcWait {
+        RpcWait::TimedOut {
+            last: "the node's RPC never became reachable (no .cookie yet)".into(),
+            warming,
+        }
+    }
+
+    /// ZAN'S NODES, 2026-10-01. A btxd that died during the RPC wait is
+    /// handled exactly like one that died inside the 5 s watch: read its log,
+    /// take the chip-refusal fallback if it applies, try again.
+    #[test]
+    fn an_exit_during_the_rpc_wait_goes_back_round_the_launch_loop() {
+        assert_eq!(after_rpc_wait(&exited(), false), AfterRpcWait::Exited);
+    }
+
+    /// A stop or a quit that took the node while it was starting is not an
+    /// exit to retry, whichever way the wait ended.
+    #[test]
+    fn a_node_taken_by_a_stop_during_the_wait_is_not_retried() {
+        assert_eq!(
+            after_rpc_wait(&exited(), true),
+            AfterRpcWait::StoppedMeanwhile
+        );
+        assert_eq!(
+            after_rpc_wait(&timed_out(false), true),
+            AfterRpcWait::StoppedMeanwhile
+        );
+    }
+
+    /// Still alive at the end: it is stopped, never left running behind the
+    /// error. One that never answered has no RPC, so it gets SIGTERM and a
+    /// kill; one that answered warmup has RPC, so it gets the graceful stop.
+    #[test]
+    fn a_live_node_at_the_timeout_is_stopped_the_way_it_can_be() {
+        assert_eq!(
+            after_rpc_wait(&timed_out(false), false),
+            AfterRpcWait::StopAlive { graceful: false }
+        );
+        assert_eq!(
+            after_rpc_wait(&timed_out(true), false),
+            AfterRpcWait::StopAlive { graceful: true }
+        );
+    }
+
+    /// The timeout error says what the engine was last doing, in one short
+    /// sentence, or that it had printed nothing yet (the engine buffers its
+    /// log until StartLogging, init.cpp:2924 at v0.34.12).
+    #[test]
+    fn the_timeout_error_says_what_the_engine_was_last_doing() {
+        let dir = Path::new("/home/zan/.easybtx");
+        let last = "the node's RPC never became reachable (no .cookie yet)";
+        let with = rpc_timeout_error(
+            last,
+            Some("MatMul RC production canary: begin"),
+            Some(NoRpcStop::Killed),
+            dir,
+        );
+        assert!(with.starts_with("the node didn't become ready: "), "{with}");
+        assert!(
+            with.contains("\"MatMul RC production canary: begin\""),
+            "{with}"
+        );
+        assert!(with.contains("stopped it"), "{with}");
+        assert!(
+            with.contains("easybtx-node.log in /home/zan/.easybtx"),
+            "{with}"
+        );
+
+        let without = rpc_timeout_error(last, None, Some(NoRpcStop::OnSigterm), dir);
+        assert!(
+            without.contains("had not written anything to its log yet"),
+            "{without}"
+        );
+        // One the kill did not end is not called stopped (Task A review I2).
+        let held = rpc_timeout_error(last, None, Some(NoRpcStop::StillRunning), dir);
+        assert!(!held.contains("stopped it"), "{held}");
+        assert!(held.contains("could not stop it"), "{held}");
+        assert!(held.contains("restarting the computer"), "{held}");
+        for s in [&with, &without, &held] {
+            assert!(!s.contains('\u{2014}'), "em-dash in: {s}");
+        }
+    }
+
+    /// The wiring, in the code: the launch loop waits with the watching form,
+    /// records debug.log's length before the spawn, and stops a live node
+    /// before it returns the timeout.
+    #[test]
+    fn the_launch_loop_watches_the_child_and_stops_a_live_one() {
+        let src = include_str!("commands.rs");
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(spawn_fn.contains("wait_for_node_rpc_watching("));
+        assert!(!spawn_fn.contains("wait_for_node_rpc("));
+        let offset = spawn_fn.find("debug_log_len(datadir)").unwrap();
+        assert!(offset < spawn_fn.find(".start(").unwrap());
+        // `stop_without_rpc_outcome` since 0.7.1 Task B: the GPU-hang retry
+        // needs to know whether the kill freed the lock.
+        let stop = spawn_fn.find(".stop_without_rpc_outcome(").unwrap();
+        let timeout = spawn_fn.find("rpc_timeout_error(").unwrap();
+        assert!(stop < timeout, "stop first, then report");
+        // Task A review I1: the launch's log is read BEFORE the stop, or the
+        // "last log line" is the engine's own shutdown ("Shutdown: done").
+        let since = spawn_fn
+            .find("debug_log_since(datadir, log_offset)")
+            .unwrap();
+        assert!(since < stop, "read what it was doing, then stop it");
+        // Task A review M2: stopped while the slot is held, so a Quit in the
+        // meantime waits for it instead of finding an empty slot and leaving.
+        assert!(!spawn_fn.contains("let taken = state.node.lock().await.take();"));
+        assert!(spawn_fn.contains("let mut slot = state.node.lock().await;"));
+        // Task A review M4: with no hint and no error line, the exit status.
+        assert!(spawn_fn.contains("launch_failure_cause_or_exit(&tail, last_exit.as_deref())"));
+        assert!(spawn_fn.contains(".exit_status()"));
+    }
+
+    // ── Task A review M6: the wording of an exit and of a timeout ─────────
+
+    #[test]
+    fn an_exit_is_described_by_when_it_happened() {
+        assert_eq!(exit_when(false, false), "within 5s of spawning");
+        assert_eq!(exit_when(true, false), "before its RPC came up");
+        assert_eq!(exit_when(true, true), "while it was warming up");
+    }
+
+    /// The wait's own sentence may already end in a full stop or an ellipsis
+    /// (btxd's "Verifying blocks…"); the error does not add a second one.
+    #[test]
+    fn the_timeout_error_never_doubles_a_full_stop() {
+        let dir = Path::new("/dd");
+        for last in [
+            "node is warming up: Verifying blocks…",
+            "the RPC said no.",
+            "the node's RPC never became reachable (no .cookie yet)",
+        ] {
+            let e = rpc_timeout_error(last, None, Some(NoRpcStop::Killed), dir);
+            assert!(!e.contains("…."), "{e}");
+            assert!(!e.contains(".."), "{e}");
+            assert!(e.contains(last), "{e}");
+        }
+    }
+
+    // ── Task A review M1: Stop and Quit on a start hung before RPC ────────
+
+    /// A node whose RPC never answered cannot be reached by btx-cli stop, so
+    /// the stop signals it instead, with the short no-RPC grace. One whose
+    /// RPC is armed or answers (warmup included) gets the graceful stop.
+    #[test]
+    fn a_stop_before_rpc_signals_the_node_instead_of_asking_it() {
+        assert!(stop_needs_no_rpc(false, false));
+        assert!(!stop_needs_no_rpc(false, true), "it answers: ask it");
+        assert!(!stop_needs_no_rpc(true, false), "armed: ask it");
+        assert!(!stop_needs_no_rpc(true, true));
+    }
+
+    #[test]
+    fn stop_node_inner_uses_the_no_rpc_stop_where_it_applies() {
+        let src = include_str!("commands.rs");
+        let stop_fn = src
+            .split("pub async fn stop_node_inner(state: &AppState) {")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        // Read before the node slot is locked, so the two locks are never
+        // taken in the other order.
+        let armed = stop_fn.find("state.rpc.lock().await.is_some()").unwrap();
+        let slot = stop_fn.find("state.node.lock().await").unwrap();
+        assert!(armed < slot);
+        let decide = stop_fn.find("stop_needs_no_rpc(").unwrap();
+        let no_rpc = stop_fn
+            .find(".stop_without_rpc_outcome(NO_RPC_STOP_GRACE)")
+            .unwrap();
+        assert!(decide < no_rpc);
+    }
+
+    // ── Task A review M3: slow in the GPU check is not stuck in it ────────
+
+    /// A node only SLOW in the engine's GPU check (a Mac's canary runs one
+    /// full episode: 102 to 218 s on an M2 Pro) gets a bounded extension of
+    /// the no-answer budget, and only then is it stopped or moved.
+    #[test]
+    fn a_start_inside_the_gpu_check_gets_a_bounded_extension() {
+        use btx_core::node::PreRpcStage;
+        assert!(extends_for_gpu_check(
+            true,
+            &timed_out(false),
+            false,
+            PreRpcStage::GpuCheck
+        ));
+        // Not before StartLogging (the archive or earlier), not after the
+        // GPU step, not for a node whose RPC was up, not for an exit or a
+        // stop.
+        assert!(!extends_for_gpu_check(
+            true,
+            &timed_out(false),
+            false,
+            PreRpcStage::BeforeLogging
+        ));
+        assert!(!extends_for_gpu_check(
+            true,
+            &timed_out(false),
+            false,
+            PreRpcStage::PastGpuCheck
+        ));
+        assert!(!extends_for_gpu_check(
+            true,
+            &timed_out(true),
+            false,
+            PreRpcStage::GpuCheck
+        ));
+        assert!(!extends_for_gpu_check(
+            true,
+            &exited(),
+            false,
+            PreRpcStage::GpuCheck
+        ));
+        assert!(!extends_for_gpu_check(
+            true,
+            &timed_out(false),
+            true,
+            PreRpcStage::GpuCheck
+        ));
+        // Only a launch that runs the GPU check (final review M6): a mirror
+        // or a host with no graphics card has nothing to wait out there.
+        assert!(!extends_for_gpu_check(
+            false,
+            &timed_out(false),
+            false,
+            PreRpcStage::GpuCheck
+        ));
+
+        // Bounded: ten minutes in all, past twice the slowest measured
+        // episode, and never open-ended.
+        let total_secs = (super::RPC_WAIT_POLLS + super::GPU_CHECK_EXTRA_POLLS) as u64
+            * super::RPC_WAIT_POLL_MS
+            / 1000;
+        assert_eq!(total_secs, 600);
+        assert!(total_secs >= 2 * 218);
+    }
+
+    /// The wiring: the extension is one more watched wait, before the
+    /// outcome is decided, so the GPU fallback runs only once it is used up.
+    #[test]
+    fn the_extension_runs_before_the_outcome_is_decided() {
+        let src = include_str!("commands.rs");
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let ext = spawn_fn.find("extends_for_gpu_check(").unwrap();
+        let extra = spawn_fn.find("GPU_CHECK_EXTRA_POLLS,").unwrap();
+        let decide = spawn_fn.find("after_rpc_wait(&wait, slot_empty)").unwrap();
+        assert!(ext < extra && extra < decide);
+    }
+
+    // ── 0.7.1 Task B: a validating start stuck in the engine's GPU check ──
+
+    /// ZAN'S NODES, 2026-10-01, the leading reading: the card hung during
+    /// catch-up and now hangs every consensus start inside the engine's GPU
+    /// check. With the evidence, the stopped btxd is followed by a mirror
+    /// attempt, which does no GPU work before RPC.
+    #[test]
+    fn a_start_stuck_in_the_gpu_check_retries_as_a_mirror() {
+        for stop in [NoRpcStop::OnSigterm, NoRpcStop::Killed] {
+            assert_eq!(
+                after_no_rpc_timeout(true, Some(stop), None),
+                AfterNoRpcTimeout::RetryAsMirror,
+                "{stop:?}"
+            );
+        }
+        // EASYBTX_NODE_TRUSTED_MIRROR=1 already asks for a mirror.
+        assert_eq!(
+            after_no_rpc_timeout(true, Some(NoRpcStop::Killed), Some(true)),
+            AfterNoRpcTimeout::RetryAsMirror
+        );
+    }
+
+    /// A btxd stuck in the graphics driver outlives even the kill and still
+    /// holds the datadir lock: a mirror spawned beside it would only be
+    /// refused the lock. So nothing is spawned, and the person is told the
+    /// one thing that frees it.
+    #[test]
+    fn a_card_that_holds_the_node_asks_for_a_restart_and_spawns_nothing() {
+        assert_eq!(
+            after_no_rpc_timeout(true, Some(NoRpcStop::StillRunning), None),
+            AfterNoRpcTimeout::RestartComputer
+        );
+        let msg = gpu_holds_node_error("graphics card");
+        assert!(msg.contains("graphics card"), "{msg}");
+        assert!(msg.contains("restart the computer"), "{msg}");
+        assert!(msg.contains("press Start"), "{msg}");
+        assert_eq!(msg.matches(". ").count(), 0, "one sentence: {msg}");
+        assert!(!msg.contains('\u{2014}'), "em-dash in: {msg}");
+    }
+
+    /// A Mac's GPU is its "graphics chip" in the app's other sentences, so
+    /// these say chip there and card on an NVIDIA machine (final review M7).
+    #[test]
+    fn the_gpu_sentences_name_the_hardware_as_the_app_does() {
+        for word in ["graphics chip", "graphics card"] {
+            for s in [
+                gpu_holds_node_error(word),
+                gpu_check_warming(word),
+                driver_release_warming(word),
+            ] {
+                assert!(s.contains(word), "{s}");
+                assert!(!s.contains('\u{2014}'), "em-dash in: {s}");
+            }
+        }
+        assert!(!gpu_check_warming("graphics chip").contains("card"));
+    }
+
+    /// A btxd on a wedged NVIDIA card can take well over the kill's 5 s to
+    /// go while the driver tears its context down. It is waited for, up to
+    /// DRIVER_RELEASE_WAIT, before a restart of the computer is asked for;
+    /// one that goes meanwhile is followed by the mirror attempt (final
+    /// review I1).
+    #[test]
+    fn a_card_slow_to_let_go_is_waited_for_before_a_restart_is_asked() {
+        assert_eq!(
+            after_driver_wait(false, false),
+            AfterNoRpcTimeout::RetryAsMirror
+        );
+        assert_eq!(
+            after_driver_wait(true, false),
+            AfterNoRpcTimeout::RetryAsMirror
+        );
+        assert_eq!(
+            after_driver_wait(true, true),
+            AfterNoRpcTimeout::RestartComputer
+        );
+        assert_eq!(super::DRIVER_RELEASE_WAIT.as_secs(), 60);
+
+        let src = include_str!("commands.rs");
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let kill = spawn_fn.find(".stop_without_rpc_outcome(").unwrap();
+        let wait = spawn_fn
+            .find(".wait_after_kill(DRIVER_RELEASE_WAIT)")
+            .unwrap();
+        let decide = spawn_fn.find("after_driver_wait(").unwrap();
+        let held = spawn_fn.find("return Err(gpu_holds_node_error(").unwrap();
+        assert!(kill < wait && wait < decide && decide < held);
+    }
+
+    /// A Stop pressed while the launch loop stops a stuck btxd waits for the
+    /// slot, finds it empty, and leaves; the loop must not then spawn a
+    /// mirror behind its back (final review M1). stop_node_inner moves
+    /// refresher_gen first, so a moved generation is a Stop.
+    #[test]
+    fn a_stop_during_the_no_rpc_stop_is_not_followed_by_a_retry() {
+        assert!(!stopped_since(7, 7));
+        assert!(stopped_since(7, 8));
+
+        let src = include_str!("commands.rs");
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let snap = spawn_fn
+            .find("let start_gen = state.refresher_gen.load(Ordering::SeqCst);")
+            .unwrap();
+        assert!(snap < spawn_fn.find("for attempt in 1..=LAUNCH_ATTEMPTS").unwrap());
+        // Both retries that follow a stop the loop made itself look first:
+        // the GPU-hang one and the Mac's chip refusal.
+        for marker in [
+            "AfterNoRpcTimeout::RetryAsMirror => {",
+            "btx_core::node::record_matmul_consensus_refused(datadir);",
+        ] {
+            let at = spawn_fn.find(marker).unwrap();
+            let rest = &spawn_fn[at..];
+            let check = rest.find("stopped_since(start_gen,").unwrap();
+            let retry = rest.find("continue;").unwrap();
+            assert!(check < retry, "{marker}");
+        }
+    }
+
+    /// A retry inside the spawn (GPU hang, Mac chip refusal) re-decides the
+    /// signer; what start_node_inner does after the spawn reads that, not the
+    /// value it had before (final review M3).
+    #[test]
+    fn the_start_rereads_the_signer_decision_after_the_spawn() {
+        let src = include_str!("commands.rs");
+        let start_fn = src
+            .split("pub(crate) async fn start_node_inner(")
+            .nth(1)
+            .and_then(|s| s.split("\nasync fn spawn_node_with_lock_retry(").next())
+            .unwrap();
+        let spawn = start_fn
+            .find("spawn_node_with_lock_retry(app, state")
+            .unwrap();
+        let reread = start_fn.find("let signer_applies_here = state\n").unwrap();
+        let first_use = start_fn.find("ends_orphaned_mirror_launch(").unwrap();
+        assert!(spawn < reread && reread < first_use);
+    }
+
+    /// After the restart-the-computer error, a Start without a reboot finds
+    /// the stuck btxd still holding the folder. That is the graphics driver,
+    /// not "another easyBTX app", so the same error is said again (final
+    /// review M8).
+    #[test]
+    fn a_start_beside_the_held_btxd_repeats_the_restart_error() {
+        use btx_core::node::DatadirHolder;
+        let held = Some(4242);
+        assert!(holder_is_gpu_held(
+            true,
+            DatadirHolder::ManagedBtxd { pid: 4242 },
+            held
+        ));
+        assert!(holder_is_gpu_held(
+            true,
+            DatadirHolder::OrphanedBtxd { pid: 4242 },
+            held
+        ));
+        // Another process, no record, or no held pid: the ordinary path.
+        assert!(!holder_is_gpu_held(
+            true,
+            DatadirHolder::ManagedBtxd { pid: 7 },
+            held
+        ));
+        assert!(!holder_is_gpu_held(
+            false,
+            DatadirHolder::ManagedBtxd { pid: 4242 },
+            held
+        ));
+        assert!(!holder_is_gpu_held(
+            true,
+            DatadirHolder::ManagedBtxd { pid: 4242 },
+            None
+        ));
+        assert!(!holder_is_gpu_held(true, DatadirHolder::Free, held));
+
+        let src = include_str!("commands.rs");
+        let start_fn = src
+            .split("pub(crate) async fn start_node_inner(")
+            .nth(1)
+            .and_then(|s| s.split("\nasync fn spawn_node_with_lock_retry(").next())
+            .unwrap();
+        let holder = start_fn
+            .find("let holder = btx_core::node::datadir_holder(&datadir).await;")
+            .unwrap();
+        let check = start_fn.find("holder_is_gpu_held(").unwrap();
+        let plan = start_fn.find("let plan = pre_launch_plan(").unwrap();
+        assert!(
+            holder < check && check < plan,
+            "before the 30 s of rechecks"
+        );
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let store = spawn_fn.find("GPU_HELD_PID.store(").unwrap();
+        let error = spawn_fn.find("return Err(gpu_holds_node_error(").unwrap();
+        assert!(store < error);
+        // ...and the launch record is disarmed before that error, so a Stop
+        // or Quit after it does not wait out a stop grace on the held btxd.
+        let disarm = spawn_fn[..error]
+            .rfind("*state.launch.lock().await = None;")
+            .expect("the held-btxd error disarms the launch record");
+        assert!(store < disarm && disarm < error);
+    }
+
+    /// A GPU hang on the last attempt has no attempt left for the mirror, and
+    /// "kept exiting right after launch" would be wrong: it says the node
+    /// follows signatures from the next Start (final review M9).
+    #[test]
+    fn a_gpu_hang_on_the_last_attempt_says_what_the_next_start_does() {
+        assert!(mirror_attempt_left(1));
+        assert!(mirror_attempt_left(super::LAUNCH_ATTEMPTS - 1));
+        assert!(!mirror_attempt_left(super::LAUNCH_ATTEMPTS));
+        let msg = gpu_hung_on_last_attempt("graphics card");
+        assert!(msg.contains("graphics card"), "{msg}");
+        assert!(msg.contains("follows signatures"), "{msg}");
+        assert!(msg.contains("press Start"), "{msg}");
+        assert!(!msg.contains("kept exiting"), "{msg}");
+        assert!(!msg.contains('\u{2014}'), "em-dash in: {msg}");
+
+        let src = include_str!("commands.rs");
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let arm = spawn_fn
+            .find("AfterNoRpcTimeout::RetryAsMirror => {")
+            .unwrap();
+        let rest = &spawn_fn[arm..];
+        let check = rest.find("mirror_attempt_left(attempt)").unwrap();
+        assert!(check < rest.find("continue;").unwrap());
+    }
+
+    /// No evidence, no change of role: a timeout that is not the GPU check
+    /// (nothing in debug.log yet, the policy line already there, a mirror
+    /// launch, or a node whose RPC was up) is only reported, as in Task A.
+    #[test]
+    fn without_the_gpu_evidence_a_timeout_is_only_reported() {
+        for stop in [
+            None,
+            Some(NoRpcStop::OnSigterm),
+            Some(NoRpcStop::Killed),
+            Some(NoRpcStop::StillRunning),
+        ] {
+            assert_eq!(
+                after_no_rpc_timeout(false, stop, None),
+                AfterNoRpcTimeout::Fail,
+                "{stop:?}"
+            );
+        }
+    }
+
+    /// The operator's EASYBTX_NODE_TRUSTED_MIRROR=0 means never a mirror, and
+    /// the record yields to it, so a retry would hang the same way.
+    #[test]
+    fn the_operators_zero_keeps_the_plain_timeout() {
+        assert_eq!(
+            after_no_rpc_timeout(true, Some(NoRpcStop::Killed), Some(false)),
+            AfterNoRpcTimeout::Fail
+        );
+    }
+
+    /// "Check blocks" in Settings is the way back, in one click: it clears
+    /// the owner's choice and the GPU-hang record together.
+    #[test]
+    fn check_blocks_in_settings_clears_the_hung_record_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        btx_core::node::record_gpu_start_hung(dir, btx_core::backend::Backend::Cuda);
+        apply_follow_signatures_choice(dir, false).unwrap();
+        assert!(!btx_core::node::gpu_start_hung(dir));
+        assert!(!btx_core::node::follows_signatures_by_choice(dir));
+
+        // Choosing to follow signatures leaves the record alone and adds the
+        // choice.
+        btx_core::node::record_gpu_start_hung(dir, btx_core::backend::Backend::Cuda);
+        apply_follow_signatures_choice(dir, true).unwrap();
+        assert!(btx_core::node::gpu_start_hung(dir));
+        assert!(btx_core::node::follows_signatures_by_choice(dir));
+    }
+
+    /// The wiring, in the code: the launch reads its own arguments after the
+    /// spawn, and on the evidence records the hang, takes the key line out
+    /// for the mirror and goes round the loop. An engine upgrade clears the
+    /// record next to the Mac's refusal marker, and Settings' switch goes
+    /// through the one helper.
+    #[test]
+    fn the_launch_loop_follows_signatures_after_a_gpu_hang() {
+        let src = include_str!("commands.rs");
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let start = spawn_fn.find(".start(").unwrap();
+        let args = spawn_fn
+            .find("launch_runs_gpu_check(node_backend(), controller.launch_args())")
+            .unwrap();
+        assert!(start < args, "the arguments exist once the launch ran");
+        let stuck = spawn_fn
+            .find("stuck_in_gpu_check(gpu_check_launch, &since)")
+            .unwrap();
+        let record = spawn_fn
+            .find("record_gpu_start_hung(datadir, node_backend())")
+            .unwrap();
+        assert!(stuck < record);
+        let signer = spawn_fn[record..]
+            .find("signer_after_chip_refusal(")
+            .unwrap();
+        let retry = spawn_fn[record..].find("continue;").unwrap();
+        assert!(
+            signer < retry,
+            "the key line leaves before the mirror attempt"
+        );
+        assert!(spawn_fn.contains("gpu_holds_node_error("));
+
+        let start_fn = src
+            .split("pub(crate) async fn start_node_inner(")
+            .nth(1)
+            .and_then(|s| s.split("\nasync fn spawn_node_with_lock_retry(").next())
+            .unwrap();
+        let refused = start_fn
+            .find("clear_matmul_consensus_refused(&datadir);")
+            .unwrap();
+        let hung = start_fn.find("clear_gpu_start_hung(&datadir);").unwrap();
+        assert!(
+            hung > refused && hung - refused < 400,
+            "cleared on upgrade, beside the refusal marker"
+        );
+
+        let settings_fn = src
+            .split("pub async fn set_follow_signatures(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(settings_fn.contains("apply_follow_signatures_choice(&node_datadir(), on)"));
+    }
+}
+
+/// The probe the RPC wait asks once per poll (Task A review, TESTS): a child
+/// that exits is gone, an empty slot is gone, and a slot someone else holds
+/// at that instant reads as still there, the safe direction.
+#[cfg(all(test, unix))]
+mod slot_probe_tests {
+    use super::slot_child_gone;
+    use btx_core::backend::Backend;
+    use btx_core::node::NodeController;
+    use tokio::sync::Mutex;
+
+    /// A shell script standing in for btxd. Retries the ETXTBSY race a
+    /// freshly written executable can lose (errno 26 on Linux and macOS),
+    /// as btx-core's own shim does.
+    async fn start_shim(dir: &std::path::Path, body: &str) -> NodeController {
+        use std::os::unix::fs::PermissionsExt;
+        let shim = dir.join("btxd");
+        std::fs::write(&shim, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let conf = dir.join("faststart.conf");
+        std::fs::write(&conf, "").unwrap();
+        for attempt in 1..=20 {
+            let mut controller = NodeController::new();
+            match controller
+                .start(&shim, dir, &conf, Backend::Cpu, &shim)
+                .await
+            {
+                Ok(()) => return controller,
+                Err(e) if attempt < 20 && e.to_string().contains("os error 26") => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(e) => panic!("shim spawn: {e}"),
+            }
+        }
+        unreachable!()
+    }
+
+    #[tokio::test]
+    async fn a_child_that_exits_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = Mutex::new(Some(start_shim(tmp.path(), "sleep 0.3; exit 3").await));
+        assert!(!slot_child_gone(&slot), "alive at first");
+        let started = std::time::Instant::now();
+        while !slot_child_gone(&slot) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the exit was never seen"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[test]
+    fn an_empty_slot_is_gone() {
+        assert!(slot_child_gone(&Mutex::new(None)));
+    }
+
+    #[tokio::test]
+    async fn a_held_slot_reads_as_still_there() {
+        let slot: Mutex<Option<NodeController>> = Mutex::new(None);
+        let _held = slot.lock().await;
+        assert!(!slot_child_gone(&slot));
     }
 }

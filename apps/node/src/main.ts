@@ -10,7 +10,14 @@ import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { AmbientLine } from "./ambient";
-import { followRowVisible, stalledFollowOffer, validationView } from "./validation";
+import {
+  followResultText,
+  followRowVisible,
+  followToggleOn,
+  gpuHungSignerNote,
+  stalledFollowOffer,
+  validationView,
+} from "./validation";
 import {
   CHAIN_BLOCKS_PER_HOUR,
   type CatchupSample,
@@ -234,6 +241,12 @@ interface NodeStatusInfo {
   /** The engine refused this Mac's graphics chip, so the node follows
    *  signatures. The status screen says so once per engine. */
   chip_refused: boolean;
+  /** A validating start hung in the engine's GPU check, so the app moved the
+   *  node to following signatures (validation.ts says why; Settings' switch
+   *  tries the card again). */
+  gpu_start_hung: boolean;
+  /** "graphics chip" on a Mac, "graphics card" elsewhere. */
+  graphics_word: string;
   /** How far the background check of the snapshot's older history has got;
    *  null when there is none running. */
   history_check: HistoryCheck | null;
@@ -792,7 +805,10 @@ function reflectSignerRow(status: NodeStatusInfo): void {
   const t = $<HTMLInputElement>("signer-toggle");
   if (document.activeElement !== t) t.checked = status.signer_enabled;
   const desc = $("signer-desc");
-  if (status.signer_applies_here === false) {
+  const hungNote = gpuHungSignerNote(status);
+  if (hungNote) {
+    desc.textContent = hungNote;
+  } else if (status.signer_applies_here === false) {
     desc.textContent =
       "This machine follows other nodes' signatures rather than checking blocks itself, so it cannot sign. The setting is kept for a machine with a graphics card the engine accepts";
   } else if (status.signing_live) {
@@ -892,11 +908,11 @@ function reflectFollowOffer(status: NodeStatusInfo): void {
 
 function reflectFollowRow(status: NodeStatusInfo): void {
   // Only where it is a choice: a machine that checks blocks, one whose chip
-  // failed the check, or one whose owner already chose. A machine that
-  // follows signatures anyway has none.
+  // failed the check, one whose card hung the start-up check, or one whose
+  // owner already chose. A machine that follows signatures anyway has none.
   $("follow-row").hidden = !followRowVisible(status);
   const t = $<HTMLInputElement>("follow-toggle");
-  if (document.activeElement !== t) t.checked = status.follow_signatures;
+  if (document.activeElement !== t) t.checked = followToggleOn(status);
 }
 
 async function setFollowSignatures(on: boolean): Promise<void> {
@@ -942,10 +958,20 @@ $<HTMLInputElement>("follow-toggle").addEventListener("change", async (e) => {
   box.disabled = true;
   try {
     await setFollowSignatures(on);
+    // The restart has run by now; when "check blocks" hung the card again,
+    // the node is back on signatures and the line says so.
+    let after: NodeStatusInfo | null = null;
+    try {
+      after = await invoke<NodeStatusInfo>("get_node_status");
+    } catch {
+      // No status: say what was asked for.
+    }
     result.classList.remove("is-error");
-    result.textContent = on
-      ? "Your node restarted and follows signatures now."
-      : "Your node restarted and checks blocks itself again.";
+    result.textContent = followResultText(
+      on,
+      after?.gpu_start_hung === true,
+      after?.graphics_word,
+    );
     catchupSamples = [];
   } catch (err) {
     box.checked = !on;

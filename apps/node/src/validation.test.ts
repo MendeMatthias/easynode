@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  followResultText,
   followRowVisible,
+  followToggleOn,
+  gpuHungSignerNote,
   stalledFollowOffer,
   validationView,
   type FollowInput,
@@ -289,5 +292,96 @@ describe("the way out for a machine whose chip cannot check blocks", () => {
       follow_signatures: false,
     };
     expect(followRowVisible(mirror)).toBe(false);
+  });
+});
+
+describe("a machine whose graphics card hung the engine's start-up check (0.7.1)", () => {
+  const hungMirror: FollowInput = {
+    rc_stalled: false,
+    rc_trusted_mirror: true,
+    rc_validates_independently: false,
+    follow_signatures: false,
+    gpu_start_hung: true,
+  };
+
+  it("says why the node follows signatures, and the way back", () => {
+    const v = validationView({
+      ...base,
+      rc_mode: "strict-device",
+      rc_trusted_mirror: true,
+      gpu_start_hung: true,
+    });
+    expect(v.state).toBe("Mirror");
+    expect(v.note).toMatch(/graphics card did not finish the engine's start-up check/);
+    expect(v.note).toMatch(/follows signatures for now/);
+    expect(v.note).toMatch(/Check blocks in Settings tries the card again/);
+    expect(v.note.includes(String.fromCharCode(0x2014))).toBe(false); // no em-dash
+  });
+
+  it("says chip on a Mac, as the rest of the app does", () => {
+    const v = validationView({
+      ...base,
+      rc_mode: "strict-device",
+      rc_trusted_mirror: true,
+      gpu_start_hung: true,
+      graphics_word: "graphics chip",
+    });
+    expect(v.note).toMatch(/This machine's graphics chip did not finish/);
+    expect(v.note).toMatch(/tries the chip again/);
+    expect(v.note).not.toMatch(/card/);
+  });
+
+  it("keeps the plain mirror note where the card did not hang", () => {
+    const v = validationView({ ...base, rc_mode: "strict-device", rc_trusted_mirror: true });
+    expect(v.note).not.toMatch(/start-up check/);
+  });
+
+  it("still says so first when no source hands over confirmations", () => {
+    const v = validationView({
+      ...base,
+      rc_mode: "strict-device",
+      rc_trusted_mirror: true,
+      gpu_start_hung: true,
+      archive_authority: 0,
+    });
+    expect(v.state).toBe("Mirror: waiting for a source");
+  });
+
+  it("says what the switch did, including when the card hung again (final review M2)", () => {
+    expect(followResultText(true, false)).toBe("Your node restarted and follows signatures now.");
+    expect(followResultText(false, false)).toBe(
+      "Your node restarted and checks blocks itself again.",
+    );
+    const again = followResultText(false, true);
+    expect(again).toBe(
+      "The graphics card still did not finish the start-up check, so the node follows " +
+        "signatures again.",
+    );
+    expect(followResultText(false, true, "graphics chip")).toMatch(/^The graphics chip still/);
+  });
+
+  it("names the way back on the signer row (final review M4)", () => {
+    const note = gpuHungSignerNote({ gpu_start_hung: true, signer_applies_here: false });
+    expect(note).toMatch(/graphics card did not finish the engine's start-up check/);
+    expect(note).toMatch(/cannot sign/);
+    expect(note).toMatch(/Check blocks in Settings/);
+    expect(
+      gpuHungSignerNote({
+        gpu_start_hung: true,
+        signer_applies_here: false,
+        graphics_word: "graphics chip",
+      }),
+    ).toMatch(/tries the chip again/);
+    expect(gpuHungSignerNote({ gpu_start_hung: false, signer_applies_here: false })).toBeNull();
+    expect(gpuHungSignerNote({ gpu_start_hung: true, signer_applies_here: true })).toBeNull();
+  });
+
+  it("shows the Settings switch, switched on, so one click tries the card again", () => {
+    expect(followRowVisible(hungMirror)).toBe(true);
+    expect(followToggleOn(hungMirror)).toBe(true);
+    expect(followToggleOn({ ...hungMirror, gpu_start_hung: false })).toBe(false);
+    expect(
+      followToggleOn({ ...hungMirror, gpu_start_hung: false, follow_signatures: true }),
+    ).toBe(true);
   });
 });

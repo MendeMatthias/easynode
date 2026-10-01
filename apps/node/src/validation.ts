@@ -32,6 +32,18 @@ export type ValidationInput = {
   /** Following the chain via an attestation quorum instead of local replay. */
   rc_trusted_mirror: boolean;
   /**
+   * A validating start hung in the engine's GPU check and the app moved the
+   * node to following signatures (btx_core::node::gpu_start_hung). Absent
+   * from an older backend, which reads as false.
+   */
+  gpu_start_hung?: boolean;
+  /**
+   * How the app names this machine's GPU: "graphics chip" on a Mac,
+   * "graphics card" elsewhere (btx_core::node::graphics_word). Absent from an
+   * older backend, which reads as "graphics card".
+   */
+  graphics_word?: string;
+  /**
    * Archive peers passing the trusted-mirror authority gate (manual or noban),
    * or null when unknown (node stopped / didn't answer / older backend). On a
    * mirror, 0 here is the root cause of the silent-stall class: the node will
@@ -160,6 +172,22 @@ export function validationView(status: ValidationInput): ValidationView {
         cls: "is-stalled",
       };
     }
+    // A card that can check blocks but hung the engine's start-up check
+    // (0.7.1): the plain note would tell its owner the machine cannot check
+    // the proof of work at all, which is not what happened, and not say the
+    // way back.
+    if (status.gpu_start_hung) {
+      const word = status.graphics_word ?? "graphics card";
+      const short = word.replace(/^graphics /, "");
+      return {
+        state: "Mirror",
+        note:
+          `This machine's ${word} did not finish the engine's start-up check, so this ` +
+          "node follows signatures for now: it keeps up using signed confirmations from a node " +
+          `that does check the proof of work. Check blocks in Settings tries the ${short} again.`,
+        cls: "is-degraded",
+      };
+    }
     return {
       state: "Mirror",
       // "Two independent operators" stopped being true at the 23 September
@@ -205,6 +233,9 @@ export type FollowInput = {
   rc_validates_independently: boolean;
   /** The owner already chose to follow signatures on this machine. */
   follow_signatures: boolean;
+  /** The app moved the node to following signatures after its graphics card
+   *  hung the engine's start-up check. Absent from an older backend. */
+  gpu_start_hung?: boolean;
 };
 
 /**
@@ -238,7 +269,60 @@ export function stalledFollowOffer(status: FollowInput): string | null {
 export function followRowVisible(status: FollowInput): boolean {
   return (
     status.follow_signatures ||
+    status.gpu_start_hung === true ||
     status.rc_validates_independently ||
     (status.rc_stalled && !status.rc_trusted_mirror)
+  );
+}
+
+/**
+ * Whether the Settings switch reads "on" (follows signatures). On for the
+ * owner's own choice, and on after the card hung the start-up check, because
+ * the node does follow signatures then: switching it off is "check blocks",
+ * which clears both and tries the card again, in one click.
+ */
+export function followToggleOn(status: FollowInput): boolean {
+  return status.follow_signatures || status.gpu_start_hung === true;
+}
+
+/**
+ * The line under the Settings switch once the restart it asked for is done.
+ * `gpuStartHung` is read from the status after that restart: "check blocks"
+ * tries the card again, and when it hangs again the node is back on
+ * signatures, which "checks blocks itself again" would deny (final review
+ * M2).
+ */
+export function followResultText(
+  on: boolean,
+  gpuStartHung: boolean,
+  graphicsWord: string = "graphics card",
+): string {
+  if (on) return "Your node restarted and follows signatures now.";
+  if (gpuStartHung) {
+    return (
+      `The ${graphicsWord} still did not finish the start-up check, so the node follows ` +
+      "signatures again."
+    );
+  }
+  return "Your node restarted and checks blocks itself again.";
+}
+
+/**
+ * The signer row's sentence on a machine moved to following signatures by a
+ * card that hung the start-up check: it cannot sign now, and the way back is
+ * the same switch (final review M4). Null where it does not apply.
+ */
+export function gpuHungSignerNote(status: {
+  gpu_start_hung?: boolean;
+  signer_applies_here: boolean | null;
+  graphics_word?: string;
+}): string | null {
+  if (!status.gpu_start_hung || status.signer_applies_here !== false) return null;
+  const word = status.graphics_word ?? "graphics card";
+  const short = word.replace(/^graphics /, "");
+  return (
+    `This machine follows signatures for now because its ${word} did not finish the engine's ` +
+    `start-up check, so it cannot sign. Check blocks in Settings tries the ${short} again, and ` +
+    "signing comes back once the node checks blocks"
   );
 }
