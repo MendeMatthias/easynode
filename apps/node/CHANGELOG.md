@@ -25,6 +25,23 @@ nothing on screen said so. Thanks to the operator who reported it.
   any shipped key that is missing or blocked, and how many signatures were
   accepted and turned away.
 
+**On a Mac, the node now lets you go first.**
+Some owners found their Mac hard to use with the node running. On a Mac the
+node uses the graphics chip to check blocks, and that is the same chip that
+draws your screen. Until now the node ran at the same priority as the apps
+you were using.
+
+- On a Mac the node now runs as a background task. macOS gives your apps the
+  graphics chip and the processor first, and the node uses what is left. In
+  our tests, graphics work in the foreground was held up less while the node
+  checked its graphics chip, though not in every moment.
+- Starting the node can take a little longer, because its graphics check gives
+  way too. In our tests it still finished in under four minutes.
+- While the node is far behind (more than about 12 hours of blocks), it runs at
+  normal priority so it can catch up, and goes back to the background once it
+  is caught up.
+- Nodes that sign blocks do the same. Linux and Windows are unchanged.
+
 ## [0.7.1] - 2026-10-01
 
 **A node that stops while starting now tells you why, and gets going again on its own.**
