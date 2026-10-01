@@ -2055,8 +2055,13 @@ pub fn debug_log_len(datadir: &Path) -> u64 {
 /// a btxd stuck before that point has written nothing to debug.log at all.
 ///
 /// A file now SHORTER than `offset` was shrunk by `ShrinkDebugFile`, which
-/// runs inside this launch's StartLogging, so everything in it past the
-/// shrink is this launch's own and the plain tail is the right read.
+/// runs inside this launch's StartLogging. It keeps the old file's last 10 MB
+/// (logging.cpp:519-540 at v0.34.12) and this launch's lines follow them, so
+/// the plain tail read then can hold far more of older runs than of this
+/// one: a launch writes only a few lines before RPC. A reader that must tell
+/// them apart looks past this launch's StartLogging line ([`pre_rpc_stage`]
+/// does); a quote of the last line is safe, since that line is this
+/// launch's.
 pub fn debug_log_since(datadir: &Path, offset: u64) -> String {
     const MAX: u64 = 64 * 1024;
     let path = datadir.join("debug.log");
