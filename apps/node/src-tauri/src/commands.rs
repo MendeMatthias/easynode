@@ -2098,6 +2098,10 @@ async fn spawn_node_with_lock_retry(
                             );
                             eprintln!("[node-app] {msg}");
                             setup_log(datadir, &msg);
+                            // Disarmed as on the pre-launch path above: a Stop or
+                            // Quit after this error must not wait out a stop grace
+                            // on a btxd nothing can free.
+                            *state.launch.lock().await = None;
                             return Err(gpu_holds_node_error(gpu_word));
                         }
                         AfterNoRpcTimeout::Fail => {}
@@ -9806,6 +9810,12 @@ mod launch_wait_tests {
         let store = spawn_fn.find("GPU_HELD_PID.store(").unwrap();
         let error = spawn_fn.find("return Err(gpu_holds_node_error(").unwrap();
         assert!(store < error);
+        // ...and the launch record is disarmed before that error, so a Stop
+        // or Quit after it does not wait out a stop grace on the held btxd.
+        let disarm = spawn_fn[..error]
+            .rfind("*state.launch.lock().await = None;")
+            .expect("the held-btxd error disarms the launch record");
+        assert!(store < disarm && disarm < error);
     }
 
     /// A GPU hang on the last attempt has no attempt left for the mirror, and
