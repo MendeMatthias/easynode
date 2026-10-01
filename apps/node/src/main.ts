@@ -10,7 +10,14 @@ import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { AmbientLine } from "./ambient";
-import { followRowVisible, followToggleOn, stalledFollowOffer, validationView } from "./validation";
+import {
+  followResultText,
+  followRowVisible,
+  followToggleOn,
+  gpuHungSignerNote,
+  stalledFollowOffer,
+  validationView,
+} from "./validation";
 import {
   CHAIN_BLOCKS_PER_HOUR,
   type CatchupSample,
@@ -798,7 +805,10 @@ function reflectSignerRow(status: NodeStatusInfo): void {
   const t = $<HTMLInputElement>("signer-toggle");
   if (document.activeElement !== t) t.checked = status.signer_enabled;
   const desc = $("signer-desc");
-  if (status.signer_applies_here === false) {
+  const hungNote = gpuHungSignerNote(status);
+  if (hungNote) {
+    desc.textContent = hungNote;
+  } else if (status.signer_applies_here === false) {
     desc.textContent =
       "This machine follows other nodes' signatures rather than checking blocks itself, so it cannot sign. The setting is kept for a machine with a graphics card the engine accepts";
   } else if (status.signing_live) {
@@ -948,10 +958,20 @@ $<HTMLInputElement>("follow-toggle").addEventListener("change", async (e) => {
   box.disabled = true;
   try {
     await setFollowSignatures(on);
+    // The restart has run by now; when "check blocks" hung the card again,
+    // the node is back on signatures and the line says so.
+    let after: NodeStatusInfo | null = null;
+    try {
+      after = await invoke<NodeStatusInfo>("get_node_status");
+    } catch {
+      // No status: say what was asked for.
+    }
     result.classList.remove("is-error");
-    result.textContent = on
-      ? "Your node restarted and follows signatures now."
-      : "Your node restarted and checks blocks itself again.";
+    result.textContent = followResultText(
+      on,
+      after?.gpu_start_hung === true,
+      after?.graphics_word,
+    );
     catchupSamples = [];
   } catch (err) {
     box.checked = !on;

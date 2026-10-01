@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  followResultText,
   followRowVisible,
   followToggleOn,
+  gpuHungSignerNote,
   stalledFollowOffer,
   validationView,
   type FollowInput,
@@ -343,6 +345,35 @@ describe("a machine whose graphics card hung the engine's start-up check (0.7.1)
       archive_authority: 0,
     });
     expect(v.state).toBe("Mirror: waiting for a source");
+  });
+
+  it("says what the switch did, including when the card hung again (final review M2)", () => {
+    expect(followResultText(true, false)).toBe("Your node restarted and follows signatures now.");
+    expect(followResultText(false, false)).toBe(
+      "Your node restarted and checks blocks itself again.",
+    );
+    const again = followResultText(false, true);
+    expect(again).toBe(
+      "The graphics card still did not finish the start-up check, so the node follows " +
+        "signatures again.",
+    );
+    expect(followResultText(false, true, "graphics chip")).toMatch(/^The graphics chip still/);
+  });
+
+  it("names the way back on the signer row (final review M4)", () => {
+    const note = gpuHungSignerNote({ gpu_start_hung: true, signer_applies_here: false });
+    expect(note).toMatch(/graphics card did not finish the engine's start-up check/);
+    expect(note).toMatch(/cannot sign/);
+    expect(note).toMatch(/Check blocks in Settings/);
+    expect(
+      gpuHungSignerNote({
+        gpu_start_hung: true,
+        signer_applies_here: false,
+        graphics_word: "graphics chip",
+      }),
+    ).toMatch(/tries the chip again/);
+    expect(gpuHungSignerNote({ gpu_start_hung: false, signer_applies_here: false })).toBeNull();
+    expect(gpuHungSignerNote({ gpu_start_hung: true, signer_applies_here: true })).toBeNull();
   });
 
   it("shows the Settings switch, switched on, so one click tries the card again", () => {
