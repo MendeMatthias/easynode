@@ -682,6 +682,12 @@ pub struct AppState {
     /// know the method, and absence is reported as unknown, never as "no".
     /// Cleared on every stop/start like the others. See `btx_core::role`.
     pub matmul_trusted: Arc<Mutex<Option<btx_core::node_api::MatmulTrustedStatus>>>,
+    /// The engine's signature counters (`accepted`, `rejected` from that same
+    /// answer) over the last ~22 minutes, sampled on the refresher's slow
+    /// tick: what the watchdog's `PinsRejectEverySignature` rule and Copy
+    /// diagnostics read. Starts over with every engine run (the refresher's
+    /// generation) and on every stop/start like the others.
+    pub signature_window: Arc<Mutex<btx_core::watchdog::SignatureWindow>>,
     /// The engine's `getmatmulattestedtip` signed frontier from the refresher's
     /// last tick that got an answer. The role card's chain position reads it:
     /// a node that knows of no newer headers is not at the tip when signed
@@ -845,6 +851,7 @@ impl AppState {
             stall_verdict: Arc::new(Mutex::new(None)),
             archive_service: Arc::new(Mutex::new(None)),
             matmul_trusted: Arc::new(Mutex::new(None)),
+            signature_window: Arc::new(Mutex::new(Default::default())),
             signed_frontier: Arc::new(Mutex::new(None)),
             catch_up_help: Arc::new(Mutex::new(Default::default())),
             recent_signers: Arc::new(Mutex::new(None)),
