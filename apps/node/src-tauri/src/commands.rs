@@ -1496,6 +1496,15 @@ pub(crate) async fn start_node_held(app: &AppHandle, state: &AppState) -> Result
     *state.rpc.lock().await = Some(rpc.clone());
     *state.started_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
     abort_mirror_load.armed = false;
+    // A retry inside the spawn (a start stuck in the GPU check, a Mac's chip
+    // refused) moved the host to following signatures and decided the signer
+    // again; everything below reads that, not the value from before the
+    // spawn (final review M3).
+    let signer_applies_here = state
+        .signer_applies_here
+        .lock()
+        .await
+        .unwrap_or(signer_applies_here);
 
     // The upgrade is DONE only now — a node launched from the new tag (or a
     // fresh spawn of it) is serving. Attach-mode never flips: the running node
@@ -9600,6 +9609,25 @@ mod launch_wait_tests {
             let retry = rest.find("continue;").unwrap();
             assert!(check < retry, "{marker}");
         }
+    }
+
+    /// A retry inside the spawn (GPU hang, Mac chip refusal) re-decides the
+    /// signer; what start_node_inner does after the spawn reads that, not the
+    /// value it had before (final review M3).
+    #[test]
+    fn the_start_rereads_the_signer_decision_after_the_spawn() {
+        let src = include_str!("commands.rs");
+        let start_fn = src
+            .split("pub(crate) async fn start_node_inner(")
+            .nth(1)
+            .and_then(|s| s.split("\nasync fn spawn_node_with_lock_retry(").next())
+            .unwrap();
+        let spawn = start_fn
+            .find("spawn_node_with_lock_retry(app, state")
+            .unwrap();
+        let reread = start_fn.find("let signer_applies_here = state\n").unwrap();
+        let first_use = start_fn.find("ends_orphaned_mirror_launch(").unwrap();
+        assert!(spawn < reread && reread < first_use);
     }
 
     /// No evidence, no change of role: a timeout that is not the GPU check
