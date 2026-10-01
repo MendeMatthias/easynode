@@ -21,8 +21,8 @@
 //! the GPU does not look at `nice`. The cost: the check took 1.5 to 2.1 times
 //! as long (148 to 219 s against 84 to 110 s), still far inside the app's
 //! ten-minute start budget, and plain CPU work in the background policy runs
-//! on the efficiency cores only (a fixed single-thread job took 3.1 times as
-//! long there).
+//! on the efficiency cores only (a fixed CPU job took 2.4 to 3.1 times as
+//! long on one thread and 4.4 to 8.7 times on ten, varying run to run).
 //!
 //! ── WHAT THIS DOES ──────────────────────────────────────────────────────────
 //! On macOS the app puts btxd into the Darwin background policy right after
@@ -31,13 +31,20 @@
 //! efficiency cores, throttles its disk I/O behind other programs' I/O, marks
 //! its sockets as background traffic, and gives its GPU work low priority.
 //!
-//! One exception, because of the efficiency-core cost above: while the node
-//! is far behind the chain ([`FAR_BEHIND_BLOCKS`]), the app takes it back out
-//! of the background policy so catching up is not slowed down several times
-//! over, and puts it back once it is near the tip ([`NEAR_TIP_BLOCKS`]). The
-//! gap between the two keeps it from switching back and forth. A node at the
-//! tip validates one block about every 90 seconds, which is where the
-//! background policy costs least and helps most.
+//! Exceptions, each at normal priority:
+//! * far behind the chain ([`FAR_BEHIND_BLOCKS`]), so catching up is not
+//!   slowed down several times over; back into the background policy near
+//!   the tip ([`NEAR_TIP_BLOCKS`]), the gap between the two keeping it from
+//!   switching back and forth (the node app's status refresher, every 30 s);
+//! * the GPU-check extension past the ordinary three-minute wait, whose
+//!   ten-minute budget was sized at normal priority, and a snapshot load
+//!   (`NodeController::hold_normal_priority`);
+//! * a stop, so the shutdown flush is not throttled.
+//!
+//! A node the app adopted after a self-update rather than spawned is managed
+//! the same way, through its name-checked pidfile pid
+//! (`node::verified_btxd_pidfile_pid`), with the policy applied rather than
+//! assumed ([`retune_engine_priority`] with `None`).
 //!
 //! The engine's own worker counts stay the engine's (`node.rs`, the comment
 //! above `BTX_MATMUL_BACKEND`); this changes who goes first, not how much.
