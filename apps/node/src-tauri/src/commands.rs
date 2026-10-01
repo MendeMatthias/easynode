@@ -689,6 +689,24 @@ fn stopped_since(gen_at_start: u64, gen_now: u64) -> bool {
     gen_now != gen_at_start
 }
 
+/// The pid of a btxd this app run left held by the graphics driver
+/// ([`AfterNoRpcTimeout::RestartComputer`]), 0 for none. In memory on
+/// purpose: a restart of the computer, the only thing that frees it, also
+/// ends this app run.
+static GPU_HELD_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Is the process holding this datadir the btxd the graphics driver still
+/// holds? Then a Start without a reboot says the restart error again,
+/// rather than blaming "another easyBTX app" after half a minute of
+/// rechecks (final review M8). Pure, pinned by a test.
+fn holder_is_gpu_held(record: bool, holder: DatadirHolder, held_pid: Option<u32>) -> bool {
+    let pid = match holder {
+        DatadirHolder::ManagedBtxd { pid } | DatadirHolder::OrphanedBtxd { pid } => pid,
+        DatadirHolder::Free | DatadirHolder::Unidentifiable { .. } => return false,
+    };
+    record && held_pid == Some(pid)
+}
+
 /// How long a btxd that outlived the kill is watched before the app asks for
 /// a restart of the computer (final review I1). A wedged NVIDIA card can hold
 /// a killed process well past the kill's own 5 s while the driver tears down
@@ -1401,6 +1419,21 @@ pub(crate) async fn start_node_held(app: &AppHandle, state: &AppState) -> Result
     let (plan, probe, holder) = loop {
         let probe = rpc_already_answering(&datadir).await;
         let holder = btx_core::node::datadir_holder(&datadir).await;
+        let held = match GPU_HELD_PID.load(Ordering::SeqCst) {
+            0 => None,
+            pid => Some(pid),
+        };
+        if holder_is_gpu_held(btx_core::node::gpu_start_hung(&datadir), holder, held) {
+            // Still the btxd the graphics driver would not let go of. Nothing
+            // the app can do frees it, and a Quit must not wait out a stop
+            // grace on it either, so the launch record is disarmed as for a
+            // node that is not ours.
+            *state.launch.lock().await = None;
+            eprintln!("[node-app] the btxd the graphics driver holds (pid {held:?}) still holds this datadir");
+            return Err(gpu_holds_node_error(btx_core::node::graphics_word(
+                node_backend(),
+            )));
+        }
         let plan = pre_launch_plan(
             probe.is_some(),
             upgraded_this_start,
@@ -1981,6 +2014,13 @@ async fn spawn_node_with_lock_retry(
                         };
                         set_phase(app, state, note.clone()).await;
                         let gone = c.wait_after_kill(DRIVER_RELEASE_WAIT).await;
+                        if !gone {
+                            // Remembered so a Start without a reboot names
+                            // it again (final review M8).
+                            if let Some(pid) = c.child_pid() {
+                                GPU_HELD_PID.store(pid, Ordering::SeqCst);
+                            }
+                        }
                         let still_ours = *state.phase.lock().await == note;
                         if still_ours {
                             set_phase(app, state, NodePhase::Starting).await;
@@ -9271,8 +9311,8 @@ mod launch_wait_tests {
     use super::{
         after_driver_wait, after_no_rpc_timeout, after_rpc_wait, apply_follow_signatures_choice,
         driver_release_warming, exit_when, extends_for_gpu_check, gpu_check_warming,
-        gpu_holds_node_error, rpc_timeout_error, stop_needs_no_rpc, stopped_since,
-        AfterNoRpcTimeout, AfterRpcWait,
+        gpu_holds_node_error, holder_is_gpu_held, rpc_timeout_error, stop_needs_no_rpc,
+        stopped_since, AfterNoRpcTimeout, AfterRpcWait,
     };
     use btx_core::node::NoRpcStop;
     use btx_core::setup::RpcWait;
@@ -9686,6 +9726,67 @@ mod launch_wait_tests {
         let reread = start_fn.find("let signer_applies_here = state\n").unwrap();
         let first_use = start_fn.find("ends_orphaned_mirror_launch(").unwrap();
         assert!(spawn < reread && reread < first_use);
+    }
+
+    /// After the restart-the-computer error, a Start without a reboot finds
+    /// the stuck btxd still holding the folder. That is the graphics driver,
+    /// not "another easyBTX app", so the same error is said again (final
+    /// review M8).
+    #[test]
+    fn a_start_beside_the_held_btxd_repeats_the_restart_error() {
+        use btx_core::node::DatadirHolder;
+        let held = Some(4242);
+        assert!(holder_is_gpu_held(
+            true,
+            DatadirHolder::ManagedBtxd { pid: 4242 },
+            held
+        ));
+        assert!(holder_is_gpu_held(
+            true,
+            DatadirHolder::OrphanedBtxd { pid: 4242 },
+            held
+        ));
+        // Another process, no record, or no held pid: the ordinary path.
+        assert!(!holder_is_gpu_held(
+            true,
+            DatadirHolder::ManagedBtxd { pid: 7 },
+            held
+        ));
+        assert!(!holder_is_gpu_held(
+            false,
+            DatadirHolder::ManagedBtxd { pid: 4242 },
+            held
+        ));
+        assert!(!holder_is_gpu_held(
+            true,
+            DatadirHolder::ManagedBtxd { pid: 4242 },
+            None
+        ));
+        assert!(!holder_is_gpu_held(true, DatadirHolder::Free, held));
+
+        let src = include_str!("commands.rs");
+        let start_fn = src
+            .split("pub(crate) async fn start_node_inner(")
+            .nth(1)
+            .and_then(|s| s.split("\nasync fn spawn_node_with_lock_retry(").next())
+            .unwrap();
+        let holder = start_fn
+            .find("let holder = btx_core::node::datadir_holder(&datadir).await;")
+            .unwrap();
+        let check = start_fn.find("holder_is_gpu_held(").unwrap();
+        let plan = start_fn.find("let plan = pre_launch_plan(").unwrap();
+        assert!(
+            holder < check && check < plan,
+            "before the 30 s of rechecks"
+        );
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let store = spawn_fn.find("GPU_HELD_PID.store(").unwrap();
+        let error = spawn_fn.find("return Err(gpu_holds_node_error(").unwrap();
+        assert!(store < error);
     }
 
     /// No evidence, no change of role: a timeout that is not the GPU check
