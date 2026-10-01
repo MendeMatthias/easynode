@@ -3032,12 +3032,11 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                                 v.class == btx_core::watchdog::StallClass::PinsRejectEverySignature
                             });
                             if key_mismatch {
-                                // No redial: peers are already handing this
-                                // node signatures and it refuses them all, so
-                                // another peer changes nothing. Nor does the
-                                // app touch btx_rw.conf or the conf. One line
-                                // when the verdict first appears, not every
-                                // tick.
+                                // The redial below runs for this verdict only
+                                // with no authority peer (watchdog_redials).
+                                // The app never touches btx_rw.conf or the
+                                // conf. One line when the verdict first
+                                // appears, not every tick.
                                 let shown_before =
                                     stall_slot.lock().await.as_ref().is_some_and(|v| {
                                         v.class
@@ -3046,16 +3045,23 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                                 if !shown_before {
                                     let ev = facts.signatures.as_ref();
                                     eprintln!(
-                                        "[node-app] watchdog: PinsRejectEverySignature after {}s frozen at {:?}: accepted +{} rejected +{} over {}s, {} shipped key(s) not pinned; no redial",
+                                        "[node-app] watchdog: PinsRejectEverySignature after {}s frozen at {:?}: accepted +{} rejected +{} over {}s, {} shipped key(s) not pinned, {} authority peer(s)",
                                         frozen_secs,
                                         heights,
                                         ev.map_or(0, |e| e.accepted_delta),
                                         ev.map_or(0, |e| e.rejected_delta),
                                         ev.map_or(0, |e| e.span_secs),
                                         ev.map_or(0, |e| e.shipped_keys_missing),
+                                        facts
+                                            .archive_authority
+                                            .map_or("unknown".to_string(), |n| n.to_string()),
                                     );
                                 }
-                            } else if let Some(v) = verdict.as_ref() {
+                            }
+                            if let Some(v) = verdict
+                                .as_ref()
+                                .filter(|v| watchdog_redials(v, facts.archive_authority))
+                            {
                                 // Remediation — the ONE automated action, from
                                 // the one mechanism with a production receipt
                                 // (archive handshake → unstuck in 21 s): dial
@@ -3373,6 +3379,20 @@ fn shown_stall(
     } else {
         watchdog
     }
+}
+
+/// Whether the watchdog's archive redial runs for this verdict. Every class
+/// as before, except `PinsRejectEverySignature`: peers are already handing
+/// that node signatures and it refuses them all, so another peer changes
+/// nothing, UNLESS no authority peer is connected at all. Then a redial
+/// costs nothing and may bring a peer that relays signatures from a key the
+/// node does pin, so it is kept.
+fn watchdog_redials(
+    v: &btx_core::watchdog::StallVerdict,
+    archive_authority: Option<usize>,
+) -> bool {
+    v.class != btx_core::watchdog::StallClass::PinsRejectEverySignature
+        || archive_authority == Some(0)
 }
 
 /// The watchdog's signature fact (`StallFacts::signatures`): the window's
@@ -7608,6 +7628,35 @@ mod tests {
         std::fs::write(dir.path().join("faststart").join("faststart.conf"), &rw).unwrap();
         let ev = super::signature_evidence(Some(deltas), &live, dir.path(), None).unwrap();
         assert_eq!(ev.missing_explained_by, Some("faststart/faststart.conf"));
+    }
+
+    /// The archive redial runs for every verdict as before, except the key
+    /// verdict, where it runs only with no authority peer at all: there a
+    /// redial costs nothing and may bring a peer that relays signatures from
+    /// a key this node does pin. With authority peers already connected and
+    /// relaying, another dial changes nothing.
+    #[test]
+    fn the_key_verdict_redials_only_when_no_authority_peer_is_connected() {
+        use btx_core::watchdog::{StallClass, StallVerdict};
+        let v = |class| StallVerdict {
+            class,
+            summary: "".into(),
+        };
+        let keys = v(StallClass::PinsRejectEverySignature);
+        assert!(super::watchdog_redials(&keys, Some(0)));
+        assert!(!super::watchdog_redials(&keys, Some(3)));
+        assert!(!super::watchdog_redials(&keys, None));
+        for class in [
+            StallClass::BodyMissing,
+            StallClass::BlockFetchGated,
+            StallClass::AttestationMissing,
+            StallClass::NoQualifyingPeer,
+            StallClass::MsghandSpin,
+        ] {
+            for authority in [None, Some(0), Some(3)] {
+                assert!(super::watchdog_redials(&v(class), authority), "{class:?}");
+            }
+        }
     }
 
     /// The owner's decision 1: while the help concludes that no archive peer
