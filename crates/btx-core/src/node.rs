@@ -143,7 +143,16 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // engine's getmmattest hammer (btxchain/btx#142) for asking about
     // blocks we did not have. The one shipped seed proven on the live
     // chain with full history.
-    "89.85.40.184:19335",
+    //
+    // ── MEASURED DEAD 2026-10-01, so it leaves the list ─────────────────────
+    // Probed from this project's Mac at 17:18Z: three TCP attempts, four
+    // seconds apart, eight-second timeout, refused on all three. Corroborated
+    // by the easybtx.com census, which lists this seed as down with 0% uptime
+    // over its stored history. Its noban grant in BTX_LIVE_BODY_SOURCE_IPS
+    // stays, as the two retired above kept theirs. Put it back the day a real
+    // node handshakes it again, with that reading.
+    //
+    //   "89.85.40.184:19335"  0/3 refused — 2026-10-01
     // 139.59.106.83 REMOVED 2026-09-01. Three independent confirmations that it
     // sits on a stale branch: an operator caught it serving header 8b4842ee at
     // height 204,615 where the canonical block is e19acc35 (Byron and our own
@@ -152,7 +161,14 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // tip; its BODIES were valid, which is exactly why it looked healthy. A
     // seed that wedges fresh header presync is disqualified regardless.
     // 2026-09-05 19:49Z: answered at 210872 on the minority branch; NETWORK.
-    "194.93.48.158:19335",
+    //
+    // ── MEASURED DEAD 2026-10-01, so it leaves the list ─────────────────────
+    // The same probe from this project's Mac at 17:18Z: 0/3, refused. The
+    // easybtx.com census last reached it around 2026-09-26 (22% uptime over
+    // its stored history). Put it back the day a real node handshakes it
+    // again, with that reading.
+    //
+    //   "194.93.48.158:19335"  0/3 refused — 2026-10-01
     // Operator node, at tip, open inbound, consented to being a seed 2026-09-01
     // with the honest caveat that it is a rented box he cannot promise forever.
     // A retired seed costs one failed dial; the checkpoint gate (planned) makes
@@ -7378,8 +7394,13 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
         // 20 s, and it is the one consenting seed the easybtx.com census has
         // measured on the heaviest chain all week. 37.230.134.222 has refused
         // every connection since 2026-09-12 23:31Z (btxd's own log).
+        // 2026-10-01: the head moved to 109.199.124.187. 89.85.40.184 and
+        // 194.93.48.158 refused three TCP dials each from the Mac at 17:18Z,
+        // and the easybtx.com census lists both as down. What justifies the
+        // new head: the same probe connected 3/3, and the census measures it
+        // at the tip on /BTX:0.34.12/ the same hour (seed d942).
         assert!(
-            BTX_BOOTSTRAP_PEERS[0].starts_with("89.85.40.184:"),
+            BTX_BOOTSTRAP_PEERS[0].starts_with("109.199.124.187:"),
             "head is {} — if a seed was retired, move this with it and say \
              what measurement justified the new head",
             BTX_BOOTSTRAP_PEERS[0]
@@ -7658,10 +7679,12 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
         // 2026-09-13: 4 became 3 — 37.230.134.222 refused every connection
         // from btxscan's real node since 09-12 23:31Z; it keeps its seat in
         // BTX_ARCHIVE_PEERS and leaves the head.
+        // 2026-10-01: 3 became 1 — 89.85.40.184 and 194.93.48.158 refused
+        // three TCP dials each from the Mac and are down in the census.
         assert_eq!(
             BTX_BOOTSTRAP_PEERS.len(),
-            3,
-            "BTX_BOOTSTRAP_PEERS should have 3 entries"
+            1,
+            "BTX_BOOTSTRAP_PEERS should have 1 entry"
         );
     }
 
