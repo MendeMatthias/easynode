@@ -38,6 +38,12 @@ export type ValidationInput = {
    */
   gpu_start_hung?: boolean;
   /**
+   * How the app names this machine's GPU: "graphics chip" on a Mac,
+   * "graphics card" elsewhere (btx_core::node::graphics_word). Absent from an
+   * older backend, which reads as "graphics card".
+   */
+  graphics_word?: string;
+  /**
    * Archive peers passing the trusted-mirror authority gate (manual or noban),
    * or null when unknown (node stopped / didn't answer / older backend). On a
    * mirror, 0 here is the root cause of the silent-stall class: the node will
@@ -171,12 +177,14 @@ export function validationView(status: ValidationInput): ValidationView {
     // the proof of work at all, which is not what happened, and not say the
     // way back.
     if (status.gpu_start_hung) {
+      const word = status.graphics_word ?? "graphics card";
+      const short = word.replace(/^graphics /, "");
       return {
         state: "Mirror",
         note:
-          "This machine's graphics card did not finish the engine's start-up check, so this " +
+          `This machine's ${word} did not finish the engine's start-up check, so this ` +
           "node follows signatures for now: it keeps up using signed confirmations from a node " +
-          "that does check the proof of work. Check blocks in Settings tries the card again.",
+          `that does check the proof of work. Check blocks in Settings tries the ${short} again.`,
         cls: "is-degraded",
       };
     }

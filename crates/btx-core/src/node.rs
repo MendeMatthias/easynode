@@ -2189,17 +2189,31 @@ pub fn gpu_start_hung(datadir: &Path) -> bool {
     gpu_start_hung_path(datadir).exists()
 }
 
+/// How the app names this host's GPU to a person: a Mac's is its "graphics
+/// chip", as the chip notice and the Block checking card say; anything else
+/// is a "graphics card" (final review M7).
+pub fn graphics_word(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Metal => "graphics chip",
+        _ => "graphics card",
+    }
+}
+
 /// Record the hang so the next launch follows signatures. Best-effort, like
 /// the refusal marker: an unwritable datadir costs one more slow start.
-pub fn record_gpu_start_hung(datadir: &Path) {
+pub fn record_gpu_start_hung(datadir: &Path, backend: Backend) {
     let path = gpu_start_hung_path(datadir);
+    let word = graphics_word(backend);
+    let short = word.trim_start_matches("graphics ");
     if let Err(e) = std::fs::write(
         &path,
-        "This machine's graphics card did not finish the node engine's start-up\n\
-         check: the engine waited on the card and never opened its connection\n\
-         for the app. So the app starts this node following signatures instead\n\
-         of checking blocks. Choosing \"check blocks\" in Settings deletes this\n\
-         file and tries the card again, and so does an engine update.\n",
+        format!(
+            "This machine's {word} did not finish the node engine's start-up\n\
+             check: the engine waited on the {short} and never opened its connection\n\
+             for the app. So the app starts this node following signatures instead\n\
+             of checking blocks. Choosing \"check blocks\" in Settings deletes this\n\
+             file and tries the {short} again, and so does an engine update.\n"
+        ),
     ) {
         eprintln!("[node] could not write {}: {e}", path.display());
     }
@@ -5954,7 +5968,7 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
         assert!(!gpu_start_hung(dir));
         assert!(!host_follows_signatures(btxd, dir, Backend::Cuda));
 
-        record_gpu_start_hung(dir);
+        record_gpu_start_hung(dir, Backend::Cuda);
         assert!(gpu_start_hung(dir));
         let text = std::fs::read_to_string(dir.join(".gpu-start-hung")).unwrap();
         assert!(text.contains("graphics card"), "{text}");
@@ -5999,9 +6013,24 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
     #[test]
     fn full_check_at_setup_clears_the_hung_record() {
         let tmp = tempfile::tempdir().expect("temp datadir");
-        record_gpu_start_hung(tmp.path());
+        record_gpu_start_hung(tmp.path(), Backend::Cuda);
         apply_start_choice(tmp.path(), StartChoice::FullCheck, true).unwrap();
         assert!(!gpu_start_hung(tmp.path()));
+    }
+
+    /// A Mac's GPU is a "graphics chip" everywhere else in the app, an
+    /// NVIDIA one a "graphics card" (final review M7).
+    #[test]
+    fn the_graphics_hardware_is_named_as_the_app_names_it() {
+        assert_eq!(graphics_word(Backend::Metal), "graphics chip");
+        assert_eq!(graphics_word(Backend::Cuda), "graphics card");
+        assert_eq!(graphics_word(Backend::Cpu), "graphics card");
+        let tmp = tempfile::tempdir().expect("temp datadir");
+        record_gpu_start_hung(tmp.path(), Backend::Metal);
+        let text = std::fs::read_to_string(tmp.path().join(".gpu-start-hung")).unwrap();
+        assert!(text.contains("graphics chip"), "{text}");
+        assert!(text.contains("tries the chip again"), "{text}");
+        assert!(!text.contains("card"), "{text}");
     }
 
     /// The launch keeps the arguments it passed, so the app can ask whether

@@ -238,6 +238,8 @@ interface NodeStatusInfo {
    *  node to following signatures (validation.ts says why; Settings' switch
    *  tries the card again). */
   gpu_start_hung: boolean;
+  /** "graphics chip" on a Mac, "graphics card" elsewhere. */
+  graphics_word: string;
   /** How far the background check of the snapshot's older history has got;
    *  null when there is none running. */
   history_check: HistoryCheck | null;

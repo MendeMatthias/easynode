@@ -316,6 +316,19 @@ describe("a machine whose graphics card hung the engine's start-up check (0.7.1)
     expect(v.note.includes(String.fromCharCode(0x2014))).toBe(false); // no em-dash
   });
 
+  it("says chip on a Mac, as the rest of the app does", () => {
+    const v = validationView({
+      ...base,
+      rc_mode: "strict-device",
+      rc_trusted_mirror: true,
+      gpu_start_hung: true,
+      graphics_word: "graphics chip",
+    });
+    expect(v.note).toMatch(/This machine's graphics chip did not finish/);
+    expect(v.note).toMatch(/tries the chip again/);
+    expect(v.note).not.toMatch(/card/);
+  });
+
   it("keeps the plain mirror note where the card did not hang", () => {
     const v = validationView({ ...base, rc_mode: "strict-device", rc_trusted_mirror: true });
     expect(v.note).not.toMatch(/start-up check/);

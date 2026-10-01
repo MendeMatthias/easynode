@@ -520,9 +520,14 @@ const NO_RPC_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10
 /// answers ends in the GPU fallback, not an endless "Starting".
 const GPU_CHECK_EXTRA_POLLS: u32 = 840;
 
-/// What the window says during that extension.
-const GPU_CHECK_WARMING: &str = "Your node is checking this machine's graphics card before it \
-                                 opens. On some machines this takes several minutes.";
+/// What the window says during that extension. `word` is
+/// `btx_core::node::graphics_word`: chip on a Mac, card elsewhere.
+fn gpu_check_warming(word: &str) -> String {
+    format!(
+        "Your node is checking this machine's {word} before it opens. On some machines this \
+         takes several minutes."
+    )
+}
 
 /// Whether the launch loop gives this launch [`GPU_CHECK_EXTRA_POLLS`]: it
 /// runs the GPU check (`btx_core::node::launch_runs_gpu_check`, final review
@@ -691,9 +696,14 @@ fn stopped_since(gen_at_start: u64, gen_now: u64) -> bool {
 /// a process that will never go.
 const DRIVER_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// What the window says during that minute.
-const DRIVER_RELEASE_WARMING: &str = "The graphics card is slow to let go of the stopped node. \
-                                      Waiting up to a minute before starting it again.";
+/// What the window says during that minute (`word` as for
+/// [`gpu_check_warming`]).
+fn driver_release_warming(word: &str) -> String {
+    format!(
+        "The {word} is slow to let go of the stopped node. Waiting up to a minute before \
+         starting it again."
+    )
+}
 
 /// After a start stuck in the GPU check whose btxd outlived the kill: gone
 /// by the end of [`DRIVER_RELEASE_WAIT`] is the mirror attempt, still there
@@ -708,9 +718,14 @@ fn after_driver_wait(alive_after_kill: bool, alive_after_wait: bool) -> AfterNoR
 
 /// The error for [`AfterNoRpcTimeout::RestartComputer`]. One sentence, on
 /// purpose: nothing in the app can free a process the graphics driver holds,
-/// and the next start after a restart follows signatures by itself.
-const GPU_HOLDS_NODE_ERROR: &str = "the graphics card stopped answering and is holding the node, \
-                                    so restart the computer, then press Start.";
+/// and the next start after a restart follows signatures by itself. `word`
+/// as for [`gpu_check_warming`].
+fn gpu_holds_node_error(word: &str) -> String {
+    format!(
+        "the {word} stopped answering and is holding the node, so restart the computer, then \
+         press Start."
+    )
+}
 
 /// Record or withdraw the owner's choice to follow signatures, as Settings
 /// sends it. Withdrawing it ("check blocks") also clears the record of a
@@ -1803,6 +1818,8 @@ async fn spawn_node_with_lock_retry(
         // arguments it actually passed, for the GPU-hang fallback below.
         let gpu_check_launch =
             btx_core::node::launch_runs_gpu_check(node_backend(), controller.launch_args());
+        // "graphics chip" on a Mac, "graphics card" elsewhere (final review M7).
+        let gpu_word = btx_core::node::graphics_word(node_backend());
         // Park the controller in the shared slot BEFORE the survival watch so
         // a quit landing inside the watch still finds — and gracefully stops —
         // the child instead of orphaning it.
@@ -1872,13 +1889,13 @@ async fn spawn_node_with_lock_retry(
             if extends_for_gpu_check(gpu_check_launch, &wait, slot_empty, stage) {
                 let extra_secs = GPU_CHECK_EXTRA_POLLS as u64 * RPC_WAIT_POLL_MS / 1000;
                 let msg = format!(
-                    "the node engine is still in its graphics card check after {waited_secs}s; \
+                    "the node engine is still in its {gpu_word} check after {waited_secs}s; \
                      waiting up to {extra_secs}s more before deciding"
                 );
                 eprintln!("[node-app] {msg}");
                 setup_log(datadir, &msg);
                 let note = NodePhase::Warming {
-                    message: GPU_CHECK_WARMING.to_string(),
+                    message: gpu_check_warming(gpu_word),
                 };
                 set_phase(app, state, note.clone()).await;
                 let node_slot = state.node.clone();
@@ -1960,7 +1977,7 @@ async fn spawn_node_with_lock_retry(
                         // a minute, still from the slot, before a restart of
                         // the computer is asked for (final review I1).
                         let note = NodePhase::Warming {
-                            message: DRIVER_RELEASE_WARMING.to_string(),
+                            message: driver_release_warming(gpu_word),
                         };
                         set_phase(app, state, note.clone()).await;
                         let gone = c.wait_after_kill(DRIVER_RELEASE_WAIT).await;
@@ -1978,7 +1995,7 @@ async fn spawn_node_with_lock_retry(
                     *slot = None;
                     drop(slot);
                     if next != AfterNoRpcTimeout::Fail {
-                        btx_core::node::record_gpu_start_hung(datadir);
+                        btx_core::node::record_gpu_start_hung(datadir, node_backend());
                         // The next launch is a mirror, and a mirror holds no
                         // key: the key line written for the validating
                         // launch comes out, as after the Mac's refusal.
@@ -1995,11 +2012,11 @@ async fn spawn_node_with_lock_retry(
                     match next {
                         AfterNoRpcTimeout::RetryAsMirror => {
                             let msg = format!(
-                                "This machine's graphics card did not finish the node \
-                                 engine's start-up check in {waited_secs}s, so the node was \
-                                 stopped and now starts following signatures (attempt \
+                                "This machine's {gpu_word} did not finish the node engine's \
+                                 start-up check in {waited_secs}s, so the node was stopped and \
+                                 now starts following signatures (attempt \
                                  {attempt}/{LAUNCH_ATTEMPTS}). Check blocks in Settings tries \
-                                 the card again."
+                                 it again."
                             );
                             eprintln!("[node-app] {msg}");
                             setup_log(datadir, &msg);
@@ -2014,14 +2031,15 @@ async fn spawn_node_with_lock_retry(
                             continue;
                         }
                         AfterNoRpcTimeout::RestartComputer => {
-                            let msg = "This machine's graphics card did not finish the node \
-                                       engine's start-up check, and the stopped node is still \
-                                       held by the graphics driver, so nothing new was started. \
-                                       After a restart of the computer the node follows \
-                                       signatures.";
+                            let msg = format!(
+                                "This machine's {gpu_word} did not finish the node engine's \
+                                 start-up check, and the stopped node is still held by the \
+                                 graphics driver, so nothing new was started. After a restart \
+                                 of the computer the node follows signatures."
+                            );
                             eprintln!("[node-app] {msg}");
-                            setup_log(datadir, msg);
-                            return Err(GPU_HOLDS_NODE_ERROR.to_string());
+                            setup_log(datadir, &msg);
+                            return Err(gpu_holds_node_error(gpu_word));
                         }
                         AfterNoRpcTimeout::Fail => {}
                     }
@@ -3698,6 +3716,9 @@ pub struct NodeStatusInfo {
     /// The Block checking card says why, and the Settings switch shows so the
     /// owner can try the card again.
     pub gpu_start_hung: bool,
+    /// How the window names this machine's GPU: "graphics chip" on a Mac,
+    /// "graphics card" elsewhere (`btx_core::node::graphics_word`).
+    pub graphics_word: String,
     /// Bytes this node has uploaded to peers this run (`getnettotals`).
     ///
     /// Feeds the "Helping the network" card: chain data other people actually
@@ -4244,6 +4265,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         full_check_first: full_check_first(),
         chip_refused: btx_core::node::matmul_consensus_was_refused(&datadir),
         gpu_start_hung: btx_core::node::gpu_start_hung(&datadir),
+        graphics_word: btx_core::node::graphics_word(setup_backend()).to_string(),
         archive_peers,
         stall,
         node_profile: settings.node_profile.clone(),
@@ -9248,8 +9270,9 @@ mod signed_start_tests {
 mod launch_wait_tests {
     use super::{
         after_driver_wait, after_no_rpc_timeout, after_rpc_wait, apply_follow_signatures_choice,
-        exit_when, extends_for_gpu_check, rpc_timeout_error, stop_needs_no_rpc, stopped_since,
-        AfterNoRpcTimeout, AfterRpcWait, GPU_HOLDS_NODE_ERROR,
+        driver_release_warming, exit_when, extends_for_gpu_check, gpu_check_warming,
+        gpu_holds_node_error, rpc_timeout_error, stop_needs_no_rpc, stopped_since,
+        AfterNoRpcTimeout, AfterRpcWait,
     };
     use btx_core::node::NoRpcStop;
     use btx_core::setup::RpcWait;
@@ -9552,12 +9575,29 @@ mod launch_wait_tests {
             after_no_rpc_timeout(true, Some(NoRpcStop::StillRunning), None),
             AfterNoRpcTimeout::RestartComputer
         );
-        let msg = GPU_HOLDS_NODE_ERROR;
+        let msg = gpu_holds_node_error("graphics card");
         assert!(msg.contains("graphics card"), "{msg}");
         assert!(msg.contains("restart the computer"), "{msg}");
         assert!(msg.contains("press Start"), "{msg}");
         assert_eq!(msg.matches(". ").count(), 0, "one sentence: {msg}");
         assert!(!msg.contains('\u{2014}'), "em-dash in: {msg}");
+    }
+
+    /// A Mac's GPU is its "graphics chip" in the app's other sentences, so
+    /// these say chip there and card on an NVIDIA machine (final review M7).
+    #[test]
+    fn the_gpu_sentences_name_the_hardware_as_the_app_does() {
+        for word in ["graphics chip", "graphics card"] {
+            for s in [
+                gpu_holds_node_error(word),
+                gpu_check_warming(word),
+                driver_release_warming(word),
+            ] {
+                assert!(s.contains(word), "{s}");
+                assert!(!s.contains('\u{2014}'), "em-dash in: {s}");
+            }
+        }
+        assert!(!gpu_check_warming("graphics chip").contains("card"));
     }
 
     /// A btxd on a wedged NVIDIA card can take well over the kill's 5 s to
@@ -9592,7 +9632,7 @@ mod launch_wait_tests {
             .find(".wait_after_kill(DRIVER_RELEASE_WAIT)")
             .unwrap();
         let decide = spawn_fn.find("after_driver_wait(").unwrap();
-        let held = spawn_fn.find("return Err(GPU_HOLDS_NODE_ERROR").unwrap();
+        let held = spawn_fn.find("return Err(gpu_holds_node_error(").unwrap();
         assert!(kill < wait && wait < decide && decide < held);
     }
 
@@ -9683,14 +9723,14 @@ mod launch_wait_tests {
     fn check_blocks_in_settings_clears_the_hung_record_too() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        btx_core::node::record_gpu_start_hung(dir);
+        btx_core::node::record_gpu_start_hung(dir, btx_core::backend::Backend::Cuda);
         apply_follow_signatures_choice(dir, false).unwrap();
         assert!(!btx_core::node::gpu_start_hung(dir));
         assert!(!btx_core::node::follows_signatures_by_choice(dir));
 
         // Choosing to follow signatures leaves the record alone and adds the
         // choice.
-        btx_core::node::record_gpu_start_hung(dir);
+        btx_core::node::record_gpu_start_hung(dir, btx_core::backend::Backend::Cuda);
         apply_follow_signatures_choice(dir, true).unwrap();
         assert!(btx_core::node::gpu_start_hung(dir));
         assert!(btx_core::node::follows_signatures_by_choice(dir));
@@ -9717,7 +9757,9 @@ mod launch_wait_tests {
         let stuck = spawn_fn
             .find("stuck_in_gpu_check(gpu_check_launch, &since)")
             .unwrap();
-        let record = spawn_fn.find("record_gpu_start_hung(datadir)").unwrap();
+        let record = spawn_fn
+            .find("record_gpu_start_hung(datadir, node_backend())")
+            .unwrap();
         assert!(stuck < record);
         let signer = spawn_fn[record..]
             .find("signer_after_chip_refusal(")
@@ -9727,7 +9769,7 @@ mod launch_wait_tests {
             signer < retry,
             "the key line leaves before the mirror attempt"
         );
-        assert!(spawn_fn.contains("GPU_HOLDS_NODE_ERROR"));
+        assert!(spawn_fn.contains("gpu_holds_node_error("));
 
         let start_fn = src
             .split("pub(crate) async fn start_node_inner(")
