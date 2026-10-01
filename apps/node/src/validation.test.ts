@@ -238,6 +238,22 @@ describe("classified stall verdicts", () => {
     expect(v.note).toContain("signed confirmations");
   });
 
+  it("shows the signer-key verdict like every other class", () => {
+    const summary =
+      "signatures are reaching this node, but none come from a key it trusts, so it " +
+      "cannot move. Updating easyNode brings the current key list; if it is already up " +
+      "to date, the keys it trusts may have stopped signing for now";
+    const v = validationView({
+      ...base,
+      rc_mode: "strict-device",
+      rc_trusted_mirror: true,
+      stall: { class: "pins_reject_every_signature", summary },
+    });
+    expect(v.state).toBe("Needs attention");
+    expect(v.cls).toBe("is-stalled");
+    expect(v.note).toBe(summary);
+  });
+
   it("null stall changes nothing", () => {
     const v = validationView({
       ...base,

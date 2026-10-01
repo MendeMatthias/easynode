@@ -277,7 +277,10 @@ interface NodeStatusInfo {
    * node the catch-up help's conclusion that no archive peer serves old
    * blocks to it (null = healthy / no verdict). class is one of
    * "body_missing" | "block_fetch_gated" | "attestation_missing" |
-   * "no_qualifying_peer" | "msghand_spin" | "old_blocks_refused".
+   * "no_qualifying_peer" | "msghand_spin" | "old_blocks_refused" |
+   * "pins_reject_every_signature" (signatures arrive and the node accepts
+   * none of them: its signer key list is out of date, or the keys it trusts
+   * stopped signing). Every class renders the same way, from `summary`.
    */
   stall: { class: string; summary: string } | null;
   /** The user's node profile CHOICE ("full" | "keeper"). */

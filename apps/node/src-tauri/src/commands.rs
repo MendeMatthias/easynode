@@ -1411,6 +1411,7 @@ pub(crate) async fn start_node_held(app: &AppHandle, state: &AppState) -> Result
     state.peer_nicknames_cache.lock().await.clear();
     *state.archive_service.lock().await = None;
     *state.matmul_trusted.lock().await = None;
+    *state.signature_window.lock().await = Default::default();
     *state.signed_frontier.lock().await = None;
     *state.catch_up_help.lock().await = Default::default();
     *state.recent_signers.lock().await = None;
@@ -2268,6 +2269,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
     let nickname_slot = state.peer_nicknames_cache.clone();
     let archive_service_slot = state.archive_service.clone();
     let matmul_trusted_slot = state.matmul_trusted.clone();
+    let signature_window_slot = state.signature_window.clone();
     let signed_frontier_slot = state.signed_frontier.clone();
     let catch_up_slot = state.catch_up_help.clone();
     let recent_signers_slot = state.recent_signers.clone();
@@ -2591,6 +2593,12 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     // stranded on another branch, and the signed frontier is
                     // the witness that sees it. Only a successful answer
                     // overwrites the slot, as with the trusted status below.
+                    //
+                    // The signature counters from THIS tick's trusted status,
+                    // `None` when it did not answer: the fork tick below
+                    // samples them, and a missed answer must not enter the
+                    // window as a stale reading at a new time.
+                    let signature_counters: Option<(u64, u64, u64)>;
                     {
                         let serving =
                             NodeAppSettings::load(&node_datadir()).attestation_serve_enabled;
@@ -2624,6 +2632,9 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         let trusted_status = btx_core::node_api::get_matmul_trusted_status(&rpc)
                             .await
                             .ok();
+                        signature_counters = trusted_status
+                            .as_ref()
+                            .map(|s| (s.accepted, s.rejected, s.duplicates));
                         let has_local_signer =
                             trusted_status.as_ref().is_some_and(|s| s.local_signer);
                         // Whether to keep the signer window, decided ONLY on a
@@ -2712,6 +2723,20 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         }
                         fork_tick = fork_tick.wrapping_add(1);
                         if fork_tick % FORK_CHECK_EVERY == 1 {
+                            // The signature window (btx_core::watchdog::
+                            // SignatureWindow), on this slow tick: 45 samples
+                            // 30 s apart hold ~22 minutes, past the watchdog's
+                            // 15-minute verdict. No extra RPC: the counters
+                            // are this tick's trusted status.
+                            if let Some((accepted, rejected, duplicates)) = signature_counters {
+                                signature_window_slot.lock().await.push(
+                                    gen,
+                                    run_started.elapsed().as_secs(),
+                                    accepted,
+                                    rejected,
+                                    duplicates,
+                                );
+                            }
                             if !refusal_done.load(Ordering::SeqCst)
                                 && !refusal_in_flight.swap(true, Ordering::SeqCst)
                             {
@@ -2982,9 +3007,61 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                                 // the remediable ones, classify without it.
                                 cpu_pct_one_core: None,
                                 trusted_mirror: true,
+                                // The engine's signature counters over the
+                                // window, sampled on the fork tick from the
+                                // status this refresher already fetches. Sees
+                                // the node that hears signatures and accepts
+                                // none, which reads as "at the frontier"
+                                // above; see StallFacts::signatures.
+                                signatures: {
+                                    let deltas = signature_window_slot.lock().await.deltas();
+                                    let live_pin = matmul_trusted_slot
+                                        .lock()
+                                        .await
+                                        .as_ref()
+                                        .map(|s| s.trusted_signer_pubkeys.clone())
+                                        .unwrap_or_default();
+                                    let dd = node_datadir();
+                                    let outcome =
+                                        NodeAppSettings::load(&dd).last_update_check_outcome;
+                                    signature_evidence(deltas, &live_pin, &dd, outcome.as_deref())
+                                },
                             };
                             let verdict = btx_core::watchdog::discriminate(&facts);
-                            if let Some(v) = verdict.as_ref() {
+                            let key_mismatch = verdict.as_ref().is_some_and(|v| {
+                                v.class == btx_core::watchdog::StallClass::PinsRejectEverySignature
+                            });
+                            if key_mismatch {
+                                // The redial below runs for this verdict only
+                                // with no authority peer (watchdog_redials).
+                                // The app never touches btx_rw.conf or the
+                                // conf. One line when the verdict first
+                                // appears, not every tick.
+                                let shown_before =
+                                    stall_slot.lock().await.as_ref().is_some_and(|v| {
+                                        v.class
+                                        == btx_core::watchdog::StallClass::PinsRejectEverySignature
+                                    });
+                                if !shown_before {
+                                    let ev = facts.signatures.as_ref();
+                                    eprintln!(
+                                        "[node-app] watchdog: PinsRejectEverySignature after {}s frozen at {:?}: accepted +{} rejected +{} over {}s, {} shipped key(s) not pinned, {} authority peer(s)",
+                                        frozen_secs,
+                                        heights,
+                                        ev.map_or(0, |e| e.accepted_delta),
+                                        ev.map_or(0, |e| e.rejected_delta),
+                                        ev.map_or(0, |e| e.span_secs),
+                                        ev.map_or(0, |e| e.shipped_keys_missing),
+                                        facts
+                                            .archive_authority
+                                            .map_or("unknown".to_string(), |n| n.to_string()),
+                                    );
+                                }
+                            }
+                            if let Some(v) = verdict
+                                .as_ref()
+                                .filter(|v| watchdog_redials(v, facts.archive_authority))
+                            {
                                 // Remediation — the ONE automated action, from
                                 // the one mechanism with a production receipt
                                 // (archive handshake → unstuck in 21 s): dial
@@ -3304,6 +3381,57 @@ fn shown_stall(
     }
 }
 
+/// Whether the watchdog's archive redial runs for this verdict. Every class
+/// as before, except `PinsRejectEverySignature`: peers are already handing
+/// that node signatures and it refuses them all, so another peer changes
+/// nothing, UNLESS no authority peer is connected at all. Then a redial
+/// costs nothing and may bring a peer that relays signatures from a key the
+/// node does pin, so it is kept.
+fn watchdog_redials(
+    v: &btx_core::watchdog::StallVerdict,
+    archive_authority: Option<usize>,
+) -> bool {
+    v.class != btx_core::watchdog::StallClass::PinsRejectEverySignature
+        || archive_authority == Some(0)
+}
+
+/// The watchdog's signature fact (`StallFacts::signatures`): the window's
+/// deltas, plus what this app can see about why every signature might be
+/// refused. Which of this app's shipped keys the engine's live pin lacks,
+/// which file in the node folder explains that (read with the same readers
+/// the launch uses, never edited), and whether the last update check found a
+/// newer easyNode. `None` until the window spans two samples.
+fn signature_evidence(
+    deltas: Option<btx_core::watchdog::SignatureDeltas>,
+    live_pin: &[String],
+    datadir: &std::path::Path,
+    last_update_outcome: Option<&str>,
+) -> Option<btx_core::watchdog::SignatureEvidence> {
+    use btx_core::watchdog::{FASTSTART_CONF, RW_CONF};
+    let d = deltas?;
+    let missing = btx_core::watchdog::shipped_keys_missing(live_pin);
+    let missing_explained_by = if missing.is_empty() {
+        None
+    } else {
+        btx_core::watchdog::where_missing_keys_are_set(
+            &missing,
+            &btx_core::node::rw_conf_pins(&datadir.join(RW_CONF)),
+            &btx_core::node::conf_pins(&datadir.join(FASTSTART_CONF)),
+        )
+    };
+    Some(btx_core::watchdog::SignatureEvidence {
+        accepted_delta: d.accepted,
+        rejected_delta: d.rejected,
+        duplicates_delta: d.duplicates,
+        span_secs: d.span_secs,
+        shipped_keys_missing: missing.len(),
+        missing_explained_by,
+        // `found` is followed by `install-failed` when the install did not
+        // land; either way a newer build with a newer key list exists.
+        update_known: matches!(last_update_outcome, Some("found" | "install-failed")),
+    })
+}
+
 /// May the attached-mode stop path actually stop the node it is attached to?
 ///
 /// `None` is "we spawned it" (nothing was ever attached), which is ours.
@@ -3477,6 +3605,7 @@ pub async fn stop_node_inner(state: &AppState) {
     state.peer_nicknames_cache.lock().await.clear();
     *state.archive_service.lock().await = None;
     *state.matmul_trusted.lock().await = None;
+    *state.signature_window.lock().await = Default::default();
     *state.signed_frontier.lock().await = None;
     *state.catch_up_help.lock().await = Default::default();
     *state.fork.lock().await = None;
@@ -7438,6 +7567,98 @@ mod tests {
         .is_none());
     }
 
+    /// What the watchdog is told about the signatures, from the window, the
+    /// engine's live pin, the node folder's files and the last update check.
+    #[test]
+    fn the_signature_evidence_reads_the_pin_the_files_and_the_update_check() {
+        use btx_core::node::BTX_TRUSTED_ATTESTATION_PUBKEYS as SHIPPED;
+        use btx_core::watchdog::SignatureDeltas;
+        let dir = tempfile::tempdir().unwrap();
+        let deltas = SignatureDeltas {
+            accepted: 0,
+            rejected: 5_750,
+            duplicates: 0,
+            span_secs: 900,
+        };
+        let all: Vec<String> = SHIPPED.iter().map(|k| k.to_string()).collect();
+
+        // No window yet: no evidence, whatever else holds.
+        assert_eq!(
+            super::signature_evidence(None, &all, dir.path(), Some("found")),
+            None
+        );
+
+        let ev = super::signature_evidence(Some(deltas), &all, dir.path(), None).unwrap();
+        assert_eq!(
+            (ev.accepted_delta, ev.rejected_delta, ev.span_secs),
+            (0, 5_750, 900)
+        );
+        assert_eq!(ev.shipped_keys_missing, 0);
+        assert_eq!(ev.missing_explained_by, None);
+        assert!(!ev.update_known);
+
+        // An update is known only when the last check found one.
+        for (outcome, known) in [
+            ("found", true),
+            ("install-failed", true),
+            ("no-update", false),
+            ("check-failed", false),
+            ("installed", false),
+        ] {
+            let ev =
+                super::signature_evidence(Some(deltas), &all, dir.path(), Some(outcome)).unwrap();
+            assert_eq!(ev.update_known, known, "{outcome}");
+        }
+
+        // The engine dropped the key btx_rw.conf pins: that file is named,
+        // and read only (its text is left exactly as it was).
+        let rw = format!("matmultrustedpubkey={}\n", SHIPPED[3]);
+        std::fs::write(dir.path().join("btx_rw.conf"), &rw).unwrap();
+        let live: Vec<String> = all[..3].to_vec();
+        let ev = super::signature_evidence(Some(deltas), &live, dir.path(), None).unwrap();
+        assert_eq!(ev.shipped_keys_missing, 1);
+        assert_eq!(ev.missing_explained_by, Some("btx_rw.conf"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("btx_rw.conf")).unwrap(),
+            rw
+        );
+        // In the conf instead.
+        std::fs::remove_file(dir.path().join("btx_rw.conf")).unwrap();
+        std::fs::create_dir_all(dir.path().join("faststart")).unwrap();
+        std::fs::write(dir.path().join("faststart").join("faststart.conf"), &rw).unwrap();
+        let ev = super::signature_evidence(Some(deltas), &live, dir.path(), None).unwrap();
+        assert_eq!(ev.missing_explained_by, Some("faststart/faststart.conf"));
+    }
+
+    /// The archive redial runs for every verdict as before, except the key
+    /// verdict, where it runs only with no authority peer at all: there a
+    /// redial costs nothing and may bring a peer that relays signatures from
+    /// a key this node does pin. With authority peers already connected and
+    /// relaying, another dial changes nothing.
+    #[test]
+    fn the_key_verdict_redials_only_when_no_authority_peer_is_connected() {
+        use btx_core::watchdog::{StallClass, StallVerdict};
+        let v = |class| StallVerdict {
+            class,
+            summary: "".into(),
+        };
+        let keys = v(StallClass::PinsRejectEverySignature);
+        assert!(super::watchdog_redials(&keys, Some(0)));
+        assert!(!super::watchdog_redials(&keys, Some(3)));
+        assert!(!super::watchdog_redials(&keys, None));
+        for class in [
+            StallClass::BodyMissing,
+            StallClass::BlockFetchGated,
+            StallClass::AttestationMissing,
+            StallClass::NoQualifyingPeer,
+            StallClass::MsghandSpin,
+        ] {
+            for authority in [None, Some(0), Some(3)] {
+                assert!(super::watchdog_redials(&v(class), authority), "{class:?}");
+            }
+        }
+    }
+
     /// The owner's decision 1: while the help concludes that no archive peer
     /// serves old blocks, the card says so on any node, ahead of the
     /// watchdog's own verdict. Otherwise the watchdog's verdict shows as
@@ -7450,7 +7671,7 @@ mod tests {
         use btx_core::watchdog::{old_blocks_refused_verdict, StallClass, StallVerdict};
         let watchdog = Some(StallVerdict {
             class: StallClass::BlockFetchGated,
-            summary: "the watchdog's own sentence",
+            summary: "the watchdog's own sentence".into(),
         });
         let refused = Some(old_blocks_refused_verdict());
         assert_eq!(super::shown_stall(true, false, watchdog.clone()), refused);

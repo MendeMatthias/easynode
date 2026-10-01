@@ -507,6 +507,8 @@ pub async fn tools_diagnostics(
         )),
         // Kept after the check is done, current or not: the report says which.
         start_record: btx_core::snapshot_start::read(&datadir),
+        // The refresher's window, held for this run only.
+        signature_window: state.signature_window.lock().await.deltas(),
         ..Default::default()
     };
     let mut answering = None;
@@ -538,11 +540,14 @@ pub async fn tools_diagnostics(
         input.peers = api::get_peer_info(rpc).await.unwrap_or_default();
         input.attested_tip = api::get_attested_tip(rpc).await.ok();
         let trusted = api::get_matmul_trusted_status(rpc).await.ok();
-        input.role = match trusted {
+        input.role = match &trusted {
             Some(t) if t.trusted_mirror => "follows signatures".into(),
             Some(t) => format!("checks blocks itself ({})", t.matmul_validation_mode),
             None => "unknown".into(),
         };
+        // The same answer feeds the Signatures block: the live pin and the
+        // engine's signature counters.
+        input.trusted = trusted;
         for h in btx_core::known_invalid::HELD_BRANCHES {
             let on_chain = rpc
                 .call("getblockhash", json!([h.height]))

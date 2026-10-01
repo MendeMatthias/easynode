@@ -8,32 +8,50 @@ root).
 
 ## [Unreleased]
 
+**A node that hears signatures but trusts none of them now says so.**
+A node that follows signatures only moves when a key it trusts has signed the
+next block. If its list of trusted keys is out of date, signatures keep
+arriving, the node turns every one of them away, and it stops. Until now
+nothing on screen said so. Thanks to the operator who reported it.
+
+- After 15 minutes without moving, with signatures arriving and none accepted,
+  the status screen says what is happening. If an update is waiting, it says the
+  update may bring a newer key list. If not, it says the keys this node trusts
+  may have stopped signing for now.
+- If the node is missing one of the keys this app ships, the screen also names
+  the file in the node folder where that is set. The app does not change that
+  file itself.
+- **Copy diagnostics** in Tools now has a Signatures part: the trusted keys,
+  any shipped key that is missing or blocked, and how many signatures were
+  accepted and turned away.
+
 ## [0.7.1] - 2026-10-01
 
-**A node that cannot start now says why, tries again, and keeps running if the graphics card is the problem.**
-Some nodes on 0.7.0 stopped and then never started again, showing only "the
-node's RPC never became reachable (no .cookie yet)". The node engine checks the
-graphics card before it opens the connection this app talks to, and that check
-takes from a few seconds to a few minutes. If the engine stopped or got stuck
-after the first five seconds, the app did not notice: it waited three minutes,
-gave no reason, and did not try again.
+**A node that stops while starting now tells you why, and gets going again on its own.**
+A few nodes on 0.7.0 stopped after running for a while and then would not start
+again. The screen only said "the node's RPC never became reachable (no .cookie
+yet)", and pressing Start did not help. Thanks to the operators who reported it.
 
-- The app now watches the engine for the whole start. If the engine stops, the
-  app reads its log at once, tells you the reason in plain words, and tries
-  again, the same way it already did for a fast stop.
-- More reasons have names: another node already using the folder, the local
-  connection port being taken, and the node's saved record of block signatures
-  failing its own start-up check. When the app does not know the reason, it
-  shows the engine's own error line instead of saying nothing.
-- If the engine is still busy checking the graphics card after three minutes,
-  the app waits up to ten minutes in total and says so on screen. If it is
-  still stuck after that, the node follows signatures instead of not starting
-  at all, and the status screen says why. **Check blocks** in Settings tries
-  the graphics card again.
-- An engine that never opened its connection is now stopped properly, by Stop,
-  by Quit, or when a start gives up. If the graphics card driver holds it so
-  that it cannot be stopped, the app says to restart the computer rather than
-  starting a second engine on top of it.
+What happened: before the node engine opens the connection this app uses, it
+checks the graphics card. That check can take a few minutes. If the engine
+stopped or got stuck during it, the app did not notice. It waited, gave no
+reason, and did not try again.
+
+What 0.7.1 does instead:
+
+- **It says why.** The app watches the engine for the whole start. If the engine
+  stops, you see the reason in plain words, and the app tries again by itself.
+- **It gives a slow check time.** A graphics check that is just slow gets up to
+  ten minutes, with a note on screen while it runs.
+- **It keeps the node running.** If the graphics card gets stuck in that check,
+  the node follows signatures instead of not starting at all, and the status
+  screen tells you so. **Check blocks** in Settings tries the card again
+  whenever you like.
+- **It cleans up.** Stop and Quit now also end an engine that is stuck while
+  starting. If the graphics driver will not let it go, the app tells you to
+  restart the computer instead of starting a second copy on top of it.
+
+The node engine stays BTX 0.34.12, the same as 0.7.0.
 
 ## [0.7.0] - 2026-09-30
 

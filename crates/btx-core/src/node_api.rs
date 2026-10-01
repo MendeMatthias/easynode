@@ -597,6 +597,40 @@ pub struct MatmulTrustedStatus {
     /// Display order. Absent on a node with no pin and no key.
     #[serde(default)]
     pub replay_authority_context: Option<String>,
+    /// M of the M-of-N pin. Older engines omit this and the fields below;
+    /// they read as 0 / empty / `None` and nothing here takes a 0 for news.
+    #[serde(default)]
+    pub threshold: u64,
+    /// Compressed secp256k1 pin members, counted.
+    #[serde(default)]
+    pub trusted_signers: u64,
+    /// The LIVE secp pin, after the engine merged the command line, the conf
+    /// and `btx_rw.conf`: the keys whose signatures this node accepts.
+    #[serde(default)]
+    pub trusted_signer_pubkeys: Vec<String>,
+    /// ML-DSA-44 pin members, counted.
+    #[serde(default)]
+    pub trusted_pq_signers: u64,
+    /// The operator's attestation blocklist: keys whose signatures the
+    /// engine rejects even while they stay in the pin.
+    #[serde(default)]
+    pub blocked_pubkeys: Vec<String>,
+    /// Whether the pin members not on the blocklist still meet M.
+    #[serde(default)]
+    pub pin_quorum_reachable: Option<bool>,
+    /// The engine's in-memory store counters (`StoreStats`, engine
+    /// `trusted_exact_replay_attestation.h:367`): 0 at every engine start,
+    /// then only rising, so read them as DELTAS, never as totals. `accepted`
+    /// also counts the archive records loaded from disk at start, and
+    /// `rejected` rises for every signature from a key this node does not
+    /// pin, so a healthy node shows both large. See
+    /// [`crate::watchdog::SignatureWindow`].
+    #[serde(default)]
+    pub accepted: u64,
+    #[serde(default)]
+    pub rejected: u64,
+    #[serde(default)]
+    pub duplicates: u64,
 }
 
 /// Read this node's own MatMul role. Cheap, and answered by every engine that
@@ -1256,6 +1290,67 @@ mod tests {
             fail_add_with: -32601,
         };
         assert!(add_node(&rpc, "1.2.3.4:19335").await.is_err());
+    }
+
+    /// The v0.34.12 answer, cut to the fields the app reads plus a few it
+    /// does not, with the counters the signature check samples. The numbers
+    /// are the RTX 3060 signer's, healthy, from
+    /// docs/gpu-qualification-rtx3060.md: rejected is large on a node that
+    /// works, because every signature from a key it does not pin counts.
+    #[test]
+    fn trusted_status_reads_the_pin_and_the_signature_counters() {
+        let s: MatmulTrustedStatus = serde_json::from_value(json!({
+            "configured": true,
+            "matmul_validation_mode": "trusted",
+            "trusted_mirror": true,
+            "serves_attestations": true,
+            "local_signer": false,
+            "threshold": 1,
+            "trusted_signers": 2,
+            "trusted_signer_pubkeys": [
+                "03d90c148db37da28ce47ce15bade88a177728d663da4bc9ba765943b7d4e4f0aa",
+                "0224e80df33697385b54b3c69bae1f097f533c0c43e93c29f73ee97319d4a5e04c"
+            ],
+            "trusted_pq_signers": 0,
+            "trusted_pq_signer_pubkeys": [],
+            "blocked_pubkeys": [],
+            "unblocked_pin_members": 2,
+            "pin_quorum_reachable": true,
+            "stored_blocks": 600,
+            "blocks_with_quorum": 598,
+            "accepted": 3073,
+            "duplicates": 1532,
+            "rejected": 1735,
+            "capacity_rejections": 0,
+            "warning": ""
+        }))
+        .unwrap();
+        assert!(s.trusted_mirror);
+        assert_eq!(s.threshold, 1);
+        assert_eq!(s.trusted_signers, 2);
+        assert_eq!(s.trusted_signer_pubkeys.len(), 2);
+        assert_eq!(s.trusted_pq_signers, 0);
+        assert_eq!(s.pin_quorum_reachable, Some(true));
+        assert_eq!((s.accepted, s.rejected, s.duplicates), (3073, 1735, 1532));
+    }
+
+    /// Older engines answer with the role fields only. They must still parse,
+    /// and the counters read 0, which the signature window never takes for
+    /// evidence on its own (it reads deltas over time).
+    #[test]
+    fn trusted_status_from_an_engine_without_the_counters_still_parses() {
+        let s: MatmulTrustedStatus = serde_json::from_value(json!({
+            "local_signer": true,
+            "serves_attestations": true,
+            "matmul_validation_mode": "consensus",
+            "trusted_mirror": false
+        }))
+        .unwrap();
+        assert!(s.local_signer);
+        assert_eq!(s.threshold, 0);
+        assert!(s.trusted_signer_pubkeys.is_empty());
+        assert_eq!(s.pin_quorum_reachable, None);
+        assert_eq!((s.accepted, s.rejected, s.duplicates), (0, 0, 0));
     }
 
     #[test]
