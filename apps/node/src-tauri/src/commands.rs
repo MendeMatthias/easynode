@@ -689,6 +689,22 @@ fn stopped_since(gen_at_start: u64, gen_now: u64) -> bool {
     gen_now != gen_at_start
 }
 
+/// Is there an attempt left in the launch loop for the mirror that follows a
+/// GPU hang? Not on the last one (final review M9).
+fn mirror_attempt_left(attempt: u32) -> bool {
+    attempt < LAUNCH_ATTEMPTS
+}
+
+/// The error for a GPU hang on the last attempt: the record is written, so
+/// the next Start follows signatures; "kept exiting right after launch"
+/// would say something that did not happen.
+fn gpu_hung_on_last_attempt(word: &str) -> String {
+    format!(
+        "this machine's {word} did not finish the node engine's start-up check, so the node \
+         now follows signatures; press Start to start it that way."
+    )
+}
+
 /// The pid of a btxd this app run left held by the graphics driver
 /// ([`AfterNoRpcTimeout::RestartComputer`]), 0 for none. In memory on
 /// purpose: a restart of the computer, the only thing that frees it, also
@@ -2065,6 +2081,9 @@ async fn spawn_node_with_lock_retry(
                                 return Err(
                                     "the node was stopped while it was starting".to_string()
                                 );
+                            }
+                            if !mirror_attempt_left(attempt) {
+                                return Err(gpu_hung_on_last_attempt(gpu_word));
                             }
                             // It did not exit on its own; no exit to quote.
                             last_exit = None;
@@ -9311,8 +9330,8 @@ mod launch_wait_tests {
     use super::{
         after_driver_wait, after_no_rpc_timeout, after_rpc_wait, apply_follow_signatures_choice,
         driver_release_warming, exit_when, extends_for_gpu_check, gpu_check_warming,
-        gpu_holds_node_error, holder_is_gpu_held, rpc_timeout_error, stop_needs_no_rpc,
-        stopped_since, AfterNoRpcTimeout, AfterRpcWait,
+        gpu_holds_node_error, gpu_hung_on_last_attempt, holder_is_gpu_held, mirror_attempt_left,
+        rpc_timeout_error, stop_needs_no_rpc, stopped_since, AfterNoRpcTimeout, AfterRpcWait,
     };
     use btx_core::node::NoRpcStop;
     use btx_core::setup::RpcWait;
@@ -9787,6 +9806,35 @@ mod launch_wait_tests {
         let store = spawn_fn.find("GPU_HELD_PID.store(").unwrap();
         let error = spawn_fn.find("return Err(gpu_holds_node_error(").unwrap();
         assert!(store < error);
+    }
+
+    /// A GPU hang on the last attempt has no attempt left for the mirror, and
+    /// "kept exiting right after launch" would be wrong: it says the node
+    /// follows signatures from the next Start (final review M9).
+    #[test]
+    fn a_gpu_hang_on_the_last_attempt_says_what_the_next_start_does() {
+        assert!(mirror_attempt_left(1));
+        assert!(mirror_attempt_left(super::LAUNCH_ATTEMPTS - 1));
+        assert!(!mirror_attempt_left(super::LAUNCH_ATTEMPTS));
+        let msg = gpu_hung_on_last_attempt("graphics card");
+        assert!(msg.contains("graphics card"), "{msg}");
+        assert!(msg.contains("follows signatures"), "{msg}");
+        assert!(msg.contains("press Start"), "{msg}");
+        assert!(!msg.contains("kept exiting"), "{msg}");
+        assert!(!msg.contains('\u{2014}'), "em-dash in: {msg}");
+
+        let src = include_str!("commands.rs");
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let arm = spawn_fn
+            .find("AfterNoRpcTimeout::RetryAsMirror => {")
+            .unwrap();
+        let rest = &spawn_fn[arm..];
+        let check = rest.find("mirror_attempt_left(attempt)").unwrap();
+        assert!(check < rest.find("continue;").unwrap());
     }
 
     /// No evidence, no change of role: a timeout that is not the GPU check
