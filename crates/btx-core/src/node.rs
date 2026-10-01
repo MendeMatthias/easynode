@@ -4175,7 +4175,6 @@ impl NodeController {
     /// kill still holds the datadir lock, and a mirror spawned beside it
     /// would only be refused the lock.
     pub async fn stop_without_rpc_outcome(&mut self, grace: std::time::Duration) -> NoRpcStop {
-        const POLL: std::time::Duration = std::time::Duration::from_millis(200);
         let Some(mut child) = self.child.take() else {
             return NoRpcStop::OnSigterm;
         };
@@ -4186,6 +4185,8 @@ impl NodeController {
         let mut exited = matches!(child.try_wait(), Ok(Some(_)));
         #[cfg(unix)]
         if !exited {
+            // Only the SIGTERM wait polls; on Windows it would be dead code.
+            const POLL: std::time::Duration = std::time::Duration::from_millis(200);
             if let Some(pid) = child.id() {
                 // SAFETY: kill(2) on a pid we spawned and have not reaped
                 // (try_wait just said it is running); it only sends a signal.
