@@ -313,7 +313,7 @@ describe("a machine whose graphics card hung the engine's start-up check (0.7.1)
     expect(v.note).toMatch(/graphics card did not finish the engine's start-up check/);
     expect(v.note).toMatch(/follows signatures for now/);
     expect(v.note).toMatch(/Check blocks in Settings tries the card again/);
-    expect(v.note).not.toMatch(/—/);
+    expect(v.note.includes(String.fromCharCode(0x2014))).toBe(false); // no em-dash
   });
 
   it("keeps the plain mirror note where the card did not hang", () => {
