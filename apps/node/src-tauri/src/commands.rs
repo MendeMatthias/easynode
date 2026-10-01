@@ -3221,7 +3221,7 @@ fn stop_needs_no_rpc(rpc_armed: bool, rpc_answers: bool) -> bool {
 /// Does the node's RPC answer at all right now, warmup (-28) included? One
 /// quick call with the cookie; no cookie or no answer is `false`.
 async fn rpc_answers_at_all(datadir: &Path) -> bool {
-    let Ok(client) = RpcClient::from_cookie(&rpc_url(), &datadir.join(".cookie")) else {
+    let Ok(client) = RpcClient::from_cookie(rpc_url(), &datadir.join(".cookie")) else {
         return false;
     };
     matches!(
@@ -9323,7 +9323,7 @@ mod launch_wait_tests {
             let e = rpc_timeout_error(last, None, Some(NoRpcStop::Killed), dir);
             assert!(!e.contains("…."), "{e}");
             assert!(!e.contains(".."), "{e}");
-            assert!(e.contains(&format!("{last}")), "{e}");
+            assert!(e.contains(last), "{e}");
         }
     }
 
