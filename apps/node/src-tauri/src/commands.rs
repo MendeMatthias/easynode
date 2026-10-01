@@ -1646,6 +1646,8 @@ async fn spawn_node_with_lock_retry(
     paths: &FaststartResult,
     launched: &std::sync::atomic::AtomicBool,
 ) -> Result<RpcClient, String> {
+    // How the last attempt's btxd ended, when it exited.
+    let mut last_exit: Option<String> = None;
     for attempt in 1..=LAUNCH_ATTEMPTS {
         // A quit that started mid-retry must win: spawning after the graceful
         // quit's stop pass has already run would orphan a fresh btxd.
@@ -1912,6 +1914,8 @@ async fn spawn_node_with_lock_retry(
                             );
                             eprintln!("[node-app] {msg}");
                             setup_log(datadir, &msg);
+                            // It did not exit on its own; no exit to quote.
+                            last_exit = None;
                             continue;
                         }
                         AfterNoRpcTimeout::RestartComputer => {
@@ -1934,7 +1938,16 @@ async fn spawn_node_with_lock_retry(
                 _ => exited_after_watch = true,
             }
         }
-        *state.node.lock().await = None;
+        // How it ended, kept for the cause sentence when its log names
+        // nothing (Task A review M4).
+        let exit = state
+            .node
+            .lock()
+            .await
+            .take()
+            .and_then(|mut c| c.exit_status())
+            .map(btx_core::node::describe_exit);
+        last_exit = exit;
 
         // Did the engine refuse to be an independent MatMul consensus
         // validator on this machine? That is not a lock race and retrying it
@@ -1980,7 +1993,7 @@ async fn spawn_node_with_lock_retry(
         eprintln!(
             "[node-app] btxd exited {when}, attempt {attempt}/{LAUNCH_ATTEMPTS}. \
              Cause read from its log: {}",
-            btx_core::node::launch_failure_cause(&tail)
+            btx_core::node::launch_failure_cause_or_exit(&tail, last_exit.as_deref())
                 .unwrap_or_else(|| "not recognised, and it printed no error line".to_string()),
         );
     }
@@ -1997,10 +2010,10 @@ async fn spawn_node_with_lock_retry(
     // attempt that produced it, and the last attempt is the one worth quoting.
     //
     // Nothing recognised no longer means nothing said: the engine's own last
-    // error line is quoted (`launch_failure_cause`), and only a tail with
-    // neither gets the sentence below.
+    // error line is quoted (`launch_failure_cause`), then how the last
+    // attempt ended, and only with none of those the sentence below.
     let tail = btx_core::node::node_log_tail(datadir, 64 * 1024);
-    let cause = btx_core::node::launch_failure_cause(&tail)
+    let cause = btx_core::node::launch_failure_cause_or_exit(&tail, last_exit.as_deref())
         .unwrap_or_else(|| "its log does not say why in a way this app recognises.".to_string());
     Err(format!(
         "the node kept exiting right after launch: {cause} \
@@ -9263,7 +9276,9 @@ mod launch_wait_tests {
         // meantime waits for it instead of finding an empty slot and leaving.
         assert!(!spawn_fn.contains("let taken = state.node.lock().await.take();"));
         assert!(spawn_fn.contains("let mut slot = state.node.lock().await;"));
-        assert!(spawn_fn.contains("launch_failure_cause(&tail)"));
+        // Task A review M4: with no hint and no error line, the exit status.
+        assert!(spawn_fn.contains("launch_failure_cause_or_exit(&tail, last_exit.as_deref())"));
+        assert!(spawn_fn.contains(".exit_status()"));
     }
 
     // ── Task A review M1: Stop and Quit on a start hung before RPC ────────

@@ -1965,11 +1965,41 @@ pub fn launch_failure_hint(text: &str) -> Option<&'static str> {
 /// has the cause in the engine's own words.
 ///
 /// Trimmed, one line, at most 200 characters (cut on a character).
+///
+/// A line that STARTS with `Error:` wins over a later one that only carries
+/// an error in passing (a bind or a peer, "(Error: ...)"): the first is the
+/// engine's reason for stopping, the second is often only a symptom on the
+/// way down (Task A review M4).
 pub fn engine_error_line(text: &str) -> Option<String> {
-    text.lines()
-        .map(str::trim)
-        .rfind(|l| l.starts_with("Error:") || l.contains("InitError") || l.contains("Error: "))
+    let lines = || text.lines().map(str::trim);
+    lines()
+        .rfind(|l| l.starts_with("Error:"))
+        .or_else(|| lines().rfind(|l| l.contains("InitError") || l.contains("Error: ")))
         .map(|l| cap_chars(l, LOG_QUOTE_MAX_CHARS))
+}
+
+/// How a child ended, in a few words: "it exited with code N", or on unix
+/// "it was ended by signal N".
+pub fn describe_exit(status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("it exited with code {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("it was ended by signal {signal}");
+        }
+    }
+    format!("it ended ({status})")
+}
+
+/// [`launch_failure_cause`], and when the log names nothing, how the child
+/// ended ([`describe_exit`]), which is the one fact left. `None` only when
+/// there is neither.
+pub fn launch_failure_cause_or_exit(text: &str, exit: Option<&str>) -> Option<String> {
+    launch_failure_cause(text)
+        .or_else(|| exit.map(|e| format!("the engine printed no error line, and {e}.")))
 }
 
 /// The cause to show for a launch that died: the recognised sentence when
@@ -4088,6 +4118,13 @@ impl NodeController {
         }
     }
 
+    /// How the child ended, once it has (`None` while it runs or when none
+    /// was spawned). tokio keeps the status after the child is reaped, so
+    /// this can be read after [`NodeController::child_has_exited`] said so.
+    pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.as_mut()?.try_wait().ok().flatten()
+    }
+
     /// The pid of the child this controller spawned, while it has one.
     pub fn child_pid(&self) -> Option<u32> {
         self.child.as_ref().and_then(|c| c.id())
@@ -5594,8 +5631,8 @@ consensus-validator service.";
     /// saying only "not recognised".
     #[test]
     fn an_unrecognised_exit_quotes_the_engines_last_error_line() {
+        // Nothing starts with "Error:": the last line that carries one counts.
         let log = "2026-10-01T01:00:00Z Startup time: 2026-10-01T01:00:00Z\n\
-                   Error: first thing\n\
                    2026-10-01T01:00:01Z InitError: something odd about the frobnicator\n\
                    2026-10-01T01:00:01Z Shutdown: done\n";
         assert_eq!(
@@ -5617,6 +5654,66 @@ consensus-validator service.";
         assert!(engine_error_line("2026 Shutdown: done").is_none());
         assert!(launch_failure_cause("2026 Shutdown: done").is_none());
         assert!(launch_failure_cause("").is_none());
+    }
+
+    /// btxd's noui handler prints every InitError on stderr as "Error: ..."
+    /// (noui.cpp:30-46). That line is the engine's own reason, and it beats a
+    /// later debug.log line that only mentions an error in passing (Task A
+    /// review M4).
+    #[test]
+    fn the_engines_own_error_line_beats_one_that_only_mentions_an_error() {
+        let log = "Error: the real reason it stopped\n\
+                   2026-10-01T01:00:01Z Binding P2P on 0.0.0.0:19335 failed (Error: no)\n\
+                   2026-10-01T01:00:01Z Shutdown: done\n";
+        assert_eq!(
+            engine_error_line(log).as_deref(),
+            Some("Error: the real reason it stopped")
+        );
+    }
+
+    /// No hint and no error line: the exit status is the one fact left, so
+    /// it is said instead of nothing (Task A review M4).
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_with_no_error_line_says_how_it_ended() {
+        use std::os::unix::process::ExitStatusExt;
+        let code = std::process::ExitStatus::from_raw(3 << 8);
+        let signal = std::process::ExitStatus::from_raw(9);
+        assert_eq!(describe_exit(code), "it exited with code 3");
+        assert_eq!(describe_exit(signal), "it was ended by signal 9");
+
+        let said =
+            launch_failure_cause_or_exit("2026 Shutdown: done", Some("it exited with code 3"));
+        assert_eq!(
+            said.as_deref(),
+            Some("the engine printed no error line, and it exited with code 3.")
+        );
+        // A cause, when there is one, still wins.
+        let known = launch_failure_cause_or_exit(
+            "Error: Unable to start HTTP server. See debug log for details.",
+            Some("it exited with code 1"),
+        )
+        .unwrap();
+        assert!(known.contains("19334"), "{known}");
+        assert!(launch_failure_cause_or_exit("", None).is_none());
+    }
+
+    /// The controller keeps how its child ended, for that sentence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_controller_keeps_its_childs_exit_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut controller = start_shim(tmp.path(), "exit 3").await;
+        let started = std::time::Instant::now();
+        while controller.child_has_exited() != Some(true) {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let status = controller
+            .exit_status()
+            .expect("an exited child has a status");
+        assert_eq!(status.code(), Some(3));
+        assert!(NodeController::new().exit_status().is_none());
     }
 
     #[test]
