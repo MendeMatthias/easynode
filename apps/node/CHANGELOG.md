@@ -8,6 +8,23 @@ root).
 
 ## [Unreleased]
 
+**A node that hears signatures but trusts none of them now says so.**
+A node that follows signatures only moves when a key it trusts has signed the
+next block. If its list of trusted keys is out of date, signatures keep
+arriving, the node turns every one of them away, and it stops. Until now
+nothing on screen said so. Thanks to the operator who reported it.
+
+- After 15 minutes without moving, with signatures arriving and none accepted,
+  the status screen says what is happening. If an update is waiting, it says the
+  update may bring a newer key list. If not, it says the keys this node trusts
+  may have stopped signing for now.
+- If the node is missing one of the keys this app ships, the screen also names
+  the file in the node folder where that is set. The app does not change that
+  file itself.
+- **Copy diagnostics** in Tools now has a Signatures part: the trusted keys,
+  any shipped key that is missing or blocked, and how many signatures were
+  accepted and turned away.
+
 ## [0.7.1] - 2026-10-01
 
 **A node that stops while starting now tells you why, and gets going again on its own.**
