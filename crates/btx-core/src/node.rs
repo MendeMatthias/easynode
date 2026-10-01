@@ -4230,17 +4230,55 @@ impl NodeController {
         // still names it. A btxd that is still there keeps it, so the next
         // start finds the holder instead of racing it for the lock, and a
         // file that names another process is not this controller's.
-        if outcome != NoRpcStop::StillRunning {
-            if let (Some(cfg), Some(pid)) = (&self.config, child_pid) {
-                let path = pidfile_path(&cfg.datadir);
-                let ours =
-                    std::fs::read_to_string(&path).is_ok_and(|s| s.trim() == pid.to_string());
-                if ours {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
+        if outcome == NoRpcStop::StillRunning {
+            // Kept, not dropped: the caller can still see it go
+            // ([`NodeController::wait_after_kill`]). A handle let go of here
+            // would leave an exited child unreaped, and a zombie reads as
+            // alive to kill(pid, 0).
+            self.child = Some(child);
+        } else {
+            self.remove_own_pidfile(child_pid);
         }
         outcome
+    }
+
+    /// For a child that outlived [`NodeController::stop_without_rpc_outcome`]'s
+    /// kill: wait up to `limit` for it to go, reaping it, and remove its
+    /// pidfile once it has. True when it is gone (or there was none).
+    ///
+    /// Why (final review I1, 2026-10-01): on a wedged NVIDIA card a SIGKILLed
+    /// process can take well over five seconds to exit while the driver tears
+    /// down its context, and calling that "held until the computer restarts"
+    /// would ask for a reboot the machine did not need.
+    pub async fn wait_after_kill(&mut self, limit: std::time::Duration) -> bool {
+        let Some(child) = self.child.as_mut() else {
+            return true;
+        };
+        let pid = child.id();
+        let started = std::time::Instant::now();
+        loop {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                self.child = None;
+                self.remove_own_pidfile(pid);
+                return true;
+            }
+            if started.elapsed() >= limit {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Remove easybtx-node.pid when it still names `pid`, this controller's
+    /// child, and only then.
+    fn remove_own_pidfile(&self, pid: Option<u32>) {
+        if let (Some(cfg), Some(pid)) = (&self.config, pid) {
+            let path = pidfile_path(&cfg.datadir);
+            let ours = std::fs::read_to_string(&path).is_ok_and(|s| s.trim() == pid.to_string());
+            if ours {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
 
     /// The arguments this controller last launched btxd with, empty before
@@ -6038,6 +6076,50 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
             !crate::platform::process_is_alive(pid),
             "the wedged child must be gone"
         );
+    }
+
+    /// After a kill the child did not survive in time, the controller can
+    /// still see it go: a btxd on a wedged NVIDIA card can take well over the
+    /// kill's 5 s while the driver tears its context down (final review I1).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_after_kill_sees_a_late_exit_and_clears_its_pidfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut controller = start_shim(tmp.path(), "sleep 0.5; exit 0").await;
+        assert!(pidfile_path(tmp.path()).exists());
+        assert!(
+            controller
+                .wait_after_kill(std::time::Duration::from_secs(10))
+                .await
+        );
+        assert!(!pidfile_path(tmp.path()).exists(), "its own pidfile goes");
+        // Nothing left to wait for.
+        assert!(
+            controller
+                .wait_after_kill(std::time::Duration::from_millis(1))
+                .await
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_after_kill_gives_up_on_a_child_that_stays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut controller = start_shim(tmp.path(), "exec sleep 30").await;
+        let started = std::time::Instant::now();
+        assert!(
+            !controller
+                .wait_after_kill(std::time::Duration::from_millis(400))
+                .await
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert!(
+            pidfile_path(tmp.path()).exists(),
+            "a holder keeps its pidfile"
+        );
+        controller
+            .stop_without_rpc(std::time::Duration::from_secs(5))
+            .await;
     }
 
     /// The pidfile goes only when it is this child's: one that names another

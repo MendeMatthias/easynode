@@ -669,6 +669,28 @@ fn after_no_rpc_timeout(
     }
 }
 
+/// How long a btxd that outlived the kill is watched before the app asks for
+/// a restart of the computer (final review I1). A wedged NVIDIA card can hold
+/// a killed process well past the kill's own 5 s while the driver tears down
+/// its context; a minute covers that without leaving the person waiting on
+/// a process that will never go.
+const DRIVER_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What the window says during that minute.
+const DRIVER_RELEASE_WARMING: &str = "The graphics card is slow to let go of the stopped node. \
+                                      Waiting up to a minute before starting it again.";
+
+/// After a start stuck in the GPU check whose btxd outlived the kill: gone
+/// by the end of [`DRIVER_RELEASE_WAIT`] is the mirror attempt, still there
+/// is the restart. Pure, pinned by a test.
+fn after_driver_wait(alive_after_kill: bool, alive_after_wait: bool) -> AfterNoRpcTimeout {
+    if alive_after_kill && alive_after_wait {
+        AfterNoRpcTimeout::RestartComputer
+    } else {
+        AfterNoRpcTimeout::RetryAsMirror
+    }
+}
+
 /// The error for [`AfterNoRpcTimeout::RestartComputer`]. One sentence, on
 /// purpose: nothing in the app can free a process the graphics driver holds,
 /// and the next start after a restart follows signatures by itself.
@@ -1891,8 +1913,6 @@ async fn spawn_node_with_lock_retry(
                         );
                         Some(outcome)
                     };
-                    *slot = None;
-                    drop(slot);
                     // A validating start stuck in the engine's GPU check
                     // (0.7.1, the leading reading of Zan's two NVIDIA nodes):
                     // the step has no timeout, and a card that hung once can
@@ -1902,11 +1922,35 @@ async fn spawn_node_with_lock_retry(
                     // until an engine upgrade or the owner's "check blocks".
                     let stuck =
                         !graceful && btx_core::node::stuck_in_gpu_check(gpu_check_launch, &since);
-                    let next = after_no_rpc_timeout(
+                    let mut next = after_no_rpc_timeout(
                         stuck,
                         stopped,
                         btx_core::node::trusted_mirror_override(),
                     );
+                    if next == AfterNoRpcTimeout::RestartComputer {
+                        // Outlived the kill. A wedged NVIDIA card can take
+                        // well over 5 s to let a killed process go while the
+                        // driver tears its context down, so it is watched for
+                        // a minute, still from the slot, before a restart of
+                        // the computer is asked for (final review I1).
+                        let note = NodePhase::Warming {
+                            message: DRIVER_RELEASE_WARMING.to_string(),
+                        };
+                        set_phase(app, state, note.clone()).await;
+                        let gone = c.wait_after_kill(DRIVER_RELEASE_WAIT).await;
+                        let still_ours = *state.phase.lock().await == note;
+                        if still_ours {
+                            set_phase(app, state, NodePhase::Starting).await;
+                        }
+                        eprintln!(
+                            "[node-app] the btxd that outlived the kill {} within {}s",
+                            if gone { "exited" } else { "is still there" },
+                            DRIVER_RELEASE_WAIT.as_secs()
+                        );
+                        next = after_driver_wait(true, !gone);
+                    }
+                    *slot = None;
+                    drop(slot);
                     if next != AfterNoRpcTimeout::Fail {
                         btx_core::node::record_gpu_start_hung(datadir);
                         // The next launch is a mirror, and a mirror holds no
@@ -9168,8 +9212,8 @@ mod signed_start_tests {
 #[cfg(test)]
 mod launch_wait_tests {
     use super::{
-        after_no_rpc_timeout, after_rpc_wait, apply_follow_signatures_choice, exit_when,
-        extends_for_gpu_check, rpc_timeout_error, stop_needs_no_rpc, AfterNoRpcTimeout,
+        after_driver_wait, after_no_rpc_timeout, after_rpc_wait, apply_follow_signatures_choice,
+        exit_when, extends_for_gpu_check, rpc_timeout_error, stop_needs_no_rpc, AfterNoRpcTimeout,
         AfterRpcWait, GPU_HOLDS_NODE_ERROR,
     };
     use btx_core::node::NoRpcStop;
@@ -9465,6 +9509,42 @@ mod launch_wait_tests {
         assert!(msg.contains("press Start"), "{msg}");
         assert_eq!(msg.matches(". ").count(), 0, "one sentence: {msg}");
         assert!(!msg.contains('\u{2014}'), "em-dash in: {msg}");
+    }
+
+    /// A btxd on a wedged NVIDIA card can take well over the kill's 5 s to
+    /// go while the driver tears its context down. It is waited for, up to
+    /// DRIVER_RELEASE_WAIT, before a restart of the computer is asked for;
+    /// one that goes meanwhile is followed by the mirror attempt (final
+    /// review I1).
+    #[test]
+    fn a_card_slow_to_let_go_is_waited_for_before_a_restart_is_asked() {
+        assert_eq!(
+            after_driver_wait(false, false),
+            AfterNoRpcTimeout::RetryAsMirror
+        );
+        assert_eq!(
+            after_driver_wait(true, false),
+            AfterNoRpcTimeout::RetryAsMirror
+        );
+        assert_eq!(
+            after_driver_wait(true, true),
+            AfterNoRpcTimeout::RestartComputer
+        );
+        assert_eq!(super::DRIVER_RELEASE_WAIT.as_secs(), 60);
+
+        let src = include_str!("commands.rs");
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let kill = spawn_fn.find(".stop_without_rpc_outcome(").unwrap();
+        let wait = spawn_fn
+            .find(".wait_after_kill(DRIVER_RELEASE_WAIT)")
+            .unwrap();
+        let decide = spawn_fn.find("after_driver_wait(").unwrap();
+        let held = spawn_fn.find("return Err(GPU_HOLDS_NODE_ERROR").unwrap();
+        assert!(kill < wait && wait < decide && decide < held);
     }
 
     /// No evidence, no change of role: a timeout that is not the GPU check
