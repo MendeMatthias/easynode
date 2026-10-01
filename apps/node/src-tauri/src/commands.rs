@@ -3178,6 +3178,26 @@ async fn stop_with_note(
     }
 }
 
+/// Whether a stop signals the node (`stop_without_rpc_outcome`) instead of
+/// asking it through btx-cli: only when the app never armed its RPC and it
+/// does not answer now, which is a start hung before RPC. Pure, pinned by a
+/// test.
+fn stop_needs_no_rpc(rpc_armed: bool, rpc_answers: bool) -> bool {
+    !rpc_armed && !rpc_answers
+}
+
+/// Does the node's RPC answer at all right now, warmup (-28) included? One
+/// quick call with the cookie; no cookie or no answer is `false`.
+async fn rpc_answers_at_all(datadir: &Path) -> bool {
+    let Ok(client) = RpcClient::from_cookie(&rpc_url(), &datadir.join(".cookie")) else {
+        return false;
+    };
+    matches!(
+        get_blockchain_info(&client).await,
+        Ok(_) | Err(AppError::Rpc { code: -28, .. })
+    )
+}
+
 /// Graceful stop shared by the command, the tray, and app exit.
 pub async fn stop_node_inner(state: &AppState) {
     // Kill the refresher first so it can't overwrite the Stopped phase.
@@ -3189,14 +3209,28 @@ pub async fn stop_node_inner(state: &AppState) {
     stop_snapshot_serve(state, false).await;
     let launch = state.launch.lock().await.clone();
     let attached = *state.attached_to.lock().await;
+    // Before the node slot is locked, never while it is held.
+    let rpc_armed = state.rpc.lock().await.is_some();
     {
         let mut guard = state.node.lock().await;
         if let Some(controller) = guard.as_mut() {
             if let Some((btx_cli, datadir)) = launch.as_ref() {
-                stop_with_note(state, STILL_STOPPING_AFTER, async {
-                    let _ = controller.stop(btx_cli, datadir).await;
-                })
-                .await;
+                let answers = rpc_armed || rpc_answers_at_all(datadir).await;
+                if stop_needs_no_rpc(rpc_armed, answers) {
+                    // A start hung before RPC (Task A review M1): btx-cli
+                    // stop cannot reach it, and waiting out the 90 s flush
+                    // grace for a node with nothing loaded left it running
+                    // behind a Quit.
+                    let outcome = controller.stop_without_rpc_outcome(NO_RPC_STOP_GRACE).await;
+                    eprintln!(
+                        "[node-app] stopped a node that had not opened its RPC ({outcome:?})"
+                    );
+                } else {
+                    stop_with_note(state, STILL_STOPPING_AFTER, async {
+                        let _ = controller.stop(btx_cli, datadir).await;
+                    })
+                    .await;
+                }
             }
             *guard = None;
         } else if let Some((btx_cli, datadir)) = launch.as_ref() {
@@ -9103,8 +9137,8 @@ mod signed_start_tests {
 mod launch_wait_tests {
     use super::{
         after_no_rpc_timeout, after_rpc_wait, apply_follow_signatures_choice,
-        extends_for_gpu_check, rpc_timeout_error, AfterNoRpcTimeout, AfterRpcWait,
-        GPU_HOLDS_NODE_ERROR,
+        extends_for_gpu_check, rpc_timeout_error, stop_needs_no_rpc, AfterNoRpcTimeout,
+        AfterRpcWait, GPU_HOLDS_NODE_ERROR,
     };
     use btx_core::node::NoRpcStop;
     use btx_core::setup::RpcWait;
@@ -9230,6 +9264,39 @@ mod launch_wait_tests {
         assert!(!spawn_fn.contains("let taken = state.node.lock().await.take();"));
         assert!(spawn_fn.contains("let mut slot = state.node.lock().await;"));
         assert!(spawn_fn.contains("launch_failure_cause(&tail)"));
+    }
+
+    // ── Task A review M1: Stop and Quit on a start hung before RPC ────────
+
+    /// A node whose RPC never answered cannot be reached by btx-cli stop, so
+    /// the stop signals it instead, with the short no-RPC grace. One whose
+    /// RPC is armed or answers (warmup included) gets the graceful stop.
+    #[test]
+    fn a_stop_before_rpc_signals_the_node_instead_of_asking_it() {
+        assert!(stop_needs_no_rpc(false, false));
+        assert!(!stop_needs_no_rpc(false, true), "it answers: ask it");
+        assert!(!stop_needs_no_rpc(true, false), "armed: ask it");
+        assert!(!stop_needs_no_rpc(true, true));
+    }
+
+    #[test]
+    fn stop_node_inner_uses_the_no_rpc_stop_where_it_applies() {
+        let src = include_str!("commands.rs");
+        let stop_fn = src
+            .split("pub async fn stop_node_inner(state: &AppState) {")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        // Read before the node slot is locked, so the two locks are never
+        // taken in the other order.
+        let armed = stop_fn.find("state.rpc.lock().await.is_some()").unwrap();
+        let slot = stop_fn.find("state.node.lock().await").unwrap();
+        assert!(armed < slot);
+        let decide = stop_fn.find("stop_needs_no_rpc(").unwrap();
+        let no_rpc = stop_fn
+            .find(".stop_without_rpc_outcome(NO_RPC_STOP_GRACE)")
+            .unwrap();
+        assert!(decide < no_rpc);
     }
 
     // ── Task A review M3: slow in the GPU check is not stuck in it ────────
