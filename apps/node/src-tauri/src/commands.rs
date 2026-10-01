@@ -640,6 +640,119 @@ fn slot_child_gone(slot: &tokio::sync::Mutex<Option<NodeController>>) -> bool {
     }
 }
 
+/// Hold the spawned engine at normal priority for a step that must not be
+/// slowed by the background policy (`NodeController::hold_normal_priority`),
+/// with one log line. No child, no hold.
+async fn hold_engine_normal(slot: &tokio::sync::Mutex<Option<NodeController>>, why: &str) {
+    if let Some(c) = slot.lock().await.as_mut() {
+        if c.child_pid().is_none() {
+            return;
+        }
+        match c.hold_normal_priority() {
+            Ok(()) => eprintln!("[node-app] btxd runs at normal priority while {why}"),
+            Err(e) => eprintln!("[node-app] could not lift btxd's priority while {why}: {e}"),
+        }
+    }
+}
+
+/// End such a hold: back to the spawn policy, which the status refresher
+/// re-decides from the chain within 30 s. A no-op without a hold.
+async fn release_engine_hold(slot: &tokio::sync::Mutex<Option<NodeController>>) {
+    if let Some(c) = slot.lock().await.as_mut() {
+        if c.priority_held() {
+            if let Err(e) = c.release_priority_hold() {
+                eprintln!("[node-app] could not put btxd back under its policy: {e}");
+            }
+        }
+    }
+}
+
+/// What [`retune_spawned_engine`] found in the node slot.
+#[derive(Debug, PartialEq, Eq)]
+enum SpawnedRetune {
+    /// A child this app spawned: its policy was re-decided (or left alone
+    /// under a hold).
+    Handled,
+    /// No child: nothing spawned, or a node this app adopted instead.
+    NoChild,
+    /// The slot was held elsewhere at that instant; looked at again 30 s later.
+    Busy,
+}
+
+/// Re-decide the scheduling policy of the btxd this app spawned from how far
+/// behind it is (`btx_core::engine_priority`): the background policy at the
+/// tip, normal priority while far behind, so a long catch-up is not confined
+/// to the efficiency cores. One log line when it changes.
+///
+/// The controller remembers what was last set on its child. A hold (the
+/// GPU-check extension, a snapshot load) is left alone. The slot stays
+/// locked across the `setpriority` call, so the child cannot be reaped and
+/// its pid reused in between. `try_lock`, as in [`slot_child_gone`].
+fn retune_spawned_engine(
+    slot: &tokio::sync::Mutex<Option<NodeController>>,
+    blocks_behind: u64,
+) -> SpawnedRetune {
+    use btx_core::engine_priority::engine_priority_for;
+    let Ok(mut guard) = slot.try_lock() else {
+        return SpawnedRetune::Busy;
+    };
+    let Some(c) = guard.as_mut().filter(|c| c.child_pid().is_some()) else {
+        return SpawnedRetune::NoChild;
+    };
+    if c.priority_held() {
+        return SpawnedRetune::Handled;
+    }
+    let current = c.engine_priority();
+    let wanted = engine_priority_for(std::env::consts::OS, Some(blocks_behind), current);
+    if wanted != current {
+        let pid = c.child_pid().unwrap_or_default();
+        match c.set_engine_priority(wanted) {
+            Ok(()) => eprintln!(
+                "[node-app] btxd (pid {pid}) is {blocks_behind} blocks behind; it now runs at {}",
+                wanted.describe()
+            ),
+            Err(e) => eprintln!("[node-app] could not change btxd's (pid {pid}) priority: {e}"),
+        }
+    }
+    SpawnedRetune::Handled
+}
+
+/// The same for a btxd this app ADOPTED (`AttachedTo::OurOrphan`: the node a
+/// previous instance left running across a self-update). `pid` is its
+/// verified pidfile pid (`btx_core::node::verified_btxd_pidfile_pid`), or
+/// `None` when there is none. `policy` is what this refresher last set on it,
+/// per pid; a pid it has not set yet gets the chosen policy APPLIED, not
+/// assumed, because the previous app may have left it either way.
+fn retune_adopted_engine(
+    pid: Option<u32>,
+    policy: &mut Option<(u32, btx_core::engine_priority::EnginePriority)>,
+    blocks_behind: u64,
+) {
+    use btx_core::engine_priority::retune_engine_priority;
+    let Some(pid) = pid else {
+        *policy = None;
+        return;
+    };
+    let known = policy.filter(|(seen, _)| *seen == pid).map(|(_, p)| p);
+    match retune_engine_priority(pid, blocks_behind, known) {
+        Ok(now) => {
+            if known != Some(now) {
+                eprintln!(
+                    "[node-app] adopted btxd (pid {pid}) is {blocks_behind} blocks behind; it now \
+                     runs at {}",
+                    now.describe()
+                );
+            }
+            *policy = Some((pid, now));
+        }
+        Err(e) => {
+            eprintln!("[node-app] could not change the adopted btxd's (pid {pid}) priority: {e}");
+            // Unknown again, so the next look applies rather than assumes.
+            *policy = None;
+        }
+    }
+}
+
 /// What the launch loop does after it stopped a btxd that never opened its
 /// RPC (0.7.1).
 #[derive(Debug, PartialEq, Eq)]
@@ -1733,6 +1846,11 @@ pub(crate) async fn start_node_held(app: &AppHandle, state: &AppState) -> Result
         // outcome is no longer this run's to act on, and a load the task has
         // not yet begun is not made at all.
         let gen = state.refresher_gen.load(Ordering::SeqCst);
+        // A load is heavy disk work: at normal priority, deterministically,
+        // not behind other programs' disk I/O in the background policy and
+        // not depending on whether a retune tick has seen the gap yet.
+        // `spawn_load_watch` releases it when the load task ends.
+        hold_engine_normal(&state.node, "the snapshot loads").await;
         let handle = btx_core::snapshot::ensure_snapshot_loaded_with(
             rpc.clone(),
             paths.btx_cli.clone(),
@@ -1948,6 +2066,13 @@ async fn spawn_node_with_lock_retry(
                     message: gpu_check_warming(gpu_word),
                 };
                 set_phase(app, state, note.clone()).await;
+                // The extension's ten minutes were sized at normal priority
+                // (2.75x the slowest measured check); the background policy
+                // makes the check 1.5-2.1x slower. So past the ordinary wait
+                // the engine gets the chip at normal priority, and a slow Mac
+                // is never moved to following signatures because of the
+                // policy (docs/mac-engine-priority.md).
+                hold_engine_normal(&state.node, "its GPU check runs past the ordinary wait").await;
                 let node_slot = state.node.clone();
                 wait = wait_for_node_rpc_watching(
                     datadir,
@@ -1968,7 +2093,12 @@ async fn spawn_node_with_lock_retry(
                 }
             }
             match (after_rpc_wait(&wait, slot_empty), wait) {
-                (AfterRpcWait::Ready, RpcWait::Ready(client)) => return Ok(client),
+                (AfterRpcWait::Ready, RpcWait::Ready(client)) => {
+                    // RPC is up: the GPU check is over, so a hold it took
+                    // ends here.
+                    release_engine_hold(&state.node).await;
+                    return Ok(client);
+                }
                 (AfterRpcWait::StoppedMeanwhile, _) => {
                     return Err("the node was stopped while it was starting".to_string())
                 }
@@ -2280,6 +2410,8 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
     let engine_warnings_slot = state.engine_warnings.clone();
     let history_slot = state.history_check.clone();
     let started_from_slot = state.started_from.clone();
+    let node_slot = state.node.clone();
+    let attached_slot = state.attached_to.clone();
     let anchor = snapshot_spec().anchor_height;
 
     tauri::async_runtime::spawn(async move {
@@ -2322,6 +2454,8 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         // the current verdict was first seen persist across ticks.
         const FORK_CHECK_EVERY: u32 = 10;
         let mut fork_tick: u32 = 0;
+        // The adopted node's policy, per pid (`retune_adopted_engine`).
+        let mut adopted_policy: Option<(u32, btx_core::engine_priority::EnginePriority)> = None;
         let mut gap_since: Option<(std::time::Instant, u64)> = None;
         let mut fork_first_seen: Option<std::time::Instant> = None;
         let mut fork_tips: Vec<btx_core::fork::ChainTip> = Vec::new();
@@ -2722,6 +2856,20 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                             gap_since = None;
                         }
                         fork_tick = fork_tick.wrapping_add(1);
+                        // Catching up far behind at normal priority, giving
+                        // way at the tip: every 30 s, from this tick's gap.
+                        // macOS only: elsewhere the policy is always Normal,
+                        // so there is nothing to retune and no reason to
+                        // spawn `ps`/`tasklist` for an adopted engine.
+                        if cfg!(target_os = "macos")
+                            && fork_tick % FORK_CHECK_EVERY == 2
+                            && retune_spawned_engine(&node_slot, behind) == SpawnedRetune::NoChild
+                            && *attached_slot.lock().await == Some(AttachedTo::OurOrphan)
+                        {
+                            let pid =
+                                btx_core::node::verified_btxd_pidfile_pid(&node_datadir()).await;
+                            retune_adopted_engine(pid, &mut adopted_policy, behind);
+                        }
                         if fork_tick % FORK_CHECK_EVERY == 1 {
                             // The signature window (btx_core::watchdog::
                             // SignatureWindow), on this slow tick: 45 samples
@@ -5764,6 +5912,11 @@ fn spawn_load_watch(
             btx_core::snapshot::SnapshotOutcome::NotLoaded(format!("the load task ended: {e}"))
         });
         let state = app.state::<AppState>();
+        // The load's hold ends with it, on this run's node only: after a
+        // stop or restart the slot holds another start, without a hold.
+        if state.refresher_gen.load(Ordering::SeqCst) == gen {
+            release_engine_hold(&state.node).await;
+        }
         if let Err(e) = after_snapshot_load(&app, &state, gen, mirror_load_launch, outcome).await {
             eprintln!("[node-app] the restart after a snapshot load failed: {e}");
         }
@@ -10235,5 +10388,174 @@ mod slot_probe_tests {
         let slot: Mutex<Option<NodeController>> = Mutex::new(None);
         let _held = slot.lock().await;
         assert!(!slot_child_gone(&slot));
+    }
+
+    // ── The engine's scheduling policy on the slow tick (0.7.2) ────────────
+    use super::{retune_adopted_engine, retune_spawned_engine, SpawnedRetune};
+    use btx_core::engine_priority::{EnginePriority, FAR_BEHIND_BLOCKS};
+
+    #[test]
+    fn an_empty_slot_has_no_child_to_retune() {
+        assert_eq!(
+            retune_spawned_engine(&Mutex::new(None), 0),
+            SpawnedRetune::NoChild
+        );
+    }
+
+    #[tokio::test]
+    async fn a_held_slot_is_looked_at_again_later() {
+        let slot: Mutex<Option<NodeController>> = Mutex::new(None);
+        let _held = slot.lock().await;
+        assert_eq!(
+            retune_spawned_engine(&slot, FAR_BEHIND_BLOCKS + 1),
+            SpawnedRetune::Busy
+        );
+    }
+
+    /// The spawned child: under the spawn policy after `start`, lifted far
+    /// behind, kept between the lines, back at the tip; a hold is left alone.
+    /// Off macOS it stays Normal throughout.
+    #[tokio::test]
+    async fn the_spawned_engine_follows_the_gap() {
+        use EnginePriority::{Background, Normal};
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = Mutex::new(Some(start_shim(tmp.path(), "sleep 30").await));
+        let mut seen = Vec::new();
+        for behind in [0, FAR_BEHIND_BLOCKS + 1, 200, 0] {
+            assert_eq!(retune_spawned_engine(&slot, behind), SpawnedRetune::Handled);
+            seen.push(slot.lock().await.as_ref().unwrap().engine_priority());
+        }
+        slot.lock()
+            .await
+            .as_mut()
+            .unwrap()
+            .hold_normal_priority()
+            .ok();
+        retune_spawned_engine(&slot, 0);
+        let held = slot.lock().await.as_ref().unwrap().engine_priority();
+        if let Some(c) = slot.lock().await.as_mut() {
+            c.stop_without_rpc(std::time::Duration::from_secs(2)).await;
+        }
+        if cfg!(target_os = "macos") {
+            assert_eq!(seen, vec![Background, Normal, Normal, Background]);
+            assert_eq!(held, Normal, "a hold is not retuned away");
+        } else {
+            assert_eq!(seen, vec![Normal; 4]);
+        }
+    }
+
+    #[test]
+    fn no_adopted_pid_forgets_the_last_one() {
+        let mut policy = Some((42, EnginePriority::Background));
+        retune_adopted_engine(None, &mut policy, 0);
+        assert_eq!(policy, None);
+    }
+
+    /// The adopted node: its first policy is applied, not assumed, so a node
+    /// the previous app left in the background is lifted when far behind,
+    /// and the result is remembered for that pid.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_adopted_engine_gets_the_policy_applied_not_assumed() {
+        use btx_core::engine_priority::{apply_engine_priority, is_background};
+        use EnginePriority::{Background, Normal};
+        let mut node = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = node.id();
+        apply_engine_priority(pid, Background).unwrap();
+        let mut policy = None;
+        retune_adopted_engine(Some(pid), &mut policy, FAR_BEHIND_BLOCKS + 1);
+        let far = (policy, is_background(pid));
+        retune_adopted_engine(Some(pid), &mut policy, 0);
+        let tip = (policy, is_background(pid));
+        let _ = node.kill();
+        let _ = node.wait();
+        assert_eq!(far, (Some((pid, Normal)), Some(false)));
+        assert_eq!(tip, (Some((pid, Background)), Some(true)));
+    }
+
+    /// A hold lifts the spawned child to normal priority, the retune leaves
+    /// it there, and its release puts it back under the spawn policy.
+    #[tokio::test]
+    async fn a_hold_lifts_the_engine_until_it_is_released() {
+        use super::{hold_engine_normal, release_engine_hold};
+        use btx_core::engine_priority::engine_priority_at_spawn;
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = Mutex::new(Some(start_shim(tmp.path(), "sleep 30").await));
+        let read = |c: &NodeController| (c.engine_priority(), c.priority_held());
+        hold_engine_normal(&slot, "a test").await;
+        let held = read(slot.lock().await.as_ref().unwrap());
+        retune_spawned_engine(&slot, 0);
+        let after_retune = read(slot.lock().await.as_ref().unwrap());
+        release_engine_hold(&slot).await;
+        let released = read(slot.lock().await.as_ref().unwrap());
+        if let Some(c) = slot.lock().await.as_mut() {
+            c.stop_without_rpc(std::time::Duration::from_secs(2)).await;
+        }
+        assert_eq!(held, (EnginePriority::Normal, true));
+        assert_eq!(after_retune, (EnginePriority::Normal, true));
+        assert_eq!(released, (engine_priority_at_spawn(), false));
+        // Without a child there is nothing to hold.
+        hold_engine_normal(&Mutex::new(None), "a test").await;
+    }
+
+    /// The GPU-check extension takes the hold before its wait and RPC up
+    /// releases it; a snapshot load takes it before the load task and its
+    /// watch releases it for the same run only.
+    #[test]
+    fn the_gpu_check_extension_and_the_snapshot_load_run_at_normal_priority() {
+        let src = include_str!("commands.rs");
+        let launch = src
+            .split("async fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .unwrap();
+        let ext = launch.split("if extends_for_gpu_check(").nth(1).unwrap();
+        let hold = ext.find("hold_engine_normal(&state.node").unwrap();
+        let wait = ext.find("GPU_CHECK_EXTRA_POLLS,").unwrap();
+        assert!(hold < wait, "the hold comes before the extension's wait");
+        let ready = ext
+            .split("(AfterRpcWait::Ready, RpcWait::Ready(client)) => {")
+            .nth(1)
+            .unwrap();
+        assert!(
+            ready.find("release_engine_hold(&state.node)").unwrap()
+                < ready.find("return Ok(client)").unwrap()
+        );
+        let start = src
+            .split("pub(crate) async fn start_node_inner(")
+            .nth(1)
+            .unwrap();
+        assert!(
+            start
+                .find("hold_engine_normal(&state.node, \"the snapshot loads\")")
+                .unwrap()
+                < start.find("ensure_snapshot_loaded_with(").unwrap()
+        );
+        let watch = src.split("fn spawn_load_watch(").nth(1).unwrap();
+        let gen_check = watch
+            .find("refresher_gen.load(Ordering::SeqCst) == gen")
+            .unwrap();
+        let release = watch.find("release_engine_hold(&state.node)").unwrap();
+        let after = watch.find("after_snapshot_load(").unwrap();
+        assert!(gen_check < release && release < after);
+    }
+
+    /// The refresher asks for the adopted node only when the slot has no
+    /// child AND the app is attached to its own orphan, and reads the pid
+    /// through the name-checked helper.
+    #[test]
+    fn the_refresher_retunes_an_adopted_node_only_when_it_is_ours() {
+        let src = include_str!("commands.rs");
+        let tick = src.split("fn spawn_status_refresher(").nth(1).unwrap();
+        let call = tick
+            .split("retune_spawned_engine(&node_slot, behind) == SpawnedRetune::NoChild")
+            .nth(1)
+            .expect("the spawned retune comes first");
+        let guard = call.find("Some(AttachedTo::OurOrphan)").unwrap();
+        let read = call.find("verified_btxd_pidfile_pid(").unwrap();
+        let adopted = call.find("retune_adopted_engine(pid").unwrap();
+        assert!(guard < read && read < adopted);
     }
 }

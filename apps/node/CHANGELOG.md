@@ -8,6 +8,8 @@ root).
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-10-01
+
 **A node that hears signatures but trusts none of them now says so.**
 A node that follows signatures only moves when a key it trusts has signed the
 next block. If its list of trusted keys is out of date, signatures keep
@@ -24,6 +26,35 @@ nothing on screen said so. Thanks to the operator who reported it.
 - **Copy diagnostics** in Tools now has a Signatures part: the trusted keys,
   any shipped key that is missing or blocked, and how many signatures were
   accepted and turned away.
+
+**On a Mac, the node now lets you go first.**
+Some owners found their Mac hard to use with the node running. On a Mac the
+node uses the graphics chip to check blocks, and that is the same chip that
+draws your screen. Until now the node ran at the same priority as the apps
+you were using.
+
+- On a Mac the node now runs as a background task, so macOS lets your apps go
+  first more often. On our one test Mac, graphics work in the foreground was
+  held up less while the node checked its graphics chip, though not in every
+  moment.
+- Starting the node can take a little longer, because its graphics check gives
+  way too. On our test Mac it still finished in under four minutes. If the
+  check runs past three minutes, the node gets normal priority until it is
+  done, so a slow Mac is not cut short by this change.
+- While the node is far behind (more than about 12 hours of blocks), loads a
+  snapshot, or shuts down, it runs at normal priority. Once it is caught up it
+  goes back to the background.
+- After this update, a node that kept running through the update is moved to
+  the background within about half a minute once it is caught up. It does not
+  need a restart.
+- Nodes that sign blocks do the same. Linux and Windows are unchanged.
+
+**Two peers that stopped answering are off the start list.**
+`89.85.40.184` and `194.93.48.158` refused our test connections on 1 October
+and the easybtx.com census lists both as down, so a new node no longer spends
+its first tries on them. They can come back the day they answer again.
+
+The node engine stays BTX 0.34.12, the same as 0.7.1.
 
 ## [0.7.1] - 2026-10-01
 

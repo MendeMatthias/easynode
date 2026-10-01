@@ -143,7 +143,16 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // engine's getmmattest hammer (btxchain/btx#142) for asking about
     // blocks we did not have. The one shipped seed proven on the live
     // chain with full history.
-    "89.85.40.184:19335",
+    //
+    // ── MEASURED DEAD 2026-10-01, so it leaves the list ─────────────────────
+    // Probed from this project's Mac at 17:18Z: three TCP attempts, four
+    // seconds apart, eight-second timeout, refused on all three. Corroborated
+    // by the easybtx.com census, which lists this seed as down with 0% uptime
+    // over its stored history. Its noban grant in BTX_LIVE_BODY_SOURCE_IPS
+    // stays, as the two retired above kept theirs. Put it back the day a real
+    // node handshakes it again, with that reading.
+    //
+    //   "89.85.40.184:19335"  0/3 refused — 2026-10-01
     // 139.59.106.83 REMOVED 2026-09-01. Three independent confirmations that it
     // sits on a stale branch: an operator caught it serving header 8b4842ee at
     // height 204,615 where the canonical block is e19acc35 (Byron and our own
@@ -152,7 +161,14 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // tip; its BODIES were valid, which is exactly why it looked healthy. A
     // seed that wedges fresh header presync is disqualified regardless.
     // 2026-09-05 19:49Z: answered at 210872 on the minority branch; NETWORK.
-    "194.93.48.158:19335",
+    //
+    // ── MEASURED DEAD 2026-10-01, so it leaves the list ─────────────────────
+    // The same probe from this project's Mac at 17:18Z: 0/3, refused. The
+    // easybtx.com census last reached it around 2026-09-26 (22% uptime over
+    // its stored history). Put it back the day a real node handshakes it
+    // again, with that reading.
+    //
+    //   "194.93.48.158:19335"  0/3 refused — 2026-10-01
     // Operator node, at tip, open inbound, consented to being a seed 2026-09-01
     // with the honest caveat that it is a rented box he cannot promise forever.
     // A retired seed costs one failed dial; the checkpoint gate (planned) makes
@@ -3165,6 +3181,18 @@ pub async fn stop_foreign_node(datadir: &Path, btx_cli: &Path) {
 /// a graceful stop of a HEALTHY node into a SIGKILL mid-flush, and the next
 /// start into a long "Verifying blocks…" rebuild.
 pub async fn stop_unmanaged_node(datadir: &Path, btx_cli: &Path, grace: std::time::Duration) {
+    // Out of the background policy first, as `NodeController::stop` does: a
+    // node adopted after a self-update may have been put there by the
+    // previous app, and its shutdown flush must not queue behind other
+    // programs' disk I/O. Only a pidfile pid that is alive and named btxd.
+    // macOS only: no other platform ever leaves Normal.
+    #[cfg(target_os = "macos")]
+    if let Some(pid) = verified_btxd_pidfile_pid(datadir).await {
+        let _ = crate::engine_priority::apply_engine_priority(
+            pid,
+            crate::engine_priority::EnginePriority::Normal,
+        );
+    }
     let mut stop_cmd = Command::new(btx_cli);
     stop_cmd
         .arg(format!("-datadir={}", datadir.display()))
@@ -3559,6 +3587,20 @@ pub fn btxd_pidfile_alive(datadir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The pid in `<datadir>/btxd.pid`, only when that process is alive and is
+/// named btxd ([`comm_looks_like_btxd`], the guard the force-kill uses), so a
+/// stale file whose pid was reused never points at another program. For
+/// changing the scheduling policy of a node this app adopted rather than
+/// spawned (`engine_priority`).
+pub async fn verified_btxd_pidfile_pid(datadir: &Path) -> Option<u32> {
+    let pid = btxd_pidfile_pid(datadir)?;
+    if !crate::platform::process_is_alive(pid) {
+        return None;
+    }
+    let comm = pid_comm(pid).await?;
+    comm_looks_like_btxd(&comm).then_some(pid)
+}
+
 /// The pid btxd wrote to `<datadir>/btxd.pid`, if the file holds one.
 fn btxd_pidfile_pid(datadir: &Path) -> Option<u32> {
     std::fs::read_to_string(datadir.join("btxd.pid"))
@@ -3924,6 +3966,14 @@ pub struct NodeController {
     /// Consecutive [`NodeController::restart`] calls, reset by a `start` that
     /// the caller drove itself. The crash-loop guard counts on this.
     restarts: u32,
+    /// The scheduling policy last set on the child (`engine_priority`).
+    /// Remembered because macOS does not report another process's
+    /// background state.
+    priority: crate::engine_priority::EnginePriority,
+    /// While set, the child is held at normal priority for a step that must
+    /// not be slowed (the GPU-check extension, a snapshot load), and the
+    /// status refresher's retune leaves it alone.
+    priority_hold: bool,
 }
 
 impl NodeController {
@@ -3933,7 +3983,53 @@ impl NodeController {
             config: None,
             args: Vec::new(),
             restarts: 0,
+            priority: crate::engine_priority::EnginePriority::Normal,
+            priority_hold: false,
         }
+    }
+
+    /// The scheduling policy last set on the child this controller spawned.
+    pub fn engine_priority(&self) -> crate::engine_priority::EnginePriority {
+        self.priority
+    }
+
+    /// Whether a hold keeps the child at normal priority right now
+    /// ([`NodeController::hold_normal_priority`]).
+    pub fn priority_held(&self) -> bool {
+        self.priority_hold
+    }
+
+    /// Put the child under `priority` and remember it. An error (no child,
+    /// or the call refused) changes nothing that is remembered.
+    pub fn set_engine_priority(
+        &mut self,
+        priority: crate::engine_priority::EnginePriority,
+    ) -> Result<(), String> {
+        let pid = self
+            .child_pid()
+            .ok_or_else(|| "no engine process to set".to_string())?;
+        crate::engine_priority::apply_engine_priority(pid, priority)?;
+        self.priority = priority;
+        Ok(())
+    }
+
+    /// Hold the child at normal priority until
+    /// [`NodeController::release_priority_hold`]: for a step whose time
+    /// budget was sized at normal priority (the GPU-check extension) or that
+    /// should not queue behind other programs' disk I/O (a snapshot load).
+    pub fn hold_normal_priority(&mut self) -> Result<(), String> {
+        self.priority_hold = true;
+        self.set_engine_priority(crate::engine_priority::EnginePriority::Normal)
+    }
+
+    /// End a hold and put the child back under the spawn policy; the status
+    /// refresher re-decides from the chain within 30 s. No-op without a hold.
+    pub fn release_priority_hold(&mut self) -> Result<(), String> {
+        if !self.priority_hold {
+            return Ok(());
+        }
+        self.priority_hold = false;
+        self.set_engine_priority(crate::engine_priority::engine_priority_at_spawn())
     }
 
     /// Stop any stale daemon that holds a pidfile in `datadir`.
@@ -4093,6 +4189,28 @@ impl NodeController {
 
         // Write the child's PID so future runs can detect a stale daemon.
         if let Some(pid) = child.id() {
+            // The person using the computer goes first (`engine_priority`, and
+            // docs/mac-engine-priority.md for the measurements). Applied here,
+            // before the engine's start-up GPU check, and again on every
+            // `restart`, which comes back through this function. A failure
+            // leaves a working node at normal priority, so it is logged, not
+            // returned.
+            let priority = crate::engine_priority::engine_priority_at_spawn();
+            self.priority_hold = false;
+            self.priority = match crate::engine_priority::apply_engine_priority(pid, priority) {
+                Ok(()) => {
+                    eprintln!("[node] btxd (pid {pid}) runs at {}", priority.describe());
+                    priority
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[node] could not apply {} to btxd (pid {pid}): {e}; it runs at normal \
+                         priority",
+                        priority.describe()
+                    );
+                    crate::engine_priority::EnginePriority::Normal
+                }
+            };
             let pidfile = pidfile_path(datadir);
             if let Err(e) = std::fs::write(&pidfile, pid.to_string()) {
                 eprintln!("[node] could not write pidfile {}: {e}", pidfile.display());
@@ -4460,6 +4578,19 @@ impl NodeController {
         // Out of the controller BEFORE the request, so nothing that drops the
         // controller from here on can kill a node that is shutting down.
         let child = self.child.take().map(std::mem::ManuallyDrop::new);
+
+        // Out of the background policy first (`engine_priority`): a shutdown
+        // flushes the chainstate to disk, the background policy puts that
+        // write behind every other program's disk I/O, and a stop that runs
+        // out of grace is killed mid-flush. Best-effort, like the request.
+        if let Some(pid) = child.as_ref().and_then(|c| c.id()) {
+            let _ = crate::engine_priority::apply_engine_priority(
+                pid,
+                crate::engine_priority::EnginePriority::Normal,
+            );
+            self.priority = crate::engine_priority::EnginePriority::Normal;
+            self.priority_hold = false;
+        }
 
         // Issue the graceful stop request. btxd's stop RPC returns once it has
         // received the request, NOT when it has finished flushing.
@@ -5012,6 +5143,105 @@ mod tests {
             }
         }
         unreachable!("the loop above either returns a controller or panics")
+    }
+
+    // ── The engine's scheduling policy (engine_priority, 0.7.2) ────────────
+
+    /// A btx-cli stand-in that records the base priority of the process in
+    /// `<datadir>/<pidfile>` at the moment the stop command runs, then
+    /// SIGTERMs it, so a test sees what the policy was WHEN the stop went out.
+    #[cfg(target_os = "macos")]
+    fn priority_recording_cli(dir: &std::path::Path, pidfile: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let cli = dir.join("btx-cli");
+        let script = format!(
+            "#!/bin/sh\npid=$(cat '{d}/{pidfile}')\nps -o pri= -p $pid | tr -d ' ' > \
+             '{d}/pri-at-stop'\nkill $pid\n",
+            d = dir.display()
+        );
+        std::fs::write(&cli, script).unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cli
+    }
+
+    /// `start` puts the real child in the background policy on a Mac, a hold
+    /// lifts it and its release puts it back, and `stop` lifts it BEFORE the
+    /// stop command goes out (read by the stand-in btx-cli at that moment).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn start_puts_the_child_in_the_background_and_stop_lifts_it_first() {
+        use crate::engine_priority::{is_background, EnginePriority};
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = priority_recording_cli(tmp.path(), "easybtx-node.pid");
+        let mut c = start_shim(tmp.path(), "sleep 60").await;
+        let pid = c.child_pid().unwrap();
+        let at_start = (is_background(pid), c.engine_priority());
+        c.hold_normal_priority().unwrap();
+        let held = (is_background(pid), c.priority_held());
+        c.release_priority_hold().unwrap();
+        let released = (is_background(pid), c.priority_held(), c.engine_priority());
+        c.stop(&cli, tmp.path()).await.unwrap();
+        let pri: i32 = std::fs::read_to_string(tmp.path().join("pri-at-stop"))
+            .expect("the stop command ran")
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(at_start, (Some(true), EnginePriority::Background));
+        assert_eq!(held, (Some(false), true));
+        assert_eq!(released, (Some(true), false, EnginePriority::Background));
+        assert!(
+            pri > 4,
+            "the stop went out with the node still in the background (pri {pri})"
+        );
+        assert_eq!(c.engine_priority(), EnginePriority::Normal);
+    }
+
+    /// The pid of a node this app adopted (a previous instance's btxd, found
+    /// through `btxd.pid`) is used only when that process is alive and named
+    /// btxd; and `stop_unmanaged_node` lifts its background policy before the
+    /// stop command goes out.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn an_adopted_node_is_found_by_name_and_lifted_before_its_stop() {
+        use crate::engine_priority::{apply_engine_priority, EnginePriority};
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = priority_recording_cli(tmp.path(), "btxd.pid");
+        assert_eq!(verified_btxd_pidfile_pid(tmp.path()).await, None, "no file");
+
+        // A process NOT named btxd behind the pidfile: a reused pid.
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(tmp.path().join("btxd.pid"), other.id().to_string()).unwrap();
+        let reused = verified_btxd_pidfile_pid(tmp.path()).await;
+        let _ = other.kill();
+        let _ = other.wait();
+        assert_eq!(reused, None, "a pid that is not btxd is never used");
+
+        // A process named btxd: /bin/sleep under that name. A symlink, not a
+        // copy: macOS kills a copied platform binary at exec.
+        let fake = tmp.path().join("bin").join("btxd");
+        std::fs::create_dir_all(fake.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("/bin/sleep", &fake).unwrap();
+        let mut node = std::process::Command::new(&fake).arg("60").spawn().unwrap();
+        let pid = node.id();
+        std::fs::write(tmp.path().join("btxd.pid"), pid.to_string()).unwrap();
+        let found = verified_btxd_pidfile_pid(tmp.path()).await;
+        apply_engine_priority(pid, EnginePriority::Background).unwrap();
+        let reaper = std::thread::spawn(move || node.wait());
+        stop_unmanaged_node(tmp.path(), &cli, std::time::Duration::from_secs(5)).await;
+        let _ = reaper.join();
+        let pri: i32 = std::fs::read_to_string(tmp.path().join("pri-at-stop"))
+            .expect("the stop command ran")
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(found, Some(pid));
+        assert!(
+            pri > 4,
+            "the stop went out with the node still in the background (pri {pri})"
+        );
     }
 
     #[cfg(unix)]
@@ -7349,8 +7579,13 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
         // 20 s, and it is the one consenting seed the easybtx.com census has
         // measured on the heaviest chain all week. 37.230.134.222 has refused
         // every connection since 2026-09-12 23:31Z (btxd's own log).
+        // 2026-10-01: the head moved to 109.199.124.187. 89.85.40.184 and
+        // 194.93.48.158 refused three TCP dials each from the Mac at 17:18Z,
+        // and the easybtx.com census lists both as down. What justifies the
+        // new head: the same probe connected 3/3, and the census measures it
+        // at the tip on /BTX:0.34.12/ the same hour (seed d942).
         assert!(
-            BTX_BOOTSTRAP_PEERS[0].starts_with("89.85.40.184:"),
+            BTX_BOOTSTRAP_PEERS[0].starts_with("109.199.124.187:"),
             "head is {} — if a seed was retired, move this with it and say \
              what measurement justified the new head",
             BTX_BOOTSTRAP_PEERS[0]
@@ -7629,10 +7864,12 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
         // 2026-09-13: 4 became 3 — 37.230.134.222 refused every connection
         // from btxscan's real node since 09-12 23:31Z; it keeps its seat in
         // BTX_ARCHIVE_PEERS and leaves the head.
+        // 2026-10-01: 3 became 1 — 89.85.40.184 and 194.93.48.158 refused
+        // three TCP dials each from the Mac and are down in the census.
         assert_eq!(
             BTX_BOOTSTRAP_PEERS.len(),
-            3,
-            "BTX_BOOTSTRAP_PEERS should have 3 entries"
+            1,
+            "BTX_BOOTSTRAP_PEERS should have 1 entry"
         );
     }
 
