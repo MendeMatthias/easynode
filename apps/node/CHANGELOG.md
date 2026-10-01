@@ -50,10 +50,9 @@ you were using.
 - Nodes that sign blocks do the same. Linux and Windows are unchanged.
 
 **Two peers that stopped answering are off the start list.**
-`89.85.40.184` and `194.93.48.158` refused every connection on 1 October and
-the easybtx.com census lists both as down, so a new node no longer spends its
-first tries on them. They can come back the day they answer again. The page at
-easybtx.com/node lists the peers a node dials first and what each one serves.
+`89.85.40.184` and `194.93.48.158` refused our test connections on 1 October
+and the easybtx.com census lists both as down, so a new node no longer spends
+its first tries on them. They can come back the day they answer again.
 
 The node engine stays BTX 0.34.12, the same as 0.7.1.
 

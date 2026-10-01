@@ -2858,7 +2858,11 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         fork_tick = fork_tick.wrapping_add(1);
                         // Catching up far behind at normal priority, giving
                         // way at the tip: every 30 s, from this tick's gap.
-                        if fork_tick % FORK_CHECK_EVERY == 2
+                        // macOS only: elsewhere the policy is always Normal,
+                        // so there is nothing to retune and no reason to
+                        // spawn `ps`/`tasklist` for an adopted engine.
+                        if cfg!(target_os = "macos")
+                            && fork_tick % FORK_CHECK_EVERY == 2
                             && retune_spawned_engine(&node_slot, behind) == SpawnedRetune::NoChild
                             && *attached_slot.lock().await == Some(AttachedTo::OurOrphan)
                         {
