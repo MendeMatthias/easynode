@@ -433,9 +433,10 @@ fn signatures_block(o: &mut Vec<String>, i: &DiagnosticsInput) {
                 format!("{} s", w.span_secs)
             };
             o.push(format!(
-                "  last {span}: accepted +{} · rejected +{}",
+                "  last {span}: accepted +{} · rejected +{} · duplicates +{}",
                 group(w.accepted),
-                group(w.rejected)
+                group(w.rejected),
+                group(w.duplicates)
             ));
         }
         None => o.push("  last few minutes: not measured yet".into()),
@@ -1580,6 +1581,7 @@ mod tests {
             signature_window: Some(crate::watchdog::SignatureDeltas {
                 accepted: 0,
                 rejected: 5_750,
+                duplicates: 0,
                 span_secs: 1_320,
             }),
             ..Default::default()
@@ -1601,7 +1603,7 @@ mod tests {
             "pin: 1 of 2 keys (0 post-quantum) · enough unblocked keys for the quorum: yes",
             &format!("pin keys: {}, {}", &old_a[..16], &old_b[..16]),
             "since the engine started: accepted 412 · rejected 6,750 · duplicates 9",
-            "last 22 min: accepted +0 · rejected +5,750",
+            "last 22 min: accepted +0 · rejected +5,750 · duplicates +0",
         ] {
             assert!(block.contains(part), "missing {part}:\n{block}");
         }

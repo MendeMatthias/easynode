@@ -148,6 +148,10 @@ pub struct StallFacts {
 pub struct SignatureEvidence {
     pub accepted_delta: u64,
     pub rejected_delta: u64,
+    /// Re-deliveries of a signature the engine already holds. With open
+    /// attestors off it holds only pinned keys' signatures, so a rise means a
+    /// pinned key reaches this node and the rule must not fire.
+    pub duplicates_delta: u64,
     pub span_secs: u64,
     /// This app's own shipped keys (`node::BTX_TRUSTED_ATTESTATION_PUBKEYS`)
     /// that the engine's LIVE pin does not hold. 0 when it holds them all,
@@ -181,7 +185,7 @@ pub const REJECTED_FLOOR: u64 = 20;
 
 /// The engine's signature counters over the last few minutes, as deltas.
 ///
-/// `accepted` and `rejected` (`getmatmultrustedstatus`) live in the engine's
+/// `accepted`, `rejected` and `duplicates` (`getmatmultrustedstatus`) live in the engine's
 /// memory: they start again at every engine start (`accepted` from the
 /// archive it loads, not from 0) and only rise. So a single reading means
 /// nothing; the movement across a span does. A counter that goes DOWN is an
@@ -192,8 +196,9 @@ pub const REJECTED_FLOOR: u64 = 20;
 #[derive(Debug, Clone, Default)]
 pub struct SignatureWindow {
     generation: u64,
-    /// (seconds on the caller's monotonic clock, accepted, rejected).
-    samples: VecDeque<(u64, u64, u64)>,
+    /// (seconds on the caller's monotonic clock, accepted, rejected,
+    /// duplicates).
+    samples: VecDeque<(u64, u64, u64, u64)>,
 }
 
 /// What a [`SignatureWindow`] holds, first sample to last.
@@ -201,23 +206,31 @@ pub struct SignatureWindow {
 pub struct SignatureDeltas {
     pub accepted: u64,
     pub rejected: u64,
+    pub duplicates: u64,
     pub span_secs: u64,
 }
 
 impl SignatureWindow {
     /// Add one reading. A new `generation` (another engine run), a counter
     /// that went down or a clock that went back starts the window over.
-    pub fn push(&mut self, generation: u64, at_secs: u64, accepted: u64, rejected: u64) {
+    pub fn push(
+        &mut self,
+        generation: u64,
+        at_secs: u64,
+        accepted: u64,
+        rejected: u64,
+        duplicates: u64,
+    ) {
         let restarted = self.generation != generation
-            || self
-                .samples
-                .back()
-                .is_some_and(|&(t, a, r)| at_secs < t || accepted < a || rejected < r);
+            || self.samples.back().is_some_and(|&(t, a, r, d)| {
+                at_secs < t || accepted < a || rejected < r || duplicates < d
+            });
         if restarted {
             self.samples.clear();
             self.generation = generation;
         }
-        self.samples.push_back((at_secs, accepted, rejected));
+        self.samples
+            .push_back((at_secs, accepted, rejected, duplicates));
         while self.samples.len() > SIGNATURE_WINDOW_SAMPLES {
             self.samples.pop_front();
         }
@@ -226,10 +239,11 @@ impl SignatureWindow {
     /// The movement from the oldest sample held to the newest, `None` until
     /// there are two.
     pub fn deltas(&self) -> Option<SignatureDeltas> {
-        let (&(t0, a0, r0), &(t1, a1, r1)) = (self.samples.front()?, self.samples.back()?);
+        let (&(t0, a0, r0, d0), &(t1, a1, r1, d1)) = (self.samples.front()?, self.samples.back()?);
         (self.samples.len() >= 2).then_some(SignatureDeltas {
             accepted: a1 - a0,
             rejected: r1 - r0,
+            duplicates: d1 - d0,
             span_secs: t1 - t0,
         })
     }
@@ -300,14 +314,15 @@ pub fn discriminate(f: &StallFacts) -> Option<StallVerdict> {
     // nor a retry changes which keys it accepts.
     //
     // Every condition is required. Over a span at least as long as the
-    // freeze verdict: not one signature accepted (one is proof a pinned key
-    // still reaches the node), and at least REJECTED_FLOOR rejected
+    // freeze verdict: not one signature accepted and not one duplicate
+    // (either is proof a pinned key still reaches the node), and at least REJECTED_FLOOR rejected
     // (rejections alone are normal: every signature from a key outside the
     // pin counts, and the healthy RTX 3060 signer showed 1,735 next to 3,073
     // accepted). No evidence never fires.
     if let Some(s) = &f.signatures {
         if s.span_secs >= FROZEN_VERDICT_SECS
             && s.accepted_delta == 0
+            && s.duplicates_delta == 0
             && s.rejected_delta >= REJECTED_FLOOR
         {
             return Some(pins_reject_every_signature_verdict(s));
@@ -923,6 +938,7 @@ mod tests {
                 i * 30,
                 accepted.0 + i * accepted.1,
                 rejected.0 + i * rejected.1,
+                0,
             );
         }
         w
@@ -933,6 +949,7 @@ mod tests {
         SignatureEvidence {
             accepted_delta: d.accepted,
             rejected_delta: d.rejected,
+            duplicates_delta: d.duplicates,
             span_secs: d.span_secs,
             shipped_keys_missing: 0,
             missing_explained_by: None,
@@ -947,7 +964,7 @@ mod tests {
         // 31 samples, 30 s apart: 900 s, rejected +5,750 across it.
         let mut w = SignatureWindow::default();
         for i in 0..31u64 {
-            w.push(1, i * 30, 412, 1_000 + (i * 5_750) / 30);
+            w.push(1, i * 30, 412, 1_000 + (i * 5_750) / 30, 0);
         }
         StallFacts {
             blocks: 228_900,
@@ -1015,6 +1032,39 @@ mod tests {
         );
     }
 
+    /// Hardening from review: the engine counts a duplicate only for a
+    /// signature it already holds (engine `trusted_exact_replay_attestation.cpp`
+    /// ~940, plus this node's own withdrawn vote, which a mirror does not
+    /// cast), and with open attestors off it holds only pinned keys'. A
+    /// rising `duplicates` therefore means a pinned key's signatures are
+    /// reaching this node, so "none come from a key it trusts" would be
+    /// false. The reported case had none.
+    #[test]
+    fn rising_duplicates_mean_a_pinned_key_reaches_the_node() {
+        let f = the_reported_mirror();
+        assert_eq!(f.signatures.as_ref().unwrap().duplicates_delta, 0);
+        assert_eq!(
+            discriminate(&f).unwrap().class,
+            StallClass::PinsRejectEverySignature
+        );
+        let mut w = SignatureWindow::default();
+        for i in 0..31u64 {
+            w.push(1, i * 30, 412, 1_000 + (i * 5_750) / 30, 7 + i);
+        }
+        assert_eq!(w.deltas().unwrap().duplicates, 30);
+        let f = StallFacts {
+            signatures: Some(evidence(&w)),
+            ..the_reported_mirror()
+        };
+        assert_ne!(
+            discriminate(&f).map(|v| v.class),
+            Some(StallClass::PinsRejectEverySignature)
+        );
+        // Duplicates going down is an engine restart like the others.
+        w.push(1, 31 * 30, 412, 7_000, 0);
+        assert_eq!(w.deltas(), None);
+    }
+
     /// The RTX 3060 signer, healthy (docs/gpu-qualification-rtx3060.md):
     /// accepted 3008 -> 3073 while rejected 1700 -> 1735. Rejections on a
     /// node that accepts anything at all are other keys' signatures, normal.
@@ -1023,7 +1073,7 @@ mod tests {
         // 31 samples: accepted +65 and rejected +35 over 900 s, spread out.
         let mut w = SignatureWindow::default();
         for i in 0..31u64 {
-            w.push(1, i * 30, 3_008 + (i * 65) / 30, 1_700 + (i * 35) / 30);
+            w.push(1, i * 30, 3_008 + (i * 65) / 30, 1_700 + (i * 35) / 30, 0);
         }
         let ev = evidence(&w);
         assert_eq!((ev.accepted_delta, ev.rejected_delta), (65, 35));
@@ -1056,6 +1106,7 @@ mod tests {
         let quiet = SignatureEvidence {
             accepted_delta: 0,
             rejected_delta: 0,
+            duplicates_delta: 0,
             span_secs: FROZEN_VERDICT_SECS * 2,
             shipped_keys_missing: 0,
             missing_explained_by: None,
@@ -1081,6 +1132,7 @@ mod tests {
         let trickle = SignatureEvidence {
             accepted_delta: 0,
             rejected_delta: REJECTED_FLOOR - 1,
+            duplicates_delta: 0,
             span_secs: FROZEN_VERDICT_SECS,
             shipped_keys_missing: 0,
             missing_explained_by: None,
@@ -1145,19 +1197,19 @@ mod tests {
         // counters began again at 0 (plus the archive on `accepted`), so
         // nothing before it is comparable.
         let mut w = window(31, (412, 0), (1_000, 10));
-        w.push(1, 31 * 30, 380, 0);
+        w.push(1, 31 * 30, 380, 0, 0);
         assert_eq!(w.deltas(), None);
-        w.push(1, 32 * 30, 380, 25);
+        w.push(1, 32 * 30, 380, 25, 0);
         let d = w.deltas().unwrap();
         assert_eq!((d.accepted, d.rejected, d.span_secs), (0, 25, 30));
         // Only rejected going down is a restart too.
         let mut w = window(5, (412, 1), (1_000, 10));
-        w.push(1, 5 * 30, 500, 3);
+        w.push(1, 5 * 30, 500, 3, 0);
         assert_eq!(w.deltas(), None);
 
         // A new engine generation starts over even when the numbers climb.
         let mut w = window(31, (412, 0), (1_000, 10));
-        w.push(2, 31 * 30, 9_000, 9_000);
+        w.push(2, 31 * 30, 9_000, 9_000, 0);
         assert_eq!(w.deltas(), None);
     }
 

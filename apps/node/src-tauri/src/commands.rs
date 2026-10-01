@@ -2598,7 +2598,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     // `None` when it did not answer: the fork tick below
                     // samples them, and a missed answer must not enter the
                     // window as a stale reading at a new time.
-                    let signature_counters: Option<(u64, u64)>;
+                    let signature_counters: Option<(u64, u64, u64)>;
                     {
                         let serving =
                             NodeAppSettings::load(&node_datadir()).attestation_serve_enabled;
@@ -2632,8 +2632,9 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         let trusted_status = btx_core::node_api::get_matmul_trusted_status(&rpc)
                             .await
                             .ok();
-                        signature_counters =
-                            trusted_status.as_ref().map(|s| (s.accepted, s.rejected));
+                        signature_counters = trusted_status
+                            .as_ref()
+                            .map(|s| (s.accepted, s.rejected, s.duplicates));
                         let has_local_signer =
                             trusted_status.as_ref().is_some_and(|s| s.local_signer);
                         // Whether to keep the signer window, decided ONLY on a
@@ -2727,12 +2728,13 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                             // 30 s apart hold ~22 minutes, past the watchdog's
                             // 15-minute verdict. No extra RPC: the counters
                             // are this tick's trusted status.
-                            if let Some((accepted, rejected)) = signature_counters {
+                            if let Some((accepted, rejected, duplicates)) = signature_counters {
                                 signature_window_slot.lock().await.push(
                                     gen,
                                     run_started.elapsed().as_secs(),
                                     accepted,
                                     rejected,
+                                    duplicates,
                                 );
                             }
                             if !refusal_done.load(Ordering::SeqCst)
@@ -3400,6 +3402,7 @@ fn signature_evidence(
     Some(btx_core::watchdog::SignatureEvidence {
         accepted_delta: d.accepted,
         rejected_delta: d.rejected,
+        duplicates_delta: d.duplicates,
         span_secs: d.span_secs,
         shipped_keys_missing: missing.len(),
         missing_explained_by,
@@ -7554,6 +7557,7 @@ mod tests {
         let deltas = SignatureDeltas {
             accepted: 0,
             rejected: 5_750,
+            duplicates: 0,
             span_secs: 900,
         };
         let all: Vec<String> = SHIPPED.iter().map(|k| k.to_string()).collect();
