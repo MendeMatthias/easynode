@@ -640,6 +640,51 @@ fn slot_child_gone(slot: &tokio::sync::Mutex<Option<NodeController>>) -> bool {
     }
 }
 
+/// Re-decide the engine's scheduling policy from how far behind it is
+/// (`btx_core::engine_priority`): the background policy at the tip, normal
+/// priority while far behind, so a long catch-up is not confined to the
+/// efficiency cores. One log line when it changes.
+///
+/// `policy` is what this refresher last set, per pid. A pid it has not seen
+/// yet is a fresh spawn, which `NodeController::start` put under the spawn
+/// policy. `try_lock`, as in [`slot_child_gone`]: a slot held elsewhere at
+/// that instant is simply looked at again 30 s later. A node this app did not
+/// spawn (no child) is left alone.
+fn retune_engine(
+    slot: &tokio::sync::Mutex<Option<NodeController>>,
+    policy: &mut Option<(u32, btx_core::engine_priority::EnginePriority)>,
+    blocks_behind: u64,
+) {
+    use btx_core::engine_priority::{engine_priority_for, retune_engine_priority, EnginePriority};
+    let Ok(guard) = slot.try_lock() else {
+        return;
+    };
+    let Some(pid) = guard.as_ref().and_then(|c| c.child_pid()) else {
+        *policy = None;
+        return;
+    };
+    drop(guard);
+    let current = match *policy {
+        Some((seen, current)) if seen == pid => current,
+        _ => engine_priority_for(std::env::consts::OS, None, EnginePriority::Normal),
+    };
+    match retune_engine_priority(pid, blocks_behind, current) {
+        Ok(now) => {
+            if now != current {
+                eprintln!(
+                    "[node-app] btxd (pid {pid}) is {blocks_behind} blocks behind; it now runs at {}",
+                    now.describe()
+                );
+            }
+            *policy = Some((pid, now));
+        }
+        Err(e) => {
+            eprintln!("[node-app] could not change btxd's (pid {pid}) priority: {e}");
+            *policy = Some((pid, current));
+        }
+    }
+}
+
 /// What the launch loop does after it stopped a btxd that never opened its
 /// RPC (0.7.1).
 #[derive(Debug, PartialEq, Eq)]
@@ -2280,6 +2325,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
     let engine_warnings_slot = state.engine_warnings.clone();
     let history_slot = state.history_check.clone();
     let started_from_slot = state.started_from.clone();
+    let node_slot = state.node.clone();
     let anchor = snapshot_spec().anchor_height;
 
     tauri::async_runtime::spawn(async move {
@@ -2322,6 +2368,10 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         // the current verdict was first seen persist across ticks.
         const FORK_CHECK_EVERY: u32 = 10;
         let mut fork_tick: u32 = 0;
+        // The engine's scheduling policy (btx_core::engine_priority) as this
+        // refresher last set it, per pid: macOS does not report another
+        // process's background state, so it is remembered here.
+        let mut engine_policy: Option<(u32, btx_core::engine_priority::EnginePriority)> = None;
         let mut gap_since: Option<(std::time::Instant, u64)> = None;
         let mut fork_first_seen: Option<std::time::Instant> = None;
         let mut fork_tips: Vec<btx_core::fork::ChainTip> = Vec::new();
@@ -2722,6 +2772,11 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                             gap_since = None;
                         }
                         fork_tick = fork_tick.wrapping_add(1);
+                        // Catching up far behind at normal priority, giving
+                        // way at the tip: every 30 s, from this tick's gap.
+                        if fork_tick % FORK_CHECK_EVERY == 2 {
+                            retune_engine(&node_slot, &mut engine_policy, behind);
+                        }
                         if fork_tick % FORK_CHECK_EVERY == 1 {
                             // The signature window (btx_core::watchdog::
                             // SignatureWindow), on this slow tick: 45 samples
@@ -10235,5 +10290,55 @@ mod slot_probe_tests {
         let slot: Mutex<Option<NodeController>> = Mutex::new(None);
         let _held = slot.lock().await;
         assert!(!slot_child_gone(&slot));
+    }
+
+    // ── The engine's scheduling policy on the slow tick (0.7.2) ────────────
+    use super::retune_engine;
+    use btx_core::engine_priority::{EnginePriority, FAR_BEHIND_BLOCKS};
+
+    #[test]
+    fn retune_forgets_the_last_pid_once_the_slot_is_empty() {
+        let mut policy = Some((42, EnginePriority::Background));
+        retune_engine(&Mutex::new(None), &mut policy, 0);
+        assert_eq!(policy, None);
+    }
+
+    #[tokio::test]
+    async fn retune_leaves_a_held_slot_for_the_next_look() {
+        let slot: Mutex<Option<NodeController>> = Mutex::new(None);
+        let _held = slot.lock().await;
+        let mut policy = Some((42, EnginePriority::Background));
+        retune_engine(&slot, &mut policy, FAR_BEHIND_BLOCKS + 1);
+        assert_eq!(policy, Some((42, EnginePriority::Background)));
+    }
+
+    /// A fresh spawn starts under the spawn policy; far behind it comes out
+    /// of it, and at the tip it goes back. Off macOS it stays Normal.
+    #[tokio::test]
+    async fn retune_follows_the_gap_on_a_real_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = Mutex::new(Some(start_shim(tmp.path(), "sleep 30").await));
+        let pid = slot.lock().await.as_ref().unwrap().child_pid().unwrap();
+        let mut policy = None;
+        let mut seen = Vec::new();
+        for behind in [0, FAR_BEHIND_BLOCKS + 1, 200, 0] {
+            retune_engine(&slot, &mut policy, behind);
+            seen.push(policy.map(|(p, c)| (p == pid, c)).unwrap());
+        }
+        if let Some(c) = slot.lock().await.as_mut() {
+            c.stop_without_rpc(std::time::Duration::from_secs(2)).await;
+        }
+        use EnginePriority::{Background, Normal};
+        let expected = if cfg!(target_os = "macos") {
+            vec![
+                (true, Background),
+                (true, Normal),
+                (true, Normal),
+                (true, Background),
+            ]
+        } else {
+            vec![(true, Normal); 4]
+        };
+        assert_eq!(seen, expected);
     }
 }
