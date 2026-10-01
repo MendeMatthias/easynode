@@ -162,8 +162,8 @@ pub struct SignatureEvidence {
     /// hold it), `None` when no file it reads explains it.
     pub missing_explained_by: Option<&'static str>,
     /// The last update check found a newer easyNode (`found`, or
-    /// `install-failed` after one), so this build's key list is probably the
-    /// stale part. Without that the app cannot know its own list is stale.
+    /// `install-failed` after one), which may bring a newer key list. Without
+    /// that the app cannot know whether its own list is stale.
     pub update_known: bool,
 }
 
@@ -498,8 +498,8 @@ pub fn where_missing_keys_are_set(
 fn pins_reject_every_signature_verdict(s: &SignatureEvidence) -> StallVerdict {
     let mut summary = String::from(if s.update_known {
         "signatures are reaching this node, but it does not accept any of them, so it \
-         cannot move. Its list of signer keys is probably out of date. Updating easyNode \
-         brings the current list"
+         cannot move. An update is waiting and may bring a newer key list; if not, the \
+         keys it trusts may have stopped signing for now"
     } else {
         "signatures are reaching this node, but none come from a key it trusts, so it \
          cannot move. Updating easyNode brings the current key list; if it is already up \
@@ -1241,9 +1241,16 @@ mod tests {
             serde_json::to_value(no_update.class).unwrap(),
             "pins_reject_every_signature"
         );
-        // An update is known: the list is probably what is out of date.
-        assert!(with_update.summary.contains("probably out of date"));
-        assert!(with_update.summary.contains("Updating easyNode"));
+        // An update is known. It MAY bring a newer key list, but the keys it
+        // trusts may also simply have stopped signing, so the sentence claims
+        // neither (review: "probably out of date" overstated it).
+        assert!(with_update
+            .summary
+            .contains("An update is waiting and may bring a newer key list"));
+        assert!(with_update
+            .summary
+            .contains("if not, the keys it trusts may have stopped signing for now"));
+        assert!(!with_update.summary.contains("out of date"));
         // No update known: the app may be current, so the sentence must also
         // hold when the trusted keys simply stopped signing.
         assert!(no_update.summary.contains("Updating easyNode"));
