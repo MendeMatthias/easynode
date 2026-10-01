@@ -8,6 +8,33 @@ root).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-01
+
+**A node that cannot start now says why, tries again, and keeps running if the graphics card is the problem.**
+Some nodes on 0.7.0 stopped and then never started again, showing only "the
+node's RPC never became reachable (no .cookie yet)". The node engine checks the
+graphics card before it opens the connection this app talks to, and that check
+takes from a few seconds to a few minutes. If the engine stopped or got stuck
+after the first five seconds, the app did not notice: it waited three minutes,
+gave no reason, and did not try again.
+
+- The app now watches the engine for the whole start. If the engine stops, the
+  app reads its log at once, tells you the reason in plain words, and tries
+  again, the same way it already did for a fast stop.
+- More reasons have names: another node already using the folder, the local
+  connection port being taken, and the node's saved record of block signatures
+  failing its own start-up check. When the app does not know the reason, it
+  shows the engine's own error line instead of saying nothing.
+- If the engine is still busy checking the graphics card after three minutes,
+  the app waits up to ten minutes in total and says so on screen. If it is
+  still stuck after that, the node follows signatures instead of not starting
+  at all, and the status screen says why. **Check blocks** in Settings tries
+  the graphics card again.
+- An engine that never opened its connection is now stopped properly, by Stop,
+  by Quit, or when a start gives up. If the graphics card driver holds it so
+  that it cannot be stopped, the app says to restart the computer rather than
+  starting a second engine on top of it.
+
 ## [0.7.0] - 2026-09-30
 
 **A node that fell behind catches up again, and a new node starts near the tip.**
