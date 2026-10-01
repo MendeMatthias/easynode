@@ -26,6 +26,7 @@ pub mod console_policy;
 pub mod datadir;
 pub mod diagnostics;
 pub mod disk;
+pub mod engine_priority;
 pub mod engine_warnings;
 pub mod error;
 pub mod esplora;

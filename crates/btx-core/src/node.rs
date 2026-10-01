@@ -4093,6 +4093,24 @@ impl NodeController {
 
         // Write the child's PID so future runs can detect a stale daemon.
         if let Some(pid) = child.id() {
+            // The person using the computer goes first (`engine_priority`, and
+            // docs/mac-engine-priority.md for the measurements). Applied here,
+            // before the engine's start-up GPU check, and again on every
+            // `restart`, which comes back through this function. A failure
+            // leaves a working node at normal priority, so it is logged, not
+            // returned.
+            let priority = crate::engine_priority::engine_priority_for(
+                std::env::consts::OS,
+                None,
+                crate::engine_priority::EnginePriority::Normal,
+            );
+            match crate::engine_priority::apply_engine_priority(pid, priority) {
+                Ok(()) => eprintln!("[node] btxd (pid {pid}) runs at {}", priority.describe()),
+                Err(e) => eprintln!(
+                    "[node] could not apply {} to btxd (pid {pid}): {e}; it runs at normal priority",
+                    priority.describe()
+                ),
+            }
             let pidfile = pidfile_path(datadir);
             if let Err(e) = std::fs::write(&pidfile, pid.to_string()) {
                 eprintln!("[node] could not write pidfile {}: {e}", pidfile.display());
@@ -4460,6 +4478,17 @@ impl NodeController {
         // Out of the controller BEFORE the request, so nothing that drops the
         // controller from here on can kill a node that is shutting down.
         let child = self.child.take().map(std::mem::ManuallyDrop::new);
+
+        // Out of the background policy first (`engine_priority`): a shutdown
+        // flushes the chainstate to disk, the background policy puts that
+        // write behind every other program's disk I/O, and a stop that runs
+        // out of grace is killed mid-flush. Best-effort, like the request.
+        if let Some(pid) = child.as_ref().and_then(|c| c.id()) {
+            let _ = crate::engine_priority::apply_engine_priority(
+                pid,
+                crate::engine_priority::EnginePriority::Normal,
+            );
+        }
 
         // Issue the graceful stop request. btxd's stop RPC returns once it has
         // received the request, NOT when it has finished flushing.
