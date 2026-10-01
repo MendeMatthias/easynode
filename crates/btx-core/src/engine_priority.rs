@@ -133,11 +133,19 @@ pub fn apply_engine_priority(pid: u32, priority: EnginePriority) -> Result<(), S
     }
 }
 
-/// Re-decide the policy of the running engine `pid`, which runs under
-/// `current`, from how far behind it is, and apply it when it changes.
-/// Returns the policy in force afterwards: the new one when it was applied,
-/// `current` when nothing had to change, and on an error `current` too, as
-/// the error text.
+/// The policy a freshly spawned engine gets on this operating system,
+/// before anything about the chain is known.
+pub fn engine_priority_at_spawn() -> EnginePriority {
+    engine_priority_for(std::env::consts::OS, None, EnginePriority::Normal)
+}
+
+/// Re-decide the policy of the running engine `pid` from how far behind it
+/// is, and apply it when it changes. `current` is the policy the caller last
+/// set on it, or `None` when the caller does not know (a node adopted from a
+/// previous app instance): then the chosen policy is applied regardless, and
+/// between the two lines that is the spawn policy. Returns the policy in
+/// force afterwards; on an error, the error text, and the caller should
+/// assume nothing changed.
 ///
 /// The caller remembers `current`, because macOS does not report another
 /// process's background state through `getpriority` (it reads 0 for any pid
@@ -145,13 +153,43 @@ pub fn apply_engine_priority(pid: u32, priority: EnginePriority) -> Result<(), S
 pub fn retune_engine_priority(
     pid: u32,
     blocks_behind: u64,
-    current: EnginePriority,
+    current: Option<EnginePriority>,
 ) -> Result<EnginePriority, String> {
-    let wanted = engine_priority_for(std::env::consts::OS, Some(blocks_behind), current);
-    if wanted == current {
-        return Ok(current);
+    let assumed = current.unwrap_or_else(engine_priority_at_spawn);
+    let wanted = engine_priority_for(std::env::consts::OS, Some(blocks_behind), assumed);
+    if current == Some(wanted) {
+        return Ok(wanted);
     }
     apply_engine_priority(pid, wanted).map(|()| wanted)
+}
+
+/// Whether process `pid` runs in the background policy, read the way
+/// `ps -o pri` reads it: the task's base priority drops to 4 there (measured
+/// on an M2 Pro, macOS 26.6: 26 or 31 before, 4 after `setpriority`, back
+/// after clearing it). `None` when the process is gone or off macOS. For
+/// tests and diagnostics; the policy decisions never read it back.
+#[cfg(target_os = "macos")]
+pub fn is_background(pid: u32) -> Option<bool> {
+    // SAFETY: zeroed is a valid proc_taskinfo (plain integers).
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: `info` is a properly sized, writable proc_taskinfo.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    (n == size).then_some(info.pti_priority <= 4)
+}
+
+/// Off macOS there is no background policy to read.
+#[cfg(not(target_os = "macos"))]
+pub fn is_background(_pid: u32) -> Option<bool> {
+    None
 }
 
 #[cfg(target_os = "macos")]
@@ -176,27 +214,6 @@ mod tests {
     use super::*;
 
     use EnginePriority::{Background, Normal};
-
-    /// Whether `pid` runs in the background policy, read the way `ps -o pri`
-    /// reads it: the task's base priority drops to 4 there (measured on this
-    /// M2 Pro, macOS 26.6: 26 or 31 before, 4 after `setpriority`, back after
-    /// clearing it). `None` when the process is gone.
-    #[cfg(target_os = "macos")]
-    fn is_background(pid: u32) -> Option<bool> {
-        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
-        let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
-        // SAFETY: `info` is a properly sized, writable proc_taskinfo.
-        let n = unsafe {
-            libc::proc_pidinfo(
-                pid as libc::c_int,
-                libc::PROC_PIDTASKINFO,
-                0,
-                &mut info as *mut _ as *mut libc::c_void,
-                size,
-            )
-        };
-        (n == size).then_some(info.pti_priority <= 4)
-    }
 
     #[test]
     fn a_mac_starts_the_engine_in_the_background_policy() {
@@ -253,7 +270,8 @@ mod tests {
     #[test]
     fn off_macos_normal_priority_changes_nothing() {
         assert_eq!(apply_engine_priority(0, Normal), Ok(()));
-        assert_eq!(retune_engine_priority(1, 0, Normal), Ok(Normal));
+        assert_eq!(retune_engine_priority(1, 0, Some(Normal)), Ok(Normal));
+        assert_eq!(retune_engine_priority(1, 0, None), Ok(Normal));
     }
 
     #[test]
@@ -279,11 +297,11 @@ mod tests {
         let mut seen = vec![is_background(pid)];
         let applied = apply_engine_priority(pid, Background);
         seen.push(is_background(pid));
-        let still_tip = retune_engine_priority(pid, 0, Background);
-        let far = retune_engine_priority(pid, FAR_BEHIND_BLOCKS + 1, Background);
+        let still_tip = retune_engine_priority(pid, 0, Some(Background));
+        let far = retune_engine_priority(pid, FAR_BEHIND_BLOCKS + 1, Some(Background));
         seen.push(is_background(pid));
-        let between = retune_engine_priority(pid, 200, Normal);
-        let tip = retune_engine_priority(pid, 0, Normal);
+        let between = retune_engine_priority(pid, 200, Some(Normal));
+        let tip = retune_engine_priority(pid, 0, Some(Normal));
         seen.push(is_background(pid));
         let me_after = is_background(std::process::id());
         let _ = child.kill();
@@ -298,6 +316,41 @@ mod tests {
         assert_eq!(me_after, Some(false));
     }
 
+    /// A node whose policy the caller does not know (adopted from a previous
+    /// app instance) gets the chosen policy applied, not assumed: far behind
+    /// it is lifted, at the tip and between the lines it goes into the
+    /// background, whatever it ran at before.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unknown_policy_is_applied_not_assumed() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep spawns");
+        let pid = child.id();
+        apply_engine_priority(pid, Background).unwrap();
+        let far = retune_engine_priority(pid, FAR_BEHIND_BLOCKS + 1, None);
+        let far_seen = is_background(pid);
+        let between = retune_engine_priority(pid, 200, None);
+        let between_seen = is_background(pid);
+        apply_engine_priority(pid, Normal).unwrap();
+        let tip = retune_engine_priority(pid, 0, None);
+        let tip_seen = is_background(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!((far, far_seen), (Ok(Normal), Some(false)));
+        assert_eq!((between, between_seen), (Ok(Background), Some(true)));
+        assert_eq!((tip, tip_seen), (Ok(Background), Some(true)));
+    }
+
+    #[test]
+    fn the_spawn_policy_is_the_unknown_chain_policy() {
+        assert_eq!(
+            engine_priority_at_spawn(),
+            engine_priority_for(std::env::consts::OS, None, Normal)
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn a_process_that_is_gone_is_an_error_not_a_panic() {
@@ -306,6 +359,6 @@ mod tests {
         child.wait().unwrap();
         assert!(apply_engine_priority(pid, Background).is_err());
         // And a retune on it reports the error rather than a change.
-        assert!(retune_engine_priority(pid, 0, Normal).is_err());
+        assert!(retune_engine_priority(pid, 0, Some(Normal)).is_err());
     }
 }
