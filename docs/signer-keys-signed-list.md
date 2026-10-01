@@ -11,8 +11,10 @@ The keys a mirror trusts are compiled in
 (`node::BTX_TRUSTED_ATTESTATION_PUBKEYS`). When the set of keys that actually
 sign changes, every install keeps the old list until it updates the whole app.
 An operator reported a node with two old keys pinned: 0 signatures accepted,
-5,750 rejected, about 230 blocks behind. An app update fixed it; nothing could
-have fixed it sooner.
+5,750 rejected, about 230 blocks behind, and nothing told him. The report
+does not say how it was resolved. What is known is that today only a new
+build changes the compiled list, so a node on an old list cannot get a newer
+one any sooner than its next app update.
 
 ## The shape
 
