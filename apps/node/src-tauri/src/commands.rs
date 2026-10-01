@@ -669,6 +669,17 @@ fn after_no_rpc_timeout(
     }
 }
 
+/// Did a stop arrive since the launch loop began? `stop_node_inner` moves
+/// `refresher_gen` first thing, and nothing else moves it during a start
+/// (the status refresher's own move comes only after the spawn returns). A
+/// retry the loop would take after stopping a btxd itself checks this, or a
+/// Stop pressed during that stop, which waited for the slot and found it
+/// empty, would be followed by a fresh mirror nobody asked for (final review
+/// M1).
+fn stopped_since(gen_at_start: u64, gen_now: u64) -> bool {
+    gen_now != gen_at_start
+}
+
 /// How long a btxd that outlived the kill is watched before the app asks for
 /// a restart of the computer (final review I1). A wedged NVIDIA card can hold
 /// a killed process well past the kill's own 5 s while the driver tears down
@@ -1688,6 +1699,8 @@ async fn spawn_node_with_lock_retry(
 ) -> Result<RpcClient, String> {
     // How the last attempt's btxd ended, when it exited.
     let mut last_exit: Option<String> = None;
+    // A Stop moves this; see `stopped_since`.
+    let start_gen = state.refresher_gen.load(Ordering::SeqCst);
     for attempt in 1..=LAUNCH_ATTEMPTS {
         // A quit that started mid-retry must win: spawning after the graceful
         // quit's stop pass has already run would orphan a fresh btxd.
@@ -1977,6 +1990,12 @@ async fn spawn_node_with_lock_retry(
                             );
                             eprintln!("[node-app] {msg}");
                             setup_log(datadir, &msg);
+                            if stopped_since(start_gen, state.refresher_gen.load(Ordering::SeqCst))
+                            {
+                                return Err(
+                                    "the node was stopped while it was starting".to_string()
+                                );
+                            }
                             // It did not exit on its own; no exit to quote.
                             last_exit = None;
                             continue;
@@ -2049,6 +2068,9 @@ async fn spawn_node_with_lock_retry(
                  engine, so btxd refused to start as an independent consensus validator. \
                  Retrying as a trusted mirror (attempt {attempt}/{LAUNCH_ATTEMPTS})."
             );
+            if stopped_since(start_gen, state.refresher_gen.load(Ordering::SeqCst)) {
+                return Err("the node was stopped while it was starting".to_string());
+            }
             continue;
         }
 
@@ -9213,8 +9235,8 @@ mod signed_start_tests {
 mod launch_wait_tests {
     use super::{
         after_driver_wait, after_no_rpc_timeout, after_rpc_wait, apply_follow_signatures_choice,
-        exit_when, extends_for_gpu_check, rpc_timeout_error, stop_needs_no_rpc, AfterNoRpcTimeout,
-        AfterRpcWait, GPU_HOLDS_NODE_ERROR,
+        exit_when, extends_for_gpu_check, rpc_timeout_error, stop_needs_no_rpc, stopped_since,
+        AfterNoRpcTimeout, AfterRpcWait, GPU_HOLDS_NODE_ERROR,
     };
     use btx_core::node::NoRpcStop;
     use btx_core::setup::RpcWait;
@@ -9545,6 +9567,39 @@ mod launch_wait_tests {
         let decide = spawn_fn.find("after_driver_wait(").unwrap();
         let held = spawn_fn.find("return Err(GPU_HOLDS_NODE_ERROR").unwrap();
         assert!(kill < wait && wait < decide && decide < held);
+    }
+
+    /// A Stop pressed while the launch loop stops a stuck btxd waits for the
+    /// slot, finds it empty, and leaves; the loop must not then spawn a
+    /// mirror behind its back (final review M1). stop_node_inner moves
+    /// refresher_gen first, so a moved generation is a Stop.
+    #[test]
+    fn a_stop_during_the_no_rpc_stop_is_not_followed_by_a_retry() {
+        assert!(!stopped_since(7, 7));
+        assert!(stopped_since(7, 8));
+
+        let src = include_str!("commands.rs");
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let snap = spawn_fn
+            .find("let start_gen = state.refresher_gen.load(Ordering::SeqCst);")
+            .unwrap();
+        assert!(snap < spawn_fn.find("for attempt in 1..=LAUNCH_ATTEMPTS").unwrap());
+        // Both retries that follow a stop the loop made itself look first:
+        // the GPU-hang one and the Mac's chip refusal.
+        for marker in [
+            "AfterNoRpcTimeout::RetryAsMirror => {",
+            "btx_core::node::record_matmul_consensus_refused(datadir);",
+        ] {
+            let at = spawn_fn.find(marker).unwrap();
+            let rest = &spawn_fn[at..];
+            let check = rest.find("stopped_since(start_gen,").unwrap();
+            let retry = rest.find("continue;").unwrap();
+            assert!(check < retry, "{marker}");
+        }
     }
 
     /// No evidence, no change of role: a timeout that is not the GPU check
