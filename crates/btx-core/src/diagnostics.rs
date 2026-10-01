@@ -408,14 +408,30 @@ fn signatures_block(o: &mut Vec<String>, i: &DiagnosticsInput) {
         }
     ));
     let missing = crate::watchdog::shipped_keys_missing(&t.trusted_signer_pubkeys);
+    // Pinned but on the blocklist: the engine rejects that key's signatures
+    // before it looks at the pin, so it is no more usable than a missing one.
+    let blocked: Vec<&str> = crate::node::BTX_TRUSTED_ATTESTATION_PUBKEYS
+        .into_iter()
+        .filter(|k| {
+            !missing.contains(k) && t.blocked_pubkeys.iter().any(|b| b.eq_ignore_ascii_case(k))
+        })
+        .collect();
     if !t.trusted_signer_pubkeys.is_empty() {
-        if missing.is_empty() {
+        if missing.is_empty() && blocked.is_empty() {
             o.push("  every key this app ships is in the pin".into());
-        } else {
+        }
+        if !missing.is_empty() {
             let missing: Vec<String> = missing.iter().map(|k| short(k)).collect();
             o.push(format!(
                 "  keys this app ships, not in the pin: {}",
                 missing.join(", ")
+            ));
+        }
+        if !blocked.is_empty() {
+            let blocked: Vec<String> = blocked.iter().map(|k| short(k)).collect();
+            o.push(format!(
+                "  keys this app ships, pinned but blocked: {}",
+                blocked.join(", ")
             ));
         }
     }
@@ -1625,6 +1641,41 @@ mod tests {
             ..Default::default()
         });
         assert!(r.contains("last few minutes: not measured yet"), "{r}");
+    }
+
+    /// A shipped key the engine pins but also blocks signs nothing this node
+    /// accepts (the blocklist outranks the pin), so support must see it
+    /// apart from the healthy pin keys.
+    #[test]
+    fn a_pinned_but_blocked_shipped_key_is_listed_apart() {
+        use crate::node::BTX_TRUSTED_ATTESTATION_PUBKEYS as SHIPPED;
+        let status: MatmulTrustedStatus = serde_json::from_value(serde_json::json!({
+            "trusted_mirror": true,
+            "threshold": 1,
+            "trusted_signers": 4,
+            "trusted_signer_pubkeys": SHIPPED,
+            "blocked_pubkeys": [SHIPPED[2].to_ascii_uppercase()],
+            "pin_quorum_reachable": true
+        }))
+        .unwrap();
+        assert_eq!(status.blocked_pubkeys.len(), 1);
+        let r = render(&DiagnosticsInput {
+            trusted: Some(status),
+            ..Default::default()
+        });
+        assert!(
+            r.contains(&format!(
+                "keys this app ships, pinned but blocked: {}",
+                &SHIPPED[2][..16]
+            )),
+            "{r}"
+        );
+        assert!(!r.contains("every key this app ships is in the pin"), "{r}");
+        assert!(!r.contains("not in the pin"), "{r}");
+        // An engine that omits the field reads as no key blocked.
+        let old: MatmulTrustedStatus =
+            serde_json::from_value(serde_json::json!({ "trusted_mirror": true })).unwrap();
+        assert!(old.blocked_pubkeys.is_empty());
     }
 
     #[test]

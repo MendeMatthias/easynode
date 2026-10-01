@@ -611,6 +611,10 @@ pub struct MatmulTrustedStatus {
     /// ML-DSA-44 pin members, counted.
     #[serde(default)]
     pub trusted_pq_signers: u64,
+    /// The operator's attestation blocklist: keys whose signatures the
+    /// engine rejects even while they stay in the pin.
+    #[serde(default)]
+    pub blocked_pubkeys: Vec<String>,
     /// Whether the pin members not on the blocklist still meet M.
     #[serde(default)]
     pub pin_quorum_reachable: Option<bool>,
