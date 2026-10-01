@@ -640,47 +640,88 @@ fn slot_child_gone(slot: &tokio::sync::Mutex<Option<NodeController>>) -> bool {
     }
 }
 
-/// Re-decide the engine's scheduling policy from how far behind it is
-/// (`btx_core::engine_priority`): the background policy at the tip, normal
-/// priority while far behind, so a long catch-up is not confined to the
-/// efficiency cores. One log line when it changes.
+/// What [`retune_spawned_engine`] found in the node slot.
+#[derive(Debug, PartialEq, Eq)]
+enum SpawnedRetune {
+    /// A child this app spawned: its policy was re-decided (or left alone
+    /// under a hold).
+    Handled,
+    /// No child: nothing spawned, or a node this app adopted instead.
+    NoChild,
+    /// The slot was held elsewhere at that instant; looked at again 30 s later.
+    Busy,
+}
+
+/// Re-decide the scheduling policy of the btxd this app spawned from how far
+/// behind it is (`btx_core::engine_priority`): the background policy at the
+/// tip, normal priority while far behind, so a long catch-up is not confined
+/// to the efficiency cores. One log line when it changes.
 ///
-/// `policy` is what this refresher last set, per pid. A pid it has not seen
-/// yet is a fresh spawn, which `NodeController::start` put under the spawn
-/// policy. `try_lock`, as in [`slot_child_gone`]: a slot held elsewhere at
-/// that instant is simply looked at again 30 s later. A node this app did not
-/// spawn (no child) is left alone.
-fn retune_engine(
+/// The controller remembers what was last set on its child. A hold (the
+/// GPU-check extension, a snapshot load) is left alone. The slot stays
+/// locked across the `setpriority` call, so the child cannot be reaped and
+/// its pid reused in between. `try_lock`, as in [`slot_child_gone`].
+fn retune_spawned_engine(
     slot: &tokio::sync::Mutex<Option<NodeController>>,
+    blocks_behind: u64,
+) -> SpawnedRetune {
+    use btx_core::engine_priority::engine_priority_for;
+    let Ok(mut guard) = slot.try_lock() else {
+        return SpawnedRetune::Busy;
+    };
+    let Some(c) = guard.as_mut().filter(|c| c.child_pid().is_some()) else {
+        return SpawnedRetune::NoChild;
+    };
+    if c.priority_held() {
+        return SpawnedRetune::Handled;
+    }
+    let current = c.engine_priority();
+    let wanted = engine_priority_for(std::env::consts::OS, Some(blocks_behind), current);
+    if wanted != current {
+        let pid = c.child_pid().unwrap_or_default();
+        match c.set_engine_priority(wanted) {
+            Ok(()) => eprintln!(
+                "[node-app] btxd (pid {pid}) is {blocks_behind} blocks behind; it now runs at {}",
+                wanted.describe()
+            ),
+            Err(e) => eprintln!("[node-app] could not change btxd's (pid {pid}) priority: {e}"),
+        }
+    }
+    SpawnedRetune::Handled
+}
+
+/// The same for a btxd this app ADOPTED (`AttachedTo::OurOrphan`: the node a
+/// previous instance left running across a self-update). `pid` is its
+/// verified pidfile pid (`btx_core::node::verified_btxd_pidfile_pid`), or
+/// `None` when there is none. `policy` is what this refresher last set on it,
+/// per pid; a pid it has not set yet gets the chosen policy APPLIED, not
+/// assumed, because the previous app may have left it either way.
+fn retune_adopted_engine(
+    pid: Option<u32>,
     policy: &mut Option<(u32, btx_core::engine_priority::EnginePriority)>,
     blocks_behind: u64,
 ) {
-    use btx_core::engine_priority::{engine_priority_for, retune_engine_priority, EnginePriority};
-    let Ok(guard) = slot.try_lock() else {
-        return;
-    };
-    let Some(pid) = guard.as_ref().and_then(|c| c.child_pid()) else {
+    use btx_core::engine_priority::retune_engine_priority;
+    let Some(pid) = pid else {
         *policy = None;
         return;
     };
-    drop(guard);
-    let current = match *policy {
-        Some((seen, current)) if seen == pid => current,
-        _ => engine_priority_for(std::env::consts::OS, None, EnginePriority::Normal),
-    };
-    match retune_engine_priority(pid, blocks_behind, current) {
+    let known = policy.filter(|(seen, _)| *seen == pid).map(|(_, p)| p);
+    match retune_engine_priority(pid, blocks_behind, known) {
         Ok(now) => {
-            if now != current {
+            if known != Some(now) {
                 eprintln!(
-                    "[node-app] btxd (pid {pid}) is {blocks_behind} blocks behind; it now runs at {}",
+                    "[node-app] adopted btxd (pid {pid}) is {blocks_behind} blocks behind; it now \
+                     runs at {}",
                     now.describe()
                 );
             }
             *policy = Some((pid, now));
         }
         Err(e) => {
-            eprintln!("[node-app] could not change btxd's (pid {pid}) priority: {e}");
-            *policy = Some((pid, current));
+            eprintln!("[node-app] could not change the adopted btxd's (pid {pid}) priority: {e}");
+            // Unknown again, so the next look applies rather than assumes.
+            *policy = None;
         }
     }
 }
@@ -2326,6 +2367,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
     let history_slot = state.history_check.clone();
     let started_from_slot = state.started_from.clone();
     let node_slot = state.node.clone();
+    let attached_slot = state.attached_to.clone();
     let anchor = snapshot_spec().anchor_height;
 
     tauri::async_runtime::spawn(async move {
@@ -2368,10 +2410,8 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         // the current verdict was first seen persist across ticks.
         const FORK_CHECK_EVERY: u32 = 10;
         let mut fork_tick: u32 = 0;
-        // The engine's scheduling policy (btx_core::engine_priority) as this
-        // refresher last set it, per pid: macOS does not report another
-        // process's background state, so it is remembered here.
-        let mut engine_policy: Option<(u32, btx_core::engine_priority::EnginePriority)> = None;
+        // The adopted node's policy, per pid (`retune_adopted_engine`).
+        let mut adopted_policy: Option<(u32, btx_core::engine_priority::EnginePriority)> = None;
         let mut gap_since: Option<(std::time::Instant, u64)> = None;
         let mut fork_first_seen: Option<std::time::Instant> = None;
         let mut fork_tips: Vec<btx_core::fork::ChainTip> = Vec::new();
@@ -2774,8 +2814,13 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         fork_tick = fork_tick.wrapping_add(1);
                         // Catching up far behind at normal priority, giving
                         // way at the tip: every 30 s, from this tick's gap.
-                        if fork_tick % FORK_CHECK_EVERY == 2 {
-                            retune_engine(&node_slot, &mut engine_policy, behind);
+                        if fork_tick % FORK_CHECK_EVERY == 2
+                            && retune_spawned_engine(&node_slot, behind) == SpawnedRetune::NoChild
+                            && *attached_slot.lock().await == Some(AttachedTo::OurOrphan)
+                        {
+                            let pid =
+                                btx_core::node::verified_btxd_pidfile_pid(&node_datadir()).await;
+                            retune_adopted_engine(pid, &mut adopted_policy, behind);
                         }
                         if fork_tick % FORK_CHECK_EVERY == 1 {
                             // The signature window (btx_core::watchdog::
@@ -10293,52 +10338,105 @@ mod slot_probe_tests {
     }
 
     // ── The engine's scheduling policy on the slow tick (0.7.2) ────────────
-    use super::retune_engine;
+    use super::{retune_adopted_engine, retune_spawned_engine, SpawnedRetune};
     use btx_core::engine_priority::{EnginePriority, FAR_BEHIND_BLOCKS};
 
     #[test]
-    fn retune_forgets_the_last_pid_once_the_slot_is_empty() {
-        let mut policy = Some((42, EnginePriority::Background));
-        retune_engine(&Mutex::new(None), &mut policy, 0);
-        assert_eq!(policy, None);
+    fn an_empty_slot_has_no_child_to_retune() {
+        assert_eq!(
+            retune_spawned_engine(&Mutex::new(None), 0),
+            SpawnedRetune::NoChild
+        );
     }
 
     #[tokio::test]
-    async fn retune_leaves_a_held_slot_for_the_next_look() {
+    async fn a_held_slot_is_looked_at_again_later() {
         let slot: Mutex<Option<NodeController>> = Mutex::new(None);
         let _held = slot.lock().await;
-        let mut policy = Some((42, EnginePriority::Background));
-        retune_engine(&slot, &mut policy, FAR_BEHIND_BLOCKS + 1);
-        assert_eq!(policy, Some((42, EnginePriority::Background)));
+        assert_eq!(
+            retune_spawned_engine(&slot, FAR_BEHIND_BLOCKS + 1),
+            SpawnedRetune::Busy
+        );
     }
 
-    /// A fresh spawn starts under the spawn policy; far behind it comes out
-    /// of it, and at the tip it goes back. Off macOS it stays Normal.
+    /// The spawned child: under the spawn policy after `start`, lifted far
+    /// behind, kept between the lines, back at the tip; a hold is left alone.
+    /// Off macOS it stays Normal throughout.
     #[tokio::test]
-    async fn retune_follows_the_gap_on_a_real_child() {
+    async fn the_spawned_engine_follows_the_gap() {
+        use EnginePriority::{Background, Normal};
         let tmp = tempfile::tempdir().unwrap();
         let slot = Mutex::new(Some(start_shim(tmp.path(), "sleep 30").await));
-        let pid = slot.lock().await.as_ref().unwrap().child_pid().unwrap();
-        let mut policy = None;
         let mut seen = Vec::new();
         for behind in [0, FAR_BEHIND_BLOCKS + 1, 200, 0] {
-            retune_engine(&slot, &mut policy, behind);
-            seen.push(policy.map(|(p, c)| (p == pid, c)).unwrap());
+            assert_eq!(retune_spawned_engine(&slot, behind), SpawnedRetune::Handled);
+            seen.push(slot.lock().await.as_ref().unwrap().engine_priority());
         }
+        slot.lock()
+            .await
+            .as_mut()
+            .unwrap()
+            .hold_normal_priority()
+            .ok();
+        retune_spawned_engine(&slot, 0);
+        let held = slot.lock().await.as_ref().unwrap().engine_priority();
         if let Some(c) = slot.lock().await.as_mut() {
             c.stop_without_rpc(std::time::Duration::from_secs(2)).await;
         }
-        use EnginePriority::{Background, Normal};
-        let expected = if cfg!(target_os = "macos") {
-            vec![
-                (true, Background),
-                (true, Normal),
-                (true, Normal),
-                (true, Background),
-            ]
+        if cfg!(target_os = "macos") {
+            assert_eq!(seen, vec![Background, Normal, Normal, Background]);
+            assert_eq!(held, Normal, "a hold is not retuned away");
         } else {
-            vec![(true, Normal); 4]
-        };
-        assert_eq!(seen, expected);
+            assert_eq!(seen, vec![Normal; 4]);
+        }
+    }
+
+    #[test]
+    fn no_adopted_pid_forgets_the_last_one() {
+        let mut policy = Some((42, EnginePriority::Background));
+        retune_adopted_engine(None, &mut policy, 0);
+        assert_eq!(policy, None);
+    }
+
+    /// The adopted node: its first policy is applied, not assumed, so a node
+    /// the previous app left in the background is lifted when far behind,
+    /// and the result is remembered for that pid.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_adopted_engine_gets_the_policy_applied_not_assumed() {
+        use btx_core::engine_priority::{apply_engine_priority, is_background};
+        use EnginePriority::{Background, Normal};
+        let mut node = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = node.id();
+        apply_engine_priority(pid, Background).unwrap();
+        let mut policy = None;
+        retune_adopted_engine(Some(pid), &mut policy, FAR_BEHIND_BLOCKS + 1);
+        let far = (policy, is_background(pid));
+        retune_adopted_engine(Some(pid), &mut policy, 0);
+        let tip = (policy, is_background(pid));
+        let _ = node.kill();
+        let _ = node.wait();
+        assert_eq!(far, (Some((pid, Normal)), Some(false)));
+        assert_eq!(tip, (Some((pid, Background)), Some(true)));
+    }
+
+    /// The refresher asks for the adopted node only when the slot has no
+    /// child AND the app is attached to its own orphan, and reads the pid
+    /// through the name-checked helper.
+    #[test]
+    fn the_refresher_retunes_an_adopted_node_only_when_it_is_ours() {
+        let src = include_str!("commands.rs");
+        let tick = src.split("fn spawn_status_refresher(").nth(1).unwrap();
+        let call = tick
+            .split("retune_spawned_engine(&node_slot, behind) == SpawnedRetune::NoChild")
+            .nth(1)
+            .expect("the spawned retune comes first");
+        let guard = call.find("Some(AttachedTo::OurOrphan)").unwrap();
+        let read = call.find("verified_btxd_pidfile_pid(").unwrap();
+        let adopted = call.find("retune_adopted_engine(pid").unwrap();
+        assert!(guard < read && read < adopted);
     }
 }
