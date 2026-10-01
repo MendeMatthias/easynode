@@ -524,15 +524,19 @@ const GPU_CHECK_EXTRA_POLLS: u32 = 840;
 const GPU_CHECK_WARMING: &str = "Your node is checking this machine's graphics card before it \
                                  opens. On some machines this takes several minutes.";
 
-/// Whether the launch loop gives this launch [`GPU_CHECK_EXTRA_POLLS`]: its
-/// wait ran out without an answer, the node is still in the slot, and its
-/// own part of debug.log stops inside the GPU check. Pure, pinned by a test.
+/// Whether the launch loop gives this launch [`GPU_CHECK_EXTRA_POLLS`]: it
+/// runs the GPU check (`btx_core::node::launch_runs_gpu_check`, final review
+/// M6), its wait ran out without an answer, the node is still in the slot,
+/// and its own part of debug.log stops inside the GPU check. Pure, pinned by
+/// a test.
 fn extends_for_gpu_check(
+    gpu_check_launch: bool,
     wait: &RpcWait,
     slot_empty: bool,
     stage: btx_core::node::PreRpcStage,
 ) -> bool {
-    !slot_empty
+    gpu_check_launch
+        && !slot_empty
         && matches!(wait, RpcWait::TimedOut { warming: false, .. })
         && stage == btx_core::node::PreRpcStage::GpuCheck
 }
@@ -1865,7 +1869,7 @@ async fn spawn_node_with_lock_retry(
             let stage = btx_core::node::pre_rpc_stage(&btx_core::node::debug_log_since(
                 datadir, log_offset,
             ));
-            if extends_for_gpu_check(&wait, slot_empty, stage) {
+            if extends_for_gpu_check(gpu_check_launch, &wait, slot_empty, stage) {
                 let extra_secs = GPU_CHECK_EXTRA_POLLS as u64 * RPC_WAIT_POLL_MS / 1000;
                 let msg = format!(
                     "the node engine is still in its graphics card check after {waited_secs}s; \
@@ -9444,6 +9448,7 @@ mod launch_wait_tests {
     fn a_start_inside_the_gpu_check_gets_a_bounded_extension() {
         use btx_core::node::PreRpcStage;
         assert!(extends_for_gpu_check(
+            true,
             &timed_out(false),
             false,
             PreRpcStage::GpuCheck
@@ -9452,28 +9457,41 @@ mod launch_wait_tests {
         // GPU step, not for a node whose RPC was up, not for an exit or a
         // stop.
         assert!(!extends_for_gpu_check(
+            true,
             &timed_out(false),
             false,
             PreRpcStage::BeforeLogging
         ));
         assert!(!extends_for_gpu_check(
+            true,
             &timed_out(false),
             false,
             PreRpcStage::PastGpuCheck
         ));
         assert!(!extends_for_gpu_check(
+            true,
             &timed_out(true),
             false,
             PreRpcStage::GpuCheck
         ));
         assert!(!extends_for_gpu_check(
+            true,
             &exited(),
             false,
             PreRpcStage::GpuCheck
         ));
         assert!(!extends_for_gpu_check(
+            true,
             &timed_out(false),
             true,
+            PreRpcStage::GpuCheck
+        ));
+        // Only a launch that runs the GPU check (final review M6): a mirror
+        // or a host with no graphics card has nothing to wait out there.
+        assert!(!extends_for_gpu_check(
+            false,
+            &timed_out(false),
+            false,
             PreRpcStage::GpuCheck
         ));
 
