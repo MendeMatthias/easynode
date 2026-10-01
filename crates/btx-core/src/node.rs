@@ -3185,6 +3185,8 @@ pub async fn stop_unmanaged_node(datadir: &Path, btx_cli: &Path, grace: std::tim
     // node adopted after a self-update may have been put there by the
     // previous app, and its shutdown flush must not queue behind other
     // programs' disk I/O. Only a pidfile pid that is alive and named btxd.
+    // macOS only: no other platform ever leaves Normal.
+    #[cfg(target_os = "macos")]
     if let Some(pid) = verified_btxd_pidfile_pid(datadir).await {
         let _ = crate::engine_priority::apply_engine_priority(
             pid,
