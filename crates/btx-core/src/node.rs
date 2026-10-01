@@ -1929,10 +1929,11 @@ pub fn launch_failure_hint(text: &str) -> Option<&'static str> {
         return Some(
             "the node's saved record of block signatures did not pass its own start-up \
              check, so the engine refused to start. Nothing in the chain is damaged. The \
-             record is the files whose names start with matmul_attestations.dat in the \
-             node folder. Open the data folder from Tools, move those files to another \
-             folder, and press Retry. Or use Copy diagnostics in Tools and ask for help \
-             first.",
+             record is the files and the folder whose names start with \
+             matmul_attestations.dat in the node folder. Open the data folder from Tools, \
+             move them to another folder, and press Retry. If this node signs blocks, ask \
+             for help first instead: the record also holds the signatures it took back. \
+             Copy diagnostics in Tools gathers what helps.",
         );
     }
     if text.contains(DATADIR_LOCK_REFUSED_MARKER) {
@@ -2007,6 +2008,14 @@ pub fn launch_failure_cause_or_exit(text: &str, exit: Option<&str>) -> Option<St
 /// when the tail carries neither, so the caller can say it does not know.
 pub fn launch_failure_cause(text: &str) -> Option<String> {
     if let Some(hint) = launch_failure_hint(text) {
+        // The archive refusal's reason (which record, why) is the engine's
+        // alone and is what a helper needs, so it stays with the sentence
+        // (Task A review M5).
+        if text.contains(ATTESTATION_ARCHIVE_REFUSED_MARKER) {
+            if let Some(line) = engine_error_line(text) {
+                return Some(format!("{hint} The engine said: \"{line}\"."));
+            }
+        }
         return Some(hint.to_string());
     }
     engine_error_line(text).map(|line| format!("the engine said: \"{line}\"."))
@@ -5597,7 +5606,20 @@ consensus-validator service.";
                 .contains("nothing in the chain is damaged"),
             "{hint}"
         );
+        // matmul_attestations.dat.db is a folder (LevelDB), not a file.
+        assert!(hint.contains("files and the folder"), "{hint}");
+        // On a signing node the archive also holds the votes it took back
+        // (LoadWithdrawnLocalVotes, matmul_trusted_attestations.cpp:793), so
+        // a signer is told to ask first (Task A review M5).
+        assert!(hint.contains("signs"), "{hint}");
+        assert!(hint.contains("ask for help"), "{hint}");
         assert_calm(hint);
+
+        // The cause keeps the engine's own reason (Task A review M5).
+        let cause = launch_failure_cause(log).unwrap();
+        assert!(cause.starts_with(hint), "{cause}");
+        assert!(cause.contains("record rejected: bad signature"), "{cause}");
+        assert!(!cause.contains('\u{2014}'));
     }
 
     /// init.cpp:2271 at v0.34.12, with CLIENT_NAME = "BTX".
