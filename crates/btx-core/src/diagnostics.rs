@@ -3,7 +3,7 @@
 //! Tauri side gathers the inputs and calls `report(..)`.
 
 use crate::fork::ChainTip;
-use crate::node_api::{AttestedTip, BlockchainInfo, ChainStates, PeerInfo};
+use crate::node_api::{AttestedTip, BlockchainInfo, ChainStates, MatmulTrustedStatus, PeerInfo};
 use crate::snapshot_start::{self, StartRecord};
 
 pub const LOG_TAIL_BYTES: u64 = 2 * 1024 * 1024;
@@ -73,6 +73,12 @@ pub struct DiagnosticsInput {
     pub held: Vec<HeldBranchState>,
     pub peers: Vec<PeerInfo>,
     pub attested_tip: Option<AttestedTip>,
+    /// `getmatmultrustedstatus`, for the Signatures block: the live pin and
+    /// the engine's signature counters. `None` when the node did not answer.
+    pub trusted: Option<MatmulTrustedStatus>,
+    /// The refresher's signature window (`crate::watchdog::SignatureWindow`),
+    /// `None` until it holds two samples this run.
+    pub signature_window: Option<crate::watchdog::SignatureDeltas>,
     pub stall: Option<String>,
     /// What the catch-up help is doing this run (`crate::catchup_assist`,
     /// `CatchUp::diagnostics`), one line each. Empty when no refresher ran.
@@ -333,6 +339,7 @@ pub fn render(i: &DiagnosticsInput) -> String {
             }
         ));
     }
+    signatures_block(&mut o, i);
     let notices = i
         .chain
         .as_ref()
@@ -367,6 +374,72 @@ pub fn render(i: &DiagnosticsInput) -> String {
         o.push(format!("  {l}"));
     }
     o.join("\n")
+}
+
+/// Which keys this node accepts signatures from, which of this app's own it
+/// does not, and what it did with the signatures it heard: the evidence for
+/// the watchdog's `PinsRejectEverySignature`, which the engine logs nowhere
+/// by signer. Public keys are cut to 16 hex characters, enough to compare.
+fn signatures_block(o: &mut Vec<String>, i: &DiagnosticsInput) {
+    o.push("Signatures".into());
+    let Some(t) = &i.trusted else {
+        o.push("  not answering".into());
+        return;
+    };
+    let short = |k: &str| k.chars().take(16).collect::<String>();
+    o.push(format!(
+        "  pin: {} of {} keys ({} post-quantum) · enough unblocked keys for the quorum: {}",
+        t.threshold,
+        t.trusted_signers,
+        t.trusted_pq_signers,
+        match t.pin_quorum_reachable {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unknown",
+        }
+    ));
+    let pin: Vec<String> = t.trusted_signer_pubkeys.iter().map(|k| short(k)).collect();
+    o.push(format!(
+        "  pin keys: {}",
+        if pin.is_empty() {
+            "not listed by this engine".into()
+        } else {
+            pin.join(", ")
+        }
+    ));
+    let missing = crate::watchdog::shipped_keys_missing(&t.trusted_signer_pubkeys);
+    if !t.trusted_signer_pubkeys.is_empty() {
+        if missing.is_empty() {
+            o.push("  every key this app ships is in the pin".into());
+        } else {
+            let missing: Vec<String> = missing.iter().map(|k| short(k)).collect();
+            o.push(format!(
+                "  keys this app ships, not in the pin: {}",
+                missing.join(", ")
+            ));
+        }
+    }
+    o.push(format!(
+        "  since the engine started: accepted {} · rejected {} · duplicates {}",
+        group(t.accepted),
+        group(t.rejected),
+        group(t.duplicates)
+    ));
+    match &i.signature_window {
+        Some(w) => {
+            let span = if w.span_secs >= 60 {
+                format!("{} min", w.span_secs / 60)
+            } else {
+                format!("{} s", w.span_secs)
+            };
+            o.push(format!(
+                "  last {span}: accepted +{} · rejected +{}",
+                group(w.accepted),
+                group(w.rejected)
+            ));
+        }
+        None => o.push("  last few minutes: not measured yet".into()),
+    }
 }
 
 pub struct RedactionContext {
@@ -1286,6 +1359,8 @@ mod tests {
                 },
             ],
             attested_tip: None,
+            trusted: None,
+            signature_window: None,
             stall: None,
             catch_up: vec![
                 crate::catchup_assist::refuses_old_line("109.199.124.187:19335"),
@@ -1436,6 +1511,21 @@ mod tests {
                 ..Default::default()
             }],
             attested_tip: None,
+            trusted: Some(MatmulTrustedStatus {
+                trusted_mirror: true,
+                threshold: 1,
+                trusted_signers: 4,
+                trusted_signer_pubkeys: crate::node::BTX_TRUSTED_ATTESTATION_PUBKEYS
+                    .iter()
+                    .map(|k| k.to_string())
+                    .collect(),
+                pin_quorum_reachable: Some(true),
+                accepted: 3_073,
+                rejected: 1_735,
+                duplicates: 1_532,
+                ..Default::default()
+            }),
+            signature_window: None,
             stall: None,
             catch_up: vec!["not asking any peer for blocks right now".into()],
             log_warnings: vec!["[warning] something".into()],
@@ -1454,12 +1544,85 @@ mod tests {
             "recent history",
             "Engine notices (1)",
             "not shown on the home screen",
+            "Signatures\n  pin: 1 of 4 keys (0 post-quantum) · enough unblocked keys for the quorum: yes",
+            "since the engine started: accepted 3,073 · rejected 1,735 · duplicates 1,532",
+            "every key this app ships is in the pin",
             "Catch-up help\n  not asking any peer for blocks right now",
             "Last warning lines of debug.log (1)",
         ] {
             assert!(r.contains(part), "missing {part}:\n{r}");
         }
         assert!(!r.contains('\u{2014}'));
+    }
+
+    /// The operator's case as Copy diagnostics shows it: two old keys
+    /// pinned, none of the keys this app ships, nothing accepted over the
+    /// window and thousands rejected. Short prefixes are enough to compare
+    /// keys by eye, and public keys survive the redaction.
+    #[test]
+    fn the_signatures_block_shows_the_pin_the_missing_keys_and_the_window() {
+        use crate::node::BTX_TRUSTED_ATTESTATION_PUBKEYS as SHIPPED;
+        let old_a = format!("02{}", "ab".repeat(32));
+        let old_b = format!("03{}", "cd".repeat(32));
+        let input = DiagnosticsInput {
+            generated_at: "2026-09-30 10:00 UTC".into(),
+            trusted: Some(MatmulTrustedStatus {
+                trusted_mirror: true,
+                threshold: 1,
+                trusted_signers: 2,
+                trusted_signer_pubkeys: vec![old_a.clone(), old_b.clone()],
+                pin_quorum_reachable: Some(true),
+                accepted: 412,
+                rejected: 6_750,
+                duplicates: 9,
+                ..Default::default()
+            }),
+            signature_window: Some(crate::watchdog::SignatureDeltas {
+                accepted: 0,
+                rejected: 5_750,
+                span_secs: 1_320,
+            }),
+            ..Default::default()
+        };
+        let ctx = RedactionContext {
+            home: None,
+            secrets: vec![],
+            published_hosts: vec![],
+        };
+        let r = report(&input, &ctx);
+        let block = r
+            .split("Signatures\n")
+            .nth(1)
+            .expect("a Signatures block")
+            .split("\nWatchdog:")
+            .next()
+            .unwrap();
+        for part in [
+            "pin: 1 of 2 keys (0 post-quantum) · enough unblocked keys for the quorum: yes",
+            &format!("pin keys: {}, {}", &old_a[..16], &old_b[..16]),
+            "since the engine started: accepted 412 · rejected 6,750 · duplicates 9",
+            "last 22 min: accepted +0 · rejected +5,750",
+        ] {
+            assert!(block.contains(part), "missing {part}:\n{block}");
+        }
+        let missing: Vec<&str> = SHIPPED.iter().map(|k| &k[..16]).collect();
+        assert!(
+            block.contains(&format!(
+                "keys this app ships, not in the pin: {}",
+                missing.join(", ")
+            )),
+            "{block}"
+        );
+        assert!(!block.contains('\u{2014}'));
+
+        // A node that did not answer, and a window not yet two samples long.
+        let r = render(&DiagnosticsInput::default());
+        assert!(r.contains("Signatures\n  not answering"), "{r}");
+        let r = render(&DiagnosticsInput {
+            trusted: input.trusted.clone(),
+            ..Default::default()
+        });
+        assert!(r.contains("last few minutes: not measured yet"), "{r}");
     }
 
     #[test]
