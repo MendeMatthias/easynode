@@ -86,6 +86,8 @@ pub(crate) const NOTE_WAITS: &str = "easyNode still has to move a snapshot it di
 /// Remove node data, while a run is under way or recorded.
 pub(crate) const REMOVE_WAITS: &str = "Fast-forward is running or has not finished, so easyNode \
      is not removing the node's data now. Try again once Fast-forward has finished.";
+const RECOVERY_WAITS: &str = "easyNode is still getting the node going again after a known \
+     engine error. Fast-forward can run once that has finished.";
 const NODE_IN_THE_WAY: &str = "easyNode has to finish putting the old chain data back after \
      Fast-forward, but a node it did not start is using the data folder. Stop that node, then \
      start the node again.";
@@ -336,6 +338,14 @@ fn refuse_run(datadir: &Path) -> Option<String> {
         Ok(None) => {}
         Ok(Some(_)) => return Some(NOT_FINISHED.into()),
         Err(_) => return Some(unreadable_sentence(datadir)),
+    }
+    // The read-block recovery moves the chain data too
+    // (`crate::read_block_recovery`); one recorded, or unreadable, waits.
+    if !matches!(
+        btx_core::read_block_recovery::read_record(datadir),
+        Ok(None)
+    ) {
+        return Some(RECOVERY_WAITS.into());
     }
     datadir
         .join(SET_ASIDE_PENDING_FILE)
@@ -2136,6 +2146,22 @@ mod tests {
         set_aside_for_run(d, 232_000, 100).unwrap();
         assert_eq!(refuse_run(d).as_deref(), Some(NOT_FINISHED));
         assert!(active_in(d));
+    }
+
+    /// No run while the read-block recovery has a step recorded: both move
+    /// the chain data, and each would put back the other's.
+    #[test]
+    fn a_run_waits_for_the_read_block_recovery() {
+        let tmp = datadir_with_chain(Before::default());
+        let d = tmp.path();
+        btx_core::read_block_recovery::begin(
+            d,
+            btx_core::read_block_recovery::Next::SetAsideChainData { signatures: true },
+            Before::default(),
+            100,
+        )
+        .unwrap();
+        assert_eq!(refuse_run(d).as_deref(), Some(RECOVERY_WAITS));
     }
 
     /// A set-aside note the attempt wrote names the attempt's chainstate,
