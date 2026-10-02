@@ -501,6 +501,7 @@ pub async fn tools_diagnostics(
             .as_ref()
             .map(|v| v.summary.to_string()),
         catch_up: state.catch_up_help.lock().await.lines.clone(),
+        recovery: crate::read_block_recovery::diagnostics_lines(&datadir),
         log_warnings: diagnostics::warning_lines(&btx_core::node::debug_log_tail(
             &datadir,
             diagnostics::LOG_TAIL_BYTES,

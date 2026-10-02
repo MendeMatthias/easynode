@@ -729,7 +729,7 @@ fn verdict(record: &Record, look: &Look, outcome: Option<Outcome>, now_unix: u64
 // ── On disk, each under `with_disk` ─────────────────────────────────────────
 
 /// The two settings a run changes, as they are now.
-fn run_settings(datadir: &Path) -> Before {
+pub(crate) fn run_settings(datadir: &Path) -> Before {
     let s = NodeAppSettings::load(datadir);
     Before {
         snapshot_loaded: s.snapshot_loaded,
@@ -739,7 +739,7 @@ fn run_settings(datadir: &Path) -> Before {
 
 /// Write the two settings, and the snapshot marker as "snapshot loaded"
 /// says.
-fn put_settings(datadir: &Path, to: Before) {
+pub(crate) fn put_settings(datadir: &Path, to: Before) {
     NodeAppSettings::update(datadir, |s| {
         s.snapshot_loaded = to.snapshot_loaded;
         s.first_load_pending = to.first_load_pending;

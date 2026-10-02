@@ -10,6 +10,7 @@
 mod ask;
 mod commands;
 mod fast_forward;
+mod read_block_recovery;
 mod state;
 mod tools;
 mod tray;
