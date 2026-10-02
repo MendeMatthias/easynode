@@ -47,6 +47,7 @@ pub mod node_api;
 pub mod operators;
 pub mod platform;
 pub mod power;
+pub mod read_block_recovery;
 pub mod role;
 pub mod rpc;
 pub mod service_report;

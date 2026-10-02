@@ -83,6 +83,10 @@ pub struct DiagnosticsInput {
     /// What the catch-up help is doing this run (`crate::catchup_assist`,
     /// `CatchUp::diagnostics`), one line each. Empty when no refresher ran.
     pub catch_up: Vec<String>,
+    /// The recovery from the engine's "Failed to read block" fatal
+    /// (`crate::read_block_recovery`): the step under way and the last
+    /// outcome, one line each. Empty when there is neither.
+    pub recovery: Vec<String>,
     pub log_warnings: Vec<String>,
 }
 
@@ -364,6 +368,13 @@ pub fn render(i: &DiagnosticsInput) -> String {
         o.push("  nothing to report".into());
     }
     for l in &i.catch_up {
+        o.push(format!("  {l}"));
+    }
+    o.push("Read-block recovery".into());
+    if i.recovery.is_empty() {
+        o.push("  nothing to report".into());
+    }
+    for l in &i.recovery {
         o.push(format!("  {l}"));
     }
     o.push(format!(
@@ -1383,6 +1394,7 @@ mod tests {
                 crate::catchup_assist::refuses_old_line("109.199.124.187:19335"),
                 crate::catchup_assist::refuses_old_line("203.0.113.7:19335"),
             ],
+            recovery: Vec::new(),
             log_warnings: vec![format!(
                 "[warning] signing key backup contains {wif}, update check via \
                  http://84.32.49.226:19335/status failed"
@@ -1545,6 +1557,7 @@ mod tests {
             signature_window: None,
             stall: None,
             catch_up: vec!["not asking any peer for blocks right now".into()],
+            recovery: Vec::new(),
             log_warnings: vec!["[warning] something".into()],
         };
         let r = render(&input);
@@ -1570,6 +1583,28 @@ mod tests {
             assert!(r.contains(part), "missing {part}:\n{r}");
         }
         assert!(!r.contains('\u{2014}'));
+    }
+
+    /// The read-block recovery's lines, under their own heading, and
+    /// "nothing to report" when there are none.
+    #[test]
+    fn the_read_block_recovery_has_its_own_block() {
+        let quiet = render(&DiagnosticsInput::default());
+        assert!(
+            quiet.contains("Read-block recovery\n  nothing to report"),
+            "{quiet}"
+        );
+        let input = DiagnosticsInput {
+            recovery: vec![
+                "step: signatures, phase: running, folder: read-block-recovery-100".into(),
+            ],
+            ..Default::default()
+        };
+        let r = render(&input);
+        assert!(
+            r.contains("Read-block recovery\n  step: signatures, phase: running"),
+            "{r}"
+        );
     }
 
     /// The operator's case as Copy diagnostics shows it: two old keys
