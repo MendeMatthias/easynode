@@ -1905,7 +1905,52 @@ pub const DATADIR_LOCK_REFUSED_MARKER: &str = "Cannot obtain a lock on directory
 /// debug.log lines around it are not in the tail.
 pub const HTTP_SERVER_REFUSED_MARKER: &str = "Unable to start HTTP server";
 
+/// `BlockManager::ReadRawBlock` (node/blockstorage.cpp:1897/1905 at
+/// v0.34.12) asked for a block whose position is the default one: a block
+/// the node knows the header of and never stored.
+pub const READ_BLOCK_NO_DATA_MARKER: &str =
+    "ReadRawBlock: OpenBlockFile failed for FlatFilePos(nFile=-1";
+
+/// ImportBlocks' fatal at start (node/blockstorage.cpp:2133).
+pub const CONNECT_BEST_BLOCK_FATAL_MARKER: &str = "Failed to connect best block";
+
+/// ConnectTip's fatal (validation.cpp:9646), at start and while running.
+pub const READ_BLOCK_FATAL_MARKER: &str = "Failed to read block.";
+
+/// Whether a btxd run died on engine v0.34.12's "Failed to read block"
+/// fatal (.superpowers/sdd/progress.md, P0 root cause).
+///
+/// A trusted mirror that started from a snapshot runs two chainstates. The
+/// engine's mirror shortcut in `FindMostWorkChain` hands the background one
+/// a signed block above the snapshot; it walks up from its own low tip, hits
+/// a block it never downloaded, and the read of position nFile=-1 ends the
+/// node. The signatures that pointed there are stored
+/// (`matmul_attestations.dat*`) and loaded before the next start's first
+/// activation, so every start after it dies the same way in under a second.
+///
+/// Both halves required: the read of a block with no data, AND the fatal it
+/// caused. The read alone is logged for an RPC or peer asking for a block
+/// the node only has the header of, and the node carries on; the fatal
+/// alone, after a read with a real file number, is a damaged or pruned
+/// block file, which none of the recovery for this one would help.
+pub fn log_shows_read_block_fatal(text: &str) -> bool {
+    text.contains(READ_BLOCK_NO_DATA_MARKER)
+        && (text.contains(CONNECT_BEST_BLOCK_FATAL_MARKER)
+            || text.contains(READ_BLOCK_FATAL_MARKER))
+}
+
 pub fn launch_failure_hint(text: &str) -> Option<&'static str> {
+    if log_shows_read_block_fatal(text) {
+        return Some(
+            "the node engine stopped on a known error of its own: it tried to read a block it \
+             never downloaded. This can happen to a node that follows signatures while it \
+             still checks its older history after a snapshot start, and it then happens again \
+             at every start. easyNode tries to get it running on its own: it sets aside the \
+             node's stored signatures and, if that is not enough, its chain data, and starts \
+             again from the snapshot. If that does not work either, everything is put back. \
+             Nothing is deleted. Copy diagnostics in Tools gathers what helps.",
+        );
+    }
     if text.contains(PRUNED_DATADIR_REFUSED_MARKER) {
         return Some(
             "this node folder deleted old blocks in an earlier run, and something asked \
@@ -5784,6 +5829,65 @@ consensus-validator service.";
         assert!(!log_shows_matmul_consensus_refused(""));
     }
 
+    /// Zan's Linux mirror on 2026-10-01, the restart after the first crash
+    /// (engine v0.34.12, snapshot 234614, background chainstate at 20233):
+    /// the last 80 lines of easybtx-node.log, verbatim.
+    const REAL_READ_BLOCK_FATAL: &str =
+        include_str!("../tests/fixtures/read_block_fatal/easybtx-node.log");
+
+    #[test]
+    fn the_read_block_fatal_is_recognised_from_the_real_restart() {
+        assert!(log_shows_read_block_fatal(REAL_READ_BLOCK_FATAL));
+        let hint =
+            launch_failure_hint(REAL_READ_BLOCK_FATAL).expect("the read-block fatal must be named");
+        assert!(hint.contains("signatures"), "{hint}");
+        assert!(!hint.contains('\u{2014}'), "no em-dash: {hint}");
+        assert!(!hint.to_lowercase().contains("guarantee"), "{hint}");
+        // The cause sentence is the hint, not the engine's "Error:" line.
+        assert_eq!(
+            launch_failure_cause(REAL_READ_BLOCK_FATAL).as_deref(),
+            Some(hint)
+        );
+    }
+
+    /// The crash while running prints only ConnectTip's fatal (validation.cpp
+    /// ~9646), not ImportBlocks' "Failed to connect best block": still ours.
+    #[test]
+    fn the_read_block_fatal_while_running_is_recognised_too() {
+        let running = "2026-10-01T16:13:02Z [error] ReadRawBlock: OpenBlockFile failed for \
+                       FlatFilePos(nFile=-1, nPos=0)\n2026-10-01T16:13:02Z [error] A fatal \
+                       internal error occurred, see debug.log for details: Failed to read \
+                       block.\nError: A fatal internal error occurred, see debug.log for \
+                       details: Failed to read block.\n";
+        assert!(log_shows_read_block_fatal(running));
+    }
+
+    #[test]
+    fn other_block_read_errors_are_not_the_read_block_fatal() {
+        // A block in a real file that cannot be opened (a pruned or damaged
+        // blk file), even with the same fatal after it.
+        let pruned = "[error] ReadRawBlock: OpenBlockFile failed for FlatFilePos(nFile=12, \
+                      nPos=8)\n[error] A fatal internal error occurred, see debug.log for \
+                      details: Failed to read block.";
+        assert!(!log_shows_read_block_fatal(pruned));
+        assert!(launch_failure_hint(pruned).is_none());
+        // The read line alone, with no fatal: an RPC or a peer asked for a
+        // block this node only has the header of, and the node carried on.
+        let header_only =
+            "[error] ReadRawBlock: OpenBlockFile failed for FlatFilePos(nFile=-1, nPos=0)\n\
+             2026-10-01T17:30:00Z UpdateTip: new best=00ab height=234615";
+        assert!(!log_shows_read_block_fatal(header_only));
+        // The shielded refusal (issue #35, validation.cpp ~7457), whose own
+        // text names the nFile=-1 error it replaces.
+        let shielded = "[error] DisconnectBlock(): shielded undo for block 00ab needs a full \
+                        rebuild from ancestor blocks below the prune horizon (a reorg \
+                        disconnected a block whose shielded anchor was pruned), not the \
+                        opaque \"ReadRawBlock: FlatFilePos(nFile=-1)\" error. Refusing the \
+                        prune-unsafe rebuild; restart to recover persisted shielded state.";
+        assert!(!log_shows_read_block_fatal(shielded));
+        assert!(!log_shows_read_block_fatal(""));
+    }
+
     /// The launch hint must name the cause btxd actually printed, and must stay
     /// silent when it recognises nothing. Verbatim lines, captured from a real
     /// v0.34.5 run against ~/.easybtx on 2026-08-31, where the app had been
@@ -6006,6 +6110,26 @@ consensus-validator service.";
         .unwrap();
         assert!(known.contains("19334"), "{known}");
         assert!(launch_failure_cause_or_exit("", None).is_none());
+    }
+
+    /// A spawned child that prints the real restart's lines and exits is
+    /// recognised from the log the controller captured, the tail the launch
+    /// loop reads.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_that_dies_on_the_read_block_fatal_is_recognised_from_its_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lines = tmp.path().join("lines.txt");
+        std::fs::write(&lines, REAL_READ_BLOCK_FATAL).unwrap();
+        let mut controller =
+            start_shim(tmp.path(), &format!("cat '{}'\nexit 1", lines.display())).await;
+        let started = std::time::Instant::now();
+        while controller.child_has_exited() != Some(true) {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let tail = node_log_tail(tmp.path(), 64 * 1024);
+        assert!(log_shows_read_block_fatal(&tail), "{tail}");
     }
 
     /// The controller keeps how its child ended, for that sentence.
