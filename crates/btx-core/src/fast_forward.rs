@@ -38,6 +38,7 @@
 //! * [`resume`]: a run the app was closed on is watched again from the start
 //!   of the app that resumes it.
 
+use crate::aside::{present, remove_any, Pause, Stuck};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -266,32 +267,6 @@ fn check(record: &Record) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether anything is at `path`, a link included (not followed). Only "not
-/// found" is no; any other error is passed on.
-fn present(path: &Path) -> io::Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
-/// Remove what is at `path`: a folder with everything in it, a file, or a
-/// link (never what it points at). Nothing there is fine.
-fn remove_any(path: &Path) -> io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path),
-        Ok(_) => std::fs::remove_file(path),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
-}
-
-/// Between two steps that change the disk. The app always goes on; a test
-/// stops a call here, as a crash would: nothing after it runs, not even a
-/// clean-up.
-type Pause<'a> = &'a mut dyn FnMut() -> io::Result<()>;
-
 /// Move every [`CHAIN_DATA`] entry that exists into a new dated folder, and
 /// keep the record of it on disk. Refused while a run is recorded. On a
 /// failure, what moved goes back ([`MoveError::Untouched`]); if that fails
@@ -488,38 +463,27 @@ fn put_back(datadir: &Path, record: &Record, pause: Pause) -> Result<(), MoveErr
         folder: folder.clone(),
         error,
     };
-    let mut failed = Vec::new();
-    for name in &record.moved {
-        let old = folder.join(name);
-        let place = datadir.join(name);
-        let (waiting, placed) = match (present(&old), present(&place)) {
-            (Ok(w), Ok(p)) => (w, p),
-            (Err(e), _) | (_, Err(e)) => {
-                failed.push(io::Error::new(e.kind(), format!("{name}: {e}")));
-                continue;
+    let shown = folder.display();
+    let failed: Vec<io::Error> = crate::aside::move_entries(&folder, datadir, &record.moved, pause)
+        .map_err(stranded)?
+        .into_iter()
+        .map(|s| match s {
+            Stuck::Unreadable { name, error: e } => {
+                io::Error::new(e.kind(), format!("{name}: {e}"))
             }
-        };
-        match (waiting, placed) {
-            (true, false) => {
-                pause().map_err(stranded)?;
-                if let Err(e) = std::fs::rename(&old, &place) {
-                    failed.push(io::Error::new(
-                        e.kind(),
-                        format!("{name} could not be moved back: {e}"),
-                    ));
-                }
+            Stuck::RenameFailed { name, error: e } => {
+                io::Error::new(e.kind(), format!("{name} could not be moved back: {e}"))
             }
-            (false, true) => {} // back already
-            (true, true) => failed.push(io::Error::new(
+            Stuck::InBoth { name } => io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                format!("{name} is in {} and in its place too", folder.display()),
-            )),
-            (false, false) => failed.push(io::Error::new(
+                format!("{name} is in {shown} and in its place too"),
+            ),
+            Stuck::InNeither { name } => io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("{name} is neither in its place nor in {}", folder.display()),
-            )),
-        }
-    }
+                format!("{name} is neither in its place nor in {shown}"),
+            ),
+        })
+        .collect();
     if let Some(first) = failed.first() {
         let said: Vec<String> = failed.iter().map(|e| e.to_string()).collect();
         return Err(stranded(io::Error::new(first.kind(), said.join("; "))));
