@@ -28,7 +28,7 @@
 //! folder, so no btxd, whichever app starts it, runs on a half-moved one.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use btx_core::fast_forward::{Before, MoveError};
 use btx_core::read_block_recovery::{
@@ -79,23 +79,150 @@ fn facts(datadir: &Path, args: &[String], confs: &[&Path]) -> Facts {
     }
 }
 
+/// Why [`on_disk_locked`] did not run its work.
+#[derive(Debug)]
+enum DiskErr {
+    /// Another process holds the folder's lock: a node runs on it.
+    Held,
+    Other(String),
+}
+
+impl std::fmt::Display for DiskErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiskErr::Held => write!(f, "a node holds the data folder's lock"),
+            DiskErr::Other(why) => write!(f, "{why}"),
+        }
+    }
+}
+
 /// Run `f` on a blocking thread under `with_disk`, holding the engine's
-/// lock on the folder. `Err` with a sentence-free reason when the lock is
-/// held (a node is using the folder) or the task stopped.
+/// lock on the folder.
 async fn on_disk_locked<T: Send + 'static>(
     datadir: &Path,
     f: impl FnOnce(&Path) -> T + Send + 'static,
-) -> Result<T, String> {
+) -> Result<T, DiskErr> {
+    use btx_core::fsx::{EngineLock, EngineLockError};
     let dd = datadir.to_path_buf();
     tauri::async_runtime::spawn_blocking(move || {
         with_disk(|| {
-            let _engine = btx_core::fsx::EngineLock::take(&dd)
-                .map_err(|e| format!("the engine's lock on the folder: {e}"))?;
+            let _engine = EngineLock::take(&dd).map_err(|e| match e {
+                EngineLockError::Held => DiskErr::Held,
+                EngineLockError::Io(e) => DiskErr::Other(format!("the folder's lock: {e}")),
+            })?;
             Ok(f(&dd))
         })
     })
     .await
-    .map_err(|e| format!("the task stopped: {e}"))?
+    .map_err(|e| DiskErr::Other(format!("the task stopped: {e}")))?
+}
+
+/// Another node holds the folder while something here must still be
+/// carried on: nothing moved, and the node is not started.
+const LOCK_HELD: &str = "Another node is using the node folder, so easyNode could not finish \
+     putting things back after a known engine error and did not start the node. Stop the \
+     other node (the easyBTX miner's, a second copy of this app, or a btxd started by hand) \
+     and press Start.";
+
+/// Pure: the sentence when carrying on could not begin.
+fn not_carried_on(why: &DiskErr, shown: &str) -> String {
+    match why {
+        DiskErr::Held => LOCK_HELD.to_string(),
+        DiskErr::Other(_) => stranded_sentence(shown),
+    }
+}
+
+/// The sentence on screen while the app starts a node that died on the
+/// fatal again by itself.
+pub(crate) const AUTO_START: &str = "The node stopped on a known engine error, so easyNode is \
+     starting it again on its own.";
+
+/// When this app run last started the node by itself after the fatal; 0
+/// for never. In memory: the bound is per incident, and an incident does
+/// not outlive the app run that saw it (the next opening starts the node
+/// anyway).
+static LAST_AUTO_START: AtomicU64 = AtomicU64::new(0);
+
+/// What the status refresher knows when the node stopped answering.
+#[derive(Debug, Clone, Copy)]
+struct AutoStart {
+    /// The child this app spawned has exited.
+    child_gone: bool,
+    /// This app spawned it (not attached to another app's node).
+    ours: bool,
+    /// Its own log (rotated per run) shows the fatal.
+    fatal_in_log: bool,
+    /// The person pressed Stop (the run's generation moved) or the app quits.
+    stopped_or_quitting: bool,
+    fast_forward_recorded: bool,
+    step_recorded: bool,
+    /// The last ladder rolled back: the next Start says so, no automatic one.
+    rolled_back: bool,
+    last_auto_start: u64,
+    now: u64,
+}
+
+/// Pure: start the node again by itself? Only for the fatal, on our own
+/// node, with nothing recorded that owns the chain data, and once per
+/// incident: a death within `WATCH_SECS` of the last automatic start is the
+/// same incident.
+fn auto_start_wanted(a: &AutoStart) -> bool {
+    a.child_gone
+        && a.ours
+        && a.fatal_in_log
+        && !a.stopped_or_quitting
+        && !a.fast_forward_recorded
+        && !a.step_recorded
+        && !a.rolled_back
+        && (a.last_auto_start == 0 || a.now.saturating_sub(a.last_auto_start) >= rbr::WATCH_SECS)
+}
+
+/// The status refresher found the node silent: should it start it again
+/// by itself? Records the start when it says yes.
+pub(crate) fn take_auto_start(
+    datadir: &Path,
+    child_gone: bool,
+    ours: bool,
+    stopped_or_quitting: bool,
+) -> bool {
+    let now = now();
+    let facts = AutoStart {
+        child_gone,
+        ours,
+        fatal_in_log: child_gone
+            && btx_core::node::log_shows_read_block_fatal(&btx_core::node::node_log_tail(
+                datadir,
+                64 * 1024,
+            )),
+        stopped_or_quitting,
+        fast_forward_recorded: !matches!(btx_core::fast_forward::read_record(datadir), Ok(None)),
+        step_recorded: !matches!(rbr::read_record(datadir), Ok(None)),
+        rolled_back: matches!(rbr::read_outcome(datadir), Some(Outcome::RolledBack { .. })),
+        last_auto_start: LAST_AUTO_START.load(Ordering::SeqCst),
+        now,
+    };
+    let wanted = auto_start_wanted(&facts);
+    if wanted {
+        LAST_AUTO_START.store(now, Ordering::SeqCst);
+        log(
+            datadir,
+            "the node died on the fatal while running; starting it again on its own",
+        );
+    } else if facts.fatal_in_log {
+        log(
+            datadir,
+            &format!("the node died on the fatal; not starting it by itself: {facts:?}"),
+        );
+    }
+    wanted
+}
+
+/// Pure: the note after an automatic start, for a day.
+fn auto_note(last_auto_start: u64, now_unix: u64) -> Option<String> {
+    (last_auto_start != 0 && now_unix.saturating_sub(last_auto_start) < NOTE_SECS).then(|| {
+        "The node stopped on a known engine error and easyNode started it again on its own."
+            .to_string()
+    })
 }
 
 /// The roll-back on disk, settings and the attempt's launch markers with
@@ -159,7 +286,7 @@ async fn roll_back_and_say(datadir: &Path) -> String {
         Ok(Err(folder)) => stranded_sentence(&folder),
         Err(why) => {
             log(datadir, &format!("could not put everything back: {why}"));
-            stranded_sentence(&shown)
+            not_carried_on(&why, &shown)
         }
     }
 }
@@ -247,6 +374,15 @@ pub(crate) async fn after_fatal(
             rbr::write_outcome(datadir, &Outcome::RolledBack { at: now() });
             copy::rolled_back(&datadir.display().to_string())
         }
+        Err(DiskErr::Held) => {
+            log(
+                datadir,
+                "the step did not happen: another node holds the folder",
+            );
+            "Another node is using the node folder, so easyNode did not set anything aside \
+             after a known engine error. Stop the other node and press Start."
+                .to_string()
+        }
         Err(why) => {
             log(datadir, &format!("the step did not happen: {why}"));
             copy::rolled_back(&datadir.display().to_string())
@@ -330,7 +466,7 @@ pub(crate) async fn before_start(datadir: &Path) -> Result<(), String> {
         }
         Err(why) => {
             log(datadir, &format!("carrying on did not begin: {why}"));
-            Err(stranded_sentence(&shown))
+            Err(not_carried_on(&why, &shown))
         }
     }
 }
@@ -420,6 +556,7 @@ pub(crate) fn status_note(datadir: &Path) -> Option<String> {
         rbr::read_outcome(datadir).as_ref(),
         now(),
     )
+    .or_else(|| auto_note(LAST_AUTO_START.load(Ordering::SeqCst), now()))
 }
 
 /// Pure: Copy diagnostics' lines.
@@ -546,12 +683,122 @@ mod tests {
         assert!(lines_for(None, None).is_empty());
     }
 
+    fn due() -> AutoStart {
+        AutoStart {
+            child_gone: true,
+            ours: true,
+            fatal_in_log: true,
+            stopped_or_quitting: false,
+            fast_forward_recorded: false,
+            step_recorded: false,
+            rolled_back: false,
+            last_auto_start: 0,
+            now: 10_000,
+        }
+    }
+
+    #[test]
+    fn a_node_that_died_on_the_fatal_is_started_again_by_itself() {
+        assert!(auto_start_wanted(&due()));
+    }
+
+    #[test]
+    fn any_other_death_or_state_keeps_todays_behaviour() {
+        for (what, a) in [
+            (
+                "alive",
+                AutoStart {
+                    child_gone: false,
+                    ..due()
+                },
+            ),
+            (
+                "another app's node",
+                AutoStart {
+                    ours: false,
+                    ..due()
+                },
+            ),
+            (
+                "another cause",
+                AutoStart {
+                    fatal_in_log: false,
+                    ..due()
+                },
+            ),
+            (
+                "Stop or Quit",
+                AutoStart {
+                    stopped_or_quitting: true,
+                    ..due()
+                },
+            ),
+            (
+                "Fast-forward",
+                AutoStart {
+                    fast_forward_recorded: true,
+                    ..due()
+                },
+            ),
+            (
+                "a step recorded",
+                AutoStart {
+                    step_recorded: true,
+                    ..due()
+                },
+            ),
+            (
+                "rolled back",
+                AutoStart {
+                    rolled_back: true,
+                    ..due()
+                },
+            ),
+        ] {
+            assert!(!auto_start_wanted(&a), "{what}");
+        }
+    }
+
+    /// One automatic start per incident: a death within the watch of the
+    /// last one is the same incident; one after it is a new one.
+    #[test]
+    fn one_automatic_start_per_incident() {
+        let just = AutoStart {
+            last_auto_start: 10_000 - 60,
+            ..due()
+        };
+        assert!(!auto_start_wanted(&just));
+        let long_ago = AutoStart {
+            last_auto_start: 10_000 - rbr::WATCH_SECS,
+            ..due()
+        };
+        assert!(auto_start_wanted(&long_ago));
+    }
+
+    #[test]
+    fn the_note_says_it_started_again_on_its_own() {
+        assert!(auto_note(5_000, 5_100).unwrap().contains("on its own"));
+        assert!(auto_note(0, 5_100).is_none());
+        assert!(auto_note(5_000, 5_000 + NOTE_SECS).is_none());
+    }
+
+    /// Q3: an interrupted roll-back that finds another node holding the
+    /// folder's lock says so, not "could not put everything back".
+    #[test]
+    fn a_held_lock_says_another_node_is_using_the_folder() {
+        assert_eq!(not_carried_on(&DiskErr::Held, "/d"), LOCK_HELD);
+        assert!(not_carried_on(&DiskErr::Other("x".into()), "/d").contains("/d"));
+    }
+
     #[test]
     fn the_sentences_here_follow_the_copy_rules() {
         for s in [
             stranded_sentence("/x/read-block-recovery-1"),
             STEP_TAKEN.to_string(),
             FAST_FORWARD_FIRST.to_string(),
+            AUTO_START.to_string(),
+            auto_note(1, 2).unwrap(),
+            LOCK_HELD.to_string(),
         ] {
             assert!(!s.contains('\u{2014}') && !s.contains('\u{2013}'), "{s}");
             assert!(!s.to_lowercase().contains("guarantee"), "{s}");

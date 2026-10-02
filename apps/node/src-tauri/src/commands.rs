@@ -3466,6 +3466,35 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     consecutive_failures = 0;
                 }
                 Err(_) => {
+                    // A node this app spawned that died on the engine's
+                    // "Failed to read block" fatal: every start after it
+                    // dies the same way until the read-block recovery takes
+                    // a step, so it is started again at once, by itself,
+                    // and the ladder runs in that start. Once per incident,
+                    // never after Stop or Quit, never while Fast-forward or
+                    // a recovery step is recorded (`take_auto_start`). Any
+                    // other silence keeps the "stopped responding" below.
+                    let state = app.state::<AppState>();
+                    let ours = attached_slot.lock().await.is_none();
+                    let stopped = gen_counter.load(Ordering::SeqCst) != gen
+                        || state.quitting.load(Ordering::SeqCst);
+                    if crate::read_block_recovery::take_auto_start(
+                        &node_datadir(),
+                        slot_child_gone(&node_slot),
+                        ours,
+                        stopped,
+                    ) {
+                        let p = NodePhase::Warming {
+                            message: crate::read_block_recovery::AUTO_START.into(),
+                        };
+                        *phase_slot.lock().await = p.clone();
+                        crate::tray::reflect_phase(&app, &p);
+                        // The child is gone; this clears the slot and the
+                        // run's state the way Stop does, then the start.
+                        stop_node_inner(&state).await;
+                        let _ = start_node_projected(&app, &state).await;
+                        return;
+                    }
                     consecutive_failures += 1;
                     // ~1 min of continuous silence → tell the user instead of
                     // freezing on a stale number, and stop the node the way
@@ -9315,6 +9344,38 @@ mod signed_start_tests {
                 .count(),
             2
         );
+    }
+
+    /// Q1: a node this app spawned that died on the read-block fatal while
+    /// running is started again by the refresher itself, said on screen,
+    /// before the "stopped responding" error; any other silence keeps it.
+    #[test]
+    fn the_refresher_starts_a_node_that_died_on_the_fatal_again() {
+        let src = include_str!("commands.rs");
+        let refresher = src
+            .split("\nfn spawn_status_refresher(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let asked = refresher
+            .find("crate::read_block_recovery::take_auto_start(")
+            .unwrap();
+        let said = refresher
+            .find("crate::read_block_recovery::AUTO_START")
+            .unwrap();
+        let started = refresher
+            .find("start_node_projected(&app, &state)")
+            .unwrap();
+        let error = refresher.find("The node stopped responding.").unwrap();
+        assert!(asked < said && said < started && started < error);
+        let facts = refresher
+            .find("let ours = attached_slot.lock().await.is_none();")
+            .unwrap();
+        assert!(facts < asked);
+        let arm = &refresher[facts..error];
+        assert!(arm.contains("stop_node_inner(&state).await"));
+        assert!(arm.contains("slot_child_gone(&node_slot)"));
+        assert!(arm.contains("gen_counter.load(Ordering::SeqCst) != gen"));
     }
 
     /// A step restarts the whole start, at most twice (two rungs), and the
