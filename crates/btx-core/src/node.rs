@@ -5294,8 +5294,11 @@ mod tests {
     async fn launch_watch_detects_an_immediate_child_death() {
         let tmp = tempfile::tempdir().unwrap();
         let mut controller = start_shim(tmp.path(), "exit 1").await;
+        // 10 s like the shim tests beside it: the shim starts in the macOS
+        // background band, and under a full parallel test run it was starved
+        // past a 3 s window (local CI 2 Oct, passes alone and single-threaded).
         let survived =
-            child_survives_launch_watch(&mut controller, std::time::Duration::from_secs(3)).await;
+            child_survives_launch_watch(&mut controller, std::time::Duration::from_secs(10)).await;
         assert!(
             !survived,
             "a child that exited within the window must be reported dead"
