@@ -128,9 +128,9 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // 05:00Z; getaddednodeinfo connected=false; a fresh onetry produced no
     // peer; three spaced probes from the Mac were refused. Refused, not slow.
     //
-    // It stays in BTX_ARCHIVE_PEERS below, because it is the only archive this
-    // app ships and upstream's maintainer node has come back before; being
-    // there it is still dialled, just after the three seeds that answer. What
+    // It stayed in BTX_ARCHIVE_PEERS below until 2026-10-03 (measured dead
+    // there too, see that list), because upstream's maintainer node had come
+    // back before; there it was still dialled, after the seeds that answer. What
     // it must not be is the FIRST dial every fresh node makes. Put it back here
     // the day a real node handshakes it again, with that reading.
     //
@@ -243,10 +243,20 @@ pub const BTX_ARCHIVE_PEERS: &[&str] = &[
     // 2026-08-31: upstream's maintainer-grade node. Runs the unreleased 0.34.6
     // and advertises MATMUL_ATTESTATION_ARCHIVE (observed live the same day),
     // and confirmed again 2026-09-08 from a running node: NETWORK, CONSENSUS
-    // and ATTESTATION_ARCHIVE, 12.1 MB served in six minutes. After the two
-    // removals above this is the ONLY archive this app ships, which is worth
-    // knowing before anyone reasons about how many we have.
-    "37.230.134.222:19335",
+    // and ATTESTATION_ARCHIVE, 12.1 MB served in six minutes.
+    //
+    // ── MEASURED DEAD 2026-10-03, so it leaves the list ─────────────────────
+    // Refused since 2026-09-12 23:31Z, recorded in BTX_BOOTSTRAP_PEERS above
+    // where it left the head. Probed again from this project's Mac at 23:35Z:
+    // three TCP attempts, four seconds apart, eight-second timeout, 0/3. It
+    // goes now because btx-sentinel, the box watcher, dials every shipped seed
+    // and would otherwise alarm on it every hour. Its noban grant in
+    // BTX_ARCHIVE_WHITELIST_IPS stays, as the retired seeds kept theirs. With
+    // it gone, btxscan's mirror above is the ONLY archive this app ships,
+    // which is worth knowing before anyone reasons about how many we have.
+    // Put it back the day a real node handshakes it again, with that reading.
+    //
+    //   "37.230.134.222:19335"  0/3 refused — 2026-10-03
     // 185.204.25.227 removed 2026-08-31: refused TCP outright in every probe
     // that day and upstream's re-vetted census no longer lists it.
 ];
@@ -401,6 +411,7 @@ pub const BTX_ARCHIVE_WHITELIST_IPS: &[&str] = &[
     // btxscan.io's mirror, the archive peer added 2026-09-24 (BTX_ARCHIVE_PEERS).
     "20.86.181.203",
     "207.56.229.99",
+    // Left BTX_ARCHIVE_PEERS 2026-10-03, measured dead; the grant stays.
     "37.230.134.222",
     "114.150.94.235",
     "195.137.245.82",
@@ -7974,11 +7985,18 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
         // a live v0.34.9 peer connection: services 0x82000d08,
         // MATMUL_ATTESTATION_ARCHIVE among them, and it served `02d5efca`'s
         // signatures for the tip, 227,400 and 227,313 on request.
+        // 2026-10-03: 2 became 1. 37.230.134.222 has refused since 2026-09-12
+        // 23:31Z and refused again 0/3 from the Mac at 23:35Z, and btx-sentinel
+        // would otherwise alarm on it every hour. Its noban grant stays.
         assert_eq!(
-            BTX_ARCHIVE_PEERS.len(),
-            2,
-            "37.230.134.222 and btxscan's 20.86.181.203:19338 are the measured \
-             archives; adding one needs a reading, not a hostname"
+            BTX_ARCHIVE_PEERS,
+            &["20.86.181.203:19338"],
+            "btxscan's 20.86.181.203:19338 is the one measured archive; adding \
+             one needs a reading, not a hostname"
+        );
+        assert!(
+            BTX_ARCHIVE_WHITELIST_IPS.contains(&"37.230.134.222"),
+            "a retired archive keeps its noban grant, as the retired seeds kept theirs"
         );
         // A tripwire, not a fact about the network: pinned so that adding or
         // dropping a seed cannot pass unnoticed. 2026-09-05: 9 became 7 — one

@@ -8,6 +8,13 @@ root).
 
 ## [Unreleased]
 
+**An archive peer that stopped answering is off the start list.**
+`37.230.134.222` has refused connections since 12 September and refused our
+test connections again on 3 October, so a node no longer spends one of its
+first tries on it. The node still keeps its trusted grant for that address,
+so it can come back the day it answers again. The one archive easyNode now
+ships is btxscan.io's mirror.
+
 ## [0.7.4] - 2026-10-03
 
 **The status screen says whether your node is on the same chain as other sources.**
