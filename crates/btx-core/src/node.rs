@@ -1948,7 +1948,8 @@ pub fn launch_failure_hint(text: &str) -> Option<&'static str> {
              at every start. easyNode tries to get it running on its own: it sets aside the \
              node's stored signatures and, if that is not enough, its chain data, and starts \
              again from the snapshot. If that does not work either, everything is put back. \
-             Nothing is deleted. Copy diagnostics in Tools gathers what helps.",
+             Nothing is deleted until the node is running again. Copy diagnostics in Tools \
+             gathers what helps.",
         );
     }
     if text.contains(PRUNED_DATADIR_REFUSED_MARKER) {
@@ -5846,6 +5847,11 @@ consensus-validator service.";
         assert!(hint.contains("signatures"), "{hint}");
         assert!(!hint.contains('\u{2014}'), "no em-dash: {hint}");
         assert!(!hint.to_lowercase().contains("guarantee"), "{hint}");
+        // The old chain is removed once the node runs again from the
+        // snapshot (read_block_recovery::finish): the hint must not say
+        // nothing is ever deleted (final review M3).
+        assert!(!hint.contains("Nothing is deleted."), "{hint}");
+        assert!(hint.contains("until the node is running again"), "{hint}");
         // The cause sentence is the hint, not the engine's "Error:" line.
         assert_eq!(
             launch_failure_cause(REAL_READ_BLOCK_FATAL).as_deref(),
