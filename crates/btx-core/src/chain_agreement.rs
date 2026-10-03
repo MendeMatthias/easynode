@@ -18,7 +18,8 @@
 //!
 //! ── THE RULES ───────────────────────────────────────────────────────────────
 //! ```text
-//! common height H = lowest tip among the explorers and this node, minus MARGIN
+//! common height H = lowest tip among the explorers and this node, minus
+//!                   PROBE_DEPTH (the census's height, so both compare one block)
 //! a source's block at H:
 //!   no block hash in the answer                  -> NOT RUN, with the reason
 //!   same as this node's, tip within tolerance    -> SAME
@@ -56,6 +57,11 @@ use std::time::Duration;
 /// The spec's recommended margin below the lowest tip (chain-agreement/0.1,
 /// 4.2): races at the very tip are normal and must not read as disagreement.
 pub const MARGIN: u64 = 6;
+/// How far below the lowest tip the common height is: the census's
+/// `ATTEST_PROBE_DEPTH` (site/src/pages/api/nodes-check.ts), so this app and
+/// easybtx.com ask every source about the same block. It is more than
+/// [`MARGIN`], which stays the deep/shallow rule, as on the site.
+pub const PROBE_DEPTH: u64 = 8;
 /// One-clock tolerance (4.3): 3 blocks, plus one block per minute between
 /// the two reads. The census uses the same two numbers.
 pub const TOLERANCE_BLOCKS: u64 = 3;
@@ -278,14 +284,14 @@ pub struct ScreenRow {
 }
 
 /// The common height: the lowest tip among the explorers that answered and
-/// this node, `MARGIN` below it. `None` when that is not above the genesis.
+/// this node, `PROBE_DEPTH` below it. `None` when that is not above the genesis.
 pub fn common_height(own_tip: u64, reads: &[Read]) -> Option<u64> {
     let lowest = reads
         .iter()
         .filter(|r| source(&r.id).is_some_and(|s| s.explorer))
         .filter_map(|r| r.tip)
         .fold(own_tip, u64::min);
-    lowest.checked_sub(MARGIN).filter(|h| *h > 0)
+    lowest.checked_sub(PROBE_DEPTH).filter(|h| *h > 0)
 }
 
 /// A full block hash, lowercased, or nothing.
@@ -627,7 +633,7 @@ impl Agreement {
             o.push(format!("  ({r})"));
         }
         o.push(format!(
-            "  compared at height {} ({MARGIN} or more below the lowest explorer tip and your node's), {METHOD}, {SPEC}",
+            "  compared at height {} ({PROBE_DEPTH} below the lowest explorer tip and your node's, the census's height), {METHOD}, {SPEC}",
             commas(self.height)
         ));
         o.push(match &self.own_hash {
@@ -819,7 +825,7 @@ mod tests {
     // ── the common height ──
 
     #[test]
-    fn the_common_height_is_margin_below_the_lowest_explorer_tip_and_this_node() {
+    fn the_common_height_is_the_census_depth_below_the_lowest_explorer_tip_and_this_node() {
         let reads = [
             read("btxscan", Some(240_010), None),
             read("byronbay", Some(240_008), None),
@@ -827,19 +833,23 @@ mod tests {
             // picks its height from the explorers too.
             read("witness-1", Some(239_000), None),
         ];
-        assert_eq!(common_height(240_020, &reads), Some(240_002));
-        assert_eq!(common_height(240_005, &reads), Some(239_999));
+        assert_eq!(common_height(240_020, &reads), Some(240_000));
+        assert_eq!(common_height(240_005, &reads), Some(239_997));
+        // The same block the census asks about: 8 below, not the 6 the
+        // deep/shallow rule uses.
+        assert_eq!(PROBE_DEPTH, 8);
+        assert_eq!(MARGIN, 6);
     }
 
     #[test]
     fn with_no_explorer_answering_the_height_comes_from_this_node() {
         let reads = [down("btxscan", "x"), down("byronbay", "y")];
-        assert_eq!(common_height(240_000, &reads), Some(239_994));
+        assert_eq!(common_height(240_000, &reads), Some(239_992));
     }
 
     #[test]
     fn a_node_at_the_genesis_has_no_common_height() {
-        assert_eq!(common_height(MARGIN, &[]), None);
+        assert_eq!(common_height(PROBE_DEPTH, &[]), None);
         assert_eq!(common_height(0, &[]), None);
     }
 
@@ -1187,7 +1197,7 @@ mod tests {
             lines[0],
             "  DISAGREE · WARNING · ATTACHED, NOT CHECKED HERE · as of 2026-09-21 14:13 UTC"
         );
-        assert!(text.contains("compared at height 240,000"), "{text}");
+        assert!(text.contains("compared at height 240,000 (8 below the lowest explorer tip and your node's, the census's height)"), "{text}");
         assert!(
             text.contains(&format!(
                 "your node: tip 240,010, block {A} · OBSERVED BY YOUR NODE"
@@ -1226,7 +1236,7 @@ mod tests {
             .create_async()
             .await;
         let _h1 = ex
-            .mock("GET", "/block-height/240004")
+            .mock("GET", "/block-height/240002")
             .with_body(A)
             .create_async()
             .await;
@@ -1256,8 +1266,8 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(*asked.lock().unwrap(), Some(240_004));
-        assert_eq!(a.height, 240_004);
+        assert_eq!(*asked.lock().unwrap(), Some(240_002));
+        assert_eq!(a.height, 240_002);
         assert_eq!(state(&a, "btxscan"), SourceState::Same);
         let w = a.sources.iter().find(|s| s.id == "witness-2").unwrap();
         assert_eq!(w.state, SourceState::NotRun);
