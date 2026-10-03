@@ -445,7 +445,7 @@ pub fn signers(
             out.push(raise(
                 "signatures-silent",
                 Prio::High,
-                format!("No new block signature for {} (newest signed block {h}, tip {}). Mirrors and fast-forward nodes stop following the chain.", ago(quiet), s.tip),
+                format!("No new block signature for {} (newest signed block {h}, tip {}). Mirrors and fast-forward nodes stop following the chain. It can also mean the chain itself has stopped making blocks.", ago(quiet), s.tip),
                 HOUR,
             ));
         } else {
