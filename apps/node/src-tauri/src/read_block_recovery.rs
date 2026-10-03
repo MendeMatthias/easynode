@@ -17,11 +17,14 @@
 //!   watched for `WATCH_SECS`, then the step is finished; and any start
 //!   that reached RPC ends a rolled-back incident's "already tried".
 //!
-//! A btxd that dies while running is not restarted by this app: the status
-//! refresher says "The node stopped responding" after about a minute and
-//! the next Start (the button, the tray, or the app's own start when it
-//! opens) goes through this same path, where the restart fatal shows within
-//! a second.
+//! * [`take_auto_start`]: a btxd this app spawned that died on the fatal
+//!   while running (or in the moment after its start answered RPC) is
+//!   started again by the status refresher itself, at once, said on screen,
+//!   so the ladder runs with no click. Once per incident, never after Stop
+//!   or Quit, never while Fast-forward or a recovery step is recorded or
+//!   after a roll-back. Any other death keeps the refresher's "The node
+//!   stopped responding", and the next Start (the button, the tray, or the
+//!   app's own start when it opens) goes through this same path.
 //!
 //! Every move holds `crate::fast_forward::with_disk` (the one serialisation
 //! point for moves in the data folder) and the engine's own lock on the
