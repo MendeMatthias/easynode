@@ -244,6 +244,22 @@
           <div id="engine-notes"></div>
         </div>
 
+        <!-- "Am I on the right chain?" (btx_core::chain_agreement,
+             chain-agreement.ts): this node's block at a height below every
+             tip, next to what api.btxscan.io, the witnesses and the Byron Bay
+             explorer say, every five minutes. The word is always text; colour
+             is a second cue, green only for AGREE, grey when there is not
+             enough to compare. Display only. -->
+        <div class="card agree-card" id="agree-card" hidden>
+          <div class="agree-row">
+            <span class="agree-mark" aria-hidden="true"></span>
+            <span class="agree-label">Same chain as other sources</span>
+            <span class="agree-word" id="agree-word"></span>
+          </div>
+          <p class="agree-scope" id="agree-scope"></p>
+          <div class="agree-lines" id="agree-lines"></div>
+        </div>
+
         <!-- Once per engine, after the engine refused this Mac's graphics
              chip and the app moved the node to following signatures
              (start-choice.ts chipNoticeVisible). OK remembers it. A screen

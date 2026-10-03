@@ -614,6 +614,38 @@ body {
 .engine-card.is-calm { border-color: var(--color-border); }
 .engine-card p.is-calm { color: var(--color-muted); }
 
+/* Same chain as other sources: one calm row. The word is the answer and
+   takes the text colour (spec D2); the mark and the border carry the status.
+   Green only for OK, amber for CAUTION, red for WARNING, grey for UNKNOWN,
+   so "could not compare" never looks like "agrees". */
+.agree-card { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.agree-row { display: flex; align-items: center; gap: 8px; }
+.agree-mark {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-muted);
+  flex: none;
+}
+.agree-label { color: var(--color-muted); }
+.agree-word { margin-left: auto; text-align: right; font-weight: 700; }
+.agree-scope, .agree-lines p {
+  margin: 0;
+  font-size: 12px;
+  color: var(--color-muted);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.agree-lines { display: flex; flex-direction: column; gap: 4px; }
+.agree-card.is-ok .agree-mark { background: var(--color-green); border-color: var(--color-green); }
+.agree-card.is-caution { border-color: rgba(251, 191, 36, 0.5); }
+.agree-card.is-caution .agree-mark { background: var(--color-amber); border-color: var(--color-amber); }
+.agree-card.is-caution .agree-lines p:first-child { color: var(--color-amber); }
+.agree-card.is-warning { border-color: rgba(248, 113, 113, 0.5); }
+.agree-card.is-warning .agree-mark { background: var(--color-danger); border-color: var(--color-danger); }
+.agree-card.is-warning .agree-lines p:first-child { color: var(--color-danger); }
+.agree-card.is-unknown .agree-mark { border-style: dashed; }
+
 /* Your node's role: one fact per line, each ending in a sentence on whether it
    helps. The mark is the only judgement on the card and it is deliberately
    quiet — filled green = helps other nodes, hollow = does not, dashed = the

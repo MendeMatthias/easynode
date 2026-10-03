@@ -30,6 +30,7 @@ import {
   trendReading,
 } from "./catchup-trend";
 import { type HistoryCheck, historyCheckView } from "./history-check";
+import { type ChainAgreementRow, chainAgreementView } from "./chain-agreement";
 import {
   NO_GPU_REASON,
   type StartChoice,
@@ -212,6 +213,10 @@ interface NodeStatusInfo {
   /** Everything else btxd is warning about, one sentence each, those that ask
    *  for attention first. Rendered in Rust; empty when there is nothing. */
   engine_notes: { message: string; needs_attention: boolean }[];
+  /** "Same chain as other sources" (btx_core::chain_agreement), its
+   *  sentences rendered in Rust. Null when stopped or before the first
+   *  comparison of this run. */
+  chain_agreement: ChainAgreementRow | null;
   node_nickname: string;
   broadcast_nickname: string | null;
   subversion: string | null;
@@ -1033,6 +1038,7 @@ function renderStatus(status: NodeStatusInfo) {
 
   reflectPeerNames(status);
   reflectEngineNotes(status);
+  renderChainAgreement(status);
   reflectChipNotice(status);
   reflectHistoryCheck(status);
   renderRole(status);
@@ -1906,6 +1912,35 @@ function reflectEngineNotes(status: NodeStatusInfo): void {
     const p = document.createElement("p");
     p.className = note.needs_attention ? "" : "is-calm";
     p.textContent = note.message;
+    list.appendChild(p);
+  }
+}
+
+/**
+ * "Same chain as other sources": the word, who agrees at which block and
+ * when, and for anything but AGREE what differs and what it means. The
+ * sentences are btx_core::chain_agreement's; chain-agreement.ts picks the
+ * tone. Hidden on any phase that is not running, like the role card.
+ */
+function renderChainAgreement(status: NodeStatusInfo): void {
+  const card = $("agree-card");
+  const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
+  const view = chainAgreementView(status.chain_agreement, running);
+  if (!view) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  card.classList.remove("is-ok", "is-caution", "is-warning", "is-unknown");
+  card.classList.add(view.tone);
+  $("agree-word").textContent = view.word;
+  $("agree-scope").textContent = view.scope;
+  // Elements and textContent, never innerHTML: the sentences name sources.
+  const list = $("agree-lines");
+  list.textContent = "";
+  for (const line of view.lines) {
+    const p = document.createElement("p");
+    p.textContent = line;
     list.appendChild(p);
   }
 }

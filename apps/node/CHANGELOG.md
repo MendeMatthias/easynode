@@ -8,6 +8,17 @@ root).
 
 ## [Unreleased]
 
+- **Same chain as other sources.** The status screen has a new row that
+  compares your node's block with api.btxscan.io, the two easyNode witnesses
+  and the Byron Bay explorer, every five minutes, at a height a few blocks
+  below every tip. It says AGREE, BEHIND, STALE TIP, DISAGREE or NOT ENOUGH
+  SOURCES, who agrees at which block, and when it last looked. Sources run by
+  the same operator count once, and when fewer than two operators answer the
+  row is grey, not green. It uses the same words and rules as the Network
+  health section on easybtx.com. It only shows what it finds: it changes
+  nothing about the chain your node follows. Copy diagnostics has a "Chain
+  agreement" block with each source's answer.
+
 ## [0.7.3] - 2026-10-03
 
 **A node that stops on "Failed to read block" gets itself running again.**

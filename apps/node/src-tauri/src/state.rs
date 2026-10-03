@@ -755,6 +755,11 @@ pub struct AppState {
     /// `tip_median_time`: one lost answer is not the engine taking a warning
     /// back, and a warning that blinks on and off reads as a false alarm.
     pub engine_warnings: Arc<Mutex<Vec<btx_core::engine_warnings::EngineWarning>>>,
+    /// The last "same chain as other sources" comparison
+    /// (`btx_core::chain_agreement`), made every five minutes while the node
+    /// runs. `None` before the first one and after a stop; an old one turns
+    /// grey at render time (`Agreement::screen`), never stays green.
+    pub chain_agreement: Arc<Mutex<Option<btx_core::chain_agreement::Agreement>>>,
     /// The background check of a snapshot's older history
     /// (`btx_core::node_api::refresh_history_check`), from the refresher's
     /// `getchainstates`: whether one is running (`unchecked`, for the role
@@ -861,6 +866,7 @@ impl AppState {
             fork: Arc::new(Mutex::new(None)),
             tip_median_time: Arc::new(Mutex::new(None)),
             engine_warnings: Arc::new(Mutex::new(Vec::new())),
+            chain_agreement: Arc::new(Mutex::new(None)),
             history_check: Arc::new(Mutex::new(Default::default())),
             started_from: Arc::new(Mutex::new(None)),
             archive_peers_cache: Arc::new(Mutex::new(None)),
