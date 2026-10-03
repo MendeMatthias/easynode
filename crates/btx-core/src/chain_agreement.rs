@@ -84,6 +84,9 @@ pub const MAX_AGE_SECS: u64 = 30 * 60;
 pub const CHECK_EVERY_SECS: u64 = 5 * 60;
 /// Per request. The census allows 7 s too.
 pub const TIMEOUT_SECS: u64 = 7;
+/// The most of one answer read. A tip is a number and a block hash 64
+/// characters; anything past this is not an answer to these questions.
+pub const MAX_BODY_BYTES: usize = 64 * 1024;
 
 pub const METHOD: &str = "chain-agreement/0.1";
 pub const SPEC: &str = "btx-verdicts/0.1";
@@ -708,12 +711,23 @@ impl Agreement {
 
 /// A fetch failure as one short line, in the census's words (networkHealth.mjs
 /// `sourceError`), so the site and this app name the same failure the same way.
-fn reason_for(e: crate::esplora_freshness::FetchError) -> String {
+/// `tip_route`: a 404 on `/blocks/tip/height` means the API is not there at
+/// all (witness-2 before it is installed); on `/block-height/<h>` it means
+/// the source has no block at that height.
+fn reason_for(e: crate::esplora_freshness::FetchError, tip_route: bool) -> String {
     use crate::esplora_freshness::FetchError;
     let s = match e {
-        FetchError::Status(404) => "not installed yet (HTTP 404)".to_string(),
+        FetchError::Status(404) if tip_route => "not installed yet (HTTP 404)".to_string(),
+        FetchError::Status(404) => "this source has no block at that height (HTTP 404)".into(),
+        FetchError::Status(n @ 300..=399) => format!(
+            "source unreachable: it answered with a redirect (HTTP {n}), which is not followed"
+        ),
         FetchError::Status(n) => format!("source unreachable: HTTP {n}"),
         FetchError::Timeout => format!("source unreachable: no answer within {TIMEOUT_SECS} s"),
+        FetchError::TooLarge(max) => format!(
+            "source unreachable: the answer was larger than {} KB",
+            max / 1024
+        ),
         FetchError::Other(m) => format!("source unreachable: {m}"),
     };
     s.chars().take(200).collect()
@@ -722,9 +736,9 @@ fn reason_for(e: crate::esplora_freshness::FetchError) -> String {
 /// `GET <base>/blocks/tip/height`, with a reason when there is no number.
 pub async fn read_tip(client: &reqwest::Client, base: &str) -> Result<u64, String> {
     let url = format!("{}/blocks/tip/height", base.trim_end_matches('/'));
-    let t = crate::esplora_freshness::get_text(client, &url)
+    let t = crate::esplora_freshness::get_text_capped(client, &url, MAX_BODY_BYTES)
         .await
-        .map_err(reason_for)?;
+        .map_err(|e| reason_for(e, true))?;
     t.trim()
         .parse::<u64>()
         .ok()
@@ -739,9 +753,9 @@ pub async fn read_hash(
     height: u64,
 ) -> Result<String, String> {
     let url = format!("{}/block-height/{height}", base.trim_end_matches('/'));
-    let t = crate::esplora_freshness::get_text(client, &url)
+    let t = crate::esplora_freshness::get_text_capped(client, &url, MAX_BODY_BYTES)
         .await
-        .map_err(reason_for)?;
+        .map_err(|e| reason_for(e, false))?;
     block_hash(&t).ok_or_else(|| "the answer was not a block hash".to_string())
 }
 
@@ -754,8 +768,15 @@ fn now_secs() -> u64 {
 
 /// The client for these reads: a short timeout, an honest user agent.
 pub fn client() -> reqwest::Client {
+    client_with_timeout(Duration::from_secs(TIMEOUT_SECS))
+}
+
+/// [`client`] with another timeout (tests). Never follows a redirect: the
+/// reads go to the listed hosts and nowhere else.
+pub fn client_with_timeout(timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent("easynode-chain-agreement")
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
@@ -1404,6 +1425,92 @@ mod tests {
         assert_eq!(w.reason.as_deref(), Some("not installed yet (HTTP 404)"));
         // One operator answered: grey.
         assert_eq!(a.outcome, Outcome::NotEnoughSources);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_refused_and_never_followed() {
+        let mut elsewhere = mockito::Server::new_async().await;
+        let never = elsewhere
+            .mock("GET", "/blocks/tip/height")
+            .with_body("240010")
+            .expect(0)
+            .create_async()
+            .await;
+        let mut s = mockito::Server::new_async().await;
+        let _m = s
+            .mock("GET", "/blocks/tip/height")
+            .with_status(302)
+            .with_header(
+                "location",
+                &format!("{}/blocks/tip/height", elsewhere.url()),
+            )
+            .create_async()
+            .await;
+        assert_eq!(
+            read_tip(&client(), &s.url()).await,
+            Err(
+                "source unreachable: it answered with a redirect (HTTP 302), which is not followed"
+                    .to_string()
+            )
+        );
+        never.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_huge_answer_is_not_read_to_the_end() {
+        let mut s = mockito::Server::new_async().await;
+        let _m = s
+            .mock("GET", "/block-height/5")
+            .with_body("a".repeat(MAX_BODY_BYTES + 1))
+            .create_async()
+            .await;
+        assert_eq!(
+            read_hash(&client(), &s.url(), 5).await,
+            Err("source unreachable: the answer was larger than 64 KB".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_404_names_which_route_was_missing() {
+        let mut s = mockito::Server::new_async().await;
+        let _t = s
+            .mock("GET", "/blocks/tip/height")
+            .with_status(404)
+            .create_async()
+            .await;
+        let _h = s
+            .mock("GET", "/block-height/5")
+            .with_status(404)
+            .create_async()
+            .await;
+        assert_eq!(
+            read_tip(&client(), &s.url()).await,
+            Err("not installed yet (HTTP 404)".to_string())
+        );
+        assert_eq!(
+            read_hash(&client(), &s.url(), 5).await,
+            Err("this source has no block at that height (HTTP 404)".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_that_does_not_answer_in_time_says_so() {
+        let mut s = mockito::Server::new_async().await;
+        let _m = s
+            .mock("GET", "/blocks/tip/height")
+            .with_chunked_body(|w| {
+                std::thread::sleep(std::time::Duration::from_millis(1_500));
+                w.write_all(b"240010")
+            })
+            .create_async()
+            .await;
+        let quick = client_with_timeout(std::time::Duration::from_millis(200));
+        assert_eq!(
+            read_tip(&quick, &s.url()).await,
+            Err(format!(
+                "source unreachable: no answer within {TIMEOUT_SECS} s"
+            ))
+        );
     }
 
     #[tokio::test]
