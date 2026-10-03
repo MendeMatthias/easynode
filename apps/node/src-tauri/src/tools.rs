@@ -34,6 +34,9 @@ const APP_SERVICE_HOSTS: &[&str] = &[
     "github.com",
     "api.btxscan.io",
     "btxscan.io",
+    // The Byron Bay explorer, one of the sources "Same chain as other
+    // sources" compares with (btx_core::chain_agreement).
+    "esplora.btxbyronbay.com",
 ];
 
 /// Every host diagnostics may name: the node's own published peers plus this
@@ -510,6 +513,21 @@ pub async fn tools_diagnostics(
         start_record: btx_core::snapshot_start::read(&datadir),
         // The refresher's window, held for this run only.
         signature_window: state.signature_window.lock().await.deltas(),
+        // The last comparison with other sources, as it stands now.
+        chain_agreement: state
+            .chain_agreement
+            .lock()
+            .await
+            .as_ref()
+            .map(|a| {
+                a.diagnostics_lines(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                )
+            })
+            .unwrap_or_default(),
         ..Default::default()
     };
     let mut answering = None;
@@ -958,6 +976,12 @@ mod tests {
         // Both fork witnesses the census reads: witness-1 on its own host,
         // witness-2 at api.btxscan.io/witness (deploy/esplora/witness-2). A
         // report quoting either must keep the name.
+        // The Byron Bay explorer, which the chain-agreement check reads and
+        // the Chain agreement block names.
+        assert!(
+            hosts.iter().any(|h| h == "esplora.btxbyronbay.com"),
+            "missing esplora.btxbyronbay.com: {hosts:?}"
+        );
         for witness in ["witness-1.easybtx.com", "api.btxscan.io"] {
             assert!(
                 hosts.iter().any(|h| h == witness),

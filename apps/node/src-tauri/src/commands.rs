@@ -1565,6 +1565,7 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     *state.matmul_trusted.lock().await = None;
     *state.signature_window.lock().await = Default::default();
     *state.signed_frontier.lock().await = None;
+    *state.chain_agreement.lock().await = None;
     *state.catch_up_help.lock().await = Default::default();
     *state.recent_signers.lock().await = None;
     *state.fork.lock().await = None;
@@ -2441,6 +2442,70 @@ fn spawn_warmup_watcher(app: AppHandle, state: &AppState, datadir: PathBuf) {
     });
 }
 
+/// "Same chain as other sources" (btx_core::chain_agreement): every
+/// `CHECK_EVERY_SECS` while this run lasts, compare this node's block at a
+/// height below every tip with the public sources'. Read-only GETs with a
+/// short timeout, and display only: nothing it finds changes what the node
+/// accepts, its peers or its keys. Ends with the run (the refresher's
+/// generation) and does nothing without a node.
+fn spawn_chain_agreement_checker(state: &AppState, gen: u64) {
+    let gen_counter = state.refresher_gen.clone();
+    let rpc_slot = state.rpc.clone();
+    let slot = state.chain_agreement.clone();
+    tauri::async_runtime::spawn(async move {
+        let client = btx_core::chain_agreement::client();
+        // The first comparison a minute in, once the node answers; a node
+        // still warming up is asked again a minute later, not five.
+        let mut wait = 60;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            if gen_counter.load(Ordering::SeqCst) != gen {
+                return; // superseded by a restart / stop
+            }
+            let Some(rpc) = rpc_slot.lock().await.clone() else {
+                return; // node stopped
+            };
+            let Ok(chain) = get_blockchain_info(&rpc).await else {
+                wait = 60;
+                continue;
+            };
+            wait = btx_core::chain_agreement::CHECK_EVERY_SECS;
+            let ask = rpc.clone();
+            let agreement = btx_core::chain_agreement::check(
+                &client,
+                &btx_core::chain_agreement::SOURCES,
+                chain.blocks,
+                |h| async move {
+                    btx_core::rpc::Rpc::call(&ask, "getblockhash", serde_json::json!([h]))
+                        .await
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                },
+            )
+            .await;
+            if gen_counter.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            if let Some(a) = agreement {
+                *slot.lock().await = Some(a);
+            }
+        }
+    });
+}
+
+/// The status screen's "Same chain as other sources" row: only while the
+/// node runs and once a comparison exists. The sentences are the core's.
+pub(crate) fn chain_agreement_row(
+    running: bool,
+    agreement: Option<&btx_core::chain_agreement::Agreement>,
+    now: u64,
+) -> Option<btx_core::chain_agreement::ScreenRow> {
+    if !running {
+        return None;
+    }
+    agreement.map(|a| a.screen(now))
+}
+
 /// The status refresher: every 3 s read chain info + chainstates + peers and
 /// project them into the phase (Syncing / Ready). Exits when superseded by a
 /// newer generation (restart) or when the node is stopped. Repeated RPC
@@ -2480,6 +2545,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
     let node_slot = state.node.clone();
     let attached_slot = state.attached_to.clone();
     let anchor = snapshot_spec().anchor_height;
+    spawn_chain_agreement_checker(state, gen);
 
     tauri::async_runtime::spawn(async move {
         // This run's start, for the service report's uptime field (the
@@ -3851,6 +3917,7 @@ pub async fn stop_node_inner(state: &AppState) {
     *state.matmul_trusted.lock().await = None;
     *state.signature_window.lock().await = Default::default();
     *state.signed_frontier.lock().await = None;
+    *state.chain_agreement.lock().await = None;
     *state.catch_up_help.lock().await = Default::default();
     *state.fork.lock().await = None;
     *state.tip_median_time.lock().await = None;
@@ -4218,6 +4285,10 @@ pub struct NodeStatusInfo {
     pub esplora_indexing: bool,
     pub esplora_freshness: Option<String>,
     pub esplora_message: Option<String>,
+    /// "Same chain as other sources" (btx_core::chain_agreement), its
+    /// sentences rendered in Rust. `None` when stopped or before the first
+    /// comparison of this run.
+    pub chain_agreement: Option<btx_core::chain_agreement::ScreenRow>,
     /// Serve the two routes a wallet needs to settle a fork. Unlike Esplora
     /// mode this needs no second binary and no particular prune posture, so
     /// `witness_running` is simply whether it is on and the node is up.
@@ -4600,6 +4671,14 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
     // made the exposure warning switch off the moment somebody saved
     // 127.0.0.1, while the live server went on answering 0.0.0.0 for the rest
     // of the session. The Esplora row above already gets this right.
+    let chain_agreement = chain_agreement_row(
+        running,
+        state.chain_agreement.lock().await.as_ref(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    );
     let (witness_running, witness_serving_on) = match &*state.witness.lock().await {
         Some(s) => (true, Some(s.addr.to_string())),
         None => (false, None),
@@ -4741,6 +4820,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         esplora_running,
         esplora_indexing,
         esplora_freshness: esplora_verdict.map(|v| v.freshness.as_str().to_string()),
+        chain_agreement,
         esplora_message,
         last_update_check_at: settings.last_update_check_at.clone(),
         last_update_check_outcome: settings.last_update_check_outcome.clone(),
@@ -10779,6 +10859,70 @@ mod slot_probe_tests {
         let release = watch.find("release_engine_hold(&state.node)").unwrap();
         let after = watch.find("after_snapshot_load(").unwrap();
         assert!(gen_check < release && release < after);
+    }
+
+    /// "Same chain as other sources" shows only while the node runs and once
+    /// a comparison exists; an old one is the core's grey NOT RUN row, never
+    /// the last green.
+    #[test]
+    fn the_chain_agreement_row_needs_a_running_node_and_a_comparison() {
+        use btx_core::chain_agreement::{decide, Own, Read};
+        let a = |h: &str| "a".repeat(64).replace('a', h);
+        let reads = [
+            Read {
+                id: "btxscan".into(),
+                tip: Some(240_010),
+                tip_at: 1_000,
+                hash: Some(a("1")),
+                error: None,
+            },
+            Read {
+                id: "byronbay".into(),
+                tip: Some(240_010),
+                tip_at: 1_000,
+                hash: Some(a("1")),
+                error: None,
+            },
+        ];
+        let own = Own {
+            tip: 240_010,
+            hash: Some(a("1")),
+        };
+        let agreement = decide(240_000, &own, &reads, 1_000);
+        assert_eq!(
+            super::chain_agreement_row(false, Some(&agreement), 1_000),
+            None
+        );
+        assert_eq!(super::chain_agreement_row(true, None, 1_000), None);
+        let row = super::chain_agreement_row(true, Some(&agreement), 1_060).unwrap();
+        assert_eq!(row.word, "AGREE");
+        assert_eq!(row.status, "ok");
+        let old = super::chain_agreement_row(true, Some(&agreement), 1_000 + 31 * 60).unwrap();
+        assert_eq!(old.status, "unknown");
+    }
+
+    /// The comparison runs beside the refresher: it ends with the run (the
+    /// same generation), does nothing without a node, and asks no more often
+    /// than every CHECK_EVERY_SECS.
+    #[test]
+    fn the_chain_agreement_checker_ends_with_the_run_and_waits_between_checks() {
+        let src = include_str!("commands.rs");
+        let body = src
+            .split("\nfn spawn_chain_agreement_checker(")
+            .nth(1)
+            .expect("the checker exists")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(body.contains("gen_counter.load(Ordering::SeqCst) != gen"));
+        assert!(body.contains("rpc_slot.lock().await.clone() else"));
+        assert!(body.contains("chain_agreement::CHECK_EVERY_SECS"));
+        let refresher = src.split("\nfn spawn_status_refresher(").nth(1).unwrap();
+        assert!(refresher
+            .split("\n}\n")
+            .next()
+            .unwrap()
+            .contains("spawn_chain_agreement_checker(state, gen)"));
     }
 
     /// The refresher asks for the adopted node only when the slot has no

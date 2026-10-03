@@ -20,6 +20,7 @@ pub mod aside;
 pub mod attested_snapshot;
 pub mod backend;
 pub mod catchup_assist;
+pub mod chain_agreement;
 pub mod checkin;
 pub mod confirmed_load;
 pub mod confirmed_snapshot;
