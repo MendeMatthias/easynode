@@ -1,4 +1,4 @@
-//! `btx-sentinel` — the always-on watcher on the box beside btxd2.
+//! `btx-sentinel`: the always-on watcher on the box beside btxd2.
 //!
 //! It reads easybtx.com's snapshot routes and census, the witnesses, btxd2's
 //! signer window over read-only RPC, and the shipped seeds over a P2P version
@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 const USAGE: &str = "\
-btx-sentinel — watch snapshots, signers, seeds, the census and the witnesses; alarm via Orca and ntfy
+btx-sentinel: watch snapshots, signers, seeds, the census and the witnesses; alarm via Orca and ntfy
 
 USAGE:
     btx-sentinel [options]
