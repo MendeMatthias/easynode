@@ -2442,20 +2442,6 @@ fn spawn_warmup_watcher(app: AppHandle, state: &AppState, datadir: PathBuf) {
     });
 }
 
-/// The status refresher: every 3 s read chain info + chainstates + peers and
-/// project them into the phase (Syncing / Ready). Exits when superseded by a
-/// newer generation (restart) or when the node is stopped. Repeated RPC
-/// failures surface a calm error phase instead of a silent freeze.
-///
-/// The refresher is also the app's ONE peer-census pipeline (a single
-/// getpeerinfo per tick feeds the status cache, the watchdog and the service
-/// report) and it arms the stall watchdog ITSELF — it must never depend on
-/// the UI polling `get_node_status` for any of its inputs, because with the
-/// window hidden nothing polls.
-///
-/// `bootstrap_launch` arms the one restart it ever makes on its own: the end
-/// of a header bootstrap (btx_core::node, HEADER BOOTSTRAP), at the snapshot
-/// anchor or after a stall. See [`end_header_bootstrap_with_restart`].
 /// "Same chain as other sources" (btx_core::chain_agreement): every
 /// `CHECK_EVERY_SECS` while this run lasts, compare this node's block at a
 /// height below every tip with the public sources'. Read-only GETs with a
@@ -2520,6 +2506,20 @@ pub(crate) fn chain_agreement_row(
     agreement.map(|a| a.screen(now))
 }
 
+/// The status refresher: every 3 s read chain info + chainstates + peers and
+/// project them into the phase (Syncing / Ready). Exits when superseded by a
+/// newer generation (restart) or when the node is stopped. Repeated RPC
+/// failures surface a calm error phase instead of a silent freeze.
+///
+/// The refresher is also the app's ONE peer-census pipeline (a single
+/// getpeerinfo per tick feeds the status cache, the watchdog and the service
+/// report) and it arms the stall watchdog ITSELF — it must never depend on
+/// the UI polling `get_node_status` for any of its inputs, because with the
+/// window hidden nothing polls.
+///
+/// `bootstrap_launch` arms the one restart it ever makes on its own: the end
+/// of a header bootstrap (btx_core::node, HEADER BOOTSTRAP), at the snapshot
+/// anchor or after a stall. See [`end_header_bootstrap_with_restart`].
 fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bool) {
     let gen = state.refresher_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let gen_counter = state.refresher_gen.clone();
