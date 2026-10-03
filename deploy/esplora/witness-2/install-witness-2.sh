@@ -194,7 +194,11 @@ rollback() {
   if [ "$CHANGED_BIN" = "new" ]; then
     rm -f "$BIN" && say "$BIN removed"
   elif [ -n "$CHANGED_BIN" ]; then
-    install -m 0755 "$CHANGED_BIN" "$BIN" && say "previous $BIN put back"
+    if install -m 0755 "$CHANGED_BIN" "$BIN"; then
+      say "previous $BIN put back"
+    else
+      say "WARNING: could not put the previous $BIN back; it is kept as $CHANGED_BIN"
+    fi
     [ "$CHANGED_UNIT" = "new" ] || systemctl restart "$UNIT_NAME" >/dev/null 2>&1
   fi
 }
@@ -251,7 +255,7 @@ main() {
     if sha_matches "$BIN" "$sha"; then
       say "$BIN is already this binary"
     else
-      cp -p "$BIN" "$BIN.bak-witness2-$stamp"
+      cp -p "$BIN" "$BIN.bak-witness2-$stamp" || die "could not back up $BIN"
       CHANGED_BIN="$BIN.bak-witness2-$stamp"
       install -m 0755 -o root -g root "$TMP/btx-witness" "$BIN" || die "install to $BIN failed"
       say "$BIN replaced (old one kept as $CHANGED_BIN)"
