@@ -560,8 +560,18 @@ pub(crate) fn status_note(datadir: &Path) -> Option<String> {
 }
 
 /// Pure: Copy diagnostics' lines.
-fn lines_for(record: Option<&Record>, outcome: Option<&Outcome>) -> Vec<String> {
+fn lines_for(
+    record: Option<&Record>,
+    outcome: Option<&Outcome>,
+    last_auto_start: u64,
+) -> Vec<String> {
     let mut out = Vec::new();
+    if last_auto_start != 0 {
+        out.push(format!(
+            "started again on its own at {} after the engine's \"Failed to read block\" fatal",
+            crate::update_log::rfc3339_utc(last_auto_start)
+        ));
+    }
     if let Some(r) = record {
         out.push(format!(
             "step {:?}, phase {:?}, folder {}, set aside: signatures {:?}, chain data {:?}",
@@ -580,7 +590,11 @@ pub(crate) fn diagnostics_lines(datadir: &Path) -> Vec<String> {
         Ok(r) => r,
         Err(e) => return vec![format!("the record cannot be read: {e}")],
     };
-    lines_for(record.as_ref(), rbr::read_outcome(datadir).as_ref())
+    lines_for(
+        record.as_ref(),
+        rbr::read_outcome(datadir).as_ref(),
+        LAST_AUTO_START.load(Ordering::SeqCst),
+    )
 }
 
 #[cfg(test)]
@@ -674,13 +688,25 @@ mod tests {
     #[test]
     fn diagnostics_name_the_step_the_folder_and_the_last_outcome() {
         let r = record(Step::ChainData, Phase::Running);
-        let lines = lines_for(Some(&r), Some(&Outcome::RolledBack { at: 1 }));
+        let lines = lines_for(Some(&r), Some(&Outcome::RolledBack { at: 1 }), 0);
         assert!(
             lines[0].contains("ChainData") && lines[0].contains(&r.aside),
             "{lines:?}"
         );
         assert!(lines[1].starts_with("last: "), "{lines:?}");
-        assert!(lines_for(None, None).is_empty());
+        assert!(lines_for(None, None, 0).is_empty());
+    }
+
+    /// Final review I2: the common case, the refresher's own start and a
+    /// node that stayed up, leaves no record and no outcome; the report
+    /// still says when it happened and why.
+    #[test]
+    fn diagnostics_name_an_automatic_start() {
+        let lines = lines_for(None, None, 1_791_000_000);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("Failed to read block"), "{lines:?}");
+        assert!(lines[0].contains("on its own"), "{lines:?}");
+        assert!(lines[0].contains("2026-"), "{lines:?}");
     }
 
     fn due() -> AutoStart {
