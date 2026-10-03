@@ -574,6 +574,38 @@ fn finish_with(datadir: &Path, now_unix: u64, pause: Pause) -> io::Result<Option
     Ok(Some(record))
 }
 
+/// Remove node data's part: give the ladder up. The record and the outcome
+/// go, and every dated folder (`read-block-recovery-<digits>`, never a
+/// link): with the chain removed there is nothing to put back, and a record
+/// left would let a later roll-back move the old chain back over the
+/// removal. Call with the node stopped. What it freed, in bytes.
+pub fn give_up(datadir: &Path) -> u64 {
+    let mut freed = 0;
+    if let Ok(entries) = std::fs::read_dir(datadir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let is_folder = name.to_str().is_some_and(is_aside_name)
+                && entry.file_type().is_ok_and(|t| t.is_dir());
+            if !is_folder {
+                continue;
+            }
+            let bytes = crate::disk::dir_size_bytes(&entry.path());
+            match std::fs::remove_dir_all(entry.path()) {
+                Ok(()) => freed += bytes,
+                Err(e) => eprintln!(
+                    "[read-block] could not remove {} (non-fatal): {e}",
+                    entry.path().display()
+                ),
+            }
+        }
+    }
+    if let Err(e) = clear_record(datadir) {
+        eprintln!("[read-block] could not remove the recovery record: {e}");
+    }
+    clear_outcome(datadir);
+    freed
+}
+
 /// What a start found and did before its launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AtStart {
@@ -1230,6 +1262,44 @@ mod tests {
             assert!(read_record(d.path()).is_err());
             assert!(roll_back(d.path()).is_err());
         }
+        untouched_kept(d.path());
+    }
+
+    /// Remove node data gives the ladder up: the record, the outcome and
+    /// every dated folder go, so no later roll-back brings the old chain
+    /// back over the removal. Never a link, nothing else.
+    #[test]
+    fn giving_up_removes_the_record_the_outcome_and_the_folders() {
+        let d = datadir();
+        begin(d.path(), Next::SetAsideSignatures, before(), 100).unwrap();
+        fresh_start(d.path(), false);
+        begin(
+            d.path(),
+            Next::SetAsideChainData { signatures: true },
+            before(),
+            200,
+        )
+        .unwrap();
+        write_outcome(d.path(), &Outcome::RolledBack { at: 1 });
+        std::fs::create_dir(d.path().join(aside_name(7))).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("keep"), "x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(elsewhere.path(), d.path().join(aside_name(8))).unwrap();
+        std::fs::create_dir(d.path().join("read-block-recovery-notes")).unwrap();
+
+        let removed = give_up(d.path());
+        assert!(removed > 0, "it measures what it removed");
+        assert!(read_record(d.path()).unwrap().is_none());
+        assert!(read_outcome(d.path()).is_none());
+        assert!(!d.path().join(aside_name(100)).exists());
+        assert!(!d.path().join(aside_name(7)).exists());
+        assert!(
+            elsewhere.path().join("keep").exists(),
+            "a link is not followed"
+        );
+        assert!(d.path().join("read-block-recovery-notes").exists());
+        assert!(roll_back(d.path()).unwrap().is_none(), "nothing comes back");
         untouched_kept(d.path());
     }
 

@@ -8333,7 +8333,8 @@ pub async fn remove_node_data_now(
 /// cannot come back, which is given up first
 /// (`crate::fast_forward::clear_for_removal`); otherwise the chain data, the
 /// node's sidecars, and the old chain data a finished, undone or given-up
-/// run left.
+/// run left. A read-block recovery is given up with it: its record, outcome
+/// and dated folders go (`btx_core::read_block_recovery::give_up`).
 fn remove_node_files(dd: &Path) -> Result<btx_core::disk::ReclaimReport, String> {
     crate::fast_forward::clear_for_removal(dd)?;
     let mut report = btx_core::disk::remove_node_data(dd);
@@ -8366,6 +8367,17 @@ fn remove_node_files(dd: &Path) -> Result<btx_core::disk::ReclaimReport, String>
                 report.freed_mb += bytes / (1024 * 1024);
             }
         }
+    }
+    // The read-block recovery is given up with the chain it set aside: a
+    // record left would let a later failed launch's roll-back move the old
+    // chain back over this removal (final review I1).
+    let bytes = btx_core::read_block_recovery::give_up(dd);
+    if bytes > 0 {
+        report.freed_mb += bytes / (1024 * 1024);
+        report.items.push(format!(
+            "data set aside after a known engine error ({} MB)",
+            bytes / (1024 * 1024)
+        ));
     }
     // Old chain data a Fast-forward set aside, when no run needs it (a
     // finish or a sweep that was cut off, or a run given up above).
@@ -8569,6 +8581,39 @@ mod signed_start_tests {
             "{:?}",
             report.items
         );
+    }
+
+    /// Final review I1: Remove node data with a read-block recovery step
+    /// recorded takes its dated folder, record and outcome with the chain,
+    /// so a later failed launch's roll-back cannot bring the old chain back.
+    #[test]
+    fn remove_node_data_gives_the_read_block_recovery_up() {
+        let dir = synced_validating_datadir();
+        let d = dir.path();
+        let r = btx_core::read_block_recovery::begin(
+            d,
+            btx_core::read_block_recovery::Next::SetAsideChainData { signatures: true },
+            btx_core::fast_forward::Before::default(),
+            100,
+        )
+        .unwrap();
+        std::fs::write(d.join(&r.aside).join("blocks/old"), vec![0u8; 4096]).ok();
+        let report = super::remove_node_files(d).unwrap();
+        assert!(!d.join(&r.aside).exists());
+        assert!(btx_core::read_block_recovery::read_record(d)
+            .unwrap()
+            .is_none());
+        assert!(
+            report
+                .items
+                .iter()
+                .any(|i| i.contains("known engine error")),
+            "{:?}",
+            report.items
+        );
+        assert!(btx_core::read_block_recovery::roll_back(d)
+            .unwrap()
+            .is_none());
     }
 
     /// Controller note 1 (a): Fast-forward sets `blocks/` aside, and the
