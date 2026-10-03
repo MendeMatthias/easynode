@@ -1,0 +1,62 @@
+[Unit]
+Description=BTX sentinel (watches snapshots, signers, seeds, census, witnesses; alarms via Orca and ntfy)
+After=network-online.target btxd2.service
+Wants=network-online.target
+
+[Service]
+# THE POINT OF THIS UNIT. Vercel runs for 60 seconds at a time and the laptop
+# only while its lid is open. This runs all the time on the box, beside btxd
+# and btxd2, and watches what neither can: whether the snapshot meeting point
+# is moving, whether blocks are still being signed, whether the seeds every
+# easyNode ships still answer a handshake, whether the census and the
+# witnesses are current. See crates/btx-core/src/sentinel/mod.rs.
+#
+# It ONLY reads. GETs to easybtx.com and the witnesses, read-only RPC on
+# btxd2 (getblockchaininfo, getblockhash, getmatmulattestations), and a P2P
+# version handshake to each shipped seed. It listens on nothing.
+#
+# azureuser, because btxd2 runs as azureuser and its .cookie is that user's,
+# mode 600. If btxd2 ever runs as another user, this follows it.
+User=azureuser
+Type=simple
+ExecStart=/usr/local/bin/btx-sentinel --rpc 127.0.0.1:8434 --cookie /data/btx2/.cookie
+
+# THE ALARM CONF, AND WHY IT IS A CREDENTIAL. /etc/btxscan-selfcheck.conf
+# holds ORCA_URL, ORCA_SECRET and NTFY_TOPIC, owned by root, mode 600. Giving
+# azureuser group read would not last: install-selfcheck.sh merges that file
+# and chmods it 600 on every install, so the grant would vanish silently and
+# the sentinel would go quiet with it. A copy would go stale the day the
+# secret rotates. LoadCredential= has systemd (as root) read the file at each
+# start and hand THIS service a private, read-only copy in
+# $CREDENTIALS_DIRECTORY/alarm.conf, which btx-sentinel reads by default. The
+# file's owner and mode never change. After a secret rotates:
+# systemctl restart btx-sentinel. Needs systemd 247 or newer (the box has 249).
+# A missing conf is not fatal: the sentinel logs its alarms here and says so.
+LoadCredential=alarm.conf:/etc/btxscan-selfcheck.conf
+
+# What it remembers (which alarms are on, when each channel was last told)
+# lives in /var/lib/btx-sentinel/state.json, created and owned by systemd.
+StateDirectory=btx-sentinel
+StateDirectoryMode=0700
+
+# always, not on-failure: a sentinel that has exited for any reason is a
+# watch that has stopped, and nothing else would notice.
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# AF_UNIX for name resolution through systemd-resolved; no listening socket.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
