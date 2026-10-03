@@ -101,7 +101,15 @@ witness_block() {
   printf '\t# A `handle` with one path matcher sorts ahead of every handle in (esplora_api).\n'
   printf '\thandle /witness/* {\n'
   printf '\t\turi strip_prefix /witness\n'
-  printf '\t\timport perip_limit\n'
+  # Its own per-IP zone, written inline like the live box's @rawblock route:
+  # the live file has no (perip_limit) snippet (seen 2026-10-03, run refused).
+  printf '\t\trate_limit {\n'
+  printf '\t\t\tzone witness {\n'
+  printf '\t\t\t\tkey {remote_host}\n'
+  printf '\t\t\t\tevents 120\n'
+  printf '\t\t\t\twindow 10s\n'
+  printf '\t\t\t}\n'
+  printf '\t\t}\n'
   printf '\t\treverse_proxy %s\n' "$WITNESS_LOCAL"
   printf '\t}\n'
 }
@@ -144,15 +152,15 @@ caddy_has_witness() {
 # <in> <out>: write <in> plus the witness block, placed on the line after the
 # api.btxscan.io site's opening line. Refuses (non-zero, <out> not written)
 # when the route is already there, when there is not exactly one such site,
-# or when the (perip_limit) snippet the block imports does not exist.
+# or when the rate_limit plugin's global order line is missing.
 caddy_insert_witness() {
   local in="$1" out="$2" sites
   if caddy_has_witness "$in"; then
     echo "$in already has a /witness/ route" >&2
     return 1
   fi
-  if ! grep -q '^(perip_limit) {' "$in"; then
-    echo "$in has no (perip_limit) snippet; this script only knows the box's shape" >&2
+  if ! grep -Eq '^[[:space:]]*order rate_limit ' "$in"; then
+    echo "$in has no 'order rate_limit' (the rate_limit plugin is not wired); not editing" >&2
     return 1
   fi
   sites="$(grep -c "^${SITE//./\\.} {[[:space:]]*\$" "$in")"

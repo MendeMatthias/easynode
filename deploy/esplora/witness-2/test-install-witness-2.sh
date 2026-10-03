@@ -88,8 +88,10 @@ else
   bad "handle at line ${handle_line:-?}, site at ${site_line:-?}, import at ${import_line:-?}"
 fi
 grep -q 'uri strip_prefix /witness' "$WORK/Caddyfile.new" && ok "the prefix is stripped" || bad "no strip_prefix"
+awk '/handle \/witness\/\*/,/^\t}/' "$WORK/Caddyfile.new" | grep -q 'zone witness' \
+  && ok "the witness has its own per-IP limit" || bad "no rate_limit zone inside the witness handle"
 awk '/handle \/witness\/\*/,/^\t}/' "$WORK/Caddyfile.new" | grep -q 'import perip_limit' \
-  && ok "the per-IP limit applies to the witness" || bad "no perip_limit inside the witness handle"
+  && bad "the block still depends on a snippet the live box does not have" || ok "the block needs no snippet"
 awk '/handle \/witness\/\*/,/^\t}/' "$WORK/Caddyfile.new" | grep -q 'reverse_proxy 127.0.0.1:3081' \
   && ok "it proxies to 127.0.0.1:3081" || bad "wrong upstream"
 
@@ -103,9 +105,12 @@ caddy_insert_witness "$WORK/nosite" "$WORK/nosite.new" 2>/dev/null \
 { cat "$FIXTURE"; printf '\napi.btxscan.io {\n\timport esplora_api\n}\n'; } > "$WORK/twosites"
 caddy_insert_witness "$WORK/twosites" "$WORK/twosites.new" 2>/dev/null \
   && bad "edited a file with two api.btxscan.io sites" || ok "two api.btxscan.io sites: refused"
-grep -v '^(perip_limit) {' "$FIXTURE" > "$WORK/nolimit"
-caddy_insert_witness "$WORK/nolimit" "$WORK/nolimit.new" 2>/dev/null \
-  && bad "edited a file with no (perip_limit) snippet" || ok "no (perip_limit) snippet: refused"
+grep -v '^(perip_limit) {' "$FIXTURE" > "$WORK/nosnippet"
+caddy_insert_witness "$WORK/nosnippet" "$WORK/nosnippet.new" 2>/dev/null \
+  && ok "the live box's shape (no (perip_limit) snippet) is edited" || bad "refused the live box's shape"
+grep -v 'order rate_limit' "$FIXTURE" > "$WORK/noplugin"
+caddy_insert_witness "$WORK/noplugin" "$WORK/noplugin.new" 2>/dev/null \
+  && bad "edited a file without the rate_limit order" || ok "no 'order rate_limit': refused"
 
 echo "── Caddy itself: the witness route wins over every freshness handle ──"
 CADDY="${CADDY:-$(command -v caddy || true)}"
