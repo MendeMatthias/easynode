@@ -1,0 +1,80 @@
+2026-10-01T17:28:46Z Opening LevelDB in /home/zan/.easybtx/chainstate_snapshot
+2026-10-01T17:28:46Z Opened LevelDB successfully
+2026-10-01T17:28:46Z Using obfuscation key for /home/zan/.easybtx/chainstate_snapshot
+2026-10-01T17:28:46Z [Chainstate [snapshot] @ height 234614 (49e15396acef8534af404801a8427c1690046ebcc1961877349485cc0b862388)] resized coinsdb cache to 0.4 MiB
+2026-10-01T17:28:46Z [Chainstate [snapshot] @ height 234614 (49e15396acef8534af404801a8427c1690046ebcc1961877349485cc0b862388)] resized coinstip cache to 22.0 MiB
+2026-10-01T17:28:46Z Opening LevelDB in /home/zan/.easybtx/chainstate
+2026-10-01T17:28:46Z Opened LevelDB successfully
+2026-10-01T17:28:46Z Using obfuscation key for /home/zan/.easybtx/chainstate
+2026-10-01T17:28:46Z [Chainstate [ibd] @ height 20233 (86e3bb8e0758ff94ad33088a589966b2d25e3029c47006ee34a407f603f4caff)] resized coinsdb cache to 7.6 MiB
+2026-10-01T17:28:46Z [Chainstate [ibd] @ height 20233 (86e3bb8e0758ff94ad33088a589966b2d25e3029c47006ee34a407f603f4caff)] resized coinstip cache to 418.0 MiB
+2026-10-01T17:28:46Z init message: Verifying blocks…
+2026-10-01T17:28:46Z Verifying last 6 blocks at level 3
+2026-10-01T17:28:46Z Verification progress: 0% (checking last 6 blocks at level 3 from height 20233)
+2026-10-01T17:28:46Z Verification progress: 16% (height=20232, elapsed=0s)
+2026-10-01T17:28:46Z Verification progress: 33% (height=20231, elapsed=0s)
+2026-10-01T17:28:46Z Verification progress: 50% (height=20230, elapsed=0s)
+2026-10-01T17:28:46Z Verification progress: 66% (height=20229, elapsed=0s)
+2026-10-01T17:28:46Z Verification progress: 83% (height=20228, elapsed=0s)
+2026-10-01T17:28:46Z Verification progress: 99% (height=20227, elapsed=0s)
+2026-10-01T17:28:46Z Verification: No coin database inconsistencies in last 6 blocks (6 transactions)
+2026-10-01T17:28:46Z Verifying last 6 blocks at level 3
+2026-10-01T17:28:46Z Verification progress: 0% (checking last 6 blocks at level 3 from height 234614)
+2026-10-01T17:28:46Z Verification progress: 16% (height=234613, elapsed=0s)
+2026-10-01T17:28:46Z Verification progress: 33% (height=234612, elapsed=0s)
+2026-10-01T17:28:46Z Verification progress: 50% (height=234611, elapsed=0s)
+2026-10-01T17:28:46Z Verification progress: 66% (height=234610, elapsed=0s)
+2026-10-01T17:28:46Z Verification progress: 83% (height=234609, elapsed=0s)
+2026-10-01T17:28:46Z Verification progress: 99% (height=234608, elapsed=0s)
+2026-10-01T17:28:46Z Verification: No coin database inconsistencies in last 6 blocks (6 transactions)
+2026-10-01T17:28:46Z Block index and chainstate loaded
+2026-10-01T17:28:46Z Dandelion++ privacy relay enabled (activation height: 61000)
+2026-10-01T17:28:46Z EnsureShieldedStateInitialized: not opening shielded state (nShieldedPoolDisableHeight=199300 tip=234614). Pass -shieldedstate=1 to load historical nullifiers/commitments/account_registry.
+2026-10-01T17:28:46Z Running node in NODE_NETWORK_LIMITED mode until snapshot background sync completes
+2026-10-01T17:28:46Z block tree size = 234621
+2026-10-01T17:28:46Z nBestHeight = 234614
+2026-10-01T17:28:46Z initload thread start
+2026-10-01T17:28:46Z mapport thread start
+2026-10-01T17:28:46Z torcontrol thread start
+2026-10-01T17:28:46Z Bound to 127.0.0.1:19336
+2026-10-01T17:28:46Z Bound to [::]:19335
+2026-10-01T17:28:46Z Bound to 0.0.0.0:19335
+2026-10-01T17:28:46Z Loaded 0 addresses from "anchors.dat"
+2026-10-01T17:28:46Z 0 block-relay-only anchors will be tried for connections.
+2026-10-01T17:28:46Z init message: Starting network threads…
+2026-10-01T17:28:46Z [error] ReadRawBlock: OpenBlockFile failed for FlatFilePos(nFile=-1, nPos=0)
+2026-10-01T17:28:46Z [error] A fatal internal error occurred, see debug.log for details: Failed to read block.
+Error: A fatal internal error occurred, see debug.log for details: Failed to read block.
+2026-10-01T17:28:46Z net thread start
+2026-10-01T17:28:46Z [error] A fatal internal error occurred, see debug.log for details: Failed to connect best block (Failed to read block.).
+Error: A fatal internal error occurred, see debug.log for details: Failed to connect best block (Failed to read block.).
+2026-10-01T17:28:46Z Loading 0 mempool transactions from file...
+2026-10-01T17:28:46Z Imported mempool transactions from file: 0 succeeded, 0 failed, 0 expired, 0 already there, 0 waiting for initial broadcast
+2026-10-01T17:28:46Z initload thread exit
+2026-10-01T17:28:46Z dnsseed thread start
+2026-10-01T17:28:46Z -seednode enabled. Trying the provided seeds for 30 seconds before defaulting to the dnsseeds.
+2026-10-01T17:28:46Z addcon thread start
+2026-10-01T17:28:46Z opencon thread start
+2026-10-01T17:28:46Z msghand thread start
+2026-10-01T17:28:46Z init message: Done loading
+2026-10-01T17:28:46Z mmrecover thread start
+2026-10-01T17:28:46Z [net:info] portmap: Added mapping pcp:100.90.119.197:19335 -> 192.168.1.171:19335 (for 2400s)
+2026-10-01T17:28:46Z tor: Thread interrupt
+2026-10-01T17:28:46Z mapport thread exit
+2026-10-01T17:28:46Z opencon thread exit
+2026-10-01T17:28:46Z dnsseed thread exit
+2026-10-01T17:28:46Z mmrecover thread exit
+2026-10-01T17:28:46Z Shutdown: In progress...
+2026-10-01T17:28:46Z torcontrol thread exit
+2026-10-01T17:28:46Z net thread exit
+2026-10-01T17:28:46Z msghand thread exit
+2026-10-01T17:28:51Z addcon thread exit
+2026-10-01T17:28:51Z DumpAnchors: Flush 0 outbound block-relay-only peer addresses to anchors.dat started
+2026-10-01T17:28:51Z DumpAnchors: Flush 0 outbound block-relay-only peer addresses to anchors.dat completed (0.00s)
+2026-10-01T17:28:51Z scheduler thread exit
+2026-10-01T17:28:51Z Flushed fee estimates to fee_estimates.dat.
+2026-10-01T17:28:51Z prevout.00 thread exit
+2026-10-01T17:28:51Z prevout.01 thread exit
+2026-10-01T17:28:51Z prevout.00 thread exit
+2026-10-01T17:28:51Z prevout.01 thread exit
+2026-10-01T17:28:51Z Shutdown: done
