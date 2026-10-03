@@ -50,6 +50,7 @@ pub mod power;
 pub mod read_block_recovery;
 pub mod role;
 pub mod rpc;
+pub mod sentinel;
 pub mod service_report;
 pub mod setup;
 pub mod signer;
