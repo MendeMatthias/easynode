@@ -28,6 +28,9 @@
 //!     more above H (or not read)                 -> DIFFERENT
 //!   different, and the source's tip is closer    -> STALE TIP (a race at its tip)
 //! outcome, first match:
+//!   any DIFFERENT, and only one operator answered -> NOT ENOUGH SOURCES
+//!                                                  (CAUTION, hedged: it or
+//!                                                  your node moved)
 //!   any DIFFERENT                                -> DISAGREE (WARNING)
 //!   fewer than 2 operators SAME or BEHIND        -> NOT ENOUGH SOURCES (UNKNOWN)
 //!   any STALE TIP                                -> STALE TIP (CAUTION)
@@ -36,7 +39,13 @@
 //! ```
 //! "Within tolerance" is the spec's one-clock rule: two tips are in line when
 //! they differ by at most TOLERANCE_BLOCKS plus one block per
-//! SECONDS_PER_ALLOWED_BLOCK between the two reads.
+//! SECONDS_PER_ALLOWED_BLOCK between the two reads, measured against the
+//! highest tip among this node and the sources that gave a block at H.
+//!
+//! The census has no amber case for one operator: with no node of its own,
+//! one operator alone is simply NOT ENOUGH SOURCES there. Here one operator
+//! against your node is worth an amber line, never the red DISAGREE, which
+//! needs two operators to say it.
 //!
 //! Independence is counted by OPERATOR, not by source ([`SOURCES`]): four of
 //! the five sources the census reads are run by one operator and count once.
@@ -336,10 +345,12 @@ pub fn decide(height: u64, own: &Own, reads: &[Read], observed_at: u64) -> Agree
         .collect();
 
     // The highest tip, this node's included, and when it was read: the one
-    // every other tip is measured against on one clock (spec 4.3).
+    // every other tip is measured against on one clock (spec 4.3). Only from
+    // sources that also gave a block at H: a tip whose block could not be
+    // read is no evidence, and must not make the others look behind.
     let mut top = (own.tip, observed_at);
     for (r, _) in &known {
-        if let Some(t) = r.tip {
+        if let (Some(t), Some(_)) = (r.tip, r.hash.as_deref().and_then(block_hash)) {
             if t > top.0 {
                 top = (t, r.tip_at);
             }
@@ -406,15 +417,17 @@ pub fn decide(height: u64, own: &Own, reads: &[Read], observed_at: u64) -> Agree
     let agreeing_ops = distinct(agreeing.iter().map(|r| r.operator.as_str()));
     let differing = with(&[SourceState::Different]);
     let stale = with(&[SourceState::StaleTip]);
-    let mut behind: Vec<&str> = Vec::new();
-    if own_hash.is_some() && is_behind(own.tip, observed_at) {
-        behind.push(YOUR_NODE);
-    }
-    behind.extend(
+    let own_behind = own_hash.is_some() && is_behind(own.tip, observed_at);
+    let behind = distinct(
         with(&[SourceState::Behind])
             .iter()
             .map(|r| r.label.as_str()),
     );
+    let differing_ops = distinct(differing.iter().map(|r| r.operator.as_str()));
+    // Red needs two operators: two that differ from your node, or one that
+    // agrees with it and one that does not. One operator against your node
+    // cannot say which of the two moved.
+    let operators_seen = distinct(agreeing_ops.iter().chain(differing_ops.iter()).copied()).len();
 
     let at = commas(height);
     let scope = match agreeing_ops.as_slice() {
@@ -446,6 +459,27 @@ pub fn decide(height: u64, own: &Own, reads: &[Read], observed_at: u64) -> Agree
                 "Your node did not say which block it has at height {at}, so nothing was compared."
             ),
         )
+    } else if !differing.is_empty() && operators_seen < 2 {
+        let names = distinct(differing.iter().map(|r| r.label.as_str()));
+        let one = names.len() == 1;
+        let again = CHECK_EVERY_SECS / 60;
+        let headline = if agreeing.is_empty() {
+            format!(
+                "Only one source group answered, and it shows a different block at height {at}. \
+                 Either it or your node is on another branch; this is checked again in {again} \
+                 minutes."
+            )
+        } else {
+            format!(
+                "Only one source group answered, and {} in it {} a different block at height \
+                 {at}. Either {} or your node is on another branch; this is checked again in \
+                 {again} minutes.",
+                join_names(&names),
+                if one { "shows" } else { "show" },
+                if one { "that source" } else { "those sources" },
+            )
+        };
+        (Outcome::NotEnoughSources, Status::Caution, headline)
     } else if !differing.is_empty() {
         if agreeing_ops.is_empty() {
             let ops = distinct(differing.iter().map(|r| r.operator.as_str()));
@@ -506,16 +540,24 @@ pub fn decide(height: u64, own: &Own, reads: &[Read], observed_at: u64) -> Agree
                 if one { "it" } else { "them" }
             ),
         )
-    } else if !behind.is_empty() {
-        (
-            Outcome::Behind,
-            Status::Caution,
-            format!(
+    } else if own_behind || !behind.is_empty() {
+        // Your node being the lowest is not "old, not wrong": only the block
+        // at H was compared, nothing above it.
+        let mut said = Vec::new();
+        if own_behind {
+            said.push(format!(
+                "Your node is behind the others; at height {at} it has the same block, newer \
+                 blocks were not compared."
+            ));
+        }
+        if !behind.is_empty() {
+            said.push(format!(
                 "{} {} behind the others (old, not wrong).",
                 join_names(&behind),
                 if behind.len() == 1 { "is" } else { "are" }
-            ),
-        )
+            ));
+        }
+        (Outcome::Behind, Status::Caution, said.join(" "))
     } else {
         (
             Outcome::Agree,
@@ -527,7 +569,7 @@ pub fn decide(height: u64, own: &Own, reads: &[Read], observed_at: u64) -> Agree
         )
     };
 
-    let (verdict, reason) = if outcome == Outcome::NotEnoughSources {
+    let (verdict, reason) = if status == Status::Unknown {
         let why = if own_hash.is_none() {
             format!(
                 "input not available: your node did not say which block it has at height {height}"
@@ -595,7 +637,7 @@ impl Agreement {
                     "The last comparison is more than {} minutes old.",
                     MAX_AGE_SECS / 60
                 ),
-                scope: self.scope.clone(),
+                scope: format!("Last time: {}", self.scope),
                 meaning: None,
                 as_of,
             };
@@ -1060,7 +1102,8 @@ mod tests {
         assert_eq!(a.outcome, Outcome::Behind);
         assert_eq!(
             a.headline,
-            "Your node is behind the others (old, not wrong)."
+            "Your node is behind the others; at height 240,000 it has the same block, newer \
+             blocks were not compared."
         );
     }
 
@@ -1081,15 +1124,101 @@ mod tests {
     }
 
     #[test]
-    fn a_disagreement_outranks_not_enough_sources() {
-        // Only Byron Bay answered, with a different deep block: that is still
-        // the headline, never hidden behind a grey row.
+    fn one_operator_with_a_different_block_is_amber_and_hedged_never_grey() {
+        // Only Byron Bay answered, with a different deep block. One operator
+        // against your node cannot say which of the two moved, so it is not
+        // the red DISAGREE, but it is never hidden behind a grey row either.
         let reads = [
             down("btxscan", "offline"),
             read("byronbay", Some(240_010), Some(B)),
         ];
         let a = decide(240_000, &own(240_010, A), &reads, T);
-        assert_eq!(a.outcome, Outcome::Disagree);
+        assert_eq!(a.outcome, Outcome::NotEnoughSources);
+        assert_eq!(a.status, Status::Caution);
+        assert_eq!(a.verdict, ATTACHED);
+        assert_eq!(
+            a.headline,
+            "Only one source group answered, and it shows a different block at height \
+             240,000. Either it or your node is on another branch; this is checked again in \
+             5 minutes."
+        );
+        assert_eq!(state(&a, "byronbay"), SourceState::Different);
+    }
+
+    #[test]
+    fn one_operator_split_inside_itself_is_amber_and_names_the_source() {
+        // btxscan agrees with your node, witness-1 does not, Byron Bay is
+        // down: still one operator, so amber.
+        let reads = [
+            read("btxscan", Some(240_010), Some(A)),
+            read("witness-1", Some(240_010), Some(B)),
+            down("byronbay", "offline"),
+        ];
+        let a = decide(240_000, &own(240_010, A), &reads, T);
+        assert_eq!(a.outcome, Outcome::NotEnoughSources);
+        assert_eq!(a.status, Status::Caution);
+        assert_eq!(
+            a.headline,
+            "Only one source group answered, and witness-1.easybtx.com in it shows a \
+             different block at height 240,000. Either that source or your node is on \
+             another branch; this is checked again in 5 minutes."
+        );
+    }
+
+    #[test]
+    fn a_tip_whose_block_was_not_read_does_not_set_the_pace() {
+        // witness-1 said 240,020 and then timed out on /block-height: its tip
+        // is not evidence, so the rest are not "behind" it.
+        let mut w = read("witness-1", Some(240_020), None);
+        w.error = Some("source unreachable: no answer within 7 s".into());
+        let reads = [
+            read("btxscan", Some(240_010), Some(A)),
+            w,
+            read("byronbay", Some(240_010), Some(A)),
+        ];
+        let a = decide(240_000, &own(240_010, A), &reads, T);
+        assert_eq!(a.outcome, Outcome::Agree);
+        let row = a.sources.iter().find(|s| s.id == "witness-1").unwrap();
+        assert_eq!(row.state, SourceState::NotRun);
+        assert_eq!(
+            row.reason.as_deref(),
+            Some("source unreachable: no answer within 7 s")
+        );
+    }
+
+    #[test]
+    fn only_the_witnesses_answering_is_one_operator_and_grey() {
+        let reads = [
+            down("btxscan", "source unreachable: HTTP 502"),
+            read("witness-2", Some(240_010), Some(A)),
+            read("witness-1", Some(240_010), Some(A)),
+            down("byronbay", "source unreachable: HTTP 503"),
+        ];
+        // No explorer tip: the height comes from this node.
+        assert_eq!(common_height(240_010, &reads), Some(240_002));
+        let a = decide(240_002, &own(240_010, A), &reads, T);
+        assert_eq!(a.outcome, Outcome::NotEnoughSources);
+        assert_eq!(a.status, Status::Unknown);
+        assert_eq!(
+            a.scope,
+            "Only easyBTX/btxscan answered; it agrees with your node at block 240,002"
+        );
+    }
+
+    #[test]
+    fn a_source_whose_tip_is_below_the_common_height_is_not_compared() {
+        // witness-2 sits below H; it cannot hold a block there, and what it
+        // says about it is not a disagreement.
+        let mut w = read("witness-2", Some(239_990), None);
+        w.error = Some("this source has no block at that height (HTTP 404)".into());
+        let reads = [
+            read("btxscan", Some(240_010), Some(A)),
+            w,
+            read("byronbay", Some(240_010), Some(A)),
+        ];
+        let a = decide(240_000, &own(240_010, A), &reads, T);
+        assert_eq!(a.outcome, Outcome::Agree);
+        assert_eq!(state(&a, "witness-2"), SourceState::NotRun);
     }
 
     #[test]
@@ -1136,6 +1265,7 @@ mod tests {
             r.headline,
             "The last comparison is more than 30 minutes old."
         );
+        assert_eq!(r.scope, format!("Last time: {}", a.scope));
     }
 
     #[test]
