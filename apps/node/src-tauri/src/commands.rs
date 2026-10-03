@@ -1091,11 +1091,50 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
     start_node_held(app, state).await
 }
 
+/// How many times one start begins again from the top after a rung of the
+/// read-block recovery (`crate::read_block_recovery`): one per rung that
+/// starts the node again, signatures and then chain data. The third rung
+/// rolls back and ends the start, so the record bounds this already; the
+/// count is the second fence.
+const MAX_LADDER_RESTARTS: u32 = 2;
+
 /// [`start_node_inner`] for a caller that already holds
 /// `AppState::start_in_flight`: Fast-forward's driver, which keeps it from
 /// the move of the chain data through its own start, so no other start
 /// comes between them (review M10).
+///
+/// A launch that died on the engine's "Failed to read block" fatal takes a
+/// rung of the read-block recovery and answers its `STEP_TAKEN`; the start
+/// then begins again from the top, so the step's start is an ordinary one
+/// (a fresh chain gets the header bootstrap and first load a new install
+/// gets), each with its own launch attempts.
 pub(crate) async fn start_node_held(app: &AppHandle, state: &AppState) -> Result<(), String> {
+    let datadir = node_datadir();
+    crate::read_block_recovery::before_start(&datadir).await?;
+    let mut restarts = 0;
+    loop {
+        match start_node_once(app, state).await {
+            Err(e) if e == crate::read_block_recovery::STEP_TAKEN => {
+                restarts += 1;
+                if restarts > MAX_LADDER_RESTARTS {
+                    return Err(
+                        "the node kept stopping on a known engine error; see setup.log in the \
+                         node folder."
+                            .to_string(),
+                    );
+                }
+            }
+            Ok(()) => {
+                crate::read_block_recovery::after_start(app, state);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// One pass of [`start_node_held`].
+async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String> {
     let datadir = node_datadir();
     // Before anything reads the chain data or the settings: a Fast-forward
     // run a previous start left is carried on from its record, and one cut
@@ -1982,6 +2021,9 @@ async fn spawn_node_with_lock_retry(
             )
             .await
             .map_err(|e| format!("couldn't start the node: {e}"))?;
+        // The arguments this attempt ran with, for the read-block recovery:
+        // whether it ran as a trusted mirror is read from what ran.
+        let launch_args = controller.launch_args().to_vec();
         // Did this launch run the engine's GPU check before RPC? Read from the
         // arguments it actually passed, for the GPU-hang fallback below.
         let gpu_check_launch =
@@ -2238,7 +2280,10 @@ async fn spawn_node_with_lock_retry(
                         AfterNoRpcTimeout::Fail => {}
                     }
                     let doing = btx_core::node::last_log_line(&since);
-                    return Err(rpc_timeout_error(&last, doing.as_deref(), stopped, datadir));
+                    let said = rpc_timeout_error(&last, doing.as_deref(), stopped, datadir);
+                    return Err(
+                        crate::read_block_recovery::after_failed_launch(datadir, said).await,
+                    );
                 }
                 // `after_rpc_wait` maps each outcome to exactly one of these,
                 // so what is left is an exit: fall through to the exit path.
@@ -2299,6 +2344,27 @@ async fn spawn_node_with_lock_retry(
             continue;
         }
 
+        // The engine's "Failed to read block" fatal: every start after it
+        // dies the same way, so retrying unchanged cannot help. The ladder
+        // takes its next rung (and this start begins again from the top) or
+        // rolls back; either way this start ends here. The log is this
+        // attempt's alone (rotated per run).
+        if btx_core::node::log_shows_read_block_fatal(&tail) {
+            if stopped_since(start_gen, state.refresher_gen.load(Ordering::SeqCst)) {
+                return Err("the node was stopped while it was starting".to_string());
+            }
+            let rw_conf = datadir.join("btx_rw.conf");
+            let said = crate::read_block_recovery::after_fatal(
+                app,
+                state,
+                datadir,
+                &launch_args,
+                &[paths.faststart_conf.as_path(), rw_conf.as_path()],
+            )
+            .await;
+            return Err(said);
+        }
+
         let when = exit_when(exited_after_watch, exited_warming);
         eprintln!(
             "[node-app] btxd exited {when}, attempt {attempt}/{LAUNCH_ATTEMPTS}. \
@@ -2325,11 +2391,12 @@ async fn spawn_node_with_lock_retry(
     let tail = btx_core::node::node_log_tail(datadir, 64 * 1024);
     let cause = btx_core::node::launch_failure_cause_or_exit(&tail, last_exit.as_deref())
         .unwrap_or_else(|| "its log does not say why in a way this app recognises.".to_string());
-    Err(format!(
+    let said = format!(
         "the node kept exiting right after launch: {cause} \
          See easybtx-node.log in {} for details.",
         datadir.display()
-    ))
+    );
+    Err(crate::read_block_recovery::after_failed_launch(datadir, said).await)
 }
 
 /// While the (long) startup RPC wait runs, surface warmup as a CALM phase:
@@ -3399,6 +3466,35 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     consecutive_failures = 0;
                 }
                 Err(_) => {
+                    // A node this app spawned that died on the engine's
+                    // "Failed to read block" fatal: every start after it
+                    // dies the same way until the read-block recovery takes
+                    // a step, so it is started again at once, by itself,
+                    // and the ladder runs in that start. Once per incident,
+                    // never after Stop or Quit, never while Fast-forward or
+                    // a recovery step is recorded (`take_auto_start`). Any
+                    // other silence keeps the "stopped responding" below.
+                    let state = app.state::<AppState>();
+                    let ours = attached_slot.lock().await.is_none();
+                    let stopped = gen_counter.load(Ordering::SeqCst) != gen
+                        || state.quitting.load(Ordering::SeqCst);
+                    if crate::read_block_recovery::take_auto_start(
+                        &node_datadir(),
+                        slot_child_gone(&node_slot),
+                        ours,
+                        stopped,
+                    ) {
+                        let p = NodePhase::Warming {
+                            message: crate::read_block_recovery::AUTO_START.into(),
+                        };
+                        *phase_slot.lock().await = p.clone();
+                        crate::tray::reflect_phase(&app, &p);
+                        // The child is gone; this clears the slot and the
+                        // run's state the way Stop does, then the start.
+                        stop_node_inner(&state).await;
+                        let _ = start_node_projected(&app, &state).await;
+                        return;
+                    }
                     consecutive_failures += 1;
                     // ~1 min of continuous silence → tell the user instead of
                     // freezing on a stale number, and stop the node the way
@@ -4273,11 +4369,19 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
             )
         })
         .map(|w| w.message());
-    let engine_notes: Vec<_> = engine_warnings
+    let mut engine_notes: Vec<_> = engine_warnings
         .iter()
         .filter(|w| w.is_note())
         .map(|w| w.note())
         .collect();
+    // The read-block recovery's own line: a step being watched, or one that
+    // worked in the last day. Calm: it asks nothing of the person.
+    if let Some(message) = crate::read_block_recovery::status_note(&datadir) {
+        engine_notes.push(btx_core::engine_warnings::EngineNote {
+            message,
+            needs_attention: false,
+        });
+    }
 
     // Take a CLONE of the handle and drop the guard before any await. Holding
     // `state.rpc` across a network round-trip is what every other call site in
@@ -8229,7 +8333,8 @@ pub async fn remove_node_data_now(
 /// cannot come back, which is given up first
 /// (`crate::fast_forward::clear_for_removal`); otherwise the chain data, the
 /// node's sidecars, and the old chain data a finished, undone or given-up
-/// run left.
+/// run left. A read-block recovery is given up with it: its record, outcome
+/// and dated folders go (`btx_core::read_block_recovery::give_up`).
 fn remove_node_files(dd: &Path) -> Result<btx_core::disk::ReclaimReport, String> {
     crate::fast_forward::clear_for_removal(dd)?;
     let mut report = btx_core::disk::remove_node_data(dd);
@@ -8262,6 +8367,17 @@ fn remove_node_files(dd: &Path) -> Result<btx_core::disk::ReclaimReport, String>
                 report.freed_mb += bytes / (1024 * 1024);
             }
         }
+    }
+    // The read-block recovery is given up with the chain it set aside: a
+    // record left would let a later failed launch's roll-back move the old
+    // chain back over this removal (final review I1).
+    let bytes = btx_core::read_block_recovery::give_up(dd);
+    if bytes > 0 {
+        report.freed_mb += bytes / (1024 * 1024);
+        report.items.push(format!(
+            "data set aside after a known engine error ({} MB)",
+            bytes / (1024 * 1024)
+        ));
     }
     // Old chain data a Fast-forward set aside, when no run needs it (a
     // finish or a sweep that was cut off, or a run given up above).
@@ -8465,6 +8581,39 @@ mod signed_start_tests {
             "{:?}",
             report.items
         );
+    }
+
+    /// Final review I1: Remove node data with a read-block recovery step
+    /// recorded takes its dated folder, record and outcome with the chain,
+    /// so a later failed launch's roll-back cannot bring the old chain back.
+    #[test]
+    fn remove_node_data_gives_the_read_block_recovery_up() {
+        let dir = synced_validating_datadir();
+        let d = dir.path();
+        let r = btx_core::read_block_recovery::begin(
+            d,
+            btx_core::read_block_recovery::Next::SetAsideChainData { signatures: true },
+            btx_core::fast_forward::Before::default(),
+            100,
+        )
+        .unwrap();
+        std::fs::write(d.join(&r.aside).join("blocks/old"), vec![0u8; 4096]).ok();
+        let report = super::remove_node_files(d).unwrap();
+        assert!(!d.join(&r.aside).exists());
+        assert!(btx_core::read_block_recovery::read_record(d)
+            .unwrap()
+            .is_none());
+        assert!(
+            report
+                .items
+                .iter()
+                .any(|i| i.contains("known engine error")),
+            "{:?}",
+            report.items
+        );
+        assert!(btx_core::read_block_recovery::roll_back(d)
+            .unwrap()
+            .is_none());
     }
 
     /// Controller note 1 (a): Fast-forward sets `blocks/` aside, and the
@@ -9203,6 +9352,96 @@ mod signed_start_tests {
         assert!(!node::signs_here(&conf), "the retry holds no key");
         let text = std::fs::read_to_string(&conf).unwrap();
         assert!(text.contains("prune=10000"), "{text}");
+    }
+
+    /// The read-block fatal is read from this attempt's own log (the log is
+    /// rotated per run), handed to the ladder with the launch's own
+    /// arguments, and a step taken ends this start so the next begins from
+    /// the top. It comes before the generic "btxd exited" line.
+    #[test]
+    fn the_launch_loop_hands_the_read_block_fatal_to_the_ladder() {
+        let src = include_str!("commands.rs");
+        let spawn_fn = src
+            .split("\nasync fn spawn_node_with_lock_retry(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let args = spawn_fn
+            .find("let launch_args = controller.launch_args().to_vec();")
+            .unwrap();
+        assert!(spawn_fn.find(".start(").unwrap() < args);
+        let seen = spawn_fn
+            .find("btx_core::node::log_shows_read_block_fatal(&tail)")
+            .unwrap();
+        let handed = spawn_fn
+            .find("crate::read_block_recovery::after_fatal(")
+            .unwrap();
+        let generic = spawn_fn.find("btxd exited {when}").unwrap();
+        assert!(seen < handed && handed < generic);
+        assert!(
+            spawn_fn[handed..generic].contains("return Err("),
+            "a step or a roll-back ends this start"
+        );
+        // Both other ways a launch fails go through the step-2 check.
+        assert_eq!(
+            spawn_fn
+                .matches("crate::read_block_recovery::after_failed_launch(")
+                .count(),
+            2
+        );
+    }
+
+    /// Q1: a node this app spawned that died on the read-block fatal while
+    /// running is started again by the refresher itself, said on screen,
+    /// before the "stopped responding" error; any other silence keeps it.
+    #[test]
+    fn the_refresher_starts_a_node_that_died_on_the_fatal_again() {
+        let src = include_str!("commands.rs");
+        let refresher = src
+            .split("\nfn spawn_status_refresher(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let asked = refresher
+            .find("crate::read_block_recovery::take_auto_start(")
+            .unwrap();
+        let said = refresher
+            .find("crate::read_block_recovery::AUTO_START")
+            .unwrap();
+        let started = refresher
+            .find("start_node_projected(&app, &state)")
+            .unwrap();
+        let error = refresher.find("The node stopped responding.").unwrap();
+        assert!(asked < said && said < started && started < error);
+        let facts = refresher
+            .find("let ours = attached_slot.lock().await.is_none();")
+            .unwrap();
+        assert!(facts < asked);
+        let arm = &refresher[facts..error];
+        assert!(arm.contains("stop_node_inner(&state).await"));
+        assert!(arm.contains("slot_child_gone(&node_slot)"));
+        assert!(arm.contains("gen_counter.load(Ordering::SeqCst) != gen"));
+    }
+
+    /// A step restarts the whole start, at most twice (two rungs), and the
+    /// carry-on of an interrupted move runs before any launch.
+    #[test]
+    fn a_step_starts_again_from_the_top() {
+        let src = include_str!("commands.rs");
+        let held = src
+            .split("pub(crate) async fn start_node_held(")
+            .nth(1)
+            .and_then(|s| s.split("\nasync fn start_node_once(").next())
+            .unwrap();
+        let before = held
+            .find("crate::read_block_recovery::before_start(&datadir).await?")
+            .unwrap();
+        let once = held.find("start_node_once(app, state).await").unwrap();
+        assert!(before < once);
+        assert!(held.contains("crate::read_block_recovery::STEP_TAKEN"));
+        assert!(held.contains("crate::read_block_recovery::after_start(app, state)"));
+        assert!(held.contains("MAX_LADDER_RESTARTS"));
+        assert_eq!(super::MAX_LADDER_RESTARTS, 2);
     }
 
     /// Integration review M6, in the code: the loop takes the key line out

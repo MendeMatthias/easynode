@@ -16,6 +16,7 @@
 //! items that were `pub(crate)` inside the miner were widened mechanically
 //! during the extraction — no behavior changed.
 
+pub mod aside;
 pub mod attested_snapshot;
 pub mod backend;
 pub mod catchup_assist;
@@ -46,8 +47,10 @@ pub mod node_api;
 pub mod operators;
 pub mod platform;
 pub mod power;
+pub mod read_block_recovery;
 pub mod role;
 pub mod rpc;
+pub mod sentinel;
 pub mod service_report;
 pub mod setup;
 pub mod signer;

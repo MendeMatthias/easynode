@@ -8,6 +8,35 @@ root).
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-10-03
+
+**A node that stops on "Failed to read block" gets itself running again.**
+Some nodes that follow signatures and started from a snapshot stopped after
+an hour or so with the engine error "Failed to read block", and then stopped
+again within a second every time they were started. The cause is in the node
+engine: while the node checks older history in the background, a shortcut for
+nodes that follow signatures can send that background check to a block it
+never downloaded. The real fix belongs in the engine. Thanks to the owner who
+sent the logs.
+
+- When the node stops on this error, easyNode now starts it again by itself
+  and says so on the status screen.
+- If it stops the same way again at the start and it follows signatures
+  without a signing key of its own, easyNode first puts the node's stored
+  signatures aside in a dated folder and starts again. The node fetches the
+  signatures again from its peers. A node with its own signing key keeps its
+  signatures where they are.
+- If that is not enough, or that step does not apply, easyNode puts the chain
+  folders aside and starts again from the snapshot, the same way a new install
+  does. If that fails too, easyNode puts the folders back and the screen says
+  where they are.
+- **Copy diagnostics** in Tools now shows what the recovery did.
+
+This gets a stuck node running again. Until the engine is fixed, a node can
+still stop this way while it runs; it then starts again by itself.
+
+The node engine stays BTX 0.34.12, the same as 0.7.2.
+
 ## [0.7.2] - 2026-10-01
 
 **A node that hears signatures but trusts none of them now says so.**

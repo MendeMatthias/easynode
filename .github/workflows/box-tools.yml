@@ -1,0 +1,65 @@
+# Linux builds of the small server programs in crates/btx-core/src/bin
+# (btx-witness today, and whatever else lands there), for boxes that run them
+# without a Rust toolchain. The first user is witness-2 on the api.btxscan.io
+# box: deploy/esplora/witness-2/README.md.
+#
+# Every file under crates/btx-core/src/bin is a binary target, so
+# `cargo build --bins` builds all of them and the copy step below takes each
+# one by its source file's name. A new bin rides along with no edit here.
+#
+# ⚠ 22.04 ON PURPOSE, as in btxd-linux.yml: a binary picks up the glibc of the
+# machine that built it, and 22.04 (glibc 2.35) runs on 22.04 and anything
+# newer. A newer runner would quietly narrow which boxes can run it.
+#
+# Security: workflow_dispatch only, `permissions: contents: read`, no secrets,
+# no inputs. Action pins are the commit SHAs ci.yml uses; see its header for
+# why a tag is not enough.
+name: Box tools (Linux)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: btx-core bins (linux x86_64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: crates/btx-core
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Show toolchain
+        run: rustc --version && cargo --version
+      # --locked: the artifact is built from exactly the Cargo.lock in the tree.
+      - run: cargo build --release --locked --bins
+      - name: Collect the binaries and their sha256
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/box-tools-dist"
+          mkdir -p "$out"
+          for src in src/bin/*.rs; do
+            name="$(basename "$src" .rs)"
+            test -x "target/release/$name"
+            cp "target/release/$name" "$out/"
+            file "$out/$name"
+            # Proves it starts at all on a stock 22.04: every bin here answers
+            # --help without a node.
+            "$out/$name" --help >/dev/null
+          done
+          # Into a variable first: a glob beside `| tee` in the same folder
+          # could pick up the half-written SHA256SUMS.txt itself.
+          sums="$(cd "$out" && sha256sum -- *)"
+          printf '%s\n' "$sums" | tee "$out/SHA256SUMS.txt"
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: box-tools-linux-x86_64-${{ github.sha }}
+          path: box-tools-dist/*
+          if-no-files-found: error

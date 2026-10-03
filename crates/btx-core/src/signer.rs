@@ -386,6 +386,17 @@ impl RecentSigners {
         self.entries.back().map(|(h, _, _)| *h)
     }
 
+    /// The newest height in the window that carries at least one signature.
+    /// The sentinel watches this move: a chain whose newest signed block
+    /// stops rising is a chain whose signers went quiet.
+    pub fn newest_signed_height(&self) -> Option<u64> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|(_, _, ks)| !ks.is_empty())
+            .map(|(h, _, _)| *h)
+    }
+
     /// The hash recorded at a height, if that height is in the window.
     pub fn hash_at(&self, height: u64) -> Option<&str> {
         self.entries
@@ -679,6 +690,19 @@ mod tests {
         assert_eq!(w.summary().blocks_with_signature, 100);
         assert_eq!(w.summary().seen, 100);
         assert_eq!(w.hash_at(151), Some("h151b"));
+    }
+
+    #[test]
+    fn the_newest_signed_height_skips_unsigned_blocks_on_top() {
+        let a = "02".to_string() + &"a".repeat(64);
+        let mut w = RecentSigners::new();
+        assert_eq!(w.newest_signed_height(), None);
+        w.record(10, "h10", &[att(&a)]);
+        w.record(11, "h11", &[]);
+        w.record(12, "h12", &[]);
+        assert_eq!(w.newest_signed_height(), Some(10));
+        w.record(12, "h12", &[att(&a)]);
+        assert_eq!(w.newest_signed_height(), Some(12));
     }
 
     #[test]

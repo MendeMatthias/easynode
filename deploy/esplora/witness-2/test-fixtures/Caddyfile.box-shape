@@ -1,0 +1,153 @@
+# The SHAPE of /etc/caddy/Caddyfile on the api.btxscan.io box, for testing
+# install-witness-2.sh's edit. Built from the btx-esplora repo's deploy/Caddyfile
+# (the live file is newer and is never copied anywhere). Kept: the global
+# `order rate_limit before reverse_proxy`, the (perip_limit) snippet and its
+# @ratelimited matcher, the (esplora_api) snippet with its handle blocks and the
+# terminal handle, and the api.btxscan.io site. Left out: comments, the other
+# two sites (one carries a basic_auth credential), and the one exempt IP, here
+# replaced by a documentation address.
+{
+	order rate_limit before reverse_proxy
+}
+
+(perip_limit) {
+	rate_limit @ratelimited {
+		zone perip {
+			key {remote_host}
+			events 600
+			window 10s
+		}
+	}
+}
+
+(esplora_api) {
+	encode gzip zstd
+	@options method OPTIONS
+	handle @options {
+		header Access-Control-Allow-Origin "*"
+		header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+		header Access-Control-Allow-Headers "Content-Type"
+		respond 204
+	}
+	header Access-Control-Allow-Origin "*"
+	header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+	header -Server
+	header X-Content-Type-Options "nosniff"
+
+	@rawblock {
+		method GET
+		path /rest/block/*
+	}
+	handle @rawblock {
+		rate_limit {
+			zone rawblock {
+				key {remote_host}
+				events 60
+				window 10s
+			}
+		}
+		header X-Btx-Source "btxd-rest"
+		reverse_proxy 127.0.0.1:19334 {
+			transport http {
+				read_timeout 30s
+				write_timeout 30s
+			}
+		}
+	}
+
+	@ratelimited not remote_ip 192.0.2.1
+	request_body {
+		max_size 30MB
+	}
+
+	@stale file {
+		root /run
+		try_files btx-stale
+	}
+	handle @stale {
+		header X-Btx-Upstream "local"
+		header X-Btx-Freshness "stale"
+		import perip_limit
+		reverse_proxy 127.0.0.1:3000 {
+			header_down -Access-Control-Allow-Origin
+			header_down -Access-Control-Allow-Methods
+			header_down -Access-Control-Allow-Headers
+			transport http {
+				read_timeout 30s
+				write_timeout 30s
+			}
+		}
+	}
+	@unverified file {
+		root /run
+		try_files btx-unverified
+	}
+	handle @unverified {
+		header X-Btx-Upstream "local"
+		header X-Btx-Freshness "unverified"
+		import perip_limit
+		reverse_proxy 127.0.0.1:3000 {
+			header_down -Access-Control-Allow-Origin
+			header_down -Access-Control-Allow-Methods
+			header_down -Access-Control-Allow-Headers
+			transport http {
+				read_timeout 30s
+				write_timeout 30s
+			}
+		}
+	}
+	@fresh file {
+		root /run
+		try_files btx-fresh
+	}
+	handle @fresh {
+		header X-Btx-Upstream "local"
+		header X-Btx-Freshness "fresh"
+		import perip_limit
+		reverse_proxy 127.0.0.1:3000 {
+			header_down -Access-Control-Allow-Origin
+			header_down -Access-Control-Allow-Methods
+			header_down -Access-Control-Allow-Headers
+			transport http {
+				read_timeout 30s
+				write_timeout 30s
+			}
+		}
+	}
+	handle {
+		header X-Btx-Upstream "local"
+		header X-Btx-Freshness "unverified"
+		import perip_limit
+		reverse_proxy 127.0.0.1:3000 {
+			header_down -Access-Control-Allow-Origin
+			header_down -Access-Control-Allow-Methods
+			header_down -Access-Control-Allow-Headers
+			transport http {
+				read_timeout 30s
+				write_timeout 30s
+			}
+		}
+	}
+}
+
+api.btxscan.io {
+	@notwallet not header User-Agent BTX-Wallet*
+	log_skip @notwallet
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 100mb
+			roll_keep 30
+			roll_keep_for 4320h
+		}
+		format filter {
+			wrap json
+			fields {
+				request>remote_ip delete
+				request>remote_port delete
+				request>headers>Cookie delete
+			}
+		}
+	}
+	reverse_proxy /qid/* 127.0.0.1:8890
+	import esplora_api
+}

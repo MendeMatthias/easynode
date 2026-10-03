@@ -28,3 +28,6 @@ apps/node/dist-feed/
 # from a commit. Public keys (`*.key.pub`) are not matched. The content check
 # is .github/workflows/secret-scan.yml.
 *.key
+
+# Test fixtures are real captured logs the tests read at compile time.
+!crates/btx-core/tests/fixtures/**/*.log
