@@ -1,11 +1,11 @@
-2026-10-01T17:28:46Z Opening LevelDB in /home/zan/.easybtx/chainstate_snapshot
+2026-10-01T17:28:46Z Opening LevelDB in /home/user/.easybtx/chainstate_snapshot
 2026-10-01T17:28:46Z Opened LevelDB successfully
-2026-10-01T17:28:46Z Using obfuscation key for /home/zan/.easybtx/chainstate_snapshot
+2026-10-01T17:28:46Z Using obfuscation key for /home/user/.easybtx/chainstate_snapshot
 2026-10-01T17:28:46Z [Chainstate [snapshot] @ height 234614 (49e15396acef8534af404801a8427c1690046ebcc1961877349485cc0b862388)] resized coinsdb cache to 0.4 MiB
 2026-10-01T17:28:46Z [Chainstate [snapshot] @ height 234614 (49e15396acef8534af404801a8427c1690046ebcc1961877349485cc0b862388)] resized coinstip cache to 22.0 MiB
-2026-10-01T17:28:46Z Opening LevelDB in /home/zan/.easybtx/chainstate
+2026-10-01T17:28:46Z Opening LevelDB in /home/user/.easybtx/chainstate
 2026-10-01T17:28:46Z Opened LevelDB successfully
-2026-10-01T17:28:46Z Using obfuscation key for /home/zan/.easybtx/chainstate
+2026-10-01T17:28:46Z Using obfuscation key for /home/user/.easybtx/chainstate
 2026-10-01T17:28:46Z [Chainstate [ibd] @ height 20233 (86e3bb8e0758ff94ad33088a589966b2d25e3029c47006ee34a407f603f4caff)] resized coinsdb cache to 7.6 MiB
 2026-10-01T17:28:46Z [Chainstate [ibd] @ height 20233 (86e3bb8e0758ff94ad33088a589966b2d25e3029c47006ee34a407f603f4caff)] resized coinstip cache to 418.0 MiB
 2026-10-01T17:28:46Z init message: Verifying blocks…
@@ -58,7 +58,7 @@ Error: A fatal internal error occurred, see debug.log for details: Failed to con
 2026-10-01T17:28:46Z msghand thread start
 2026-10-01T17:28:46Z init message: Done loading
 2026-10-01T17:28:46Z mmrecover thread start
-2026-10-01T17:28:46Z [net:info] portmap: Added mapping pcp:100.90.119.197:19335 -> 192.168.1.171:19335 (for 2400s)
+2026-10-01T17:28:46Z [net:info] portmap: Added mapping pcp:203.0.113.10:19335 -> 192.0.2.10:19335 (for 2400s)
 2026-10-01T17:28:46Z tor: Thread interrupt
 2026-10-01T17:28:46Z mapport thread exit
 2026-10-01T17:28:46Z opencon thread exit
