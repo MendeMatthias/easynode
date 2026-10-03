@@ -955,6 +955,15 @@ mod tests {
             hosts.iter().any(|h| h == "20.86.181.203"),
             "missing 20.86.181.203: {hosts:?}"
         );
+        // Both fork witnesses the census reads: witness-1 on its own host,
+        // witness-2 at api.btxscan.io/witness (deploy/esplora/witness-2). A
+        // report quoting either must keep the name.
+        for witness in ["witness-1.easybtx.com", "api.btxscan.io"] {
+            assert!(
+                hosts.iter().any(|h| h == witness),
+                "missing {witness}: {hosts:?}"
+            );
+        }
     }
 }
 
