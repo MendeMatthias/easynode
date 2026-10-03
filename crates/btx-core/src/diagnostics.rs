@@ -79,6 +79,10 @@ pub struct DiagnosticsInput {
     /// The refresher's signature window (`crate::watchdog::SignatureWindow`),
     /// `None` until it holds two samples this run.
     pub signature_window: Option<crate::watchdog::SignatureDeltas>,
+    /// The last "same chain as other sources" comparison
+    /// (`crate::chain_agreement::Agreement::diagnostics_lines`), each line
+    /// already indented. Empty until the first comparison of this run.
+    pub chain_agreement: Vec<String>,
     pub stall: Option<String>,
     /// What the catch-up help is doing this run (`crate::catchup_assist`,
     /// `CatchUp::diagnostics`), one line each. Empty when no refresher ran.
@@ -109,7 +113,7 @@ pub(crate) fn group(n: u64) -> String {
 /// this is that same conversion, parameterised on a given time rather than
 /// always reading the real clock, so [`relative_ago`] can be tested against a
 /// fixed one).
-fn format_utc_minute(unix_secs: i64) -> String {
+pub(crate) fn format_utc_minute(unix_secs: i64) -> String {
     let days = unix_secs.div_euclid(86_400);
     let rem = unix_secs.rem_euclid(86_400);
     // Civil-from-days (Howard Hinnant), proleptic Gregorian.
@@ -344,6 +348,11 @@ pub fn render(i: &DiagnosticsInput) -> String {
         ));
     }
     signatures_block(&mut o, i);
+    o.push("Chain agreement".into());
+    if i.chain_agreement.is_empty() {
+        o.push("  not checked yet this run".into());
+    }
+    o.extend(i.chain_agreement.iter().cloned());
     let notices = i
         .chain
         .as_ref()
@@ -1389,6 +1398,7 @@ mod tests {
             attested_tip: None,
             trusted: None,
             signature_window: None,
+            chain_agreement: Vec::new(),
             stall: None,
             catch_up: vec![
                 crate::catchup_assist::refuses_old_line("109.199.124.187:19335"),
@@ -1555,6 +1565,7 @@ mod tests {
                 ..Default::default()
             }),
             signature_window: None,
+            chain_agreement: Vec::new(),
             stall: None,
             catch_up: vec!["not asking any peer for blocks right now".into()],
             recovery: Vec::new(),
@@ -1605,6 +1616,32 @@ mod tests {
             r.contains("Read-block recovery\n  step: signatures, phase: running"),
             "{r}"
         );
+    }
+
+    /// "Am I on the right chain?" (crate::chain_agreement), under its own
+    /// heading after the Signatures block, and "not checked yet" until the
+    /// first comparison of this run.
+    #[test]
+    fn the_chain_agreement_has_its_own_block() {
+        let quiet = render(&DiagnosticsInput::default());
+        assert!(
+            quiet.contains("Chain agreement\n  not checked yet this run"),
+            "{quiet}"
+        );
+        let input = DiagnosticsInput {
+            chain_agreement: vec![
+                "  AGREE · OK · ATTACHED, NOT CHECKED HERE · as of 2026-10-03 14:05 UTC".into(),
+            ],
+            ..Default::default()
+        };
+        let r = render(&input);
+        assert!(
+            r.contains("Chain agreement\n  AGREE · OK · ATTACHED, NOT CHECKED HERE"),
+            "{r}"
+        );
+        let sig = r.find("Signatures").unwrap();
+        let agree = r.find("Chain agreement").unwrap();
+        assert!(sig < agree, "{r}");
     }
 
     /// The operator's case as Copy diagnostics shows it: two old keys
