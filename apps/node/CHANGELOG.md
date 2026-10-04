@@ -15,11 +15,13 @@ first tries on it. The node still keeps its trusted grant for that address,
 so it can come back the day it answers again. The one archive easyNode now
 ships is btxscan.io's mirror.
 
-**The node now also trusts the three zbtx signer keys.** A node that follows
-signatures now follows blocks signed by either operator: the zbtx operator,
-or this project's own signer. It now trusts seven keys instead of four. The threshold stays at 1: one signature from a trusted key is
-still enough for a block. If you already listed a zbtx key in your own conf
-or `btx_rw.conf`, the app does not add it a second time.
+**The node now also trusts three signer keys from an independent operator.**
+A node that follows signatures now accepts blocks signed by that operator
+as well as by the keys it trusted before, so it keeps moving when either
+side is the one signing. It now trusts seven keys instead of four. The
+threshold stays at 1: one signature from a trusted key is still enough for
+a block. If you already listed one of these keys in your own conf or
+`btx_rw.conf`, the app does not add it a second time.
 
 ## [0.7.4] - 2026-10-03
 

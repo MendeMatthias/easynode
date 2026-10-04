@@ -57,9 +57,11 @@ read 2026-10-04) says:
 - It stays off until the open directory is rate limited.
 
 This matches the project's earlier notes (`docs/fleet-proposal.md`, the
-btx-ops topology notes in btx-apps). What the help does not say is how the
-directory is stored or exposed over RPC; read the 0.34.x source before
-building on it.
+btx-ops topology notes in btx-apps). The help for the neighbouring
+`-matmulopenthreshold` says the directory is reported by `getmatmulattestors`.
+How it is stored, and what that RPC returns, is still to read in the 0.34.x
+source before building on it.
+
 easyNode does not set the flag today. Heard therefore means: a witness or the
 census saw the key's signatures somewhere. It carries no authority.
 
@@ -195,8 +197,9 @@ existing way.
 
 ## Open questions
 
-- How `-matmulopenattestors` stores and exposes its admitted directory. The
-  v0.34.12 help confirms what it does, not how to read it.
+- How `-matmulopenattestors` stores its admitted directory and what
+  `getmatmulattestors` returns for it. The v0.34.12 help confirms what the
+  flag does, not the shape of that answer.
 - How long a track record has to be before a key is shown as a candidate.
   Not decided. Any number picked now would be a guess.
 - Who holds the list key, and how a lost list key is replaced (also open in
