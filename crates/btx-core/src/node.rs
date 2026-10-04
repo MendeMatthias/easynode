@@ -1702,8 +1702,21 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
 ///     the same release so a later move to them does not cost a second
 ///     namespace change. The cost, per the warning below: the
 ///     `AuthorityNamespace` moves once. Measured on 4 Oct 2026 on this Mac
-///     with v0.34.12:
-///     MEASURED: <filled in by lead>
+///     with v0.34.12, two scratch mirrors, `~/.easybtx` untouched:
+///       - A copy of this Mac's old datadir (block 185,855): 4 pins for
+///         15 min (+1,129 blocks), restart with 7 pins for 30 min (+2,079
+///         blocks). It started (the stored snapshot manifest re-verified
+///         under the larger set) and synced at the same rate.
+///       - A fresh mirror from the signed snapshot 225,927, caught up to
+///         the tip on the 4 pins. That night `02d5efca` went quiet after
+///         238,007 and the 4-pin mirror stood still there for 10 min while
+///         the chain went on to 238,030: block 238,008 had "no in-memory
+///         quorum". Restarted with the 7 pins, it accepted its first new
+///         block 61 s after start, was at the tip (238,031) in the same
+///         minute, and followed every block for 30 min (238,044 against
+///         witness-2's 238,045). Both starts loaded 0 stored attestations
+///         with either pin set, so the namespace move cost no re-acquire
+///         time this mirror could see.
 ///     At M=1 each of these keys is a full authority for every mirror, as
 ///     `02d5efca` is. That is the owner's decision; the path to M=2 is in
 ///     docs/earned-trust.md. Never added here: `037db271` and `03bc9ac2`
