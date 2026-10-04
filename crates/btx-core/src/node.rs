@@ -1706,7 +1706,8 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
 ///       - A copy of this Mac's old datadir (block 185,855): 4 pins for
 ///         15 min (+1,129 blocks), restart with 7 pins for 30 min (+2,079
 ///         blocks). It started (the stored snapshot manifest re-verified
-///         under the larger set) and synced at the same rate.
+///         under the larger set) and synced at a similar rate (75 and 69
+///         blocks a minute, both crawling on old-block fetches).
 ///       - A fresh mirror from the signed snapshot 225,927, caught up to
 ///         the tip on the 4 pins. That night `02d5efca` went quiet after
 ///         238,007 and the 4-pin mirror stood still there for 10 min while
