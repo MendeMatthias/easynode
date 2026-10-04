@@ -6,7 +6,7 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
-## [Unreleased]
+## [0.7.5] - 2026-10-04
 
 **An archive peer that stopped answering is off the start list.**
 `37.230.134.222` has refused connections since 12 September and refused our
@@ -21,7 +21,10 @@ as well as by the keys it trusted before, so it keeps moving when either
 side is the one signing. It now trusts seven keys instead of four. The
 threshold stays at 1: one signature from a trusted key is still enough for
 a block. If you already listed one of these keys in your own conf or
-`btx_rw.conf`, the app does not add it a second time.
+`btx_rw.conf`, the app does not add it a second time. Measured on 4
+October: when this project's own signer went quiet at block 238,007, a
+node on the old four keys stood still there; with the new keys the same
+node was back at the tip within a minute and kept up.
 
 ## [0.7.4] - 2026-10-03
 
