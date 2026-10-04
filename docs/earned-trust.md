@@ -46,21 +46,20 @@ is unheard: pinned mirrors do not store or pass on its signatures, unless
 something admits it.
 
 The engine flag `-matmulopenattestors` is the one thing that admits such keys.
-What the project's notes record about it, from earlier reads of upstream
-`init.cpp` and the arg help (`docs/fleet-proposal.md`, and the btx-ops
-topology notes in btx-apps):
+Its help text in the shipped engine (`btxd -help -help-debug`, v0.34.12,
+read 2026-10-04) says:
 
-- With it set, btxd records valid attestations from keys it does not pin, and
-  admits a key into `admitted_open_pubkeys` after it co-signs a hash that
-  already has pin quorum.
-- Admitted keys are a directory, not a quorum. Quorum still comes only from
-  the pins, and the flag never replaces `-matmultrustedthreshold`.
-- Upstream's help said it should stay off until the open directory is rate
-  limited.
+- Default 0. With it set, btxd hears cryptographically valid ExactReplay
+  attestations from keys outside `-matmultrustedpubkey`.
+- A new key is listed as admitted after it co-signs a hash that already has
+  pin quorum, and that directory is not MatMul authority. Quorum still comes
+  only from the pins at `-matmultrustedthreshold`.
+- It stays off until the open directory is rate limited.
 
-The engine source on this machine (`~/repos/btx`) is at v0.32.11 and does not
-contain the flag, so the points above are to verify against the engine source
-of the shipped version (0.34.12 / 0.34.13) before anything relies on them.
+This matches the project's earlier notes (`docs/fleet-proposal.md`, the
+btx-ops topology notes in btx-apps). What the help does not say is how the
+directory is stored or exposed over RPC; read the 0.34.x source before
+building on it.
 easyNode does not set the flag today. Heard therefore means: a witness or the
 census saw the key's signatures somewhere. It carries no authority.
 
@@ -196,8 +195,8 @@ existing way.
 
 ## Open questions
 
-- Whether `-matmulopenattestors` behaves in the shipped engine as the notes
-  above say. Unverified on 0.34.x source.
+- How `-matmulopenattestors` stores and exposes its admitted directory. The
+  v0.34.12 help confirms what it does, not how to read it.
 - How long a track record has to be before a key is shown as a candidate.
   Not decided. Any number picked now would be a guess.
 - Who holds the list key, and how a lost list key is replaced (also open in
