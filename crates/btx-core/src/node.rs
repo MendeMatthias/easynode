@@ -1649,7 +1649,7 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
 /// Compressed secp256k1 public keys trusted to attest Profile-1 ExactReplay.
 ///
 /// Threshold is 1, so this list is a UNION and an extra key can only widen what
-/// the node accepts — it can never cause a rejection. That is why all four sit
+/// the node accepts — it can never cause a rejection. That is why all seven sit
 /// here rather than only the two upstream currently publishes.
 ///
 /// Why more than one is required at all. Measured on a parked GPU-less datadir
@@ -1693,6 +1693,22 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
 ///     At M=1 this makes that one machine a full authority for every mirror,
 ///     the trade jpp's operator standard (M=2, independent keys) is meant to
 ///     retire once a second key signs the valid chain.
+///   * `026da4e3`, `03047189`, `02c9cfb7` — the zbtx operator's three keys,
+///     added in 0.7.5 by owner decision. witness-2, a mirror pinning 9 keys,
+///     counted `026da4e3` on 96-97 of the last 100 blocks on 3-4 Oct 2026,
+///     next to `02d5efca`, the only other easyNode-pinned key signing then.
+///     The other two are the same operator's keys (its other machines,
+///     grouped under one operator in `snapshot-operators.json`), pinned in
+///     the same release so a later move to them does not cost a second
+///     namespace change. The cost, per the warning below: the
+///     `AuthorityNamespace` moves once. Measured on 4 Oct 2026 on this Mac
+///     with v0.34.12:
+///     MEASURED: <filled in by lead>
+///     At M=1 each of these keys is a full authority for every mirror, as
+///     `02d5efca` is. That is the owner's decision; the path to M=2 is in
+///     docs/earned-trust.md. Never added here: `037db271` and `03bc9ac2`
+///     (sign on mainnet, owners unrecorded) and jpp's `02e0a965` (a rented
+///     machine, for an M=2 set only).
 ///
 /// ⚠ Changing this list is not free, and the cost is not where you would look
 /// for it. btxd namespaces its durable attestation archive by
@@ -1718,11 +1734,14 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
 /// still proves it: the bounded hot store reloaded from disk still counts, the
 /// durable history behind it does not. Measure a real mirror datadir across
 /// this change before it ships.
-pub const BTX_TRUSTED_ATTESTATION_PUBKEYS: [&str; 4] = [
+pub const BTX_TRUSTED_ATTESTATION_PUBKEYS: [&str; 7] = [
     "03d90c148db37da28ce47ce15bade88a177728d663da4bc9ba765943b7d4e4f0aa",
     "0224e80df33697385b54b3c69bae1f097f533c0c43e93c29f73ee97319d4a5e04c",
     "028995b25c887ee03eb53a41312d33c8eccf48f261ecf9e91fe2b1e8e50373258a",
     "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675",
+    "026da4e3a07676cada5488123033fb1057faeb7fe6a7d50b2ae3921431e0f4bbf1",
+    "03047189023913e1922c80c895ee2a9e2eff6df05438654749e1a4f95019578a24",
+    "02c9cfb77d7e4dce0cd6b7968fee1dd53d31ef06c764185e120c825fab8c0572a0",
 ];
 
 /// The mirrors' threshold. It never rises: a mirror on a snapshot stored
@@ -8932,6 +8951,201 @@ matmul: metal runtime_probe_ok, selecting metal\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── 0.7.5: the three zbtx signer keys (owner decision, threshold 1) ──
+
+    /// The zbtx operator's three keys, in the order node.rs pins them.
+    const ZBTX_KEYS: [&str; 3] = [
+        "026da4e3a07676cada5488123033fb1057faeb7fe6a7d50b2ae3921431e0f4bbf1",
+        "03047189023913e1922c80c895ee2a9e2eff6df05438654749e1a4f95019578a24",
+        "02c9cfb77d7e4dce0cd6b7968fee1dd53d31ef06c764185e120c825fab8c0572a0",
+    ];
+
+    /// How many times each shipped key appears as a `-matmultrustedpubkey=`
+    /// argument, case-blind.
+    fn pin_count(args: &[String], key: &str) -> usize {
+        args.iter()
+            .filter(|a| {
+                a.strip_prefix("-matmultrustedpubkey=")
+                    .is_some_and(|v| v.eq_ignore_ascii_case(key))
+            })
+            .count()
+    }
+
+    /// 0.7.5 pins the zbtx operator's three keys after the four already
+    /// shipped, and nothing else. Literals, for the same reason as the
+    /// upstream-key test: the failure being guarded against is a list that
+    /// quietly differs from the decision. `037db271` and `03bc9ac2` sign on
+    /// mainnet but nobody recorded who runs them, and jpp's `02e0a965` runs
+    /// on a rented machine, so it belongs in an M=2 set only
+    /// (docs/earned-trust.md). None of them is a pin at M=1.
+    #[test]
+    fn the_pin_carries_the_three_zbtx_keys_and_none_of_the_unrecorded_ones() {
+        assert_eq!(BTX_TRUSTED_ATTESTATION_PUBKEYS.len(), 7);
+        // The four shipped before 0.7.5 keep their places: never reordered.
+        assert_eq!(
+            BTX_TRUSTED_ATTESTATION_PUBKEYS[..4],
+            [
+                "03d90c148db37da28ce47ce15bade88a177728d663da4bc9ba765943b7d4e4f0aa",
+                "0224e80df33697385b54b3c69bae1f097f533c0c43e93c29f73ee97319d4a5e04c",
+                "028995b25c887ee03eb53a41312d33c8eccf48f261ecf9e91fe2b1e8e50373258a",
+                "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675",
+            ]
+        );
+        assert_eq!(BTX_TRUSTED_ATTESTATION_PUBKEYS[4..], ZBTX_KEYS);
+        for k in BTX_TRUSTED_ATTESTATION_PUBKEYS {
+            assert!(
+                crate::operators::parse_key(k).is_some(),
+                "a valid compressed secp256k1 point: {k}"
+            );
+            assert_eq!(k, k.to_ascii_lowercase(), "lowercase: {k}");
+        }
+        let distinct: std::collections::HashSet<String> = BTX_TRUSTED_ATTESTATION_PUBKEYS
+            .iter()
+            .map(|k| k.to_ascii_lowercase())
+            .collect();
+        assert_eq!(distinct.len(), 7, "every pin distinct");
+        for prefix in ["037db271", "03bc9ac2", "02e0a965"] {
+            assert!(
+                !BTX_TRUSTED_ATTESTATION_PUBKEYS
+                    .iter()
+                    .any(|k| k.starts_with(prefix)),
+                "{prefix} must not be pinned at M=1"
+            );
+        }
+        assert_eq!(
+            BTX_TRUSTED_ATTESTATION_THRESHOLD, 1,
+            "the threshold stays 1"
+        );
+    }
+
+    /// A mirror pushes every one of the seven keys, each exactly once, and
+    /// one threshold of 1.
+    #[test]
+    fn a_mirror_launch_pins_all_seven_keys_exactly_once() {
+        let dir = signed_snapshot_datadir("zbtx-mirror");
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.12/lin/btxd"),
+            &dir,
+            &conf,
+            Backend::Cpu,
+        );
+        assert_eq!(validation_modes(&args), vec!["trusted"], "{args:?}");
+        for k in BTX_TRUSTED_ATTESTATION_PUBKEYS {
+            assert_eq!(pin_count(&args, k), 1, "{k}: {args:?}");
+        }
+        assert_eq!(
+            args.iter()
+                .filter(|a| a.starts_with("-matmultrustedpubkey="))
+                .count(),
+            7,
+            "{args:?}"
+        );
+        assert_eq!(
+            args.iter()
+                .filter(|a| *a == "-matmultrustedthreshold=1")
+                .count(),
+            1,
+            "{args:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node that already pins a zbtx key by hand, in `btx_rw.conf` or in
+    /// its conf, is not given that key again on the command line: the engine
+    /// refuses "Duplicate -matmultrustedpubkey" at init. Every other key
+    /// still goes on once. Both arms: the mirror, and a validating node on a
+    /// signed snapshot.
+    #[test]
+    fn a_zbtx_key_already_pinned_by_hand_is_not_pushed_again() {
+        let dir = signed_snapshot_datadir("zbtx-dupes");
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        let conf = dir.join("hand.conf");
+        // Upper case in the conf, as a hand edit might write it.
+        std::fs::write(
+            &conf,
+            format!(
+                "server=1\nmatmultrustedpubkey={}\n",
+                ZBTX_KEYS[1].to_ascii_uppercase()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("btx_rw.conf"),
+            format!("matmultrustedpubkey={}\n", ZBTX_KEYS[0]),
+        )
+        .unwrap();
+        let btxd = Path::new("/x/btx/v0.34.12/lin/btxd");
+        for backend in [Backend::Cpu, Backend::Cuda, Backend::Metal] {
+            let (_, args, _) = build_node_command(btxd, &dir, &conf, backend);
+            assert_eq!(pin_count(&args, ZBTX_KEYS[0]), 0, "{backend:?}: {args:?}");
+            assert_eq!(pin_count(&args, ZBTX_KEYS[1]), 0, "{backend:?}: {args:?}");
+            for k in BTX_TRUSTED_ATTESTATION_PUBKEYS
+                .iter()
+                .filter(|k| !ZBTX_KEYS[..2].contains(k))
+            {
+                assert_eq!(pin_count(&args, k), 1, "{backend:?} {k}: {args:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A signer whose own key is one of the zbtx keys (the zbtx operator's
+    /// own machine running easyNode) pins that key once: the self-pin, and
+    /// the signed-snapshot pins skip it.
+    ///
+    /// There is no private key on hand for any zbtx key, so, as in
+    /// `a_signer_whose_own_key_is_a_trusted_pubkey_is_not_pinned_twice`,
+    /// this builds the validating arm's two contributions the way
+    /// `build_node_command` does: `signing_key_self_pin`'s key, then
+    /// `validating_snapshot_pin_args` with that key in `already`.
+    #[test]
+    fn a_signer_whose_own_key_is_a_zbtx_key_pins_it_once() {
+        let dir = signed_snapshot_datadir("zbtx-self");
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        for own in ZBTX_KEYS {
+            let mut args = vec![format!("-matmultrustedpubkey={own}")];
+            args.extend(validating_snapshot_pin_args(
+                &dir,
+                &BTX_TRUSTED_ATTESTATION_PUBKEYS,
+                &[own.to_string()],
+            ));
+            for k in BTX_TRUSTED_ATTESTATION_PUBKEYS {
+                assert_eq!(pin_count(&args, k), 1, "own {own}, {k}: {args:?}");
+            }
+            assert_eq!(
+                args.iter()
+                    .filter(|a| a.starts_with("-matmultrustedthreshold="))
+                    .count(),
+                1
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A keyless validating node on a signed snapshot pins all seven keys
+    /// once, in consensus mode still.
+    #[test]
+    fn a_validating_node_on_a_signed_snapshot_pins_all_seven_once() {
+        let dir = signed_snapshot_datadir("zbtx-validating");
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        for backend in [Backend::Cuda, Backend::Metal] {
+            let (_, args, _) =
+                build_node_command(Path::new("/x/btx/v0.34.12/lin/btxd"), &dir, &conf, backend);
+            assert!(!validation_modes(&args).contains(&"trusted"), "{args:?}");
+            for k in BTX_TRUSTED_ATTESTATION_PUBKEYS {
+                assert_eq!(pin_count(&args, k), 1, "{backend:?} {k}: {args:?}");
+            }
+            for k in ZBTX_KEYS {
+                assert_eq!(pin_count(&args, k), 1, "{backend:?} {k}: {args:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Section 7, step 5: the marker makes exactly the load launch a mirror
     /// (the app's start path takes the signing key out of the conf for it;
     /// `build_node_command` does not), and clearing it gives the validating
@@ -9227,7 +9441,7 @@ matmul: metal runtime_probe_ok, selecting metal\n\
     #[test]
     fn pins_only_grow_and_the_threshold_stays() {
         let (ever, threshold) = pins_file();
-        assert_eq!(ever.len(), 4, "the file lost a line");
+        assert_eq!(ever.len(), 7, "the file lost a line");
         pins_only_grow(&ever, &BTX_TRUSTED_ATTESTATION_PUBKEYS).unwrap();
         assert!(
             BTX_TRUSTED_ATTESTATION_THRESHOLD <= threshold,

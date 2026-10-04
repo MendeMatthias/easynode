@@ -1553,7 +1553,7 @@ mod tests {
             trusted: Some(MatmulTrustedStatus {
                 trusted_mirror: true,
                 threshold: 1,
-                trusted_signers: 4,
+                trusted_signers: 7,
                 trusted_signer_pubkeys: crate::node::BTX_TRUSTED_ATTESTATION_PUBKEYS
                     .iter()
                     .map(|k| k.to_string())
@@ -1585,7 +1585,7 @@ mod tests {
             "recent history",
             "Engine notices (1)",
             "not shown on the home screen",
-            "Signatures\n  pin: 1 of 4 keys (0 post-quantum) · enough unblocked keys for the quorum: yes",
+            "Signatures\n  pin: 1 of 7 keys (0 post-quantum) · enough unblocked keys for the quorum: yes",
             "since the engine started: accepted 3,073 · rejected 1,735 · duplicates 1,532",
             "every key this app ships is in the pin",
             "Catch-up help\n  not asking any peer for blocks right now",
@@ -1724,7 +1724,7 @@ mod tests {
         let status: MatmulTrustedStatus = serde_json::from_value(serde_json::json!({
             "trusted_mirror": true,
             "threshold": 1,
-            "trusted_signers": 4,
+            "trusted_signers": SHIPPED.len(),
             "trusted_signer_pubkeys": SHIPPED,
             "blocked_pubkeys": [SHIPPED[2].to_ascii_uppercase()],
             "pin_quorum_reachable": true

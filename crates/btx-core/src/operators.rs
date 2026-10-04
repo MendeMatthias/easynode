@@ -393,7 +393,7 @@ mod tests {
             assert!(parse_key(k).is_some(), "on the curve: {k}");
             n += 1;
         }
-        assert_eq!(n, 5 + 4, "five operator keys and four pins");
+        assert_eq!(n, 5 + 7, "five operator keys and seven pins");
     }
 
     #[test]
@@ -426,13 +426,31 @@ mod tests {
             mainnet_mirror_pins().len(),
             crate::node::BTX_TRUSTED_ATTESTATION_PUBKEYS.len()
         );
-        // The one operator key every node pins today is the 3060's.
+        // The operator keys every node pins since 0.7.5: the 3060's and the
+        // zbtx operator's three. jpp's key is an operator key, not a pin.
         let list = mainnet();
-        let pinned_operators: Vec<&str> = mainnet_mirror_pins()
+        let pinned_operators: std::collections::BTreeMap<&str, usize> = mainnet_mirror_pins()
             .iter()
             .filter_map(|k| list.operator_of(k))
-            .collect();
-        assert_eq!(pinned_operators, vec!["Mende"]);
+            .fold(Default::default(), |mut m, op| {
+                *m.entry(op).or_default() += 1;
+                m
+            });
+        assert_eq!(
+            pinned_operators,
+            [("Aleksander", 3), ("Mende", 1)].into_iter().collect()
+        );
+        for k in [ALEKS_1, ALEKS_2, ALEKS_3, MENDE] {
+            assert!(f.mirror_pins.contains(&k.to_string()), "{k} is a pin");
+        }
+        assert!(
+            !f.mirror_pins.contains(&JPP.to_string()),
+            "jpp is not a pin"
+        );
+        // The file keeps its pins sorted.
+        let mut sorted = f.mirror_pins.clone();
+        sorted.sort();
+        assert_eq!(f.mirror_pins, sorted);
     }
 
     /// The website compares its copy byte for byte, so the file has one
