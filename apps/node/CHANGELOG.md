@@ -6,7 +6,25 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
-## [Unreleased]
+## [0.7.5] - 2026-10-04
+
+**An archive peer that stopped answering is off the start list.**
+`37.230.134.222` has refused connections since 12 September and refused our
+test connections again on 3 October, so a node no longer spends one of its
+first tries on it. The node still keeps its trusted grant for that address,
+so it can come back the day it answers again. The one archive easyNode now
+ships is btxscan.io's mirror.
+
+**The node now also trusts three signer keys from an independent operator.**
+A node that follows signatures now accepts blocks signed by that operator
+as well as by the keys it trusted before, so it can keep moving when only
+one of them is signing. It now trusts seven keys instead of four. The
+threshold stays at 1: one signature from a trusted key is still enough for
+a block. If you already listed one of these keys in your own conf or
+`btx_rw.conf`, the app does not add it a second time. Measured on 4
+October: when this project's own signer went quiet at block 238,007, a
+node on the old four keys stood still there; with the new keys the same
+node was back at the tip in about a minute and kept up.
 
 ## [0.7.4] - 2026-10-03
 

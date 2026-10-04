@@ -7951,7 +7951,7 @@ mod tests {
         // and read only (its text is left exactly as it was).
         let rw = format!("matmultrustedpubkey={}\n", SHIPPED[3]);
         std::fs::write(dir.path().join("btx_rw.conf"), &rw).unwrap();
-        let live: Vec<String> = all[..3].to_vec();
+        let live: Vec<String> = all.iter().filter(|k| *k != SHIPPED[3]).cloned().collect();
         let ev = super::signature_evidence(Some(deltas), &live, dir.path(), None).unwrap();
         assert_eq!(ev.shipped_keys_missing, 1);
         assert_eq!(ev.missing_explained_by, Some("btx_rw.conf"));
