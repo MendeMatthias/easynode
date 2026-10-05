@@ -402,7 +402,9 @@ pub enum Maturity {
 /// One waiting pair, from its base's `confirmations` and how long it has
 /// waited. Off the chain says more than late, and deep enough is ready
 /// however long it took (a keeper that was off for a while). A clock that
-/// went backwards is not late.
+/// went backwards is not late. A pair that is ready but cannot be offered
+/// yet (a check that answers "not yet") is held to the same deadline by
+/// [`mature`].
 pub fn maturity(confirmations: i64, exported_at: u64, now: u64, deadline: Duration) -> Maturity {
     if confirmations < 0 {
         Maturity::Orphaned
@@ -961,6 +963,17 @@ pub async fn mature(
     let now = now_unix();
     for w in std::mem::take(&mut waiting) {
         let base = w.height;
+        // Never below what is on offer: an older pair that was stuck while
+        // a newer one went out must not take its place. Read afresh, since
+        // a pair offered earlier in this round is the record now.
+        if let Some(offered) = load_record(dir).map(|r| r.height).filter(|h| base < *h) {
+            remove_pair(dir, base);
+            events.push(MatureEvent::Dropped {
+                base,
+                why: format!("block {offered} is offered already, and this one is older"),
+            });
+            continue;
+        }
         let state = match confirmations(rpc, &w.block_hash).await {
             Ok(c) => maturity(c, w.exported_at, now, deadline),
             // One lost read is not a verdict, unless the time is up anyway.
@@ -1024,6 +1037,23 @@ pub async fn mature(
                 Ok(record) => {
                     offered = true;
                     events.push(MatureEvent::Offered(record));
+                }
+                // Ready but "not yet" still counts against the six hours,
+                // or a check that never decides would keep it forever. A
+                // keeper switched off decides nothing.
+                Err(n)
+                    if n.retry
+                        && alive()
+                        && now.saturating_sub(w.exported_at) > deadline.as_secs() =>
+                {
+                    drop(
+                        format!(
+                            "it could not be offered within {} hours of its export: {}",
+                            deadline.as_secs() / 3600,
+                            n.why
+                        ),
+                        &mut events,
+                    )
                 }
                 Err(n) if n.retry => {
                     events.push(MatureEvent::NotYet { base, why: n.why });
@@ -2133,6 +2163,53 @@ mod tests {
             matches!(&events[..], [MatureEvent::Offered(_)]),
             "{events:?}"
         );
+    }
+
+    /// A pair 144 deep whose checks keep answering "not yet" is not kept
+    /// forever: six hours after its export it is dropped like any other
+    /// pair that ran out of time, files and all.
+    #[tokio::test]
+    async fn a_ready_pair_that_keeps_failing_with_retry_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        waiting_on_disk(dir.path(), 226_200, "hash-1", 0);
+        let node = ScriptedNode::new(&[144]);
+        let hook = Hook::answering(Some(NotOffered {
+            why: "the node did not answer".into(),
+            retry: true,
+        }));
+        let events = mature_now(&node, dir.path(), &hook).await;
+        assert!(
+            matches!(&events[..], [MatureEvent::Dropped { base: 226_200, why }] if why.contains("6 hours") && why.contains("did not answer")),
+            "{events:?}"
+        );
+        assert!(load_waiting(dir.path()).is_empty());
+        assert!(pairs_on_disk(dir.path()).is_empty());
+        assert_eq!(node.count("offerattestedutxosnapshot"), 0);
+    }
+
+    /// A waiting pair below the one on offer never displaces it (the older
+    /// one was stuck on "not yet" while a newer one was offered): it is
+    /// dropped, and the newer offer stays.
+    #[tokio::test]
+    async fn a_waiting_pair_below_the_offered_one_is_dropped_not_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        recorded(d, 226_300, "hash-1");
+        waiting_on_disk(d, 226_200, "hash-1", now_unix());
+        let node = ScriptedNode::new(&[244]);
+        let hook = Hook::passing();
+        let events = mature_now(&node, d, &hook).await;
+        assert!(
+            matches!(&events[..], [MatureEvent::Dropped { base: 226_200, why }] if why.contains("226300")),
+            "{events:?}"
+        );
+        assert!(hook.seen.lock().unwrap().is_empty());
+        assert_eq!(node.count("withdrawattestedutxosnapshot"), 0);
+        assert_eq!(node.count("offerattestedutxosnapshot"), 0);
+        assert_eq!(load_record(d).unwrap().height, 226_300);
+        assert!(load_waiting(d).is_empty());
+        assert!(!d.join(snapshot_file_name(226_200)).exists());
+        assert!(d.join(snapshot_file_name(226_300)).is_file());
     }
 
     /// The pair that was offered is checked again before it is re-offered
