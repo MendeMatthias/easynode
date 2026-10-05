@@ -58,7 +58,8 @@
 //! the signed manifest until the website took it. A send that failed is
 //! retried with those same bytes, after the checks pass again, so the engine
 //! signs each statement once, and each height gets at most one dissent from
-//! this node. The website's own listing counts too: a statement that already
+//! this node: once one is in the log, sent or not, no different one is
+//! signed there. The website's own listing counts too: a statement that already
 //! carries this operator's signature (this key or another of the operator's
 //! keys), or a height where a listed dissent carries it, is left alone.
 //!
@@ -172,6 +173,10 @@ pub enum Declined {
     /// statement per height, so two files at one height never both carry
     /// this node's word.
     AnotherStatementSigned { other: String },
+    /// This node signed `other`, a different dissent at the same height
+    /// (from a diary entry since replaced), sent or not. One dissent per
+    /// height, so the old one is neither sent nor followed by a second.
+    AnotherDissent { other: String },
 }
 
 impl std::fmt::Display for Declined {
@@ -184,6 +189,11 @@ impl std::fmt::Display for Declined {
             Declined::AnotherStatementSigned { other } => write!(
                 f,
                 "this node signed another statement at that height ({})",
+                other.get(..16).unwrap_or(other)
+            ),
+            Declined::AnotherDissent { other } => write!(
+                f,
+                "this node signed another dissent at that height ({}), and one is all it signs",
                 other.get(..16).unwrap_or(other)
             ),
         }
@@ -795,11 +805,24 @@ impl Confirmer<'_> {
             Err(e) => return failed(format!("the dissent: {e}")),
         };
         let dissent_hash = dissent.hash().display_hex();
-        // A dissent signed before and not sent goes now, if it says the
-        // same; one built from a diary entry since replaced is signed anew.
+        // One dissent per height, strictly: a dissent signed here before
+        // that says something else (built from a diary entry since
+        // replaced), sent or not, is the only one this height gets.
+        if let Some(e) = log
+            .dissent_at(chain, height)
+            .filter(|e| !e.statement_hash.eq_ignore_ascii_case(&dissent_hash))
+        {
+            return Verdict::Declined {
+                height,
+                statement_hash: statement_hash.to_string(),
+                why: Declined::AnotherDissent {
+                    other: e.statement_hash.clone(),
+                },
+            };
+        }
+        // The same dissent signed before and not sent goes now.
         let kept = log
             .dissent_at(chain, height)
-            .filter(|e| e.statement_hash == dissent_hash)
             .and_then(|e| self.kept(e.unsent.as_ref(), &dissent));
         let one = match kept {
             Some(bytes) => bytes,
@@ -1475,6 +1498,44 @@ mod tests {
             ]
         );
         assert_eq!(n.count("signutxosnapshotmanifest"), 0);
+    }
+
+    /// Strictly one dissent per height: a dissent this node signed at 100
+    /// from an older diary entry, never sent, is not followed by a second
+    /// one when the diary now says something else, and is not sent either.
+    #[tokio::test]
+    async fn a_different_dissent_at_a_height_with_one_unsent_is_never_signed() {
+        let (n, dir, env) = setup(102);
+        let rules = ChainRules::for_statement(&statement(), Some(&env)).unwrap();
+        let old = dissent_for(&entry(103), &statement(), &rules).unwrap();
+        let old_hash = old.hash().display_hex();
+        let mut log = ConfirmerLog::default();
+        log.record(LogEntry {
+            chain: "regtest".into(),
+            height: 100,
+            kind: LogKind::Dissent,
+            statement_hash: old_hash.clone(),
+            against: Some(H.into()),
+            unsent: Some(operators::hex(&one_signature(&old, &key(7)))),
+            signed_at: 1,
+            sent_at: None,
+        });
+        save_log(dir.path(), &log).unwrap();
+        let mut server = mockito::Server::new_async().await;
+        listing(&mut server, pending_json(&[(R_P, None)])).await;
+        let post = no_post(&mut server).await;
+        let v = round(&n, dir.path(), &env, &server).await;
+        post.assert_async().await;
+        assert_eq!(
+            v,
+            vec![Verdict::Declined {
+                height: 100,
+                statement_hash: H.into(),
+                why: Declined::AnotherDissent { other: old_hash }
+            }]
+        );
+        assert_eq!(n.count("signutxosnapshotmanifest"), 0);
+        assert_eq!(load_log(dir.path()), log, "the log is as it was");
     }
 
     /// A listed dissent is never signed, whoever sent it: it is skipped from
