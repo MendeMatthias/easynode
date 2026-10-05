@@ -808,9 +808,15 @@ pub struct AppState {
     /// purpose: the cycle reports phases from a plain closure, and the status
     /// poll only reads. `None` while the role is off or the node is down.
     pub snapshot_serve: Arc<std::sync::Mutex<Option<btx_core::snapshot_serve::ServeStatus>>>,
-    /// Generation counter for the keeper loop, bumped on every start and stop;
-    /// a loop whose generation is superseded exits, and a cycle in flight
-    /// aborts at its next poll without offering anything.
+    /// Generation counter for the keeper loop, bumped on every start and stop.
+    /// A loop whose generation is superseded exits at the top of its next
+    /// tick. A tick already in flight asks it again right before each step
+    /// that reaches outside the node's folder: before an export, right before
+    /// an offer or re-offer and right after it (an offer that landed after the
+    /// switch went off is withdrawn again and not recorded), and before the
+    /// send to easybtx.com. What it does not cover: a send already under way
+    /// (`snapshot_producer::send_offered` runs its checks and the upload as
+    /// one step) finishes.
     pub snapshot_serve_gen: Arc<AtomicU64>,
     /// What the snapshot network did in this run (the diary, the confirmer,
     /// the producer), for the "Snapshots" section of Copy diagnostics.

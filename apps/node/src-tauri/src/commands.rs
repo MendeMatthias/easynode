@@ -7379,7 +7379,9 @@ fn spawn_snapshot_keeper(state: &AppState, datadir: PathBuf) {
             let mut export_problem: Option<String> = None;
             let last =
                 snap::last_exported(snap::load_record(&dir).as_ref(), &snap::load_waiting(&dir));
-            if tip.is_some_and(|t| snap::export_due(t, snap::EXPORT_GRID, last)) {
+            // `alive` is asked again right before each step that acts: the
+            // switch can go off while a tick is in flight.
+            if alive() && tip.is_some_and(|t| snap::export_due(t, snap::EXPORT_GRID, last)) {
                 say(format!(
                     "the tip is at {}, a multiple of {}; exporting a snapshot",
                     tip.unwrap_or(0),
@@ -7402,7 +7404,16 @@ fn spawn_snapshot_keeper(state: &AppState, datadir: PathBuf) {
 
             // ── Each waiting export, 144 deep and checked, is offered ───────
             let mut waiting_note: Option<(u64, u64)> = None;
-            for ev in snap::mature(&slow, &dir, snap::MATURE_DEADLINE, &checks, &on_phase).await {
+            for ev in snap::mature(
+                &slow,
+                &dir,
+                snap::MATURE_DEADLINE,
+                &checks,
+                &on_phase,
+                &alive,
+            )
+            .await
+            {
                 match ev {
                     snap::MatureEvent::Offered(r) => say(format!(
                         "offering base {} ({} bytes, sha256 {}, file_hash {}, {} chunks)",
@@ -7431,6 +7442,7 @@ fn spawn_snapshot_keeper(state: &AppState, datadir: PathBuf) {
                     facts.headers,
                     facts.initial_block_download,
                     &checks,
+                    &alive,
                 )
                 .await
                 {
@@ -7444,12 +7456,16 @@ fn spawn_snapshot_keeper(state: &AppState, datadir: PathBuf) {
                     Ok(snap::ReofferOutcome::Refused { height, why }) => {
                         say(format!("not re-offering block {height}: {why}"))
                     }
+                    Ok(snap::ReofferOutcome::SwitchedOff { .. }) => return,
                     Ok(_) => {}
                     Err(e) => say(format!("re-offer failed: {e}")),
                 }
             }
 
             // ── The offered pair to easybtx.com (design, section 4) ─────────
+            if !alive() {
+                return;
+            }
             let record = snap::load_record(&dir);
             if let Some(r) = record.as_ref() {
                 let line = match &site {
@@ -7477,6 +7493,10 @@ fn spawn_snapshot_keeper(state: &AppState, datadir: PathBuf) {
                 }
             }
 
+            // Switched off during the send: the stop path cleared the row.
+            if !alive() {
+                return;
+            }
             let offering = snap::offer_live(&rpc).await;
             let peers_offering = snap::peers_offering(&rpc).await;
             let mut message = match (record.as_ref(), offering) {

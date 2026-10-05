@@ -1191,7 +1191,7 @@ mod tests {
             .is_some());
 
         n.with(|s| s.extend_to(DEEP - 1));
-        let events = serve::mature(&n, &snaps, serve::MATURE_DEADLINE, &c, &|_| {}).await;
+        let events = serve::mature(&n, &snaps, serve::MATURE_DEADLINE, &c, &|_| {}, &|| true).await;
         assert!(
             matches!(
                 &events[..],
@@ -1205,7 +1205,7 @@ mod tests {
         assert_eq!(n.count("offerattestedutxosnapshot"), 0);
 
         n.with(|s| s.extend_to(DEEP));
-        let events = serve::mature(&n, &snaps, serve::MATURE_DEADLINE, &c, &|_| {}).await;
+        let events = serve::mature(&n, &snaps, serve::MATURE_DEADLINE, &c, &|_| {}, &|| true).await;
         let [MatureEvent::Offered(record)] = events.as_slice() else {
             panic!("{events:?}")
         };

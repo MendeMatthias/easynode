@@ -505,6 +505,7 @@ async fn producer_and_confirmers_on_regtest() {
         serve::MATURE_DEADLINE,
         &checks,
         &|_| {},
+        &|| true,
     )
     .await;
     assert_eq!(
@@ -540,6 +541,7 @@ async fn producer_and_confirmers_on_regtest() {
         serve::MATURE_DEADLINE,
         &checks,
         &|_| {},
+        &|| true,
     )
     .await;
     match events.as_slice() {

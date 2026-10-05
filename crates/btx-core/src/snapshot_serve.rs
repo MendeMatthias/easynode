@@ -813,6 +813,10 @@ impl CyclePhase {
     }
 }
 
+const SWITCHED_OFF: &str = "serving was switched off; the next keeper offers it";
+const SWITCHED_OFF_DURING: &str =
+    "serving was switched off while it was offered; withdrawn again, the next keeper offers it";
+
 /// Why a pair was not offered. `retry` says whether asking again can change
 /// the answer: the node did not answer, or its background check is still
 /// running. Otherwise the pair is dropped for good.
@@ -935,12 +939,20 @@ pub enum MatureEvent {
 /// pair is offered per round, so each one that comes of age is offered,
 /// and sent by the producer, in turn. Never blocks on the chain: the keeper
 /// calls it every tick.
+///
+/// `alive` is the keeper's own "am I still wanted" (serving still on, the
+/// node not stopped). It is asked right before the old offer is withdrawn
+/// and again right after the new one went out: a keeper switched off before
+/// the offer offers nothing, and one switched off while the offer was on its
+/// way withdraws it again and records nothing. Either way the pair keeps
+/// waiting for the next keeper.
 pub async fn mature(
     rpc: &dyn Rpc,
     dir: &Path,
     deadline: Duration,
     before: &dyn BeforeOffer,
     on_phase: &(dyn Fn(CyclePhase) + Sync),
+    alive: &(dyn Fn() -> bool + Sync),
 ) -> Vec<MatureEvent> {
     let mut waiting = load_waiting(dir);
     let mut events = Vec::new();
@@ -1008,7 +1020,7 @@ pub async fn mature(
                 });
                 keep.push(w);
             }
-            Maturity::Ready => match offer_matured(rpc, dir, &w, before, on_phase).await {
+            Maturity::Ready => match offer_matured(rpc, dir, &w, before, on_phase, alive).await {
                 Ok(record) => {
                     offered = true;
                     events.push(MatureEvent::Offered(record));
@@ -1040,6 +1052,7 @@ async fn offer_matured(
     w: &WaitingPair,
     before: &dyn BeforeOffer,
     on_phase: &(dyn Fn(CyclePhase) + Sync),
+    alive: &(dyn Fn() -> bool + Sync),
 ) -> Result<OfferRecord, NotOffered> {
     let retry = |why: String| NotOffered { why, retry: true };
     let base = w.height;
@@ -1074,6 +1087,11 @@ async fn offer_matured(
     })?;
     let manifest_sha256 = sha256_hex(&manifest);
 
+    // The checks above can take a while; the keeper may have been switched
+    // off meanwhile. Asked last thing before anything reaches the wire.
+    if !alive() {
+        return Err(retry(SWITCHED_OFF.into()));
+    }
     on_phase(CyclePhase::Offering { base });
     // Offering on top of a live offer is untested; withdraw first. The gap is
     // one RPC round trip, and a failure here leaves the previous record for
@@ -1082,6 +1100,12 @@ async fn offer_matured(
     let offered = offer(rpc, &dat, &man)
         .await
         .map_err(|e| retry(format!("offer failed: {e}")))?;
+    // Switched off while the offer was on its way: the switch's own
+    // withdraw may have run before the offer landed, so take it back here.
+    if !alive() {
+        let _ = withdraw(rpc).await;
+        return Err(retry(SWITCHED_OFF_DURING.into()));
+    }
     let record = OfferRecord {
         height: offered.height,
         block_hash: offered.block_hash,
@@ -1127,12 +1151,20 @@ pub enum ReofferOutcome {
     Reoffered {
         height: u64,
     },
+    /// The keeper was switched off (serving off, the node stopping) before
+    /// the offer, or while it was on its way, in which case it was withdrawn
+    /// again. Nothing is offered.
+    SwitchedOff {
+        height: u64,
+    },
 }
 
 /// Re-assert the recorded offer after a node start. Idempotent, never dumps,
 /// refuses when the base is no longer canonical or the producer's checks
 /// (`before`) refuse the pair: a re-offer sends it again, and a producer
-/// never sends a pair that failed any check.
+/// never sends a pair that failed any check. `alive` as in [`mature`]: asked
+/// right before the offer and right after it, and a keeper switched off in
+/// between withdraws what it just offered.
 pub async fn reoffer(
     rpc: &dyn Rpc,
     dir: &Path,
@@ -1140,6 +1172,7 @@ pub async fn reoffer(
     headers: Option<u64>,
     initial_block_download: Option<bool>,
     before: &dyn BeforeOffer,
+    alive: &(dyn Fn() -> bool + Sync),
 ) -> Result<ReofferOutcome, String> {
     if offer_live(rpc).await == Some(true) {
         return Ok(ReofferOutcome::AlreadyLive);
@@ -1173,9 +1206,19 @@ pub async fn reoffer(
             why: n.why,
         });
     }
+    let switched_off = ReofferOutcome::SwitchedOff {
+        height: record.height,
+    };
+    if !alive() {
+        return Ok(switched_off);
+    }
     offer(rpc, &dat, &man)
         .await
         .map_err(|e| format!("offer failed: {e}"))?;
+    if !alive() {
+        let _ = withdraw(rpc).await;
+        return Ok(switched_off);
+    }
     bounce_mirror_links(rpc).await;
     Ok(ReofferOutcome::Reoffered {
         height: record.height,
@@ -1714,7 +1757,7 @@ mod tests {
     }
 
     async fn mature_now(node: &dyn Rpc, dir: &Path, hook: &dyn BeforeOffer) -> Vec<MatureEvent> {
-        mature(node, dir, MATURE_DEADLINE, hook, &|_| {}).await
+        mature(node, dir, MATURE_DEADLINE, hook, &|_| {}, &|| true).await
     }
 
     /// A pair written down as waiting, the way an export leaves it.
@@ -1809,9 +1852,14 @@ mod tests {
 
         node.with(|s| s.extend_to(226_342));
         let phases = Mutex::new(Vec::new());
-        let events = mature(&node, d, MATURE_DEADLINE, &hook, &|p| {
-            phases.lock().unwrap().push(p)
-        })
+        let events = mature(
+            &node,
+            d,
+            MATURE_DEADLINE,
+            &hook,
+            &|p| phases.lock().unwrap().push(p),
+            &|| true,
+        )
         .await;
         assert_eq!(
             events,
@@ -1831,9 +1879,14 @@ mod tests {
         );
 
         node.with(|s| s.extend_to(226_343));
-        let events = mature(&node, d, MATURE_DEADLINE, &hook, &|p| {
-            phases.lock().unwrap().push(p)
-        })
+        let events = mature(
+            &node,
+            d,
+            MATURE_DEADLINE,
+            &hook,
+            &|p| phases.lock().unwrap().push(p),
+            &|| true,
+        )
         .await;
         let [MatureEvent::Offered(record)] = events.as_slice() else {
             panic!("{events:?}")
@@ -2100,6 +2153,7 @@ mod tests {
             Some(226_150),
             Some(false),
             &hook,
+            &|| true,
         )
         .await
         .unwrap();
@@ -2148,6 +2202,7 @@ mod tests {
             Some(226_150),
             Some(false),
             &NoChecks,
+            &|| true,
         )
         .await
         .unwrap();
@@ -2166,6 +2221,7 @@ mod tests {
             Some(226_150),
             Some(false),
             &NoChecks,
+            &|| true,
         )
         .await
         .unwrap();
@@ -2186,6 +2242,7 @@ mod tests {
             Some(226_150),
             Some(false),
             &NoChecks,
+            &|| true,
         )
         .await
         .unwrap();
@@ -2205,6 +2262,7 @@ mod tests {
             Some(226_160),
             Some(false),
             &NoChecks,
+            &|| true,
         )
         .await
         .unwrap();
@@ -2220,20 +2278,106 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node = ScriptedNode::new(&[10]);
         assert_eq!(
-            reoffer(&node, dir.path(), Some(1), Some(1), Some(false), &NoChecks)
-                .await
-                .unwrap(),
+            reoffer(
+                &node,
+                dir.path(),
+                Some(1),
+                Some(1),
+                Some(false),
+                &NoChecks,
+                &|| true
+            )
+            .await
+            .unwrap(),
             ReofferOutcome::NoRecord
         );
         let r = recorded(dir.path(), 226_140, "hash-1");
         std::fs::remove_file(dir.path().join(snapshot_file_name(r.height))).unwrap();
         assert_eq!(
-            reoffer(&node, dir.path(), Some(1), Some(1), Some(false), &NoChecks)
-                .await
-                .unwrap(),
+            reoffer(
+                &node,
+                dir.path(),
+                Some(1),
+                Some(1),
+                Some(false),
+                &NoChecks,
+                &|| true
+            )
+            .await
+            .unwrap(),
             ReofferOutcome::FilesMissing { height: 226_140 }
         );
         assert_eq!(node.count("offerattestedutxosnapshot"), 0);
+    }
+
+    /// Serving switched off while a tick is in flight: the keeper asks
+    /// `alive` right before the offer and right after it. Off before: the
+    /// old offer is not withdrawn, nothing new goes out, nothing is
+    /// recorded, the pair keeps waiting. Off while the offer was on its way
+    /// (here: the moment the engine took it): it is withdrawn again and not
+    /// recorded, so nothing stays on the wire behind the switch.
+    #[tokio::test]
+    async fn a_keeper_switched_off_mid_tick_leaves_nothing_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let node = mainnet_at(226_200);
+        let hook = Hook::passing();
+        export(&node, d, &hook).await.unwrap();
+        node.with(|s| s.extend_to(226_343));
+
+        let events = mature(&node, d, MATURE_DEADLINE, &hook, &|_| {}, &|| false).await;
+        assert!(
+            matches!(&events[..], [MatureEvent::NotYet { base: 226_200, .. }]),
+            "{events:?}"
+        );
+        assert_eq!(node.count("withdrawattestedutxosnapshot"), 0);
+        assert_eq!(node.count("offerattestedutxosnapshot"), 0);
+        assert_eq!(load_record(d), None);
+        assert_eq!(
+            load_waiting(d).len(),
+            1,
+            "still waiting for the next keeper"
+        );
+
+        let alive = || node.count("offerattestedutxosnapshot") == 0;
+        let events = mature(&node, d, MATURE_DEADLINE, &hook, &|_| {}, &alive).await;
+        assert!(
+            matches!(&events[..], [MatureEvent::NotYet { base: 226_200, .. }]),
+            "{events:?}"
+        );
+        assert_eq!(node.count("offerattestedutxosnapshot"), 1);
+        assert_eq!(offer_live(&node).await, Some(false), "withdrawn again");
+        assert_eq!(load_record(d), None, "nothing recorded");
+        assert_eq!(load_waiting(d).len(), 1);
+        assert_eq!(node.count("disconnectnode"), 0, "no mirror bounced");
+    }
+
+    /// The same for a re-offer after a node start.
+    #[tokio::test]
+    async fn a_reoffer_switched_off_mid_tick_leaves_nothing_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        recorded(dir.path(), 226_140, "hash-1");
+        let node = ScriptedNode::new(&[10]);
+        async fn ask(
+            node: &ScriptedNode,
+            dir: &Path,
+            alive: &(dyn Fn() -> bool + Sync),
+        ) -> ReofferOutcome {
+            let (b, h) = (Some(226_150), Some(226_150));
+            reoffer(node, dir, b, h, Some(false), &NoChecks, alive)
+                .await
+                .unwrap()
+        }
+        let out = ask(&node, dir.path(), &|| false).await;
+        assert_eq!(out, ReofferOutcome::SwitchedOff { height: 226_140 });
+        assert_eq!(node.count("offerattestedutxosnapshot"), 0);
+
+        let alive = || node.count("offerattestedutxosnapshot") == 0;
+        let out = ask(&node, dir.path(), &alive).await;
+        assert_eq!(out, ReofferOutcome::SwitchedOff { height: 226_140 });
+        assert_eq!(node.count("offerattestedutxosnapshot"), 1);
+        assert_eq!(offer_live(&node).await, Some(false), "withdrawn again");
+        assert_eq!(node.count("disconnectnode"), 0);
     }
 
     #[tokio::test]
