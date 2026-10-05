@@ -2621,8 +2621,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         let mut snapshot_genesis: Option<String> = None;
         let diary_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let confirm_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        const CONFIRM_EVERY: u32 = (btx_core::snapshot_confirmer::CONFIRM_EVERY_SECS / 3) as u32;
-        let mut confirm_tick: u32 = CONFIRM_EVERY.saturating_sub(40);
+        let mut confirm_tick: u32 = CONFIRM_FIRST_TICK;
         // Catch-up help (btx_core::catchup_assist, decision 2026-09-29 §11):
         // while the node is behind and its newest block has stood still for
         // 30 seconds, whatever requests the engine has out, ask this app's
@@ -3552,9 +3551,17 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     if snapshot_genesis.is_none() {
                         snapshot_genesis = btx_core::diary::chain_id(&rpc).await;
                     }
-                    if btx_core::diary::on_grid(chain.blocks)
-                        && !diary_in_flight.swap(true, Ordering::SeqCst)
-                    {
+                    // The refresher is the only one that sets the flags;
+                    // the spawned step clears its own when it is done.
+                    let steps = snapshot_steps(
+                        chain.blocks,
+                        confirm_tick,
+                        diary_in_flight.load(Ordering::SeqCst),
+                        confirm_in_flight.load(Ordering::SeqCst),
+                    );
+                    confirm_tick = steps.confirm_tick;
+                    if steps.diary {
+                        diary_in_flight.store(true, Ordering::SeqCst);
                         let rpc = rpc.with_timeout(SNAPSHOT_RPC_TIMEOUT);
                         let in_flight = diary_in_flight.clone();
                         let report = snapshot_network_slot.clone();
@@ -3566,11 +3573,8 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                             in_flight.store(false, Ordering::SeqCst);
                         });
                     }
-                    confirm_tick = confirm_tick.saturating_add(1);
-                    if confirm_tick >= CONFIRM_EVERY
-                        && !confirm_in_flight.swap(true, Ordering::SeqCst)
-                    {
-                        confirm_tick = 0;
+                    if steps.confirm {
+                        confirm_in_flight.store(true, Ordering::SeqCst);
                         let rpc = rpc.with_timeout(SNAPSHOT_RPC_TIMEOUT);
                         let in_flight = confirm_in_flight.clone();
                         let report = snapshot_network_slot.clone();
@@ -7107,6 +7111,44 @@ fn keeper_poll(tip: Option<u64>) -> std::time::Duration {
         std::time::Duration::from_secs(3)
     } else {
         std::time::Duration::from_secs(30)
+    }
+}
+
+/// Status-refresher ticks (three seconds each) between confirmer rounds.
+const CONFIRM_EVERY_TICKS: u32 = (btx_core::snapshot_confirmer::CONFIRM_EVERY_SECS / 3) as u32;
+/// Where the confirmer's counter starts: near the top, so the first round
+/// goes out about two minutes into a run.
+const CONFIRM_FIRST_TICK: u32 = CONFIRM_EVERY_TICKS.saturating_sub(40);
+
+/// What the status refresher starts for the snapshot network on one tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotSteps {
+    /// A diary step: the tip is on the grid and no step is running.
+    diary: bool,
+    /// A confirmer round: the counter is up and no round is running.
+    confirm: bool,
+    /// The counter for the next tick.
+    confirm_tick: u32,
+}
+
+/// The refresher's snapshot-network decision for one tick, from the tip,
+/// the counter and whether a diary step or a confirmer round is still
+/// running. A round that is still running when the counter is up is not
+/// skipped: the counter keeps climbing and the next free tick starts it.
+/// Whether this node may confirm at all (mode, signer, key on the list) is
+/// `confirm_round`'s first question, through `snapshot_confirmer::why_not`.
+fn snapshot_steps(
+    blocks: u64,
+    confirm_tick: u32,
+    diary_busy: bool,
+    confirm_busy: bool,
+) -> SnapshotSteps {
+    let tick = confirm_tick.saturating_add(1);
+    let confirm = tick >= CONFIRM_EVERY_TICKS && !confirm_busy;
+    SnapshotSteps {
+        diary: btx_core::diary::on_grid(blocks) && !diary_busy,
+        confirm,
+        confirm_tick: if confirm { 0 } else { tick },
     }
 }
 
@@ -11316,7 +11358,10 @@ mod slot_probe_tests {
 /// beside the switch.
 #[cfg(test)]
 mod snapshot_network_tests {
-    use super::{diary_note, keeper_poll, producer_line};
+    use super::{
+        diary_note, keeper_poll, producer_line, snapshot_steps, CONFIRM_EVERY_TICKS,
+        CONFIRM_FIRST_TICK,
+    };
     use btx_core::diary::{DiaryEntry, DiaryOutcome};
     use btx_core::snapshot_producer::{SendOutcome, Submission, SubmissionOutcome};
     use std::time::Duration;
@@ -11406,6 +11451,46 @@ mod snapshot_network_tests {
     /// then every ten.
     #[test]
     fn the_refresher_keeps_the_diary_and_runs_the_confirmer_off_the_tick() {
+        assert_eq!(
+            btx_core::snapshot_confirmer::CONFIRM_EVERY_SECS,
+            600,
+            "ten minutes"
+        );
+        // Off the grid, nothing busy: the counter climbs, no diary step.
+        let off_grid = 226_150;
+        let mut tick = CONFIRM_FIRST_TICK;
+        let mut rounds_at = Vec::new();
+        for n in 1..=440u32 {
+            let s = snapshot_steps(off_grid, tick, false, false);
+            assert!(!s.diary);
+            if s.confirm {
+                rounds_at.push(n);
+            }
+            tick = s.confirm_tick;
+        }
+        // The first round two minutes in (40 ticks of 3 s), then every ten
+        // minutes (200 ticks).
+        assert_eq!(rounds_at, vec![40, 240, 440]);
+
+        // A round still running when the counter is up: none starts, the
+        // counter is not reset, and the first free tick starts one.
+        let up = CONFIRM_EVERY_TICKS - 1;
+        let busy = snapshot_steps(off_grid, up, false, true);
+        assert!(!busy.confirm);
+        assert_eq!(busy.confirm_tick, CONFIRM_EVERY_TICKS);
+        let busy = snapshot_steps(off_grid, busy.confirm_tick, false, true);
+        assert!(!busy.confirm);
+        let free = snapshot_steps(off_grid, busy.confirm_tick, false, false);
+        assert!(free.confirm);
+        assert_eq!(free.confirm_tick, 0);
+
+        // The diary on the grid only, never two at once, and on its own:
+        // a running confirmer round does not hold it back.
+        assert!(snapshot_steps(226_200, 0, false, true).diary);
+        assert!(!snapshot_steps(226_200, 0, true, false).diary);
+        assert!(!snapshot_steps(226_201, 0, false, false).diary);
+
+        // And the refresher acts on this decision, with the slow handle.
         let src = include_str!("commands.rs");
         let refresher = src
             .split("\nfn spawn_status_refresher(")
@@ -11413,20 +11498,15 @@ mod snapshot_network_tests {
             .and_then(|s| s.split("\nfn ").next())
             .unwrap();
         for part in [
-            "btx_core::diary::on_grid(chain.blocks)",
+            "let steps = snapshot_steps(",
+            "if steps.diary {",
+            "if steps.confirm {",
             "diary_step(&rpc, mode, &report)",
             "confirm_round(&rpc, trusted, genesis, &report)",
-            "(btx_core::snapshot_confirmer::CONFIRM_EVERY_SECS / 3) as u32",
-            "CONFIRM_EVERY.saturating_sub(40)",
             "rpc.with_timeout(SNAPSHOT_RPC_TIMEOUT)",
         ] {
             assert!(refresher.contains(part), "the refresher lost {part}");
         }
-        assert_eq!(
-            btx_core::snapshot_confirmer::CONFIRM_EVERY_SECS,
-            600,
-            "ten minutes"
-        );
     }
 
     /// The words beside the switch and its answer name the grid and the
