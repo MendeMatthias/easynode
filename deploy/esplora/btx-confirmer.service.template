@@ -4,7 +4,9 @@ After=network-online.target btxd.service
 Wants=network-online.target
 
 [Service]
-# Replace USER and the two paths for your host. USER is the user btxd runs as:
+# Replace USER, PUBKEY and the two paths for your host. PUBKEY is the node's
+# signing public key (66 hex digits, the one on the operator list); with it the
+# confirmer never opens the private key file. USER is the user btxd runs as:
 # the node itself rewrites the copy it signs in /var/lib/btx/snapshot-confirmer,
 # so both must be able to write there.
 #
@@ -26,7 +28,7 @@ Wants=network-online.target
 #   install -d -o USER /var/lib/btx-confirmer /var/lib/btx/snapshot-confirmer
 User=USER
 Type=simple
-ExecStart=/usr/local/bin/btx-confirmer --datadir /var/lib/btx --state /var/lib/btx-confirmer --rpc 127.0.0.1:19334
+ExecStart=/usr/local/bin/btx-confirmer --datadir /var/lib/btx --state /var/lib/btx-confirmer --pubkey PUBKEY --rpc 127.0.0.1:19334
 # always, not on-failure: a confirmer that has exited has stopped counting.
 # Five seconds keeps a btxd restart inside one tip poll. Exit 3 is a refusal
 # (another chain or replay context, a mirror, no key, a key not on the list):
@@ -35,7 +37,7 @@ Restart=always
 RestartSec=5
 RestartPreventExitStatus=3
 
-# It reads the node's cookie and key file, asks the node and easybtx.com, and
+# It reads the node's cookie, asks the node and easybtx.com, and
 # writes in exactly two places.
 NoNewPrivileges=true
 PrivateTmp=true

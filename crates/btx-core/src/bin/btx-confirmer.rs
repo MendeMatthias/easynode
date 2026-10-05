@@ -9,17 +9,19 @@
 //! own `signutxosnapshotmanifest`, and the upload of that signature or of a
 //! dissent). It adds argument parsing, the startup check and the loop.
 //!
-//!     btx-confirmer --datadir /var/lib/btx --state /var/lib/btx-confirmer
+//!     btx-confirmer --datadir /var/lib/btx --state /var/lib/btx-confirmer --pubkey 02...
 //!
 //! It never exports, loads, pins or restarts anything, and listens on
 //! nothing.
 //!
 //! WHAT IT TOUCHES. It reads the node's `.cookie` (and re-reads it after a
-//! 401, so a btxd restart does not stop it) and the PUBLIC half of the node's
-//! signing key: the file the node's conf names in
-//! `matmulattestationsignerkeyfile=`, or `<datadir>/attestation-signer.key`,
-//! or `--signer-key`. The private key never leaves that file; the engine
-//! signs with it. It writes the diary and its log of what it signed in
+//! 401, so a btxd restart does not stop it) and takes the node's signing
+//! PUBLIC key from `--pubkey`, the documented way, which opens no key file.
+//! Without it, it falls back to deriving the public key from the key file
+//! (the one the node's conf names in `matmulattestationsignerkeyfile=`, or
+//! `<datadir>/attestation-signer.key`, or `--signer-key`), wipes the private
+//! key from memory as soon as that is done and never logs it. The engine
+//! signs with the private key. It writes the diary and its log of what it signed in
 //! `--state`, and the copy the engine signs in `<datadir>/snapshot-confirmer/`,
 //! because `signutxosnapshotmanifest` reads and rewrites a file on the node's
 //! own machine.
@@ -48,14 +50,17 @@ const USAGE: &str = "\
 btx-confirmer: co-sign the snapshot network's statements, or dissent, by this node's own diary
 
 USAGE:
-    btx-confirmer --datadir <path> --state <dir> [--rpc <addr:port>] [--signer-key <file>]
+    btx-confirmer --datadir <path> --state <dir> --pubkey <hex> [--rpc <addr:port>]
 
 OPTIONS:
     --datadir <path>     the node's data directory, holding its .cookie
     --state <dir>        where the diary and the log of what was signed are kept
+    --pubkey <hex>       the node's signing public key, compressed (66 hex digits);
+                         with it, no key file is read
     --rpc <addr:port>    the node's JSON-RPC (default 127.0.0.1:19334)
-    --signer-key <file>  the node's signing key file, read for its public key only
-                         (default: the file btx.conf names, else attestation-signer.key)
+    --signer-key <file>  without --pubkey: the signing key file to derive the public
+                         key from (default: the file btx.conf names, else
+                         attestation-signer.key); the private key is wiped at once
     -h, --help           this
 
 The node must check blocks itself and sign with a key on the operator list.
@@ -80,6 +85,9 @@ struct Args {
     state: PathBuf,
     rpc: String,
     signer_key: Option<PathBuf>,
+    /// The node's signing public key, compressed, lowercase hex. With it,
+    /// no key file is read at all.
+    pubkey: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -93,6 +101,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> 
     let mut state = None;
     let mut rpc = "127.0.0.1:19334".to_string();
     let mut signer_key = None;
+    let mut pubkey = None;
     let mut args = args.into_iter();
     while let Some(a) = args.next() {
         let mut value = |name: &str| {
@@ -105,6 +114,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> 
             "--state" => state = Some(PathBuf::from(value("--state")?)),
             "--rpc" => rpc = value("--rpc")?,
             "--signer-key" => signer_key = Some(PathBuf::from(value("--signer-key")?)),
+            "--pubkey" => pubkey = Some(parse_pubkey(&value("--pubkey")?)?),
             "-h" | "--help" => return Ok(Parsed::Help),
             other => return Err(format!("unknown option: {other}")),
         }
@@ -116,7 +126,20 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> 
         state,
         rpc,
         signer_key,
+        pubkey,
     }))
+}
+
+/// `--pubkey`: a compressed secp256k1 public key on the curve, 66 hex
+/// digits, either case, kept lowercase. The refusal never repeats what was
+/// given, in case someone pasted the private key.
+fn parse_pubkey(v: &str) -> Result<String, String> {
+    operators::parse_key(v.trim())
+        .map(|k| operators::hex(&k))
+        .ok_or_else(|| {
+            "--pubkey must be the node's compressed public key: 66 hex digits starting 02 or 03"
+                .to_string()
+        })
 }
 
 /// The signing key file: `--signer-key`, else the one the datadir's
@@ -140,10 +163,24 @@ fn signer_key_path(args: &Args) -> PathBuf {
     }
 }
 
-/// The public key of the WIF in `path`, or `None`.
+/// The public key of the WIF in `path`, or `None`. The fallback when there
+/// is no `--pubkey`: the private key is in memory only for the derivation,
+/// is wiped as soon as it is done, and is never logged.
 fn read_pubkey(path: &Path) -> Option<String> {
-    let wif = std::fs::read_to_string(path).ok()?;
-    signer::wif_to_pubkey_hex(&wif).ok()
+    use zeroize::Zeroize as _;
+    let mut wif = std::fs::read_to_string(path).ok()?;
+    let pubkey = signer::wif_to_pubkey_hex(&wif).ok();
+    wif.zeroize();
+    pubkey
+}
+
+/// This node's public key: `--pubkey` when given, and then no key file is
+/// opened; else the public half of the key file ([`signer_key_path`]).
+fn our_pubkey(args: &Args) -> Option<String> {
+    match &args.pubkey {
+        Some(k) => Some(k.clone()),
+        None => read_pubkey(&signer_key_path(args)),
+    }
 }
 
 /// The replay context compiled for `chain`, display order.
@@ -264,12 +301,15 @@ async fn main() {
         }
     };
     let key_path = signer_key_path(&args);
-    let key_hex = read_pubkey(&key_path);
+    let key_hex = our_pubkey(&args);
     let env = operators::regtest_env();
     let (chain, our_key) =
         match startup_check(&genesis, &status, key_hex.as_deref(), env.as_deref()) {
             Ok(v) => v,
-            Err(e) if key_hex.is_none() => refuse(format!("{e} ({})", key_path.display())),
+            Err(e) if key_hex.is_none() => refuse(format!(
+                "{e} ({}; pass --pubkey to name the key instead)",
+                key_path.display()
+            )),
             Err(e) => refuse(e),
         };
     let site = Site::from_env().unwrap_or_else(|e| refuse(e));
@@ -404,6 +444,7 @@ mod tests {
                 state: "/s".into(),
                 rpc: "127.0.0.1:19334".into(),
                 signer_key: None,
+                pubkey: None,
             }))
         );
         assert_eq!(
@@ -434,6 +475,7 @@ mod tests {
                 state: "/s".into(),
                 rpc: "127.0.0.1:19434".into(),
                 signer_key: Some("/k".into()),
+                pubkey: None,
             }))
         );
         assert_eq!(args(&["--help"]), Ok(Parsed::Help));
@@ -461,6 +503,7 @@ mod tests {
             state: dir.path().join("state"),
             rpc: "127.0.0.1:19334".into(),
             signer_key: None,
+            pubkey: None,
         };
         assert_eq!(
             signer_key_path(&a),
@@ -554,6 +597,61 @@ mod tests {
         std::fs::write(&p, "not a key").unwrap();
         assert_eq!(read_pubkey(&p), None);
         assert_eq!(read_pubkey(&dir.path().join("missing")), None);
+    }
+
+    /// `--pubkey` is the documented way: the public key itself, so the
+    /// private key file is never opened. It must be a compressed key on the
+    /// curve; either case reads, and it is kept lowercase.
+    #[test]
+    fn the_pubkey_flag_takes_a_compressed_key_and_nothing_else() {
+        let (key, _) = listed_key();
+        let run = |k: &str| match args(&["--datadir", "/d", "--state", "/s", "--pubkey", k]) {
+            Ok(Parsed::Run(a)) => Ok(a.pubkey),
+            Ok(Parsed::Help) => Err("help".to_string()),
+            Err(e) => Err(e),
+        };
+        assert_eq!(run(&key), Ok(Some(key.clone())));
+        assert_eq!(run(&key.to_ascii_uppercase()), Ok(Some(key.clone())));
+        let bad = [
+            key[..64].to_string(),            // short
+            format!("{key}00"),               // long
+            format!("04{}", &key[2..]),       // not compressed
+            format!("02{}", "zz".repeat(32)), // not hex
+            format!("02{}", "ff".repeat(32)), // not on the curve
+            signer::generate_wif(),           // a private key
+        ];
+        for b in bad {
+            let e = run(&b).unwrap_err();
+            assert!(e.contains("--pubkey"), "{b}: {e}");
+            assert!(!e.contains(&b), "never echo what was given: {e}");
+        }
+        assert_eq!(
+            args(&["--datadir", "/d", "--state", "/s", "--pubkey"]),
+            Err("--pubkey needs a value".into())
+        );
+    }
+
+    /// Without `--pubkey` the key file is the fallback, read for its public
+    /// half only.
+    #[test]
+    fn the_pubkey_flag_wins_over_the_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let wif = signer::generate_wif();
+        let p = dir.path().join("k");
+        std::fs::write(&p, format!("{wif}\n")).unwrap();
+        let from_file = signer::wif_to_pubkey_hex(&wif).unwrap();
+        let (other, _) = listed_key();
+        let mut a = Args {
+            datadir: dir.path().into(),
+            state: dir.path().join("state"),
+            rpc: "127.0.0.1:19334".into(),
+            signer_key: Some(p.clone()),
+            pubkey: None,
+        };
+        assert_eq!(our_pubkey(&a), Some(from_file));
+        a.pubkey = Some(other.clone());
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(our_pubkey(&a), Some(other), "the file is not needed");
     }
 
     #[test]

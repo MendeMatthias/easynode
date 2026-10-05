@@ -81,16 +81,18 @@ does to sign blocks:
 sudo install -m755 crates/btx-core/target/release/btx-confirmer /usr/local/bin/
 sudo install -d -o USER /var/lib/btx-confirmer /var/lib/btx/snapshot-confirmer
 sudo cp deploy/esplora/btx-confirmer.service.template /etc/systemd/system/btx-confirmer.service
-# replace USER (the user btxd runs as) and the paths, then
+# replace USER (the user btxd runs as), PUBKEY (the node's signing public key,
+# the one on the operator list) and the paths, then
 sudo systemctl enable --now btx-confirmer
 journalctl -fu btx-confirmer
 ```
 
 It keeps its diary and the log of what it signed in `--state`, and the copy
-the node signs in `<datadir>/snapshot-confirmer/`. It reads the public half of
-the key from the file `<datadir>/btx.conf` names, else
-`<datadir>/attestation-signer.key`, or `--signer-key` for a conf elsewhere;
-the node signs with the private half. It refuses to start, with exit status
+the node signs in `<datadir>/snapshot-confirmer/`. It takes the node's signing
+public key from `--pubkey`, so it never opens the private key file; the node
+signs with the private half. Without `--pubkey` it derives the public key from
+the file `<datadir>/btx.conf` names, else `<datadir>/attestation-signer.key`,
+or `--signer-key`, and wipes the private key from memory at once. It refuses to start, with exit status
 3 and the reason, on another chain or replay context, on a node that follows
 signatures, without a key, or with a key not on the list. Until the node's
 background check of older history finishes it records and signs nothing.
