@@ -515,14 +515,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(signer_key_path(&a), dir.path().join("keys/signer.wif"));
+        // An absolute path is taken as it is. Built from a real directory so
+        // it is absolute on every platform: "/etc/..." has no drive letter on
+        // Windows, where it is relative and joins the datadir.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let absolute = elsewhere.path().join("signer.wif");
         std::fs::write(
             dir.path().join("btx.conf"),
-            "matmulattestationsignerkeyfile=/etc/btx/signer.wif\n",
+            format!("matmulattestationsignerkeyfile={}\n", absolute.display()),
         )
         .unwrap();
-        assert_eq!(signer_key_path(&a), PathBuf::from("/etc/btx/signer.wif"));
-        a.signer_key = Some("/elsewhere/k".into());
-        assert_eq!(signer_key_path(&a), PathBuf::from("/elsewhere/k"));
+        assert_eq!(signer_key_path(&a), absolute);
+        let flag = elsewhere.path().join("k");
+        a.signer_key = Some(flag.clone());
+        assert_eq!(signer_key_path(&a), flag);
     }
 
     #[test]
