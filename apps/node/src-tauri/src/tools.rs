@@ -505,6 +505,14 @@ pub async fn tools_diagnostics(
             .map(|v| v.summary.to_string()),
         catch_up: state.catch_up_help.lock().await.lines.clone(),
         recovery: crate::read_block_recovery::diagnostics_lines(&datadir),
+        // The snapshot network in this run: the diary on disk, then what the
+        // refresher's diary steps and confirmer rounds and the keeper's
+        // producer did. Heights, short hashes and operator names only.
+        snapshots: state
+            .snapshot_network
+            .lock()
+            .await
+            .lines(btx_core::diary::summary(&datadir)),
         log_warnings: diagnostics::warning_lines(&btx_core::node::debug_log_tail(
             &datadir,
             diagnostics::LOG_TAIL_BYTES,

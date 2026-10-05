@@ -1573,7 +1573,7 @@ function reflectWitnessRow(status: NodeStatusInfo): void {
 }
 
 const SNAPSHOT_SERVE_STATIC_COPY =
-  "Export the chain state at the tip, sign it, and let new nodes fetch it instead of catching up from a months-old file. Needs a node that checks blocks itself and signs. About 9 MB, refreshed every 500 blocks";
+  "Export the chain state at the tip, sign it, and let new nodes fetch it instead of catching up from a months-old file. Needs a node that checks blocks itself and signs. About 9 MB, taken every 100 blocks and offered once it is 144 blocks deep, about three and a half hours later";
 
 $<HTMLInputElement>("snapshot-serve-toggle").addEventListener("change", async (e) => {
   const box = e.target as HTMLInputElement;

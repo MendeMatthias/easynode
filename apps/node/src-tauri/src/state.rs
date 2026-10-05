@@ -253,8 +253,10 @@ pub struct NodeAppSettings {
     pub witness_listen: String,
     /// Produce and serve an attested snapshot of the chain state
     /// (`btx_core::snapshot_serve`): export the UTXO set at the tip, sign it
-    /// with this node's key, wait for it to mature, offer it over P2P, refresh
-    /// it every 500 blocks, and re-offer it after every node start. Off by
+    /// with this node's key at every multiple of 100 blocks, offer it over P2P
+    /// once it is 144 blocks deep and checked against the node's own diary,
+    /// send it to easybtx.com when the key is on the operator list, and
+    /// re-offer it after every node start. Off by
     /// default: it only works on a node that validates and signs, and the gate
     /// says so where the switch is. What is served is ~9 MB and a fetching
     /// node takes it in chunks; nothing about this node is exposed beyond a
@@ -810,6 +812,10 @@ pub struct AppState {
     /// a loop whose generation is superseded exits, and a cycle in flight
     /// aborts at its next poll without offering anything.
     pub snapshot_serve_gen: Arc<AtomicU64>,
+    /// What the snapshot network did in this run (the diary, the confirmer,
+    /// the producer), for the "Snapshots" section of Copy diagnostics.
+    /// Written by the status refresher and the snapshot keeper.
+    pub snapshot_network: Arc<Mutex<btx_core::snapshot_confirmer::NetworkReport>>,
 }
 
 /// Whose node did we attach to? Derived from the `DatadirHolder` seen at the
@@ -879,6 +885,7 @@ impl AppState {
             witness_error: Arc::new(Mutex::new(None)),
             snapshot_serve: Arc::new(std::sync::Mutex::new(None)),
             snapshot_serve_gen: Arc::new(AtomicU64::new(0)),
+            snapshot_network: Arc::new(Mutex::new(Default::default())),
         }
     }
 }
