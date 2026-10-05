@@ -6,7 +6,7 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
-## [Unreleased]
+## [0.7.7] - 2026-10-05
 
 **Every node that checks blocks itself now keeps a diary of its chain.**
 Each time the chain reaches a multiple of 100 blocks, the node writes down
@@ -23,8 +23,8 @@ is 144 blocks deep, about three and a half hours later, and only after the
 node checks it again: the block is still on its chain, the known bad
 branches are refused, and the snapshot matches the node's own diary in every
 detail. If your node's key is on the operator list, it also sends the
-snapshot to easybtx.com. Before, a snapshot was refreshed every 500 blocks and offered
-after ten confirmations.
+snapshot to easybtx.com. Before, a snapshot was refreshed every 500 blocks
+and offered after ten confirmations.
 
 **Operators' nodes confirm each other's snapshots.** A node whose key is on
 the operator list looks at the snapshots waiting on easybtx.com every ten
@@ -34,6 +34,14 @@ offered a confirmed snapshot until the owner has looked. Once two operators
 agree on a snapshot, new nodes start from it instead of from the one built
 into the app. Copy diagnostics has a new "Snapshots" section that says what
 your node's diary, confirmer and snapshot sending did in this run.
+
+**Operators who run a plain btxd can confirm too.** `btx-confirmer` is a
+small program that runs beside a btxd which checks blocks itself and signs
+with a key on the operator list. It keeps the same diary and confirms or
+dissents exactly as the app does, and nothing else: it never exports, loads
+or restarts anything. It reads only the node's RPC cookie. Build it with
+`cargo build --release --bin btx-confirmer` in `crates/btx-core`; a systemd
+template is in `deploy/esplora/`.
 
 ## [0.7.6] - 2026-10-05
 
