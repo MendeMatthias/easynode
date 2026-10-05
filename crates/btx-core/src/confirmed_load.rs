@@ -132,7 +132,7 @@ impl Holds<'static> {
 
 impl Holds<'_> {
     /// (height, block) of everything refused, invalid blocks first.
-    fn roots(&self) -> Vec<(u64, &'static str)> {
+    pub(crate) fn roots(&self) -> Vec<(u64, &'static str)> {
         self.invalid
             .iter()
             .map(|b| (b.height, b.hash))

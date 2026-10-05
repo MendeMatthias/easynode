@@ -194,7 +194,7 @@ fn now_unix() -> u64 {
 /// `Ok(None)` when the chain does not reach that height (the engine's -8,
 /// "Block height out of range"); `Err` when the node did not answer, which
 /// says nothing about the chain.
-async fn block_at(rpc: &dyn Rpc, height: u64) -> Result<Option<String>, String> {
+pub(crate) async fn block_at(rpc: &dyn Rpc, height: u64) -> Result<Option<String>, String> {
     match rpc.call("getblockhash", json!([height])).await {
         Ok(v) => v
             .as_str()
