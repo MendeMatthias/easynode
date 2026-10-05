@@ -63,6 +63,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 
 REPO = "https://github.com/MendeMatthias/EasyBTX-releases/releases/download"
 # Release asset names follow the node convention BTX-Node_<ver>_<arch>.<ext>.
@@ -263,6 +264,29 @@ def feed_problem(path, feed):
     return None
 
 
+# What Tauri's updater accepts in `pub_date`: an RFC 3339 timestamp. An empty
+# or unparseable value makes it refuse the WHOLE manifest, on every platform,
+# before it compares versions: easyNode 0.7.5 logged "invalid value for
+# `pub_date`: the 'year' component could not be parsed" against the 0.7.6
+# feed, which this script wrote with `"pub_date": ""` when it was run without
+# --pub-date (build-node-feed.sh supplies one; it had been bypassed).
+PUB_DATE_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})")
+
+
+def pub_date_or_now(value):
+    """The feed's pub_date: `value` when it is a timestamp the updater
+    parses, the current UTC second when none was given, else ValueError."""
+    if not value:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if not PUB_DATE_RE.fullmatch(value):
+        raise ValueError(
+            f"--pub-date {value!r} is not an RFC 3339 timestamp such as "
+            f"2026-10-05T12:25:49Z. The updater refuses a whole feed whose "
+            f"pub_date it cannot parse.")
+    return value
+
+
 def same_file(a, b):
     """Whether `a` and `b` name one file: the same file when both exist, else
     the same path once links are resolved and case is ignored, which is how
@@ -440,6 +464,20 @@ def self_test():
     with tempfile.TemporaryDirectory() as d:
         _self_test_main(d, pub)
 
+    # pub_date: a timestamp passes through, a missing one becomes now, and
+    # anything the updater cannot parse is refused before a feed is written.
+    assert pub_date_or_now("2026-10-05T12:25:49Z") == "2026-10-05T12:25:49Z"
+    assert pub_date_or_now("2026-10-05T12:25:49.5+02:00") == "2026-10-05T12:25:49.5+02:00"
+    for missing in ("", None):
+        assert PUB_DATE_RE.fullmatch(pub_date_or_now(missing)), missing
+    for bad in ("d", "2026-10-05", "yesterday", " 2026-10-05T12:25:49Z"):
+        try:
+            pub_date_or_now(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"pub_date {bad!r} was accepted")
+
     # The REAL embedded pubkey must parse, so a conf change cannot silently
     # disable key-id verification.
     real = pubkey_key_id(load_pubkey_from_conf())
@@ -593,6 +631,7 @@ def main():
     if not (a.mac_sig or a.linux_sig or a.win_sig or a.deb_sig):
         p.error("need at least one of --mac-sig / --linux-sig / --win-sig / --deb-sig")
     pubkey = load_pubkey_from_conf(a.pubkey_conf)
+    a.pub_date = pub_date_or_now(a.pub_date)
     # Both feeds are built, and so checked, before either is written: a bad
     # signature on one must not leave the other half-published beside it.
     deb = None
