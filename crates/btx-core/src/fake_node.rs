@@ -2,8 +2,10 @@
 //! producer's checks, the confirmer): a chain of block hashes, the answers
 //! those modules read, `getchainstates` with or without an unvalidated
 //! snapshot chainstate, `invalidateblock` that moves the chain the way the
-//! engine does, and a signer that appends a real signature to a manifest
-//! file the way `signutxosnapshotmanifest` does. Test-only.
+//! engine does, a signer that appends a real signature to a manifest
+//! file the way `signutxosnapshotmanifest` does, and the keeper's export and
+//! P2P offer (`dumptxoutsetattested` at the tip, `offerattestedutxosnapshot`,
+//! the service bit in `getnetworkinfo`). Test-only.
 //!
 //! It panics on any method it does not script, so a module under test that
 //! starts calling something new fails loudly instead of reading a `null`.
@@ -38,6 +40,15 @@ pub(crate) struct NodeState {
     pub invalidate_fails: bool,
     /// Methods that fail as on a node that went away.
     pub silent: HashSet<&'static str>,
+    /// What `dumptxoutsetattested` writes as (file, manifest). `None` writes
+    /// `snapshot bytes <tip>` and the four bytes a manifest starts with,
+    /// enough for the keeper, which never parses a manifest itself.
+    pub dump: Option<(Vec<u8>, Vec<u8>)>,
+    /// The pair `offerattestedutxosnapshot` was last given, while it is live.
+    pub offering: Option<(String, String)>,
+    /// What `getpeerinfo` answers. Empty by default, so the keeper's bounce
+    /// of the mirror links does not wait for sockets that are not there.
+    pub peers: Vec<Value>,
 }
 
 impl NodeState {
@@ -56,6 +67,14 @@ impl NodeState {
         }
         for h in height..=new_tip {
             self.chain.insert(h, sibling_hash(h));
+        }
+    }
+
+    /// New blocks ([`synthetic_hash`]) on top of the active chain up to
+    /// `tip`: time passing.
+    pub fn extend_to(&mut self, tip: u64) {
+        for h in self.tip() + 1..=tip {
+            self.chain.insert(h, synthetic_hash(h));
         }
     }
 
@@ -118,6 +137,9 @@ impl FakeNode {
                 signer: None,
                 invalidate_fails: false,
                 silent: HashSet::new(),
+                dump: None,
+                offering: None,
+                peers: Vec::new(),
             }),
             calls: Mutex::new(Vec::new()),
         }
@@ -242,6 +264,70 @@ impl Rpc for FakeNode {
                     "signer": crate::operators::hex(&pubkey),
                 }))
             }
+            // The export always bases on the tip, as the engine's does.
+            "dumptxoutsetattested" => {
+                let tip = s.tip();
+                let (dat, man) = s.dump.clone().unwrap_or_else(|| {
+                    (
+                        format!("snapshot bytes {tip}").into_bytes(),
+                        vec![0x02, 0x01, 0x46, 0xfa],
+                    )
+                });
+                let write = |at: &Value, bytes: &[u8]| {
+                    std::fs::write(at.as_str().unwrap_or_default(), bytes)
+                        .map_err(|e| rpc_err(-1, &e.to_string()))
+                };
+                write(&params[0], &dat)?;
+                write(&params[1], &man)?;
+                let utxo = s
+                    .utxo
+                    .as_ref()
+                    .and_then(|u| u["hash_serialized_3"].as_str())
+                    .unwrap_or("dcf828e4")
+                    .to_string();
+                Ok(json!({
+                    "base_height": tip,
+                    "base_hash": s.chain[&tip],
+                    "txoutset_hash": utxo,
+                    "coins_written": 140_936,
+                    "max_cs_main_hold_us": 7385
+                }))
+            }
+            "offerattestedutxosnapshot" => {
+                let dat = params[0].as_str().unwrap_or_default().to_string();
+                let man = params[1].as_str().unwrap_or_default().to_string();
+                let height = std::path::Path::new(&dat)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(crate::snapshot_serve::height_from_file_name)
+                    .ok_or_else(|| rpc_err(-8, "not a snapshot file name"))?;
+                let hash = s
+                    .chain
+                    .get(&height)
+                    .cloned()
+                    .ok_or_else(|| rpc_err(-5, "Block not found"))?;
+                let size = std::fs::metadata(&dat)
+                    .map_err(|e| rpc_err(-22, &e.to_string()))?
+                    .len();
+                s.offering = Some((dat, man));
+                Ok(json!({
+                    "block_hash": hash,
+                    "height": height,
+                    "file_size": size,
+                    "chunk_count": 1,
+                    "file_hash": "f4607b19",
+                    "signatures": 1
+                }))
+            }
+            "withdrawattestedutxosnapshot" => {
+                Ok(json!({ "withdrawn": s.offering.take().is_some() }))
+            }
+            "getnetworkinfo" => Ok(json!({
+                "localservices": if s.offering.is_some() { "0000000188000d08" } else { "0000000088000d08" },
+                "localservicesnames": []
+            })),
+            "getpeerinfo" => Ok(Value::Array(s.peers.clone())),
+            "disconnectnode" | "addnode" => Ok(Value::Null),
             other => panic!("the fake node was asked {other}, which it does not script"),
         }
     }

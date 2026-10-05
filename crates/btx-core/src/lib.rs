@@ -59,6 +59,7 @@ pub mod service_report;
 pub mod setup;
 pub mod signer;
 pub mod snapshot;
+pub mod snapshot_producer;
 pub mod snapshot_serve;
 pub mod snapshot_site;
 pub mod snapshot_start;
