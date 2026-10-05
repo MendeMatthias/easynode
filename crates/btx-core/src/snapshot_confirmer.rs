@@ -18,21 +18,29 @@
 //!    (check 2), no refused block under it, then the five chain fields
 //!    against that entry (check 4). [`Mismatch::next`] decides: wait, say
 //!    nothing, or dissent.
-//! 4. All passed: `signutxosnapshotmanifest` on a COPY of the listed manifest
-//!    in the work folder, then exactly one new signature is taken from it,
+//! 4. All passed, and two rules of this node's own hold ([`Declined`]): a
+//!    listed operator other than this node's own has signed the statement
+//!    (nobody's word is added to a statement no one else vouched for), and
+//!    this node has signed no other statement at that height. Then
+//!    `signutxosnapshotmanifest` on a statement-only COPY in the work folder
+//!    (the statement with no signatures at all), the one signature it made is
 //!    checked to be this node's key and valid over the statement, and a
 //!    manifest carrying the statement and that one signature goes back
-//!    through `POST /api/snapshots/statement`, where the website merges it
-//!    (`mergeSignatures` in snapshotRendezvous.mjs: one per key, stored ones
-//!    first). Only check 4 failed: a dissent instead (below).
+//!    through `POST /api/snapshots/statement`, where the website files it
+//!    under the statement's hash and merges it onto the stored record
+//!    (`acceptManifest` takes any manifest whose every signature is a listed
+//!    key and valid; `mergeSignatures` in snapshotRendezvous.mjs keeps one
+//!    per key, stored ones first). Only check 4 failed: a dissent instead
+//!    (below).
 //!
 //! WHY A COPY, AND WHY ONLY ONE SIGNATURE BACK. `signutxosnapshotmanifest`
 //! signs blindly (it checks only the chain id, the replay context and its own
 //! key, `trusted_exact_replay_attestation.cpp:1387-1403`), so it only ever
 //! sees a statement that already passed, and it rewrites the file it is
-//! given, so it never sees one the app still needs. Sending back the
-//! website's whole merged manifest would re-send signatures this node did
-//! not make; the one new signature is all this node can vouch for.
+//! given, so it never sees one the app still needs. It is given the bare
+//! statement, so nothing the website supplied reaches the engine. Sending
+//! back the website's whole merged manifest would re-send signatures this
+//! node did not make; the one signature is all this node can vouch for.
 //!
 //! THE DISSENT (section 6a). Built from the diary entry, not the statement:
 //! height, block hash, `hash_serialized_3`, coin count and chain transaction
@@ -145,6 +153,41 @@ pub enum Verdict {
         statement_hash: String,
         error: String,
     },
+    /// This node's own rule says no, whatever its diary says ([`Declined`]).
+    /// Nothing was signed or sent.
+    Declined {
+        height: u64,
+        statement_hash: String,
+        why: Declined,
+    },
+}
+
+/// Why this node will not put its signature on a statement it could check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Declined {
+    /// No listed operator other than this node's own has signed it: a
+    /// statement nobody else vouched for is not one to be the first on.
+    NoOtherOperator,
+    /// This node signed `other`, another statement at the same height. One
+    /// statement per height, so two files at one height never both carry
+    /// this node's word.
+    AnotherStatementSigned { other: String },
+}
+
+impl std::fmt::Display for Declined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Declined::NoOtherOperator => write!(
+                f,
+                "no listed operator other than this node's own has signed it"
+            ),
+            Declined::AnotherStatementSigned { other } => write!(
+                f,
+                "this node signed another statement at that height ({})",
+                other.get(..16).unwrap_or(other)
+            ),
+        }
+    }
 }
 
 impl Verdict {
@@ -158,7 +201,8 @@ impl Verdict {
             | Verdict::Waiting { height, .. }
             | Verdict::Skipped { height, .. }
             | Verdict::Unreadable { height, .. }
-            | Verdict::Failed { height, .. } => *height,
+            | Verdict::Failed { height, .. }
+            | Verdict::Declined { height, .. } => *height,
         }
     }
 
@@ -172,7 +216,8 @@ impl Verdict {
             | Verdict::Waiting { statement_hash, .. }
             | Verdict::Skipped { statement_hash, .. }
             | Verdict::Unreadable { statement_hash, .. }
-            | Verdict::Failed { statement_hash, .. } => statement_hash,
+            | Verdict::Failed { statement_hash, .. }
+            | Verdict::Declined { statement_hash, .. } => statement_hash,
         }
     }
 
@@ -214,6 +259,7 @@ impl Verdict {
             Verdict::Failed { error, .. } => {
                 format!("could not answer the snapshot at {h} yet: {error}")
             }
+            Verdict::Declined { why, .. } => format!("did not sign the snapshot at {h}: {why}"),
         }
     }
 }
@@ -329,6 +375,22 @@ impl ConfirmerLog {
     pub fn signature(&self, chain: &str, statement_hash: &str) -> Option<&LogEntry> {
         self.entries.iter().find(|e| {
             e.kind == LogKind::Signed && e.chain == chain && e.statement_hash == statement_hash
+        })
+    }
+
+    /// This node's co-signature at `height` on a statement other than
+    /// `statement_hash`.
+    pub fn other_signature_at(
+        &self,
+        chain: &str,
+        height: u64,
+        statement_hash: &str,
+    ) -> Option<&LogEntry> {
+        self.entries.iter().find(|e| {
+            e.kind == LogKind::Signed
+                && e.chain == chain
+                && e.height == height
+                && !e.statement_hash.eq_ignore_ascii_case(statement_hash)
         })
     }
 
@@ -577,11 +639,28 @@ impl Confirmer<'_> {
                 statement_hash,
             };
         }
+        // `signed_by` counts listed operators only, each signature verified.
+        if !r.signed_by.iter().any(|o| o != ours) {
+            return Verdict::Declined {
+                height,
+                statement_hash,
+                why: Declined::NoOtherOperator,
+            };
+        }
 
         let st = &r.manifest.statement;
         let diary = diary::load(self.state_dir, &st.chain_id().display_hex());
         match check_against_node(self.rpc, st, &r.rules, &diary, &self.holds).await {
             Ok(_) => {
+                if let Some(e) = log.other_signature_at(chain, height, &statement_hash) {
+                    return Verdict::Declined {
+                        height,
+                        statement_hash,
+                        why: Declined::AnotherStatementSigned {
+                            other: e.statement_hash.clone(),
+                        },
+                    };
+                }
                 self.cosign(&r.manifest, chain, &statement_hash, height, &mut log)
                     .await
             }
@@ -653,7 +732,7 @@ impl Confirmer<'_> {
             Some(bytes) => bytes,
             None => {
                 let sig = match self
-                    .sign_copy(m, &format!("{statement_hash}.manifest"))
+                    .sign_copy(&m.statement, &format!("{statement_hash}.manifest"))
                     .await
                 {
                     Ok(s) => s,
@@ -725,12 +804,8 @@ impl Confirmer<'_> {
         let one = match kept {
             Some(bytes) => bytes,
             None => {
-                let unsigned = Manifest {
-                    statement: dissent.clone(),
-                    signatures: Vec::new(),
-                };
                 let sig = match self
-                    .sign_copy(&unsigned, &format!("dissent-{dissent_hash}.manifest"))
+                    .sign_copy(&dissent, &format!("dissent-{dissent_hash}.manifest"))
                     .await
                 {
                     Ok(s) => s,
@@ -786,13 +861,18 @@ impl Confirmer<'_> {
         Ok(reply.operators)
     }
 
-    /// Sign a copy of `m` with the engine, and take exactly the one
-    /// signature it added: this node's key, valid over the statement. The
+    /// Sign a copy of the bare statement `st` (no signatures) with the
+    /// engine, and take the one signature it made: the statement unchanged,
+    /// exactly one signature, this node's key, valid over the statement. The
     /// copy is removed whatever happens.
-    async fn sign_copy(&self, m: &Manifest, name: &str) -> Result<Signed, String> {
+    async fn sign_copy(&self, st: &Statement, name: &str) -> Result<Signed, String> {
         std::fs::create_dir_all(self.work_dir).map_err(|e| format!("work folder: {e}"))?;
         let path = self.work_dir.join(name);
-        std::fs::write(&path, m.to_bytes()).map_err(|e| format!("writing the copy: {e}"))?;
+        let bare = Manifest {
+            statement: st.clone(),
+            signatures: Vec::new(),
+        };
+        std::fs::write(&path, bare.to_bytes()).map_err(|e| format!("writing the copy: {e}"))?;
         let signed = self
             .rpc
             .call("signutxosnapshotmanifest", json!([path.to_string_lossy()]))
@@ -802,18 +882,14 @@ impl Confirmer<'_> {
         signed.map_err(|e| format!("the engine did not sign: {e}"))?;
         let mut after = cs::parse(&after.map_err(|e| format!("reading the copy: {e}"))?)
             .map_err(|e| format!("the signed copy does not read: {e}"))?;
-        let n = m.signatures.len();
-        if after.statement != m.statement
-            || after.signatures.len() != n + 1
-            || after.signatures[..n] != m.signatures[..]
-        {
+        if after.statement != *st || after.signatures.len() != 1 {
             return Err("the engine did not add exactly one signature".into());
         }
-        let new = after.signatures.pop().expect("n + 1 signatures");
+        let new = after.signatures.pop().expect("one signature");
         if new.key != self.our_key {
             return Err("the engine did not sign with this node's key".into());
         }
-        if !cs::signature_is_valid(&m.statement.hash(), &new.key, &new.der) {
+        if !cs::signature_is_valid(&st.hash(), &new.key, &new.der) {
             return Err("the engine's signature does not check out".into());
         }
         Ok(new)
@@ -836,6 +912,8 @@ pub struct Tally {
     pub skipped: u64,
     pub unreadable: u64,
     pub failed: u64,
+    /// Statements this node's own rule declined ([`Declined`]), once each.
+    pub declined: u64,
     /// Signed or dissented already, by this node or its operator.
     pub already: u64,
     pub listed_dissents: u64,
@@ -855,6 +933,7 @@ fn kind(v: &Verdict) -> &'static str {
         Verdict::Skipped { .. } => "skipped",
         Verdict::Unreadable { .. } => "unreadable",
         Verdict::Failed { .. } => "failed",
+        Verdict::Declined { .. } => "declined",
     }
 }
 
@@ -876,13 +955,13 @@ impl Tally {
                     self.dissented += 1;
                     self.last_refusal = Some(v.line());
                 }
-                Verdict::Skipped { .. } | Verdict::Unreadable { .. } => {
+                Verdict::Skipped { .. } | Verdict::Unreadable { .. } | Verdict::Declined { .. } => {
                     self.last_refusal = Some(v.line());
                     if first {
-                        if matches!(v, Verdict::Skipped { .. }) {
-                            self.skipped += 1;
-                        } else {
-                            self.unreadable += 1;
+                        match v {
+                            Verdict::Skipped { .. } => self.skipped += 1,
+                            Verdict::Unreadable { .. } => self.unreadable += 1,
+                            _ => self.declined += 1,
                         }
                     }
                 }
@@ -920,7 +999,7 @@ impl Tally {
     pub fn report(&self) -> Vec<String> {
         let mut out = vec![format!(
             "confirmer: {} rounds ({} stopped), co-signed {}, dissented {}, waiting {}, \
-             skipped {}, unreadable {}, failed {}, done before {}, dissents listed {}",
+             skipped {}, unreadable {}, failed {}, declined {}, done before {}, dissents listed {}",
             self.rounds,
             self.stopped,
             self.signed,
@@ -929,6 +1008,7 @@ impl Tally {
             self.skipped,
             self.unreadable,
             self.failed,
+            self.declined,
             self.already,
             self.listed_dissents
         )];
@@ -1524,6 +1604,115 @@ mod tests {
         assert_eq!(n.count("getblockcount"), 2, "checked again before sending");
     }
 
+    // ── Whose word this node adds to ────────────────────────────────────────
+
+    /// A statement no listed operator but this node's own has signed is not
+    /// one this node signs first, however well its diary agrees. A valid
+    /// signature by a key on no list counts for nobody. Said once.
+    #[tokio::test]
+    async fn a_statement_no_other_listed_operator_signed_is_declined() {
+        let (n, dir, env) = setup(101);
+        // Key 9 is on no list: its signature verifies and vouches for nothing.
+        let unlisted = one_signature(&statement(), &key(9));
+        let mut server = mockito::Server::new_async().await;
+        listing(&mut server, pending_json(&[(&unlisted, None)])).await;
+        let post = no_post(&mut server).await;
+        let v = round(&n, dir.path(), &env, &server).await;
+        post.assert_async().await;
+        assert_eq!(
+            v,
+            vec![Verdict::Declined {
+                height: 100,
+                statement_hash: H.into(),
+                why: Declined::NoOtherOperator
+            }]
+        );
+        assert_eq!(n.count("signutxosnapshotmanifest"), 0);
+        assert!(load_log(dir.path()).entries.is_empty());
+        let mut t = Tally::default();
+        let mut seen = HashSet::new();
+        assert_eq!(t.add(&v, &mut seen).len(), 1);
+        assert!(t.add(&v, &mut seen).is_empty(), "said once");
+        assert_eq!(t.declined, 1);
+        // The producer's listed signature beside it is what counts.
+        let both = Manifest {
+            statement: statement(),
+            signatures: vec![
+                cs::parse(R_P).unwrap().signatures[0].clone(),
+                cs::parse(&unlisted).unwrap().signatures[0].clone(),
+            ],
+        }
+        .to_bytes();
+        let mut server = mockito::Server::new_async().await;
+        listing(&mut server, pending_json(&[(&both, None)])).await;
+        server
+            .mock("POST", POST)
+            .match_body(one_signature(&statement(), &key(7)))
+            .with_body(reply(H))
+            .create_async()
+            .await;
+        let v = round(&n, dir.path(), &env, &server).await;
+        assert!(matches!(&v[..], [Verdict::Signed { .. }]), "{v:?}");
+    }
+
+    /// One statement per height: having signed another statement at 100
+    /// (another file of the same height, say), this node signs no second.
+    #[tokio::test]
+    async fn a_second_statement_at_a_signed_height_is_declined() {
+        let (n, dir, env) = setup(101);
+        let other = "ab".repeat(32);
+        let mut log = ConfirmerLog::default();
+        log.record(LogEntry {
+            chain: "regtest".into(),
+            height: 100,
+            kind: LogKind::Signed,
+            statement_hash: other.clone(),
+            against: None,
+            unsent: None,
+            signed_at: 1,
+            sent_at: Some(1),
+        });
+        save_log(dir.path(), &log).unwrap();
+        let mut server = mockito::Server::new_async().await;
+        listing(&mut server, pending_json(&[(R_P, None)])).await;
+        let post = no_post(&mut server).await;
+        let v = round(&n, dir.path(), &env, &server).await;
+        post.assert_async().await;
+        assert_eq!(
+            v,
+            vec![Verdict::Declined {
+                height: 100,
+                statement_hash: H.into(),
+                why: Declined::AnotherStatementSigned { other }
+            }]
+        );
+        assert_eq!(n.count("signutxosnapshotmanifest"), 0);
+    }
+
+    /// The engine signs the bare statement, never the website's signatures
+    /// with it, and what goes back is the statement and this node's one.
+    #[tokio::test]
+    async fn the_engine_signs_the_statement_alone() {
+        let (n, dir, env) = setup(101);
+        let mut server = mockito::Server::new_async().await;
+        listing(&mut server, pending_json(&[(R_PC, None)])).await;
+        let post = server
+            .mock("POST", POST)
+            .match_body(one_signature(&statement(), &key(7)))
+            .with_body(reply(H))
+            .create_async()
+            .await;
+        let env = format!("{env};other={C}");
+        let v = round(&n, dir.path(), &env, &server).await;
+        post.assert_async().await;
+        assert!(matches!(&v[..], [Verdict::Signed { .. }]), "{v:?}");
+        let inputs = n.with(|s| s.signing_inputs.clone());
+        assert_eq!(inputs.len(), 1);
+        let given = cs::parse(&inputs[0]).unwrap();
+        assert_eq!(given.statement, statement());
+        assert!(given.signatures.is_empty(), "{:?}", given.signatures);
+    }
+
     // ── What the website says is not trusted ────────────────────────────────
 
     #[tokio::test]
@@ -1629,7 +1818,7 @@ mod tests {
         assert_eq!(
             report[0],
             "confirmer: 5 rounds (2 stopped), co-signed 0, dissented 0, waiting 1, skipped 1, \
-             unreadable 0, failed 0, done before 1, dissents listed 0"
+             unreadable 0, failed 0, declined 0, done before 1, dissents listed 0"
         );
         assert!(report[1].starts_with("confirmer, last refusal: did not sign"));
         assert!(report[2].starts_with("confirmer, last round: this node is still"));

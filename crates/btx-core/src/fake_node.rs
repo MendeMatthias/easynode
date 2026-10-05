@@ -37,6 +37,8 @@ pub(crate) struct NodeState {
     pub mode: String,
     /// The key `signutxosnapshotmanifest` signs with.
     pub signer: Option<SigningKey>,
+    /// Every manifest `signutxosnapshotmanifest` was given, as it read it.
+    pub signing_inputs: Vec<Vec<u8>>,
     pub invalidate_fails: bool,
     /// Methods that fail as on a node that went away.
     pub silent: HashSet<&'static str>,
@@ -135,6 +137,7 @@ impl FakeNode {
                 replay_context: None,
                 mode: "consensus".into(),
                 signer: None,
+                signing_inputs: Vec::new(),
                 invalidate_fails: false,
                 silent: HashSet::new(),
                 dump: None,
@@ -242,6 +245,7 @@ impl Rpc for FakeNode {
                     .clone()
                     .ok_or_else(|| rpc_err(-1, "requires a configured local signer"))?;
                 let bytes = std::fs::read(&path).map_err(|e| rpc_err(-22, &e.to_string()))?;
+                s.signing_inputs.push(bytes.clone());
                 let mut m = cs::parse(&bytes).map_err(|e| rpc_err(-22, &e.to_string()))?;
                 let pubkey: [u8; 33] = key
                     .verifying_key()
