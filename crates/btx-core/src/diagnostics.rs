@@ -91,6 +91,11 @@ pub struct DiagnosticsInput {
     /// (`crate::read_block_recovery`): the step under way and the last
     /// outcome, one line each. Empty when there is neither.
     pub recovery: Vec<String>,
+    /// What the snapshot network did in this run: the diary, the confirmer,
+    /// the producer (`crate::snapshot_confirmer::NetworkReport::lines`), one
+    /// line each. Empty when no refresher ran. Public material only: heights,
+    /// short block hashes, operator names and counts, never a key.
+    pub snapshots: Vec<String>,
     pub log_warnings: Vec<String>,
 }
 
@@ -353,6 +358,13 @@ pub fn render(i: &DiagnosticsInput) -> String {
         o.push("  not checked yet this run".into());
     }
     o.extend(i.chain_agreement.iter().cloned());
+    o.push("Snapshots".into());
+    if i.snapshots.is_empty() {
+        o.push("  nothing to report".into());
+    }
+    for l in &i.snapshots {
+        o.push(format!("  {l}"));
+    }
     let notices = i
         .chain
         .as_ref()
@@ -1405,6 +1417,10 @@ mod tests {
                 crate::catchup_assist::refuses_old_line("203.0.113.7:19335"),
             ],
             recovery: Vec::new(),
+            snapshots: vec![
+                "diary: 12 heights, newest 233400 (block 11bd18812b6afcd1)".into(),
+                format!("confirmer, last round: 198.51.100.4:443 refused, key file {wif}"),
+            ],
             log_warnings: vec![format!(
                 "[warning] signing key backup contains {wif}, update check via \
                  http://84.32.49.226:19335/status failed"
@@ -1416,7 +1432,7 @@ mod tests {
             published_hosts: crate::node::published_peer_hosts(),
         };
         let out = report(&input, &context);
-        for gone in [wif.as_str(), "84.32.49.226", "203.0.113.7"] {
+        for gone in [wif.as_str(), "84.32.49.226", "203.0.113.7", "198.51.100.4"] {
             assert!(!out.contains(gone), "{gone} survived end to end:\n{out}");
         }
         assert!(
@@ -1434,6 +1450,7 @@ mod tests {
             "Peers (1 in, 1 out)",
             "peer 4: 109.199.124.187:19335",
             "Engine notices",
+            "Snapshots\n  diary: 12 heights, newest 233400 (block 11bd18812b6afcd1)",
             "Last warning lines of debug.log",
         ] {
             assert!(out.contains(kept), "{kept} missing end to end:\n{out}");
@@ -1512,6 +1529,12 @@ mod tests {
     }
 
     #[test]
+    fn a_node_that_did_nothing_for_the_snapshot_network_says_so() {
+        let r = render(&DiagnosticsInput::default());
+        assert!(r.contains("Snapshots\n  nothing to report\n"), "{r}");
+    }
+
+    #[test]
     fn the_report_has_every_section_and_no_em_dash() {
         let input = DiagnosticsInput {
             generated_at: "2026-09-29 14:05 UTC".into(),
@@ -1569,10 +1592,16 @@ mod tests {
             stall: None,
             catch_up: vec!["not asking any peer for blocks right now".into()],
             recovery: Vec::new(),
+            snapshots: vec![
+                "diary: 12 heights, newest 233400 (block 11bd18812b6afcd1)".into(),
+                "confirmer: 3 rounds (0 stopped), co-signed 1, dissented 0".into(),
+            ],
             log_warnings: vec!["[warning] something".into()],
         };
         let r = render(&input);
         for part in [
+            "Snapshots\n  diary: 12 heights, newest 233400 (block 11bd18812b6afcd1)\n  \
+             confirmer: 3 rounds",
             "easyNode diagnostics",
             "App 0.7.0",
             "Role: follows signatures",

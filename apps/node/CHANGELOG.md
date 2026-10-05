@@ -6,6 +6,35 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
+## [Unreleased]
+
+**Every node that checks blocks itself now keeps a diary of its chain.**
+Each time the chain reaches a multiple of 100 blocks, the node writes down
+what its own chain looked like at that block: the block, the hash of all
+unspent coins, how many there are and how many transactions the chain holds.
+It keeps the newest 100 of these in `snapshot-diary.json` in the data folder.
+A node that follows signatures, or that started from a snapshot and is still
+checking the older history, writes nothing until that check is done.
+
+**Snapshots are now taken every 100 blocks and sent only once they are 144
+blocks deep.** If you serve a chain snapshot, a fresh one is exported each
+time the chain reaches a multiple of 100 blocks. It is offered once its block
+is 144 blocks deep, about three and a half hours later, and only after the
+node checks it again: the block is still on its chain, the known bad
+branches are refused, and the snapshot matches the node's own diary in every
+detail. If your node's key is on the operator list, it also sends the
+snapshot to easybtx.com. Before, a snapshot was refreshed every 500 blocks and offered
+after ten confirmations.
+
+**Operators' nodes confirm each other's snapshots.** A node whose key is on
+the operator list looks at the snapshots waiting on easybtx.com every ten
+minutes. It co-signs one only when its own diary matches it in every detail.
+If its diary disagrees, it sends a signed dissent instead, and no node is
+offered a confirmed snapshot until the owner has looked. Once two operators
+agree on a snapshot, new nodes start from it instead of from the one built
+into the app. Copy diagnostics has a new "Snapshots" section that says what
+your node's diary, confirmer and snapshot sending did in this run.
+
 ## [0.7.6] - 2026-10-05
 
 **A new node starts about 260 blocks behind the tip instead of 13,400.**

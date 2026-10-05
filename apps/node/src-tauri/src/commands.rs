@@ -1910,8 +1910,9 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     maybe_start_esplora(state, &datadir).await;
     maybe_start_witness(state, &datadir).await;
     // The snapshot keeper, if chosen: re-offers the recorded pair once this
-    // node is at the tip (the offer never survives a restart), and refreshes
-    // it every 500 blocks. Gated against the LIVE node on every tick.
+    // node is at the tip (the offer never survives a restart), and takes a
+    // fresh one at every multiple of 100 blocks, offered once it is 144 blocks
+    // deep. Gated against the LIVE node on every tick.
     maybe_start_snapshot_serve(state, &datadir).await;
     // A Fast-forward the app was closed in the middle of is watched to its
     // end, now that the node is up.
@@ -2540,6 +2541,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
     let fork_slot = state.fork.clone();
     let tip_time_slot = state.tip_median_time.clone();
     let engine_warnings_slot = state.engine_warnings.clone();
+    let snapshot_network_slot = state.snapshot_network.clone();
     let history_slot = state.history_check.clone();
     let started_from_slot = state.started_from.clone();
     let node_slot = state.node.clone();
@@ -2612,6 +2614,14 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         // CHANGED, which is what the stall rule measures.
         let mut bootstrap_headers: Option<u64> = None;
         let mut bootstrap_moved_at = std::time::Instant::now();
+        // The snapshot network (btx_core::diary, btx_core::snapshot_confirmer):
+        // the chain's genesis, read once; whether a diary step or a confirmer
+        // round is running; the confirmer's counter, which starts near the
+        // top so the first round goes out about two minutes in.
+        let mut snapshot_genesis: Option<String> = None;
+        let diary_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let confirm_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut confirm_tick: u32 = CONFIRM_FIRST_TICK;
         // Catch-up help (btx_core::catchup_assist, decision 2026-09-29 §11):
         // while the node is behind and its newest block has stood still for
         // 30 seconds, whatever requests the engine has out, ask this app's
@@ -3525,6 +3535,55 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                                 *signer_offer_slot.lock().await = Some(status);
                             }
                         }
+                    }
+
+                    // ── The diary and the confirmer (snapshot network) ──────
+                    //
+                    // Every node that checks blocks itself writes down its own
+                    // chain state when the tip is on the grid of 100
+                    // (btx_core::diary); a node on the operator list also
+                    // co-signs a statement waiting on easybtx.com, or dissents
+                    // from it, only by that diary (btx_core::snapshot_confirmer).
+                    // Both run off the tick, on a handle with a longer
+                    // timeout: gettxoutsetinfo hashes the whole UTXO set, and
+                    // a round of HTTP can outlast the tick. Off the grid this
+                    // costs nothing: the height is already in hand.
+                    if snapshot_genesis.is_none() {
+                        snapshot_genesis = btx_core::diary::chain_id(&rpc).await;
+                    }
+                    // The refresher is the only one that sets the flags;
+                    // the spawned step clears its own when it is done.
+                    let steps = snapshot_steps(
+                        chain.blocks,
+                        confirm_tick,
+                        diary_in_flight.load(Ordering::SeqCst),
+                        confirm_in_flight.load(Ordering::SeqCst),
+                    );
+                    confirm_tick = steps.confirm_tick;
+                    if steps.diary {
+                        diary_in_flight.store(true, Ordering::SeqCst);
+                        let rpc = rpc.with_timeout(SNAPSHOT_RPC_TIMEOUT);
+                        let in_flight = diary_in_flight.clone();
+                        let report = snapshot_network_slot.clone();
+                        let mode = btx_core::role::validation_mode(
+                            matmul_trusted_slot.lock().await.as_ref(),
+                        );
+                        tauri::async_runtime::spawn(async move {
+                            diary_step(&rpc, mode, &report).await;
+                            in_flight.store(false, Ordering::SeqCst);
+                        });
+                    }
+                    if steps.confirm {
+                        confirm_in_flight.store(true, Ordering::SeqCst);
+                        let rpc = rpc.with_timeout(SNAPSHOT_RPC_TIMEOUT);
+                        let in_flight = confirm_in_flight.clone();
+                        let report = snapshot_network_slot.clone();
+                        let trusted = matmul_trusted_slot.lock().await.clone();
+                        let genesis = snapshot_genesis.clone();
+                        tauri::async_runtime::spawn(async move {
+                            confirm_round(&rpc, trusted, genesis, &report).await;
+                            in_flight.store(false, Ordering::SeqCst);
+                        });
                     }
                 }
                 Err(AppError::Rpc { code: -28, .. }) => {
@@ -6995,14 +7054,27 @@ pub async fn set_witness_listen(
 
 // ── Snapshot serving ─────────────────────────────────────────────────────────
 // btx_core::snapshot_serve is the design. In one paragraph: a node that
-// validates and signs exports the UTXO set at the tip, waits ten
-// confirmations because the dump bases on the 0-conf tip and siblings arrive
-// every ~25 blocks, offers the matured pair over P2P, re-makes the links to
-// the mirrors because service bits travel only in the handshake, refreshes
-// every 500 blocks, and re-offers after every node start because the offer
-// lives in the running process only. The keeper below is that loop. Every
-// decision in it is a pure function in the core module with a test; this is
-// orchestration and reporting.
+// validates and signs exports the UTXO set when its tip is exactly on the
+// grid (every multiple of 100 blocks), writing its own diary entry for that
+// height first; each export waits on its own until its block is 144 deep,
+// because the dump bases on the 0-conf tip and siblings arrive every ~25
+// blocks; the producer's checks (btx_core::snapshot_producer: held blocks
+// refused, the base still on the chain, the statement against the node's own
+// diary, every chainstate validated) then have the last word before the pair
+// is offered over P2P; the links to the mirrors are re-made because service
+// bits travel only in the handshake; the offered pair goes to easybtx.com
+// when the node's key is on the operator list; and the recorded pair is
+// re-offered, after the same checks, after every node start because the
+// offer lives in the running process only. The keeper below is that loop.
+// Every decision in it is a function in the core modules with a test; this
+// is orchestration and reporting.
+
+/// Requests that hash or write the whole UTXO set (`gettxoutsetinfo`,
+/// `dumptxoutsetattested`) or refuse a long held branch (`invalidateblock`)
+/// can outlast the RPC client's 60 s on mainnet. They run off the status
+/// refresher's tick and in the keeper's own task, so a longer wait blocks
+/// nothing else.
+const SNAPSHOT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 fn set_snapshot_status(
     slot: &Arc<std::sync::Mutex<Option<snap::ServeStatus>>>,
@@ -7024,25 +7096,273 @@ async fn snapshot_serve_facts(state: &AppState, datadir: &Path) -> snap::Snapsho
     }
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The keeper's poll: every few seconds while the tip is within two blocks
+/// of a grid height, since the export has to happen while the tip is exactly
+/// there; every half minute otherwise.
+fn keeper_poll(tip: Option<u64>) -> std::time::Duration {
+    if tip.is_some_and(|t| snap::blocks_to_grid(t, snap::EXPORT_GRID) <= 2) {
+        std::time::Duration::from_secs(3)
+    } else {
+        std::time::Duration::from_secs(30)
+    }
+}
+
+/// Status-refresher ticks (three seconds each) between confirmer rounds.
+const CONFIRM_EVERY_TICKS: u32 = (btx_core::snapshot_confirmer::CONFIRM_EVERY_SECS / 3) as u32;
+/// Where the confirmer's counter starts: near the top, so the first round
+/// goes out about two minutes into a run.
+const CONFIRM_FIRST_TICK: u32 = CONFIRM_EVERY_TICKS.saturating_sub(40);
+
+/// What the status refresher starts for the snapshot network on one tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotSteps {
+    /// A diary step: the tip is on the grid and no step is running.
+    diary: bool,
+    /// A confirmer round: the counter is up and no round is running.
+    confirm: bool,
+    /// The counter for the next tick.
+    confirm_tick: u32,
+}
+
+/// The refresher's snapshot-network decision for one tick, from the tip,
+/// the counter and whether a diary step or a confirmer round is still
+/// running. A round that is still running when the counter is up is not
+/// skipped: the counter keeps climbing and the next free tick starts it.
+/// Whether this node may confirm at all (mode, signer, key on the list) is
+/// `confirm_round`'s first question, through `snapshot_confirmer::why_not`.
+fn snapshot_steps(
+    blocks: u64,
+    confirm_tick: u32,
+    diary_busy: bool,
+    confirm_busy: bool,
+) -> SnapshotSteps {
+    let tick = confirm_tick.saturating_add(1);
+    let confirm = tick >= CONFIRM_EVERY_TICKS && !confirm_busy;
+    SnapshotSteps {
+        diary: btx_core::diary::on_grid(blocks) && !diary_busy,
+        confirm,
+        confirm_tick: if confirm { 0 } else { tick },
+    }
+}
+
+/// What the diary step said, for the log and Copy diagnostics. `None` when
+/// it is not news (already written, the tip off the grid).
+fn diary_note(outcome: &Result<btx_core::diary::DiaryOutcome, String>) -> Option<String> {
+    use btx_core::diary::DiaryOutcome;
+    match outcome {
+        Ok(DiaryOutcome::Recorded(e)) => Some(format!(
+            "wrote {} (block {}, {} coins)",
+            e.height,
+            e.block_hash.get(..16).unwrap_or(&e.block_hash),
+            e.coins
+        )),
+        Ok(DiaryOutcome::TipMoved) => Some(
+            "the tip moved while the chain state was read; the next chance is 100 blocks later"
+                .to_string(),
+        ),
+        Ok(DiaryOutcome::NotValidating) => Some(
+            "not kept: this node follows signatures instead of checking blocks itself".to_string(),
+        ),
+        Ok(DiaryOutcome::Unvalidated) => Some(
+            "not kept: this node is still checking older history in the background".to_string(),
+        ),
+        Ok(DiaryOutcome::AlreadyRecorded(_) | DiaryOutcome::NotOnGrid) => None,
+        Err(e) => Some(e.clone()),
+    }
+}
+
+/// One diary step (btx_core::diary), from the status refresher while the
+/// tip is on the grid. Every validating node keeps the diary, producer or
+/// not. Logged and reported when the news changes, so a tip that sits on a
+/// grid height for a minute says it once.
+async fn diary_step(
+    rpc: &RpcClient,
+    mode: btx_core::role::ValidationMode,
+    report: &Arc<tokio::sync::Mutex<btx_core::snapshot_confirmer::NetworkReport>>,
+) {
+    let dd = node_datadir();
+    let outcome = btx_core::diary::record_at_tip(rpc, &dd, mode).await;
+    let Some(note) = diary_note(&outcome) else {
+        return;
+    };
+    let mut r = report.lock().await;
+    if r.diary.as_deref() != Some(note.as_str()) {
+        eprintln!("[snapshot] diary: {note}");
+        r.diary = Some(note);
+    }
+}
+
+/// One confirmer round (btx_core::snapshot_confirmer), from the status
+/// refresher every ten minutes. When the node does not confirm, the report
+/// says why and nothing is asked of easybtx.com. Only the public key is read
+/// here (`signer::read_signer_pubkey` derives it from the key file and
+/// returns nothing else); the engine signs with the private key itself.
+async fn confirm_round(
+    rpc: &RpcClient,
+    trusted: Option<btx_core::node_api::MatmulTrustedStatus>,
+    genesis: Option<String>,
+    report: &Arc<tokio::sync::Mutex<btx_core::snapshot_confirmer::NetworkReport>>,
+) {
+    use btx_core::snapshot_confirmer as confirmer;
+    let dd = node_datadir();
+    let env = btx_core::operators::regtest_env();
+    let off = |why: String| async move {
+        let mut r = report.lock().await;
+        if r.confirmer_off.as_deref() != Some(why.as_str()) {
+            eprintln!("[snapshot] confirmer off: {why}");
+            r.confirmer_off = Some(why);
+        }
+    };
+    let (Some(trusted), Some(genesis)) = (trusted, genesis) else {
+        off("the node has not answered yet".into()).await;
+        return;
+    };
+    let key_hex = btx_core::signer::read_signer_pubkey(&dd);
+    if let Some(why) = confirmer::why_not(&trusted, key_hex.as_deref(), &genesis, env.as_deref()) {
+        off(why.into()).await;
+        return;
+    }
+    // why_not read both already; these cannot fail after it.
+    let (Some(our_key), Some(chain)) = (
+        key_hex.as_deref().and_then(btx_core::operators::parse_key),
+        btx_core::operators::Chain::from_genesis_hex(&genesis),
+    ) else {
+        return;
+    };
+    let site = btx_core::snapshot_site::Site::from_env();
+    let client = btx_core::snapshot_site::client();
+    let (site, client) = match (site, client) {
+        (Ok(s), Ok(c)) => (s, c),
+        (Err(e), _) | (_, Err(e)) => {
+            let mut guard = report.lock().await;
+            let r = &mut *guard;
+            r.confirmer_off = None;
+            if let Some(line) = r
+                .confirmer
+                .stopped(&confirmer::NoRound::Site(e), &mut r.seen)
+            {
+                eprintln!("[snapshot] {line}");
+            }
+            return;
+        }
+    };
+    let work = snap::snapshot_dir(&dd).join(confirmer::WORK_DIR);
+    let c = confirmer::Confirmer {
+        rpc,
+        client: &client,
+        site: &site,
+        state_dir: &dd,
+        work_dir: &work,
+        our_key,
+        holds: btx_core::confirmed_load::Holds::compiled(),
+        regtest_env: env.as_deref(),
+    };
+    let round = c.round(chain).await;
+    let mut guard = report.lock().await;
+    let r = &mut *guard;
+    r.confirmer_off = None;
+    let lines = match round {
+        Ok(verdicts) => r.confirmer.add(&verdicts, &mut r.seen),
+        Err(why) => r.confirmer.stopped(&why, &mut r.seen).into_iter().collect(),
+    };
+    for line in lines {
+        eprintln!("[snapshot] {line}");
+    }
+}
+
+/// The producer's last step, said in one line for the log and Copy
+/// diagnostics. `None` when nothing happened (not due).
+fn producer_line(
+    outcome: &btx_core::snapshot_producer::SendOutcome,
+    height: u64,
+) -> Option<String> {
+    use btx_core::snapshot_producer::{SendOutcome, SubmissionOutcome};
+    Some(match outcome {
+        SendOutcome::NotDue => return None,
+        SendOutcome::NotListed => format!(
+            "offering block {height} on the network; this node's key is not on the operator \
+             list, so nothing is sent to easybtx.com"
+        ),
+        SendOutcome::NotSent(n) if n.retry() => {
+            format!("not sending block {height} yet: {n}; trying again in ten minutes")
+        }
+        SendOutcome::NotSent(n) => format!("not sending block {height}: {n}"),
+        SendOutcome::Sent(s) => {
+            let short = s.statement_hash.get(..16).unwrap_or(&s.statement_hash);
+            match &s.outcome {
+                SubmissionOutcome::Sent {
+                    file,
+                    operators,
+                    confirmed,
+                    ..
+                } => format!(
+                    "sent block {height} to easybtx.com (statement {short}, file {file}, signed by \
+                     {}{})",
+                    if operators.is_empty() {
+                        "no listed operator yet".to_string()
+                    } else {
+                        operators.join(", ")
+                    },
+                    if *confirmed { ", confirmed" } else { "" }
+                ),
+                _ => format!("sent block {height} to easybtx.com (statement {short})"),
+            }
+        }
+        SendOutcome::Failed { error } => format!(
+            "sending block {height} to easybtx.com failed; trying again in ten minutes: {error}"
+        ),
+        SendOutcome::GivenUp { reason } => {
+            format!("not sending block {height} to easybtx.com: {reason}")
+        }
+    })
+}
+
 /// The keeper: one loop per node start, superseded by the generation counter
-/// the moment the node stops or the role is switched off. A cycle in flight
-/// asks `keep_going` at every poll and aborts without offering anything.
+/// the moment the node stops or the role is switched off. Each tick: the
+/// gate, an export when the tip is exactly on the grid, one round over the
+/// exports waiting to be 144 deep, a re-offer of the recorded pair after a
+/// node start, and the offered pair to easybtx.com when it is due.
 fn spawn_snapshot_keeper(state: &AppState, datadir: PathBuf) {
     let gen = state.snapshot_serve_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let gen_counter = state.snapshot_serve_gen.clone();
     let rpc_slot = state.rpc.clone();
     let status_slot = state.snapshot_serve.clone();
+    let report_slot = state.snapshot_network.clone();
     let quitting = state.quitting.clone();
     tauri::async_runtime::spawn(async move {
         let dir = snap::snapshot_dir(&datadir);
         let alive =
             move || gen_counter.load(Ordering::SeqCst) == gen && !quitting.load(Ordering::SeqCst);
+        // The producer's checks, the hook every export, offer and re-offer
+        // goes through.
+        let checks = btx_core::snapshot_producer::ProducerChecks {
+            diary_dir: datadir.clone(),
+            holds: btx_core::confirmed_load::Holds::compiled(),
+            regtest_env: btx_core::operators::regtest_env(),
+        };
+        // The website and its client, made once per keeper.
+        let site = btx_core::snapshot_site::Site::from_env()
+            .and_then(|s| btx_core::snapshot_site::client().map(|c| (s, c)));
+        // What this keeper has said in the log, so a pair that waits or is
+        // refused is said once, not every tick.
+        let mut said: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut say = move |line: String| {
+            if said.insert(line.clone()) {
+                eprintln!("[snapshot] {line}");
+            }
+        };
         // A node that just came up needs a moment before its first answers
-        // mean anything; after that, a tick every half minute.
+        // mean anything.
         let mut wait = std::time::Duration::from_secs(15);
         loop {
             tokio::time::sleep(wait).await;
-            wait = std::time::Duration::from_secs(30);
             if !alive() {
                 return;
             }
@@ -7050,29 +7370,27 @@ fn spawn_snapshot_keeper(state: &AppState, datadir: PathBuf) {
                 set_snapshot_status(&status_slot, None);
                 return; // the stop path owns the rest
             };
+            let slow = rpc.with_timeout(SNAPSHOT_RPC_TIMEOUT);
             let facts = snap::read_facts(&rpc, Some(btx_core::disk::free_disk_mb(&datadir))).await;
-            let record = snap::load_record(&dir);
             let tip = facts.blocks;
-            let base = record.as_ref().map(|r| r.height);
-            let stale_by = tip.zip(base).map(|(t, b)| t.saturating_sub(b));
-            let from_record = |s: &mut snap::ServeStatus| {
+
+            if let Some(b) = snap::check(&facts).blocker {
+                let record = snap::load_record(&dir);
+                let mut s = snap::ServeStatus {
+                    offering: snap::offer_live(&rpc).await,
+                    message: snap::explain(&b),
+                    needs_attention: !b.is_transient(),
+                    stale_by: tip
+                        .zip(record.as_ref().map(|r| r.height))
+                        .map(|(t, h)| t.saturating_sub(h)),
+                    ..Default::default()
+                };
                 if let Some(r) = record.as_ref() {
                     s.base_height = Some(r.height);
                     s.base_hash = Some(r.block_hash.clone());
                     s.file_size = Some(r.file_size);
                     s.sha256 = Some(r.sha256.clone());
                 }
-                s.stale_by = stale_by;
-            };
-
-            if let Some(b) = snap::check(&facts).blocker {
-                let mut s = snap::ServeStatus {
-                    offering: snap::offer_live(&rpc).await,
-                    message: snap::explain(&b),
-                    needs_attention: !b.is_transient(),
-                    ..Default::default()
-                };
-                from_record(&mut s);
                 set_snapshot_status(&status_slot, Some(s));
                 // A permanent blocker needs a person; polling it every half
                 // minute changes nothing and fills the log.
@@ -7080,101 +7398,193 @@ fn spawn_snapshot_keeper(state: &AppState, datadir: PathBuf) {
                 continue;
             }
 
-            if snap::refresh_due(tip.unwrap_or(0), base) {
-                eprintln!(
-                    "[snapshot] tip {} is {} blocks past base {}; exporting a fresh snapshot",
-                    tip.unwrap_or(0),
-                    stale_by.unwrap_or(0),
-                    base.map(|b| b.to_string()).unwrap_or_else(|| "none".into())
-                );
-                let phase_slot = status_slot.clone();
-                let previous = record.clone();
-                let on_phase = move |p: snap::CyclePhase| {
-                    let mut s = snap::ServeStatus {
-                        // The OLD offer stays live while the new base matures.
-                        offering: previous.as_ref().map(|_| true),
-                        message: p.message(),
-                        phase: Some(p),
-                        ..Default::default()
-                    };
-                    if let Some(r) = previous.as_ref() {
-                        s.base_height = Some(r.height);
-                        s.base_hash = Some(r.block_hash.clone());
-                    }
-                    set_snapshot_status(&phase_slot, Some(s));
+            // Phases go to the Settings row as they happen; the end of the
+            // tick writes the whole status again.
+            let phase_slot = status_slot.clone();
+            let offered_before = snap::load_record(&dir);
+            let on_phase = move |p: snap::CyclePhase| {
+                let mut s = snap::ServeStatus {
+                    // The OLD offer stays live while a new base matures.
+                    offering: offered_before.as_ref().map(|_| true),
+                    message: p.message(),
+                    phase: Some(p),
+                    ..Default::default()
                 };
-                let keep_going = alive.clone();
-                match snap::run_cycle(
-                    &rpc,
-                    &dir,
-                    snap::MATURE_POLL,
-                    snap::MATURE_DEADLINE,
-                    &keep_going,
-                    &on_phase,
-                )
-                .await
+                if let Some(r) = offered_before.as_ref() {
+                    s.base_height = Some(r.height);
+                    s.base_hash = Some(r.block_hash.clone());
+                }
+                set_snapshot_status(&phase_slot, Some(s));
+            };
+
+            // ── Export, only with the tip exactly on the grid ───────────────
+            let mut export_problem: Option<String> = None;
+            let last =
+                snap::last_exported(snap::load_record(&dir).as_ref(), &snap::load_waiting(&dir));
+            // `alive` is asked again right before each step that acts: the
+            // switch can go off while a tick is in flight.
+            if alive() && tip.is_some_and(|t| snap::export_due(t, snap::EXPORT_GRID, last)) {
+                say(format!(
+                    "the tip is at {}, a multiple of {}; exporting a snapshot",
+                    tip.unwrap_or(0),
+                    snap::EXPORT_GRID
+                ));
+                match snap::export_on_grid(&slow, &dir, snap::EXPORT_GRID, &checks, &on_phase).await
                 {
-                    Ok(r) => eprintln!(
-                        "[snapshot] offering base {} ({} bytes, sha256 {}, file_hash {}, {} chunks)",
-                        r.height, r.file_size, r.sha256, r.file_hash, r.chunk_count
-                    ),
+                    Ok(p) => say(format!(
+                        "exported block {} ({}); it is offered once it is {} blocks deep",
+                        p.height,
+                        p.block_hash,
+                        snap::CONFIRMATIONS_REQUIRED
+                    )),
                     Err(e) => {
-                        eprintln!("[snapshot] cycle failed: {e}");
-                        let mut s = snap::ServeStatus {
-                            offering: snap::offer_live(&rpc).await,
-                            message: format!("The last export did not complete: {e}. Trying again."),
-                            ..Default::default()
-                        };
-                        from_record(&mut s);
-                        set_snapshot_status(&status_slot, Some(s));
-                        wait = std::time::Duration::from_secs(300);
+                        say(format!("export: {e}"));
+                        export_problem = Some(e);
                     }
                 }
-                continue;
             }
 
+            // ── Each waiting export, 144 deep and checked, is offered ───────
+            let mut waiting_note: Option<(u64, u64)> = None;
+            for ev in snap::mature(
+                &slow,
+                &dir,
+                snap::MATURE_DEADLINE,
+                &checks,
+                &on_phase,
+                &alive,
+            )
+            .await
+            {
+                match ev {
+                    snap::MatureEvent::Offered(r) => say(format!(
+                        "offering base {} ({} bytes, sha256 {}, file_hash {}, {} chunks)",
+                        r.height, r.file_size, r.sha256, r.file_hash, r.chunk_count
+                    )),
+                    snap::MatureEvent::Dropped { base, why } => {
+                        say(format!("dropped the export at block {base}: {why}"))
+                    }
+                    snap::MatureEvent::NotYet { base, why } => {
+                        say(format!("the export at block {base} waits: {why}"))
+                    }
+                    snap::MatureEvent::Waiting {
+                        base,
+                        confirmations,
+                        ..
+                    } => waiting_note = Some((base, confirmations)),
+                }
+            }
+
+            // ── After a node start, the recorded pair again ─────────────────
             if snap::offer_live(&rpc).await != Some(true) {
                 match snap::reoffer(
-                    &rpc,
+                    &slow,
                     &dir,
                     facts.blocks,
                     facts.headers,
                     facts.initial_block_download,
+                    &checks,
+                    &alive,
                 )
                 .await
                 {
                     Ok(snap::ReofferOutcome::Reoffered { height }) => {
                         eprintln!("[snapshot] re-offered base {height} after a node start")
                     }
-                    Ok(snap::ReofferOutcome::BaseNotCanonical { height }) => eprintln!(
-                        "[snapshot] base {height} is no longer on the active chain; \
-                         not re-offering, the next refresh replaces it"
-                    ),
+                    Ok(snap::ReofferOutcome::BaseNotCanonical { height }) => say(format!(
+                        "base {height} is no longer on the active chain; not re-offering, the \
+                         next export replaces it"
+                    )),
+                    Ok(snap::ReofferOutcome::Refused { height, why }) => {
+                        say(format!("not re-offering block {height}: {why}"))
+                    }
+                    Ok(snap::ReofferOutcome::SwitchedOff { .. }) => return,
                     Ok(_) => {}
-                    Err(e) => eprintln!("[snapshot] re-offer failed: {e}"),
+                    Err(e) => say(format!("re-offer failed: {e}")),
                 }
             }
 
+            // ── The offered pair to easybtx.com (design, section 4) ─────────
+            if !alive() {
+                return;
+            }
+            let record = snap::load_record(&dir);
+            if let Some(r) = record.as_ref() {
+                let line = match &site {
+                    Ok((site, client)) => producer_line(
+                        &btx_core::snapshot_producer::send_offered(
+                            &slow,
+                            &checks,
+                            client,
+                            site,
+                            &dir,
+                            r,
+                            unix_now(),
+                        )
+                        .await,
+                        r.height,
+                    ),
+                    Err(e) => Some(format!("nothing is sent to the website: {e}")),
+                };
+                if let Some(line) = line {
+                    let mut rep = report_slot.lock().await;
+                    if rep.producer.as_deref() != Some(line.as_str()) {
+                        eprintln!("[snapshot] {line}");
+                        rep.producer = Some(line);
+                    }
+                }
+            }
+
+            // Switched off during the send: the stop path cleared the row.
+            if !alive() {
+                return;
+            }
             let offering = snap::offer_live(&rpc).await;
             let peers_offering = snap::peers_offering(&rpc).await;
+            let mut message = match (record.as_ref(), offering) {
+                (Some(r), Some(true)) => snap::ServeStatus::serving_message(r, tip, peers_offering),
+                (Some(r), _) => format!(
+                    "A snapshot at block {} is on disk and not offered yet; the node has to be \
+                     at the tip, the block still on the chain, and the checks passed.",
+                    r.height
+                ),
+                (None, _) => format!(
+                    "Nothing offered yet. A snapshot is taken at the next multiple of {} blocks \
+                     and offered once it is {} blocks deep.",
+                    snap::EXPORT_GRID,
+                    snap::CONFIRMATIONS_REQUIRED
+                ),
+            };
+            if let Some((base, c)) = waiting_note {
+                message.push_str(&format!(
+                    " Block {base} is exported and waiting: {c} of {} blocks deep.",
+                    snap::CONFIRMATIONS_REQUIRED
+                ));
+            }
+            if let Some(e) = &export_problem {
+                message.push_str(&format!(
+                    " The last export did not complete ({e}). The next one is taken at the next \
+                     multiple of {} blocks.",
+                    snap::EXPORT_GRID
+                ));
+            }
             let mut s = snap::ServeStatus {
                 offering,
                 peers_offering,
-                message: match (record.as_ref(), offering) {
-                    (Some(r), Some(true)) => {
-                        snap::ServeStatus::serving_message(r, tip, peers_offering)
-                    }
-                    (Some(r), _) => format!(
-                        "A snapshot at block {} is on disk and not offered yet; the node has to be \
-                         at the tip and the block still on the chain.",
-                        r.height
-                    ),
-                    (None, _) => "Nothing exported yet.".to_string(),
-                },
+                message,
+                stale_by: tip
+                    .zip(record.as_ref().map(|r| r.height))
+                    .map(|(t, h)| t.saturating_sub(h)),
                 ..Default::default()
             };
-            from_record(&mut s);
+            if let Some(r) = record.as_ref() {
+                s.base_height = Some(r.height);
+                s.base_hash = Some(r.block_hash.clone());
+                s.file_size = Some(r.file_size);
+                s.sha256 = Some(r.sha256.clone());
+            }
             set_snapshot_status(&status_slot, Some(s));
+            wait = keeper_poll(tip);
         }
     });
 }
@@ -7227,8 +7637,8 @@ pub async fn set_snapshot_serve(state: State<'_, AppState>, on: bool) -> Result<
     }
     spawn_snapshot_keeper(&state, datadir);
     Ok(
-        "On. The first snapshot is exported at the tip and offered once it has ten \
-         confirmations, about fifteen minutes; after that it is refreshed every 500 blocks."
+        "On. A snapshot is taken each time the chain reaches a multiple of 100 blocks \
+         and offered once it is 144 blocks deep, about three and a half hours later."
             .to_string(),
     )
 }
@@ -10940,5 +11350,191 @@ mod slot_probe_tests {
         let read = call.find("verified_btxd_pidfile_pid(").unwrap();
         let adopted = call.find("retune_adopted_engine(pid").unwrap();
         assert!(guard < read && read < adopted);
+    }
+}
+
+/// The snapshot network in the app: the keeper's poll near the grid, what the
+/// diary step and the producer say, the refresher's wiring, and the words
+/// beside the switch.
+#[cfg(test)]
+mod snapshot_network_tests {
+    use super::{
+        diary_note, keeper_poll, producer_line, snapshot_steps, CONFIRM_EVERY_TICKS,
+        CONFIRM_FIRST_TICK,
+    };
+    use btx_core::diary::{DiaryEntry, DiaryOutcome};
+    use btx_core::snapshot_producer::{SendOutcome, Submission, SubmissionOutcome};
+    use std::time::Duration;
+
+    #[test]
+    fn the_keeper_looks_every_few_seconds_only_right_before_a_grid_height() {
+        assert_eq!(keeper_poll(Some(233_398)), Duration::from_secs(3));
+        assert_eq!(keeper_poll(Some(233_399)), Duration::from_secs(3));
+        assert_eq!(keeper_poll(Some(233_397)), Duration::from_secs(30));
+        // On the grid the export happens in that very tick.
+        assert_eq!(keeper_poll(Some(233_400)), Duration::from_secs(30));
+        assert_eq!(keeper_poll(None), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn the_diary_step_says_what_it_wrote_and_stays_quiet_otherwise() {
+        let e = DiaryEntry {
+            height: 233_400,
+            block_hash: "11bd18812b6afcd1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            hash_serialized: "ab".repeat(32),
+            coins: 140_936,
+            chain_tx: 250_000,
+            recorded_at: 0,
+        };
+        assert_eq!(
+            diary_note(&Ok(DiaryOutcome::Recorded(e))).as_deref(),
+            Some("wrote 233400 (block 11bd18812b6afcd1, 140936 coins)")
+        );
+        assert_eq!(
+            diary_note(&Ok(DiaryOutcome::AlreadyRecorded(233_400))),
+            None
+        );
+        assert_eq!(diary_note(&Ok(DiaryOutcome::NotOnGrid)), None);
+        for o in [DiaryOutcome::NotValidating, DiaryOutcome::Unvalidated] {
+            assert!(diary_note(&Ok(o)).unwrap().starts_with("not kept: "));
+        }
+        assert!(diary_note(&Ok(DiaryOutcome::TipMoved))
+            .unwrap()
+            .contains("100 blocks later"));
+        assert_eq!(
+            diary_note(&Err("gettxoutsetinfo: timed out".into())).as_deref(),
+            Some("gettxoutsetinfo: timed out")
+        );
+    }
+
+    #[test]
+    fn the_producer_says_one_line_per_outcome_and_nothing_when_not_due() {
+        assert_eq!(producer_line(&SendOutcome::NotDue, 233_400), None);
+        assert!(producer_line(&SendOutcome::NotListed, 233_400)
+            .unwrap()
+            .contains("not on the operator list, so nothing is sent to easybtx.com"));
+        let failed = SendOutcome::Failed {
+            error: "HTTP 503".into(),
+        };
+        assert_eq!(
+            producer_line(&failed, 233_400).as_deref(),
+            Some(
+                "sending block 233400 to easybtx.com failed; trying again in ten minutes: HTTP 503"
+            )
+        );
+        let sent = SendOutcome::Sent(Submission {
+            height: 233_400,
+            block_hash: "11".repeat(32),
+            statement_hash: "d3ee9312".repeat(8),
+            attempts: 1,
+            first_tried_at: 0,
+            last_tried_at: 0,
+            outcome: SubmissionOutcome::Sent {
+                at: 0,
+                file: "stored".into(),
+                operators: vec!["Mende".into()],
+                signers: vec![],
+                confirmed: false,
+            },
+        });
+        assert_eq!(
+            producer_line(&sent, 233_400).as_deref(),
+            Some(
+                "sent block 233400 to easybtx.com (statement d3ee9312d3ee9312, file stored, \
+                 signed by Mende)"
+            )
+        );
+    }
+
+    /// Every validating node keeps the diary from the refresher, off the
+    /// tick, and the confirmer's first round goes out about two minutes in,
+    /// then every ten.
+    #[test]
+    fn the_refresher_keeps_the_diary_and_runs_the_confirmer_off_the_tick() {
+        assert_eq!(
+            btx_core::snapshot_confirmer::CONFIRM_EVERY_SECS,
+            600,
+            "ten minutes"
+        );
+        // Off the grid, nothing busy: the counter climbs, no diary step.
+        let off_grid = 226_150;
+        let mut tick = CONFIRM_FIRST_TICK;
+        let mut rounds_at = Vec::new();
+        for n in 1..=440u32 {
+            let s = snapshot_steps(off_grid, tick, false, false);
+            assert!(!s.diary);
+            if s.confirm {
+                rounds_at.push(n);
+            }
+            tick = s.confirm_tick;
+        }
+        // The first round two minutes in (40 ticks of 3 s), then every ten
+        // minutes (200 ticks).
+        assert_eq!(rounds_at, vec![40, 240, 440]);
+
+        // A round still running when the counter is up: none starts, the
+        // counter is not reset, and the first free tick starts one.
+        let up = CONFIRM_EVERY_TICKS - 1;
+        let busy = snapshot_steps(off_grid, up, false, true);
+        assert!(!busy.confirm);
+        assert_eq!(busy.confirm_tick, CONFIRM_EVERY_TICKS);
+        let busy = snapshot_steps(off_grid, busy.confirm_tick, false, true);
+        assert!(!busy.confirm);
+        let free = snapshot_steps(off_grid, busy.confirm_tick, false, false);
+        assert!(free.confirm);
+        assert_eq!(free.confirm_tick, 0);
+
+        // The diary on the grid only, never two at once, and on its own:
+        // a running confirmer round does not hold it back.
+        assert!(snapshot_steps(226_200, 0, false, true).diary);
+        assert!(!snapshot_steps(226_200, 0, true, false).diary);
+        assert!(!snapshot_steps(226_201, 0, false, false).diary);
+
+        // And the refresher acts on this decision, with the slow handle.
+        let src = include_str!("commands.rs");
+        let refresher = src
+            .split("\nfn spawn_status_refresher(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .unwrap();
+        for part in [
+            "let steps = snapshot_steps(",
+            "if steps.diary {",
+            "if steps.confirm {",
+            "diary_step(&rpc, mode, &report)",
+            "confirm_round(&rpc, trusted, genesis, &report)",
+            "rpc.with_timeout(SNAPSHOT_RPC_TIMEOUT)",
+        ] {
+            assert!(refresher.contains(part), "the refresher lost {part}");
+        }
+    }
+
+    /// The words beside the switch and its answer name the grid and the
+    /// depth the keeper uses, and none of the old timings.
+    #[test]
+    fn the_switch_says_every_100_blocks_and_144_deep() {
+        let html = include_str!("../../index.html");
+        let ts = include_str!("../../src/main.ts");
+        let rs = include_str!("commands.rs");
+        let copy = "About 9 MB, taken every 100 blocks and offered once it is 144 blocks deep, \
+                    about three and a half hours later";
+        assert!(html.contains(copy) && ts.contains(copy));
+        let answer = rs
+            .split("pub async fn set_snapshot_serve(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(answer.contains("a multiple of 100 blocks"));
+        assert!(answer.contains("144 blocks deep, about three and a half hours later"));
+        for text in [html, ts, answer] {
+            for old in ["every 500 blocks", "refreshed every"] {
+                assert!(!text.contains(old), "{old} is still there");
+            }
+        }
+        for text in [copy, answer] {
+            assert!(!text.contains('\u{2014}') && !text.contains("ten confirmations"));
+        }
+        assert_eq!(btx_core::snapshot_serve::EXPORT_GRID, 100);
+        assert_eq!(btx_core::snapshot_serve::CONFIRMATIONS_REQUIRED, 144);
     }
 }
