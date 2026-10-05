@@ -183,6 +183,29 @@ pub enum DiaryOutcome {
     Unvalidated,
 }
 
+/// One writer at a time per diary file, across the whole process. The app
+/// has two: the status refresher's diary step and the producer's
+/// `before_export`, often at the same grid height. Unserialized, both load,
+/// both hash the whole UTXO set, and the later save can drop what the
+/// earlier one wrote. The lock is held from the load to the save, so the
+/// second writer sees the height written ([`DiaryOutcome::AlreadyRecorded`]).
+fn writer_lock(dir: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let path = diary_path(dir);
+    let key = std::fs::canonicalize(dir)
+        .map(|d| diary_path(&d))
+        .unwrap_or(path);
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key)
+        .or_default()
+        .clone()
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -284,7 +307,8 @@ pub async fn read_at_tip(rpc: &dyn Rpc) -> Result<Option<DiaryEntry>, String> {
 /// One diary step, cheap when there is nothing to do: a mode that does not
 /// validate asks nothing, and a tip off the grid costs one `getblockcount`.
 /// The status refresher calls it every tick, the producer right before it
-/// exports and `btx-confirmer` every few seconds. `dir` holds the diary (the
+/// exports and `btx-confirmer` every few seconds. Writers of one diary take
+/// turns ([`writer_lock`]), so two at the same height hash the UTXO set once. `dir` holds the diary (the
 /// datadir, or the confirmer's `--state`); `mode` is
 /// [`crate::role::validation_mode`] of the node's `getmatmultrustedstatus`.
 ///
@@ -322,6 +346,9 @@ pub async fn record_at_tip(
             "chain {genesis} is neither mainnet nor regtest, so it has no diary"
         ));
     }
+    // From here to the save, this is the diary's only writer.
+    let lock = writer_lock(dir);
+    let _writer = lock.lock().await;
     let mut diary = load(dir, &genesis);
     if let Some(known) = diary.at(tip).map(|e| e.block_hash.clone()) {
         if block_at(rpc, tip).await?.as_deref() == Some(known.as_str()) {
@@ -456,6 +483,51 @@ mod tests {
                 "getchaintxstats"
             ]
         );
+    }
+
+    /// A node that yields before every answer, so two diary steps on one
+    /// task interleave the way the status refresher's and the keeper's do.
+    struct Yielding<'a>(&'a FakeNode);
+
+    #[async_trait::async_trait]
+    impl Rpc for Yielding<'_> {
+        async fn call(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> crate::error::AppResult<serde_json::Value> {
+            tokio::task::yield_now().await;
+            self.0.call(method, params).await
+        }
+    }
+
+    /// The status refresher and the keeper's `before_export` both write the
+    /// diary at the same grid height. One writer at a time per diary: the
+    /// second waits, finds the height written, and does not hash the whole
+    /// UTXO set again.
+    #[tokio::test]
+    async fn two_writers_at_once_hash_the_utxo_set_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = regtest_at_100();
+        let node = Yielding(&fake);
+        let (a, b) = tokio::join!(
+            record_at_tip(&node, dir.path(), ValidationMode::Consensus),
+            record_at_tip(&node, dir.path(), ValidationMode::Consensus),
+        );
+        let mut outs = [a.unwrap(), b.unwrap()];
+        outs.sort_by_key(|o| matches!(o, DiaryOutcome::Recorded(_)));
+        assert!(
+            matches!(
+                &outs,
+                [
+                    DiaryOutcome::AlreadyRecorded(100),
+                    DiaryOutcome::Recorded(_)
+                ]
+            ),
+            "{outs:?}"
+        );
+        assert_eq!(fake.count("gettxoutsetinfo"), 1);
+        assert_eq!(load(dir.path(), REGTEST_GENESIS).entries.len(), 1);
     }
 
     #[tokio::test]
