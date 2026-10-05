@@ -27,6 +27,7 @@ pub mod confirmed_snapshot;
 pub mod console_policy;
 pub mod datadir;
 pub mod diagnostics;
+pub mod diary;
 pub mod disk;
 pub mod engine_priority;
 pub mod engine_warnings;
@@ -34,6 +35,8 @@ pub mod error;
 pub mod esplora;
 pub mod esplora_freshness;
 pub mod esplora_sidecar;
+#[cfg(test)]
+pub(crate) mod fake_node;
 pub mod fast_forward;
 pub mod fork;
 pub mod frontier;
