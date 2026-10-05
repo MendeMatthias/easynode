@@ -6,6 +6,25 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
+## [0.7.6] - 2026-10-05
+
+**A new node starts about 260 blocks behind the tip instead of 13,400.**
+Until a snapshot is confirmed by two operators, every new node starts from the
+signed snapshot built into the app. That was block 225,927, published on 21
+September, and by now it left a new node about 13,400 blocks to catch up:
+roughly three days on an RTX 3060. The built-in start is now block 239,111,
+exported on 5 October by this project's own validating node and signed by its
+key, `02d5efca`. Before it was built in, it was checked on a fresh node: it
+loaded in under two seconds and was following new blocks within a minute. Its
+block is the one api.btxscan.io shows at that height. A node that is already
+running is not affected; this only changes where a new one starts.
+
+**A node that also mines on the same graphics card catches up more slowly.**
+Not a change in this version, but measured while making it: on an RTX 3060, a
+node that shared the card with a miner checked about 67 blocks an hour while
+catching up, and about 200 to 250 an hour with the card to itself. At the tip
+both keep up, because the network makes about 40 blocks an hour.
+
 ## [0.7.5] - 2026-10-04
 
 **An archive peer that stopped answering is off the start list.**

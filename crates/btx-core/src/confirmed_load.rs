@@ -724,9 +724,9 @@ mod tests {
         include_bytes!("../tests/fixtures/confirmed_snapshot/regtest-PCD.manifest");
     const R_P: &[u8] = include_bytes!("../tests/fixtures/confirmed_snapshot/regtest-P.manifest");
     const R_DAT: &[u8] = include_bytes!("../tests/fixtures/confirmed_snapshot/regtest-100.dat");
-    /// The published 225,927 manifest: the pinned pair's, signed by the 3060.
+    /// The published 239,111 manifest: the pinned pair's, signed by the 3060.
     const PINNED_MANIFEST: &[u8] =
-        include_bytes!("../tests/fixtures/confirmed_snapshot/mainnet-225927.manifest");
+        include_bytes!("../tests/fixtures/confirmed_snapshot/mainnet-239111.manifest");
     const THE_3060: &str = "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675";
     const P: &str = "0343faebbc3a28f2e452132477192cb5455f0c0f2cfdab01c9217c43c2cbc3e464";
     const C: &str = "02c05d68daeabe9e5f0556fcdca6c5a4011eca1d46ee34826d444d1d95b15e6c0f";

@@ -9,8 +9,8 @@
 //!    signed, checked here by [`crate::confirmed_snapshot`] before anything
 //!    is downloaded past the manifest. Nothing the website says is trusted;
 //!    the pointer only says where to look.
-//! 2. The pair published before any of this existed ([`pinned_pair`], base
-//!    225,927). One operator signed it, but its sizes and hashes are compiled
+//! 2. The pair compiled into this app ([`pinned_pair`], base 239,111 since
+//!    0.7.6, 225,927 before). One operator signed it, but its sizes and hashes are compiled
 //!    into the app, so it is trusted as the app is.
 //! 3. The snapshot compiled into the engine (`crate::snapshot`).
 //!
@@ -59,19 +59,24 @@ pub struct AttestedPair {
     pub manifest_sha256: String,
 }
 
-/// The pair published before the pointer existed: base 225,927, on the chain
-/// both sides of the 227,313 split share. Read from the published files on
-/// 2026-09-26: the manifest (statement version 2, 140,731 coins) carries one
-/// signature, by `02d5efca`, the key every mirror pins since 0.6.30, and its
-/// `snapshot_file_hash` equals the file's byte-reversed double SHA-256
-/// (`f234192d…`). The sizes and SHA-256 values below are those files'.
+/// The pair every node starts from while no snapshot is confirmed: base
+/// 239,111, exported by the 3060's own validating node on 2026-10-05 and
+/// published as `utxo-snapshot-239111`. Until 0.7.6 this was 225,927, which by
+/// then left a new node about 13,400 blocks to catch up, roughly three days on
+/// a 3060. Checked before it was pinned: the base is block 239,111 on
+/// api.btxscan.io and on the signer's node; the statement's chain transaction
+/// count (342,192) equals `getchaintxstats` at that block; its shielded pin is
+/// mainnet's fixed value; the manifest's one signature, by `02d5efca`,
+/// verifies; and `loadtxoutsetattested` on a fresh node loaded it in 1.4 s and
+/// followed signatures to 239,289 within a minute. 209,953 coins. The sizes
+/// and SHA-256 values below are the published files'.
 pub fn pinned_pair() -> AttestedPair {
     AttestedPair {
-        height: 225_927,
-        block_hash: "06780445dae193010e099e6425c5430f121416b067b8d68a8a5c3b52e8a4b932".into(),
-        file_size: 9_045_522,
-        sha256: "5f386c9c8be5a6c28bc5b63352903325cfe6a64a68c68b38f49ea4ac85f9ca05".into(),
-        manifest_sha256: "8adc90c2b4514334d0bc0e1dafa5f3bc85ed0cfcc55d051a586e117794e332ed".into(),
+        height: 239_111,
+        block_hash: "9290188337a649a16227603a8bebe7468289bb07499f63f13f2d0548101c448e".into(),
+        file_size: 12_307_808,
+        sha256: "2b882ea838a50e2ce5dd298890665888f3d108c5d51a74ae7d3b41aa08cc922f".into(),
+        manifest_sha256: "9d2ffca2a4b657e64e6a1de9c8c1f3ffea3933d4e1c468c74fe744c4f1901442".into(),
     }
 }
 
@@ -935,8 +940,13 @@ mod tests {
     fn the_pin_is_a_real_pair_above_the_compiled_snapshot() {
         let p = pinned_pair();
         assert!(check(&p, COMPILED).is_ok());
-        // Below the 23 September split, on the chain both sides share.
-        assert!(p.height < 227_313);
+        // Until 0.7.6 the pin sat below the 23 September split (227,313), on
+        // the chain both sides shared, while mirrors still followed the longer
+        // branch. 0.7.6 moved it past every block this app refuses
+        // (`crate::known_invalid`): on the pinned base's chain, 227,313 is the
+        // valid `d5f0e92f…`, and 228,146 and 229,400 are neither held root
+        // (read on the signer's node and on api.btxscan.io, 2026-10-05).
+        assert!(p.height > 229_400);
         let mut broken = p.clone();
         broken.sha256.pop();
         assert!(check(&broken, COMPILED).is_err());
@@ -946,8 +956,8 @@ mod tests {
     /// engine that one day compiles a higher base beats both.
     #[test]
     fn the_fallback_start_is_the_higher_of_the_pin_and_the_compiled_base() {
-        assert_eq!(fallback_start(COMPILED), 225_927);
-        assert_eq!(fallback_start(228_000), 228_000);
+        assert_eq!(fallback_start(COMPILED), 239_111);
+        assert_eq!(fallback_start(240_000), 240_000);
     }
 
     #[test]
@@ -1668,7 +1678,7 @@ mod tests {
     /// Before a release: the pinned pair is still published byte for byte.
     /// `cargo test -p btx-core -- --ignored the_pinned_pair_is_still_published`
     #[tokio::test]
-    #[ignore = "network: downloads 9 MB from GitHub"]
+    #[ignore = "network: downloads 12 MB from GitHub"]
     async fn the_pinned_pair_is_still_published() {
         let tmp = tempfile::tempdir().unwrap();
         let client = http_client().unwrap();
