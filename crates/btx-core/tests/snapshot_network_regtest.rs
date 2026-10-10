@@ -239,9 +239,17 @@ impl Node {
             .find(|l| l.contains("MatMul RC execution policy:"))
             .unwrap_or_default()
             .to_string();
-        let ok = log.contains("no_supported_device")
+        // `no_supported_device` comes from src/cuda/cuda_context.cpp, so only
+        // a CUDA build can say it. A macOS engine is a Metal build with no
+        // CUDA context (measured 2026-10-10: v0.34.12 and v0.34.15 both fail
+        // the CUDA-only line on an M-series Mac with the policy line right),
+        // so there the proof is the policy line and no device provider at all.
+        let device_hidden =
+            log.contains("no_supported_device") || cfg!(target_os = "macos");
+        let ok = device_hidden
             && policy.contains("cpu-diagnostic provider=toy-rc")
-            && !log.contains("provider=cuda");
+            && !log.contains("provider=cuda")
+            && !log.contains("provider=metal");
         if !ok {
             self.kill();
             panic!(
