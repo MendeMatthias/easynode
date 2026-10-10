@@ -101,10 +101,19 @@ env:
   # btxd-windows-5f32c4c4... (19524914 bytes). All four pins move together.
   # VERSION and TAG are equal: the binary reports v0.34.12 and the install key
   # is plain v0.34.12.
-  PROVEN_BTXD_RUN_ID: "36723745858"
-  PROVEN_BTXD_ARTIFACT: "btxd-windows-5f32c4c4d1cb033180bcd40a461deae2c1bc1ee1"
-  PROVEN_BTXD_VERSION: "v0.34.12"
-  PROVEN_BTXD_TAG: "v0.34.12"
+  #
+  # MOVED 2026-10-10 to upstream's TAG v0.34.15 = 476f3f23, because mainnet
+  # block 244000 switched on consensus checks 0.34.12 lacks (commands.rs has
+  # the reasoning). Run 38062021519, dispatched on claude/engine-0.34.15 with
+  # the new default ref: both jobs green, the mingw cross-compile (`native model
+  # network ... OFF`) and "regtest smoke on real Windows" (`BTX daemon version
+  # v0.34.15`, SMOKE PASSED), artifact btxd-windows-476f3f23... (19644349
+  # bytes). All four pins move together. VERSION and TAG are equal: the binary
+  # reports v0.34.15 and the install key is plain v0.34.15.
+  PROVEN_BTXD_RUN_ID: "38062021519"
+  PROVEN_BTXD_ARTIFACT: "btxd-windows-476f3f23e15228bb3e6119ed1e139a9b25424ce8"
+  PROVEN_BTXD_VERSION: "v0.34.15"
+  PROVEN_BTXD_TAG: "v0.34.15"
 
 permissions:
   contents: read
