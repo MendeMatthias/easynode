@@ -244,8 +244,7 @@ impl Node {
         // CUDA context (measured 2026-10-10: v0.34.12 and v0.34.15 both fail
         // the CUDA-only line on an M-series Mac with the policy line right),
         // so there the proof is the policy line and no device provider at all.
-        let device_hidden =
-            log.contains("no_supported_device") || cfg!(target_os = "macos");
+        let device_hidden = log.contains("no_supported_device") || cfg!(target_os = "macos");
         let ok = device_hidden
             && policy.contains("cpu-diagnostic provider=toy-rc")
             && !log.contains("provider=cuda")

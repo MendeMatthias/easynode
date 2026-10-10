@@ -19,6 +19,15 @@ rest of the network refuses and end up on a different chain. The chain passed
 244,000 before this release, so please update. On the first start after the
 update the app fetches the new engine once, as it did for 0.34.12.
 
+**If the new engine cannot be installed, the old one no longer starts.**
+Until now, when an update could not put the new engine in place (not enough
+free disk, for example), the app quietly kept running the engine it already
+had. From now on it does that only if the old engine follows the network's
+current rules. 0.34.12 does not, so the node stops instead, the screen says
+why, and pressing Start tries the update again once the cause is fixed. A node
+that is honestly stopped is better than one that says Ready on the wrong
+chain.
+
 **Why 0.34.15 and not 0.34.14.** 0.34.14 brought the new rules, but a node
 coming back from a restart or an outage could sit there without adding blocks.
 0.34.15 fixes that. Upstream also warns that 0.34.13 can split from the rest

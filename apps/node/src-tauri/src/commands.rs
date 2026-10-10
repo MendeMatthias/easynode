@@ -1105,6 +1105,27 @@ pub(crate) const ALREADY_STARTING: &str = "the node is already starting, give it
 /// Spawn (or attach to) the node and bring the app to a running state:
 /// RPC client armed, snapshot-load guaranteed in the background, keep-awake
 /// held, and the status refresher loop driving the phase.
+/// What a start does when this release's engine could not be provisioned over
+/// the one already installed under `installed`. It used to launch `installed`
+/// whatever it was, which is the failure the upgrade branch exists to prevent:
+/// past a flag day the old engine forks off while the screen says Ready. Since
+/// mainnet block 244000 that is every engine below 0.34.14, including the
+/// 0.34.12 every 0.7.x install holds, so such a start stops here with the
+/// reason on screen, and the next Start tries the upgrade again. An installed
+/// engine that still follows the rules keeps the old fallback.
+fn after_failed_engine_upgrade(installed: &str, err: &str) -> Result<(), String> {
+    if btx_core::node::engine_follows_network_rules(installed) {
+        return Ok(());
+    }
+    Err(format!(
+        "The node engine could not be updated to {NODE_RELEASE_TAG}: {err}. The engine \
+         installed now, {installed}, does not follow the network's rules since block \
+         244,000 and could end up on its own chain while looking healthy, so it is not \
+         started. Fix the cause above if it names one (often free disk space), then press \
+         Start to try the update again."
+    ))
+}
+
 pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Result<(), String> {
     // One start at a time, held through a drop guard so a panic releases it.
     // The double-spawn guard further down keys on a live child in
@@ -1277,8 +1298,17 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
                         tag = NODE_RELEASE_TAG.to_string();
                     }
                     Err(e) => {
-                        // Non-fatal: keep launching the old, known-good tag.
-                        eprintln!("[node-app] node upgrade provisioning failed (using {tag}): {e}");
+                        // Non-fatal only while the installed engine still
+                        // follows the network's rules; see
+                        // `after_failed_engine_upgrade`.
+                        eprintln!(
+                            "[node-app] node upgrade provisioning failed (installed {tag}): {e}"
+                        );
+                        setup_log(
+                            &datadir,
+                            &format!("engine upgrade to {NODE_RELEASE_TAG} failed (installed {tag}): {e}"),
+                        );
+                        after_failed_engine_upgrade(&tag, &e.to_string())?;
                     }
                 }
             }
@@ -7921,9 +7951,9 @@ pub async fn node_footprint(state: State<'_, AppState>) -> Result<NodeFootprint,
 #[cfg(test)]
 mod tests {
     use super::{
-        attached_node_is_ours_to_stop, ends_header_bootstrap, header_bootstrap_end_message,
-        pre_launch_plan, refused_record, snapshot_spec, witness_started_message, AttachedTo,
-        PreLaunchPlan, NODE_RELEASE_COMMIT, NODE_RELEASE_TAG,
+        after_failed_engine_upgrade, attached_node_is_ours_to_stop, ends_header_bootstrap,
+        header_bootstrap_end_message, pre_launch_plan, refused_record, snapshot_spec,
+        witness_started_message, AttachedTo, PreLaunchPlan, NODE_RELEASE_COMMIT, NODE_RELEASE_TAG,
     };
 
     /// To the plugin a refused update IS no update, so the webview reports
@@ -8665,6 +8695,38 @@ mod tests {
             btx_core::installer::conf_for_profile("full", NODE_RELEASE_TAG),
             btx_core::installer::NODE_FASTSTART_CONF
         );
+    }
+
+    /// A failed engine upgrade used to launch the installed engine whatever it
+    /// was. Past block 244000 that is 0.34.12 on every 0.7.x install, which
+    /// lacks the network's rules, so the start must stop and say why.
+    #[test]
+    fn a_failed_upgrade_never_falls_back_to_an_engine_without_the_rules() {
+        let err = "not enough free disk to un-prune it";
+        let refused = after_failed_engine_upgrade("v0.34.12", err)
+            .expect_err("0.34.12 must not be launched past 244000");
+        assert!(refused.contains(err), "the reason is kept: {refused}");
+        assert!(refused.contains("v0.34.12"), "{refused}");
+        assert!(refused.contains(NODE_RELEASE_TAG), "{refused}");
+        assert!(refused.contains("244,000"), "{refused}");
+        assert!(refused.contains("Start"), "it says how to retry: {refused}");
+        assert!(!refused.contains('\u{2014}'), "{refused}");
+        for old in ["v0.34.13", "v0.34.9", "v0.34.6-3013c2c2", ""] {
+            assert!(after_failed_engine_upgrade(old, err).is_err(), "{old}");
+        }
+    }
+
+    /// The fallback is still worth having for an engine that follows the
+    /// rules: a node on a good older engine beats no node.
+    #[test]
+    fn a_failed_upgrade_keeps_an_engine_that_follows_the_rules() {
+        for ok in ["v0.34.14", "v0.34.15"] {
+            assert_eq!(
+                after_failed_engine_upgrade(ok, "copy failed"),
+                Ok(()),
+                "{ok}"
+            );
+        }
     }
 
     /// "snapshot_spec() moves WITH this constant" was a comment, and nothing
