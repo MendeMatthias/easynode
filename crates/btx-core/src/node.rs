@@ -197,6 +197,24 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // AND current (docs/archival-capacity.md).
     // 2026-09-05 19:49Z: answered at 210862 (minority branch, ten behind it).
     "109.199.124.187:19335",
+    // archive.btxbyronbay.com, Jarek's FULL-HISTORY archive, offered by its
+    // operator 2026-10-11 ("serves the entire chain: every block header and
+    // every full block"). Measured from this project's Mac the same day, by
+    // name and by this IP: /BTX:0.34.15/, protocol 800002, start height
+    // 244,596 (the pool seed above read 244,597 in the same minute), services
+    // 0x2000d09 = NETWORK, WITNESS, SHIELDED, NETWORK_LIMITED, P2P_V2 and
+    // MATMUL_TRUSTED_MIRROR. Then asked for deep bodies: `getdata` for block
+    // 1,000 returned it in 0.6 s and for block 150,000 (1,048,962 bytes) in
+    // 2.3 s, each naming the right parent (894cc48f… and 06754227…).
+    //
+    // It sits here, after the live-chain seed, and NOT in BTX_ARCHIVE_PEERS:
+    // it carries no MATMUL_ATTESTATION_ARCHIVE bit and is itself a trusted
+    // mirror, so it cannot hand signatures to a mirror, which is what that
+    // list is for. What it does hold is the whole chain, which no other entry
+    // in either list does. Literal IP, like every entry here, because the
+    // catch-up help matches these against the engine's peer addresses; if the
+    // host moves, the name above is where to look first.
+    "134.199.150.193:19335",
     // 89.167.80.220 and 51.15.18.10 REMOVED 2026-09-05. Both /BTX:0.32.12/,
     // both measured parked at 185,109 on a pre-fork dead branch and answering
     // 2,000 headers of it to anyone who asks; the validator has carried both
@@ -8100,10 +8118,12 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
         // BTX_ARCHIVE_PEERS and leaves the head.
         // 2026-10-01: 3 became 1 — 89.85.40.184 and 194.93.48.158 refused
         // three TCP dials each from the Mac and are down in the census.
+        // 2026-10-11: 1 became 2 — Jarek's full-history archive at
+        // 134.199.150.193, measured serving blocks 1,000 and 150,000.
         assert_eq!(
             BTX_BOOTSTRAP_PEERS.len(),
-            1,
-            "BTX_BOOTSTRAP_PEERS should have 1 entry"
+            2,
+            "BTX_BOOTSTRAP_PEERS should have 2 entries"
         );
     }
 
