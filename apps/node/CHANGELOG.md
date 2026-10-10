@@ -6,7 +6,7 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
-## [Unreleased]
+## [0.7.10] - 2026-10-11
 
 **A second source of signatures and old blocks.** The app now also dials the
 second node behind btxscan.io, which keeps the whole chain and hands out the
