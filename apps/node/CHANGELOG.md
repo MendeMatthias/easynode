@@ -6,14 +6,21 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
-## [Unreleased]
+## [0.7.9] - 2026-10-10
 
-**A second place to fetch old blocks from.** The app now also dials
-archive.btxbyronbay.com, a node that keeps the whole chain, offered by its
-operator Jarek. A new node, or one catching up, can fetch old blocks from it
-when other peers only keep recent ones. We checked it before adding it: it
-runs BTX 0.34.15, is at the tip, and sent back old blocks (1,000 and 150,000)
-when asked.
+**A node that is far behind can fetch old blocks again.** A node that is
+catching up asks the peers built into the app for the blocks it is missing.
+We measured those peers on 10 October: both of them keep only recent blocks,
+and both answered "not found" when asked for an old one. So a new node,
+which starts about 5,500 blocks behind, or one that was switched off for more
+than a few hours, could only wait for the rest of the network to send the
+blocks on its own. The app now also dials archive.btxbyronbay.com, a node that
+keeps the whole chain, offered by its operator Jarek. Before adding it we
+checked it: it runs BTX 0.34.15, is at the tip, and sent back old blocks
+(1,000 and 150,000) when asked, each one the right block.
+
+Nothing else changes. The node engine stays BTX 0.34.15, so this update does
+not download the engine again.
 
 ## [0.7.8] - 2026-10-10
 
