@@ -119,8 +119,12 @@ APP_DEGRADED_GATE="node_allows_degraded_matmul_start"
 APP_SINGLE_KEY_OVERRIDE="-allowsinglekeytrustedmirror=1"
 # The unguarded unblocked-pin check (see the header). Measured on 2026-09-23:
 # absent on v0.34.4, v0.34.5 and v0.34.6, where the same comparison sits behind
-# `if (!trusted_signers.empty() &&`; present on v0.34.8-rc4 and v0.34.9. Its
-# presence means a node holding a local signing key and no pin is refused.
+# `if (!trusted_signers.empty() &&`; present on v0.34.8-rc4, v0.34.9 and
+# v0.34.12. Its presence means a node holding a local signing key and no pin is
+# refused. Absent again on v0.34.15 (read 2026-10-10, init.cpp:1813-1815): the
+# comparison is now `unblocked_pin_capacity <`, which counts a local secp WIF as
+# seeding the pin, so a signer with no pin starts and "accepted" is the right
+# reading. The app's self-pin stays harmless there.
 SIGNER_UNPINNED_REFUSAL="if (unblocked_pin_members <"
 # The app-side answer: node.rs pins a validating signer's own key.
 APP_SIGNER_SELF_PIN="signing_key_self_pin"

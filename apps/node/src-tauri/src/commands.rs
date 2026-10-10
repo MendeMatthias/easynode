@@ -359,19 +359,58 @@ use crate::state::{
 // consensus start, 1-of-1 mirror refused, signer self-pin present, manifest
 // rows cuda/sm_120 and metal/m4_class).
 //
-// THE INSTALL KEY IS `v0.34.12`, bare, equal to what btxd reports. No release
-// ever used it, so every install re-provisions on update and fetches the
+// THE INSTALL KEY WAS `v0.34.12`, bare, equal to what btxd reports. No release
+// ever used it, so every install re-provisioned on update and fetched the
 // engine once, as the move to `v0.34.9` did.
-pub const NODE_RELEASE_TAG: &str = "v0.34.12";
+//
+// ── 2026-10-10: v0.34.15, BECAUSE BLOCK 244000 IS A FLAG DAY ────────────────
+//
+// Tag `v0.34.15` = `476f3f23e15228bb3e6119ed1e139a9b25424ce8` (annotated tag,
+// tagged 2026-10-06; upstream PR 223). Why it cannot wait: 0.34.14 schedules
+// three consensus checks at mainnet height 244000
+// (BTX_SECURITY_ACTIVATION_HEIGHT, chainparams.cpp:181): a 32-byte HTLC
+// preimage, recovery proofs counted in the shielded block budget, and
+// nMatMulPhase1HeaderNotMostWorkHeight, so a MatMul header that only passed
+// the compact-target precheck can no longer become the best header (5be6edd6).
+// 0.34.12 has none of the three, so past 244000 it can follow headers and
+// accept blocks every 0.34.14+ node refuses. The chain passed 244000 before
+// this pin moved (easybtx.com measured 244282 on 2026-10-10). 0.34.15 rather
+// than 0.34.14 because 0.34.14 can sit without connecting blocks after a
+// restart or outage (a unique followed tip-child waited for a fresh rcadmit
+// ticket); 0.34.15 ExactReplays it. Upstream's notice also warns that a block
+// 0.34.12 accepts could split 0.34.13 nodes, so no install should stop there.
+//
+// What else moved, read at the SHA. PR 211 (the bounded-mode livelock named
+// above) is in. An unset `-reorgpolicy` is legacy again from 0.34.14
+// (node/chainstatemanager_args.cpp:155); node.rs still passes
+// `-reorgpolicy=legacy` explicitly, which is the same mode and keeps the launch
+// line independent of the default. The qualified-device warning above is
+// REVERSED: a qualified GPU digest that disagrees with a header is now a
+// retryable local failure (`qualified_device_digest_mismatch_retryable`,
+// matmul/matmul_v4_rc_gkr.cpp), not a final InvalidConsensus, so a GPU that
+// computes wrong no longer rejects a valid block for good. chainparams.cpp
+// adds no assumeutxo base: 219000 and 228000 are unchanged, so snapshot_spec()
+// stays on 219000 for the reasons above. Both guards pass on the tag
+// (check-engine-tag.sh: 5 of 5 on the sentinel, shielded commitment 94343b76;
+// check-engine-fleet-ready.sh: degraded consensus start, 1-of-1 mirror
+// refused, signer self-pin present, manifest rows cuda/sm_120 and
+// metal/m4_class, the same two as 0.34.12). Upstream publishes no SHA256SUMS
+// for 0.34.15; the archive hashes the staging scripts pin are GitHub's asset
+// digests, which equal the ones numair lists on PR 223.
+//
+// THE INSTALL KEY IS `v0.34.15`, bare, equal to what btxd reports. No release
+// ever used it, so every install re-provisions on update and fetches the
+// engine once.
+pub const NODE_RELEASE_TAG: &str = "v0.34.15";
 
 /// The exact upstream commit NODE_RELEASE_TAG names: the commit upstream's
-/// annotated tag `v0.34.12` points at. Kept set although the key is itself
+/// annotated tag `v0.34.15` points at. Kept set although the key is itself
 /// an upstream tag, so the guards, `engine_pin_ref` and the engine build
 /// workflows check out a SHA that cannot move under us, and the CI artifacts
 /// are named for the commit (`btxd-<os>-<sha>`), which is what the installer
 /// workflows' identity checks compare. If upstream ever re-tags, this does not
 /// move by itself; re-run both guards on the new commit and choose a new key.
-pub const NODE_RELEASE_COMMIT: &str = "5f32c4c4d1cb033180bcd40a461deae2c1bc1ee1";
+pub const NODE_RELEASE_COMMIT: &str = "476f3f23e15228bb3e6119ed1e139a9b25424ce8";
 
 /// The pinned assumeutxo snapshot this app bootstraps from: height 219000,
 /// [`btx_core::snapshot::v0_34_9_spec`], pinned from upstream's manifest and
@@ -1066,6 +1105,27 @@ pub(crate) const ALREADY_STARTING: &str = "the node is already starting, give it
 /// Spawn (or attach to) the node and bring the app to a running state:
 /// RPC client armed, snapshot-load guaranteed in the background, keep-awake
 /// held, and the status refresher loop driving the phase.
+/// What a start does when this release's engine could not be provisioned over
+/// the one already installed under `installed`. It used to launch `installed`
+/// whatever it was, which is the failure the upgrade branch exists to prevent:
+/// past a flag day the old engine forks off while the screen says Ready. Since
+/// mainnet block 244000 that is every engine below 0.34.14, including the
+/// 0.34.12 every 0.7.x install holds, so such a start stops here with the
+/// reason on screen, and the next Start tries the upgrade again. An installed
+/// engine that still follows the rules keeps the old fallback.
+fn after_failed_engine_upgrade(installed: &str, err: &str) -> Result<(), String> {
+    if btx_core::node::engine_follows_network_rules(installed) {
+        return Ok(());
+    }
+    Err(format!(
+        "The node engine could not be updated to {NODE_RELEASE_TAG}: {err}. The engine \
+         installed now, {installed}, does not follow the network's rules since block \
+         244,000 and could end up on its own chain while looking healthy, so it is not \
+         started. Fix the cause above if it names one (often free disk space), then press \
+         Start to try the update again."
+    ))
+}
+
 pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Result<(), String> {
     // One start at a time, held through a drop guard so a panic releases it.
     // The double-spawn guard further down keys on a live child in
@@ -1238,8 +1298,17 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
                         tag = NODE_RELEASE_TAG.to_string();
                     }
                     Err(e) => {
-                        // Non-fatal: keep launching the old, known-good tag.
-                        eprintln!("[node-app] node upgrade provisioning failed (using {tag}): {e}");
+                        // Non-fatal only while the installed engine still
+                        // follows the network's rules; see
+                        // `after_failed_engine_upgrade`.
+                        eprintln!(
+                            "[node-app] node upgrade provisioning failed (installed {tag}): {e}"
+                        );
+                        setup_log(
+                            &datadir,
+                            &format!("engine upgrade to {NODE_RELEASE_TAG} failed (installed {tag}): {e}"),
+                        );
+                        after_failed_engine_upgrade(&tag, &e.to_string())?;
                     }
                 }
             }
@@ -7882,9 +7951,9 @@ pub async fn node_footprint(state: State<'_, AppState>) -> Result<NodeFootprint,
 #[cfg(test)]
 mod tests {
     use super::{
-        attached_node_is_ours_to_stop, ends_header_bootstrap, header_bootstrap_end_message,
-        pre_launch_plan, refused_record, snapshot_spec, witness_started_message, AttachedTo,
-        PreLaunchPlan, NODE_RELEASE_COMMIT, NODE_RELEASE_TAG,
+        after_failed_engine_upgrade, attached_node_is_ours_to_stop, ends_header_bootstrap,
+        header_bootstrap_end_message, pre_launch_plan, refused_record, snapshot_spec,
+        witness_started_message, AttachedTo, PreLaunchPlan, NODE_RELEASE_COMMIT, NODE_RELEASE_TAG,
     };
 
     /// To the plugin a refused update IS no update, so the webview reports
@@ -8628,6 +8697,38 @@ mod tests {
         );
     }
 
+    /// A failed engine upgrade used to launch the installed engine whatever it
+    /// was. Past block 244000 that is 0.34.12 on every 0.7.x install, which
+    /// lacks the network's rules, so the start must stop and say why.
+    #[test]
+    fn a_failed_upgrade_never_falls_back_to_an_engine_without_the_rules() {
+        let err = "not enough free disk to un-prune it";
+        let refused = after_failed_engine_upgrade("v0.34.12", err)
+            .expect_err("0.34.12 must not be launched past 244000");
+        assert!(refused.contains(err), "the reason is kept: {refused}");
+        assert!(refused.contains("v0.34.12"), "{refused}");
+        assert!(refused.contains(NODE_RELEASE_TAG), "{refused}");
+        assert!(refused.contains("244,000"), "{refused}");
+        assert!(refused.contains("Start"), "it says how to retry: {refused}");
+        assert!(!refused.contains('\u{2014}'), "{refused}");
+        for old in ["v0.34.13", "v0.34.9", "v0.34.6-3013c2c2", ""] {
+            assert!(after_failed_engine_upgrade(old, err).is_err(), "{old}");
+        }
+    }
+
+    /// The fallback is still worth having for an engine that follows the
+    /// rules: a node on a good older engine beats no node.
+    #[test]
+    fn a_failed_upgrade_keeps_an_engine_that_follows_the_rules() {
+        for ok in ["v0.34.14", "v0.34.15"] {
+            assert_eq!(
+                after_failed_engine_upgrade(ok, "copy failed"),
+                Ok(()),
+                "{ok}"
+            );
+        }
+    }
+
     /// "snapshot_spec() moves WITH this constant" was a comment, and nothing
     /// held anyone to it. Both ways of breaking it are silent. A base the
     /// engine does not compile in makes `loadtxoutset` refuse, and every fast
@@ -8658,6 +8759,10 @@ mod tests {
             // the_pinned_compiled_base_is_below_every_refused_block forbids
             // until a compiled load checks for refused blocks after loading.
             "v0.34.12" => 219_000,
+            // Adds no base: chainparams.cpp at 476f3f23 changes only the
+            // 244000 activation constants, so 219000 and 228000 stand as on
+            // 0.34.12, and the pin stays on 219000 for the same reasons.
+            "v0.34.15" => 219_000,
             other => panic!(
                 "no record of the assumeutxo bases {other} carries: read `git show \
                  {other}:src/kernel/chainparams.cpp` (m_assumeutxo_data), add its row \

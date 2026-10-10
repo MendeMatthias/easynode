@@ -257,21 +257,22 @@ release's sums, and stages them into `src-tauri/resources/node-pkg/`. Without it
 `tauri build` fails with `glob pattern resources/node-pkg/**/* path not found`,
 because `tauri.conf.json` declares that directory as a bundle resource.
 
-The staged engine is BTX v0.34.9: upstream's tag `v0.34.9` at commit
-`84b998b4` (tagged 2026-09-23). The app installs it under the key
-`NODE_RELEASE_TAG` = `v0.34.9` in `src-tauri/src/commands.rs`, with the commit
-beside it as `NODE_RELEASE_COMMIT`. The previous key was `v0.34.6-3013c2c2`,
-suffixed because installs from 0.6.18 through 0.6.22 held an earlier build
-under the bare `v0.34.6`; no install ever used `v0.34.9`, so the bare tag is
-enough to make every install re-provision, which is the only moment the app
-does. The release engine is a source build with `-DWITH_MODELNET=OFF`: 0.34.7
+The staged engine is BTX v0.34.15: upstream's tag `v0.34.15` at commit
+`476f3f23` (tagged 2026-10-06). The app installs it under the key
+`NODE_RELEASE_TAG` = `v0.34.15` in `src-tauri/src/commands.rs`, with the commit
+beside it as `NODE_RELEASE_COMMIT`. It moved from `v0.34.12` in 0.7.8 because
+mainnet block 244,000 switched on three consensus checks 0.34.12 does not have;
+`commands.rs` has the reasoning beside the pin. No install ever used
+`v0.34.15`, so the bare tag is enough to make every install re-provision, which
+is the only moment the app does. The release engine is a source build with
+`-DWITH_MODELNET=OFF`: 0.34.7
 turned upstream's Native Model Network on by default, and it needs OpenSSL 3.5
 and starts a `btx-modeld` helper the app has no use for.
 
 The download-based staging scripts (`stage-node-pkg.sh`,
-`stage-node-pkg-linux.sh`) fetch upstream's v0.34.9 archives, whose
-`SHA256SUMS` is published unsigned this time, so the scripts pin bytes rather
-than a signature. Upstream builds those archives with the model network ON, so
+`stage-node-pkg-linux.sh`) fetch upstream's v0.34.15 archives. That release publishes no
+`SHA256SUMS`, so the scripts pin GitHub's asset digests, which equal the hashes
+upstream lists on its PR 223: bytes rather than a signature. Upstream builds those archives with the model network ON, so
 the scripts drop its seven helpers (`btx-modeld` and friends) and btxd logs the
 helper as missing and carries on as a monetary node. Upstream's Linux binaries
 need glibc 2.38, so on Linux the contributor path that matters is the source
@@ -279,7 +280,7 @@ path below: build btxd at that commit and stage it with the `-source` script
 for your platform. Those two must agree: the app installs the bundled package
 into a directory named after the key and then checks that the binary reports
 the version the package declares in its `.btxd-version` marker (the version
-part of the key, `v0.34.9`), so a mismatch fails first-run setup rather than
+part of the key, `v0.34.15`), so a mismatch fails first-run setup rather than
 quietly running the wrong engine. The script writes that marker from what it
 actually staged.
 
@@ -312,14 +313,14 @@ on an Ubuntu 22.04 box for 0.6.15 through 0.6.18.
 
 ```bash
 # 1. build btxd from a PRISTINE checkout of btxchain/btx at the pinned ref,
-#    which is NODE_RELEASE_COMMIT (84b998b4f3272775aaf8c241ac11dc683f4c4e23,
-#    upstream's tag v0.34.9; `engine_pin_ref apps/node` prints it). The recipe
+#    which is NODE_RELEASE_COMMIT (476f3f23e15228bb3e6119ed1e139a9b25424ce8,
+#    upstream's tag v0.34.15; `engine_pin_ref apps/node` prints it). The recipe
 #    has the exact cmake flags, -DWITH_MODELNET=OFF included, and the CUDA
 #    requirement.
 # 2. stage what you built, instead of stage-node-pkg.sh; the second argument
 #    is the version btxd will REPORT: the install key without any -suffix.
 #    Omit it and the script derives the same value from the pin.
-./scripts/stage-node-pkg-linux-source.sh ~/btx/build v0.34.9
+./scripts/stage-node-pkg-linux-source.sh ~/btx/build v0.34.15
 # 3. then the usual npm ci && npm run tauri build
 ```
 

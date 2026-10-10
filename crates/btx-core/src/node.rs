@@ -1545,6 +1545,25 @@ fn node_has_reorg_policy(btxd: &Path) -> bool {
     (major, minor, patch) >= (0, 34, 12)
 }
 
+/// Whether an engine installed under `tag` still follows the network's
+/// consensus rules, i.e. is v0.34.14 or newer. Mainnet block 244000 switched
+/// on three checks that came with 0.34.14 (BTX_SECURITY_ACTIVATION_HEIGHT,
+/// chainparams.cpp:181 at v0.34.15): a 32-byte HTLC preimage, recovery proofs
+/// in the shielded block budget, and a Phase-1-only MatMul header that may not
+/// become the best header. An older engine can accept blocks every current
+/// node refuses and follow them onto its own chain while reporting itself
+/// healthy, so the app never launches one as a fallback. Fails closed: an
+/// unreadable tag is not trusted.
+pub fn engine_follows_network_rules(tag: &str) -> bool {
+    let Some(v) = parse_tag_version(tag) else {
+        return false;
+    };
+    let major = v.first().copied().unwrap_or(0);
+    let minor = v.get(1).copied().unwrap_or(0);
+    let patch = v.get(2).copied().unwrap_or(0);
+    (major, minor, patch) >= (0, 34, 14)
+}
+
 /// The `-matmulrcexecution` mode this host should run, or `None` to leave
 /// btxd's own default in place.
 ///
@@ -5973,6 +5992,37 @@ consensus-validator service.";
     /// (easybtx-node.log) and exits 1 before debug.log says anything. The
     /// second is its sibling for `-deepforkautoresolve=0`
     /// (chainstatemanager_args.cpp:187-190).
+    /// Mainnet block 244000 switched on three consensus checks that came with
+    /// 0.34.14. An install key below that must never be launched as a
+    /// fallback, whatever its shape, and an unreadable one is not trusted.
+    #[test]
+    fn only_an_engine_with_the_244000_rules_follows_the_network() {
+        for tag in [
+            "v0.34.14",
+            "v0.34.15",
+            "v0.34.15-abcdef12",
+            "v0.35.0",
+            "v1.0.0",
+        ] {
+            assert!(engine_follows_network_rules(tag), "{tag} has the rules");
+        }
+        for tag in [
+            "v0.34.13",
+            "v0.34.12",
+            "v0.34.9",
+            "v0.34.6-3013c2c2",
+            "v0.33.3-pr105b",
+            "v0.33.2",
+            "",
+            "latest",
+        ] {
+            assert!(
+                !engine_follows_network_rules(tag),
+                "{tag} must not be launched"
+            );
+        }
+    }
+
     #[test]
     fn a_reorg_policy_refusal_is_named_and_is_not_a_reason_to_wipe() {
         for log in [

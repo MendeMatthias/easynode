@@ -831,7 +831,15 @@ mod tests {
     ///   cargo test --lib signer::tests::the_shipped_engine_signs_with_a_generated_key -- --ignored
     /// ```
     ///
-    /// Passed on 2026-09-16 against btxd 0.34.6 (`v0.34.6-3013c2c2`).
+    /// Passed on 2026-09-16 against btxd 0.34.6 (`v0.34.6-3013c2c2`), and on
+    /// 2026-10-10 against v0.34.15 on an M-series Mac.
+    ///
+    /// The wait is ten minutes, the app's own launch budget, not the 30 s it
+    /// once was. From 0.34.12 a consensus engine runs its GPU canary before
+    /// it binds RPC, and on a Mac that is one full production episode:
+    /// measured 2026-10-10 with these exact arguments, RPC answered after
+    /// 99 s on v0.34.12 (canary wall 94.4 s) and 116 s on v0.34.15 (114.7 s).
+    /// A refusal still fails at once: the loop checks the child every poll.
     #[tokio::test]
     #[ignore]
     async fn the_shipped_engine_signs_with_a_generated_key() {
@@ -866,7 +874,7 @@ mod tests {
             .expect("btxd spawns");
         let cookie = dir.path().join(".cookie");
         let mut status = None;
-        for _ in 0..60 {
+        for _ in 0..1200 {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             if let Some(code) = child.try_wait().unwrap() {
                 panic!("btxd exited early with {code}: the engine refused the key");
@@ -887,7 +895,7 @@ mod tests {
                 break;
             }
         }
-        let (rpc, v) = status.expect("btxd answered getmatmultrustedstatus within 30 s");
+        let (rpc, v) = status.expect("btxd answered getmatmultrustedstatus within 10 min");
         let _ = rpc.call("stop", serde_json::json!([])).await;
         let _ = child.wait();
         assert_eq!(v["local_signer"], true, "{v}");
