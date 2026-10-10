@@ -249,6 +249,26 @@ pub const BTX_ARCHIVE_PEERS: &[&str] = &[
     // but dials nobody who holds its signatures stays at 227,312 all the same.
     // Signers already dial it (signer::BTX_MIRRORS_FED_BY_SIGNERS), once.
     "20.86.181.203:19338",
+    // 2026-10-10: btxscan's OTHER node on the same box, port 19335, the one
+    // with the whole chain. Owner's decision the same evening, after 0.7.9
+    // shipped Jarek's archive. Measured from this project's Mac:
+    // /BTX:0.34.15/, at the tip (start height 244,623), services 0x82000d09 =
+    // NETWORK, WITNESS, SHIELDED, NETWORK_LIMITED, P2P_V2,
+    // MATMUL_TRUSTED_MIRROR and MATMUL_ATTESTATION_ARCHIVE. `getdata` for block
+    // 150,000 returned its 1,048,962 bytes in 0.9 s naming parent 06754227…,
+    // where 19338 above and 109.199.124.187 answered NOTFOUND. GETMMATTEST
+    // returned `02d5efca`'s signature, the key signing the chain, for 244,652,
+    // for 240,000 and for 227,313 `d5f0e92f` itself. So it is both halves of
+    // what this list is for: signatures for a mirror, and the old blocks the
+    // catch-up help asks for.
+    //
+    // Same machine as 19338: a second node for when one of the two stalls
+    // (as 19338 did on 2026-10-10, handshaking nobody while btxscan sat at
+    // 244,097), not a second site. The independent full-history source is
+    // Jarek's archive in BTX_BOOTSTRAP_PEERS; this one has no MATMUL bits of
+    // its own to lose a race over. 20.86.181.203 already holds the noban grant
+    // in BTX_ARCHIVE_WHITELIST_IPS, which covers both ports.
+    "20.86.181.203:19335",
     // 207.56.229.99, 114.150.94.235 and 195.137.245.82 were measured 0/3 on
     // 2026-09-08 and are listed with that measurement in BTX_BOOTSTRAP_PEERS
     // above. An archive that does not answer cannot be a download source, and
@@ -8089,11 +8109,15 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
         // 2026-10-03: 2 became 1. 37.230.134.222 has refused since 2026-09-12
         // 23:31Z and refused again 0/3 from the Mac at 23:35Z, and btx-sentinel
         // would otherwise alarm on it every hour. Its noban grant stays.
+        // 2026-10-10: 1 became 2. 20.86.181.203:19335, btxscan's full node on
+        // the same box: services 0x82000d09 (NETWORK and
+        // MATMUL_ATTESTATION_ARCHIVE), served block 150,000 and `02d5efca`'s
+        // signatures for 244,652, 240,000 and 227,313.
         assert_eq!(
             BTX_ARCHIVE_PEERS,
-            &["20.86.181.203:19338"],
-            "btxscan's 20.86.181.203:19338 is the one measured archive; adding \
-             one needs a reading, not a hostname"
+            &["20.86.181.203:19338", "20.86.181.203:19335"],
+            "btxscan's two nodes are the measured archives; adding one needs a \
+             reading, not a hostname"
         );
         assert!(
             BTX_ARCHIVE_WHITELIST_IPS.contains(&"37.230.134.222"),
