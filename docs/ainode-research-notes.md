@@ -9,6 +9,15 @@ documentation states intent, not proof that something runs.
 The feasibility study that follows these notes is driven by
 [`ainode-research-prompt.md`](ainode-research-prompt.md).
 
+> **Outcome: DO NOT BUILD YET.** The study came back negative and its verdict
+> supersedes the optimistic readings below. See
+> [`ainode-feasibility-research.md`](ainode-feasibility-research.md). Two
+> corrections to these notes in particular: "sponsored mirroring" pays nobody
+> because it has no code at all, and upstream already ships a Qt desktop with
+> a Models dock, so a new app would differentiate on packaging alone. Sections
+> 1 to 3 below are still accurate on what the model plane *is*; section 4's
+> conclusion no longer holds.
+
 ---
 
 ## 1. Where this started: Huawei
@@ -82,9 +91,19 @@ This is the part most likely to be misread, so it is stated flatly.
 |---|---|
 | Seed or host a model; advertise capacity | **No** |
 | Give compute under Pay With Compute | **No** — you get access to one resource |
-| Deliver bytes when free supply cannot cover it, and a sponsor pays | **Yes** |
-| Win a bounty: build or train a model someone funded | **Yes** |
-| Release campaign: open a private model to the public | **Yes** |
+| Deliver bytes when free supply cannot cover it, and a sponsor pays | **No** — see correction below |
+| Win a bounty: build or train a model someone funded | **Yes**, to the winning creator |
+| Release campaign: open a private model to the public | **Yes**, to the publisher |
+
+> **Correction after the feasibility study.** "Sponsored mirroring" is not a
+> payment path. It has no code: paid `getmodel` modes return
+> `APPROVAL_REQUIRED`, the helper advertises `paid_chain_verify=false`, and
+> the peer-facing `/quotes` and `/payment` endpoints answer `403 OWNER_ONLY`.
+> In practice it means an off-protocol transfer between two people who already
+> know each other. The only two paths where BTX actually moves are bounties
+> and release campaigns, and both pay creators and publishers rather than
+> anyone contributing hardware. Both also require a synced wallet on `btxd`,
+> because the claim RPC needs the wallet to hold the claimer's PQ private key.
 
 `doc/modelnet/economics.md` lists, under what does not exist: "Protocol
 emissions or token rewards for hosting or advertised capacity." Also ruled
