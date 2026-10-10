@@ -6,6 +6,17 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
+## [0.7.10] - 2026-10-11
+
+**A second source of signatures and old blocks.** The app now also dials the
+second node behind btxscan.io, which keeps the whole chain and hands out the
+signed confirmations a node that follows signatures needs. We checked it
+first: it runs BTX 0.34.15, is at the tip, sent back an old block (150,000)
+when asked, and gave the signatures of the key that signs the chain for new
+and old blocks alike. It lives on the same machine as the btxscan node the
+app already used, so it helps when one of the two gets stuck, and Jarek's
+archive from 0.7.9 stays the independent one.
+
 ## [0.7.9] - 2026-10-10
 
 **A node that is far behind can fetch old blocks again.** A node that is
