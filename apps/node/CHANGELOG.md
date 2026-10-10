@@ -6,6 +6,35 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
+## [0.7.8] - 2026-10-10
+
+**The node engine moves to BTX 0.34.15, because the network's rules changed
+at block 244,000.** From that block on, three new checks are part of the rules
+every up-to-date node enforces: a stricter rule for one kind of timed payment
+(HTLC), proofs in private transactions now count toward a block's size budget,
+and a block header that only passed a quick first check can no longer be
+treated as the newest block. The engine this app shipped until now, 0.34.12,
+does not have these checks, so past block 244,000 it could accept blocks the
+rest of the network refuses and end up on a different chain. The chain passed
+244,000 before this release, so please update. On the first start after the
+update the app fetches the new engine once, as it did for 0.34.12.
+
+**Why 0.34.15 and not 0.34.14.** 0.34.14 brought the new rules, but a node
+coming back from a restart or an outage could sit there without adding blocks.
+0.34.15 fixes that. Upstream also warns that 0.34.13 can split from the rest
+of the network, so this app skips both.
+
+**A graphics card that computes a block wrong no longer rejects it for good.**
+On 0.34.12, when a qualified graphics card disagreed with a block, the node
+treated the block as invalid with no second opinion, so a card making a
+mistake could push your node off the real chain. On 0.34.15 that is a local
+failure the node tries again, and the block is not marked invalid.
+
+Nothing else about how your node runs changes. It still follows the chain with
+the most work behind it (the engine's "legacy" reorg setting, which is the
+engine's default again from 0.34.14 on), and a new node still starts from the
+same snapshot at block 219,000.
+
 ## [0.7.7] - 2026-10-05
 
 **Every node that checks blocks itself now keeps a diary of its chain.**

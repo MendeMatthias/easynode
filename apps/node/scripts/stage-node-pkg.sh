@@ -31,18 +31,18 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="$APP_DIR/src-tauri/resources/node-pkg"
 
-VERSION="0.34.12"
+VERSION="0.34.15"
 # Refuse to stage a version the app will then refuse. See scripts/lib/engine-pin.sh.
 # shellcheck source=lib/engine-pin.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/engine-pin.sh"
 assert_matches_engine_pin "$APP_DIR" "$VERSION"
 
 TARBALL_URL="https://github.com/btxchain/btx/releases/download/v${VERSION}/btx-${VERSION}-arm64-apple-darwin.tar.gz"
-# From the release's SHA256SUMS. Upstream has re-generated release assets in
-# place before, and a silent swap must FAIL here, never ship unnoticed. v0.34.12
-# publishes that file UNSIGNED (no SHA256SUMS.asc, as for v0.34.9), so this
-# pins the bytes, not a signature.
-TARBALL_SHA256="d90d1adf2ae1d9a29decc97423db258459674a08c35e0bef60dc82467983d72e"
+# Upstream has re-generated release assets in place before, and a silent swap
+# must FAIL here, never ship unnoticed. v0.34.15 publishes NO SHA256SUMS at
+# all; this is GitHub's asset digest for the file, which equals the hash
+# upstream lists on btxchain/btx PR 223. It pins the bytes, not a signature.
+TARBALL_SHA256="6e1ec111fcfedb6da356e3897d3d224c07396c82b8897a83fdcfa558b781c4a8"
 
 SRC="${EASYBTX_NODE_PKG_SRC:-}"
 if [[ -z "$SRC" && -x "$HOME/btx-node-research/btx-$VERSION/bin/btxd" ]]; then

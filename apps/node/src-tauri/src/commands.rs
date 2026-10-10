@@ -359,19 +359,58 @@ use crate::state::{
 // consensus start, 1-of-1 mirror refused, signer self-pin present, manifest
 // rows cuda/sm_120 and metal/m4_class).
 //
-// THE INSTALL KEY IS `v0.34.12`, bare, equal to what btxd reports. No release
-// ever used it, so every install re-provisions on update and fetches the
+// THE INSTALL KEY WAS `v0.34.12`, bare, equal to what btxd reports. No release
+// ever used it, so every install re-provisioned on update and fetched the
 // engine once, as the move to `v0.34.9` did.
-pub const NODE_RELEASE_TAG: &str = "v0.34.12";
+//
+// ── 2026-10-10: v0.34.15, BECAUSE BLOCK 244000 IS A FLAG DAY ────────────────
+//
+// Tag `v0.34.15` = `476f3f23e15228bb3e6119ed1e139a9b25424ce8` (annotated tag,
+// tagged 2026-10-06; upstream PR 223). Why it cannot wait: 0.34.14 schedules
+// three consensus checks at mainnet height 244000
+// (BTX_SECURITY_ACTIVATION_HEIGHT, chainparams.cpp:181): a 32-byte HTLC
+// preimage, recovery proofs counted in the shielded block budget, and
+// nMatMulPhase1HeaderNotMostWorkHeight, so a MatMul header that only passed
+// the compact-target precheck can no longer become the best header (5be6edd6).
+// 0.34.12 has none of the three, so past 244000 it can follow headers and
+// accept blocks every 0.34.14+ node refuses. The chain passed 244000 before
+// this pin moved (easybtx.com measured 244282 on 2026-10-10). 0.34.15 rather
+// than 0.34.14 because 0.34.14 can sit without connecting blocks after a
+// restart or outage (a unique followed tip-child waited for a fresh rcadmit
+// ticket); 0.34.15 ExactReplays it. Upstream's notice also warns that a block
+// 0.34.12 accepts could split 0.34.13 nodes, so no install should stop there.
+//
+// What else moved, read at the SHA. PR 211 (the bounded-mode livelock named
+// above) is in. An unset `-reorgpolicy` is legacy again from 0.34.14
+// (node/chainstatemanager_args.cpp:155); node.rs still passes
+// `-reorgpolicy=legacy` explicitly, which is the same mode and keeps the launch
+// line independent of the default. The qualified-device warning above is
+// REVERSED: a qualified GPU digest that disagrees with a header is now a
+// retryable local failure (`qualified_device_digest_mismatch_retryable`,
+// matmul/matmul_v4_rc_gkr.cpp), not a final InvalidConsensus, so a GPU that
+// computes wrong no longer rejects a valid block for good. chainparams.cpp
+// adds no assumeutxo base: 219000 and 228000 are unchanged, so snapshot_spec()
+// stays on 219000 for the reasons above. Both guards pass on the tag
+// (check-engine-tag.sh: 5 of 5 on the sentinel, shielded commitment 94343b76;
+// check-engine-fleet-ready.sh: degraded consensus start, 1-of-1 mirror
+// refused, signer self-pin present, manifest rows cuda/sm_120 and
+// metal/m4_class, the same two as 0.34.12). Upstream publishes no SHA256SUMS
+// for 0.34.15; the archive hashes the staging scripts pin are GitHub's asset
+// digests, which equal the ones numair lists on PR 223.
+//
+// THE INSTALL KEY IS `v0.34.15`, bare, equal to what btxd reports. No release
+// ever used it, so every install re-provisions on update and fetches the
+// engine once.
+pub const NODE_RELEASE_TAG: &str = "v0.34.15";
 
 /// The exact upstream commit NODE_RELEASE_TAG names: the commit upstream's
-/// annotated tag `v0.34.12` points at. Kept set although the key is itself
+/// annotated tag `v0.34.15` points at. Kept set although the key is itself
 /// an upstream tag, so the guards, `engine_pin_ref` and the engine build
 /// workflows check out a SHA that cannot move under us, and the CI artifacts
 /// are named for the commit (`btxd-<os>-<sha>`), which is what the installer
 /// workflows' identity checks compare. If upstream ever re-tags, this does not
 /// move by itself; re-run both guards on the new commit and choose a new key.
-pub const NODE_RELEASE_COMMIT: &str = "5f32c4c4d1cb033180bcd40a461deae2c1bc1ee1";
+pub const NODE_RELEASE_COMMIT: &str = "476f3f23e15228bb3e6119ed1e139a9b25424ce8";
 
 /// The pinned assumeutxo snapshot this app bootstraps from: height 219000,
 /// [`btx_core::snapshot::v0_34_9_spec`], pinned from upstream's manifest and
@@ -8658,6 +8697,10 @@ mod tests {
             // the_pinned_compiled_base_is_below_every_refused_block forbids
             // until a compiled load checks for refused blocks after loading.
             "v0.34.12" => 219_000,
+            // Adds no base: chainparams.cpp at 476f3f23 changes only the
+            // 244000 activation constants, so 219000 and 228000 stand as on
+            // 0.34.12, and the pin stays on 219000 for the same reasons.
+            "v0.34.15" => 219_000,
             other => panic!(
                 "no record of the assumeutxo bases {other} carries: read `git show \
                  {other}:src/kernel/chainparams.cpp` (m_assumeutxo_data), add its row \
