@@ -272,6 +272,30 @@ pub fn render(i: &DiagnosticsInput) -> String {
                     ));
                 }
             }
+            // The number every "blocks behind" reader uses since 0.7.11
+            // (crate::network_height), and the frontier it came from.
+            let frontier = match c
+                .signed_frontier
+                .as_ref()
+                .and_then(|f| f.height.map(|h| (h, f)))
+            {
+                Some((h, f)) => format!(
+                    "signed frontier {} {}",
+                    group(h),
+                    if f.on_active_chain == Some(true) {
+                        "on this chain"
+                    } else {
+                        "on another branch"
+                    }
+                ),
+                None => "no signed frontier".into(),
+            };
+            let network = c.network_height();
+            o.push(format!(
+                "  {frontier} · network height {} ({} above the tip)",
+                group(network),
+                group(network.saturating_sub(c.blocks))
+            ));
         }
         None => o.push("  not answering".into()),
     }
@@ -1820,6 +1844,49 @@ mod tests {
         assert!(
             r.contains("  tip median time 2026-09-29 13:50 UTC, about 15 minutes ago"),
             "missing the tip's age:\n{r}"
+        );
+    }
+
+    /// The number every "blocks behind" reader uses since 0.7.11
+    /// (crate::network_height) is in the report, with the signed frontier it
+    /// came from and whether that is on this node's chain.
+    #[test]
+    fn chain_section_says_the_network_height_and_the_signed_frontier() {
+        let frontier = |on: bool| crate::node_api::AttestedTip {
+            height: Some(245_260),
+            on_active_chain: Some(on),
+            ..Default::default()
+        };
+        let input = |on: bool| DiagnosticsInput {
+            chain: Some(BlockchainInfo {
+                blocks: 240_000,
+                headers: 240_010,
+                signed_frontier: Some(frontier(on)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = render(&input(true));
+        assert!(
+            r.contains("  signed frontier 245,260 on this chain · network height 245,260 (5,260 above the tip)"),
+            "{r}"
+        );
+        let r = render(&input(false));
+        assert!(
+            r.contains("  signed frontier 245,260 on another branch · network height 240,010 (10 above the tip)"),
+            "{r}"
+        );
+        let r = render(&DiagnosticsInput {
+            chain: Some(BlockchainInfo {
+                blocks: 240_000,
+                headers: 240_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(
+            r.contains("  no signed frontier · network height 240,000 (0 above the tip)"),
+            "{r}"
         );
     }
 
