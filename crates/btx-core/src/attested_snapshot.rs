@@ -9,9 +9,10 @@
 //!    signed, checked here by [`crate::confirmed_snapshot`] before anything
 //!    is downloaded past the manifest. Nothing the website says is trusted;
 //!    the pointer only says where to look.
-//! 2. The pair compiled into this app ([`pinned_pair`], base 239,111 since
-//!    0.7.6, 225,927 before). One operator signed it, but its sizes and hashes are compiled
-//!    into the app, so it is trusted as the app is.
+//! 2. The pair compiled into this app ([`pinned_pair`], base 245,300 since
+//!    0.7.11, 239,111 from 0.7.6, 225,927 before). One operator signed it, but
+//!    its sizes and hashes are compiled into the app, so it is trusted as the
+//!    app is.
 //! 3. The snapshot compiled into the engine (`crate::snapshot`).
 //!
 //! The engine loads a signed pair only when a key this node pins signed its
@@ -60,23 +61,33 @@ pub struct AttestedPair {
 }
 
 /// The pair every node starts from while no snapshot is confirmed: base
-/// 239,111, exported by the 3060's own validating node on 2026-10-05 and
-/// published as `utxo-snapshot-239111`. Until 0.7.6 this was 225,927, which by
-/// then left a new node about 13,400 blocks to catch up, roughly three days on
-/// a 3060. Checked before it was pinned: the base is block 239,111 on
-/// api.btxscan.io and on the signer's node; the statement's chain transaction
-/// count (342,192) equals `getchaintxstats` at that block; its shielded pin is
-/// mainnet's fixed value; the manifest's one signature, by `02d5efca`,
-/// verifies; and `loadtxoutsetattested` on a fresh node loaded it in 1.4 s and
-/// followed signatures to 239,289 within a minute. 209,953 coins. The sizes
-/// and SHA-256 values below are the published files'.
+/// 245,300, exported by the 3060's own validating node (engine v0.34.15) and
+/// sent by its producer to easybtx.com on 2026-10-11, the first file the
+/// website ever stored and checked; published as `utxo-snapshot-245300`.
+/// Until 0.7.11 this was 239,111 (0.7.6), which by then left a new node about
+/// 6,300 blocks to catch up, and 225,927 before that.
+///
+/// Checked before it was pinned, on 2026-10-11 (UTC): the base is block
+/// 245,300 on api.btxscan.io and on btxscan's v0.34.15 node (253
+/// confirmations), and the signer's statement names the same block; the
+/// statement's chain transaction count (349,043) equals `getchaintxstats` at
+/// that block; on that chain 227,313 is the valid `d5f0e92f…` and neither held
+/// root is present; the chain id, replay context and shielded pin are
+/// mainnet's; the manifest's one signature, by `02d5efca`, verifies; and the
+/// UTXO set hash (`d39b8733…`) and coin count (236,526) were recomputed from
+/// the file itself, every coin parsed and hashed in the node's key order, by a
+/// script that reproduces the 239,111 pair's values exactly. Not done this
+/// time: a load on a fresh mainnet node (no node runs on the release Mac). A
+/// pin that fails to load leaves the chainstate as it was and the node goes
+/// on to the engine's compiled snapshot (`crate::snapshot`). The sizes and
+/// SHA-256 values below are the published files'.
 pub fn pinned_pair() -> AttestedPair {
     AttestedPair {
-        height: 239_111,
-        block_hash: "9290188337a649a16227603a8bebe7468289bb07499f63f13f2d0548101c448e".into(),
-        file_size: 12_307_808,
-        sha256: "2b882ea838a50e2ce5dd298890665888f3d108c5d51a74ae7d3b41aa08cc922f".into(),
-        manifest_sha256: "9d2ffca2a4b657e64e6a1de9c8c1f3ffea3933d4e1c468c74fe744c4f1901442".into(),
+        height: 245_300,
+        block_hash: "0d20af508b6edccb6f47a0a91d12fa2ed3d44ed8b2105cfc340c7fee8730bf22".into(),
+        file_size: 13_375_946,
+        sha256: "b152992f6356129065f7af57738f7737ac68dd4a3b255016775a8e2e19fc166c".into(),
+        manifest_sha256: "c58a9a873e2fa5ac4dbfe4fa526eaf1767721017e109715c60dd4dc304234ea3".into(),
     }
 }
 
@@ -945,19 +956,51 @@ mod tests {
         // branch. 0.7.6 moved it past every block this app refuses
         // (`crate::known_invalid`): on the pinned base's chain, 227,313 is the
         // valid `d5f0e92f…`, and 228,146 and 229,400 are neither held root
-        // (read on the signer's node and on api.btxscan.io, 2026-10-05).
+        // (read on the signer's node and on api.btxscan.io, 2026-10-05, and for
+        // 0.7.11's 245,300 on btxscan's v0.34.15 node, 2026-10-11).
         assert!(p.height > 229_400);
         let mut broken = p.clone();
         broken.sha256.pop();
         assert!(check(&broken, COMPILED).is_err());
     }
 
+    /// The compiled pin and the published manifest it names agree in every
+    /// field the app compiles: the manifest's SHA-256, its statement's height,
+    /// block and file size, one signature, by the 3060, valid. The fixture is
+    /// the published `snapshot-manifest-245300.json`, byte for byte.
+    #[test]
+    fn the_pin_names_the_published_manifest_and_its_statement() {
+        use sha2::{Digest, Sha256};
+        const MANIFEST: &[u8] =
+            include_bytes!("../tests/fixtures/confirmed_snapshot/mainnet-245300.manifest");
+        let p = pinned_pair();
+        assert_eq!(
+            crate::operators::hex(&Sha256::digest(MANIFEST)),
+            p.manifest_sha256
+        );
+        let m = cs::parse(MANIFEST).unwrap();
+        assert_eq!(m.statement.height() as u64, p.height);
+        assert_eq!(m.statement.block_hash().display_hex(), p.block_hash);
+        assert_eq!(m.statement.file_size(), p.file_size);
+        assert_eq!(m.signatures.len(), 1);
+        assert_eq!(
+            crate::operators::hex(&m.signatures[0].key),
+            "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675"
+        );
+        assert!(cs::signature_is_valid(
+            &m.statement.hash(),
+            &m.signatures[0].key,
+            &m.signatures[0].der
+        ));
+    }
+
     /// Section 9: a confirmed snapshot must beat the pinned pair, and an
     /// engine that one day compiles a higher base beats both.
     #[test]
     fn the_fallback_start_is_the_higher_of_the_pin_and_the_compiled_base() {
-        assert_eq!(fallback_start(COMPILED), 239_111);
-        assert_eq!(fallback_start(240_000), 240_000);
+        assert_eq!(fallback_start(COMPILED), 245_300);
+        assert_eq!(fallback_start(240_000), 245_300);
+        assert_eq!(fallback_start(250_000), 250_000);
     }
 
     #[test]

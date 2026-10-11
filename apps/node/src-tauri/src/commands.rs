@@ -10466,15 +10466,15 @@ mod signed_start_tests {
     fn a_chain_that_reaches_the_fallback_start_settles_its_first_load() {
         let anchor = super::snapshot_spec().anchor_height;
         let fallback = btx_core::attested_snapshot::fallback_start(anchor);
-        assert_eq!(fallback, 239_111);
+        assert_eq!(fallback, 245_300);
         assert!(!chain_outgrew_first_load(None, anchor), "no answer");
         assert!(!chain_outgrew_first_load(Some(0), anchor));
         assert!(!chain_outgrew_first_load(Some(fallback - 1), anchor));
         assert!(chain_outgrew_first_load(Some(fallback), anchor));
         assert!(chain_outgrew_first_load(Some(fallback + 5_000), anchor));
         // An engine that compiles a higher base moves the bar with it.
-        assert!(!chain_outgrew_first_load(Some(239_999), 240_000));
-        assert!(chain_outgrew_first_load(Some(240_000), 240_000));
+        assert!(!chain_outgrew_first_load(Some(249_999), 250_000));
+        assert!(chain_outgrew_first_load(Some(250_000), 250_000));
     }
 
     /// Final review I1, the review's probe turned around: a relaunch (a
