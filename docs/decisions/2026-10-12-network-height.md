@@ -120,6 +120,14 @@ on this chain, and the network height with its distance above the tip.
   the raw `headers`).
 - It does not trust a signer more than the node already does: the frontier is
   the pins the node already follows.
+- It does not count a frontier that sits just across a short fork. A node
+  whose tip lost a one-block race has the winning chain's frontier off its own
+  chain (`on_active_chain` false, measured below), and the rule leaves it out.
+  On a node that follows signatures `headers` carries the same height there,
+  so nothing is lost; a validating node in that shape reads near its own tip,
+  as it did on 0.7.10. Counting a frontier whose branch leaves ours within the
+  engine's park depth (6) would close that, but it needs the fork point, which
+  `getblockchaininfo` does not give. Left for later.
 
 ## Validation
 
@@ -129,11 +137,20 @@ on this chain, and the network height with its distance above the tip.
   phase, the wallet.
 - Read only on a real v0.34.15 node (btxd2, above): the frontier rides in
   `getblockchaininfo` in the shape decoded here.
-- Not measured: a v0.34.15 node in the middle of a long catch-up, which is the
-  case this fixes. Regtest cannot switch the rule on, and the owner does not
-  run a mainnet node on the release Mac. The first 0.7.11 install that starts
-  from the pinned pair is that measurement: its Copy diagnostics now prints
-  the frontier and the network height beside `headers`.
+- Read only on a second real v0.34.15 node, an easyNode 0.7.10 test install
+  that follows signatures and has stalled behind the tip (found running on the
+  release Mac on 2026-10-11 at 21:31 UTC, started by the test install, not by
+  this work): `blocks` 242,639, `headers` 244,690, frontier 244,689 with
+  `on_active_chain` false, api.btxscan.io's tip 245,557. Its tip `7296ebc9…`
+  is a stale sibling: the chain's 242,639 is `4045784f…`, both on the same
+  242,638, and the frontier `dd089a28…` is btxscan's block at 244,689. So
+  `headers - blocks` said 2,051, the rule says the same, and neither can say
+  more than the node has heard: it stopped hearing at 244,690.
+- Not measured: a validating v0.34.15 node in the middle of a long catch-up on
+  its own chain, which is the case this fixes. Regtest cannot switch the rule
+  on. The first 0.7.11 install that starts from the pinned pair is that
+  measurement: its Copy diagnostics prints the frontier and the network height
+  beside `headers`.
 
 ## Rollback
 
