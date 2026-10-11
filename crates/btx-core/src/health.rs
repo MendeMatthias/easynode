@@ -120,6 +120,7 @@ mod tests {
             is_stale: false,
             behind_best_header: 0,
             warnings: Vec::new(),
+            signed_frontier: None,
         }
     }
     fn mining(enabled: bool, pause: bool, reason: &str) -> MiningInfo {

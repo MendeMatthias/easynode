@@ -293,13 +293,15 @@ pub fn classify(raw: &str) -> Option<EngineWarning> {
 /// ask for attention first.
 ///
 /// Being behind the signers is dropped while the node already knows it is
-/// behind: during the first sync, or while it holds headers at least as far
-/// ahead as the engine's own threshold. The catch-up line and the chain card
-/// already say so there, from better numbers. The warning is kept for the one
-/// case they cannot see, a node that has not even heard of the blocks.
+/// behind: during the first sync, or while the network height
+/// ([`BlockchainInfo::network_height`]) stands at least the engine's own
+/// threshold above its tip. The catch-up line and the chain card already say
+/// so there, from the same number. The warning is kept for the case they
+/// cannot see: a frontier on another branch, or a node that has not even
+/// heard of the blocks.
 pub fn from_node(info: &BlockchainInfo) -> Vec<EngineWarning> {
     let knows_it_is_behind = info.initial_block_download
-        || info.headers.saturating_sub(info.blocks) >= FRONTIER_WARNING_BLOCKS;
+        || info.network_height().saturating_sub(info.blocks) >= FRONTIER_WARNING_BLOCKS;
     let mut out: Vec<EngineWarning> = info
         .warnings
         .iter()
@@ -536,6 +538,7 @@ mod tests {
             is_stale: false,
             behind_best_header: 0,
             warnings: warnings.iter().map(|w| w.to_string()).collect(),
+            signed_frontier: None,
         }
     }
 
@@ -771,6 +774,29 @@ mod tests {
             false,
         );
         assert_eq!(from_node(&blind).len(), 1);
+        // After mainnet 244,000 headers stay near blocks while a node catches
+        // up; the signed frontier on its own chain is what knows the gap, and
+        // the catch-up line reads it (crate::network_height).
+        let after_244000 = BlockchainInfo {
+            signed_frontier: Some(crate::node_api::AttestedTip {
+                height: Some(229_694 + 969),
+                on_active_chain: Some(true),
+                ..Default::default()
+            }),
+            ..info(&[BEHIND_FRONTIER], 229_694, 229_694, false)
+        };
+        assert!(from_node(&after_244000).is_empty());
+        // A frontier on another branch is not a gap this node can close by
+        // catching up: the warning stays.
+        let elsewhere = BlockchainInfo {
+            signed_frontier: Some(crate::node_api::AttestedTip {
+                height: Some(229_694 + 969),
+                on_active_chain: Some(false),
+                ..Default::default()
+            }),
+            ..info(&[BEHIND_FRONTIER], 229_694, 229_694, false)
+        };
+        assert_eq!(from_node(&elsewhere).len(), 1);
     }
 
     #[test]

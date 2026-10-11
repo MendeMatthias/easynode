@@ -2862,10 +2862,14 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                             // Already in hand at this tick and, until now, used
                             // only to discriminate stalls ninety lines below —
                             // never shown to the person reading the badge.
-                            blocks_behind: chain.headers.saturating_sub(readiness.height()),
+                            // The network height, not headers alone: after
+                            // mainnet 244,000 headers stay near blocks while a
+                            // node catches up (`phase_target`).
+                            blocks_behind: phase_target(&chain, readiness.height())
+                                .saturating_sub(readiness.height()),
                         }
                     } else {
-                        let mut headers = chain.headers;
+                        let mut headers = phase_target(&chain, readiness.height());
                         let mut progress = readiness.progress();
                         // Headers phase (chain height still 0): RPC reports
                         // headers=0 through PRE-sync and a ~0 verification
@@ -3061,7 +3065,12 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     // already made. Never judged during initial block
                     // download, when headers lead blocks by design.
                     {
-                        let behind = chain.headers.saturating_sub(chain.blocks);
+                        // The network height (btx_core::network_height): after
+                        // mainnet 244,000 headers alone stay near blocks while
+                        // a node catches up, and this window, the alarm below
+                        // and the engine's priority all went quiet with them.
+                        let network = chain.network_height();
+                        let behind = network.saturating_sub(chain.blocks);
                         if behind > btx_core::fork::HEADERS_AHEAD_ALARM {
                             gap_since.get_or_insert((std::time::Instant::now(), behind));
                         } else {
@@ -3203,7 +3212,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                             btx_core::fork::fork_alarm(
                                 &fork_tips,
                                 chain.blocks,
-                                chain.headers,
+                                network,
                                 gap,
                                 at_served_body_tip,
                             )
@@ -3294,7 +3303,10 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     }
 
                     // ── Trusted-mirror stall watchdog tick ──────────────────
-                    let heights = (readiness.height(), chain.headers);
+                    // The network height, not headers alone: after mainnet
+                    // 244,000 headers stay near blocks while a node catches
+                    // up, and the stall diagnosis below never saw a gap.
+                    let heights = (readiness.height(), chain.network_height());
                     // Progress rule (refined — see btx_core::watchdog): while
                     // a connectable gap exists, only BLOCK movement counts.
                     // BTX mints a header every ~90 s, so the old any-change
@@ -3759,6 +3771,19 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
 /// conclusion without a line in the log. Never during a header bootstrap
 /// (plan decision 9): its node has loaded no snapshot and is restarted when
 /// the headers are in.
+/// What the phase counts toward from one `getblockchaininfo`: the network
+/// height (btx_core::network_height) once the node has blocks, because after
+/// mainnet 244,000 `headers` alone stays near `blocks` while a node catches
+/// up; the raw header count while it is still fetching headers (`height` 0),
+/// which is the number that moves on the "Counting the chain" screen.
+pub(crate) fn phase_target(chain: &btx_core::node_api::BlockchainInfo, height: u64) -> u64 {
+    if height == 0 {
+        chain.headers
+    } else {
+        chain.network_height()
+    }
+}
+
 fn catch_up_tick<'a>(
     header_bootstrap: bool,
     blocks: u64,
@@ -8320,6 +8345,53 @@ mod tests {
         assert_eq!(*state.catch_up_help.lock().await, Default::default());
     }
 
+    /// What the phase counts toward, after mainnet 244,000: headers stay near
+    /// blocks while a node catches up, and the signed frontier on its own
+    /// chain is the gap (btx_core::network_height). Measured on a test
+    /// install: the app said 4,888 behind when the real gap was about 5,260.
+    #[test]
+    fn the_phase_counts_toward_the_network_height_once_blocks_move() {
+        use btx_core::node_api::{AttestedTip, BlockchainInfo};
+        let catching_up = BlockchainInfo {
+            blocks: 240_000,
+            headers: 244_888,
+            signed_frontier: Some(AttestedTip {
+                height: Some(245_260),
+                on_active_chain: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(super::phase_target(&catching_up, 240_000), 245_260);
+        assert_eq!(
+            super::phase_target(&catching_up, 240_000).saturating_sub(240_000),
+            5_260
+        );
+        // Still fetching headers, no block yet: the count that moves on the
+        // "Counting the chain" screen is the header count, not the signers'.
+        let counting = BlockchainInfo {
+            blocks: 0,
+            headers: 120_000,
+            signed_frontier: Some(AttestedTip {
+                height: Some(245_260),
+                on_active_chain: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(super::phase_target(&counting, 0), 120_000);
+        // A frontier on another branch is no part of this node's gap.
+        let elsewhere = BlockchainInfo {
+            signed_frontier: Some(AttestedTip {
+                height: Some(245_260),
+                on_active_chain: Some(false),
+                ..Default::default()
+            }),
+            ..catching_up.clone()
+        };
+        assert_eq!(super::phase_target(&elsewhere, 240_000), 244_888);
+    }
+
     /// The help ticks on reads that answered, and only then: a failed read
     /// handed on as an empty answer would stop it as if nothing were above
     /// the tip (no tips) or count every peer as gone (no peers), and end its
@@ -10394,15 +10466,15 @@ mod signed_start_tests {
     fn a_chain_that_reaches_the_fallback_start_settles_its_first_load() {
         let anchor = super::snapshot_spec().anchor_height;
         let fallback = btx_core::attested_snapshot::fallback_start(anchor);
-        assert_eq!(fallback, 239_111);
+        assert_eq!(fallback, 245_300);
         assert!(!chain_outgrew_first_load(None, anchor), "no answer");
         assert!(!chain_outgrew_first_load(Some(0), anchor));
         assert!(!chain_outgrew_first_load(Some(fallback - 1), anchor));
         assert!(chain_outgrew_first_load(Some(fallback), anchor));
         assert!(chain_outgrew_first_load(Some(fallback + 5_000), anchor));
         // An engine that compiles a higher base moves the bar with it.
-        assert!(!chain_outgrew_first_load(Some(239_999), 240_000));
-        assert!(chain_outgrew_first_load(Some(240_000), 240_000));
+        assert!(!chain_outgrew_first_load(Some(249_999), 250_000));
+        assert!(chain_outgrew_first_load(Some(250_000), 250_000));
     }
 
     /// Final review I1, the review's probe turned around: a relaunch (a

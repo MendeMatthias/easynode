@@ -84,7 +84,9 @@ pub async fn ask_chain_progress(state: State<'_, AppState>) -> Result<Ask<ChainP
         btx_core::health::sync_readiness(&chainstates, &chain, snapshot_spec().anchor_height);
     Ok(Ask::Ready(ChainProgress {
         height: readiness.height(),
-        headers: chain.headers,
+        // "Block X of ~Y": the network height once blocks move
+        // (`commands::phase_target`, btx_core::network_height).
+        headers: crate::commands::phase_target(&chain, readiness.height()),
         progress: readiness.progress(),
         near_tip: readiness.is_near_tip(),
         peers: peers.unwrap_or(0),

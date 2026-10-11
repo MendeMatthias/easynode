@@ -45,6 +45,7 @@ pub mod header_path;
 pub mod health;
 pub mod installer;
 pub mod known_invalid;
+pub mod network_height;
 pub mod nickname;
 pub mod node;
 pub mod node_api;

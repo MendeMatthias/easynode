@@ -710,7 +710,9 @@ fn times_in_words(n: u32) -> String {
 pub struct Tick<'a> {
     /// This tick's `getblockchaininfo`: the tip's height.
     pub blocks: u64,
-    /// The same answer's best header height.
+    /// The same answer's best header height. With [`Tick::frontier`] it
+    /// makes the network height that decides whether the help runs at all
+    /// (crate::network_height).
     pub headers: u64,
     /// The last `getchaintips` that answered. The refresher reads it every
     /// tenth tick, so it may be up to about 30 seconds old.
@@ -909,7 +911,11 @@ async fn tick_until(
         peers: t.peers,
         refused: None,
     };
-    if !cu.helper.enabled || t.blocks == 0 || t.headers < t.blocks.saturating_add(MIN_BEHIND) {
+    // The network height, not `headers` alone: after mainnet 244,000 the
+    // best header stays near the tip while a node catches up
+    // (crate::network_height), and the signed frontier still knows.
+    let network = crate::network_height::network_height(t.blocks, t.headers, t.frontier);
+    if !cu.helper.enabled || t.blocks == 0 || network < t.blocks.saturating_add(MIN_BEHIND) {
         let d = cu.helper.decide(&seen);
         return said(cu, was_helping, &d);
     }
@@ -2502,6 +2508,42 @@ mod tests {
         let asked = node.asked();
         assert_eq!(asked.len(), 60);
         assert_eq!(asked.last().unwrap().0, hash(160));
+    }
+
+    #[tokio::test]
+    async fn after_244000_the_signed_frontier_opens_the_help_when_headers_do_not() {
+        // From mainnet 244,000 the engine's best header stays near the tip
+        // while a node catches up (crate::network_height): getblockchaininfo
+        // says headers == blocks although the node holds the headers ahead
+        // and its signed frontier is 60 above. The help used to stay off.
+        let node = FakeNode::new(300, 100, Some(160));
+        let (tips, peers) = ([tip(300, "headers-only")], [peer(7, A, 300)]);
+        let slot = node.attested();
+        let t = Tick {
+            frontier: slot.as_ref(),
+            ..tick_of(100, 100, &tips, &peers)
+        };
+        let mut cu = CatchUp::for_this_app();
+        let t0 = Instant::now();
+        tick(&node, &mut cu, &t, t0).await;
+        tick(&node, &mut cu, &t, t0 + QUIET).await;
+        let asked = node.asked();
+        assert_eq!(asked.len(), 60);
+        assert_eq!(asked.last().unwrap().0, hash(160));
+        // A frontier off this node's chain opens nothing.
+        let off = AttestedTip {
+            on_active_chain: Some(false),
+            ..slot.clone().unwrap()
+        };
+        let node = FakeNode::new(300, 100, Some(160));
+        let t = Tick {
+            frontier: Some(&off),
+            ..tick_of(100, 100, &tips, &peers)
+        };
+        let mut cu = CatchUp::for_this_app();
+        tick(&node, &mut cu, &t, t0).await;
+        tick(&node, &mut cu, &t, t0 + QUIET).await;
+        assert!(node.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

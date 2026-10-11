@@ -182,6 +182,9 @@ pub struct SnapshotFacts {
     /// nothing an importer can verify.
     pub local_signer: Option<bool>,
     pub blocks: Option<u64>,
+    /// The network height (crate::network_height), not `headers` alone:
+    /// after mainnet 244,000 the best header stays near the tip while a node
+    /// catches up, and a dump then is not the tip's.
     pub headers: Option<u64>,
     pub initial_block_download: Option<bool>,
     /// Whether `help dumptxoutsetattested` names a real command. The quartet
@@ -595,11 +598,20 @@ pub async fn read_facts(rpc: &dyn Rpc, free_disk_mb: Option<u64>) -> SnapshotFac
         Err(_) => (None, None),
     };
     let (blocks, headers, initial_block_download) = match chain {
-        Ok(v) => (
-            u64_field(&v, "blocks"),
-            u64_field(&v, "headers"),
-            v.get("initialblockdownload").and_then(|x| x.as_bool()),
-        ),
+        Ok(v) => {
+            let blocks = u64_field(&v, "blocks");
+            let frontier = v
+                .get("matmul_signed_frontier")
+                .and_then(|f| serde_json::from_value(f.clone()).ok());
+            let network = blocks
+                .zip(u64_field(&v, "headers"))
+                .map(|(b, h)| crate::network_height::network_height(b, h, frontier.as_ref()));
+            (
+                blocks,
+                network,
+                v.get("initialblockdownload").and_then(|x| x.as_bool()),
+            )
+        }
         Err(_) => (None, None, None),
     };
     // `help <unknown>` is not an error on this engine: it answers the string
@@ -2475,6 +2487,61 @@ mod tests {
         let f = read_facts(&OldEngine, Some(10_000)).await;
         assert_eq!(f.engine_knows_rpc, Some(false));
         assert_eq!(check(&f).blocker, Some(SnapshotBlocker::EngineTooOld));
+    }
+
+    #[tokio::test]
+    async fn a_producer_behind_its_signed_frontier_does_not_dump_although_headers_say_tip() {
+        // After mainnet 244,000 the best header stays near the tip while a
+        // node catches up (crate::network_height). A producer 5,260 below the
+        // signed frontier on its own chain is behind, whatever headers say,
+        // and an export there is not the tip's.
+        struct CatchingUp {
+            on_active_chain: bool,
+        }
+        #[async_trait]
+        impl Rpc for CatchingUp {
+            async fn call(&self, method: &str, _p: Value) -> AppResult<Value> {
+                Ok(match method {
+                    "help" => json!("dumptxoutsetattested \"path\" ..."),
+                    "getmatmultrustedstatus" => {
+                        json!({"local_signer": true, "matmul_validation_mode": "consensus"})
+                    }
+                    "getchainstates" => json!({"chainstates": [{"validated": true}]}),
+                    _ => json!({
+                        "blocks": 240_000, "headers": 240_000, "initialblockdownload": false,
+                        "matmul_signed_frontier": {
+                            "height": 245_260, "on_active_chain": self.on_active_chain,
+                            "on_chain_attested_height": 240_000, "blocks_behind": 5_260
+                        }
+                    }),
+                })
+            }
+        }
+        let f = read_facts(
+            &CatchingUp {
+                on_active_chain: true,
+            },
+            Some(10_000),
+        )
+        .await;
+        assert_eq!(
+            tip_gate(f.blocks, f.headers, f.initial_block_download),
+            Some(SnapshotBlocker::BehindTip {
+                blocks_behind: 5_260
+            })
+        );
+        // A frontier on another branch is not a height this node is behind.
+        let f = read_facts(
+            &CatchingUp {
+                on_active_chain: false,
+            },
+            Some(10_000),
+        )
+        .await;
+        assert_eq!(
+            tip_gate(f.blocks, f.headers, f.initial_block_download),
+            None
+        );
     }
 
     #[tokio::test]

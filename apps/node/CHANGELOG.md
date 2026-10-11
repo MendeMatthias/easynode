@@ -6,6 +6,37 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
+## [0.7.11] - 2026-10-12
+
+**A new node starts a few hundred blocks behind the tip instead of about 6,300.**
+Until two operators confirm a snapshot, every new node starts from the
+snapshot built into the app. That was block 239,111 from 5 October, and the
+chain has grown about 1,400 blocks a day since. The built-in start is now
+block 245,300, taken on 11 October by this project's own validating node and
+signed by its key, `02d5efca`. Before it was built in we checked that its
+block is the one btxscan.io shows at that height, that its signature is
+valid, and, coin by coin, that the snapshot holds exactly what the signer
+said it does. A node that is already running is not affected.
+
+**"Blocks behind" is right again.** Since block 244,000 the node engine only
+counts a newer block header once it has checked that block or a signer has
+signed it. So while a node was catching up, the app counted too few blocks
+behind: one test install said 4,888 when the real gap was about 5,260. The
+help that fetches missing blocks, the stall check and the warning about
+falling behind the signers went quiet with it. The app now also reads the
+newest block the signers have signed on your node's own chain, and counts
+from whichever is highest. The main screen says "Catching up to block N",
+and Copy diagnostics shows the signed block and the number the app counts
+toward.
+
+**Snapshots can be confirmed now.** Each new snapshot is sent to easybtx.com,
+where a second operator's node adds its signature. Until 11 October the
+website could not keep a snapshot file or record a second signature, so no
+snapshot could ever be confirmed. That is fixed on the website, and the first
+snapshot file was stored the same night. A snapshot still needs two operators
+before new nodes start from it; until then they start from the built-in one
+above.
+
 ## [0.7.10] - 2026-10-11
 
 **A second source of signatures and old blocks.** The app now also dials the
