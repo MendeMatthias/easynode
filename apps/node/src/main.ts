@@ -1125,7 +1125,7 @@ function renderStatus(status: NodeStatusInfo) {
         sub.textContent = `Counting the chain: ${fmtInt(p.headers)} block headers so far`;
       } else {
         badge.textContent = `SYNCING ${(p.progress * 100).toFixed(1)}%`;
-        sub.textContent = `Catching up: headers at ${fmtInt(p.headers)}`;
+        sub.textContent = `Catching up to block ${fmtInt(p.headers)}`;
       }
       height = p.height;
       $("stat-peers").textContent = fmtInt(p.peers);
