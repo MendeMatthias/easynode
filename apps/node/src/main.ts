@@ -1093,6 +1093,12 @@ function renderStatus(status: NodeStatusInfo) {
   badge.textContent = head.badge;
   sub.textContent = head.sub;
   const mode = head.mode;
+  // The badge takes the orb's colour when something is wrong, so the word
+  // reads as a warning without the orb beside it (styles.css).
+  badge.dataset.mode = mode;
+  // Compact mode is only the light; hovering it is the one way to read why
+  // it is amber or red.
+  $("compact-light").title = head.sub ? `${head.badge}: ${head.sub}` : head.badge;
   orb.className = `status-orb is-${mode}`;
 
   // Ambient line + compact orb mirror the main orb's state — one mapping.

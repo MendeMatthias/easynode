@@ -423,6 +423,8 @@ body {
   font-size: 16px;
   letter-spacing: 0.06em;
 }
+.status-badge[data-mode="stalled"] { color: var(--color-amber); }
+.status-badge[data-mode="error"] { color: var(--color-danger); }
 .status-sub {
   font-size: 12.5px;
   color: var(--color-muted);
