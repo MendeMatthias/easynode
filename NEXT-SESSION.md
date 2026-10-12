@@ -12,12 +12,28 @@ MendeMatthias/EasyBTX-releases, ten assets, every one re-downloaded identical
 and every updater signature verified against the released bytes; repo Latest
 still v0.30.0). Engine unchanged: BTX v0.34.15 (`476f3f23`).
 
-**The website PR is merged (EasyBTX #576, `0c3f08b`) but was NOT deployed**:
-Vercel made no deployment for that merge commit (GitHub and Vercel both
-reported all systems operational), and a manual `vercel deploy --prod` from
-the session was blocked by the permission classifier. Until it deploys,
-easybtx.com serves the 0.7.10 feed and pages (safe: those assets exist). Check
-`curl -s https://easybtx.com/updater/latest-node.json | jq .version` first.
+**The website serves 0.7.11** (EasyBTX #576, `0c3f08b`, deployed by the owner
+at about 07:36 UTC on 10-12; Vercel had made no deployment for the merge on
+its own). Checked from the live feed the way the app updates: all four
+updates (Mac, AppImage, .deb, Windows) download, verify against the app's
+updater key, and match the release's SHA256SUMS; the /node page's four
+download links answer 200.
+
+**Followers are stuck, and that is a signer problem, not a code one**
+(read-only on btxscan's node, 07:35 UTC, tip 245,972):
+
+- `02d5efca` (the 3060) has signed nothing since 245,498. It stays connected
+  to btxscan with a starting height of 245,498.
+- `02c9cfb7` (zbtx3, pinned since 0.7.5) signed 245,500 to 245,764 and then
+  stopped (block 245,764 is from 02:12 UTC), so followers moved up overnight
+  and stand at 245,764 again.
+- Only `037db271` signs the tip. It is deliberately not pinned (owner
+  unrecorded, see the pin list's doc and
+  `the_pin_carries_the_three_zbtx_keys_and_none_of_the_unrecorded_ones`).
+
+To see who signs a block: `getmatmulattestations <hash>` returns raw hex;
+the signer is the 33-byte key after `21`
+(`grep -o '210[23][0-9a-f]\{64\}'`).
 
 What 0.7.11 did (easynode #187):
 
@@ -41,7 +57,7 @@ producer stored block 245,300's file six minutes after the deploy.
 ## Since 0.7.11 on main, unreleased: the UI audit
 
 An audit of every screen (`docs/node-ui-audit-2026-10-12.md`) and its fixes
-(easynode #189, #190). The one that matters: the headline said a green LIVE
+(easynode #189, #190, #191). The one that matters: the headline said a green LIVE
 over a node following signatures that had been stuck for hours, while the
 cards below said it was not following. `apps/node/src/headline.ts` now
 derives the badge, the line and the light from what the cards say; the tray
