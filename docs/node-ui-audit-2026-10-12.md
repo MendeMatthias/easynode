@@ -31,7 +31,8 @@ done without the owner.
 | 13 | The tray said "Node: running · block 245498" on a stuck node. | "Node: not following · block 245,498" (`tray::stuck_for_tray`, tested). |
 | 14 | A slow status poll (btxd not answering) stacked up overlapping polls behind a screen that looked current. | One poll at a time; after 10 s the line says it is waiting and how old the screen is. |
 
-Screens: `~/Desktop/easyNode-UI-audit-2026-10-12/screens/` (before and after).
+Each row can be opened in the preview (end of this page);
+`?s=follower-frozen-6h` is the first one.
 
 ## Still open, most important first
 
