@@ -356,14 +356,12 @@
             <button id="settings-close" class="icon-btn" type="button" aria-label="Close">✕</button>
           </div>
 
-          <div class="setting-row">
-            <div class="setting-text">
-              <span class="setting-name">Data folder</span>
-              <span class="setting-desc" id="setting-datadir">—</span>
-            </div>
-            <button id="open-datadir-btn" class="btn-secondary" type="button">Open</button>
-          </div>
-
+          <!-- Four groups (docs/node-ui-audit-2026-10-12.md, item 4): what this
+               computer does, what the node gives the network, what operators run
+               (folded: most people never need it), and the disk. Only the order
+               and the headings changed; every row and id is as it was. -->
+          <section class="settings-group">
+            <h3 class="settings-group-title">This computer</h3>
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Launch at login</span>
@@ -386,6 +384,84 @@
             </label>
           </div>
 
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">When you close the window</span>
+              <span class="setting-desc" data-tray-term>The red X can ask, keep the node in the menu bar, or quit</span>
+            </div>
+            <div class="seg" id="onclose-seg" role="radiogroup" aria-label="On close">
+              <button class="seg-btn" data-onclose="ask" type="button">Ask</button>
+              <button class="seg-btn" data-onclose="tray" type="button" data-tray-term>Menu bar</button>
+              <button class="seg-btn" data-onclose="quit" type="button">Quit</button>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Updates</span>
+              <span class="setting-desc" id="update-check-result">Checks automatically on launch and every 6 hours</span>
+              <!-- Rendered from what the backend persisted, on every tick: the
+                   automatic check is no longer silent about what it did, and
+                   the line survives the relaunch an install causes. -->
+              <span class="setting-desc" id="update-last-check">Last check: none yet</span>
+            </div>
+            <button id="update-check-btn" class="btn-secondary" type="button">Check now</button>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Color</span>
+              <span class="setting-desc">The light your node glows with</span>
+            </div>
+            <div class="accent-dots" role="radiogroup" aria-label="Accent color">
+              <button class="accent-dot" data-accent="ember" style="--dot:#f7931a" type="button" aria-label="Ember"></button>
+              <button class="accent-dot" data-accent="btx" style="--dot:#4ade80" type="button" aria-label="BTX green"></button>
+              <button class="accent-dot" data-accent="ocean" style="--dot:#38bdf8" type="button" aria-label="Ocean"></button>
+              <button class="accent-dot" data-accent="nova" style="--dot:#c084fc" type="button" aria-label="Nova"></button>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Look</span>
+              <span class="setting-desc">How your node shows it's alive</span>
+            </div>
+            <div class="seg" role="radiogroup" aria-label="Visual style">
+              <button class="seg-btn" data-visual="calm" type="button">Calm</button>
+              <button class="seg-btn" data-visual="energy" type="button">Pulse</button>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Wallet</span>
+              <span class="setting-desc">Watch a BTX wallet, with balances from your own node</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="wallet-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Data folder</span>
+              <span class="setting-desc" id="setting-datadir">—</span>
+            </div>
+            <button id="open-datadir-btn" class="btn-secondary" type="button">Open</button>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">What's next</span>
+              <span class="setting-desc">What's coming next</span>
+            </div>
+            <button id="future-btn-settings" class="btn-secondary" type="button">See it</button>
+          </div>
+          </section>
+
+          <section class="settings-group">
+            <h3 class="settings-group-title">Helping the network</h3>
           <div class="setting-row setting-row-stacked">
             <div class="setting-text">
               <span class="setting-name">Node nickname</span>
@@ -442,6 +518,21 @@
                one home computer signed, and the app had no way to add a
                second. The copy under the key says what is being asked for,
                which is trust rather than bandwidth. -->
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Write a local service report</span>
+              <span class="setting-desc">Saves what this node has served to a file in your data folder every few minutes. Local only, nothing is uploaded</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="report-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          </section>
+
+          <details class="settings-group settings-group-fold">
+            <summary class="settings-group-title">For operators<span class="settings-group-hint">Signing for mirrors, answering wallets, snapshots and Esplora</span></summary>
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Sign confirmations for mirrors</span>
@@ -453,6 +544,7 @@
             </label>
           </div>
           <p class="setting-result" id="signer-result" hidden></p>
+
           <div class="setting-row setting-row-stacked" id="signer-key-row" hidden>
             <div class="setting-text">
               <span class="setting-name">Your public signing key</span>
@@ -463,6 +555,7 @@
               <button id="signer-copy-btn" class="btn-secondary" type="button">Copy key</button>
             </div>
           </div>
+
           <div class="setting-row" id="signer-publish-row" hidden>
             <div class="setting-text">
               <span class="setting-name">Offer my key to mirror operators</span>
@@ -475,17 +568,6 @@
             </label>
           </div>
           <p class="setting-result" id="signer-publish-result" hidden></p>
-
-          <div class="setting-row">
-            <div class="setting-text">
-              <span class="setting-name">Write a local service report</span>
-              <span class="setting-desc">Saves what this node has served to a file in your data folder every few minutes. Local only, nothing is uploaded</span>
-            </div>
-            <label class="switch">
-              <input type="checkbox" id="report-toggle" />
-              <span class="slider"></span>
-            </label>
-          </div>
 
           <div class="setting-row">
             <div class="setting-text">
@@ -552,74 +634,10 @@
             </div>
             <p class="setting-result" id="esplora-result" hidden></p>
           </div>
+          </details>
 
-          <div class="setting-row">
-            <div class="setting-text">
-              <span class="setting-name">When you close the window</span>
-              <span class="setting-desc" data-tray-term>The red X can ask, keep the node in the menu bar, or quit</span>
-            </div>
-            <div class="seg" id="onclose-seg" role="radiogroup" aria-label="On close">
-              <button class="seg-btn" data-onclose="ask" type="button">Ask</button>
-              <button class="seg-btn" data-onclose="tray" type="button" data-tray-term>Menu bar</button>
-              <button class="seg-btn" data-onclose="quit" type="button">Quit</button>
-            </div>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-text">
-              <span class="setting-name">Updates</span>
-              <span class="setting-desc" id="update-check-result">Checks automatically on launch and every 6 hours</span>
-              <!-- Rendered from what the backend persisted, on every tick: the
-                   automatic check is no longer silent about what it did, and
-                   the line survives the relaunch an install causes. -->
-              <span class="setting-desc" id="update-last-check">Last check: none yet</span>
-            </div>
-            <button id="update-check-btn" class="btn-secondary" type="button">Check now</button>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-text">
-              <span class="setting-name">Color</span>
-              <span class="setting-desc">The light your node glows with</span>
-            </div>
-            <div class="accent-dots" role="radiogroup" aria-label="Accent color">
-              <button class="accent-dot" data-accent="ember" style="--dot:#f7931a" type="button" aria-label="Ember"></button>
-              <button class="accent-dot" data-accent="btx" style="--dot:#4ade80" type="button" aria-label="BTX green"></button>
-              <button class="accent-dot" data-accent="ocean" style="--dot:#38bdf8" type="button" aria-label="Ocean"></button>
-              <button class="accent-dot" data-accent="nova" style="--dot:#c084fc" type="button" aria-label="Nova"></button>
-            </div>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-text">
-              <span class="setting-name">Look</span>
-              <span class="setting-desc">How your node shows it's alive</span>
-            </div>
-            <div class="seg" role="radiogroup" aria-label="Visual style">
-              <button class="seg-btn" data-visual="calm" type="button">Calm</button>
-              <button class="seg-btn" data-visual="energy" type="button">Pulse</button>
-            </div>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-text">
-              <span class="setting-name">Wallet</span>
-              <span class="setting-desc">Watch a BTX wallet, with balances from your own node</span>
-            </div>
-            <label class="switch">
-              <input type="checkbox" id="wallet-toggle" />
-              <span class="slider"></span>
-            </label>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-text">
-              <span class="setting-name">What's next</span>
-              <span class="setting-desc">What's coming next</span>
-            </div>
-            <button id="future-btn-settings" class="btn-secondary" type="button">See it</button>
-          </div>
-
+          <section class="settings-group">
+            <h3 class="settings-group-title">Disk</h3>
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Reclaim disk space</span>
@@ -637,6 +655,7 @@
             <button id="remove-node-btn" class="btn-secondary" type="button">Remove…</button>
           </div>
           <p class="setting-result" id="remove-node-result" hidden></p>
+          </section>
 
           <p class="settings-footer" id="settings-footer"></p>
         </div>
