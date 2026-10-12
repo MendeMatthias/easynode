@@ -56,6 +56,7 @@ import {
   type UpdateCheckEvent,
 } from "./update-check";
 import { contributionView } from "./contribution";
+import { explorerRow } from "./feature-rows";
 import { type VisualMode, announceChange, headline, waitingLine } from "./headline";
 import { initOverlayKeys } from "./overlay-keys";
 import { mountPowerCore } from "./power-core";
@@ -139,6 +140,8 @@ interface NodeStatusInfo {
   keep_awake_supported: boolean;
   tray_term: string;
   txindex_enabled: boolean;
+  /** Explorer mode can run here: no pruning in effect or chosen. */
+  explorer_available: boolean;
   /**
    * Serve historical signed confirmations back to the network
    * (matmulattestationserve). Persisted choice or an adopted hand-set conf
@@ -311,6 +314,8 @@ interface NodeStatusInfo {
   esplora_freshness: string | null;
   /** The guardian's reason while running, else why the front is not. */
   esplora_message: string | null;
+  /** Why Esplora cannot run on this machine at all, said calmly. */
+  esplora_unavailable: string | null;
   /** Answer block-hash questions for wallets. Needs no second binary and no
    *  particular prune posture: the server is compiled into this app. */
   witness_enabled: boolean;
@@ -751,9 +756,6 @@ function renderContribution(status: NodeStatusInfo) {
  *  given a name while somebody is looking at it. */
 let welcomeOpen = false;
 
-/** Whether the panel's signing item was on screen when it was closed, so the
- *  "launch at login turns on with this" sentence in it is kept. */
-let welcomeOfferedSigning = false;
 
 function maybeShowWelcome(status: NodeStatusInfo) {
   if (welcomeOpen || status.welcome_shown || !status.setup_complete) return;
@@ -762,8 +764,12 @@ function maybeShowWelcome(status: NodeStatusInfo) {
   // null until the first start decides; a panel that waited for it would miss
   // the moment, so null is taken as "probably" and the item is shown, which
   // is the honest default on every machine with an NVIDIA driver.
-  welcomeOfferedSigning = status.signer_enabled && status.signer_applies_here !== false;
-  $("welcome-signer-item").hidden = !welcomeOfferedSigning;
+  const signs = status.signer_enabled && status.signer_applies_here !== false;
+  $("welcome-signer-item").hidden = !signs;
+  // Snapshot serving needs the same host, and Explorer mode a node that
+  // keeps the whole chain; elsewhere they do nothing, so they are not listed.
+  $("welcome-snapshot-item").hidden = !(signs && status.snapshot_serve_enabled);
+  $("welcome-explorer-item").hidden = !(status.txindex_enabled && status.explorer_available);
   const input = $<HTMLInputElement>("welcome-nickname");
   // An existing install reaching this panel through the contribution
   // migration may already be named. Showing an empty box would read as "your
@@ -794,16 +800,15 @@ async function closeWelcome() {
     btn.disabled = false;
     return;
   }
-  // A signer is only useful while it is up. The panel said launch at login
-  // turns on with signing, and this is where it does, once, best-effort: the
-  // plugin is unavailable in dev and the switch in Settings remains the
-  // operator's. Keep-awake is already on by default for the same reason.
-  if (welcomeOfferedSigning) {
-    try {
-      await enable();
-    } catch (e) {
-      console.warn("could not turn launch-at-login on for the signer", e);
-    }
+  // A node only helps while it is up, so launch at login is on for every
+  // node (the owner's rule of 2026-10-12; it used to be for signers only).
+  // The panel says so, this is where it happens, once and best-effort: the
+  // plugin is unavailable in dev and the switch in Settings stays the
+  // person's. Keep-awake is already on by default for the same reason.
+  try {
+    await enable();
+  } catch (e) {
+    console.warn("could not turn launch-at-login on", e);
   }
   // Mark it seen only after the name is settled, so a refusal above cannot
   // cost the user the panel.
@@ -1066,6 +1071,7 @@ function renderStatus(status: NodeStatusInfo) {
   // opened an hour into a run says what the node is doing now.
   $("close-signer-warning").hidden = !status.signing_live;
   reflectEsploraRow(status);
+  reflectExplorerRow(status);
   reflectWitnessRow(status);
   reflectSnapshotServeRow(status);
   reflectFollowRow(status);
@@ -1641,6 +1647,43 @@ function reflectSnapshotServeRow(status: NodeStatusInfo): void {
   }
 }
 
+/** Explorer mode's row (feature-rows.ts explorerRow). */
+function reflectExplorerRow(status: NodeStatusInfo): void {
+  const row = explorerRow(status);
+  const t = $<HTMLInputElement>("explorer-toggle");
+  if (document.activeElement !== t && !explorerToggleBusy) t.checked = row.checked;
+  t.disabled = row.disabled || explorerToggleBusy;
+  $("explorer-desc").textContent = row.desc;
+}
+
+// The switch restarts a running node to apply the change (ask.rs
+// set_explorer_mode), so it is seconds, and a second click waits.
+let explorerToggleBusy = false;
+$<HTMLInputElement>("explorer-toggle").addEventListener("change", async (e) => {
+  const box = e.target as HTMLInputElement;
+  const on = box.checked;
+  const result = $("explorer-result");
+  explorerToggleBusy = true;
+  box.disabled = true;
+  result.classList.remove("is-error");
+  result.textContent = on ? "Turning on, the node restarts…" : "Turning off, the node restarts…";
+  result.hidden = false;
+  try {
+    await invoke("set_explorer_mode", { on });
+    result.textContent = on
+      ? "On. The index builds in the background while the node keeps working."
+      : "Off. The index is no longer kept.";
+  } catch (err) {
+    box.checked = !on;
+    result.classList.add("is-error");
+    result.textContent = String(err);
+  } finally {
+    explorerToggleBusy = false;
+    box.disabled = false;
+    void tick();
+  }
+});
+
 const ESPLORA_STATIC_COPY =
   "Serve the Esplora API to wallets from your own full node. Needs the whole chain on disk (never a pruned node), electrs and Caddy built from deploy/esplora, and disk for the index";
 
@@ -1659,6 +1702,11 @@ function reflectEsploraRow(status: NodeStatusInfo): void {
   desc.classList.remove("needs-attention");
   if (!status.esplora_enabled) {
     desc.textContent = ESPLORA_STATIC_COPY;
+  } else if (status.esplora_unavailable) {
+    // On by default since 2026-10-12, and on nearly every install it cannot
+    // run: its programs are not shipped, or the node keeps only the newest
+    // blocks. Not a fault, so not amber.
+    desc.textContent = status.esplora_unavailable;
   } else if (status.esplora_indexing) {
     // Work in progress, NOT a problem: no amber. A first index on a full chain
     // runs for hours and the node serves the network the whole time.

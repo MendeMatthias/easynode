@@ -168,6 +168,18 @@ pub fn run() {
                      the welcome panel will say so"
                 );
             }
+            // The owner's rule of 2026-10-12: every feature on, a machine that
+            // cannot run one simply does not, anyone can switch one off. The
+            // four that were never on by default (wallet panel, Explorer mode,
+            // Esplora, snapshot serving) are turned on once, before the node
+            // starts, so they apply to this run. See
+            // `NodeAppSettings::migrate_features_on`.
+            if NodeAppSettings::migrate_features_on(&node_datadir()) {
+                eprintln!(
+                    "[node-app] turned on the wallet panel, Explorer mode, Esplora and snapshot \
+                     serving; each runs only where it can, and the welcome panel says so"
+                );
+            }
 
             // Returning user: the app's promise is "open it and your node
             // runs" — auto-start without a click. First run shows the wizard

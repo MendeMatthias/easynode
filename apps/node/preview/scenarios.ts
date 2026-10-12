@@ -46,7 +46,8 @@ const base: Json = {
   keep_awake: true,
   keep_awake_supported: true,
   tray_term: "menu bar",
-  txindex_enabled: false,
+  txindex_enabled: true,
+  explorer_available: true,
   attestation_serve_enabled: true,
   signer_enabled: true,
   signer_applies_here: true,
@@ -81,7 +82,7 @@ const base: Json = {
   subversion: "/BTX:0.34.15/",
   peer_nicknames: [],
   service_report_enabled: true,
-  wallet_enabled: false,
+  wallet_enabled: true,
   on_close: "ask",
   rc_mode: "gpu",
   rc_validates_independently: true,
@@ -105,7 +106,10 @@ const base: Json = {
   node_profile: "full",
   datadir_pruned: false,
   keeper_engine_ready: true,
-  esplora_enabled: false,
+  esplora_enabled: true,
+  // commands.rs ESPLORA_NOT_INSTALLED: no electrs or Caddy, as on nearly every install.
+  esplora_unavailable:
+    "Not on this computer: it needs electrs and Caddy, which easyNode does not install. It starts by itself once both are here.",
   esplora_listen: "http://127.0.0.1:3080",
   esplora_serving_on: null,
   esplora_running: false,
@@ -118,8 +122,21 @@ const base: Json = {
   witness_running: true,
   witness_public: false,
   witness_message: null,
-  snapshot_serve_enabled: false,
-  snapshot_serve: null,
+  snapshot_serve_enabled: true,
+  snapshot_serve: {
+    offering: true,
+    base_height: 245_700,
+    base_hash: null,
+    stale_by: 60,
+    file_size: 9_400_000,
+    sha256: null,
+    peers_offering: 1,
+    phase: null,
+    // btx_core::snapshot_serve ServeStatus::serving_message.
+    message:
+      "Offering a snapshot of the chain at block 245,700 (60 blocks old, 9.0 MB, 3 chunks). The next one is taken in 40 blocks and offered once it is 144 blocks deep. One other node offers one.",
+    needs_attention: false,
+  },
   last_update_check_at: iso(42 * 60_000),
   last_update_check_outcome: "no-update",
   last_update_check_detail: "automatic",
@@ -150,6 +167,20 @@ const follower: Json = {
   },
   // A home router: nothing connects in.
   inbound_peers: 0,
+  // btx_core::snapshot_serve explain(NotValidating), calm since 2026-10-12.
+  snapshot_serve: {
+    offering: false,
+    base_height: null,
+    base_hash: null,
+    stale_by: null,
+    file_size: null,
+    sha256: null,
+    peers_offering: null,
+    phase: null,
+    message:
+      "This node follows signed attestations (trusted mode) instead of checking blocks itself, so it holds a chain state it never verified and there is nothing it could honestly attest. Only a node that validates can produce a snapshot.",
+    needs_attention: false,
+  },
   // Only one pinned key has signed recent blocks since early October.
   role_lines: ROLE.follower_one_signer,
 };
@@ -327,6 +358,15 @@ const scenarios: Record<string, { label: string; status: Json; extra?: Record<st
   "wizard-downloading": {
     label: "First run: downloading the snapshot",
     status: { running: false, setup_complete: false, welcome_shown: false, phase: { phase: "downloading", progress: 0.34 } },
+  },
+  keeper: {
+    label: "Keeper (pruned): Explorer mode greyed out, Esplora not on this node",
+    status: {
+      node_profile: "keeper",
+      datadir_pruned: true,
+      explorer_available: false,
+      esplora_unavailable: "Not on this node: wallets need the whole chain, and this node keeps only the newest blocks.",
+    },
   },
   "wizard-short-disk": {
     label: "First run: not enough disk, said before the click",
