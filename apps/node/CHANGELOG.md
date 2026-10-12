@@ -6,6 +6,42 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
+## [Unreleased]
+
+**The headline no longer says LIVE over a node that has stopped following
+the chain.** On 12 October a node that follows signatures sat on one block
+for six hours under a green "Your node is live and helping the network",
+while the cards below it said the node was not following the chain. The
+headline and the light now say the same thing as those cards: NOT FOLLOWING
+in amber once the app's own checks call the node stuck (for a node that
+follows signatures that can be 15 minutes in, for any node it is at most 2
+hours), BEHIND when
+newer blocks exist that the node cannot get, and DIFFERENT BRANCH when no
+other source holds your node's block. When other sources are only a few
+blocks ahead, it stays LIVE and says so in the line under it. The small
+window shows the same light.
+
+**A stopped node shows what happened and Start node at the top.** Both used
+to sit at the bottom of the screen, below every card.
+
+**"Global network stats" opens easybtx.com/stats.** It opened
+btxprice.com/stats, which no longer answers.
+
+**Panels close with Escape.** Opening a panel moves the keyboard into it,
+closing it gives the keyboard back to the button that opened it, and Tab
+stays inside the open panel.
+
+**Closing the window while Ask, Tools or What's next was open seemed to do
+nothing.** The "Close BTX Node?" question opened behind the panel. It now
+opens on top.
+
+**Smaller fixes.** "Start node" in Ask says why when the node cannot start,
+instead of doing nothing visible. About and What's next describe the app as
+it is today: there is a wallet, Ask and Quick start have shipped. The tile
+that shows the engine's version is called "BTX engine", so it is not
+confused with the app's own version in the header. The note under Node mode
+reads as a sentence.
+
 ## [0.7.11] - 2026-10-12
 
 **A new node starts a few hundred blocks behind the tip instead of about 6,300.**
