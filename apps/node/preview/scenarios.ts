@@ -328,6 +328,10 @@ const scenarios: Record<string, { label: string; status: Json; extra?: Record<st
     label: "First run: downloading the snapshot",
     status: { running: false, setup_complete: false, welcome_shown: false, phase: { phase: "downloading", progress: 0.34 } },
   },
+  "wizard-short-disk": {
+    label: "First run: not enough disk, said before the click",
+    status: { running: false, setup_complete: false, welcome_shown: false, phase: { phase: "welcome" }, disk_free_mb: 64 * 1024 },
+  },
   "wizard-error": {
     label: "First run: setup failed",
     status: {

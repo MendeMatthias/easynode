@@ -36,6 +36,7 @@ import {
   type StartChoice,
   announcer,
   chipNoticeVisible,
+  diskShortfall,
   setupArgs,
   startChoiceView,
   switchLaterShown,
@@ -642,6 +643,16 @@ function renderWizard(status: NodeStatusInfo) {
   // install the preflight would pass at 20. Always the fresh figure: a resume
   // is gated lower, but overstating is the direction that never strands anyone.
   $("wizard-disk-needed").textContent = fmtGB(status.disk_required_mb);
+  // Short of space: said next to the two numbers before the click, not only
+  // in the error card after it. Not during setup or over its error, which
+  // already say it.
+  const short =
+    inProgress || p.phase === "error"
+      ? null
+      : diskShortfall(status.disk_free_mb, status.disk_required_mb, status.node_profile);
+  $("wizard-free-disk").classList.toggle("is-short", short !== null);
+  $("wizard-disk-short").hidden = short === null;
+  $("wizard-disk-short").textContent = short ?? "";
 
   switch (p.phase) {
     case "downloading":
