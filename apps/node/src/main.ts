@@ -21,7 +21,7 @@ import {
 import {
   CHAIN_BLOCKS_PER_HOUR,
   type CatchupSample,
-  type TrendReading,
+  type StaleCard,
   cannotCatchUp,
   catchupLine,
   chainCardMessage,
@@ -54,6 +54,7 @@ import {
   type UpdateCheckEvent,
 } from "./update-check";
 import { contributionView } from "./contribution";
+import { type VisualMode, headline } from "./headline";
 import { mountPowerCore } from "./power-core";
 import { initAsk } from "./ask";
 import { initTools } from "./tools";
@@ -493,9 +494,9 @@ function fmtInt(n: number): string {
   return n.toLocaleString("en-US");
 }
 
-// One derivation of "what state is the node in" — the orbs, the ambient line,
-// and the Start/Stop button all read THIS, so they can never disagree.
-type VisualMode = "ready" | "syncing" | "stopped" | "error" | "stalled";
+// What phase the node run is in, for the Start/Stop button. The orbs and the
+// ambient line read headline.ts, which starts from this and turns a running
+// node amber when a card below says it is not following the chain.
 /**
  * `rcStalled` = btxd reported it cannot check the new proof of work. The process
  * is up and answering RPC, so every phase signal still says "ready" — but the
@@ -1051,9 +1052,47 @@ function renderStatus(status: NodeStatusInfo) {
   reflectSnapshotServeRow(status);
   reflectFollowRow(status);
 
-  const mode = visualMode(p, status.rc_stalled);
+  // Record the gap on every poll while the node runs, so the wording below
+  // can tell a closing gap from a pinned one, and a syncing node that adds
+  // blocks from one that has stopped. Cheap, bounded, and the only place the
+  // sample is available. Which phases feed it, with what gap, and which start
+  // it over is catchup-trend.ts `trendReading`.
+  const reading = trendReading(p, Date.now());
+  catchupSamples = recordReading(catchupSamples, reading, Date.now());
+
+  // After the sample above, so the stale card judges the trend as it is now.
+  // Judged once a tick: the chain card and the headline read the same one.
+  const stale = staleCard(status.tip_stale_message, reading, catchupSamples, Date.now(), syncingStaleAmber);
+  syncingStaleAmber = reading.kind === "syncing" && stale?.tone === "amber";
+  reflectFork(status, stale);
+  reflectFollowOffer(status);
+
+  // The badge, the line under it and the orb, from one function
+  // (headline.ts), so the headline cannot say LIVE over a card that says the
+  // node is not following the chain.
+  const head = headline(p, {
+    rcStalled: status.rc_stalled,
+    rcMayFallBehind: status.rc_may_fall_behind,
+    stale,
+    forkMessage: status.fork_message,
+    behindSignersMessage: status.behind_signers_message,
+    tipAgeSecs: status.tip_age_secs,
+    stallClass: status.stall?.class ?? null,
+    agreement: status.chain_agreement?.this_node ?? null,
+    // "Near tip" is a boolean with no lag term: it flips the moment the
+    // snapshot chainstate loads at a height fixed in the release, so a fresh
+    // install reads LIVE while still thousands of blocks short. The line says
+    // the gap, and from the gap's own trend whether it is closing
+    // (catchup-trend.ts, where the wording and its history are).
+    catchup:
+      p.phase === "ready" && p.blocks_behind >= LAG_WORTH_SAYING
+        ? catchupLine(p.blocks_behind, catchupSamples, Date.now())
+        : null,
+  });
+  badge.textContent = head.badge;
+  sub.textContent = head.sub;
+  const mode = head.mode;
   orb.className = `status-orb is-${mode}`;
-  errCard.hidden = true;
 
   // Ambient line + compact orb mirror the main orb's state — one mapping.
   ambientMain.setMode(ambientMode(mode));
@@ -1064,94 +1103,17 @@ function renderStatus(status: NodeStatusInfo) {
   lastActive = mode === "ready" || mode === "syncing";
   core?.setActive(lastActive);
 
-  // Record the gap on every poll while the node runs, so the wording below
-  // can tell a closing gap from a pinned one, and a syncing node that adds
-  // blocks from one that has stopped. Cheap, bounded, and the only place the
-  // sample is available. Which phases feed it, with what gap, and which start
-  // it over is catchup-trend.ts `trendReading`.
-  const reading = trendReading(p, Date.now());
-  catchupSamples = recordReading(catchupSamples, reading, Date.now());
-
-  // After the sample above, so the stale card judges the trend as it is now.
-  reflectFork(status, reading);
-  reflectFollowOffer(status);
+  // A node that is not running shows what happened and how to start it right
+  // under the headline (styles.css `.is-idle`); they sat at the bottom of a
+  // long scroll, below every card.
+  screenStatus.classList.toggle("is-idle", p.phase === "stopped" || p.phase === "error");
+  errCard.hidden = p.phase !== "error";
+  if (p.phase === "error") $("status-error-msg").textContent = p.message;
 
   let height = 0;
-  switch (p.phase) {
-    case "ready":
-      if (status.rc_stalled) {
-        // Running, connected, answering RPC — and NOT following the chain.
-        // Say that plainly instead of the confident green LIVE.
-        badge.textContent = "NOT FOLLOWING";
-        sub.textContent = "Your node is running but cannot check new blocks on this machine";
-      } else if (status.rc_may_fall_behind) {
-        badge.textContent = "LIVE";
-        sub.textContent = "Your node is helping the network, checking blocks on the processor";
-      } else if (p.blocks_behind >= LAG_WORTH_SAYING) {
-        // "Near tip" is a boolean with no lag term: it flips the moment the
-        // snapshot chainstate loads at a height fixed in the release, so a
-        // fresh install reads LIVE while still thousands of blocks short and
-        // grinding. Still LIVE — it is running and connected — but say the gap
-        // rather than let "helping the network" stand on its own.
-        //
-        // "Still catching up" is a claim about the FUTURE, and it is not always
-        // true. A node more than three blocks behind is paced to one block per
-        // block interval by the cadence burst hold (btxchain/btx#140), which is
-        // the one speed at which a gap never closes: measured 2026-09-15, a Mac
-        // held between 84 and 99 behind for hours while this line promised it
-        // was catching up. That wording reads as slow internet and sends people
-        // hunting peers, which is what happened on 2026-09-06 and 2026-09-13.
-        // So say which of the two is happening, from the gap's own trend.
-        //
-        // And say how long: the line carries the node's own measured pace, a
-        // time to go while the gap closes and the two rates side by side when
-        // it does not (catchup-trend.ts, where the wording is tested).
-        badge.textContent = "LIVE";
-        sub.textContent = catchupLine(p.blocks_behind, catchupSamples, Date.now());
-      } else {
-        // "LIVE", not "READY": the node is running and serving the network now —
-        // "ready" reads like it's waiting to do something.
-        badge.textContent = "LIVE";
-        sub.textContent = "Your node is live and helping the network";
-      }
-      height = p.height;
-      $("stat-peers").textContent = fmtInt(p.peers);
-      break;
-    case "syncing":
-      if (p.height === 0 && p.headers > 0) {
-        // Headers phase (pre-sync/sync): the chain itself hasn't started —
-        // show the header count doing the moving.
-        badge.textContent = `FETCHING HEADERS ${(p.progress * 100).toFixed(0)}%`;
-        sub.textContent = `Counting the chain: ${fmtInt(p.headers)} block headers so far`;
-      } else {
-        badge.textContent = `SYNCING ${(p.progress * 100).toFixed(1)}%`;
-        sub.textContent = `Catching up to block ${fmtInt(p.headers)}`;
-      }
-      height = p.height;
-      $("stat-peers").textContent = fmtInt(p.peers);
-      break;
-    case "starting":
-    case "loading_snapshot":
-      badge.textContent = p.phase === "starting" ? "STARTING" : "LOADING SNAPSHOT";
-      sub.textContent = "This can take a moment";
-      break;
-    case "warming":
-      badge.textContent = "GETTING READY";
-      sub.textContent = `${p.message} Nothing is wrong. Your node is checking its data. This can take a while after a hard shutdown.`;
-      break;
-    case "stopped":
-      badge.textContent = "STOPPED";
-      sub.textContent = "The node is not running";
-      break;
-    case "error":
-      badge.textContent = "NEEDS ATTENTION";
-      sub.textContent = "";
-      errCard.hidden = false;
-      $("status-error-msg").textContent = p.message;
-      break;
-    default:
-      badge.textContent = "…";
-      sub.textContent = "";
+  if (p.phase === "ready" || p.phase === "syncing") {
+    height = p.height;
+    $("stat-peers").textContent = fmtInt(p.peers);
   }
 
   // A new block arrived — send one gentle note through the frequency line.
@@ -1788,11 +1750,9 @@ let syncingStaleAmber = false;
  * so a stale alarm never outlives the condition, and hidden on any phase that
  * is not running: a stopped node has no view of the chain to be behind with.
  */
-function reflectFork(status: NodeStatusInfo, reading: TrendReading): void {
+function reflectFork(status: NodeStatusInfo, stale: StaleCard | null): void {
   const card = $("fork-card");
   const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
-  const stale = staleCard(status.tip_stale_message, reading, catchupSamples, Date.now(), syncingStaleAmber);
-  syncingStaleAmber = reading.kind === "syncing" && stale?.tone === "amber";
   const shown = chainCardMessage(stale, status.fork_message, status.behind_signers_message);
   if (!running || !shown) {
     card.hidden = true;

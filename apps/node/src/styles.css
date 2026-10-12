@@ -571,6 +571,12 @@ body {
 
 .actions { margin-top: auto; display: flex; flex-direction: column; gap: var(--space-s); }
 .actions .btn-primary { width: 100%; }
+/* A stopped or failed node: what happened and Start node come right under
+   the headline instead of below every card (main.ts sets .is-idle). Visual
+   order only, and only these two move, so reading order stays close. */
+#screen-status.is-idle > .status-orb-wrap { order: -2; }
+#screen-status.is-idle > #status-error,
+#screen-status.is-idle > .actions { order: -1; margin-top: 0; }
 
 .error-card {
   border-color: rgba(248, 113, 113, 0.4);

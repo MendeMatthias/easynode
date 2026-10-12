@@ -251,7 +251,22 @@ describe("classified stall verdicts", () => {
     });
     expect(v.state).toBe("Needs attention");
     expect(v.cls).toBe("is-stalled");
-    expect(v.note).toBe(summary);
+    // The watchdog writes one sentence for the diagnostics and the screen
+    // alike, lower case and with no full stop; the card shows it as one.
+    expect(v.note).toBe(
+      "Signatures are reaching this node, but none come from a key it trusts, so it " +
+        "cannot move. Updating easyNode brings the current key list; if it is already up " +
+        "to date, the keys it trusts may have stopped signing for now.",
+    );
+  });
+
+  it("leaves a summary that is already a sentence as it is", () => {
+    const v = validationView({
+      ...base,
+      rc_trusted_mirror: true,
+      stall: { class: "body_missing", summary: "A block body is missing." },
+    });
+    expect(v.note).toBe("A block body is missing.");
   });
 
   it("null stall changes nothing", () => {
