@@ -28,6 +28,11 @@ stuck node instead of "running", and groups the block number.
 sat in the disk card, far below a green LIVE. The headline now says DISK
 ALMOST FULL in amber, the moment the disk card turns red.
 
+**Setup says the disk is too small before you press the button.** It used to
+find out only after "Set up my node", and show it below the fold. Now the
+free space turns red and a line under it says what is missing, and that
+Keeper mode needs far less.
+
 **A stopped node shows what happened and Start node at the top.** Both used
 to sit at the bottom of the screen, below every card.
 

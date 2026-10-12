@@ -126,15 +126,16 @@ Also: Esplora shows "Not installed yet: electrs
 user cannot act on. Hide the row unless the programs are found, or link a
 guide. Descriptions mix sentences with and without a full stop.
 
-### 5. The setup screen lets you start an install that cannot fit
+### 5. The setup screen let you start an install that cannot fit
 
-The disk check runs only after "Set up my node" is pressed, then shows an
+The disk check ran only after "Set up my node" was pressed, then showed an
 error below the fold (it scrolls there), although both numbers were on
 screen before the click, for example "Disk needed 140.0 GiB, Free on this
-computer 12.4 GiB". Screen:
-`finding-wizard-disk-error-after-click.jpg`. Proposal: colour the free space
-red and say it next to the button before the click; when free space is
-between 20 and 140 GiB, offer Keeper mode (20 GiB) right there.
+computer 12.4 GiB". **Fixed in a follow-up:** the free figure turns red and
+a line under it says what is missing, naming Keeper mode in Settings for a
+full node. The backend's check still decides; the button is left alone.
+Still open: a one-click "Use Keeper mode" right there, instead of a trip to
+Settings.
 
 ### 6. Ask answers only fixed questions
 
@@ -191,6 +192,16 @@ in smaller type would read better.
   when NOT FOLLOWING for an hour, "Start node" when stopped (done), "Free
   space" when the disk is low.
 - **Tray icon in three colours** (see 2).
+- **A notification when the node has been stuck for an hour.** Today the
+  only signals are inside the window and the tray menu; a person who
+  closed the window finds out from the explorer. One OS notification per
+  episode, off with the same switch as launch at login.
+- **A "Get help" row in Tools:** where to send Copy diagnostics, so the
+  person who pressed it knows what to do with what is on their clipboard.
+- **Screen readers do not hear state changes.** The badge has no live
+  region, so NOT FOLLOWING appears silently. A polite region that speaks
+  only when the badge's text changes (the chip notice's `announcer`
+  pattern in start-choice.ts) would do it without repeating every poll.
 
 ## Edge cases checked
 
