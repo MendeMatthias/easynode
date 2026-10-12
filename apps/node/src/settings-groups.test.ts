@@ -29,6 +29,9 @@ describe("Settings groups", () => {
     expect(groupOf("open-datadir-btn")).toBe("This computer");
     expect(groupOf("keeper-toggle")).toBe("Helping the network");
     expect(groupOf("follow-row")).toBe("Helping the network");
+    // Signing is the most a capable node gives, so it stays in plain sight;
+    // the key itself and the offer to mirror operators are folded.
+    expect(groupOf("signer-toggle")).toBe("Helping the network");
     expect(groupOf("signer-key-row")).toBe("For operators");
     expect(groupOf("esplora-listen")).toBe("For operators");
     expect(groupOf("remove-node-btn")).toBe("Disk");

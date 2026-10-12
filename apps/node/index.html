@@ -498,6 +498,23 @@
             </label>
           </div>
 
+          <!-- The signer role (btx_core::signer). The switch is the whole
+               ask of the 2026-09-16 outage: btxscan froze because ONE key on
+               one home computer signed, and the app had no way to add a
+               second. The copy under the key says what is being asked for,
+               which is trust rather than bandwidth. -->
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Sign confirmations for mirrors</span>
+              <span class="setting-desc" id="signer-desc">Your node signs each block it checks, so the nodes that cannot check blocks themselves, the explorer's included, can follow yours. Applies on next start</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="signer-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <p class="setting-result" id="signer-result" hidden></p>
+
           <!-- The way back from the status screen's offer, and the same choice
                for anyone who wants it on a machine that could check blocks.
                Hidden on a machine that follows signatures anyway. -->
@@ -513,12 +530,6 @@
           </div>
           <p class="setting-result" id="follow-result" hidden></p>
 
-          <!-- The signer role (btx_core::signer). The switch is the whole
-               ask of the 2026-09-16 outage: btxscan froze because ONE key on
-               one home computer signed, and the app had no way to add a
-               second. The copy under the key says what is being asked for,
-               which is trust rather than bandwidth. -->
-
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Write a local service report</span>
@@ -532,19 +543,7 @@
           </section>
 
           <details class="settings-group settings-group-fold">
-            <summary class="settings-group-title">For operators<span class="settings-group-hint">Signing for mirrors, answering wallets, snapshots and Esplora</span></summary>
-          <div class="setting-row">
-            <div class="setting-text">
-              <span class="setting-name">Sign confirmations for mirrors</span>
-              <span class="setting-desc" id="signer-desc">Your node signs each block it checks, so the nodes that cannot check blocks themselves, the explorer's included, can follow yours. Applies on next start</span>
-            </div>
-            <label class="switch">
-              <input type="checkbox" id="signer-toggle" />
-              <span class="slider"></span>
-            </label>
-          </div>
-          <p class="setting-result" id="signer-result" hidden></p>
-
+            <summary class="settings-group-title">For operators<span class="settings-group-hint">Your signing key, answering wallets, snapshots and Esplora</span></summary>
           <div class="setting-row setting-row-stacked" id="signer-key-row" hidden>
             <div class="setting-text">
               <span class="setting-name">Your public signing key</span>
