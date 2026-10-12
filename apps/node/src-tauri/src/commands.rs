@@ -2764,9 +2764,9 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         )
                     });
                     *engine_warnings_slot.lock().await = warnings_now;
-                    // A verifier lost mid-run comes back with a restart, which
-                    // re-runs the startup qualification; the engine's own
-                    // re-test did not run once in 13 hours on the 3060
+                    // A verifier lost mid-run gets a restart, which re-runs the
+                    // startup qualification in a new process; on the 3060 the
+                    // engine's in-process re-tests failed for 13 hours
                     // (btx_core::engine_warnings::restart_for_lost_verifier).
                     let first = *run_first_blocks.get_or_insert(chain.blocks);
                     verifier_lost_since = if cannot_verify_now {

@@ -478,15 +478,19 @@ pub const VERIFIER_RESTART_MIN_GAP: std::time::Duration = std::time::Duration::f
 /// Whether the app restarts the engine because its block verifier was lost
 /// mid-run ([`EngineWarning::CannotVerifyBlocks`] standing for `lost_for`).
 ///
-/// Measured on the project's RTX 3060 signer, 2026-10-11 19:48 UTC: the
-/// engine quarantined its CUDA verifier (`strict_device_provider_quarantined`,
-/// health reason `device_seeded_phase1_declined_or_wrong_size`, the run's
-/// 18th quarantine) and reported "automatic byte-exact re-test after backoff;
-/// no restart required", then ran no re-test at all in the next 13 hours
-/// (`recovery_self_checks: 0` in getmininginfo `backend_runtime`). The node
-/// stopped at block 245,498 and signed nothing all night. The engine's own
-/// warning says to restart with a provider that passes self-qualification,
-/// and its startup qualification had passed in that run.
+/// Measured on the project's RTX 3060 signer (stats export, 2026-10-12
+/// 08:53 UTC): its tip stopped at block 245,498 (19:48 UTC on 10-11) with
+/// the CUDA verifier quarantined (`strict_device_provider_quarantined`,
+/// health reason `device_seeded_phase1_declined_or_wrong_size`) and
+/// `quarantine_events: 18`, `recovery_self_checks: 0`. In v0.34.15
+/// (matmul_v4_rc_gkr.cpp) each failed attempt re-quarantines and counts one
+/// event, the re-test waits 60 s doubling to a 1 h cap, and
+/// `recovery_self_checks` counts only successes: so the engine re-tested
+/// about 18 times over 13 hours and the card failed every one, inside the
+/// same process. The engine's warning says to restart with a provider that
+/// passes self-qualification; a restart is a new process and a new device
+/// context, which in-process re-tests are not. Whether that brings such a
+/// card back was not yet measured when this was written.
 ///
 /// Only for a run whose verifier worked (`verified_this_run`: the node
 /// connected blocks in this run): a card refused at startup is the

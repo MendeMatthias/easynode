@@ -10,9 +10,10 @@ root).
 
 **A node whose graphics card check fails mid-run restarts itself.** On 11
 October at 19:48 UTC the node engine on this project's RTX 3060 signer took
-its graphics card out of block checking, said it would test the card again
-by itself, and did not, for 13 hours. The node stopped at block 245,498 and
-signed nothing, and every node that follows signatures stopped with it. Now,
+its graphics card out of block checking and tested it again about every
+hour, and the card failed each time, for 13 hours. The node stopped at block
+245,498 and signed nothing, and every node that follows signatures stopped
+with it. Now,
 when the engine says it cannot check blocks for 15 minutes in a run where it
 had been checking them, easyNode restarts the node, which runs the card check
 again. At most once every 3 hours, and never for a card that did not pass at
