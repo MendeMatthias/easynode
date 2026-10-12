@@ -28,6 +28,7 @@ done without the owner.
 | 10 | Node mode showed the watchdog's sentence in lower case with no full stop. | Shown as a sentence. |
 | 11 | Info and Settings buttons had no tooltip; em-dashes in visible sentences. | Fixed. |
 | 12 | Compact mode is only a light, with no way to read why it is amber. | The light's tooltip is the headline. |
+| 13 | The tray said "Node: running · block 245498" on a stuck node. | "Node: not following · block 245,498" (`tray::stuck_for_tray`, tested). |
 
 Screens: `~/Desktop/easyNode-UI-audit-2026-10-12/screens/` (before and after).
 
@@ -66,14 +67,15 @@ Proposal: keep the facts, change who they are addressed to.
 - Operator wording ("config pins", "attestations", "threshold one", "full
   authority") moves to Copy diagnostics, which already carries the facts.
 
-### 2. The menu bar / tray still says "running" on a stuck node
+### 2. The tray icon does not change colour
 
-`tray.rs:124` renders `Node: running · block 245498` from the phase alone:
-no stuck state, no thousands separator, and the tray icon is the static app
-icon. Someone who only looks at the menu bar sees nothing wrong. Proposal:
-the frontend already computes the headline; send its badge to the tray
-(`Node: not following · block 245,498`), and give the icon an amber and a
-grey variant.
+The tray's status line rendered `Node: running · block 245498` from the
+phase alone, so someone who only looks at the menu bar saw nothing wrong.
+**Fixed in #189:** it says `Node: not following · block 245,498` on the
+watchdog's verdict or an old tip with nothing newer known, computed in Rust
+because the window may be hidden. Still open: the icon is the static app
+icon. Proposal: an amber and a grey variant, so the state is visible
+without opening the menu.
 
 ### 3. A failed status poll leaves the last state on screen forever
 
