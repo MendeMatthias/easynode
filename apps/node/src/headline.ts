@@ -19,7 +19,8 @@
  *   (`chainCardMessage`), which ranks them after the stale sentence, as this
  *   does;
  * - the agreement row, only where it is about this node
- *   (btx_core::chain_agreement `ScreenRow::this_node`).
+ *   (btx_core::chain_agreement `ScreenRow::this_node`);
+ * - a disk so full the node may stop: the disk card.
  * The headline says which of them holds, in a few words, and the card says
  * the rest.
  */
@@ -60,6 +61,9 @@ export type HeadlineFacts = {
   /** The catch-up line (catchup-trend.ts `catchupLine`) for a ready node far
    *  enough behind to say so, null otherwise. The caller holds the samples. */
   catchup: string | null;
+  /** Free disk under `disk_critical_mb` (btx_core::disk), where the disk
+   *  card says "Very low disk space: the node may stop". */
+  diskCritical: boolean;
 };
 
 export type Headline = { badge: string; sub: string; mode: VisualMode };
@@ -72,6 +76,8 @@ export function tipAgeWords(secs: number): string {
 }
 
 const fmtInt = (n: number): string => n.toLocaleString("en-US");
+
+const FREE_SPACE = "Free some space";
 
 export function headline(p: HeadlinePhase, f: HeadlineFacts): Headline {
   switch (p.phase) {
@@ -89,8 +95,12 @@ export function headline(p: HeadlinePhase, f: HeadlineFacts): Headline {
       }
       return {
         badge: `SYNCING ${(p.progress * 100).toFixed(1)}%`,
-        sub: notKeepingUp(f) ? "Syncing, but not keeping up with the chain right now" : `Catching up to block ${fmtInt(p.headers)}`,
-        mode: notKeepingUp(f) ? "stalled" : "syncing",
+        sub: notKeepingUp(f)
+          ? "Syncing, but not keeping up with the chain right now"
+          : f.diskCritical
+            ? `Syncing, but it may stop when the disk fills. ${FREE_SPACE}`
+            : `Catching up to block ${fmtInt(p.headers)}`,
+        mode: notKeepingUp(f) || f.diskCritical ? "stalled" : "syncing",
       };
     case "starting":
       return { badge: "STARTING", sub: "This can take a moment", mode: "syncing" };
@@ -167,6 +177,16 @@ function readyHeadline(f: HeadlineFacts): Headline {
     return {
       badge: "BEHIND",
       sub: "Your node is running, but newer blocks exist that it does not have yet",
+      mode: "stalled",
+    };
+  }
+  if (f.diskCritical) {
+    // After every chain problem, which says the node is not doing its job
+    // now; before the lines about pace, because this one is about to stop it.
+    // The disk card sat about 500 px below the fold under a green LIVE.
+    return {
+      badge: "DISK ALMOST FULL",
+      sub: `Your node is live, but it may stop when the disk fills. ${FREE_SPACE}`,
       mode: "stalled",
     };
   }

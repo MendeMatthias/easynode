@@ -1089,6 +1089,8 @@ function renderStatus(status: NodeStatusInfo) {
       p.phase === "ready" && p.blocks_behind >= LAG_WORTH_SAYING
         ? catchupLine(p.blocks_behind, catchupSamples, Date.now())
         : null,
+    // The same test the disk card's red "may stop" line uses, below.
+    diskCritical: status.disk_free_mb > 0 && status.disk_free_mb < status.disk_critical_mb,
   });
   badge.textContent = head.badge;
   sub.textContent = head.sub;

@@ -24,6 +24,10 @@ shows the same light, with the headline when you hover it. The status line
 in the menu bar (the tray on Windows and Linux) says "not following" on a
 stuck node instead of "running", and groups the block number.
 
+**A disk so full that the node may stop is said at the top.** The warning
+sat in the disk card, far below a green LIVE. The headline now says DISK
+ALMOST FULL in amber, the moment the disk card turns red.
+
 **A stopped node shows what happened and Start node at the top.** Both used
 to sit at the bottom of the screen, below every card.
 
