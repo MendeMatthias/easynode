@@ -29,6 +29,7 @@ done without the owner.
 | 11 | Info and Settings buttons had no tooltip; em-dashes in visible sentences. | Fixed. |
 | 12 | Compact mode is only a light, with no way to read why it is amber. | The light's tooltip is the headline. |
 | 13 | The tray said "Node: running · block 245498" on a stuck node. | "Node: not following · block 245,498" (`tray::stuck_for_tray`, tested). |
+| 14 | A slow status poll (btxd not answering) stacked up overlapping polls behind a screen that looked current. | One poll at a time; after 10 s the line says it is waiting and how old the screen is. |
 
 Screens: `~/Desktop/easyNode-UI-audit-2026-10-12/screens/` (before and after).
 
@@ -77,15 +78,18 @@ because the window may be hidden. Still open: the icon is the static app
 icon. Proposal: an amber and a grey variant, so the state is visible
 without opening the menu.
 
-### 3. A failed status poll leaves the last state on screen forever
+### 3. A failed status poll leaves the last state on screen
 
-`main.ts:1215`: when `get_node_status` throws after the first success, the
-error goes to the console and the screen keeps its last state, LIVE
-included, with a frozen uptime. `main.ts:2615` polls every 1.5 s with no
-in-flight guard, so a slow call can overlap the next and render out of
-order. Not measured here (the preview cannot make the backend slow).
-Proposal: skip a tick while one is in flight, and after about 10 s without
-an answer replace the line under the badge with "Not updated for 12 s".
+`get_node_status` asks btxd twice with a 60 s timeout each, and the app
+polled every 1.5 s with no guard, so a btxd that accepts connections and
+never answers stacked up dozens of polls while the screen showed its last
+state as current. **Fixed in #189:** one poll at a time (an action's
+refresh runs right after the slow one lands), and after 10 s the line under
+the badge says "Waiting for your node to answer. This screen is 12 s old".
+Still open: a poll that *fails* (the command errors) after the first success
+only goes to the console; the screen keeps its last state. Proposal: after
+two failures in a row, the same line with "The app lost track of your
+node".
 
 ### 4. Settings is one flat list of about 22 rows
 
@@ -188,6 +192,7 @@ in smaller type would read better.
 | Close button pressed with a panel open | Dialog now on top (was hidden) |
 | Escape on the close dialog or welcome panel | Ignored on purpose |
 | Windows wording | About now uses the tray word |
+| Status poll slow (btxd not answering) | One poll at a time, "Waiting for your node to answer" after 10 s (checked in the preview with a 20 s status call) |
 | Status poll fails after start | Last state stays up (open, item 3) |
 
 ## Looking at every state yourself

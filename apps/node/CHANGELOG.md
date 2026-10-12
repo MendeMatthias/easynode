@@ -38,6 +38,13 @@ stays inside the open panel.
 nothing.** The "Close BTX Node?" question opened behind the panel. It now
 opens on top.
 
+**A node that stops answering no longer freezes the screen silently.** The
+app asks for its status every 1.5 seconds and waits up to two minutes for a
+node that accepts the question and never answers. It used to keep asking on
+top of the unanswered questions while the screen showed the last answer as
+if it were current. It now asks one at a time, and after 10 seconds says
+"Waiting for your node to answer" under the headline.
+
 **Smaller fixes.** "Start node" in Ask says why when the node cannot start,
 instead of doing nothing visible. About and What's next describe the app as
 it is today: there is a wallet, Ask and Quick start have shipped. The tile
