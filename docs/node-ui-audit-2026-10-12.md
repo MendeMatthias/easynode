@@ -70,6 +70,15 @@ Proposal: keep the facts, change who they are addressed to.
 - Operator wording ("config pins", "attestations", "threshold one", "full
   authority") moves to Copy diagnostics, which already carries the facts.
 
+Why this is a decision and not a fix: the "Pin a second key" line was
+written for mirror operators (the 2026-09-17 btxscan case, where one of four
+pinned keys carried 552 of 600 blocks), and its test says naming the remedy
+is the point. The same card serves both audiences. The clean version keeps
+the remedy where the pins are the operator's own (a `btx_rw.conf` the app
+did not write, which the watchdog already detects) and gives home installs,
+whose pins ship with the app, the "nothing to change on this computer"
+wording.
+
 ### 2. The tray icon does not change colour
 
 The tray's status line rendered `Node: running · block 245498` from the
