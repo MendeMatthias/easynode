@@ -11,6 +11,7 @@ const facts = (over: Partial<HeadlineFacts> = {}): HeadlineFacts => ({
   stallClass: null,
   agreement: null,
   catchup: null,
+  diskCritical: false,
   ...over,
 });
 
@@ -153,6 +154,39 @@ describe("headline on a node at its tip", () => {
       facts({ agreement: "behind", catchup: "Your node is live, still catching up: 40 blocks behind" }),
     );
     expect(h.sub).toBe("Your node is live, still catching up: 40 blocks behind");
+  });
+
+  // The disk card's "Very low disk space: the node may stop" sat about 500
+  // px below the fold of a 780 px window, under a green LIVE.
+  it("says the disk is almost full when the node may stop over it", () => {
+    expect(headline(ready, facts({ diskCritical: true }))).toEqual({
+      badge: "DISK ALMOST FULL",
+      sub: "Your node is live, but it may stop when the disk fills. Free some space",
+      mode: "stalled",
+    });
+  });
+
+  it("puts a node that is not following ahead of a full disk", () => {
+    const h = headline(ready, facts({ diskCritical: true, stallClass: "body_missing" }));
+    expect(h.badge).toBe("NOT FOLLOWING");
+  });
+
+  it("puts a full disk ahead of the catch-up line", () => {
+    const h = headline(
+      { phase: "ready", blocks_behind: 40 },
+      facts({ diskCritical: true, catchup: "Your node is live, still catching up: 40 blocks behind" }),
+    );
+    expect(h.badge).toBe("DISK ALMOST FULL");
+  });
+
+  it("says a full disk while syncing too", () => {
+    const h = headline(
+      { phase: "syncing", height: 200_000, headers: 245_760, progress: 0.5 },
+      facts({ diskCritical: true }),
+    );
+    expect(h.badge).toBe("SYNCING 50.0%");
+    expect(h.sub).toBe("Syncing, but it may stop when the disk fills. Free some space");
+    expect(h.mode).toBe("stalled");
   });
 
   it("keeps the processor line for a node that may fall behind", () => {

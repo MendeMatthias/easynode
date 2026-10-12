@@ -30,6 +30,7 @@ done without the owner.
 | 12 | Compact mode is only a light, with no way to read why it is amber. | The light's tooltip is the headline. |
 | 13 | The tray said "Node: running · block 245498" on a stuck node. | "Node: not following · block 245,498" (`tray::stuck_for_tray`, tested). |
 | 14 | A slow status poll (btxd not answering) stacked up overlapping polls behind a screen that looked current. | One poll at a time; after 10 s the line says it is waiting and how old the screen is. |
+| 15 | "Very low disk space: the node may stop" sat in the disk card, about 500 px below the fold of the 780 px window, under a green LIVE. | DISK ALMOST FULL in amber at the top, on the disk card's own threshold (`disk_critical_mb`, 2 GiB). Fixed in the follow-up to #189. |
 
 Each row can be opened in the preview (end of this page);
 `?s=follower-frozen-6h` is the first one.
@@ -205,6 +206,8 @@ in smaller type would read better.
 | Escape on the close dialog or welcome panel | Ignored on purpose |
 | Windows wording | About now uses the tray word |
 | Status poll slow (btxd not answering) | One poll at a time, "Waiting for your node to answer" after 10 s (checked in the preview with a 20 s status call) |
+| Disk under 2 GiB free while live or syncing | DISK ALMOST FULL, amber (was LIVE, warning far below) |
+| Disk under 10 GiB free | Amber note in the disk card only, as before |
 | Status poll fails after start | Last state stays up (open, item 3) |
 
 ## Looking at every state yourself

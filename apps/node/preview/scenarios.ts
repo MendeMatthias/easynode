@@ -32,8 +32,9 @@ const base: Json = {
   phase: { phase: "ready", height: TIP, peers: 12, blocks_behind: 0 },
   uptime_secs: 3 * 3600 + 412,
   disk_free_mb: 210 * 1024,
-  disk_warn_mb: 20 * 1024,
-  disk_critical_mb: 5 * 1024,
+  // btx_core::disk NODE_DISK_WARN_MB and NODE_DISK_CRITICAL_MB.
+  disk_warn_mb: 10 * 1024,
+  disk_critical_mb: 2 * 1024,
   // btx_core::setup::disk_required(true, false): a fresh full node.
   disk_required_mb: 140 * 1024,
   datadir_size_mb: 9.8 * 1024,
@@ -271,8 +272,12 @@ const scenarios: Record<string, { label: string; status: Json; extra?: Record<st
     },
   },
   "low-disk": {
-    label: "Disk almost full",
-    status: { disk_free_mb: 3.2 * 1024 },
+    label: "Disk almost full: the node may stop",
+    status: { disk_free_mb: 1.6 * 1024 },
+  },
+  "low-disk-warn": {
+    label: "Disk getting low (amber in the disk card only)",
+    status: { disk_free_mb: 6.5 * 1024 },
   },
   "engine-notes": {
     label: "Engine warnings",
