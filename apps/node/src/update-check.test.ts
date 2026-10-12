@@ -33,6 +33,7 @@ import {
   UPDATE_CHECK_OUTCOMES,
   type UpdateCheckBranch,
   type UpdateCheckOutcome,
+  hhmm,
 } from "./update-check";
 
 // Normalise line endings: a Windows checkout with autocrlf hands these files
@@ -643,5 +644,14 @@ describe("updateCheck() keeps a failed install from downloading again, and a pre
       expect(main, name).toMatch(new RegExp(`invoke(<[^>]*>)?\\("${name}"`));
       expect(lib, name).toContain(`commands::${name},`);
     }
+  });
+});
+
+// One clock format across the screen: Settings' "your key went to
+// easybtx.com" stamp printed "6:12:19 AM" next to "Last check: today 05:37".
+describe("hhmm", () => {
+  it("is 24-hour local time with two-digit hours and no seconds", () => {
+    expect(hhmm(new Date(2026, 9, 12, 6, 12, 19))).toBe("06:12");
+    expect(hhmm(new Date(2026, 9, 12, 18, 5, 0))).toBe("18:05");
   });
 });

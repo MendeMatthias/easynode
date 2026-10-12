@@ -155,13 +155,11 @@ in smaller type would read better.
 
 ### 7. Smaller things
 
-- **Units:** "Helping the network" prints 1024-based bytes as "GB"
-  (`contribution.ts:70`) two cards below "9.8 GiB". `fmtGB` was already
-  fixed for the same 7%.
-- **Times:** three formats on one screen: "6:12:19 AM" (Settings, key
-  offer, `main.ts:852`), "today 05:37" (updates), "21:40 UTC" (agreement
-  row). Proposal: local "HH:MM" everywhere, UTC only where a source's time
-  is quoted.
+- **Units and times** (fixed in a follow-up): "Helping the network" and the
+  Remove button printed 1024-based sizes as "GB" next to "9.8 GiB", and the
+  key-offer time read "6:12:19 AM" next to "today 05:37". Both now use the
+  screen's units (GiB, MiB) and its 24-hour clock. The agreement row keeps
+  "21:40 UTC", since it quotes when the sources were read.
 - **"Helping the network"** is one long sentence ("4 nodes have connected to
   you, you have sent them 1.2 GB of the chain, you have passed ... running
   for 3 hours"). Three short rows would scan faster.

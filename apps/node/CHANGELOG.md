@@ -57,6 +57,11 @@ top of the unanswered questions while the screen showed the last answer as
 if it were current. It now asks one at a time, and after 10 seconds says
 "Waiting for your node to answer" under the headline.
 
+**One unit and one clock.** "Helping the network" and the Remove button
+printed sizes divided by 1024 as "GB", next to disk figures in GiB; they say
+GiB and MiB now. The time your key last went to easybtx.com reads "06:12",
+like every other time on the screen, instead of "6:12:19 AM".
+
 **Smaller fixes.** "Start node" in Ask says why when the node cannot start,
 instead of doing nothing visible. About and What's next describe the app as
 it is today: there is a wallet, Ask and Quick start have shipped. The tile
