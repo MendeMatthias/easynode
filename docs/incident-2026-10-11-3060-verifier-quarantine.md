@@ -3,8 +3,8 @@
 The project's RTX 3060 signer (`02d5efca`, nickname `innovation3060`, a
 Windows PC) stopped checking blocks at block 245,498 and signed nothing
 after it. Every easyNode that follows signatures stopped with it, except
-where zbtx3's key (`02c9cfb7`) carried them further. Not resolved when this
-was written (2026-10-12 12:00 UTC).
+where zbtx3's key (`02c9cfb7`) carried them further. The PC was rebooted on
+10-12 at about 13:00 UTC and signs again (below).
 
 ## Measured
 
@@ -40,6 +40,23 @@ btxscan's node:
   because blocks equalled headers.
 - 12:00 UTC on 10-12: btxscan still held the same connection from the 3060
   (opened 19:51:08 on 10-11), so its engine had not been restarted yet.
+
+## After the reboot (10-12, read-only on btxscan's node)
+
+- The owner quit easyNode and rebooted the PC at about 13:00 UTC. By 13:06
+  `02d5efca` was on blocks 245,499, 245,500 and 245,510, which it had never
+  signed: the card passes the engine's check again and the node signs each
+  block as it checks it.
+- Pace, 13:08:39 to 13:12:42 UTC: 245,520 to 245,534, about 207 blocks an
+  hour against the chain's about 40. 664 behind the tip (246,198) then, so
+  at the tip in about 4 hours if the pace holds.
+- zbtx3's `02c9cfb7` signed up to about 245,975, so followers could already
+  reach that far; past it they move with the 3060 (about 2 hours from 13:12).
+- The 3060 was not directly connected to btxscan at 13:06; its signatures
+  reached btxscan through other peers.
+- A reboot is not a node restart: whether restarting only the engine would
+  have brought the card back is still not known, and #199 stays unreleased
+  until it is.
 
 ## Not known
 
