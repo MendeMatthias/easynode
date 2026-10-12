@@ -54,9 +54,10 @@ btxscan's node:
 - The engine's `debug.log` (node folder: Settings > Data folder > Open)
   around 19:40 to 20:00 UTC on 10-11: lines starting "MatMul Profile-1
   provider quarantined" and what precedes them.
-- Windows Event Viewer, System log, same window (21:40 to 22:00 local time
-  if the PC is on UTC+2): Kernel-Power (sleep, resume), `nvlddmkm` (driver
-  reset, Xid), Display.
+- Windows Event Viewer, System log, same window: 23:40 to 00:00 local time
+  on 10-11 to 10-12 (the PC is in Dubai, UTC+4; it shares its public address
+  with this project's Mac). Kernel-Power (sleep, resume), `nvlddmkm`
+  (driver reset, Xid), Display.
 - `nvidia-smi`: driver version, temperatures, whether another process holds
   the GPU (the easyBTX miner shares the folder `~/.easybtx`).
 - Power settings: anything that lets the PC sleep despite easyNode's
