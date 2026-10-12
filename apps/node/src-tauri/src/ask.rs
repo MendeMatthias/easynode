@@ -277,7 +277,7 @@ fn block_error_to_ask(e: AppError) -> Ask<BlockAnswer> {
             code: -1,
             ref message,
         } if message.contains("Block not available") => Ask::Unavailable {
-            message: "Your node hasn't downloaded that block yet — it's still \
+            message: "Your node hasn't downloaded that block yet: it is still \
                           backfilling older history in the background. Ask for a newer \
                           block, or try again later."
                 .into(),

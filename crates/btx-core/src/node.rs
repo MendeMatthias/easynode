@@ -4264,7 +4264,7 @@ impl NodeController {
                 return Err(AppError::Disk(format!(
                     "not starting the node: {} has {:.1} GiB free and btxd needs at least {} GiB \
                      to write blocks and chainstate without corrupting them. Free some \
-                     space and start it again — the chain on disk is fine.",
+                     space and start it again; the chain on disk is fine.",
                     datadir.display(),
                     free as f64 / GIB as f64,
                     crate::setup::NODE_START_DISK_FLOOR / GIB,
