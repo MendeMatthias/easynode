@@ -38,6 +38,21 @@ conditional update of a stored record failed, so no snapshot file was ever
 stored and no co-signature could ever merge. Verified live: the 3060's
 producer stored block 245,300's file six minutes after the deploy.
 
+## Since 0.7.11 on main, unreleased: the UI audit
+
+An audit of every screen (`docs/node-ui-audit-2026-10-12.md`) and its fixes
+(easynode #189, #190). The one that matters: the headline said a green LIVE
+over a node following signatures that had been stuck for hours, while the
+cards below said it was not following. `apps/node/src/headline.ts` now
+derives the badge, the line and the light from what the cards say; the tray
+says "not following" too (`tray::stuck_for_tray`). The next release (0.7.12)
+ships them. Two items in the audit are decisions, not fixes: the role card's
+wording for home users (it tells them to "pin a second key") and grouping
+Settings.
+
+To look at any screen without a node: `npm --prefix apps/node run
+preview:states`, then `http://localhost:1440/preview/index.html`.
+
 ## Open work, in priority order
 
 1. **A second operator must confirm.** `/api/snapshots/latest` stays 404
