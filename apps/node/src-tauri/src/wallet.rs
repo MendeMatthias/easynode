@@ -642,7 +642,7 @@ pub async fn wallet_create(state: State<'_, AppState>) -> Result<Ask<CreateResul
     let datadir = node_datadir();
     if NodeAppSettings::load(&datadir).wallet_name.is_some() {
         return Ok(Ask::Unavailable {
-            message: "A wallet is already set up — stop watching it first.".into(),
+            message: "A wallet is already set up. Stop watching it first.".into(),
         });
     }
     let Some(rpc) = state.rpc.lock().await.clone() else {
@@ -718,7 +718,7 @@ pub async fn wallet_create(state: State<'_, AppState>) -> Result<Ask<CreateResul
 pub async fn wallet_receive_address(state: State<'_, AppState>) -> Result<Ask<String>, String> {
     let settings = NodeAppSettings::load(&node_datadir());
     let Some(name) = settings.wallet_name.clone() else {
-        return Err("No wallet yet — create or import one first.".into());
+        return Err("No wallet yet. Create or import one first.".into());
     };
     let Some(rpc) = state.rpc.lock().await.clone() else {
         return Ok(Ask::Stopped);
@@ -769,7 +769,7 @@ pub async fn wallet_send(
 
     let settings = NodeAppSettings::load(&node_datadir());
     let Some(name) = settings.wallet_name.clone() else {
-        return Err("No wallet yet — create or import one first.".into());
+        return Err("No wallet yet. Create or import one first.".into());
     };
     let Some(rpc) = state.rpc.lock().await.clone() else {
         return Ok(Ask::Stopped);
@@ -791,7 +791,7 @@ pub async fn wallet_send(
     // rejects a legitimate "send everything" by a rounding crumb.
     if amount > balances.trusted + 1e-12 {
         return Err(format!(
-            "You can spend {:.8} BTX right now — that's less than {:.8}.",
+            "You can spend {:.8} BTX right now, which is less than {:.8}.",
             balances.trusted, amount
         ));
     }

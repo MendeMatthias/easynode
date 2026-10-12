@@ -1316,7 +1316,7 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     }
 
     let paths: FaststartResult = returning_launch_paths(&datadir, &tag)
-        .ok_or_else(|| "node binaries not installed yet — run setup first".to_string())?;
+        .ok_or_else(|| "node binaries not installed yet; run setup first".to_string())?;
 
     // Double-spawn guard: a controller whose child is still alive means a
     // previous start is in flight (e.g. a long warmup). Overwriting it would
@@ -1325,7 +1325,7 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     if let Some(controller) = state.node.lock().await.as_mut() {
         if controller.child_has_exited() == Some(false) {
             return Err(
-                "the node is still starting up (this can take a while after an unclean shutdown) — give it a moment"
+                "the node is still starting up (this can take a while after an unclean shutdown); give it a moment"
                     .to_string(),
             );
         }
@@ -2011,7 +2011,7 @@ async fn spawn_node_with_lock_retry(
         // A quit that started mid-retry must win: spawning after the graceful
         // quit's stop pass has already run would orphan a fresh btxd.
         if state.quitting.load(Ordering::SeqCst) {
-            return Err("the app is quitting — not starting the node".to_string());
+            return Err("the app is quitting, so the node is not starting".to_string());
         }
         // Whether this attempt had to clear a holder decides two things: the
         // long stop-wait below, and whether the post-spawn survival watch runs
