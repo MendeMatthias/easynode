@@ -45,7 +45,7 @@
             <circle cx="16.5" cy="13" r="0.7" fill="currentColor" stroke="none"></circle>
           </svg>
         </button>
-        <button id="info-btn" class="icon-btn" type="button" aria-label="About BTX Node" aria-haspopup="dialog">
+        <button id="info-btn" class="icon-btn" type="button" aria-label="About BTX Node" aria-haspopup="dialog" title="About BTX Node">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
                stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <circle cx="12" cy="12" r="9"></circle>
@@ -60,7 +60,7 @@
             <path d="M9 20v-5H4"></path><path d="M15 20v-5h5"></path>
           </svg>
         </button>
-        <button id="settings-btn" class="icon-btn" type="button" aria-label="Settings" aria-haspopup="dialog">
+        <button id="settings-btn" class="icon-btn" type="button" aria-label="Settings" aria-haspopup="dialog" title="Settings">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
                stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <circle cx="12" cy="12" r="3"></circle>
@@ -222,7 +222,7 @@
             <span class="stat-value" id="stat-uptime">—</span>
           </div>
           <div class="stat">
-            <span class="stat-label">Node version</span>
+            <span class="stat-label">BTX engine</span>
             <span class="stat-value" id="stat-version">—</span>
           </div>
         </div>
@@ -397,7 +397,7 @@
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Keeper mode</span>
-              <span class="setting-desc" id="keeper-desc">Small node (~10 GB) that serves signed confirmations — the network's scarcest service</span>
+              <span class="setting-desc" id="keeper-desc">Small node (~10 GB) that serves signed confirmations, the network's scarcest service</span>
             </div>
             <label class="switch">
               <input type="checkbox" id="keeper-toggle" />
@@ -408,7 +408,7 @@
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Serve confirmations</span>
-              <span class="setting-desc">On automatically in Keeper mode — a full node can serve its history here too. Applies on next start</span>
+              <span class="setting-desc">On automatically in Keeper mode. A full node can serve its history here too. Applies on next start</span>
             </div>
             <label class="switch">
               <input type="checkbox" id="serve-toggle" />
@@ -473,7 +473,7 @@
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Write a local service report</span>
-              <span class="setting-desc">Saves what this node has served to a file in your data folder every few minutes. Local only — nothing is uploaded</span>
+              <span class="setting-desc">Saves what this node has served to a file in your data folder every few minutes. Local only, nothing is uploaded</span>
             </div>
             <label class="switch">
               <input type="checkbox" id="report-toggle" />
@@ -598,7 +598,7 @@
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Wallet</span>
-              <span class="setting-desc">Watch a BTX wallet — balances from your own node</span>
+              <span class="setting-desc">Watch a BTX wallet, with balances from your own node</span>
             </div>
             <label class="switch">
               <input type="checkbox" id="wallet-toggle" />
@@ -626,7 +626,7 @@
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Remove node data</span>
-              <span class="setting-desc">Delete the chain and free its disk space — set up again anytime</span>
+              <span class="setting-desc">Delete the chain and free its disk space. Set up again anytime</span>
             </div>
             <button id="remove-node-btn" class="btn-secondary" type="button">Remove…</button>
           </div>
@@ -741,21 +741,22 @@
           </div>
           <div class="info-body">
             <p>
-              A full node keeps its own complete, verified copy of the BTX
-              blockchain and checks every block against the rules — no trust in
-              anyone else's server. Nodes relay blocks and transactions between
-              peers and help new nodes join.
+              A full node keeps its own copy of the BTX blockchain and relays
+              blocks and transactions between peers, so nobody has to trust one
+              company's server. It helps new nodes join, too.
             </p>
             <p>
-              BTX Node runs one for you: it fast-started from a
-              checksum-verified snapshot, keeps the node healthy in your menu
-              bar, and shows you what it's doing. No wallet, no mining, no
-              account — just you, helping the network stay decentralized.
+              BTX Node runs one for you. It starts from a signed snapshot, so
+              it is ready in minutes, keeps the node healthy from your
+              <span data-tray-term>menu bar</span>, and shows you what it is
+              doing. Quick start follows the signatures of nodes that check
+              every block; Full check has your graphics card check them itself.
+              No mining and no account. A wallet is there if you want one.
             </p>
             <p class="info-fineprint">
               The full chain measured 124 GiB on 2026-09-04 and now grows
               about 8 MB a day, so the space it needs is mostly the history it
-              already has. BTX has no node rewards today — this one is for the
+              already has. BTX has no node rewards today: this one is for the
               network. Settings can remove the chain data anytime.
             </p>
             <div class="info-footprint">
@@ -780,7 +781,7 @@
 
           <div id="wallet-import-section" hidden>
             <p class="ask-intro">
-              Your own node can make a wallet — or open one you already have.
+              Your own node can make a wallet, or open one you already have.
               Either way the keys live on this computer and your node answers with
               the balance and the history. No website, no account, no third party
               in the middle.
@@ -788,7 +789,7 @@
             <button id="wallet-create-btn" class="btn-primary" type="button">Create a new wallet</button>
             <p class="ask-line wallet-fineprint">
               Makes a post-quantum wallet inside your node and saves its
-              <strong>.btxwallet</strong> file to your Desktop — the same file the
+              <strong>.btxwallet</strong> file to your Desktop, the same file the
               official BTX browser wallet uses. That file IS your money: store
               it somewhere safe and never share it.
             </p>
@@ -817,7 +818,7 @@
               <p class="ask-line" id="wallet-caveat" hidden></p>
               <p class="ask-line wallet-fineprint">
                 Every row is answered by your node. Click one to open it on the
-                public explorer if you want a second pair of eyes — that's the
+                public explorer if you want a second pair of eyes. That is the
                 only time anything leaves this machine, and only the id you clicked.
               </p>
             </div>
@@ -833,7 +834,7 @@
               <p class="ask-line wallet-fineprint">
                 A fresh address for each payment keeps your payments from being
                 tied together in public. Every address you've ever been given
-                keeps working — old ones never expire.
+                keeps working; old ones never expire.
               </p>
             </div>
 
@@ -946,7 +947,7 @@
             <div class="overlay-head"><h2>Stopping your node safely…</h2></div>
             <p class="ask-intro">
               Letting btxd finish writing so your next start is instant. This is
-              quick — the window closes on its own.
+              quick, and the window closes on its own.
             </p>
           </div>
         </div>
@@ -961,13 +962,14 @@
           </div>
           <p class="ask-intro">
             Answers come straight from the verified copy of the chain on this
-            computer — no outside service. <span class="cite-dot" aria-hidden="true"></span>
+            computer, with no outside service. <span class="cite-dot" aria-hidden="true"></span>
             means "from your own node".
           </p>
 
           <div class="ask-gate" id="ask-gate" hidden>
             <p>Start your node to ask it questions.</p>
             <button id="ask-start-btn" class="btn-secondary" type="button">Start node</button>
+            <p class="setting-result is-error" id="ask-start-error" role="alert" hidden></p>
           </div>
 
           <div class="ask-list" id="ask-list">
@@ -1085,15 +1087,16 @@
             <button id="future-close" class="icon-btn" type="button" aria-label="Close">✕</button>
           </div>
           <ul class="future-list">
-            <li><strong>Ask your node</strong> — shipped in v0.2: cited answers about the chain, straight from your own node. Tap the <strong>?</strong> in the header.</li>
-            <li><strong>Node supporter identity</strong> — a way for your node to say "I was here", with stats you can share.</li>
-            <li><strong>Compute contribution</strong> — opt in to donate spare compute to useful network work, using the node's built-in service RPC.</li>
-            <li><strong>Following the chain past 185,000 on any machine</strong> — today that needs an Apple Silicon Mac or one of the newest graphics cards. A mode that works everywhere is being built by the BTX team; when it is safe to leave running unattended, it ships here.</li>
-            <li><strong>Making it worth your while</strong> — if the network adds node incentives, this app is where they land first.</li>
+            <li><strong>Node supporter identity:</strong> a way for your node to say "I was here", with stats you can share.</li>
+            <li><strong>Compute contribution:</strong> opt in to donate spare compute to useful network work, using the node's built-in service RPC.</li>
+            <li><strong>Making it worth your while:</strong> if the network adds node incentives, this app is where they land first.</li>
           </ul>
           <p class="info-fineprint">
-            These are plans, not promises — order and shape can change. Already
-            shipped: the wallet, and Windows and Linux builds.
+            These are plans, not promises; order and shape can change. Already
+            shipped: Ask your node (the <strong>?</strong> in the header), the
+            wallet, Quick start for machines that cannot check blocks
+            themselves, signing for the nodes that follow yours, and Windows
+            and Linux builds.
           </p>
         </div>
       </div>
