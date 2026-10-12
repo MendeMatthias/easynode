@@ -397,13 +397,18 @@ export function initAsk(): void {
   }
   $("ask-start-btn").addEventListener("click", async () => {
     const b = $<HTMLButtonElement>("ask-start-btn");
+    const err = $("ask-start-error");
     b.disabled = true;
     b.textContent = "Starting…";
+    err.hidden = true;
     try {
       await invoke("start_node");
       await refreshGate();
     } catch (e) {
-      console.error("start from ask panel failed", e);
+      // Said where the click was. It went to the console only, so a start
+      // that failed looked like a button that did nothing.
+      err.textContent = `Couldn't start the node: ${String(e)}`;
+      err.hidden = false;
     } finally {
       b.disabled = false;
       b.textContent = "Start node";

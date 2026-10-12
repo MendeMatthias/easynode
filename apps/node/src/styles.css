@@ -423,6 +423,8 @@ body {
   font-size: 16px;
   letter-spacing: 0.06em;
 }
+.status-badge[data-mode="stalled"] { color: var(--color-amber); }
+.status-badge[data-mode="error"] { color: var(--color-danger); }
 .status-sub {
   font-size: 12.5px;
   color: var(--color-muted);
@@ -571,6 +573,12 @@ body {
 
 .actions { margin-top: auto; display: flex; flex-direction: column; gap: var(--space-s); }
 .actions .btn-primary { width: 100%; }
+/* A stopped or failed node: what happened and Start node come right under
+   the headline instead of below every card (main.ts sets .is-idle). Visual
+   order only, and only these two move, so reading order stays close. */
+#screen-status.is-idle > .status-orb-wrap { order: -2; }
+#screen-status.is-idle > #status-error,
+#screen-status.is-idle > .actions { order: -1; margin-top: 0; }
 
 .error-card {
   border-color: rgba(248, 113, 113, 0.4);
@@ -693,6 +701,11 @@ body {
   padding: var(--space-m);
 }
 .overlay[hidden] { display: none; }
+/* "Close BTX Node?" and "Quitting" open over whatever panel is up when the
+   window's close button or the tray's Quit is pressed. At the shared z-index
+   they painted behind Ask, Tools and What's next, which come later in the
+   page, and the close button seemed to do nothing. Below the toast (20). */
+#close-overlay { z-index: 15; }
 .overlay-panel {
   width: 100%;
   max-width: 460px;
