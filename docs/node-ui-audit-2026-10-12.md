@@ -35,7 +35,7 @@ Screens: `~/Desktop/easyNode-UI-audit-2026-10-12/screens/` (before and after).
 
 ## Still open, most important first
 
-### 1. The role card reads like a list of failures on a normal home Mac. Needs a decision.
+### 1. The role card talks to home users like operators. Needs a decision.
 
 Generated from `btx_core::role` itself (`apps/node/preview/rolegen`), a Mac
 that follows signatures behind a home router shows, under a headline that
@@ -52,8 +52,10 @@ says it is helping:
 - **Reachable: "No inbound connections"**, not helping, with a port
   forwarding instruction (`role.rs:644`).
 
-Three of five lines are marked as not helping for the most common install,
-and two of them are not things the person did wrong or can easily change.
+Three of five lines carry the "does not help" mark for the most common
+install (a hollow circle, read out as "does not help the network"), and two
+of them are not things the person did wrong or can easily change. The mark
+is quiet; the words are the problem.
 
 Proposal: keep the facts, change who they are addressed to.
 
