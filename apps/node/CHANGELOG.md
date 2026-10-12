@@ -6,7 +6,7 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
-## [Unreleased]
+## [0.7.12] - 2026-10-12
 
 **Everything is on, and anything can be switched off.** The wallet,
 Explorer mode (look up any past transaction in Ask), serving a chain
@@ -34,14 +34,14 @@ while the cards below it said the node was not following the chain. The
 headline and the light now say the same thing as those cards: NOT FOLLOWING
 in amber once the app's own checks call the node stuck (for a node that
 follows signatures that can be 15 minutes in, for any node it is at most 2
-hours), BEHIND when
-newer blocks exist that the node cannot get, and DIFFERENT BRANCH when no
-other source holds your node's block. When other sources are only a few
-blocks ahead, it stays LIVE and says so in the line under it. The word
-itself turns amber or red when something is wrong, and the small window
-shows the same light, with the headline when you hover it. The status line
-in the menu bar (the tray on Windows and Linux) says "not following" on a
-stuck node instead of "running", and groups the block number.
+hours), BEHIND when newer blocks exist that the node cannot get, and
+DIFFERENT BRANCH when no other source holds your node's block. When other
+sources are only a few blocks ahead, it stays LIVE and says so in the line
+under it. The word itself turns amber or red when something is wrong, and
+the small window shows the same light, with the headline when you hover it.
+The status line in the menu bar (the tray on Windows and Linux) says "not
+following" on a stuck node instead of "running", and groups the block
+number.
 
 **A disk so full that the node may stop is said at the top.** The warning
 sat in the disk card, far below a green LIVE. The headline now says DISK
