@@ -2894,7 +2894,26 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         }
                     };
                     *phase_slot.lock().await = new_phase.clone();
-                    crate::tray::reflect_phase(&app, &new_phase);
+                    // The tray says "not following" on the facts the window's
+                    // headline turns amber on without the window's trend: the
+                    // watchdog's verdict (last tick's), or an old tip with
+                    // nothing newer known (tray::stuck_for_tray). The window
+                    // may be hidden, so the tray cannot wait for it.
+                    let stuck = match &new_phase {
+                        NodePhase::Ready { blocks_behind, .. } => {
+                            let now_unix = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            crate::tray::stuck_for_tray(
+                                stall_slot.lock().await.is_some(),
+                                btx_core::node_api::tip_is_stale(chain.median_time, now_unix),
+                                *blocks_behind,
+                            )
+                        }
+                        _ => false,
+                    };
+                    crate::tray::reflect_status(&app, &new_phase, stuck);
 
                     // Latch btxd's rc verdict OURSELVES (bounded tail read,
                     // only until latched — same rule as get_node_status).
