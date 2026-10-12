@@ -54,31 +54,61 @@ btxscan's node:
   reach that far; past it they move with the 3060 (about 2 hours from 13:12).
 - The 3060 was not directly connected to btxscan at 13:06; its signatures
   reached btxscan through other peers.
-- A reboot is not a node restart: whether restarting only the engine would
-  have brought the card back is still not known, and #199 stays unreleased
-  until it is.
+- A reboot is not a node restart; see "Would restarting only the engine
+  have brought the card back?" below.
+- It reached the network tip at 17:33 UTC on 10-12 (246,379, the same hash
+  as btxscan), every block signed by `02d5efca`, verifier not quarantined.
 
-## Not known
+## Cause: Windows Update replaced the GPU driver under the running engine
 
-- Why the card failed at 19:48. A sleep/wake or a graphics driver reset
-  would explain both the verifier and the network drop; nothing measured
-  says which.
-- Whether restarting the engine brings the card back, or the PC needs a
-  reboot (a driver reset).
+Measured on the 3060 on 10-12, read-only.
 
-## What to look at on the 3060
+- The 3060's easyNode is the Linux AppImage inside WSL2 on that Windows
+  PC (datadir `~/.easybtx`), with btxd reaching the card through WSL's
+  CUDA passthrough. It is not the Windows build.
+- System log, 10-11: Windows Update installed "NVIDIA Display Driver
+  Update (32.0.16.1088)" (driver 610.88) from 23:49:25 to 23:50:46 local,
+  which is 19:49:25 to 19:50:46 UTC. The engine kept running through it.
+- The app's observer log (one row every two minutes) has block 245,498
+  connected between 19:48:53 and 19:51:03 UTC and nothing after. The peer
+  reconnections at 19:51 to 19:56 fall in the same minutes.
+- Ruled out: no `nvlddmkm`, Display or Dxgkrnl events, no sleep, resume or
+  unexpected power loss in the window. Sleep and hibernate are set to
+  never. The easyBTX miner did not run: its launcher exits on an owner flag,
+  and its logs were last written on 10-05.
+- The engine's `debug.log` was trimmed at the restart and starts at 10-12
+  02:25 UTC, so the 19:49 lines are gone; the app's own log rotates per
+  launch. What survives (02:25 to 12:55 UTC) shows the in-process re-test
+  about hourly ("provider auto-un-quarantined ... backoff_elapsed") failing
+  at once with `device_seeded_phase1_declined_or_wrong_size` every time.
+  That reason is logged when the CUDA call `rc_phase1_seeded` returns false
+  or throws (v0.34.15 `src/matmul/matmul_v4_rc.cpp`, around line 840).
+- Every 30 minutes the engine logged "MatMul RC runtime re-probe: ...
+  present=1 reason=runtime_identity_present_but_full_qualification_requires_restart".
+  That text is fixed (`src/init.cpp`, around line 4165): it means the
+  device's identity was readable from inside the old process. The driver
+  and the card answered; only the computation failed.
+- The engine never resets its CUDA context in a running process (no
+  `cudaDeviceReset` in the v0.34.15 sources).
+- Windows also restarted the PC on its own on 10-12: the owner's reboot at
+  12:54 UTC (from the update notification), then two automatic restarts
+  at 13:29 and 13:32 UTC as an update finished. The engine came back after
+  each, and its startup qualification passed every time.
+- Nothing starts the node until someone logs in on that PC: WSL is started
+  by a Startup-folder script and a logon task, and auto-logon is off.
 
-- The engine's `debug.log` (node folder: Settings > Data folder > Open)
-  around 19:40 to 20:00 UTC on 10-11: lines starting "MatMul Profile-1
-  provider quarantined" and what precedes them.
-- Windows Event Viewer, System log, same window: 23:40 to 00:00 local time
-  on 10-11 to 10-12 (the PC is in Dubai, UTC+4; it shares its public address
-  with this project's Mac). Kernel-Power (sleep, resume), `nvlddmkm`
-  (driver reset, Xid), Display.
-- `nvidia-smi`: driver version, temperatures, whether another process holds
-  the GPU (the easyBTX miner shares the folder `~/.easybtx`).
-- Power settings: anything that lets the PC sleep despite easyNode's
-  keep-awake.
+## Would restarting only the engine have brought the card back?
+
+Probably, but it was not tested. For: identical failures on every in-process
+re-test while the device stayed reachable, no in-process context reset, and
+a fresh process qualifying at once. Against: nobody has swapped a driver and
+then restarted only the engine; WSL itself might need a restart after a
+host driver swap.
+
+The owner keeps Windows Update and driver installs on, on purpose: the node
+has to survive a driver swap, a restart or a power cut on its own. #199's
+restart costs one engine restart if it does not help, because a run whose
+card fails startup qualification is not restarted again.
 
 ## What changed
 
@@ -87,6 +117,7 @@ btxscan's node:
 - easynode #199 (merged 10-12, not released): when the engine reports it
   cannot verify blocks for 15 minutes in a run that had been verifying,
   easyNode restarts the engine itself, at most once every 3 hours
-  (`btx_core::engine_warnings::restart_for_lost_verifier`). Release it
-  (0.7.13) only if a restart is shown to bring such a card back; if only a
-  reboot does, rework it first.
+  (`btx_core::engine_warnings::restart_for_lost_verifier`). With the cause
+  known it is the right first remedy. Missing before release: if the card
+  still fails startup qualification after that restart, the app should tell
+  the person to reboot the PC, which is the remedy known to work.

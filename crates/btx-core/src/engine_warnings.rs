@@ -487,7 +487,9 @@ pub const VERIFIER_RESTART_MIN_GAP: std::time::Duration = std::time::Duration::f
 /// event, the re-test waits 60 s doubling to a 1 h cap, and
 /// `recovery_self_checks` counts only successes: so the engine re-tested
 /// about 18 times over 13 hours and the card failed every one, inside the
-/// same process. The engine's warning says to restart with a provider that
+/// same process. The cause (System log, measured 2026-10-12): Windows Update
+/// installed NVIDIA driver 32.0.16.1088 at 19:49 to 19:50 UTC, live, under
+/// the running engine. The engine's warning says to restart with a provider that
 /// passes self-qualification; a restart is a new process and a new device
 /// context, which in-process re-tests are not. Whether that brings such a
 /// card back was not yet measured when this was written.
@@ -513,12 +515,14 @@ pub fn restart_for_lost_verifier(
 #[cfg(test)]
 mod tests {
 
-    // The 3060, 2026-10-11 19:48 UTC: the engine quarantined its GPU verifier
-    // mid-run (`device_seeded_phase1_declined_or_wrong_size`, the run's 18th
-    // quarantine), promised "automatic byte-exact re-test after backoff; no
-    // restart required", and ran zero re-tests in the next 13 hours
-    // (`recovery_self_checks: 0`). The network's main signer sat frozen all
-    // night. A restart re-runs the startup qualification, which had passed.
+    // The 3060, 2026-10-11 19:49 UTC: Windows Update installed an NVIDIA
+    // driver under the running engine, which lost its GPU verifier mid-run
+    // (`device_seeded_phase1_declined_or_wrong_size`). It promised "automatic
+    // byte-exact re-test after backoff; no restart required", re-tested about
+    // hourly inside the same process and failed every time for 13 hours
+    // (`recovery_self_checks` counts only successes, so it read 0). The
+    // network's main signer sat frozen all night. A restart re-runs the
+    // startup qualification, which had passed.
 
     #[test]
     fn a_verifier_lost_mid_run_is_restarted_after_fifteen_minutes() {
