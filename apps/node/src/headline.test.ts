@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type HeadlineFacts, type HeadlinePhase, headline, tipAgeWords } from "./headline";
+import { type HeadlineFacts, type HeadlinePhase, headline, tipAgeWords, waitingLine } from "./headline";
 
 const facts = (over: Partial<HeadlineFacts> = {}): HeadlineFacts => ({
   rcStalled: false,
@@ -248,5 +248,25 @@ describe("tipAgeWords", () => {
     expect(tipAgeWords(2 * 3600 + 1)).toBe("2 hours old");
     expect(tipAgeWords(47 * 3600 + 3599)).toBe("47 hours old");
     expect(tipAgeWords(48 * 3600)).toBe("2 days old");
+  });
+});
+
+describe("waitingLine", () => {
+  it("says nothing while a poll is quick", () => {
+    expect(waitingLine(0)).toBeNull();
+    expect(waitingLine(9_999)).toBeNull();
+  });
+
+  // get_node_status asks btxd twice with a 60 s timeout each; a btxd that
+  // accepts the connection and never answers held the last screen, LIVE
+  // included, for up to two minutes with nothing saying so.
+  it("says the screen is waiting once a poll has taken 10 seconds", () => {
+    expect(waitingLine(10_000)).toBe("Waiting for your node to answer. This screen is 10 s old");
+    expect(waitingLine(65_400)).toBe("Waiting for your node to answer. This screen is 65 s old");
+  });
+
+  it("switches to minutes from two minutes on", () => {
+    expect(waitingLine(120_000)).toBe("Waiting for your node to answer. This screen is 2 min old");
+    expect(waitingLine(605_000)).toBe("Waiting for your node to answer. This screen is 10 min old");
   });
 });

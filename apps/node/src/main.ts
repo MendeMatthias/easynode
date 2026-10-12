@@ -54,7 +54,7 @@ import {
   type UpdateCheckEvent,
 } from "./update-check";
 import { contributionView } from "./contribution";
-import { type VisualMode, headline } from "./headline";
+import { type VisualMode, headline, waitingLine } from "./headline";
 import { initOverlayKeys } from "./overlay-keys";
 import { mountPowerCore } from "./power-core";
 import { initAsk } from "./ask";
@@ -1173,7 +1173,43 @@ let lastStatus: NodeStatusInfo | null = null;
 /** One-shot latch so the wizard error card scrolls into view only when it first appears. */
 let wizardErrorShown = false;
 
+/** When the status poll in flight started, or null when none is. One poll at
+ *  a time: get_node_status asks btxd twice with a 60 s timeout each, and at
+ *  one poll every 1.5 s a btxd that accepted connections and never answered
+ *  stacked up dozens of them, each asking it twice more, and their answers
+ *  could land out of order. */
+let pollStartedAt: number | null = null;
+/** A tick asked for while one was in flight (an action's "refresh now"):
+ *  run once more as soon as it lands, so the action's result still shows. */
+let pollAgain = false;
+
 async function tick() {
+  if (pollStartedAt !== null) {
+    pollAgain = true;
+    return;
+  }
+  pollStartedAt = Date.now();
+  try {
+    await pollStatus();
+  } finally {
+    pollStartedAt = null;
+    if (pollAgain) {
+      pollAgain = false;
+      void tick();
+    }
+  }
+}
+
+/** While a poll is slow, say so under the badge instead of letting the last
+ *  screen stand as if it were current (headline.ts `waitingLine`). The next
+ *  status that lands rewrites the line. */
+function reflectWaiting(): void {
+  if (pollStartedAt === null || !lastStatus || screenStatus.hidden) return;
+  const line = waitingLine(Date.now() - pollStartedAt);
+  if (line) $("status-sub").textContent = line;
+}
+
+async function pollStatus() {
   try {
     const status = await invoke<NodeStatusInfo>("get_node_status");
     lastStatus = status;
@@ -2612,7 +2648,10 @@ void (async () => {
     /* dev without tauri */
   }
   await tick();
-  setInterval(() => void tick(), 1500);
+  setInterval(() => {
+    reflectWaiting();
+    void tick();
+  }, 1500);
   void updateCheck();
   // The six-hourly recheck used to be a setInterval here. It is now the Rust
   // timer in src-tauri/src/update_timer.rs, so there is ONE periodic path and

@@ -188,3 +188,18 @@ function readyHeadline(f: HeadlineFacts): Headline {
   // "LIVE", not "READY": the node is running and serving the network now.
   return { badge: "LIVE", sub: "Your node is live and helping the network", mode: "ready" };
 }
+
+/** How long a status poll may take before the screen says it is waiting. */
+export const WAITING_AFTER_MS = 10_000;
+
+/** The line under the badge while a status poll has been out for
+ *  `WAITING_AFTER_MS` or more, else null. get_node_status asks btxd twice
+ *  with a 60 s timeout each (commands.rs), and a btxd that accepts the
+ *  connection and never answers held the last screen, LIVE included, for up
+ *  to two minutes with nothing saying so. */
+export function waitingLine(waitedMs: number): string | null {
+  if (waitedMs < WAITING_AFTER_MS) return null;
+  const secs = Math.floor(waitedMs / 1000);
+  const age = secs < 120 ? `${secs} s` : `${Math.floor(secs / 60)} min`;
+  return `Waiting for your node to answer. This screen is ${age} old`;
+}
