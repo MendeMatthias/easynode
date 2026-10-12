@@ -1529,13 +1529,16 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     // idempotent, costs one small file read, and also self-heals a conf the
     // MINER rewrote through the shared ~/.easybtx datadir.
     //
-    // Deliberately NOT part of NODE_FASTSTART_CONF: Explorer mode is opt-in,
-    // and the default conf must stay the lean one.
-    if let Err(e) = btx_core::setup::set_conf_kv(
-        &paths.faststart_conf,
-        "txindex",
-        settings.txindex_enabled.then_some("1"),
-    ) {
+    // Not part of NODE_FASTSTART_CONF, which the keeper conf replaces
+    // wholesale. Applied only where no pruning is in effect: BTX v0.34.15
+    // refuses to start with pruning and a transaction index together
+    // (src/init.cpp:2077), so `txindex=1` on a keeper or a pruned folder
+    // would leave the node unable to start at all.
+    let explorer_on =
+        settings.txindex_enabled && btx_core::setup::explorer_mode_possible_here(&datadir);
+    if let Err(e) =
+        btx_core::setup::set_conf_kv(&paths.faststart_conf, "txindex", explorer_on.then_some("1"))
+    {
         // Never fatal: a node that starts without the index is still a node.
         eprintln!("[node-app] could not re-apply txindex to the conf: {e}");
     }
@@ -4216,6 +4219,10 @@ pub struct NodeStatusInfo {
     pub tray_term: String,
     /// Explorer mode (txindex) — the persisted user choice.
     pub txindex_enabled: bool,
+    /// Whether Explorer mode can run on this node at all: no pruning in
+    /// effect or chosen (`ask::explorer_mode_available`). Settings greys the
+    /// switch out with the reason when it cannot.
+    pub explorer_available: bool,
     /// Attestation serving (`matmulattestationserve=1`) — the persisted user
     /// choice, or a hand-set conf flag the start path adopted. A change
     /// applies on the next node (re)start.
@@ -4457,6 +4464,9 @@ pub struct NodeStatusInfo {
     pub esplora_indexing: bool,
     pub esplora_freshness: Option<String>,
     pub esplora_message: Option<String>,
+    /// Why Esplora cannot run on this machine at all, said calmly; `None`
+    /// when it can, or when it is off.
+    pub esplora_unavailable: Option<String>,
     /// "Same chain as other sources" (btx_core::chain_agreement), its
     /// sentences rendered in Rust. `None` when stopped or before the first
     /// comparison of this run.
@@ -4906,6 +4916,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
             "system tray".to_string()
         },
         txindex_enabled: settings.txindex_enabled,
+        explorer_available: crate::ask::explorer_mode_available(&datadir),
         attestation_serve_enabled: settings.attestation_serve_enabled,
         signer_enabled: settings.signer_enabled,
         signer_applies_here,
@@ -4994,6 +5005,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         esplora_freshness: esplora_verdict.map(|v| v.freshness.as_str().to_string()),
         chain_agreement,
         esplora_message,
+        esplora_unavailable: state.esplora_unavailable.lock().await.clone(),
         last_update_check_at: settings.last_update_check_at.clone(),
         last_update_check_outcome: settings.last_update_check_outcome.clone(),
         last_update_check_detail: settings.last_update_check_detail.clone(),
@@ -6845,6 +6857,7 @@ pub async fn set_esplora(state: State<'_, AppState>, on: bool) -> Result<String,
         NodeAppSettings::update(&datadir, |s| s.esplora_enabled = false);
         stop_esplora(&state).await;
         *state.esplora_error.lock().await = None;
+        *state.esplora_unavailable.lock().await = None;
         return Ok("Esplora off. Wallets pointed at this node stop getting answers.".to_string());
     }
     let facts = esplora_facts(&state, &datadir).await;
@@ -6939,27 +6952,46 @@ async fn start_esplora(
     Ok(())
 }
 
+/// Settings' calm line for a machine without electrs and Caddy.
+const ESPLORA_NOT_INSTALLED: &str =
+    "Not on this computer: it needs electrs and Caddy, which easyNode \
+     does not install. It starts by itself once both are here.";
+/// Settings' calm line for a node that keeps only the newest blocks.
+const ESPLORA_PRUNED: &str = "Not on this node: wallets need the whole chain, and this node keeps \
+     only the newest blocks.";
+
 /// Every node start: honour the persisted choice, and record rather than
 /// hide why it could not be honoured.
 async fn maybe_start_esplora(state: &AppState, datadir: &Path) {
+    *state.esplora_unavailable.lock().await = None;
     if !NodeAppSettings::load(datadir).esplora_enabled {
         return;
     }
+    // On by default since 2026-10-12, so on nearly every install one of these
+    // two holds. Neither is a failure: the programs are not shipped with the
+    // app, and a node that keeps only the newest blocks cannot serve history.
+    // Said calmly (`esplora_unavailable`), never in amber.
     let (electrs, caddy) = match (find_binary(ELECTRS_BIN), find_binary(CADDY_BIN)) {
         (Some(e), Some(c)) => (e, c),
-        (None, _) => {
-            let msg = missing_binary_message(ELECTRS_BIN);
-            eprintln!("[esplora] not starting: {msg}");
-            *state.esplora_error.lock().await = Some(msg);
-            return;
-        }
-        (_, None) => {
-            let msg = missing_binary_message(CADDY_BIN);
-            eprintln!("[esplora] not starting: {msg}");
-            *state.esplora_error.lock().await = Some(msg);
+        _ => {
+            eprintln!("[esplora] not starting: electrs or caddy is not installed");
+            *state.esplora_error.lock().await = None;
+            *state.esplora_unavailable.lock().await = Some(ESPLORA_NOT_INSTALLED.to_string());
             return;
         }
     };
+    let facts = esplora_facts(state, datadir).await;
+    if let Some(
+        btx_core::esplora::EsploraBlocker::ConfIsPruned { .. }
+        | btx_core::esplora::EsploraBlocker::DatadirAlreadyPruned { .. }
+        | btx_core::esplora::EsploraBlocker::KeeperProfile,
+    ) = btx_core::esplora::check(&facts).blocker
+    {
+        eprintln!("[esplora] not starting: this node does not keep the whole chain");
+        *state.esplora_error.lock().await = None;
+        *state.esplora_unavailable.lock().await = Some(ESPLORA_PRUNED.to_string());
+        return;
+    }
     if let Err(e) = start_esplora(state, datadir, &electrs, &caddy).await {
         eprintln!("[esplora] not starting: {e}");
     }
@@ -7492,7 +7524,12 @@ fn spawn_snapshot_keeper(state: &AppState, datadir: PathBuf) {
                 let mut s = snap::ServeStatus {
                     offering: snap::offer_live(&rpc).await,
                     message: snap::explain(&b),
-                    needs_attention: !b.is_transient(),
+                    // A machine that follows signatures cannot produce a
+                    // snapshot, and since 2026-10-12 the switch is on by
+                    // default there too: that is "not on this computer", not
+                    // something to fix, so it is not amber.
+                    needs_attention: !b.is_transient()
+                        && !matches!(b, snap::SnapshotBlocker::NotValidating { .. }),
                     stale_by: tip
                         .zip(record.as_ref().map(|r| r.height))
                         .map(|(t, h)| t.saturating_sub(h)),

@@ -848,6 +848,9 @@ body {
 }
 .switch input:checked + .slider { background: rgba(247, 147, 26, 0.25); border-color: var(--color-accent); }
 .switch input:checked + .slider::before { transform: translateX(18px); background: var(--color-accent); }
+/* A feature this machine cannot run: the switch is greyed out and the line
+   beside it says why (feature-rows.ts). */
+.switch input:disabled + .slider { opacity: 0.4; cursor: not-allowed; }
 
 /* Toast */
 .toast {

@@ -27,6 +27,7 @@ describe("Settings groups", () => {
   it("puts each row where a person would look for it", () => {
     expect(groupOf("autostart-toggle")).toBe("This computer");
     expect(groupOf("open-datadir-btn")).toBe("This computer");
+    expect(groupOf("explorer-toggle")).toBe("This computer");
     expect(groupOf("keeper-toggle")).toBe("Helping the network");
     expect(groupOf("follow-row")).toBe("Helping the network");
     // Signing is the most a capable node gives, so it stays in plain sight;

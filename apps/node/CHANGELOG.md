@@ -8,6 +8,25 @@ root).
 
 ## [Unreleased]
 
+**Everything is on, and anything can be switched off.** The wallet,
+Explorer mode (look up any past transaction in Ask), serving a chain
+snapshot and Esplora are now on by default, next to the services that
+already were, and your node starts with your computer. Each one runs only
+where it can: a Mac that follows signatures does not make snapshots, a
+Keeper does not build the transaction index, and Esplora waits until its
+programs are installed. Where a feature cannot run, Settings greys its
+switch out and says why in one line. If you already run a node, these turn
+on once with this update and the welcome panel lists them; switch off
+whatever you do not want, and it stays off.
+
+**Settings are in four groups.** This computer, Helping the network, For
+operators (folded) and Disk, instead of one long list. Explorer mode has a
+switch there now; it used to be offered only from Ask.
+
+**Fixed: a Keeper could turn on Explorer mode and then not start.** The node
+engine refuses to run with pruning and a transaction index together; the
+app now never asks for both.
+
 **The headline no longer says LIVE over a node that has stopped following
 the chain.** On 12 October a node that follows signatures sat on one block
 for six hours under a green "Your node is live and helping the network",

@@ -135,6 +135,33 @@ pub fn conf_is_pruned(conf_path: &Path) -> Option<bool> {
     conf_kv(conf_path, "prune").map(|v| v.trim() != "0")
 }
 
+/// Whether the engine may run with `txindex=1` (Explorer mode) here. BTX
+/// v0.34.15 refuses to start with pruning and a transaction index together
+/// ("Prune mode is incompatible with -txindex.", src/init.cpp:2077 at
+/// 476f3f23), so it is only for a node that keeps the whole chain: no
+/// `prune=` in effect, where `btx_rw.conf` outranks the app's conf, and no
+/// block file deleted yet. Pure, so the rule is tested; the reading of the
+/// three facts is [`explorer_mode_possible_here`].
+pub fn explorer_mode_possible(
+    conf_pruned: Option<bool>,
+    rw_conf_pruned: Option<bool>,
+    datadir_pruned: bool,
+) -> bool {
+    let prune_in_effect = rw_conf_pruned.or(conf_pruned).unwrap_or(false);
+    !prune_in_effect && !datadir_pruned
+}
+
+/// [`explorer_mode_possible`] for a node folder: its `faststart/faststart.conf`,
+/// its `btx_rw.conf`, and whether `blocks/` has already lost `blk00000.dat`
+/// (`crate::node::datadir_has_pruned`).
+pub fn explorer_mode_possible_here(datadir: &Path) -> bool {
+    explorer_mode_possible(
+        conf_is_pruned(&datadir.join("faststart").join("faststart.conf")),
+        conf_is_pruned(&datadir.join("btx_rw.conf")),
+        crate::node::datadir_has_pruned(datadir),
+    )
+}
+
 /// What writing a conf with `now_pruned` posture needs on disk, given what the
 /// datadir already is. [`disk_required`] gates the FIRST install; the paths
 /// that rewrite the conf later must gate too, or a keeper who switched to Full
@@ -1460,6 +1487,48 @@ maxreorgdepthwarn=9
         assert_eq!(conf_is_pruned(&conf), Some(false));
         std::fs::write(&conf, "server=1\nprune=10000\n").unwrap();
         assert_eq!(conf_is_pruned(&conf), Some(true));
+    }
+
+    // BTX v0.34.15 refuses to start with pruning and a transaction index
+    // together (src/init.cpp:2077, "Prune mode is incompatible with
+    // -txindex."), so Explorer mode is only for a node that keeps everything.
+
+    #[test]
+    fn explorer_mode_needs_no_pruning_in_effect_and_no_deleted_blocks() {
+        assert!(explorer_mode_possible(Some(false), None, false));
+        assert!(explorer_mode_possible(None, None, false));
+        assert!(
+            !explorer_mode_possible(Some(true), None, false),
+            "the keeper conf"
+        );
+        assert!(
+            !explorer_mode_possible(None, None, true),
+            "blocks already deleted"
+        );
+    }
+
+    #[test]
+    fn btx_rw_conf_outranks_the_apps_conf_for_explorer_mode() {
+        // The 3060 on 2026-09-06: conf prune=0, btx_rw.conf prune=4096.
+        assert!(!explorer_mode_possible(Some(false), Some(true), false));
+        assert!(explorer_mode_possible(Some(true), Some(false), false));
+    }
+
+    #[test]
+    fn explorer_mode_possible_here_reads_both_confs_and_the_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        std::fs::create_dir_all(d.join("faststart")).unwrap();
+        std::fs::create_dir_all(d.join("blocks")).unwrap();
+        std::fs::write(d.join("faststart/faststart.conf"), "prune=0\n").unwrap();
+        std::fs::write(d.join("blocks/blk00000.dat"), b"x").unwrap();
+        assert!(explorer_mode_possible_here(d));
+        std::fs::write(d.join("btx_rw.conf"), "prune=4096\n").unwrap();
+        assert!(!explorer_mode_possible_here(d));
+        std::fs::remove_file(d.join("btx_rw.conf")).unwrap();
+        std::fs::remove_file(d.join("blocks/blk00000.dat")).unwrap();
+        std::fs::write(d.join("blocks/blk00003.dat"), b"x").unwrap();
+        assert!(!explorer_mode_possible_here(d), "blk00000 gone: pruned");
     }
 
     #[test]

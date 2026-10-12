@@ -443,6 +443,22 @@
             </label>
           </div>
 
+          <!-- Explorer mode (txindex), on by default where the whole chain is
+               kept and greyed out with the reason where it is not
+               (feature-rows.ts explorerRow). It used to be offered only from
+               Ask's transaction lookup. -->
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Explorer mode</span>
+              <span class="setting-desc" id="explorer-desc"></span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="explorer-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <p class="setting-result" id="explorer-result" hidden></p>
+
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Data folder</span>
@@ -695,8 +711,7 @@
                 easybtx.com so the people who run mirrors can find it and
                 decide whether to trust it; the private key never leaves this
                 machine, and both that and the offer can be switched off in
-                Settings. Launch at login turns on with this, so your
-                signature keeps coming.
+                Settings.
               </p>
             </li>
             <li class="role-line is-helps">
@@ -723,6 +738,20 @@
                 answers only this machine.
               </p>
             </li>
+            <!-- Only where this node validates and signs (welcome-signer-item's
+                 rule); anywhere else it does nothing, so it is not listed. -->
+            <li class="role-line is-helps" id="welcome-snapshot-item" hidden>
+              <div class="role-row">
+                <span class="role-mark" role="img" aria-label="on"></span>
+                <span class="role-label">Serving a chain snapshot</span>
+                <span class="role-value">On</span>
+              </div>
+              <p class="role-note">
+                Every 100 blocks your node exports the chain state, signs it,
+                and lets new nodes start from it instead of from an older file.
+                About 9 MB each.
+              </p>
+            </li>
             <li class="role-line is-helps">
               <div class="role-row">
                 <span class="role-mark" role="img" aria-label="on"></span>
@@ -733,6 +762,36 @@
                 Writes what your node has served to a file in your data folder.
                 Local only. Nothing is uploaded.
               </p>
+            </li>
+          </ul>
+
+          <!-- On for the person, by the owner's rule of 2026-10-12 (every
+               feature on, switchable off in Settings). -->
+          <p class="welcome-lede">And for you, also on:</p>
+          <ul class="role-lines" id="welcome-you-list">
+            <li class="role-line is-helps">
+              <div class="role-row">
+                <span class="role-mark" role="img" aria-label="on"></span>
+                <span class="role-label">Starting with your computer</span>
+                <span class="role-value">On</span>
+              </div>
+              <p class="role-note">Your node starts when you sign in, so it keeps helping after a restart.</p>
+            </li>
+            <li class="role-line is-helps">
+              <div class="role-row">
+                <span class="role-mark" role="img" aria-label="on"></span>
+                <span class="role-label">Wallet</span>
+                <span class="role-value">On</span>
+              </div>
+              <p class="role-note">The wallet button in the header. Nothing is created until you make or open a wallet.</p>
+            </li>
+            <li class="role-line is-helps" id="welcome-explorer-item" hidden>
+              <div class="role-row">
+                <span class="role-mark" role="img" aria-label="on"></span>
+                <span class="role-label">Explorer mode</span>
+                <span class="role-value">On</span>
+              </div>
+              <p class="role-note">Ask can look up any past transaction. Your node builds a small index once, in the background.</p>
             </li>
           </ul>
 
