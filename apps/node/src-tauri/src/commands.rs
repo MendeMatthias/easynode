@@ -9059,12 +9059,17 @@ fn remove_node_files(dd: &Path) -> Result<btx_core::disk::ReclaimReport, String>
     Ok(report)
 }
 
-/// Open the network-wide stats page (btxprice.com/stats) in the default
+/// Open the network-wide stats page (easybtx.com/stats) in the default
 /// browser. Fixed URL on purpose: the webview never chooses what to open,
 /// so there is no arbitrary-URL surface.
+///
+/// It opened btxprice.com/stats until 0.7.11. Measured 2026-10-12 02:30 UTC:
+/// btxprice.com resolves (104.248.108.126) and times out on port 443, while
+/// easybtx.com/stats answers 200 with the chain height, the node census, the
+/// pools and the fork timeline.
 #[tauri::command]
 pub async fn open_global_stats() -> Result<(), String> {
-    const URL: &str = "https://btxprice.com/stats";
+    const URL: &str = "https://easybtx.com/stats";
     btx_core::platform::open_url(URL).map_err(|e| format!("couldn't open the stats page: {e}"))
 }
 
