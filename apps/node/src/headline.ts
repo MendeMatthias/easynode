@@ -223,3 +223,17 @@ export function waitingLine(waitedMs: number): string | null {
   const age = secs < 120 ? `${secs} s` : `${Math.floor(secs / 60)} min`;
   return `Waiting for your node to answer. This screen is ${age} old`;
 }
+
+/** The badge without a trailing percentage: "SYNCING 62.3%" and "SYNCING
+ *  62.4%" are one state to a listener. */
+const badgeKind = (badge: string): string => badge.replace(/\s*[\d.]+%$/, "");
+
+/** What a screen reader hears when the headline changes state: the badge,
+ *  then the line, once. Null on the first screen (the person is reading it
+ *  anyway) and while the state holds, so a poll every 1.5 s does not repeat
+ *  it, and a moving percentage does not count as a change. The badge had no
+ *  live region at all, so NOT FOLLOWING appeared silently. */
+export function announceChange(previousBadge: string | null, next: Headline): string | null {
+  if (previousBadge === null || badgeKind(previousBadge) === badgeKind(next.badge)) return null;
+  return next.sub ? `${next.badge}. ${next.sub}` : next.badge;
+}

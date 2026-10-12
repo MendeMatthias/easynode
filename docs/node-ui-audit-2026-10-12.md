@@ -31,6 +31,7 @@ done without the owner.
 | 13 | The tray said "Node: running · block 245498" on a stuck node. | "Node: not following · block 245,498" (`tray::stuck_for_tray`, tested). |
 | 14 | A slow status poll (btxd not answering) stacked up overlapping polls behind a screen that looked current. | One poll at a time; after 10 s the line says it is waiting and how old the screen is. |
 | 15 | "Very low disk space: the node may stop" sat in the disk card, about 500 px below the fold of the 780 px window, under a green LIVE. | DISK ALMOST FULL in amber at the top, on the disk card's own threshold (`disk_critical_mb`, 2 GiB). Fixed in the follow-up to #189. |
+| 16 | Screen readers did not hear state changes: the badge had no live region, so NOT FOLLOWING appeared silently. | A polite region says each new state once (`announceChange`), not every poll and not every percentage tick. Follow-up. |
 
 Each row can be opened in the preview (end of this page);
 `?s=follower-frozen-6h` is the first one.
@@ -198,10 +199,7 @@ in smaller type would read better.
   episode, off with the same switch as launch at login.
 - **A "Get help" row in Tools:** where to send Copy diagnostics, so the
   person who pressed it knows what to do with what is on their clipboard.
-- **Screen readers do not hear state changes.** The badge has no live
-  region, so NOT FOLLOWING appears silently. A polite region that speaks
-  only when the badge's text changes (the chip notice's `announcer`
-  pattern in start-choice.ts) would do it without repeating every poll.
+
 
 ## Edge cases checked
 

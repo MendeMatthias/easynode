@@ -39,6 +39,9 @@ to sit at the bottom of the screen, below every card.
 **"Global network stats" opens easybtx.com/stats.** It opened
 btxprice.com/stats, which no longer answers.
 
+**Screen readers hear the status change.** When the headline moves to a new
+state (NOT FOLLOWING, STOPPED, LIVE again), it is said once.
+
 **Panels close with Escape.** Opening a panel moves the keyboard into it,
 closing it gives the keyboard back to the button that opened it, and Tab
 stays inside the open panel.

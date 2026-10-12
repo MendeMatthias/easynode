@@ -55,7 +55,7 @@ import {
   type UpdateCheckEvent,
 } from "./update-check";
 import { contributionView } from "./contribution";
-import { type VisualMode, headline, waitingLine } from "./headline";
+import { type VisualMode, announceChange, headline, waitingLine } from "./headline";
 import { initOverlayKeys } from "./overlay-keys";
 import { mountPowerCore } from "./power-core";
 import { initAsk } from "./ask";
@@ -1040,6 +1040,11 @@ $("signer-copy-btn").addEventListener("click", async () => {
  *  poll loop calls renderStatus repeatedly and the trend needs history; the
  *  arithmetic itself is pure and tested in catchup-trend.test.ts. */
 let catchupSamples: CatchupSample[] = [];
+/** The badge the last render showed, for announceChange; null before the
+ *  first status screen. */
+let lastHeadlineBadge: string | null = null;
+/** Speaks the headline's changes of state (#status-announce). */
+const announceStatus = announcer($("status-announce"));
 
 function renderStatus(status: NodeStatusInfo) {
   showScreen("status");
@@ -1103,6 +1108,9 @@ function renderStatus(status: NodeStatusInfo) {
     // The same test the disk card's red "may stop" line uses, below.
     diskCritical: status.disk_free_mb > 0 && status.disk_free_mb < status.disk_critical_mb,
   });
+  const said = announceChange(lastHeadlineBadge, head);
+  lastHeadlineBadge = head.badge;
+  if (said) announceStatus(said);
   badge.textContent = head.badge;
   sub.textContent = head.sub;
   const mode = head.mode;
