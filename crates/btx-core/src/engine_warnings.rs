@@ -147,7 +147,8 @@ impl EngineWarning {
                     "This machine's graphics chip did not pass the node engine's own check, so \
                      your node cannot check the new proof of work and has stopped following new \
                      blocks. Everything already downloaded is safe. Restarting easyNode runs the \
-                     check again.",
+                     check again; when the check had passed earlier in this run, easyNode \
+                     restarts the node by itself after 15 minutes.",
                 );
                 if let Some(r) = reason {
                     m.push_str(&format!(" The engine's reason: {}.", r.replace('_', " ")));
@@ -463,8 +464,90 @@ fn group(n: u64) -> String {
     out
 }
 
+/// How long the engine's "cannot verify blocks" warning must stand, in a run
+/// whose verifier had been working, before the app restarts the engine.
+/// Fifteen minutes gives the engine's own "automatic re-test after backoff"
+/// its chance first.
+pub const VERIFIER_LOST_RESTART_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(15 * 60);
+
+/// The least time between two such restarts, so a card that keeps failing
+/// costs a restart every few hours, not a loop.
+pub const VERIFIER_RESTART_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
+
+/// Whether the app restarts the engine because its block verifier was lost
+/// mid-run ([`EngineWarning::CannotVerifyBlocks`] standing for `lost_for`).
+///
+/// Measured on the project's RTX 3060 signer (stats export, 2026-10-12
+/// 08:53 UTC): its tip stopped at block 245,498 (19:48 UTC on 10-11) with
+/// the CUDA verifier quarantined (`strict_device_provider_quarantined`,
+/// health reason `device_seeded_phase1_declined_or_wrong_size`) and
+/// `quarantine_events: 18`, `recovery_self_checks: 0`. In v0.34.15
+/// (matmul_v4_rc_gkr.cpp) each failed attempt re-quarantines and counts one
+/// event, the re-test waits 60 s doubling to a 1 h cap, and
+/// `recovery_self_checks` counts only successes: so the engine re-tested
+/// about 18 times over 13 hours and the card failed every one, inside the
+/// same process. The engine's warning says to restart with a provider that
+/// passes self-qualification; a restart is a new process and a new device
+/// context, which in-process re-tests are not. Whether that brings such a
+/// card back was not yet measured when this was written.
+///
+/// Only for a run whose verifier worked (`verified_this_run`: the node
+/// connected blocks in this run): a card refused at startup is the
+/// chip-refused path's, and restarting it would only repeat the refusal. At
+/// most once per [`VERIFIER_RESTART_MIN_GAP`] (`since_last_restart`, `None`
+/// when the app has not done this yet). Pure, so the rule is tested.
+pub fn restart_for_lost_verifier(
+    lost_for: Option<std::time::Duration>,
+    verified_this_run: bool,
+    since_last_restart: Option<std::time::Duration>,
+) -> bool {
+    let Some(lost_for) = lost_for else {
+        return false;
+    };
+    verified_this_run
+        && lost_for >= VERIFIER_LOST_RESTART_AFTER
+        && since_last_restart.is_none_or(|d| d >= VERIFIER_RESTART_MIN_GAP)
+}
+
 #[cfg(test)]
 mod tests {
+
+    // The 3060, 2026-10-11 19:48 UTC: the engine quarantined its GPU verifier
+    // mid-run (`device_seeded_phase1_declined_or_wrong_size`, the run's 18th
+    // quarantine), promised "automatic byte-exact re-test after backoff; no
+    // restart required", and ran zero re-tests in the next 13 hours
+    // (`recovery_self_checks: 0`). The network's main signer sat frozen all
+    // night. A restart re-runs the startup qualification, which had passed.
+
+    #[test]
+    fn a_verifier_lost_mid_run_is_restarted_after_fifteen_minutes() {
+        let min = |m: u64| Some(std::time::Duration::from_secs(m * 60));
+        assert!(!restart_for_lost_verifier(min(14), true, None));
+        assert!(restart_for_lost_verifier(min(15), true, None));
+        assert!(restart_for_lost_verifier(min(13 * 60), true, None));
+    }
+
+    #[test]
+    fn a_verifier_that_never_qualified_this_run_is_left_alone() {
+        // A card refused at startup is the chip-refused path's to handle; a
+        // restart every few hours would only repeat the refusal.
+        let lost = Some(std::time::Duration::from_secs(3600));
+        assert!(!restart_for_lost_verifier(lost, false, None));
+    }
+
+    #[test]
+    fn nothing_lost_means_nothing_to_restart() {
+        assert!(!restart_for_lost_verifier(None, true, None));
+    }
+
+    #[test]
+    fn at_most_one_such_restart_every_three_hours() {
+        let lost = Some(std::time::Duration::from_secs(3600));
+        let h = |x: u64| Some(std::time::Duration::from_secs(x * 3600));
+        assert!(!restart_for_lost_verifier(lost, true, h(2)));
+        assert!(restart_for_lost_verifier(lost, true, h(3)));
+    }
     use super::*;
 
     // Every string below is what v0.34.9 actually puts in the array, with its
@@ -553,6 +636,10 @@ mod tests {
         let m = classify(RC_UNVERIFIABLE).unwrap().message();
         assert!(m.contains("strict device not ready"), "{m}");
         assert!(m.contains("Restarting easyNode"), "{m}");
+        assert!(
+            m.contains("restarts the node by itself after 15 minutes"),
+            "{m}"
+        );
     }
 
     /// The reason the engine re-publishes every half hour while a chip stays
