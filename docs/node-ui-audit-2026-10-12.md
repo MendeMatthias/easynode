@@ -31,6 +31,7 @@ done without the owner.
 | 13 | The tray said "Node: running · block 245498" on a stuck node. | "Node: not following · block 245,498" (`tray::stuck_for_tray`, tested). |
 | 14 | A slow status poll (btxd not answering) stacked up overlapping polls behind a screen that looked current. | One poll at a time; after 10 s the line says it is waiting and how old the screen is. |
 | 15 | "Very low disk space: the node may stop" sat in the disk card, about 500 px below the fold of the 780 px window, under a green LIVE. | DISK ALMOST FULL in amber at the top, on the disk card's own threshold (`disk_critical_mb`, 2 GiB). Fixed in the follow-up to #189. |
+| 16 | Screen readers did not hear state changes: the badge had no live region, so NOT FOLLOWING appeared silently. | A polite region says each new state once (`announceChange`), not every poll and not every percentage tick. Follow-up. |
 
 Each row can be opened in the preview (end of this page);
 `?s=follower-frozen-6h` is the first one.
@@ -126,15 +127,16 @@ Also: Esplora shows "Not installed yet: electrs
 user cannot act on. Hide the row unless the programs are found, or link a
 guide. Descriptions mix sentences with and without a full stop.
 
-### 5. The setup screen lets you start an install that cannot fit
+### 5. The setup screen let you start an install that cannot fit
 
-The disk check runs only after "Set up my node" is pressed, then shows an
+The disk check ran only after "Set up my node" was pressed, then showed an
 error below the fold (it scrolls there), although both numbers were on
 screen before the click, for example "Disk needed 140.0 GiB, Free on this
-computer 12.4 GiB". Screen:
-`finding-wizard-disk-error-after-click.jpg`. Proposal: colour the free space
-red and say it next to the button before the click; when free space is
-between 20 and 140 GiB, offer Keeper mode (20 GiB) right there.
+computer 12.4 GiB". **Fixed in a follow-up:** the free figure turns red and
+a line under it says what is missing, naming Keeper mode in Settings for a
+full node. The backend's check still decides; the button is left alone.
+Still open: a one-click "Use Keeper mode" right there, instead of a trip to
+Settings.
 
 ### 6. Ask answers only fixed questions
 
@@ -191,6 +193,13 @@ in smaller type would read better.
   when NOT FOLLOWING for an hour, "Start node" when stopped (done), "Free
   space" when the disk is low.
 - **Tray icon in three colours** (see 2).
+- **A notification when the node has been stuck for an hour.** Today the
+  only signals are inside the window and the tray menu; a person who
+  closed the window finds out from the explorer. One OS notification per
+  episode, off with the same switch as launch at login.
+- **A "Get help" row in Tools:** where to send Copy diagnostics, so the
+  person who pressed it knows what to do with what is on their clipboard.
+
 
 ## Edge cases checked
 

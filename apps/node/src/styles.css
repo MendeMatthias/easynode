@@ -208,6 +208,8 @@ body {
 .fact { display: flex; justify-content: space-between; gap: var(--space-s); font-size: 13px; }
 .fact-label { color: var(--color-muted); white-space: nowrap; }
 .fact-value { text-align: right; }
+.fact-value.is-short { color: var(--color-danger); }
+.wizard-disk-short { margin: 0; font-size: 12px; line-height: 1.45; color: var(--color-danger); }
 .wizard-note {
   font-size: 12px;
   color: var(--color-muted);

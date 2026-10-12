@@ -28,11 +28,19 @@ stuck node instead of "running", and groups the block number.
 sat in the disk card, far below a green LIVE. The headline now says DISK
 ALMOST FULL in amber, the moment the disk card turns red.
 
+**Setup says the disk is too small before you press the button.** It used to
+find out only after "Set up my node", and show it below the fold. Now the
+free space turns red and a line under it says what is missing, and that
+Keeper mode needs far less.
+
 **A stopped node shows what happened and Start node at the top.** Both used
 to sit at the bottom of the screen, below every card.
 
 **"Global network stats" opens easybtx.com/stats.** It opened
 btxprice.com/stats, which no longer answers.
+
+**Screen readers hear the status change.** When the headline moves to a new
+state (NOT FOLLOWING, STOPPED, LIVE again), it is said once.
 
 **Panels close with Escape.** Opening a panel moves the keyboard into it,
 closing it gives the keyboard back to the button that opened it, and Tab

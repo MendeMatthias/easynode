@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type HeadlineFacts, type HeadlinePhase, headline, tipAgeWords, waitingLine } from "./headline";
+import { type HeadlineFacts, type HeadlinePhase, announceChange, headline, tipAgeWords, waitingLine } from "./headline";
 
 const facts = (over: Partial<HeadlineFacts> = {}): HeadlineFacts => ({
   rcStalled: false,
@@ -302,5 +302,31 @@ describe("waitingLine", () => {
   it("switches to minutes from two minutes on", () => {
     expect(waitingLine(120_000)).toBe("Waiting for your node to answer. This screen is 2 min old");
     expect(waitingLine(605_000)).toBe("Waiting for your node to answer. This screen is 10 min old");
+  });
+});
+
+describe("announceChange", () => {
+  const live = { badge: "LIVE", sub: "Your node is live and helping the network", mode: "ready" as const };
+  const stuck = {
+    badge: "NOT FOLLOWING",
+    sub: "Your node is running, but no signature it trusts is arriving, so it cannot move",
+    mode: "stalled" as const,
+  };
+
+  it("says nothing on the first screen, which the person is reading anyway", () => {
+    expect(announceChange(null, live)).toBeNull();
+  });
+
+  it("says a new state once, badge then line", () => {
+    expect(announceChange("LIVE", stuck)).toBe(
+      "NOT FOLLOWING. Your node is running, but no signature it trusts is arriving, so it cannot move",
+    );
+    expect(announceChange("NOT FOLLOWING", stuck)).toBeNull();
+  });
+
+  it("does not speak every tick of a percentage", () => {
+    const at = (pct: string) => ({ badge: `SYNCING ${pct}%`, sub: "Catching up to block 245,760", mode: "syncing" as const });
+    expect(announceChange("SYNCING 62.3%", at("62.4"))).toBeNull();
+    expect(announceChange("FETCHING HEADERS 41%", at("0.1"))).toBe("SYNCING 0.1%. Catching up to block 245,760");
   });
 });
