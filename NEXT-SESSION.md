@@ -1,13 +1,39 @@
 # Next easyNode session: the handover
 
-State on 2026-10-12, after 0.7.11. Verified against the released bytes, not
+State on 2026-10-12, after 0.7.12. Verified against the released bytes, not
 just the local build, except where it says otherwise.
 
 ---
 
 ## Where things stand
 
-**Published: easyNode 0.7.11 on Mac, Linux and Windows** (`node-v0.7.11` on
+**Published: easyNode 0.7.12 on Mac, Linux and Windows** (`node-v0.7.12`,
+ten assets re-downloaded identical, every updater signature verified
+against the released bytes, Latest still v0.30.0; site PR EasyBTX #577
+merged as `0e3d1221`). Engine unchanged: BTX v0.34.15, the Mac node package
+byte-identical to 0.7.11's (btxd `a315d86e`). What it carries (easynode
+#189 to #197):
+
+- **Every feature on by default, running only where it can, all
+  switchable** (the owner's rule of 2026-10-12): wallet panel, Explorer mode,
+  snapshot serving, Esplora and launch at login joined the services already
+  on. Existing installs get them once (`migrate_features_on`) and the
+  welcome panel lists them. Explorer mode is applied only where no pruning is
+  in effect (`btx_core::setup::explorer_mode_possible_here`), which also
+  fixed a Keeper that turned it on from Ask and then could not start (BTX
+  refuses pruning plus txindex, `src/init.cpp:2077`). The whole chain held
+  349,792 transactions (07:52 UTC), so the index is tens of MB. Snapshot
+  loads and Fast-forward pass on regtest with `-txindex=1` on the shipped
+  engine.
+- **The headline follows the chain cards** (`apps/node/src/headline.ts`):
+  NOT FOLLOWING / BEHIND / DIFFERENT BRANCH / DISK ALMOST FULL instead of a
+  green LIVE over a stuck node; the tray (`tray::stuck_for_tray`) and the
+  compact light follow.
+- Settings in four groups, Escape and focus for panels, the close dialog no
+  longer opens behind a panel, one status poll at a time, and the rest of
+  `docs/node-ui-audit-2026-10-12.md`.
+
+**Before that: easyNode 0.7.11 on Mac, Linux and Windows** (`node-v0.7.11` on
 MendeMatthias/EasyBTX-releases, ten assets, every one re-downloaded identical
 and every updater signature verified against the released bytes; repo Latest
 still v0.30.0). Engine unchanged: BTX v0.34.15 (`476f3f23`).
@@ -70,6 +96,28 @@ To look at any screen without a node: `npm --prefix apps/node run
 preview:states`, then `http://localhost:1440/preview/index.html`.
 
 ## Open work, in priority order
+
+0. **Upstream btxchain/btx#225 would end co-signing as the confirmer does
+   it.** Open, not merged, "a later 0.34.16 can carry it" (its author,
+   2026-10-07). Its `af9020cd` makes `signutxosnapshotmanifest` rebuild the
+   statement from the signing node's own active tip and refuse unless every
+   field matches. The confirmer (`snapshot_confirmer.rs`) co-signs a
+   statement 144 blocks deep that it checked against its diary, relying on
+   the RPC signing blindly (its header says so), so under #225 every
+   co-signature and every dissent is refused. `confirmed_snapshot_regtest`
+   already catches this: its confirmer co-signs block 100 from a node with
+   no blocks. Run it against any new engine before bumping.
+   The way that still works under #225: two operators agree by each
+   PRODUCING the statement at the same grid height (the snapshot keeper
+   exports at every multiple of 100 when its tip reaches it, and the website
+   merges identical statements by hash). Measured on regtest with the shipped
+   v0.34.15, 2026-10-12: two validating nodes on one chain exported
+   byte-identical files (8,055 bytes) and identical statements at block 100.
+   Since 0.7.12 snapshot serving is on by default on every node that
+   validates and signs, so an operator-listed easyNode (zbtx's) now produces
+   too. Check that the website's merge and the producer's upload really do
+   this with two producers before relying on it, and redesign the confirmer
+   before taking an engine with #225.
 
 1. **A second operator must confirm.** `/api/snapshots/latest` stays 404
    until Aleksander (zbtx1 to zbtx3) or jpp co-signs; every statement since
