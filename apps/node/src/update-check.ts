@@ -206,7 +206,8 @@ export function installErrorFromDetail(detail: string): string {
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-function hhmm(d: Date): string {
+/** Local 24-hour "06:12", the one clock format the screen uses. */
+export function hhmm(d: Date): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 

@@ -45,6 +45,7 @@ import {
   classifyCheckFailure,
   checkFailureMessage,
   handInstallBanner,
+  hhmm,
   handInstallNotice,
   installErrorFromDetail,
   lastCheckLine,
@@ -860,7 +861,7 @@ function reflectSignerRow(status: NodeStatusInfo): void {
     // know it happened and when, and the backend has no business formatting a
     // clock for them.
     const when = new Date(offer.at);
-    const stamp = Number.isNaN(when.getTime()) ? "" : ` (${when.toLocaleTimeString()})`;
+    const stamp = Number.isNaN(when.getTime()) ? "" : ` (${hhmm(when)})`;
     line.textContent = `${offer.detail}${stamp}`;
     line.hidden = false;
   } else if (status.signing_live) {
@@ -2129,8 +2130,9 @@ $("remove-node-btn").addEventListener("click", async () => {
   const btn = $<HTMLButtonElement>("remove-node-btn");
   if (btn.dataset.armed !== "1") {
     btn.dataset.armed = "1";
-    const gb = lastStatus ? (lastStatus.datadir_size_mb / 1024).toFixed(0) : "?";
-    btn.textContent = `Click again to remove ~${gb} GB`;
+    // Mebibytes over 1024: GiB, the unit the disk card above prints.
+    const gib = lastStatus ? (lastStatus.datadir_size_mb / 1024).toFixed(0) : "?";
+    btn.textContent = `Click again to remove ~${gib} GiB`;
     clearTimeout(removeArmTimer);
     removeArmTimer = setTimeout(() => {
       btn.dataset.armed = "";
