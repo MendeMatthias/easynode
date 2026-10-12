@@ -2604,6 +2604,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
     let nickname_slot = state.peer_nicknames_cache.clone();
     let archive_service_slot = state.archive_service.clone();
     let matmul_trusted_slot = state.matmul_trusted.clone();
+    let last_verifier_restart_slot = state.last_verifier_restart.clone();
     let signature_window_slot = state.signature_window.clone();
     let signed_frontier_slot = state.signed_frontier.clone();
     let catch_up_slot = state.catch_up_help.clone();
@@ -2701,6 +2702,12 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         // headers, the batch out, the peers that dropped us over old blocks)
         // lasts for this run only.
         let mut catch_up = btx_core::catchup_assist::CatchUp::for_this_app();
+        // The block height at this run's first answer, so the rule below can
+        // tell a verifier lost mid-run (blocks were connected) from one that
+        // never qualified, and when the engine's "cannot verify" warning
+        // first stood (cleared the moment it goes).
+        let mut run_first_blocks: Option<u64> = None;
+        let mut verifier_lost_since: Option<std::time::Instant> = None;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             if gen_counter.load(Ordering::SeqCst) != gen {
@@ -2749,8 +2756,64 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     // render time against the clock then.
                     *tip_time_slot.lock().await = Some(chain.median_time);
                     // What the engine is warning about, from the same answer.
-                    *engine_warnings_slot.lock().await =
-                        btx_core::engine_warnings::from_node(&chain);
+                    let warnings_now = btx_core::engine_warnings::from_node(&chain);
+                    let cannot_verify_now = warnings_now.iter().any(|w| {
+                        matches!(
+                            w,
+                            btx_core::engine_warnings::EngineWarning::CannotVerifyBlocks { .. }
+                        )
+                    });
+                    *engine_warnings_slot.lock().await = warnings_now;
+                    // A verifier lost mid-run comes back with a restart, which
+                    // re-runs the startup qualification; the engine's own
+                    // re-test did not run once in 13 hours on the 3060
+                    // (btx_core::engine_warnings::restart_for_lost_verifier).
+                    let first = *run_first_blocks.get_or_insert(chain.blocks);
+                    verifier_lost_since = if cannot_verify_now {
+                        Some(verifier_lost_since.unwrap_or_else(std::time::Instant::now))
+                    } else {
+                        None
+                    };
+                    let validating = matmul_trusted_slot.lock().await.as_ref().is_some_and(|t| {
+                        t.matmul_validation_mode.eq_ignore_ascii_case("consensus")
+                    });
+                    let since_last = last_verifier_restart_slot.lock().await.map(|t| t.elapsed());
+                    if validating
+                        && btx_core::engine_warnings::restart_for_lost_verifier(
+                            verifier_lost_since.map(|t| t.elapsed()),
+                            chain.blocks > first,
+                            since_last,
+                        )
+                    {
+                        *last_verifier_restart_slot.lock().await = Some(std::time::Instant::now());
+                        let mins = verifier_lost_since
+                            .map(|t| t.elapsed().as_secs() / 60)
+                            .unwrap_or(0);
+                        let msg = format!(
+                            "the block verifier has been unavailable for {mins} min in a run that \
+                             had been checking blocks (stopped at {}); restarting the node so the \
+                             engine checks the graphics card again",
+                            chain.blocks
+                        );
+                        eprintln!("[node-app] {msg}");
+                        setup_log(&node_datadir(), &msg);
+                        let restart_app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let state = restart_app.state::<AppState>();
+                            if state.rpc.lock().await.is_none()
+                                || state.quitting.load(Ordering::SeqCst)
+                            {
+                                return; // stopped or quitting meanwhile: leave it
+                            }
+                            if let Err(e) = restart_node_projected(&restart_app, &state).await {
+                                eprintln!(
+                                    "[node-app] the restart for a lost block verifier failed: {e}"
+                                );
+                            }
+                        });
+                        // The restart's stop supersedes this refresher.
+                        return;
+                    }
                     // Housekeeping: free the ~450 MB bootstrap snapshot the
                     // moment its load is confirmed (C3-gated; safe while btxd
                     // runs — it never holds the file after loadtxoutset).

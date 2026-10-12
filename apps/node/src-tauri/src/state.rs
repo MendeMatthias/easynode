@@ -858,6 +858,11 @@ pub struct AppState {
     /// switch is on by default, so this is the common case and Settings says
     /// it calmly.
     pub esplora_unavailable: Arc<Mutex<Option<String>>>,
+    /// When the app last restarted the engine because its block verifier was
+    /// lost mid-run (`btx_core::engine_warnings::restart_for_lost_verifier`).
+    /// In the app's state rather than the refresher's, because the restart
+    /// replaces the refresher that made it.
+    pub last_verifier_restart: Arc<Mutex<Option<std::time::Instant>>>,
     /// Generation counter for the guardian loop, bumped on every sidecar
     /// start; a loop whose generation is superseded exits.
     pub esplora_gen: Arc<AtomicU64>,
@@ -950,6 +955,7 @@ impl AppState {
             esplora_verdict: Arc::new(Mutex::new(None)),
             esplora_error: Arc::new(Mutex::new(None)),
             esplora_unavailable: Arc::new(Mutex::new(None)),
+            last_verifier_restart: Arc::new(Mutex::new(None)),
             esplora_gen: Arc::new(AtomicU64::new(0)),
             witness: Arc::new(Mutex::new(None)),
             witness_error: Arc::new(Mutex::new(None)),
