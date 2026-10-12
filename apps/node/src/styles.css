@@ -699,6 +699,11 @@ body {
   padding: var(--space-m);
 }
 .overlay[hidden] { display: none; }
+/* "Close BTX Node?" and "Quitting" open over whatever panel is up when the
+   window's close button or the tray's Quit is pressed. At the shared z-index
+   they painted behind Ask, Tools and What's next, which come later in the
+   page, and the close button seemed to do nothing. Below the toast (20). */
+#close-overlay { z-index: 15; }
 .overlay-panel {
   width: 100%;
   max-width: 460px;

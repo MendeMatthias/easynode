@@ -55,6 +55,7 @@ import {
 } from "./update-check";
 import { contributionView } from "./contribution";
 import { type VisualMode, headline } from "./headline";
+import { initOverlayKeys } from "./overlay-keys";
 import { mountPowerCore } from "./power-core";
 import { initAsk } from "./ask";
 import { initTools } from "./tools";
@@ -2594,6 +2595,8 @@ void (async () => {
   initAsk();
   initTools();
   initWallet();
+  // Escape, focus in and back, and Tab kept inside the open panel.
+  initOverlayKeys();
   try {
     const v = await getVersion();
     appVersion = v;
