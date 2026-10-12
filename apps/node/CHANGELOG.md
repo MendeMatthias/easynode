@@ -18,8 +18,9 @@ follows signatures that can be 15 minutes in, for any node it is at most 2
 hours), BEHIND when
 newer blocks exist that the node cannot get, and DIFFERENT BRANCH when no
 other source holds your node's block. When other sources are only a few
-blocks ahead, it stays LIVE and says so in the line under it. The small
-window shows the same light.
+blocks ahead, it stays LIVE and says so in the line under it. The word
+itself turns amber or red when something is wrong, and the small window
+shows the same light, with the headline when you hover it.
 
 **A stopped node shows what happened and Start node at the top.** Both used
 to sit at the bottom of the screen, below every card.
