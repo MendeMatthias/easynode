@@ -97,18 +97,37 @@ Measured on the 3060 on 10-12, read-only.
 - Nothing starts the node until someone logs in on that PC: WSL is started
   by a Startup-folder script and a logon task, and auto-logon is off.
 
-## Would restarting only the engine have brought the card back?
+## Would restarting only the engine have brought the card back? No.
 
-Probably, but it was not tested. For: identical failures on every in-process
-re-test while the device stayed reachable, no in-process context reset, and
-a fresh process qualifying at once. Against: nobody has swapped a driver and
-then restarted only the engine; WSL itself might need a restart after a
-host driver swap.
+Measured on 2026-10-13: the owner installed an NVIDIA driver on purpose
+while the node ran (610.88 to 617.42).
+
+- Windows registered the new driver at 10:09:28 UTC. At 10:09:29 the engine
+  quarantined its verifier with the same reason as on 10-11
+  (`device_seeded_phase1_declined_or_wrong_size`), withdrew
+  `NODE_MATMUL_CONSENSUS` and disconnected all 13 peers. That is the 10-11
+  "network drop": the engine's own doing, not the network's.
+- It re-tested inside the process six times in 51 minutes and failed every
+  time, as on 10-11. The installer ran until 10:55:42 UTC.
+- 10:58: a throwaway btxd (empty datadir, no network, same flags) passed the
+  full startup qualification on the new driver (`driver=13040`).
+- 11:01: easyNode and btxd were restarted, WSL and the PC were not. The new
+  btxd failed startup qualification: "CUDA driver version is insufficient for
+  CUDA runtime version", DEGRADED START with provider `cpu`. A throwaway btxd
+  at 11:02 failed the same way. New processes inside the old WSL VM worked
+  only for a moment after the install; `nvidia-smi` inside it crashed
+  throughout.
+- 11:02: `wsl --shutdown`, then a fresh start. btxd passed startup
+  qualification at 11:03:21 and signed 246,970 onwards (the block that had
+  failed at 10:09).
+
+So on a node inside WSL2, a host driver swap needs a WSL restart, not an
+engine restart. #199's engine-only restart would not have helped. It costs
+one restart and then stops (a run whose card fails startup qualification is
+not restarted again), but it does not heal the node.
 
 The owner keeps Windows Update and driver installs on, on purpose: the node
-has to survive a driver swap, a restart or a power cut on its own. #199's
-restart costs one engine restart if it does not help, because a run whose
-card fails startup qualification is not restarted again.
+has to survive a driver swap, a restart or a power cut on its own.
 
 ## What changed
 
@@ -117,7 +136,12 @@ card fails startup qualification is not restarted again.
 - easynode #199 (merged 10-12, not released): when the engine reports it
   cannot verify blocks for 15 minutes in a run that had been verifying,
   easyNode restarts the engine itself, at most once every 3 hours
-  (`btx_core::engine_warnings::restart_for_lost_verifier`). With the cause
-  known it is the right first remedy. Missing before release: if the card
-  still fails startup qualification after that restart, the app should tell
-  the person to reboot the PC, which is the remedy known to work.
+  (`btx_core::engine_warnings::restart_for_lost_verifier`). Not to be
+  released as it is: on WSL an engine restart does not bring the card back
+  (above). Rework first: restart WSL where the node runs inside it, and
+  otherwise tell the person to restart the PC. Whether an engine restart
+  is enough on a native Windows or Linux install is not measured.
+- On the 3060 itself (not in the repo): a boot task starts WSL with nobody
+  logged in, and `instanceIdleTimeout=-1` stops WSL from shutting an idle
+  distro down. On 10-13 WSL had stopped the node's distro about 15 s after
+  the logon launcher's calls ended, killing the running node.
