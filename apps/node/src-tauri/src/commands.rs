@@ -5397,26 +5397,51 @@ fn launch_wsl_restart() -> Result<(), String> {
          '-NoProfile','-NonInteractive','-WindowStyle','Hidden','-EncodedCommand','{}'",
         encode_powershell(&script)
     );
-    let status = std::process::Command::new(btx_core::wsl::POWERSHELL_FROM_WSL)
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-EncodedCommand",
-            &encode_powershell(&outer),
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("cannot start Windows PowerShell through WSL interop: {e}"))?;
+    let encoded = encode_powershell(&outer);
+    let args = [
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-EncodedCommand",
+        encoded.as_str(),
+    ];
+    let run = |program: &str, before: &[&str]| {
+        std::process::Command::new(program)
+            .args(before)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+    };
+    let status = match run(btx_core::wsl::POWERSHELL_FROM_WSL, &[]) {
+        // ENOEXEC: the WSLInterop handler is gone, which is what another
+        // distro's systemd-binfmt does to the whole VM at its boot (the 3060,
+        // 2026-10-13 20:14 UTC). Its interpreter still runs a Windows program.
+        Err(e) if e.raw_os_error() == Some(ENOEXEC) => {
+            eprintln!(
+                "[node-app] Windows programs are not recognised here ({e}); starting \
+                 PowerShell through {} instead",
+                btx_core::wsl::INTEROP_INTERPRETER
+            );
+            run(
+                btx_core::wsl::INTEROP_INTERPRETER,
+                &[btx_core::wsl::POWERSHELL_FROM_WSL],
+            )
+        }
+        other => other,
+    }
+    .map_err(|e| format!("cannot start Windows PowerShell through WSL interop: {e}"))?;
     if status.success() {
         Ok(())
     } else {
         Err(format!("Windows PowerShell exited with {status}"))
     }
 }
+
+/// `execve` refused the binary format (Linux errno 8).
+const ENOEXEC: i32 = 8;
 
 /// PowerShell's `-EncodedCommand`: base64 of the script in UTF-16LE.
 fn encode_powershell(script: &str) -> String {

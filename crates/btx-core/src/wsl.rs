@@ -43,6 +43,17 @@ pub fn this_host_runs_in_wsl() -> bool {
 pub const POWERSHELL_FROM_WSL: &str =
     "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
 
+/// The interpreter WSL registers for Windows programs (binfmt `WSLInterop`,
+/// `:WSLInterop:M::MZ::/init:PF`). Called directly as
+/// `/init <windows program> <args>` it starts the program the same way,
+/// which is the way left when the handler is gone. Another distro booting
+/// with `systemd-binfmt` wipes it for the whole VM: on the 3060 on
+/// 2026-10-13 two new distros did, and the WSL restart failed with "Exec
+/// format error". Reproduced that day by wiping the entry as root: a plain
+/// exec failed and `/init` worked, with arguments passed unchanged
+/// (`cmd.exe /c echo` printed).
+pub const INTEROP_INTERPRETER: &str = "/init";
+
 /// A distro or user name that can go into the script as it is.
 fn plain_name(s: &str) -> bool {
     !s.is_empty()
