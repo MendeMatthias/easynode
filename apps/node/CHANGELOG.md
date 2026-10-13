@@ -6,14 +6,43 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
-## [0.7.13] - 2026-10-14
+## [Unreleased]
+
+**The WSL recovery from 0.7.13 is safer.** An audit of it, and a second test
+with a real graphics-card reset on 13 October, found what follows; all of it
+is fixed.
+
+- It restarts WSL only for easyNode's own node. Attached to another app's node
+  (the miner's, say), it used to leave that node running and then kill it
+  with WSL, uncleanly.
+- The limit of one WSL restart every 3 hours now holds across the restart.
+  It was kept in memory, which the restart itself ends, so a card that
+  qualified at startup and then failed again could cost a WSL restart every
+  20 minutes. A record now lives in the settings file, and a card that keeps
+  failing costs at most two: the first, and one more if the run after it
+  comes up without the card within the hour, as when a driver install is
+  still going.
+- easyNode prepares the restart before it stops anything, so a restart it
+  cannot make leaves the node running. It gives Windows 30 seconds to take
+  the job over, and if WSL has not restarted two minutes later it starts the
+  node again. The Windows side writes what it did to
+  `%TEMP%\easynode-wsl-restart.log` and tries starting easyNode again up to three
+  times.
+- Started by a boot script, easyNode now still finds the name of its own WSL
+  distribution, instead of restarting the default one.
+- The message about a card that fails the engine's check says restarting the
+  computer clears it only when it follows a driver update; the same message
+  shows for a card refused at startup.
+
+## [0.7.13] - 2026-10-14 · linux + windows (mac follows when built)
 
 **A node that loses its graphics card mid-run gets it back by itself.** On
 11 October at 19:49 UTC Windows Update installed a graphics driver under the
 running node on this project's RTX 3060 signer. The node engine took the card
 out of block checking and tested it again about every hour, and the card
 failed each time, for 13 hours. The node stopped at block 245,498 and signed
-nothing, and every node that follows signatures stopped with it. Now, when
+nothing, and nodes that follow signatures stopped with it, except where
+another signer's key carried them further. Now, when
 the engine says it cannot check blocks for 15 minutes in a run where it had
 been checking them, easyNode acts, at most once every 3 hours and never for a
 card that did not pass at startup:
@@ -248,7 +277,7 @@ or restarts anything. It reads only the node's RPC cookie. Build it with
 `cargo build --release --bin btx-confirmer` in `crates/btx-core`; a systemd
 template is in `deploy/esplora/`.
 
-## [0.7.6] - 2026-10-05
+## [0.7.6] - 2026-10-05 · linux + windows (mac stayed on 0.7.5)
 
 **A new node starts about 260 blocks behind the tip instead of 13,400.**
 Until a snapshot is confirmed by two operators, every new node starts from the

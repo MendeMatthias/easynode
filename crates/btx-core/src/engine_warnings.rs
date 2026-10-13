@@ -146,10 +146,11 @@ impl EngineWarning {
                 let mut m = String::from(
                     "This machine's graphics chip did not pass the node engine's own check, so \
                      your node cannot check the new proof of work and has stopped following new \
-                     blocks. Everything already downloaded is safe. This usually follows a \
-                     graphics driver update, and restarting the computer clears it. When the \
+                     blocks. Everything already downloaded is safe. When this follows a \
+                     graphics driver update, restarting the computer clears it. When the \
                      check had passed earlier in this run, easyNode tries by itself after 15 \
-                     minutes: it restarts the node, or restarts WSL when it runs inside WSL.",
+                     minutes: it restarts the node, or, inside WSL with that switch on in \
+                     Settings, it restarts WSL.",
                 );
                 if let Some(r) = reason {
                     m.push_str(&format!(" The engine's reason: {}.", r.replace('_', " ")));
@@ -518,6 +519,53 @@ pub fn restart_for_lost_verifier(
         && since_last_restart.is_none_or(|d| d >= VERIFIER_RESTART_MIN_GAP)
 }
 
+/// How long after the app's own WSL restart a run that never verified a
+/// block may ask for one more. A driver install can still be running when the
+/// first one fires: on 2026-10-13 the NVIDIA installer ran 46 minutes, and the
+/// 15-minute rule would have fired a third of the way in.
+pub const WSL_FOLLOW_UP_WINDOW: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The most WSL restarts the app makes for one loss of the card: the first,
+/// and one follow-up. A run that verifies blocks again starts a new count.
+pub const WSL_RESTARTS_PER_LOSS: u32 = 2;
+
+/// Whether an app inside WSL restarts WSL now, for a verifier lost for
+/// `lost_for`.
+///
+/// [`restart_for_lost_verifier`] keeps its gap in memory, and a WSL restart
+/// ends the process that holds it: the new run would see no gap at all, and
+/// a card that qualifies at startup and fails again mid-run would cost a WSL
+/// restart every ~20 minutes, each one stopping every Linux program on the PC
+/// (audit of #205, 2026-10-14). So this one reads a record kept in the
+/// settings file: `since_last`, the time since the app last restarted WSL for
+/// this, and `streak`, how many it has made since a run last verified blocks.
+///
+/// - A run that verified blocks: at most once per
+///   [`VERIFIER_RESTART_MIN_GAP`], as for the engine.
+/// - A run that never verified a block, within [`WSL_FOLLOW_UP_WINDOW`] of
+///   the app's own WSL restart: one more ([`WSL_RESTARTS_PER_LOSS`] in all).
+///   That is the run that came up without its card because the driver
+///   install was still going. Any other run that never verified is left alone:
+///   a card refused at startup is the chip-refused path's.
+pub fn restart_wsl_for_lost_verifier(
+    lost_for: Option<std::time::Duration>,
+    verified_this_run: bool,
+    since_last: Option<std::time::Duration>,
+    streak: u32,
+) -> bool {
+    let Some(lost_for) = lost_for else {
+        return false;
+    };
+    if lost_for < VERIFIER_LOST_RESTART_AFTER {
+        return false;
+    }
+    if verified_this_run {
+        since_last.is_none_or(|d| d >= VERIFIER_RESTART_MIN_GAP)
+    } else {
+        since_last.is_some_and(|d| d <= WSL_FOLLOW_UP_WINDOW) && streak < WSL_RESTARTS_PER_LOSS
+    }
+}
+
 /// What the app does once [`restart_for_lost_verifier`] says yes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LostVerifierRemedy {
@@ -552,6 +600,33 @@ pub fn lost_verifier_remedy(in_wsl: bool, wsl_restart_allowed: bool) -> LostVeri
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_wsl_restart_keeps_its_gap_across_the_restart_it_causes() {
+        let min = |m: u64| Some(std::time::Duration::from_secs(m * 60));
+        // A run that verified blocks: 15 minutes lost, no earlier restart.
+        assert!(restart_wsl_for_lost_verifier(min(15), true, None, 0));
+        assert!(!restart_wsl_for_lost_verifier(min(14), true, None, 0));
+        // The record survived the restart: 20 minutes ago means no, the
+        // ~20-minute loop the audit found.
+        assert!(!restart_wsl_for_lost_verifier(min(15), true, min(20), 0));
+        assert!(!restart_wsl_for_lost_verifier(min(15), true, min(179), 0));
+        assert!(restart_wsl_for_lost_verifier(min(15), true, min(180), 0));
+    }
+
+    #[test]
+    fn a_run_that_came_up_without_its_card_gets_one_follow_up() {
+        let min = |m: u64| Some(std::time::Duration::from_secs(m * 60));
+        // Right after our own restart, the driver install still running.
+        assert!(restart_wsl_for_lost_verifier(min(15), false, min(20), 1));
+        // But only one: the second follow-up is refused.
+        assert!(!restart_wsl_for_lost_verifier(min(15), false, min(20), 2));
+        // Not long after it, and not without one: a card refused at startup
+        // is the chip-refused path's, never a WSL restart.
+        assert!(!restart_wsl_for_lost_verifier(min(15), false, min(61), 1));
+        assert!(!restart_wsl_for_lost_verifier(min(15), false, None, 0));
+        assert!(!restart_wsl_for_lost_verifier(min(14), false, min(20), 1));
+    }
 
     #[test]
     fn inside_wsl_the_remedy_is_a_wsl_restart_unless_switched_off() {
@@ -699,10 +774,21 @@ mod tests {
         assert!(m.contains("strict device not ready"), "{m}");
         // A driver update is the measured cause (10-11, 10-13), and an easyNode
         // restart alone does not clear it inside WSL: the advice is the computer.
-        assert!(m.contains("restarting the computer clears it"), "{m}");
+        // Only when it follows a driver update: the same warning shows for a
+        // chip refused at startup, which a restart does not clear (audit).
+        assert!(
+            m.contains(
+                "When this follows a graphics driver update, restarting the computer clears it"
+            ),
+            "{m}"
+        );
         assert!(!m.contains("Restarting easyNode"), "{m}");
         assert!(m.contains("after 15 minutes"), "{m}");
-        assert!(m.contains("restarts WSL when it runs inside WSL"), "{m}");
+        // A WSL restart only where it can happen: inside WSL, switch on.
+        assert!(
+            m.contains("inside WSL with that switch on in Settings"),
+            "{m}"
+        );
     }
 
     /// The reason the engine re-publishes every half hour while a chip stays

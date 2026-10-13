@@ -2780,36 +2780,64 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     let validating = matmul_trusted_slot.lock().await.as_ref().is_some_and(|t| {
                         t.matmul_validation_mode.eq_ignore_ascii_case("consensus")
                     });
+                    let verified_this_run = chain.blocks > first;
+                    let lost_for = verifier_lost_since.map(|t| t.elapsed());
+                    let settings_now = NodeAppSettings::load(&node_datadir());
+                    // Never restart WSL under a node another app owns: its
+                    // stop only detaches, and `wsl --shutdown` would kill that
+                    // app and its btxd uncleanly (audit of #205).
+                    let ours = attached_node_is_ours_to_stop(*attached_slot.lock().await);
+                    let remedy = btx_core::engine_warnings::lost_verifier_remedy(
+                        btx_core::wsl::this_host_runs_in_wsl(),
+                        settings_now.gpu_recovery_restarts_wsl && ours,
+                    );
+                    let wsl_path =
+                        remedy == btx_core::engine_warnings::LostVerifierRemedy::RestartWsl;
+                    // A run that verifies blocks ends a streak of WSL restarts.
+                    if verified_this_run && settings_now.gpu_wsl_restart_streak > 0 {
+                        NodeAppSettings::update(&node_datadir(), |s| s.gpu_wsl_restart_streak = 0);
+                    }
+                    let since_wsl_restart = settings_now
+                        .gpu_wsl_restart_last_unix
+                        .map(|t| std::time::Duration::from_secs(unix_now_secs().saturating_sub(t)));
                     let since_last = last_verifier_restart_slot.lock().await.map(|t| t.elapsed());
-                    if validating
-                        && btx_core::engine_warnings::restart_for_lost_verifier(
-                            verifier_lost_since.map(|t| t.elapsed()),
-                            chain.blocks > first,
-                            since_last,
-                        )
-                    {
-                        *last_verifier_restart_slot.lock().await = Some(std::time::Instant::now());
-                        let mins = verifier_lost_since
-                            .map(|t| t.elapsed().as_secs() / 60)
-                            .unwrap_or(0);
-                        let remedy = btx_core::engine_warnings::lost_verifier_remedy(
-                            btx_core::wsl::this_host_runs_in_wsl(),
-                            NodeAppSettings::load(&node_datadir()).gpu_recovery_restarts_wsl,
-                        );
-                        let what = match remedy {
-                            btx_core::engine_warnings::LostVerifierRemedy::RestartWsl => {
-                                "stopping the node and restarting WSL, which is what brings the \
-                                 graphics card back after a driver update"
-                            }
-                            btx_core::engine_warnings::LostVerifierRemedy::RestartEngine => {
-                                "restarting the node so the engine checks the graphics card again"
-                            }
+                    let fire = validating
+                        && if wsl_path {
+                            btx_core::engine_warnings::restart_wsl_for_lost_verifier(
+                                lost_for,
+                                verified_this_run,
+                                since_wsl_restart,
+                                settings_now.gpu_wsl_restart_streak,
+                            )
+                        } else {
+                            btx_core::engine_warnings::restart_for_lost_verifier(
+                                lost_for,
+                                verified_this_run,
+                                since_last,
+                            )
                         };
-                        let msg = format!(
-                            "the block verifier has been unavailable for {mins} min in a run that \
-                             had been checking blocks (stopped at {}); {what}",
-                            chain.blocks
-                        );
+                    if fire {
+                        *last_verifier_restart_slot.lock().await = Some(std::time::Instant::now());
+                        let mins = lost_for.map(|t| t.as_secs() / 60).unwrap_or(0);
+                        let what = if wsl_path {
+                            "stopping the node and restarting WSL, which is what brings the \
+                             graphics card back after a driver update"
+                        } else {
+                            "restarting the node so the engine checks the graphics card again"
+                        };
+                        let msg = if verified_this_run {
+                            format!(
+                                "the block verifier has been unavailable for {mins} min in a run \
+                                 that had been checking blocks (stopped at {}); {what}",
+                                chain.blocks
+                            )
+                        } else {
+                            format!(
+                                "the block verifier is still unavailable {mins} min into the run \
+                                 after easyNode's own WSL restart, as when a driver install was \
+                                 still going; {what}, once more"
+                            )
+                        };
                         eprintln!("[node-app] {msg}");
                         setup_log(&node_datadir(), &msg);
                         let restart_app = app.clone();
@@ -2820,37 +2848,9 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                             {
                                 return; // stopped or quitting meanwhile: leave it
                             }
-                            if remedy == btx_core::engine_warnings::LostVerifierRemedy::RestartWsl {
-                                // Stop cleanly first: `wsl --shutdown` would
-                                // otherwise kill btxd mid-flush.
-                                stop_node_inner(&state).await;
-                                set_phase(&restart_app, &state, NodePhase::Stopped).await;
-                                match launch_wsl_restart() {
-                                    Ok(()) => {
-                                        let note = "WSL restarts in a few seconds; easyNode \
-                                                    starts again by itself about a minute later";
-                                        eprintln!("[node-app] {note}");
-                                        setup_log(&node_datadir(), note);
-                                        return;
-                                    }
-                                    Err(e) => {
-                                        let note = format!(
-                                            "could not restart WSL ({e}); restarting the node \
-                                             instead"
-                                        );
-                                        eprintln!("[node-app] {note}");
-                                        setup_log(&node_datadir(), &note);
-                                        if let Err(e) =
-                                            start_node_projected(&restart_app, &state).await
-                                        {
-                                            eprintln!(
-                                                "[node-app] the restart for a lost block \
-                                                 verifier failed: {e}"
-                                            );
-                                        }
-                                        return;
-                                    }
-                                }
+                            if wsl_path {
+                                recover_by_restarting_wsl(&restart_app, &state).await;
+                                return;
                             }
                             if let Err(e) = restart_node_projected(&restart_app, &state).await {
                                 eprintln!(
@@ -5364,16 +5364,92 @@ pub async fn restart_node_projected(
     start_node_projected(app, state).await
 }
 
-/// Restart WSL from inside it, to get the GPU block verifier back after a
-/// driver update on the Windows host (`btx_core::wsl`). Call with the node
-/// already stopped: this returns once the Windows side has the job, and WSL,
-/// this app with it, goes down a few seconds later.
+/// Recover the GPU block verifier by restarting WSL (`btx_core::wsl`), after a
+/// driver update on the Windows host.
+///
+/// Order matters (audit of #205, 2026-10-14):
+/// 1. Build the command first. A distro, user or path that cannot be
+///    embedded safely must leave the node running, so the engine is
+///    restarted instead and nothing is stopped for nothing.
+/// 2. Record the restart in the settings file before it happens: the
+///    process that makes it does not survive it, and the next run needs the
+///    record to keep its gap (`restart_wsl_for_lost_verifier`).
+/// 3. Stop btxd cleanly, since `wsl --shutdown` would kill it mid-flush.
+/// 4. Hand the restart to Windows. If that fails, start the node again.
+/// 5. Safety net: WSL normally takes this app down within seconds. If it is
+///    still running two minutes later, the restart did not happen (blocked
+///    by antivirus, say), so the node starts again here rather than staying
+///    stopped. What the Windows side did is in `%TEMP%\easynode-wsl-restart.log`.
+async fn recover_by_restarting_wsl(app: &AppHandle, state: &State<'_, AppState>) {
+    let log = |note: &str| {
+        eprintln!("[node-app] {note}");
+        setup_log(&node_datadir(), note);
+    };
+    let command = match prepare_wsl_restart() {
+        Ok(c) => c,
+        Err(e) => {
+            log(&format!(
+                "cannot restart WSL ({e}); restarting the node instead"
+            ));
+            if let Err(e) = restart_node_projected(app, state).await {
+                log(&format!(
+                    "the restart for a lost block verifier failed: {e}"
+                ));
+            }
+            return;
+        }
+    };
+    NodeAppSettings::update(&node_datadir(), |s| {
+        s.gpu_wsl_restart_last_unix = Some(unix_now_secs());
+        s.gpu_wsl_restart_streak = s.gpu_wsl_restart_streak.saturating_add(1);
+    });
+    stop_node_inner(state).await;
+    set_phase(app, state, NodePhase::Stopped).await;
+    if let Err(e) = run_wsl_restart(&command) {
+        log(&format!(
+            "could not restart WSL ({e}); starting the node again"
+        ));
+        if let Err(e) = start_node_projected(app, state).await {
+            log(&format!(
+                "the restart for a lost block verifier failed: {e}"
+            ));
+        }
+        return;
+    }
+    log("WSL restarts in a few seconds; easyNode starts again by itself about a minute later");
+    tokio::time::sleep(WSL_RESTART_GRACE).await;
+    if state.quitting.load(Ordering::SeqCst) || state.rpc.lock().await.is_some() {
+        return;
+    }
+    log(&format!(
+        "WSL was not restarted within {} s (on Windows, see %TEMP%\\{}); starting the node again",
+        WSL_RESTART_GRACE.as_secs(),
+        btx_core::wsl::RESTART_LOG_NAME
+    ));
+    if let Err(e) = start_node_projected(app, state).await {
+        log(&format!(
+            "the restart for a lost block verifier failed: {e}"
+        ));
+    }
+}
+
+/// How long the app waits for `wsl --shutdown` to take it down before it
+/// concludes the restart did not happen. The script waits 3 s before shutting
+/// down, so two minutes is a wide margin.
+const WSL_RESTART_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long the outer PowerShell may take to hand the job over. It only starts
+/// the inner one, which takes about a second; a hung interop call must not
+/// park the recovery with the node stopped.
+const WSL_HANDOFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Build the PowerShell command that restarts WSL and brings easyNode back,
+/// without running anything: the outer script, encoded for `-EncodedCommand`.
 ///
 /// Two PowerShell processes, so the one doing the work is not a child of WSL
-/// interop: the outer one, started from here, only starts the inner one
-/// detached and exits. Both scripts travel as `-EncodedCommand`, so nothing
-/// in them is re-quoted on the way.
-fn launch_wsl_restart() -> Result<(), String> {
+/// interop: the outer one only starts the inner one detached and exits. Both
+/// scripts travel as `-EncodedCommand`, so nothing in them is re-quoted.
+fn prepare_wsl_restart() -> Result<String, String> {
     let user = std::env::var("USER")
         .ok()
         .filter(|u| !u.is_empty())
@@ -5387,35 +5463,57 @@ fn launch_wsl_restart() -> Result<(), String> {
                 .map(|p| p.display().to_string())
         })
         .ok_or("cannot tell which program to start again")?;
-    let distro = std::env::var("WSL_DISTRO_NAME")
-        .ok()
-        .filter(|d| !d.is_empty());
+    let distro = this_wsl_distro();
     let script = btx_core::wsl::restart_wsl_script(distro.as_deref(), &user, &relaunch)
-        .ok_or("the distro, user or program path needs quoting; not restarting WSL")?;
+        .ok_or("the distro, user or program path needs quoting")?;
     let outer = format!(
         "Start-Process -WindowStyle Hidden -FilePath powershell.exe -ArgumentList \
          '-NoProfile','-NonInteractive','-WindowStyle','Hidden','-EncodedCommand','{}'",
         encode_powershell(&script)
     );
-    let encoded = encode_powershell(&outer);
+    Ok(encode_powershell(&outer))
+}
+
+/// This distro's name: `WSL_DISTRO_NAME`, which a boot hook or a systemd unit
+/// does not set, else what `wslpath -w /` says. `None` restarts the default
+/// distro, which may not be this one when a PC has several.
+fn this_wsl_distro() -> Option<String> {
+    if let Some(d) = std::env::var("WSL_DISTRO_NAME")
+        .ok()
+        .filter(|d| !d.is_empty())
+    {
+        return Some(d);
+    }
+    let out = std::process::Command::new("wslpath")
+        .args(["-w", "/"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    btx_core::wsl::distro_from_unc_root(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Run the command from [`prepare_wsl_restart`]: Windows PowerShell through
+/// WSL interop, and through its interpreter when the interop handler is gone.
+/// Waits at most [`WSL_HANDOFF_TIMEOUT`].
+fn run_wsl_restart(encoded: &str) -> Result<(), String> {
     let args = [
         "-NoProfile",
         "-NonInteractive",
         "-WindowStyle",
         "Hidden",
         "-EncodedCommand",
-        encoded.as_str(),
+        encoded,
     ];
-    let run = |program: &str, before: &[&str]| {
+    let spawn = |program: &str, before: &[&str]| {
         std::process::Command::new(program)
             .args(before)
             .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
+            .spawn()
     };
-    let status = match run(btx_core::wsl::POWERSHELL_FROM_WSL, &[]) {
+    let mut child = match spawn(btx_core::wsl::POWERSHELL_FROM_WSL, &[]) {
         // ENOEXEC: the WSLInterop handler is gone, which is what another
         // distro's systemd-binfmt does to the whole VM at its boot (the 3060,
         // 2026-10-13 20:14 UTC). Its interpreter still runs a Windows program.
@@ -5425,7 +5523,7 @@ fn launch_wsl_restart() -> Result<(), String> {
                  PowerShell through {} instead",
                 btx_core::wsl::INTEROP_INTERPRETER
             );
-            run(
+            spawn(
                 btx_core::wsl::INTEROP_INTERPRETER,
                 &[btx_core::wsl::POWERSHELL_FROM_WSL],
             )
@@ -5433,11 +5531,30 @@ fn launch_wsl_restart() -> Result<(), String> {
         other => other,
     }
     .map_err(|e| format!("cannot start Windows PowerShell through WSL interop: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("Windows PowerShell exited with {status}"))
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("Windows PowerShell exited with {status}")),
+            Ok(None) if started.elapsed() >= WSL_HANDOFF_TIMEOUT => {
+                let _ = child.kill();
+                return Err(format!(
+                    "Windows PowerShell did not hand the job over within {} s",
+                    WSL_HANDOFF_TIMEOUT.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
+            Err(e) => return Err(format!("cannot wait for Windows PowerShell: {e}")),
+        }
     }
+}
+
+/// Wall-clock seconds since 1970, for records that outlive this process.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// `execve` refused the binary format (Linux errno 8).

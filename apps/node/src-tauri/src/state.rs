@@ -124,6 +124,14 @@ pub struct NodeAppSettings {
     /// because restarting WSL stops every Linux program on that PC.
     #[serde(default = "default_true")]
     pub gpu_recovery_restarts_wsl: bool,
+    /// When the app last restarted WSL to recover the GPU verifier (unix
+    /// seconds), and how many such restarts since a run last verified blocks.
+    /// Here rather than in memory because the WSL restart ends the process
+    /// that made it (`btx_core::engine_warnings::restart_wsl_for_lost_verifier`).
+    #[serde(default)]
+    pub gpu_wsl_restart_last_unix: Option<u64>,
+    #[serde(default)]
+    pub gpu_wsl_restart_streak: u32,
     /// Explorer mode: the node maintains a full transaction index
     /// (`txindex=1`) so historical txid lookups answer locally.
     ///
@@ -356,6 +364,8 @@ impl Default for NodeAppSettings {
             btx_release_tag: None,
             keep_awake: true,
             gpu_recovery_restarts_wsl: true,
+            gpu_wsl_restart_last_unix: None,
+            gpu_wsl_restart_streak: 0,
             // On, by the owner's rule of 2026-10-12: every feature is on,
             // and one a machine cannot run simply does not run there.
             txindex_enabled: true,
@@ -1340,6 +1350,9 @@ mod tests {
             legacy.gpu_recovery_restarts_wsl,
             "missing gpu_recovery_restarts_wsl defaults true"
         );
+        // And starts with no record of a WSL restart.
+        assert_eq!(legacy.gpu_wsl_restart_last_unix, None);
+        assert_eq!(legacy.gpu_wsl_restart_streak, 0);
         // Corrupt file → defaults, never a panic.
         std::fs::write(dir.path().join(SETTINGS_FILE_NAME), b"not-json").unwrap();
         assert_eq!(
