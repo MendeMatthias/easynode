@@ -8,6 +8,15 @@ root).
 
 ## [Unreleased]
 
+**You can count your node in the network's totals.** easybtx.com can now say
+how much the easyNode network uploads to other nodes, over the last day, the
+last week and since counting began, but only from nodes that report it. A new
+switch in Settings, under For operators, does that: off unless you turn it
+on. It sends the same numbers a signing node already sends with its key
+(versions, uptime, block height, connection counts, bytes uploaded), and no
+wallet, address or key. A signing node that offers its key is counted
+already. Needs easybtx.com to accept the new report (EasyBTX#584) first.
+
 **A node whose graphics card check fails mid-run restarts itself.** On 11
 October at 19:48 UTC the node engine on this project's RTX 3060 signer took
 its graphics card out of block checking and tested it again about every

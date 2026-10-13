@@ -512,6 +512,44 @@ pub(crate) fn offer_status(
     }
 }
 
+/// The Settings line for one check-in sent because the operator chose to be
+/// counted in the network stats: the same outcomes as [`offer_status`], about
+/// numbers instead of a key.
+pub(crate) fn share_status(
+    outcome: &btx_core::checkin::CheckinOutcome,
+    at: &str,
+) -> SignerOfferStatus {
+    use btx_core::checkin::CheckinOutcome as O;
+    let (delivered, detail) = match outcome {
+        O::Accepted => (
+            true,
+            "Your node's numbers reached easybtx.com and count toward the network's totals."
+                .to_string(),
+        ),
+        O::TooSoon => (
+            true,
+            "easybtx.com already has your node's numbers from a few minutes ago.".to_string(),
+        ),
+        O::Unavailable => (
+            false,
+            "easybtx.com could not take your node's numbers just now. It will try again."
+                .to_string(),
+        ),
+        O::Rejected { status, .. } => (
+            false,
+            format!(
+                "easybtx.com refused your node's numbers ({status}). This is a bug in this app \
+                 rather than something you can fix; the log has the detail."
+            ),
+        ),
+    };
+    SignerOfferStatus {
+        delivered,
+        at: at.to_string(),
+        detail,
+    }
+}
+
 /// A btxd path that carries this build's engine tag and nothing else, for the
 /// rules that read only the tag (`btx_core::node::host_follows_signatures` and
 /// the degraded-start gate behind it) before the real install path is resolved.
@@ -2611,6 +2649,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
     let recent_signers_slot = state.recent_signers.clone();
     let signer_pubkey_slot = state.signer_pubkey.clone();
     let signer_offer_slot = state.signer_offer.clone();
+    let stats_share_slot = state.stats_share.clone();
     let fork_slot = state.fork.clone();
     let tip_time_slot = state.tip_median_time.clone();
     let engine_warnings_slot = state.engine_warnings.clone();
@@ -3606,9 +3645,12 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     // signing key nobody pins signs into the void, and until
                     // 0.6.26 getting one to a mirror operator meant a person
                     // copying 66 characters into a chat. A node that does not
-                    // sign sends NOTHING: the gate below is the engine's own
-                    // answer that a key is loaded, not a setting, so a machine
-                    // that cannot sign cannot phone home either.
+                    // sign sends no key: that gate is the engine's own answer
+                    // that a key is loaded, not a setting, so a machine that
+                    // cannot sign cannot offer one. The same check-in without
+                    // the key goes out when the operator chose to be counted
+                    // in the network stats. A node that does neither sends
+                    // NOTHING.
                     checkin_tick += 1;
                     if checkin_tick >= CHECKIN_EVERY {
                         checkin_tick = 0;
@@ -3620,11 +3662,12 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                             .as_ref()
                             .is_some_and(|s| s.local_signer);
                         let pubkey = signer_pubkey_slot.lock().await.clone();
-                        if settings.signer_enabled
+                        let offering_key = settings.signer_enabled
                             && settings.signer_publish_enabled
                             && holds_key
-                            && pubkey.is_some()
-                        {
+                            && pubkey.is_some();
+                        let sharing_stats = settings.stats_share_enabled;
+                        if offering_key || sharing_stats {
                             let net = btx_core::node_api::get_connection_counts(&rpc).await.ok();
                             // No service bits, no claim: the endpoint requires
                             // them and a made-up value would be a lie about
@@ -3668,7 +3711,11 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                                         .as_ref()
                                         .filter(|n| n.inbound > 0)
                                         .map(|_| btx_core::role::P2P_PORT),
-                                    signer_pubkey: pubkey,
+                                    signer_pubkey: if offering_key { pubkey } else { None },
+                                    inbound_peers: net.as_ref().map(|n| n.inbound),
+                                    engine_uptime_secs: btx_core::node_api::get_engine_uptime(&rpc)
+                                        .await
+                                        .ok(),
                                 };
                                 let now_iso = crate::update_log::rfc3339_utc(
                                     std::time::SystemTime::now()
@@ -3676,29 +3723,50 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                                         .map(|d| d.as_secs())
                                         .unwrap_or(0),
                                 );
-                                let status = match btx_core::checkin::offer_signing_key(
+                                // One POST serves both purposes; each Settings
+                                // line reports it in its own words.
+                                let outcome = btx_core::checkin::post_checkin(
                                     &btx_core::checkin::checkin_endpoint(),
                                     &checkin,
                                 )
-                                .await
-                                {
-                                    Ok(outcome) => offer_status(&outcome, &now_iso),
-                                    Err(e) => SignerOfferStatus {
-                                        delivered: false,
-                                        at: now_iso.clone(),
-                                        detail: format!(
-                                            "Could not reach easybtx.com to offer your key ({e}). \
-                                             Your node keeps signing; it will try again."
-                                        ),
-                                    },
-                                };
-                                if !status.delivered {
-                                    eprintln!(
-                                        "[node-app] signing key not offered: {}",
-                                        status.detail
-                                    );
+                                .await;
+                                if offering_key {
+                                    let status = match &outcome {
+                                        Ok(outcome) => offer_status(outcome, &now_iso),
+                                        Err(e) => SignerOfferStatus {
+                                            delivered: false,
+                                            at: now_iso.clone(),
+                                            detail: format!(
+                                                "Could not reach easybtx.com to offer your key ({e}). \
+                                                 Your node keeps signing; it will try again."
+                                            ),
+                                        },
+                                    };
+                                    if !status.delivered {
+                                        eprintln!(
+                                            "[node-app] signing key not offered: {}",
+                                            status.detail
+                                        );
+                                    }
+                                    *signer_offer_slot.lock().await = Some(status);
                                 }
-                                *signer_offer_slot.lock().await = Some(status);
+                                if sharing_stats {
+                                    let status = match &outcome {
+                                        Ok(outcome) => share_status(outcome, &now_iso),
+                                        Err(e) => SignerOfferStatus {
+                                            delivered: false,
+                                            at: now_iso.clone(),
+                                            detail: format!(
+                                                "Could not reach easybtx.com to report your \
+                                                 node's numbers ({e}). It will try again."
+                                            ),
+                                        },
+                                    };
+                                    if !status.delivered {
+                                        eprintln!("[node-app] stats not shared: {}", status.detail);
+                                    }
+                                    *stats_share_slot.lock().await = Some(status);
+                                }
                             }
                         }
                     }
@@ -4308,6 +4376,10 @@ pub struct NodeStatusInfo {
     /// `None` until a signing node has tried once.
     pub signer_publish_enabled: bool,
     pub signer_offer: Option<SignerOfferStatus>,
+    /// Be counted in the network stats (`stats_share_enabled`), and what came
+    /// of the last check-in that sent this run. `None` until one went out.
+    pub stats_share_enabled: bool,
+    pub stats_share: Option<SignerOfferStatus>,
     /// What this node is really providing to other nodes right now: at the
     /// signed frontier and serving history, advertising the archive bit while
     /// silently degraded to the live window, or not serving at all. `None`
@@ -4991,6 +5063,8 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         signing_live,
         signer_publish_enabled: settings.signer_publish_enabled,
         signer_offer: state.signer_offer.lock().await.clone(),
+        stats_share_enabled: settings.stats_share_enabled,
+        stats_share: state.stats_share.lock().await.clone(),
         archive_service: archive_service.clone(),
         archive_service_message: archive_service.as_ref().map(|a| a.message()),
         role,
@@ -6596,6 +6670,29 @@ pub async fn set_signer_publish(state: State<'_, AppState>, on: bool) -> Result<
     )
 }
 
+/// Settings: be counted in the network's stats (`stats_share_enabled`).
+///
+/// Turning it off stops these check-ins at the next cycle. What was already
+/// added to the totals stays there, and the node's row ages out of the
+/// directory within a day; the message says so rather than implying a recall.
+#[tauri::command]
+pub async fn set_stats_share(state: State<'_, AppState>, on: bool) -> Result<String, String> {
+    NodeAppSettings::update(&node_datadir(), |s| s.stats_share_enabled = on);
+    if on {
+        return Ok(
+            "Your node will report its numbers when it next checks in, within fifteen minutes. \
+             The first report sets a starting point; what it uploads from then on is counted."
+                .to_string(),
+        );
+    }
+    *state.stats_share.lock().await = None;
+    Ok(
+        "Your node will stop reporting its numbers. What it already reported stays in the \
+         totals, and its entry leaves the directory within a day."
+            .to_string(),
+    )
+}
+
 /// Which conf the engine-upgrade path writes: the selected profile's when the
 /// disk can take it, otherwise the posture the datadir already has. `None`
 /// means there is no safe conf and the engine must not be re-provisioned this
@@ -8090,6 +8187,41 @@ pub async fn node_footprint(state: State<'_, AppState>) -> Result<NodeFootprint,
         mem_mb,
         chain_mb,
     })
+}
+
+#[cfg(test)]
+mod stats_share_tests {
+    use super::{offer_status, share_status};
+    use btx_core::checkin::CheckinOutcome as O;
+
+    /// A node counted in the stats without signing has no key, so its line
+    /// must never talk about one; and the two non-failures (stored, or stored
+    /// a few minutes ago) must not read as errors, the same rule offer_status
+    /// follows for a node checking in every fifteen minutes.
+    #[test]
+    fn the_stats_line_never_mentions_a_key_and_only_failures_read_as_failures() {
+        let outcomes = [
+            (O::Accepted, true),
+            (O::TooSoon, true),
+            (O::Unavailable, false),
+            (
+                O::Rejected {
+                    status: 422,
+                    reason: "schema must be one of 2".into(),
+                },
+                false,
+            ),
+        ];
+        for (outcome, delivered) in outcomes {
+            let s = share_status(&outcome, "2026-10-14T00:00:00Z");
+            assert_eq!(s.delivered, delivered, "{outcome:?}");
+            assert!(!s.detail.to_lowercase().contains("key"), "{}", s.detail);
+            assert_eq!(s.at, "2026-10-14T00:00:00Z");
+            // Same verdict as the key offer for the same outcome: one POST
+            // serves both lines, and they must not disagree about it.
+            assert_eq!(offer_status(&outcome, "t").delivered, delivered);
+        }
+    }
 }
 
 #[cfg(test)]

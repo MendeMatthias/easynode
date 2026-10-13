@@ -209,6 +209,22 @@ pub struct NodeAppSettings {
     /// bits. No wallet, no address, no secret key.
     #[serde(default = "default_true")]
     pub signer_publish_enabled: bool,
+    /// Be counted in the network's stats: check in with easybtx.com every
+    /// fifteen minutes even when this node does not sign, so its upload joins
+    /// the fleet's "served" figure (`btx_core::checkin`; published under
+    /// `selfReported.served` on `/api/nodes`).
+    ///
+    /// OFF unless the operator turns it on, new installs included. Unlike
+    /// `signer_publish_enabled` this is not the delivery half of a service the
+    /// operator already chose. It is a report about their machine, and the
+    /// promise in `checkin`'s header is that nothing is sent without a choice.
+    ///
+    /// What is sent is the signer's check-in without the key: a random local
+    /// id, the app and engine versions, uptimes, heights, peer counts, bytes
+    /// uploaded and the service bits. A node that signs and offers its key
+    /// already sends these numbers with it, so it is counted either way.
+    #[serde(default)]
+    pub stats_share_enabled: bool,
     /// Write a local `service-report.json` next to the datadir every few
     /// minutes: uptime, heights, peers, bytes served, archive-peer summary,
     /// stall verdict. LOCAL FILE ONLY — nothing phones home; this is the
@@ -362,6 +378,8 @@ impl Default for NodeAppSettings {
             // explorer's freeze on 2026-09-16 was about.
             signer_enabled: true,
             signer_publish_enabled: true,
+            // Off, new installs included. See the field.
+            stats_share_enabled: false,
             service_report_enabled: true,
             node_profile: default_profile(),
             // No nickname. Anything else would publish an identifier the user
@@ -782,6 +800,9 @@ pub struct AppState {
     /// the people who pin it" is the one thing a volunteer wants to know and
     /// the one thing a silent POST cannot tell them.
     pub signer_offer: Arc<Mutex<Option<SignerOfferStatus>>>,
+    /// What came of the last check-in sent because the operator chose to be
+    /// counted in the network stats. `None` until one has gone out this run.
+    pub stats_share: Arc<Mutex<Option<SignerOfferStatus>>>,
     /// The fork detector's verdict — a longer chain this node cannot obtain
     /// blocks for — computed by the refresher from `getchaintips` and the
     /// headers/blocks gap. Cleared on every stop/start like the others, so a
@@ -943,6 +964,7 @@ impl AppState {
             signer_pubkey: Arc::new(Mutex::new(None)),
             signer_applies_here: Arc::new(Mutex::new(None)),
             signer_offer: Arc::new(Mutex::new(None)),
+            stats_share: Arc::new(Mutex::new(None)),
             fork: Arc::new(Mutex::new(None)),
             tip_median_time: Arc::new(Mutex::new(None)),
             engine_warnings: Arc::new(Mutex::new(Vec::new())),

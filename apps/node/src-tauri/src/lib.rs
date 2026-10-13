@@ -63,6 +63,7 @@ pub fn run() {
             commands::set_attestation_serve,
             commands::set_signer,
             commands::set_signer_publish,
+            commands::set_stats_share,
             commands::set_node_nickname,
             commands::set_service_report,
             commands::mark_welcome_shown,

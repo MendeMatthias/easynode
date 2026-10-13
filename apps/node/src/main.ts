@@ -161,6 +161,10 @@ interface NodeStatusInfo {
    *  what came of the last attempt this run (null until one has been made). */
   signer_publish_enabled: boolean;
   signer_offer: { delivered: boolean; at: string; detail: string } | null;
+  /** Be counted in the network stats, and what came of the last check-in it
+   *  sent this run (null until one went out). */
+  stats_share_enabled: boolean;
+  stats_share: { delivered: boolean; at: string; detail: string } | null;
   /** What we are really providing: `state` is serving_history |
    *  degraded_to_live_window | not_serving | unknown. */
   archive_service: { state: string; blocks_behind?: number } | null;
@@ -876,7 +880,49 @@ function reflectSignerRow(status: NodeStatusInfo): void {
     line.hidden = true;
   }
   line.classList.toggle("needs-attention", !!offer && !offer.delivered);
+
+  reflectStatsShareRow(status);
 }
+
+/** Settings: be counted in the network stats. Shown on every node: unlike the
+ *  key offer above, it needs nothing this machine might lack. */
+function reflectStatsShareRow(status: NodeStatusInfo): void {
+  const toggle = $<HTMLInputElement>("stats-share-toggle");
+  if (document.activeElement !== toggle) toggle.checked = status.stats_share_enabled;
+  const line = $("stats-share-status");
+  const last = status.stats_share;
+  if (status.stats_share_enabled && last) {
+    const when = new Date(last.at);
+    const stamp = Number.isNaN(when.getTime()) ? "" : ` (${hhmm(when)})`;
+    line.textContent = `${last.detail}${stamp}`;
+    line.hidden = false;
+  } else if (status.stats_share_enabled) {
+    line.textContent = "Your node's numbers go out with the next check-in, within fifteen minutes.";
+    line.hidden = false;
+  } else {
+    line.hidden = true;
+  }
+  line.classList.toggle("needs-attention", !!last && !last.delivered);
+}
+
+$<HTMLInputElement>("stats-share-toggle").addEventListener("change", async (e) => {
+  const box = e.target as HTMLInputElement;
+  const on = box.checked;
+  const result = $("stats-share-result");
+  box.disabled = true;
+  try {
+    const msg = await invoke<string>("set_stats_share", { on });
+    result.classList.remove("is-error");
+    result.textContent = msg;
+  } catch (err) {
+    box.checked = !on;
+    result.classList.add("is-error");
+    result.textContent = String(err);
+  }
+  result.hidden = false;
+  box.disabled = false;
+  void tick();
+});
 
 $<HTMLInputElement>("signer-publish-toggle").addEventListener("change", async (e) => {
   const box = e.target as HTMLInputElement;

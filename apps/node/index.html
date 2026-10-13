@@ -584,6 +584,19 @@
           </div>
           <p class="setting-result" id="signer-publish-result" hidden></p>
 
+          <div class="setting-row" id="stats-share-row">
+            <div class="setting-text">
+              <span class="setting-name">Count my node in the network's totals</span>
+              <span class="setting-desc" id="stats-share-desc">Sends your node's numbers to easybtx.com every fifteen minutes, so what it uploads to other nodes counts toward how much the easyNode network serves, published on easybtx.com. Sent: a random id made on this machine, the app and engine versions, how long it has run, its block height, how many nodes it is connected to and how much it has uploaded. Not sent: no wallet, no address, no key. A node that signs and offers its key already sends these numbers with it</span>
+              <span class="setting-desc" id="stats-share-status" hidden></span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="stats-share-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <p class="setting-result" id="stats-share-result" hidden></p>
+
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Help wallets check the chain</span>
