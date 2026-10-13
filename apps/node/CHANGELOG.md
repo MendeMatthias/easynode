@@ -8,16 +8,26 @@ root).
 
 ## [Unreleased]
 
-**A node whose graphics card check fails mid-run restarts itself.** On 11
-October at 19:48 UTC the node engine on this project's RTX 3060 signer took
-its graphics card out of block checking and tested it again about every
-hour, and the card failed each time, for 13 hours. The node stopped at block
-245,498 and signed nothing, and every node that follows signatures stopped
-with it. Now,
-when the engine says it cannot check blocks for 15 minutes in a run where it
-had been checking them, easyNode restarts the node, which runs the card check
-again. At most once every 3 hours, and never for a card that did not pass at
-startup.
+**A node that loses its graphics card mid-run gets it back by itself.** On
+11 October at 19:49 UTC Windows Update installed a graphics driver under the
+running node on this project's RTX 3060 signer. The node engine took the card
+out of block checking and tested it again about every hour, and the card
+failed each time, for 13 hours. The node stopped at block 245,498 and signed
+nothing, and every node that follows signatures stopped with it. Now, when
+the engine says it cannot check blocks for 15 minutes in a run where it had
+been checking them, easyNode acts, at most once every 3 hours and never for a
+card that did not pass at startup:
+
+- Inside WSL on Windows it stops the node cleanly and restarts WSL, then
+  starts again by itself. A driver installed on purpose on 13 October showed
+  that restarting only the node does not bring the card back there, and that
+  restarting WSL does, in seconds. Restarting WSL stops every Linux program on
+  that PC, so Settings has a switch for it, shown only inside WSL and on by
+  default.
+- On Linux and macOS it restarts the node, which runs the card check again.
+- When the check still fails, the message now says what clears it: restart
+  the computer. It used to say "restarting easyNode", which does not help
+  after a driver update.
 
 ## [0.7.12] - 2026-10-12
 

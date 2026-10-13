@@ -58,6 +58,7 @@ pub fn run() {
             tools::tools_fast_forward_run,
             tools::tools_fast_forward_status,
             commands::set_keep_awake,
+            commands::set_gpu_recovery_restarts_wsl,
             commands::set_node_profile,
             commands::set_follow_signatures,
             commands::set_attestation_serve,

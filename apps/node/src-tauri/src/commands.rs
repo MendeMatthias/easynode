@@ -2768,6 +2768,9 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     // startup qualification in a new process; on the 3060 the
                     // engine's in-process re-tests failed for 13 hours
                     // (btx_core::engine_warnings::restart_for_lost_verifier).
+                    // Inside WSL the restart is of WSL itself, since an engine
+                    // restart does not bring the card back there
+                    // (btx_core::engine_warnings::lost_verifier_remedy).
                     let first = *run_first_blocks.get_or_insert(chain.blocks);
                     verifier_lost_since = if cannot_verify_now {
                         Some(verifier_lost_since.unwrap_or_else(std::time::Instant::now))
@@ -2789,10 +2792,22 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         let mins = verifier_lost_since
                             .map(|t| t.elapsed().as_secs() / 60)
                             .unwrap_or(0);
+                        let remedy = btx_core::engine_warnings::lost_verifier_remedy(
+                            btx_core::wsl::this_host_runs_in_wsl(),
+                            NodeAppSettings::load(&node_datadir()).gpu_recovery_restarts_wsl,
+                        );
+                        let what = match remedy {
+                            btx_core::engine_warnings::LostVerifierRemedy::RestartWsl => {
+                                "stopping the node and restarting WSL, which is what brings the \
+                                 graphics card back after a driver update"
+                            }
+                            btx_core::engine_warnings::LostVerifierRemedy::RestartEngine => {
+                                "restarting the node so the engine checks the graphics card again"
+                            }
+                        };
                         let msg = format!(
                             "the block verifier has been unavailable for {mins} min in a run that \
-                             had been checking blocks (stopped at {}); restarting the node so the \
-                             engine checks the graphics card again",
+                             had been checking blocks (stopped at {}); {what}",
                             chain.blocks
                         );
                         eprintln!("[node-app] {msg}");
@@ -2804,6 +2819,38 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                                 || state.quitting.load(Ordering::SeqCst)
                             {
                                 return; // stopped or quitting meanwhile: leave it
+                            }
+                            if remedy == btx_core::engine_warnings::LostVerifierRemedy::RestartWsl {
+                                // Stop cleanly first: `wsl --shutdown` would
+                                // otherwise kill btxd mid-flush.
+                                stop_node_inner(&state).await;
+                                set_phase(&restart_app, &state, NodePhase::Stopped).await;
+                                match launch_wsl_restart() {
+                                    Ok(()) => {
+                                        let note = "WSL restarts in a few seconds; easyNode \
+                                                    starts again by itself about a minute later";
+                                        eprintln!("[node-app] {note}");
+                                        setup_log(&node_datadir(), note);
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        let note = format!(
+                                            "could not restart WSL ({e}); restarting the node \
+                                             instead"
+                                        );
+                                        eprintln!("[node-app] {note}");
+                                        setup_log(&node_datadir(), &note);
+                                        if let Err(e) =
+                                            start_node_projected(&restart_app, &state).await
+                                        {
+                                            eprintln!(
+                                                "[node-app] the restart for a lost block \
+                                                 verifier failed: {e}"
+                                            );
+                                        }
+                                        return;
+                                    }
+                                }
                             }
                             if let Err(e) = restart_node_projected(&restart_app, &state).await {
                                 eprintln!(
@@ -4270,6 +4317,12 @@ pub struct NodeStatusInfo {
     /// shown, defaulted ON, and prevented nothing — and toggling it off and
     /// back on, the obvious recovery, also did nothing and still returned Ok.
     pub keep_awake_supported: bool,
+    /// Whether this app runs inside WSL2, where the GPU recovery switch
+    /// applies (`btx_core::wsl::this_host_runs_in_wsl`). Settings shows the
+    /// switch only here.
+    pub in_wsl: bool,
+    /// The GPU recovery switch: restart WSL when the block verifier is lost.
+    pub gpu_recovery_restarts_wsl: bool,
     /// What this platform calls the place a closed window keeps running: the
     /// "menu bar" on macOS, the "system tray" everywhere else.
     ///
@@ -4973,6 +5026,8 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         welcome_shown: settings.welcome_shown,
         keep_awake: settings.keep_awake,
         keep_awake_supported: btx_core::power::sleep_assertion_supported(),
+        in_wsl: btx_core::wsl::this_host_runs_in_wsl(),
+        gpu_recovery_restarts_wsl: settings.gpu_recovery_restarts_wsl,
         tray_term: if cfg!(target_os = "macos") {
             "menu bar".to_string()
         } else {
@@ -5307,6 +5362,92 @@ pub async fn restart_node_projected(
     stop_node_inner(state).await;
     set_phase(app, state, NodePhase::Stopped).await;
     start_node_projected(app, state).await
+}
+
+/// Restart WSL from inside it, to get the GPU block verifier back after a
+/// driver update on the Windows host (`btx_core::wsl`). Call with the node
+/// already stopped: this returns once the Windows side has the job, and WSL,
+/// this app with it, goes down a few seconds later.
+///
+/// Two PowerShell processes, so the one doing the work is not a child of WSL
+/// interop: the outer one, started from here, only starts the inner one
+/// detached and exits. Both scripts travel as `-EncodedCommand`, so nothing
+/// in them is re-quoted on the way.
+fn launch_wsl_restart() -> Result<(), String> {
+    let user = std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .ok_or("USER is not set")?;
+    let relaunch = std::env::var("APPIMAGE")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .map(|p| p.display().to_string())
+        })
+        .ok_or("cannot tell which program to start again")?;
+    let distro = std::env::var("WSL_DISTRO_NAME")
+        .ok()
+        .filter(|d| !d.is_empty());
+    let script = btx_core::wsl::restart_wsl_script(distro.as_deref(), &user, &relaunch)
+        .ok_or("the distro, user or program path needs quoting; not restarting WSL")?;
+    let outer = format!(
+        "Start-Process -WindowStyle Hidden -FilePath powershell.exe -ArgumentList \
+         '-NoProfile','-NonInteractive','-WindowStyle','Hidden','-EncodedCommand','{}'",
+        encode_powershell(&script)
+    );
+    let encoded = encode_powershell(&outer);
+    let args = [
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-EncodedCommand",
+        encoded.as_str(),
+    ];
+    let run = |program: &str, before: &[&str]| {
+        std::process::Command::new(program)
+            .args(before)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+    };
+    let status = match run(btx_core::wsl::POWERSHELL_FROM_WSL, &[]) {
+        // ENOEXEC: the WSLInterop handler is gone, which is what another
+        // distro's systemd-binfmt does to the whole VM at its boot (the 3060,
+        // 2026-10-13 20:14 UTC). Its interpreter still runs a Windows program.
+        Err(e) if e.raw_os_error() == Some(ENOEXEC) => {
+            eprintln!(
+                "[node-app] Windows programs are not recognised here ({e}); starting \
+                 PowerShell through {} instead",
+                btx_core::wsl::INTEROP_INTERPRETER
+            );
+            run(
+                btx_core::wsl::INTEROP_INTERPRETER,
+                &[btx_core::wsl::POWERSHELL_FROM_WSL],
+            )
+        }
+        other => other,
+    }
+    .map_err(|e| format!("cannot start Windows PowerShell through WSL interop: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Windows PowerShell exited with {status}"))
+    }
+}
+
+/// `execve` refused the binary format (Linux errno 8).
+const ENOEXEC: i32 = 8;
+
+/// PowerShell's `-EncodedCommand`: base64 of the script in UTF-16LE.
+fn encode_powershell(script: &str) -> String {
+    use base64::Engine;
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// End a header bootstrap: stop the node, clear the marker, start it again the
@@ -7857,6 +7998,12 @@ pub async fn set_snapshot_serve(state: State<'_, AppState>, on: bool) -> Result<
 }
 
 #[tauri::command]
+pub async fn set_gpu_recovery_restarts_wsl(on: bool) -> Result<(), String> {
+    NodeAppSettings::update(&node_datadir(), |s| s.gpu_recovery_restarts_wsl = on);
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn set_keep_awake(state: State<'_, AppState>, on: bool) -> Result<(), String> {
     let datadir = node_datadir();
     NodeAppSettings::update(&datadir, |s| s.keep_awake = on);
@@ -8095,10 +8242,23 @@ pub async fn node_footprint(state: State<'_, AppState>) -> Result<NodeFootprint,
 #[cfg(test)]
 mod tests {
     use super::{
-        after_failed_engine_upgrade, attached_node_is_ours_to_stop, ends_header_bootstrap,
-        header_bootstrap_end_message, pre_launch_plan, refused_record, snapshot_spec,
-        witness_started_message, AttachedTo, PreLaunchPlan, NODE_RELEASE_COMMIT, NODE_RELEASE_TAG,
+        after_failed_engine_upgrade, attached_node_is_ours_to_stop, encode_powershell,
+        ends_header_bootstrap, header_bootstrap_end_message, pre_launch_plan, refused_record,
+        snapshot_spec, witness_started_message, AttachedTo, PreLaunchPlan, NODE_RELEASE_COMMIT,
+        NODE_RELEASE_TAG,
     };
+
+    /// `-EncodedCommand` is base64 of UTF-16LE. `Write-Output ok` encodes to
+    /// this in PowerShell itself:
+    /// `[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('Write-Output ok'))`.
+    #[test]
+    fn powershell_scripts_are_encoded_as_utf16le_base64() {
+        assert_eq!(encode_powershell("a"), "YQA=");
+        assert_eq!(
+            encode_powershell("Write-Output ok"),
+            "VwByAGkAdABlAC0ATwB1AHQAcAB1AHQAIABvAGsA"
+        );
+    }
 
     /// To the plugin a refused update IS no update, so the webview reports
     /// "no-update". The record must say what happened instead.
