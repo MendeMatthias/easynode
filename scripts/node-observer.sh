@@ -53,6 +53,26 @@
 #      scripts/observer-ok.sh reads the state column, and the release scripts
 #      refuse to run on anything but a fresh `ok`.
 #
+#   5. A LOST BLOCK VERIFIER (since 2026-10-13). The state says
+#      `verifier_lost` while the engine's own warning says "strict-device
+#      validation is unavailable", the text crates/btx-core/src/
+#      engine_warnings.rs maps to CannotVerifyBlocks. On 2026-10-11 the 3060
+#      signer lost its GPU verifier to a live driver install and this script
+#      wrote `ok` for 13 hours (docs/incident-2026-10-11-3060-verifier-
+#      quarantine.md).
+#
+#   6. A FROZEN TIP (since 2026-10-13). The state says `stale_tip` when blocks
+#      have not moved for BTX_STALE_ROWS samples (15, thirty minutes) AND the
+#      tip block is older than BTX_STALE_AGE seconds (1800). Rules 3 and 4
+#      both need headers ahead of blocks, and on a signer they never are:
+#      since block 244,000 a header counts only once checked or signed by a
+#      pinned key, so a frozen signer reads `behind 0`. A node catching up is
+#      never called stale, because its blocks keep moving.
+#
+#      Neither recovers anything. The fix for 5 depends on where the node runs
+#      (an engine restart does not bring the card back inside WSL; a WSL
+#      restart does, measured 2026-10-13), and that is the app's call.
+#
 # ⚠ IT NEVER KILLS A LIVE btxd. Every recovery path above is gated on the node
 # being absent or provably stuck; none of them stops a node that is working.
 #
@@ -70,6 +90,8 @@
 #   BTX_FORK_LEAD    blocks a headers-only branch must lead ours by (default 6)
 #   BTX_FORK_BEHIND  headers-minus-blocks that starts the clock (default 20)
 #   BTX_FORK_ROWS    consecutive samples over it that mean FORK (default 5)
+#   BTX_STALE_ROWS   samples without a new block that can mean stale_tip (15)
+#   BTX_STALE_AGE    seconds the tip block must also be older than (1800)
 set -uo pipefail
 
 CLI="${BTX_CLI:-$HOME/.local/btx/v0.34.5/linux-x86_64/bin/btx-cli}"
@@ -84,6 +106,8 @@ START_CMD="${BTX_START_CMD:-}"
 FORK_LEAD="${BTX_FORK_LEAD:-6}"
 FORK_BEHIND="${BTX_FORK_BEHIND:-20}"
 FORK_ROWS="${BTX_FORK_ROWS:-5}"
+STALE_ROWS="${BTX_STALE_ROWS:-15}"
+STALE_AGE="${BTX_STALE_AGE:-1800}"
 
 TSV="${BTX_OBSERVER_TSV:-$HOME/node-observer.tsv}"
 LOG="${BTX_OBSERVER_LOG:-$HOME/node-observer.log}"
@@ -181,6 +205,30 @@ fork_condition_holds() {
   return 0
 }
 
+# Does the engine say it cannot verify blocks? $1 is the text of the
+# `warnings` field (a string on older engines, a JSON array since 0.34.x).
+# Exactly the phrase crates/btx-core/src/engine_warnings.rs matches for
+# CannotVerifyBlocks; the "Active chain tip is stale" warning a node shows
+# while catching up must NOT match. Exit 0 = the verifier is lost.
+cannot_verify_in() {
+  case "${1:-}" in
+    *"strict-device validation is unavailable"*) return 0 ;;
+  esac
+  return 1
+}
+
+# Is the tip frozen? Pure, like fork_condition_holds.
+#   $1 frozen_rows  consecutive samples with the same block count
+#   $2 tip_age      seconds since the tip block's timestamp ("" = unknown)
+# Exit 0 = stale_tip. Both must hold: no new block for STALE_ROWS samples, and
+# a tip older than STALE_AGE, so a slow block or a just-restarted node is not
+# called stale. An unknown age never alarms.
+stale_tip_holds() {
+  rows="${1:-0}"; age="${2:-}"
+  [ -n "$age" ] || return 1
+  [ "$rows" -ge "$STALE_ROWS" ] && [ "$age" -gt "$STALE_AGE" ]
+}
+
 # Is btxd in the process table?
 #
 # `pgrep -x btxd` alone is not the question. Since upstream 0.34.1 the released
@@ -249,11 +297,36 @@ if [ "${1:-}" = "--self-test" ]; then
   expect calm "over the gap but only 4 samples"    0 4 4860 4860
   # No window recorded: fall back to the sample count alone.
   expect fork "rows met with no window recorded"   0 9 100 ""
+
+  # LOST VERIFIER. The warning the 3060 published from 19:49 UTC on 2026-10-11
+  # to the reboot, and again on 2026-10-13 after a live driver install.
+  lost_text='["CRITICAL: MatMul RC strict-device validation is unavailable. The next MatMul RC block at or after activation height 185000 cannot be independently verified by this node; MatMul consensus-validator and attestation-archive services are withheld. provider=cuda_rc_exact_fused_extract reason=strict_device_provider_quarantined"]'
+  # The warning the same node shows while merely catching up (2026-10-12).
+  catchup_text='["Active chain tip is stale: this node has validated headers far ahead of connected blocks, or a heavier competing header chain it has not connected. Do not credit deposits from getblockcount or gettransaction confirmations until is_stale is false."]'
+  cannot_verify_in "$lost_text"    || { echo "self-test: the 10-11 warning should mean verifier_lost"; fails=1; }
+  cannot_verify_in "$catchup_text" && { echo "self-test: the catch-up warning must not mean verifier_lost"; fails=1; }
+  cannot_verify_in "[]"            && { echo "self-test: no warnings must not mean verifier_lost"; fails=1; }
+
+  # FROZEN TIP. The 3060 at 245,498 on 10-11: no new block for hours, tip block
+  # hours old, behind 0 because a signer's headers never run ahead.
+  stale() {  # <want: stale|calm> <label> <frozen_rows> <tip_age>
+    want="$1"; label="$2"; shift 2
+    if stale_tip_holds "$@"; then got=stale; else got=calm; fi
+    if [ "$got" != "$want" ]; then echo "self-test: $label should be $want, got $got"; fails=1; fi
+  }
+  stale stale "the 10-11 freeze, 13 h"               390 46800
+  stale stale "30 min frozen, tip 31 min old"        15 1860
+  stale calm  "14 samples frozen"                    14 46800
+  stale calm  "frozen rows but a fresh tip"          15 600
+  # A node catching up after a restart: tip hours old, blocks moving.
+  stale calm  "catching up, tip 2 h old"             0 7200
+  stale calm  "age unknown"                          99 ""
   if [ "$fails" -eq 0 ]; then echo "self-test: every case behaved"; exit 0; fi
   exit 1
 fi
 
 last_blocks=""; stuck=0; behind_rows=0; fork_said=0; behind_at_start=""
+frozen=0; alarm_said=0; alarm_state=""
 while true; do
   now="$(date -u +%FT%TZ)"; state=ok
 
@@ -319,6 +392,18 @@ while true; do
   att="$("$CLI" "${A[@]}" getmatmultrustedstatus 2>/dev/null | json_int stored_attestations)"
 
   if [ "$blocks" = "$last_blocks" ]; then stuck=$((stuck+1)); else stuck=0; fi
+  # Its own count: the stall rule below resets `stuck` after it acts.
+  if [ "$blocks" = "$last_blocks" ]; then frozen=$((frozen+1)); else frozen=0; fi
+  tip_time="$(printf '%s' "$ci" | json_int time)"
+  tip_age=""
+  case "$tip_time" in ''|*[!0-9]*) ;; *) tip_age=$(( $(date +%s) - tip_time )) ;; esac
+  warnings_text="$(printf '%s' "$ci" | python3 -c '
+import sys, json
+try:
+    print(json.dumps(json.load(sys.stdin).get("warnings", "")))
+except Exception:
+    print("")
+' 2>/dev/null)"
   # The headers-ahead window, with the SAME closing test crates/btx-core/src/
   # fork.rs applies in `headers_ahead`: remember how far behind we were when
   # the window opened, so a gap that is shrinking never alarms.
@@ -357,6 +442,31 @@ while true; do
     fi
     stuck=0
   fi
+
+  # ── LOST VERIFIER, FROZEN TIP (rules 5 and 6) ──────────────────────────────
+  # Override ok and the stall states; FORK below still overrides both. Said on
+  # stderr when it starts and every 15 samples while it holds, like FORK.
+  alarm=""
+  if cannot_verify_in "$warnings_text"; then
+    alarm=verifier_lost
+    msg="VERIFIER LOST at blocks $blocks: the engine says strict-device validation is unavailable; this node checks and signs nothing until its GPU verifier is back"
+  elif stale_tip_holds "$frozen" "$tip_age"; then
+    alarm=stale_tip
+    msg="STALE TIP at blocks $blocks: no new block for $frozen sample(s), tip block ${tip_age}s old, behind $behind"
+  fi
+  if [ -n "$alarm" ]; then
+    state="$alarm"
+    if [ "$alarm" != "$alarm_state" ] || [ $((alarm_said % 15)) -eq 0 ]; then
+      say "$msg"
+      printf 'node-observer: %s\n' "$msg" >&2
+    fi
+    [ "$alarm" != "$alarm_state" ] && alarm_said=0
+    alarm_said=$((alarm_said+1))
+  else
+    [ -n "$alarm_state" ] && say "$alarm_state cleared at blocks $blocks"
+    alarm_said=0
+  fi
+  alarm_state="$alarm"
 
   # ── FORK (easynode#37) ─────────────────────────────────────────────────────
   # Overrides ok and the stall states: a stall on a fork is a fork first. Said
