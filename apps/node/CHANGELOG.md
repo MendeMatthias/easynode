@@ -6,7 +6,7 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
-## [Unreleased]
+## [0.7.13] - 2026-10-14
 
 **A node that loses its graphics card mid-run gets it back by itself.** On
 11 October at 19:49 UTC Windows Update installed a graphics driver under the
