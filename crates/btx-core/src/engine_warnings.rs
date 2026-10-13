@@ -491,8 +491,12 @@ pub const VERIFIER_RESTART_MIN_GAP: std::time::Duration = std::time::Duration::f
 /// installed NVIDIA driver 32.0.16.1088 at 19:49 to 19:50 UTC, live, under
 /// the running engine. The engine's warning says to restart with a provider that
 /// passes self-qualification; a restart is a new process and a new device
-/// context, which in-process re-tests are not. Whether that brings such a
-/// card back was not yet measured when this was written.
+/// context, which in-process re-tests are not. Measured on the 3060 on
+/// 2026-10-13 with a deliberate driver install: on a node inside WSL2 it
+/// does NOT bring the card back. The restarted engine failed startup
+/// qualification ("CUDA driver version is insufficient"), and only a WSL
+/// restart did (docs/incident-2026-10-11-3060-verifier-quarantine.md). Do
+/// not release this rule as the remedy before that is handled.
 ///
 /// Only for a run whose verifier worked (`verified_this_run`: the node
 /// connected blocks in this run): a card refused at startup is the
