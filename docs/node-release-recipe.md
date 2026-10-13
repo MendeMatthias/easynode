@@ -68,10 +68,18 @@ It does NOT yield a quiet "no update available". In tauri-plugin-updater 2.10.1
 missing from a higher-versioned feed gets `Err(TargetsNotFound)`. What makes it
 harmless is `main.ts` `updateCheck`: it only surfaces an error when the check was
 MANUAL, so the automatic 6-hourly check swallows it and the client stays put,
-downloading nothing. The visible cost is the **Check now** button, which reports
-"Couldn't check right now — are you online?" to anyone on an omitted platform.
-Expect a little support noise from whichever platform you leave out, and do not
-mistake that report for a broken feed.
+downloading nothing. The visible cost is the **Check now** button. Before 0.6.20
+it reported "Couldn't check right now — are you online?" to anyone on an
+omitted platform; since 0.6.20 (easynode #66, `f2530af`) it says the current
+release has no build for this platform and where the downloads are.
+
+**An omitted platform's OLDER copies get nothing either.** The feed names one
+version, so while a release skips a platform, a copy on that platform older
+than its last build is offered no update at all, not that last build. 0.7.13
+skipped the Mac: every Mac below 0.7.12 was offered nothing, including any
+below 0.7.8 still on the 0.34.12 engine the site warns about (release audit,
+2026-10-14). Say so on the site and in the release notes, and make the
+skipped platform's build soon.
 
 So a single-platform release still ships a feed carrying only that platform's
 key, and the others stay on their last real build.

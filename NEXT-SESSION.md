@@ -1,11 +1,42 @@
 # Next easyNode session: the handover
 
-State on 2026-10-12, after 0.7.12. Verified against the released bytes, not
+State on 2026-10-14, after 0.7.13. Verified against the released bytes, not
 just the local build, except where it says otherwise.
 
 ---
 
-## Where things stand
+## Where things stand (2026-10-14)
+
+**Published: easyNode 0.7.13 for Linux and Windows** (`node-v0.7.13`, seven
+assets re-downloaded identical, every updater signature verified against the
+released bytes, Latest still v0.30.0, release notes say the Mac stays on
+0.7.12; site PR EasyBTX #585 merged as `d8f08bec` and deployed, the live feed
+reads 0.7.13 with `linux-x86_64` and `windows-x86_64` only). Built by CI from
+`3abafff`, whose tree is identical to main's `26eb878` (#206). Engine
+unchanged: BTX v0.34.15. The 3060 updated itself to it through the website at
+22:02 UTC on 10-13 (AppImage `12eff640…`), btxd running throughout.
+
+What it carries (easynode #199, #205, #206): a node that loses its GPU block
+verifier mid-run gets it back by itself. Inside WSL it restarts WSL (an
+engine restart does not help there, measured with a deliberate NVIDIA install
+on 10-13); elsewhere it restarts the engine. The cause of the 10-11 freeze was
+Windows Update installing a driver under the running engine
+(`docs/incident-2026-10-11-3060-verifier-quarantine.md`).
+
+**On main, unreleased: the audit fixes** (the PR after #206). Two read-only
+audits of #204 to #206 found a WSL restart that ignored a node owned by
+another app, a 3-hour gap lost across the restart it causes (a possible
+restart every ~20 min), no safety net when Windows failed to restart WSL, the
+observer's lost exec bit, and wording. All fixed; ship them as 0.7.14.
+
+**The 3060's own setup changed** (not in the repo): a boot task starts WSL
+with nobody logged in; `.wslconfig` has `instanceIdleTimeout=-1`; zbtx3's key
+`02c9cfb7` is pinned in `btx_rw.conf`; the observer runs #204 from this clone.
+The AInode project's WSL distros run in the same VM, and `AInode-build` boots
+`systemd-binfmt`, which wipes the WSLInterop handler for every distro: the
+recovery's `/init` fallback exists for that.
+
+## Before that: 0.7.12 (2026-10-12)
 
 **Published: easyNode 0.7.12 on Mac, Linux and Windows** (`node-v0.7.12`,
 ten assets re-downloaded identical, every updater signature verified
@@ -96,6 +127,13 @@ To look at any screen without a node: `npm --prefix apps/node run
 preview:states`, then `http://localhost:1440/preview/index.html`.
 
 ## Open work, in priority order
+
+00. **Build the Mac 0.7.13 (on the Mac).** The feed names 0.7.13 with no Mac
+    key, so every Mac below 0.7.12 is offered nothing until then, including
+    any below 0.7.8 still on the 0.34.12 engine. Then publish a feed with all
+    three platforms and move the site's Mac pins.
+01. **Release 0.7.14** with the audit fixes, on all three platforms if the Mac
+    is ready by then.
 
 0. **Upstream btxchain/btx#225 would end co-signing as the confirmer does
    it.** Open, not merged, "a later 0.34.16 can carry it" (its author,
