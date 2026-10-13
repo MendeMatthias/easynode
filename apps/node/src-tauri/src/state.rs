@@ -116,6 +116,14 @@ pub struct NodeAppSettings {
     /// visible toggle in Settings for laptop users who prefer sleep.
     #[serde(default = "default_true")]
     pub keep_awake: bool,
+    /// Inside WSL2 only: when the GPU block verifier is lost mid-run (a
+    /// graphics driver update on the Windows host), restart WSL to get it
+    /// back, since an engine restart does not (measured on the 3060,
+    /// 2026-10-13; `btx_core::engine_warnings::lost_verifier_remedy`). ON by
+    /// default by the owner's rule that the node heals itself. Switchable,
+    /// because restarting WSL stops every Linux program on that PC.
+    #[serde(default = "default_true")]
+    pub gpu_recovery_restarts_wsl: bool,
     /// Explorer mode: the node maintains a full transaction index
     /// (`txindex=1`) so historical txid lookups answer locally.
     ///
@@ -347,6 +355,7 @@ impl Default for NodeAppSettings {
             first_load_pending: false,
             btx_release_tag: None,
             keep_awake: true,
+            gpu_recovery_restarts_wsl: true,
             // On, by the owner's rule of 2026-10-12: every feature is on,
             // and one a machine cannot run simply does not run there.
             txindex_enabled: true,
@@ -974,6 +983,10 @@ mod tests {
     fn settings_default_keeps_awake_and_needs_setup() {
         let s = NodeAppSettings::default();
         assert!(s.keep_awake, "keep-awake defaults ON (the app's purpose)");
+        assert!(
+            s.gpu_recovery_restarts_wsl,
+            "GPU recovery by WSL restart defaults ON (the owner's self-healing rule)"
+        );
         assert!(!s.setup_complete);
         assert!(!s.snapshot_loaded);
         assert!(s.btx_release_tag.is_none());
@@ -1322,6 +1335,11 @@ mod tests {
         let legacy = NodeAppSettings::load(dir.path());
         assert!(legacy.setup_complete);
         assert!(legacy.keep_awake, "missing keep_awake defaults true");
+        // An install from before the switch existed gets the self-healing.
+        assert!(
+            legacy.gpu_recovery_restarts_wsl,
+            "missing gpu_recovery_restarts_wsl defaults true"
+        );
         // Corrupt file → defaults, never a panic.
         std::fs::write(dir.path().join(SETTINGS_FILE_NAME), b"not-json").unwrap();
         assert_eq!(

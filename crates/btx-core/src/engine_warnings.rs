@@ -146,9 +146,10 @@ impl EngineWarning {
                 let mut m = String::from(
                     "This machine's graphics chip did not pass the node engine's own check, so \
                      your node cannot check the new proof of work and has stopped following new \
-                     blocks. Everything already downloaded is safe. Restarting easyNode runs the \
-                     check again; when the check had passed earlier in this run, easyNode \
-                     restarts the node by itself after 15 minutes.",
+                     blocks. Everything already downloaded is safe. This usually follows a \
+                     graphics driver update, and restarting the computer clears it. When the \
+                     check had passed earlier in this run, easyNode tries by itself after 15 \
+                     minutes: it restarts the node, or restarts WSL when it runs inside WSL.",
                 );
                 if let Some(r) = reason {
                     m.push_str(&format!(" The engine's reason: {}.", r.replace('_', " ")));
@@ -495,8 +496,9 @@ pub const VERIFIER_RESTART_MIN_GAP: std::time::Duration = std::time::Duration::f
 /// 2026-10-13 with a deliberate driver install: on a node inside WSL2 it
 /// does NOT bring the card back. The restarted engine failed startup
 /// qualification ("CUDA driver version is insufficient"), and only a WSL
-/// restart did (docs/incident-2026-10-11-3060-verifier-quarantine.md). Do
-/// not release this rule as the remedy before that is handled.
+/// restart did (docs/incident-2026-10-11-3060-verifier-quarantine.md). So
+/// what the app does when this says yes depends on where it runs:
+/// [`lost_verifier_remedy`].
 ///
 /// Only for a run whose verifier worked (`verified_this_run`: the node
 /// connected blocks in this run): a card refused at startup is the
@@ -516,8 +518,60 @@ pub fn restart_for_lost_verifier(
         && since_last_restart.is_none_or(|d| d >= VERIFIER_RESTART_MIN_GAP)
 }
 
+/// What the app does once [`restart_for_lost_verifier`] says yes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LostVerifierRemedy {
+    /// Restart the engine: a new process re-runs the startup qualification.
+    RestartEngine,
+    /// Stop the engine, then restart WSL from the Windows side and bring
+    /// easyNode back ([`crate::wsl::restart_wsl_script`]).
+    RestartWsl,
+}
+
+/// Which remedy fits this machine.
+///
+/// - Inside WSL2: restart WSL. Measured on the 3060 on 2026-10-13: after a
+///   live driver install an engine restart failed startup qualification, and
+///   a WSL restart brought the card back in seconds. `wsl_restart_allowed` is
+///   the person's switch (on by default); restarting WSL stops every Linux
+///   program on that PC, so it must stay switchable. With it off the engine
+///   is restarted, which costs a minute and does no harm.
+/// - Native Linux and macOS: restart the engine. Whether that is enough
+///   after a driver update there is not measured. When it is not, the
+///   startup qualification fails, no further restart follows, and the
+///   message tells the person to restart the computer.
+/// - Windows natively: never reached. The Windows engine has no GPU
+///   verifier (`backend::BUNDLED_ENGINE_HAS_CUDA`).
+pub fn lost_verifier_remedy(in_wsl: bool, wsl_restart_allowed: bool) -> LostVerifierRemedy {
+    if in_wsl && wsl_restart_allowed {
+        LostVerifierRemedy::RestartWsl
+    } else {
+        LostVerifierRemedy::RestartEngine
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn inside_wsl_the_remedy_is_a_wsl_restart_unless_switched_off() {
+        assert_eq!(
+            lost_verifier_remedy(true, true),
+            LostVerifierRemedy::RestartWsl
+        );
+        assert_eq!(
+            lost_verifier_remedy(true, false),
+            LostVerifierRemedy::RestartEngine
+        );
+        assert_eq!(
+            lost_verifier_remedy(false, true),
+            LostVerifierRemedy::RestartEngine
+        );
+        assert_eq!(
+            lost_verifier_remedy(false, false),
+            LostVerifierRemedy::RestartEngine
+        );
+    }
 
     // The 3060, 2026-10-11 19:49 UTC: Windows Update installed an NVIDIA
     // driver under the running engine, which lost its GPU verifier mid-run
@@ -643,11 +697,12 @@ mod tests {
         );
         let m = classify(RC_UNVERIFIABLE).unwrap().message();
         assert!(m.contains("strict device not ready"), "{m}");
-        assert!(m.contains("Restarting easyNode"), "{m}");
-        assert!(
-            m.contains("restarts the node by itself after 15 minutes"),
-            "{m}"
-        );
+        // A driver update is the measured cause (10-11, 10-13), and an easyNode
+        // restart alone does not clear it inside WSL: the advice is the computer.
+        assert!(m.contains("restarting the computer clears it"), "{m}");
+        assert!(!m.contains("Restarting easyNode"), "{m}");
+        assert!(m.contains("after 15 minutes"), "{m}");
+        assert!(m.contains("restarts WSL when it runs inside WSL"), "{m}");
     }
 
     /// The reason the engine re-publishes every half hour while a chip stays

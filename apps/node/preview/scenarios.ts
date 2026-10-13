@@ -45,6 +45,8 @@ const base: Json = {
   welcome_shown: true,
   keep_awake: true,
   keep_awake_supported: true,
+  in_wsl: false,
+  gpu_recovery_restarts_wsl: true,
   tray_term: "menu bar",
   txindex_enabled: true,
   explorer_available: true,

@@ -136,11 +136,14 @@ has to survive a driver swap, a restart or a power cut on its own.
 - easynode #199 (merged 10-12, not released): when the engine reports it
   cannot verify blocks for 15 minutes in a run that had been verifying,
   easyNode restarts the engine itself, at most once every 3 hours
-  (`btx_core::engine_warnings::restart_for_lost_verifier`). Not to be
-  released as it is: on WSL an engine restart does not bring the card back
-  (above). Rework first: restart WSL where the node runs inside it, and
-  otherwise tell the person to restart the PC. Whether an engine restart
-  is enough on a native Windows or Linux install is not measured.
+  (`btx_core::engine_warnings::restart_for_lost_verifier`). Reworked after
+  the 10-13 measurement (`lost_verifier_remedy`, `btx_core::wsl`): inside
+  WSL the app stops the node and restarts WSL from the Windows side, behind
+  a Settings switch that is on by default; elsewhere it restarts the
+  engine; and the message says to restart the computer when the check
+  still fails. The native Windows engine has no GPU verifier, so the case
+  does not arise there. Whether an engine restart is enough on native Linux
+  or macOS after a driver update is not measured.
 - On the 3060 itself (not in the repo): a boot task starts WSL with nobody
   logged in, and `instanceIdleTimeout=-1` stops WSL from shutting an idle
   distro down. On 10-13 WSL had stopped the node's distro about 15 s after
