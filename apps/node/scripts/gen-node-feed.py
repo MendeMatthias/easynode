@@ -674,8 +674,9 @@ def main():
               f"safe state when they are not part of this release.")
         print("      (Mechanically the plugin returns TargetsNotFound; main.ts "
               "only surfaces check errors on a MANUAL check, so the automatic "
-              "one is silent. Expect 'Check now' on those platforms to say "
-              "\"Couldn't check right now — are you online?\" — harmless.)")
+              "one is silent. Since 0.6.20 'Check now' there says the release has no "
+              "build for that platform. Copies there OLDER than that platform's "
+              "last build are offered nothing until it ships: say so on the site.)")
 
 
 if __name__ == "__main__":
