@@ -6,7 +6,7 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
-## [Unreleased]
+## [0.7.14] - 2026-10-14 · linux + windows (mac follows when built)
 
 **The WSL recovery from 0.7.13 is safer.** An audit of it, and a second test
 with a real graphics-card reset on 13 October, found what follows; all of it
