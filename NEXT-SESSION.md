@@ -178,11 +178,15 @@ preview:states`, then `http://localhost:1440/preview/index.html`.
 ## Open work, in priority order
 
 00. **The Mac build of 0.7.14**: "Tomorrow on the Mac" above.
-01. **An end-to-end run of the WSL recovery in the real app.** The pieces are
-    proven one by one, but the app has not yet restarted WSL by itself after
-    a real GPU loss. It needs an admin `pnputil /restart-device` on the 3060
-    while 0.7.14 runs and has verified blocks; a GPU-memory hog does NOT
-    cause the loss (WDDM pages GPU memory out, measured 2026-10-14).
+01. **Done 2026-10-14: the WSL recovery, end to end, in the real app.** A
+    real card reset on the 3060 under 0.7.14: the app restarted WSL at 15
+    minutes and the node was checking blocks again 62 s later, no clicks
+    (timeline in docs/incident-2026-10-11-3060-verifier-quarantine.md). It
+    showed one gap, fixed on main after it and unreleased: an app started
+    after the loss never acted (`engine_lost_its_card`). To repeat it: an
+    admin `pnputil /restart-device` on the card while the app has verified
+    blocks; a GPU-memory hog does NOT cause the loss (WDDM pages GPU memory
+    out, measured 2026-10-14).
 
 0. **Upstream btxchain/btx#225 would end co-signing as the confirmer does
    it.** Open, not merged, "a later 0.34.16 can carry it" (its author,

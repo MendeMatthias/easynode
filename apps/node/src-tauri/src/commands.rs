@@ -2708,6 +2708,9 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         // first stood (cleared the moment it goes).
         let mut run_first_blocks: Option<u64> = None;
         let mut verifier_lost_since: Option<std::time::Instant> = None;
+        // The engine's last answer to "did you lose a card you had in use",
+        // so the refresher asks it at most once a minute.
+        let mut engine_card_answer: Option<(std::time::Instant, bool)> = None;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             if gen_counter.load(Ordering::SeqCst) != gen {
@@ -2777,6 +2780,9 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     } else {
                         None
                     };
+                    if !cannot_verify_now {
+                        engine_card_answer = None;
+                    }
                     let validating = matmul_trusted_slot.lock().await.as_ref().is_some_and(|t| {
                         t.matmul_validation_mode.eq_ignore_ascii_case("consensus")
                     });
@@ -2801,21 +2807,57 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         .gpu_wsl_restart_last_unix
                         .map(|t| std::time::Duration::from_secs(unix_now_secs().saturating_sub(t)));
                     let since_last = last_verifier_restart_slot.lock().await.map(|t| t.elapsed());
-                    let fire = validating
-                        && if wsl_path {
-                            btx_core::engine_warnings::restart_wsl_for_lost_verifier(
-                                lost_for,
-                                verified_this_run,
-                                since_wsl_restart,
-                                settings_now.gpu_wsl_restart_streak,
-                            )
-                        } else {
-                            btx_core::engine_warnings::restart_for_lost_verifier(
-                                lost_for,
-                                verified_this_run,
-                                since_last,
-                            )
+                    let streak = settings_now.gpu_wsl_restart_streak;
+                    let rule = |engine_lost_card: bool| {
+                        validating
+                            && if wsl_path {
+                                btx_core::engine_warnings::restart_wsl_for_lost_verifier(
+                                    lost_for,
+                                    verified_this_run,
+                                    engine_lost_card,
+                                    since_wsl_restart,
+                                    since_last,
+                                    streak,
+                                )
+                            } else {
+                                btx_core::engine_warnings::restart_for_lost_verifier(
+                                    lost_for,
+                                    verified_this_run,
+                                    engine_lost_card,
+                                    since_last,
+                                )
+                            }
+                    };
+                    // An app started after the card was lost adopts the same
+                    // engine and never connects a block in its own run, so the
+                    // rule alone would leave it frozen (end-to-end run of
+                    // 2026-10-14). The engine remembers losing a card it had in
+                    // use. Asked only when its answer would change what
+                    // happens, and at most once a minute: a card refused at
+                    // startup carries the same warning for as long as it runs.
+                    let mut engine_lost_card = false;
+                    let mut fire = rule(false);
+                    if !fire && rule(true) {
+                        engine_lost_card = match engine_card_answer {
+                            Some((at, lost))
+                                if at.elapsed() < std::time::Duration::from_secs(60) =>
+                            {
+                                lost
+                            }
+                            _ => {
+                                use btx_core::rpc::Rpc as _;
+                                let lost = rpc
+                                    .call("getmininginfo", serde_json::json!([]))
+                                    .await
+                                    .is_ok_and(|v| {
+                                        btx_core::engine_warnings::engine_lost_its_card(&v)
+                                    });
+                                engine_card_answer = Some((std::time::Instant::now(), lost));
+                                lost
+                            }
                         };
+                        fire = engine_lost_card;
+                    }
                     if fire {
                         *last_verifier_restart_slot.lock().await = Some(std::time::Instant::now());
                         let mins = lost_for.map(|t| t.as_secs() / 60).unwrap_or(0);
@@ -2829,6 +2871,13 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                             format!(
                                 "the block verifier has been unavailable for {mins} min in a run \
                                  that had been checking blocks (stopped at {}); {what}",
+                                chain.blocks
+                            )
+                        } else if engine_lost_card {
+                            format!(
+                                "the block verifier has been unavailable for {mins} min, and the \
+                                 engine reports losing the graphics card it had in use (stopped \
+                                 at {}); {what}",
                                 chain.blocks
                             )
                         } else {

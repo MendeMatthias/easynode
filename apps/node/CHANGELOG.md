@@ -6,6 +6,20 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
+## [Unreleased]
+
+**A lost graphics card is recovered even when easyNode itself restarted
+after the loss.** On 14 October a real graphics-card reset on the project's
+RTX 3060 was recovered with no clicks: easyNode waited its 15 minutes,
+restarted WSL, and the node was checking blocks again a minute later. The
+same test showed a gap. easyNode judged whether the card had been working
+from its own run, so an easyNode started after the loss (its window closed
+with the display, the person reopened it, an update relaunched it) never
+acted, and the node stayed frozen. It now also asks the engine, which
+remembers losing a card it had been using. A card refused at startup still
+never causes a restart, and the limits stay as they were: at most two WSL
+restarts for one loss, and otherwise one every 3 hours.
+
 ## [0.7.14] - 2026-10-14 · linux + windows (mac follows when built)
 
 **The WSL recovery from 0.7.13 is safer.** An audit of it, and a second test
