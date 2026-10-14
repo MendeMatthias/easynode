@@ -6,7 +6,7 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
-## [Unreleased]
+## [0.7.15] - 2026-10-14 · linux + windows (mac follows when built)
 
 **A lost graphics card is recovered even when easyNode itself restarted
 after the loss.** On 14 October a real graphics-card reset on the project's
