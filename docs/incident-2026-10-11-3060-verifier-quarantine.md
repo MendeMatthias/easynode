@@ -150,9 +150,11 @@ step and never touched WSL while the restart was due. Times UTC.
 The restart record was written (`gpu_wsl_restart_last_unix`) and the streak
 went back to 0 once the new run verified blocks. The witness, the tunnel, the
 Esplora front, the observer and the keepalive came back with WSL by
-themselves. Catching up the 16 blocks missed during the wait was paced by the
-engine, about 75 s a block ("MatMul pending verification cap reached
-(budget-deferred)", bodies re-queued every 60 s), not by easyNode.
+themselves. The node came back 13 blocks behind (the network mined 248,134
+to 248,146 during the outage) and connected 25 blocks in 22 and a half
+minutes, about 54 s each, while the network added 12 more. That pace was
+the engine's own ("MatMul pending verification cap reached
+(budget-deferred)", bodies re-queued every 60 s), not easyNode's.
 
 Costs, both expected: every other WSL distribution on the PC stopped with
 WSL (here AInode's engines and build distributions), and the node signed
@@ -170,13 +172,18 @@ block (`QuarantineProvider`, `ExtendProviderQuarantine`,
 src/matmul/matmul_v4_rc_gkr.cpp:84-169), so "quarantined, at least one
 event" means this engine had the card and lost it, while a card refused at
 startup counts none. Such a run is treated like one that verified, under
-the same 3-hour spacing, and the one follow-up rule is unchanged.
+the same 3-hour spacing, but only before our first WSL restart for the
+loss (on the engine path, before the app's first restart), so two
+restarts per loss stays the cap; the one follow-up rule is unchanged.
+Released in 0.7.15 (#211). That path is tested against the engine's
+recorded answers; the reset above ran under 0.7.14, whose app survived it.
 
 ## What changed
 
-- easyNode 0.7.12 (released 10-12) still shows NOT FOLLOWING for this,
-  and its tray says "not following" too.
-- easynode #199 (merged 10-12, not released): when the engine reports it
+- easyNode 0.7.12 (released 10-12) shows NOT FOLLOWING for this, and its
+  tray says "not following" too.
+- easynode #199 (merged 10-12, released in 0.7.13, hardened in 0.7.14 by
+  #208, extended in 0.7.15 by #211): when the engine reports it
   cannot verify blocks for 15 minutes in a run that had been verifying,
   easyNode restarts the engine itself, at most once every 3 hours
   (`btx_core::engine_warnings::restart_for_lost_verifier`). Reworked after

@@ -20,7 +20,7 @@ remembers losing a card it had been using. A card refused at startup still
 never causes a restart, and the limits stay as they were: at most two WSL
 restarts for one loss, and otherwise one every 3 hours.
 
-## [0.7.14] - 2026-10-14 · linux + windows (mac follows when built)
+## [0.7.14] - 2026-10-14 · linux + windows (no mac build; the mac goes from 0.7.12 to 0.7.15)
 
 **The WSL recovery from 0.7.13 is safer.** An audit of it, and a second test
 with a real graphics-card reset on 13 October, found what follows; all of it
@@ -48,7 +48,7 @@ is fixed.
   computer clears it only when it follows a driver update; the same message
   shows for a card refused at startup.
 
-## [0.7.13] - 2026-10-14 · linux + windows (mac follows when built)
+## [0.7.13] - 2026-10-13 · linux + windows (no mac build; the mac goes from 0.7.12 to 0.7.15)
 
 **A node that loses its graphics card mid-run gets it back by itself.** On
 11 October at 19:49 UTC Windows Update installed a graphics driver under the

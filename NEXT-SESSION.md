@@ -55,8 +55,11 @@ NOT rebuild or re-sign them; the Mac build goes into the SAME release, the way
    platform tag to `mac + linux + windows` in easynode and re-sync
    `apps/node/CHANGELOG.md`. Run `scripts/check-download-links.sh`. Merge only
    once the Mac assets answer 200.
-8. Edit the `node-v0.7.15` release notes: drop the sentence about the Mac
-   staying on 0.7.12.
+8. Edit the `node-v0.7.15` release notes: add the Mac (the `.dmg`, and the
+   updater tarball) to the first line, and drop both Mac sentences at the
+   end (the Mac staying on 0.7.12, and a Mac on 0.7.11 or older being
+   offered nothing). The notes of node-v0.7.13 and node-v0.7.14 already say
+   they have no Mac build, and so do their changelog headings.
 9. Watch a Mac on 0.7.12 or older update itself, and one below 0.7.8.
 
 ## 0.7.13, the release 0.7.14 hardens
@@ -165,7 +168,7 @@ conditional update of a stored record failed, so no snapshot file was ever
 stored and no co-signature could ever merge. Verified live: the 3060's
 producer stored block 245,300's file six minutes after the deploy.
 
-## Since 0.7.11 on main, unreleased: the UI audit
+## The UI audit (shipped in 0.7.12)
 
 An audit of every screen (`docs/node-ui-audit-2026-10-12.md`) and its fixes
 (easynode #189, #190, #191). The one that matters: the headline said a green LIVE
