@@ -129,6 +129,49 @@ not restarted again), but it does not heal the node.
 The owner keeps Windows Update and driver installs on, on purpose: the node
 has to survive a driver swap, a restart or a power cut on its own.
 
+## The recovery, end to end (2026-10-14)
+
+easyNode 0.7.14 on the 3060, started at 09:23 UTC by the boot chain after a
+Windows restart and verifying blocks since. The owner reset the card with
+`pnputil /restart-device` (admin); a watcher on the Windows side logged each
+step and never touched WSL while the restart was due. Times UTC.
+
+| | |
+|---|---|
+| 16:45:53 | Card lost while checking block 248,134: `device_seeded_phase1_declined_or_wrong_size`, `NODE_MATMUL_CONSENSUS` withdrawn, as with the driver install of 10-13 |
+| 16:46 to 17:01 | Frozen at 248,133 by design: the 15 minutes the engine's own re-test gets first. The app (pid 575) survived the reset |
+| 17:01:26 | The app's Windows side: "easyNode lost its GPU block verifier; restarting WSL" (`%TEMP%\easynode-wsl-restart.log`) |
+| 17:01:34 | `wsl --shutdown` exited 0 |
+| 17:01:43 | Relaunch, attempt 1; Ubuntu running again at 17:01:44 |
+| 17:02:23 | easyNode started by the relaunch (its 40 s wait); the boot hook stood aside |
+| 17:02:28 | The new engine qualified the card (`ready=1`) and signed from 248,134 on as `02d5efca` |
+| 17:25:25 (block 248,158) | At btxscan's tip again |
+
+The restart record was written (`gpu_wsl_restart_last_unix`) and the streak
+went back to 0 once the new run verified blocks. The witness, the tunnel, the
+Esplora front, the observer and the keepalive came back with WSL by
+themselves. Catching up the 16 blocks missed during the wait was paced by the
+engine, about 75 s a block ("MatMul pending verification cap reached
+(budget-deferred)", bodies re-queued every 60 s), not by easyNode.
+
+Costs, both expected: every other WSL distribution on the PC stopped with
+WSL (here AInode's engines and build distributions), and the node signed
+nothing for about 16 minutes.
+
+**The gap it showed.** The app judged "the card had been working" from its
+own run (`chain.blocks > first` in the refresher). It survived this reset,
+but on 10-13 a device reset closed its window through WSLg, and the
+keepalive started a fresh app. A fresh app adopts the same frozen engine,
+never connects a block in its own run, and so never acts: the node stays
+frozen until someone notices. Fixed after this run: the app also asks the
+engine (`btx_core::engine_warnings::engine_lost_its_card`). In v0.34.15
+`quarantine_events` rises only when a card in use fails while checking a
+block (`QuarantineProvider`, `ExtendProviderQuarantine`,
+src/matmul/matmul_v4_rc_gkr.cpp:84-169), so "quarantined, at least one
+event" means this engine had the card and lost it, while a card refused at
+startup counts none. Such a run is treated like one that verified, under
+the same 3-hour spacing, and the one follow-up rule is unchanged.
+
 ## What changed
 
 - easyNode 0.7.12 (released 10-12) still shows NOT FOLLOWING for this,
