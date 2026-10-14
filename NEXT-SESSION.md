@@ -1,11 +1,60 @@
 # Next easyNode session: the handover
 
-State on 2026-10-14, after 0.7.13. Verified against the released bytes, not
+State on 2026-10-14, after 0.7.14 (Linux and Windows). Verified against the
+released bytes, not
 just the local build, except where it says otherwise.
 
 ---
 
 ## Where things stand (2026-10-14)
+
+**Published: easyNode 0.7.14 for Linux and Windows** (`node-v0.7.14`, built
+by CI from `6ac2e60`, tree identical to main's `f637808`, #209), the audit
+fixes of #208 on top of 0.7.13. Same checks as 0.7.13 below: draft first,
+every asset re-downloaded identical, signatures verified against the released
+bytes, Latest still v0.30.0. The Mac is next, below.
+
+## Tomorrow on the Mac: add the Mac build to node-v0.7.14
+
+The Linux and Windows assets of `node-v0.7.14` are published and signed. Do
+NOT rebuild or re-sign them; the Mac build goes into the SAME release, the way
+0.7.8 to 0.7.12 did. Until it ships, every Mac below 0.7.12 is offered nothing
+(the feed names 0.7.14 with no Mac key), which is why this is first.
+
+1. `git pull` on main (`f637808` or later; `tauri.conf.json` says 0.7.14).
+2. Prove the staged `apps/node/src-tauri/resources/node-pkg` is the shipped
+   engine: byte for byte against 0.7.12's Mac bundle (btxd `a315d86e…`), as in
+   recipe step 4. Never run `stage-node-pkg.sh`.
+3. Build: `cd apps/node && TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/easybtx.key)"
+   TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" npx tauri build --bundles app,updater`,
+   then the `.dmg` with `hdiutil` (Applications symlink plus the `.app`, UDZO).
+4. Rename the tarball to `BTX-Node_0.7.14_aarch64.app.tar.gz`, sign THAT name
+   (`npx tauri signer sign -f ~/.tauri/easybtx.key -p "" <file>`), and verify it
+   with `apps/node/scripts/verify-updater-sig.py`.
+5. Upload the tarball, its `.sig` and `BTX-Node_0.7.14_aarch64.dmg` to
+   `node-v0.7.14`. Replace `SHA256SUMS` with five lines: the three published
+   lines unchanged, plus the tarball and the `.dmg`, as 0.7.12's had. Keep
+   `make_latest` `"false"`, and check `/releases/latest` is still v0.30.0.
+6. Feed with all three platforms WITHOUT re-signing Linux and Windows
+   (`build-node-feed.sh` re-signs every file it is given). Download the
+   published `.sig` files of the AppImage, the `.deb` and the setup `.exe`,
+   then `python3 apps/node/scripts/gen-node-feed.py --version 0.7.14 --tag
+   node-v0.7.14 --mac-sig <tgz>.sig --linux-sig <AppImage>.sig --deb-sig
+   <deb>.sig --win-sig <exe>.sig --notes "easyNode 0.7.14. See
+   https://easybtx.com/node/changelog" --pub-date <now, UTC> --out
+   latest-node.json`.
+7. Site PR on EasyBTX: copy both feeds into `site/public/updater/`; move
+   `REL_MAC`, `relPageMac` and `dl.mac` in `site/src/pages/node.astro` to
+   `node-v0.7.14`; rewrite every "the Mac stays on 0.7.12" sentence on `/node`
+   and `/node/how-to` (grep `0.7.12`); change the 0.7.14 changelog heading's
+   platform tag to `mac + linux + windows` in easynode and re-sync
+   `apps/node/CHANGELOG.md`. Run `scripts/check-download-links.sh`. Merge only
+   once the Mac assets answer 200.
+8. Edit the `node-v0.7.14` release notes: drop the sentence about the Mac
+   staying on 0.7.12.
+9. Watch a Mac on 0.7.12 or older update itself, and one below 0.7.8.
+
+## 0.7.13, the release 0.7.14 hardens
 
 **Published: easyNode 0.7.13 for Linux and Windows** (`node-v0.7.13`, seven
 assets re-downloaded identical, every updater signature verified against the
@@ -23,11 +72,11 @@ on 10-13); elsewhere it restarts the engine. The cause of the 10-11 freeze was
 Windows Update installing a driver under the running engine
 (`docs/incident-2026-10-11-3060-verifier-quarantine.md`).
 
-**On main, unreleased: the audit fixes** (the PR after #206). Two read-only
+**The audit fixes** (#208, shipped in 0.7.14). Two read-only
 audits of #204 to #206 found a WSL restart that ignored a node owned by
 another app, a 3-hour gap lost across the restart it causes (a possible
 restart every ~20 min), no safety net when Windows failed to restart WSL, the
-observer's lost exec bit, and wording. All fixed; ship them as 0.7.14.
+observer's lost exec bit, and wording. All fixed, and shipped as 0.7.14.
 
 **The 3060's own setup changed** (not in the repo): a boot task starts WSL
 with nobody logged in; `.wslconfig` has `instanceIdleTimeout=-1`; zbtx3's key
@@ -128,12 +177,12 @@ preview:states`, then `http://localhost:1440/preview/index.html`.
 
 ## Open work, in priority order
 
-00. **Build the Mac 0.7.13 (on the Mac).** The feed names 0.7.13 with no Mac
-    key, so every Mac below 0.7.12 is offered nothing until then, including
-    any below 0.7.8 still on the 0.34.12 engine. Then publish a feed with all
-    three platforms and move the site's Mac pins.
-01. **Release 0.7.14** with the audit fixes, on all three platforms if the Mac
-    is ready by then.
+00. **The Mac build of 0.7.14**: "Tomorrow on the Mac" above.
+01. **An end-to-end run of the WSL recovery in the real app.** The pieces are
+    proven one by one, but the app has not yet restarted WSL by itself after
+    a real GPU loss. It needs an admin `pnputil /restart-device` on the 3060
+    while 0.7.14 runs and has verified blocks; a GPU-memory hog does NOT
+    cause the loss (WDDM pages GPU memory out, measured 2026-10-14).
 
 0. **Upstream btxchain/btx#225 would end co-signing as the confirmer does
    it.** Open, not merged, "a later 0.34.16 can carry it" (its author,
