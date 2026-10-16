@@ -19,6 +19,20 @@ fixes of #208 on top of 0.7.13. Same checks as 0.7.13 below: draft first,
 every asset re-downloaded identical, signatures verified against the released
 bytes, Latest still v0.30.0. The Mac is next, below.
 
+**On main, not released (2026-10-16): the 5-minute chain-state write**
+(`btx_core::state_flush`). It becomes 0.7.16 for Linux and Windows only after
+the Mac's 0.7.15 is in `node-v0.7.15` (it was not on 10-16: only the
+AppImage, the `.deb`, the Windows setup, their `.sig`s and `SHA256SUMS`). The
+Mac can take it straight into 0.7.16.
+What 10-15 taught, so nobody re-derives it: btxd writes on its own every 50
+to 70 min (validation.cpp:127), `gettxoutsetinfo` forces a write first
+(rpc/blockchain.cpp:1488), and btxd retries its addnodes every ~15 s by
+itself (net.cpp `ThreadOpenAddedConnections`), so an app-side re-dial adds
+nothing. The 6 peerless minutes after the 10-15 restart were the 3060's
+TP-Link Wi-Fi failing to associate until 10:53:46 (WLAN-AutoConfig 8002,
+"The driver disconnected while associating"); on 10-14 it took 9 minutes.
+Its Ethernet port is unplugged.
+
 ## Tomorrow on the Mac: add the Mac build to node-v0.7.15
 
 The Linux and Windows assets of `node-v0.7.15` are published and signed. Do
