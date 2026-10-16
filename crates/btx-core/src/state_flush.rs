@@ -7,27 +7,42 @@
 //! loses whatever came after the last write, and the next start downloads and
 //! checks those blocks again. On 2026-10-15 a Windows restart killed the RTX
 //! 3060 signer's btxd 44 minutes after its last write: the chainstate and the
-//! block files both ended at 248,800, 36 blocks behind, and catching those up
-//! at the engine's ~75 s a block is most of why the signer was back at the tip
-//! only 41 minutes after boot.
+//! block files both ended at 248,800, 36 blocks behind, and the signer was
+//! back at the tip 41 minutes after boot, 6.5 of them with no network.
 //!
 //! There is no flush RPC, but `gettxoutsetinfo` starts with
 //! `ForceFlushStateToDisk(wipe_cache=false)` (v0.34.15
-//! rpc/blockchain.cpp:1488): block and undo files, the block index and the
-//! coins, synced to disk, with the cache kept warm. Hash type `none` skips the
-//! hashing; with no coinstatsindex (easyNode's confs leave it off) what is left
-//! is a count over the coins database, which is 18 MB on the 3060, and the
-//! whole call took 71 ms there. The shielded state needs nothing from us: the
-//! engine persists it with every block it connects (validation.cpp:8997).
+//! rpc/blockchain.cpp:1488), with the cache kept warm. That fsyncs the block
+//! and undo files and the block index and writes the coins to their database
+//! (not fsynced, txdb.cpp:195: the OS writes them back within seconds, and a
+//! start that finds them behind replays blocks from the synced block files).
+//! Hash type `none` skips the hashing; with no coinstatsindex (easyNode's
+//! confs leave it off) what is left is a count over the coins database, 18 MB
+//! on the 3060, done without the main lock; the whole call took 71 ms there.
+//! The shielded state needs nothing from us: the engine persists it with every
+//! block it connects (validation.cpp:8997).
+//!
+//! WHAT THE ANSWER PROVES. Less than it seems: `ForceFlushStateToDisk` logs a
+//! failed write and returns nothing (validation.cpp:9198-9203), so the RPC
+//! answers either way, and an error after the write (a coinstatsindex still
+//! syncing, on an attached node that has one) comes back as a failure although
+//! the write ran. The log therefore speaks of the request, not of the disk.
 //!
 //! One side effect: after a full write the engine compacts the coins database
-//! once in 320 writes (`ShouldCompactChainstate`), so about once a day at this
-//! cadence instead of about once a fortnight. On a database this size that is
-//! nothing.
+//! once in 320 writes (`ShouldCompactChainstate`, asynchronous), so about once
+//! a day at this cadence instead of about once a fortnight. On a database this
+//! size that is nothing.
 //!
-//! Never during initial block download. The engine's own write policy is
-//! tuned for it, and a snapshot load holds the lock the write takes, so the
-//! request would only wait in one of the engine's RPC threads.
+//! WHEN NOT. While the engine reports initial block download: its own write
+//! policy is tuned for that. That flag is narrower than "catching up". It
+//! latches off for good once the tip is less than 30 days old
+//! (`DEFAULT_MAX_TIP_AGE`, kernel/chainstatemanager_opts.h:36), so a node
+//! restarted after hours or days, the case this exists for, and a node
+//! started from a recent snapshot are asked every 5 minutes while they catch
+//! up, which costs nothing worth measuring at this size. A request that meets
+//! the main lock held for minutes (a snapshot's activation, the end of its
+//! background check, a large reorg) waits, times out on our side, and is not
+//! repeated until the period is up again.
 
 use std::time::Duration;
 
@@ -40,9 +55,11 @@ use crate::rpc::Rpc;
 /// block about every 90 s, so a hard kill costs at most about three blocks.
 pub const FLUSH_EVERY: Duration = Duration::from_secs(5 * 60);
 
-/// How long one request may wait for its answer. As long as the period, so
-/// at most one request of ours is ever waiting inside the engine: a write
-/// waits for the engine's main lock, which a large reorg can hold for minutes.
+/// How long one request may wait for its answer: the whole period. A timeout
+/// on our side does not cancel the request inside the engine, so this is not
+/// what keeps requests from piling up there. What does is that a new one goes
+/// out only from a refresher tick whose `getblockchaininfo` answered, and that
+/// call needs the same main lock the write waits for.
 pub const FLUSH_TIMEOUT: Duration = FLUSH_EVERY;
 
 /// Whether this refresher tick should ask for a write. `since_last` is the
@@ -70,24 +87,27 @@ pub async fn flush(rpc: &dyn Rpc) -> AppResult<()> {
 /// the last one: the first result of a run is always said, and after that
 /// only a change, so a healthy node writes one line a run and not one every
 /// five minutes. `previous` is the last result's success, `None` before the
-/// first; `result` is how long the write took, or why it failed.
+/// first; `result` is how long the engine took to answer, or the error. The
+/// words are about the request, because the answer does not prove the disk
+/// either way (see the module notes).
 pub fn outcome_line(previous: Option<bool>, result: &Result<Duration, String>) -> Option<String> {
     match (previous, result) {
         (Some(true), Ok(_)) | (Some(false), Err(_)) => None,
         (None, Ok(took)) => Some(format!(
-            "the engine wrote its chain state to disk in {} ms. easyNode asks for this every \
-             {} minutes, so a power cut or a hard kill costs a few blocks, not up to an hour \
-             of them",
+            "asked the engine to write its chain state to disk; it answered in {} ms. \
+             easyNode asks every {} minutes, so a power cut or a hard kill costs a few \
+             blocks, not up to an hour of them",
             took.as_millis(),
             FLUSH_EVERY.as_secs() / 60
         )),
         (Some(false), Ok(took)) => Some(format!(
-            "the engine writes its chain state to disk again ({} ms)",
+            "the engine answers the request to write its chain state again ({} ms)",
             took.as_millis()
         )),
         (_, Err(e)) => Some(format!(
-            "could not ask the engine to write its chain state to disk ({e}). It still \
-             writes on its own about once an hour; easyNode asks again in {} minutes",
+            "the request to write the chain state to disk failed ({e}); the write may \
+             still have run. The engine also writes on its own about once an hour, and \
+             easyNode asks again in {} minutes",
             FLUSH_EVERY.as_secs() / 60
         )),
     }
@@ -118,17 +138,12 @@ mod tests {
         );
         assert!(
             !flush_due(due, false, 0, false),
-            "no chain yet: header sync or a snapshot load"
+            "no chain yet: header sync"
         );
         assert!(
             !flush_due(due, false, 248_800, true),
             "never a second request while the first one waits"
         );
-    }
-
-    #[test]
-    fn the_timeout_keeps_one_request_waiting_at_most() {
-        assert!(FLUSH_TIMEOUT <= FLUSH_EVERY);
     }
 
     /// Records what it was asked and answers as scripted.
@@ -198,6 +213,28 @@ mod tests {
             "and not every 5 minutes"
         );
         assert!(outcome_line(Some(false), &ok).unwrap().contains("again"));
-        assert!(outcome_line(None, &failed).unwrap().contains("could not"));
+        assert!(outcome_line(None, &failed)
+            .unwrap()
+            .contains("may still have run"));
+    }
+
+    /// An answer does not prove the disk either way (the engine logs a failed
+    /// write and answers anyway; an index error comes after the write), so no
+    /// line may claim the write happened or did not.
+    #[test]
+    fn the_lines_speak_of_the_request_not_of_the_disk() {
+        let ok = Ok(Duration::from_millis(71));
+        let failed = Err("HTTP timeout".to_string());
+        let lines = [
+            outcome_line(None, &ok),
+            outcome_line(Some(false), &ok),
+            outcome_line(None, &failed),
+            outcome_line(Some(true), &failed),
+        ];
+        for line in lines.iter().map(|l| l.as_deref().unwrap()) {
+            for claim in ["wrote", "could not ask", "was written", "not written"] {
+                assert!(!line.contains(claim), "{claim:?} in {line:?}");
+            }
+        }
     }
 }

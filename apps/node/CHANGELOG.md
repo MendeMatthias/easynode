@@ -15,8 +15,9 @@ last write. On 15 October a Windows restart killed the node on the project's
 RTX 3060 44 minutes after its last write, so it had to download and check 36
 blocks again, and it was back at the tip 41 minutes after boot. easyNode now
 asks the engine to write its state every 5 minutes, which took 71 ms there.
-It does so on every node past its first download, and never during that
-download, where the engine's own schedule is the right one.
+It does so on every node except one whose newest block is more than 30 days
+old, as on a first download, where the engine's own schedule is the right
+one.
 
 The same morning the node sat 6 minutes without peers. That was the PC's
 Wi-Fi taking 6 minutes to connect after the restart; the engine retried its
