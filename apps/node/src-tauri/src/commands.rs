@@ -2711,6 +2711,13 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         // The engine's last answer to "did you lose a card you had in use",
         // so the refresher asks it at most once a minute.
         let mut engine_card_answer: Option<(std::time::Instant, bool)> = None;
+        // The chain-state write (btx_core::state_flush): when it was last
+        // asked for (this run's start counts, so the first is five minutes
+        // in), whether that request still waits, and whether the last one
+        // worked, so the log says the first result and then only changes.
+        let mut flush_asked = std::time::Instant::now();
+        let flush_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flush_last_ok: Arc<std::sync::Mutex<Option<bool>>> = Arc::default();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             if gen_counter.load(Ordering::SeqCst) != gen {
@@ -3844,6 +3851,46 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         let genesis = snapshot_genesis.clone();
                         tauri::async_runtime::spawn(async move {
                             confirm_round(&rpc, trusted, genesis, &report).await;
+                            in_flight.store(false, Ordering::SeqCst);
+                        });
+                    }
+
+                    // ── Write the chain state to disk (every 5 minutes) ─────
+                    //
+                    // btxd writes on its own only every 50 to 70 minutes, so
+                    // a hard kill or a power cut used to cost up to an hour
+                    // of blocks: 36 on the 3060 on 2026-10-15, after a
+                    // Windows restart killed its btxd (btx_core::state_flush).
+                    // Off the tick, like the diary: the write waits for the
+                    // engine's main lock. Any node, any role, our own or an
+                    // adopted one; never during initial block download.
+                    if btx_core::state_flush::flush_due(
+                        flush_asked.elapsed(),
+                        chain.initial_block_download,
+                        chain.blocks,
+                        flush_in_flight.load(Ordering::SeqCst),
+                    ) {
+                        flush_asked = std::time::Instant::now();
+                        flush_in_flight.store(true, Ordering::SeqCst);
+                        let rpc = rpc.with_timeout(btx_core::state_flush::FLUSH_TIMEOUT);
+                        let in_flight = flush_in_flight.clone();
+                        let last_ok = flush_last_ok.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let started = std::time::Instant::now();
+                            let result = btx_core::state_flush::flush(&rpc)
+                                .await
+                                .map(|()| started.elapsed())
+                                .map_err(|e| e.to_string());
+                            let previous = last_ok
+                                .lock()
+                                .map(|mut l| l.replace(result.is_ok()))
+                                .unwrap_or(None);
+                            if let Some(msg) =
+                                btx_core::state_flush::outcome_line(previous, &result)
+                            {
+                                eprintln!("[node-app] {msg}");
+                                setup_log(&node_datadir(), &msg);
+                            }
                             in_flight.store(false, Ordering::SeqCst);
                         });
                     }

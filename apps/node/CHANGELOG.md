@@ -6,6 +6,23 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
+## [Unreleased]
+
+**A power cut or a hard restart costs a few blocks, not up to an hour of
+them.** The engine writes its chain state to disk on its own only about once
+an hour; a clean stop writes everything, a hard one loses what came after the
+last write. On 15 October a Windows restart killed the node on the project's
+RTX 3060 44 minutes after its last write, so it had to download and check 36
+blocks again, and it was back at the tip 41 minutes after boot. easyNode now
+asks the engine to write its state every 5 minutes, which took 71 ms there.
+It does so on every node past its first download, and never during that
+download, where the engine's own schedule is the right one.
+
+The same morning the node sat 6 minutes without peers. That was the PC's
+Wi-Fi taking 6 minutes to connect after the restart; the engine retried its
+peers every 15 seconds throughout and was connected 7 seconds after the
+Wi-Fi was, so nothing in easyNode changes for it.
+
 ## [0.7.15] - 2026-10-14 · linux + windows (mac follows when built)
 
 **A lost graphics card is recovered even when easyNode itself restarted

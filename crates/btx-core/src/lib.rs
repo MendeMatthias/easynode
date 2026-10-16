@@ -65,6 +65,7 @@ pub mod snapshot_producer;
 pub mod snapshot_serve;
 pub mod snapshot_site;
 pub mod snapshot_start;
+pub mod state_flush;
 pub mod statement_check;
 pub mod stuck_blocks;
 pub mod supply;
