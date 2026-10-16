@@ -3862,8 +3862,12 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     // of blocks: 36 on the 3060 on 2026-10-15, after a
                     // Windows restart killed its btxd (btx_core::state_flush).
                     // Off the tick, like the diary: the write waits for the
-                    // engine's main lock. Any node, any role, our own or an
-                    // adopted one; never during initial block download.
+                    // engine's main lock. Any node and any role, never during
+                    // initial block download. That includes a node another
+                    // app owns (the miner's): the request changes nothing but
+                    // when its engine writes, and on a validating node the
+                    // diary step above already sends it a gettxoutsetinfo at
+                    // every grid height, whoever owns it.
                     if btx_core::state_flush::flush_due(
                         flush_asked.elapsed(),
                         chain.initial_block_download,
@@ -12180,6 +12184,58 @@ mod snapshot_network_tests {
             "rpc.with_timeout(SNAPSHOT_RPC_TIMEOUT)",
         ] {
             assert!(refresher.contains(part), "the refresher lost {part}");
+        }
+    }
+
+    /// The 5-minute chain-state write (btx_core::state_flush) is asked from
+    /// the refresher's answered-tick arm, on its own long handle, off the
+    /// tick, and its waiting flag is cleared when the request ends.
+    #[test]
+    fn the_refresher_asks_for_the_chain_state_write_off_the_tick() {
+        let src = include_str!("commands.rs");
+        let refresher = src
+            .split("\nfn spawn_status_refresher(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .unwrap();
+        let answered_arm_ends = refresher
+            .find("Err(AppError::Rpc { code: -28, .. })")
+            .expect("the warming-up arm");
+        let gate = refresher
+            .find("btx_core::state_flush::flush_due(")
+            .expect("the refresher lost the chain-state write");
+        assert!(
+            gate < answered_arm_ends,
+            "only on a tick whose read answered"
+        );
+        let step = &refresher[gate..answered_arm_ends];
+        let spawn = step
+            .find("tauri::async_runtime::spawn(")
+            .expect("off the tick");
+        for (part, after_spawn) in [
+            ("chain.initial_block_download,", false),
+            ("flush_in_flight.load(Ordering::SeqCst),", false),
+            ("flush_asked = std::time::Instant::now();", false),
+            ("flush_in_flight.store(true, Ordering::SeqCst);", false),
+            (
+                "rpc.with_timeout(btx_core::state_flush::FLUSH_TIMEOUT)",
+                false,
+            ),
+            ("btx_core::state_flush::flush(&rpc)", true),
+            (
+                "btx_core::state_flush::outcome_line(previous, &result)",
+                true,
+            ),
+            ("in_flight.store(false, Ordering::SeqCst);", true),
+        ] {
+            let at = step
+                .find(part)
+                .unwrap_or_else(|| panic!("the write step lost {part}"));
+            assert_eq!(
+                at > spawn,
+                after_spawn,
+                "{part} on the wrong side of the spawn"
+            );
         }
     }
 
