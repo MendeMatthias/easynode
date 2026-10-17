@@ -1641,7 +1641,10 @@ mod tests {
         assert_eq!(c.operators, vec!["Mende".to_string(), "Jarek".to_string()]);
 
         let handed = trim_to_pinned(&merged, &view.pinned);
-        assert_eq!(handed.signatures, ours.signatures, "only the pinned signature");
+        assert_eq!(
+            handed.signatures, ours.signatures,
+            "only the pinned signature"
+        );
 
         // Jarek's signature alone would reach the engine as no signature at
         // all: his key confirms, it never loads.
@@ -1649,6 +1652,8 @@ mod tests {
             statement: his.statement.clone(),
             signatures: his.signatures.clone(),
         };
-        assert!(trim_to_pinned(&his_only, &view.pinned).signatures.is_empty());
+        assert!(trim_to_pinned(&his_only, &view.pinned)
+            .signatures
+            .is_empty());
     }
 }
