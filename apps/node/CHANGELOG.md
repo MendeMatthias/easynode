@@ -6,7 +6,7 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
-## [Unreleased]
+## [0.7.16] - 2026-10-18 · linux + windows (mac follows when built)
 
 **Jarek confirms chain snapshots, so a new node can start about a day from
 the tip.** A snapshot counts as confirmed only when two different operators
