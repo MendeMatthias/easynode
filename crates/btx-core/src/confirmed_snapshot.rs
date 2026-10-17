@@ -1595,4 +1595,60 @@ mod tests {
         assert!(Hash32::from_display_hex("00").is_none());
         assert!(Hash32([0; 32]).is_null());
     }
+    /// The first mainnet statement two operators signed apart: the 3060 at
+    /// 251,000, posted to easybtx.com at 144 deep, and Jarek's validator,
+    /// published at api-explorer.btxbyronbay.com/snapshots/ (manifest
+    /// sha256 `62dc029c...`). Each exported while its own tip was that
+    /// block; the statements are the same 229 bytes and the files the same
+    /// bytes. Merged, they confirm; the engine is then handed only the
+    /// 3060's signature, because Jarek's key is an operator key, not a pin.
+    #[test]
+    fn mende_and_jarek_confirm_251000_on_mainnet() {
+        const MENDE_251000: &[u8] =
+            include_bytes!("../tests/fixtures/confirmed_snapshot/mainnet-251000-mende.manifest");
+        const JAREK_251000: &[u8] =
+            include_bytes!("../tests/fixtures/confirmed_snapshot/mainnet-251000-jarek.manifest");
+        let ours = parse(MENDE_251000).unwrap();
+        let his = parse(JAREK_251000).unwrap();
+        assert_eq!(ours.statement.raw(), his.statement.raw(), "one statement");
+        assert_eq!(ours.statement.height(), 251_000);
+
+        let view = NodeView {
+            genesis: None,
+            replay_context: None,
+            start_height: 245_300,
+            pinned: operators::mainnet_mirror_pins(),
+        };
+        // Either alone is one operator.
+        for one in [&ours, &his] {
+            assert!(matches!(
+                check(one, &view, None),
+                Err(Refusal::TooFewOperators(_))
+            ));
+        }
+
+        let merged = Manifest {
+            statement: ours.statement.clone(),
+            signatures: ours
+                .signatures
+                .iter()
+                .chain(his.signatures.iter())
+                .cloned()
+                .collect(),
+        };
+        let c = check(&merged, &view, None).unwrap();
+        assert_eq!(c.height, 251_000);
+        assert_eq!(c.operators, vec!["Mende".to_string(), "Jarek".to_string()]);
+
+        let handed = trim_to_pinned(&merged, &view.pinned);
+        assert_eq!(handed.signatures, ours.signatures, "only the pinned signature");
+
+        // Jarek's signature alone would reach the engine as no signature at
+        // all: his key confirms, it never loads.
+        let his_only = Manifest {
+            statement: his.statement.clone(),
+            signatures: his.signatures.clone(),
+        };
+        assert!(trim_to_pinned(&his_only, &view.pinned).signatures.is_empty());
+    }
 }

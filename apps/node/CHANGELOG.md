@@ -8,6 +8,20 @@ root).
 
 ## [Unreleased]
 
+**Jarek confirms chain snapshots, so a new node can start about a day from
+the tip.** A snapshot counts as confirmed only when two different operators
+on the list compiled into easyNode signed the same statement, and until now
+only the project's own RTX 3060 signed, so every new node started from the
+built-in snapshot at block 245,300, thousands of blocks back. Jarek (Byron
+Bay), who runs the archive at archive.btxbyronbay.com, now cuts a signed
+snapshot at every multiple of 1,000 blocks on his own GPU validator. At block
+251,000 his statement and the 3060's were the same, byte for byte, and so
+were the files. easyNode 0.7.16 adds him to the list, so a statement both
+signed is confirmed, and a new node starts from it. His key confirms
+snapshots only. It is not a key easyNode trusts for blocks, and his signature
+is never passed to the engine. An older easyNode still starts from block
+245,300.
+
 **A power cut or a hard restart costs a few blocks, not up to an hour of
 them.** The engine writes its chain state to disk on its own only about once
 an hour; a clean stop writes everything, a hard one loses what came after the
