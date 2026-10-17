@@ -6,6 +6,51 @@ just the local build, except where it says otherwise.
 
 ---
 
+## Update 2026-10-18: Jarek confirms snapshots
+
+**Jarek (Byron Bay) is the second snapshot operator** (#218, owner's decision
+of 2026-10-18, after btxchain/btx#239). His validator key `02d12c32…fe030`
+is in `crates/btx-core/snapshot-operators.json` as an operator, NOT a pin:
+it confirms snapshots, has no say over blocks, and `trim_to_pinned` keeps it
+from the engine. He cuts at every multiple of 1,000 while his own tip is that
+block and publishes the single-signature manifest at
+`https://api-explorer.btxbyronbay.com/snapshots/`. At 251,000 his statement
+and file were the 3060's, byte for byte
+(`confirmed_snapshot::tests::mende_and_jarek_confirm_251000_on_mainnet`).
+
+**The website picks his cuts up** (EasyBTX #599, `.github/workflows/byron-cuts.yml`,
+hourly at :41, no secret). It posts a cut only onto a statement the website
+already holds from the 3060, which posts at 144 deep. His tip-time cut never
+opens a statement or a dispute on its own. A cut that differs fails the job
+for a human to look at. First real run, 2026-10-17 22:5x UTC: his signature
+merged into 251,000 (record confirmed, operators Mende and Jarek), but
+writing the public manifest answered 503. `@vercel/blob`'s `useCache: false`
+adds `?cache=0`, which the PUBLIC store refuses with 400 whether the blob
+exists or not. Fixed in EasyBTX #601 (private reads only). After it deploys,
+the next statement that adds a signature runs `republishStale` and
+`/api/snapshots/latest` serves 251,000. Check that, then check that easyNode's
+loader takes it.
+
+**Older apps are unaffected.** They check a confirmed pointer against their own
+compiled list, where Jarek is missing. `peek_confirmed` fails quietly (no
+Fast-forward offer) and `prepare_start` falls back to the pinned 245,300 pair,
+just as with the 404. Only 0.7.16 and later take the confirmed pair.
+
+**0.7.16 is the version bump in #220.** It goes out for Linux and Windows with
+#216, #217 and #218. The order above still holds: the Mac's 0.7.15 first, and
+once #220 is on main, that Mac build must come from `e76315b`. Or skip it:
+build 0.7.16 for all three platforms, and the Mac gap closes with it.
+
+**The 3060 skipped 249,600 and 250,000** (no statement at either). Jarek's
+cuts land only on multiples of 1,000, so a skipped one costs a day without a
+new confirmed snapshot. Being investigated on the 3060 PC itself (its logs).
+
+**Jarek has a brief** (Mende sent it in the nodes Telegram group,
+2026-10-18): the pickup contract, "don't post to /api/snapshots/statement
+yourself", and proposals that are not agreed yet (cut every 100, his key in
+a future M=2 block set, explorers checking each other, a second AInode model
+host).
+
 ## Where things stand (2026-10-14)
 
 **Published: easyNode 0.7.15 for Linux and Windows** (`node-v0.7.15`,
@@ -233,9 +278,10 @@ preview:states`, then `http://localhost:1440/preview/index.html`.
    this with two producers before relying on it, and redesign the confirmer
    before taking an engine with #225.
 
-1. **A second operator must confirm.** `/api/snapshots/latest` stays 404
-   until Aleksander (zbtx1 to zbtx3) or jpp co-signs; every statement since
-   5 October carries only `02d5efca`. zbtx1 sits on a dead branch from
+1. **A second operator confirms: done, waiting on EasyBTX #601** (see the
+   2026-10-18 update above). Jarek co-signs every multiple of 1,000. Until
+   then, every statement since 5 October carried only `02d5efca`.
+   Aleksander (zbtx1 to zbtx3) and jpp would still make it sturdier. zbtx1 sits on a dead branch from
    244,089 (first block `24528d1139a71aa694e65bf54dc47a3e2652d4716f94fa43c3d1a3738fb16ba7`).
    No co-signature attempt reached the website at all. The overnight report
    (`~/Desktop/easyNode-overnight-report.md`) has the commands for each of
