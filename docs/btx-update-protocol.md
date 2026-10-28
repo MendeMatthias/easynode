@@ -138,7 +138,10 @@ rc, while the network is calm.
 - **The official seeds** (node.btx.dev, node.btx.tools, node.btxchain.org) report 228,000, about 30k
   behind. New nodes need our own addnodes.
 - **Public archives** (Lars, 24/7, full history): `85.215.122.100:19335`, `217.154.143.140:19335`.
-  Lars is also taking over the hourly snapshots.
+  Lars is also taking over the hourly snapshots. Checked 2026-10-28 22:27Z: `217.154.143.140` was on
+  btxscan's tip and served blocks 1,000 and 150,000, so easyNode dials it as a bootstrap peer.
+  `85.215.122.100` sat on a one-block orphan at 261,839 (`fabf50f4…`) while the chain moved on, so it
+  is in no list yet. Probe it again before adding it anywhere.
 - Guides pinned in Nodes & Ops: "GPU-less archive sheet v5" (includes the freeze fix) and "Signer + relay guide v0.34.15".
 - Our rc1 test (Mende, 10-24, M5): a clone of the easyNode datadir matched rc1 ↔ 0.34.15 in both
   directions (#237). Junior ran rc1 on Windows and it passed, on CPU only since it has no CUDA.
