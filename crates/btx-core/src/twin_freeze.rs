@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::node_api::AttestedTip;
 use crate::rpc::Rpc;
 
@@ -224,6 +224,8 @@ pub struct TwinFreeze {
     watching: Option<Watch>,
     /// The record was read at the first tick.
     loaded: bool,
+    /// `reconsiderblock` failures in a row, so the log says the first only.
+    put_back_failures: u32,
 }
 
 impl TwinFreeze {
@@ -456,6 +458,9 @@ pub async fn verify(
         at = prev;
         (h, prev) = header(rpc, &at).await?;
     }
+    if h != height {
+        return Ok(Err(Refusal::FrontierOutOfReach));
+    }
     if at == twin {
         return Ok(Err(Refusal::OnSignedFrontier));
     }
@@ -514,11 +519,11 @@ pub async fn tick(
     let mut out = Vec::new();
     if !tf.loaded {
         tf.loaded = true;
-        // A run that ended while a block was set aside: decide now whether
-        // the node moved on, put it back if not.
+        // A run that ended while a block was set aside: the node gets a
+        // full ADVANCE_WAIT from now (it may itself have just restarted),
+        // and the block goes back if it has not moved on by then.
         if let Some(r) = read_record(datadir).filter(|r| r.state == State::Watching) {
-            let since = s.now.checked_sub(ADVANCE_WAIT).unwrap_or(s.now);
-            tf.set_aside(&r.twin, r.height, r.shape, since);
+            tf.set_aside(&r.twin, r.height, r.shape, s.now);
             out.push(format!(
                 "picked up the set-aside block {} at {} from the last run",
                 short(&r.twin),
@@ -539,36 +544,47 @@ pub async fn tick(
             frontier_hash,
             shape,
         } => match verify(rpc, &twin, height, &frontier_hash).await {
-            Ok(Ok(())) => match rpc.call("invalidateblock", json!([twin])).await {
-                Ok(_) => {
-                    tf.set_aside(&twin, height, shape, s.now);
+            Ok(Ok(())) => {
+                // The record goes first: an app that dies right after the
+                // invalidateblock still knows to put the block back.
+                let record = Record {
+                    twin: twin.clone(),
+                    height,
+                    shape,
+                    state: State::Watching,
+                    at_unix: now_unix,
+                };
+                if let Err(e) = write_record(datadir, &record) {
+                    tf.refused(&twin, s.now);
                     out.push(format!(
+                        "could not write {RECORD_FILE} ({e}), so left block {} alone.",
+                        short(&twin)
+                    ));
+                    return out;
+                }
+                // Watched even when the call fails: a timeout may still have
+                // set it aside, and reconsiderblock on a valid block does
+                // nothing.
+                tf.set_aside(&twin, height, shape, s.now);
+                match rpc.call("invalidateblock", json!([twin])).await {
+                    Ok(_) => out.push(format!(
                         "stuck {} min on block {} at {height} while the signed frontier is \
-                             {} blocks ahead on another branch ({}). Set it aside with \
-                             invalidateblock; it goes back with reconsiderblock if the node \
-                             does not move on within {} min.",
+                         {} blocks ahead on another branch ({}). Set it aside with \
+                         invalidateblock; it goes back with reconsiderblock if the node \
+                         does not move on within {} min.",
                         STUCK.as_secs() / 60,
                         twin,
                         s.frontier.and_then(|f| f.blocks_behind).unwrap_or(0),
                         shape.label(),
                         ADVANCE_WAIT.as_secs() / 60,
-                    ));
-                    keep(
-                        Record {
-                            twin,
-                            height,
-                            shape,
-                            state: State::Watching,
-                            at_unix: now_unix,
-                        },
-                        &mut out,
-                    );
+                    )),
+                    Err(e) => out.push(format!(
+                        "invalidateblock {} failed: {e}. Watching anyway; it is put back \
+                         if the node does not move on.",
+                        short(&twin)
+                    )),
                 }
-                Err(e) => {
-                    tf.refused(&twin, s.now);
-                    out.push(format!("invalidateblock {} failed: {e}", short(&twin)));
-                }
-            },
+            }
             Ok(Err(why)) => {
                 tf.refused(&twin, s.now);
                 out.push(format!(
@@ -604,7 +620,18 @@ pub async fn tick(
         }
         Decision::PutBack { twin, height } => {
             match rpc.call("reconsiderblock", json!([twin])).await {
+                // The node does not know the block at all (its data folder was
+                // made again since): nothing is set aside, nothing to put back.
+                Err(AppError::Rpc { code: -5, .. }) => {
+                    tf.done();
+                    let _ = std::fs::remove_file(record_path(datadir));
+                    out.push(format!(
+                        "the node no longer knows block {} at {height}: nothing to put back.",
+                        short(&twin)
+                    ));
+                }
                 Ok(_) => {
+                    tf.put_back_failures = 0;
                     let shape = tf.watching.as_ref().map(|w| w.shape);
                     tf.done();
                     out.push(format!(
@@ -624,8 +651,16 @@ pub async fn tick(
                         &mut out,
                     );
                 }
-                // Tried again next tick.
-                Err(e) => out.push(format!("reconsiderblock {} failed: {e}", short(&twin))),
+                // Tried again next tick; said once.
+                Err(e) => {
+                    tf.put_back_failures += 1;
+                    if tf.put_back_failures == 1 {
+                        out.push(format!(
+                            "reconsiderblock {} failed: {e}. Trying again every few seconds.",
+                            short(&twin)
+                        ));
+                    }
+                }
             }
         }
     }
@@ -675,7 +710,6 @@ pub fn status_note(datadir: &Path, now_unix: u64) -> Option<(String, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::AppError;
     use async_trait::async_trait;
     use serde_json::Value;
     use std::collections::{HashMap, HashSet};
@@ -691,6 +725,7 @@ mod tests {
         active: Vec<String>,
         invalid: HashSet<String>,
         calls: Vec<String>,
+        fail_invalidate: bool,
     }
 
     struct Fake(Mutex<Tree>);
@@ -751,6 +786,9 @@ mod tests {
                     Ok(v)
                 }
                 "invalidateblock" => {
+                    if t.fail_invalidate {
+                        return Err(AppError::Http("timed out".into()));
+                    }
                     t.invalid.insert(arg.clone());
                     if let Some(i) = t.active.iter().position(|b| *b == arg) {
                         t.active.truncate(i);
@@ -758,6 +796,12 @@ mod tests {
                     Ok(Value::Null)
                 }
                 "reconsiderblock" => {
+                    if !t.blocks.contains_key(&arg) {
+                        return Err(AppError::Rpc {
+                            code: -5,
+                            message: "Block not found".into(),
+                        });
+                    }
                     t.invalid.remove(&arg);
                     Ok(Value::Null)
                 }
@@ -1120,20 +1164,36 @@ mod tests {
         assert!(fake.changes().is_empty());
         assert_eq!(read_record(dir.path()).unwrap().state, State::Recovered);
 
-        // Still one below: put back straight away.
+        // Still one below right after the restart: it gets a full wait.
         let (fake, _) = race(100, 104);
         fake.0.lock().unwrap().active.pop();
         write_record(dir.path(), &rec(State::Watching)).unwrap();
         let tip = fake.tip();
         let mut tf = TwinFreeze::new();
-        tick(
-            &fake,
-            dir.path(),
-            &mut tf,
-            &seen(Instant::now(), &tip, &f, None),
-            9,
-        )
-        .await;
+        let t0 = Instant::now();
+        for secs in [0, 60, 170] {
+            let s = seen(t0 + Duration::from_secs(secs), &tip, &f, None);
+            tick(&fake, dir.path(), &mut tf, &s, 9).await;
+        }
+        assert!(fake.changes().is_empty(), "too early: {:?}", fake.changes());
+        // ...and if it catches up within it, the fix stays.
+        fake.follow("n104");
+        let up = fake.tip();
+        let s = seen(t0 + Duration::from_secs(175), &up, &f, None);
+        tick(&fake, dir.path(), &mut tf, &s, 9).await;
+        assert!(fake.changes().is_empty());
+        assert_eq!(read_record(dir.path()).unwrap().state, State::Recovered);
+
+        // Still one below after the full wait: put back.
+        let (fake, _) = race(100, 104);
+        fake.0.lock().unwrap().active.pop();
+        write_record(dir.path(), &rec(State::Watching)).unwrap();
+        let tip = fake.tip();
+        let mut tf = TwinFreeze::new();
+        for secs in [0, ADVANCE_WAIT.as_secs()] {
+            let s = seen(t0 + Duration::from_secs(secs), &tip, &f, None);
+            tick(&fake, dir.path(), &mut tf, &s, 9).await;
+        }
         assert_eq!(fake.changes(), vec![format!("reconsiderblock {twin}")]);
         assert_eq!(read_record(dir.path()).unwrap().state, State::PutBack);
     }
@@ -1201,6 +1261,57 @@ mod tests {
             .await;
         }
         assert_eq!(fake.changes(), vec![format!("invalidateblock {twin}")]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_invalidateblock_is_still_watched_and_put_back() {
+        let (fake, twin) = race(259_362, 259_365);
+        fake.0.lock().unwrap().fail_invalidate = true;
+        let f = frontier(259_365, 2);
+        let (_lines, dir) = freeze_and_recover(&fake, &f, &dual_quorum_log(259_363), None).await;
+        assert_eq!(
+            fake.changes(),
+            vec![
+                format!("invalidateblock {twin}"),
+                format!("reconsiderblock {twin}")
+            ]
+        );
+        assert_eq!(read_record(dir.path()).unwrap().state, State::PutBack);
+    }
+
+    #[tokio::test]
+    async fn a_record_for_a_block_the_node_no_longer_knows_is_dropped() {
+        let (fake, _) = race(100, 104);
+        fake.0.lock().unwrap().active.pop();
+        let dir = tempfile::tempdir().unwrap();
+        write_record(
+            dir.path(),
+            &Record {
+                twin: "gone".into(),
+                height: 101,
+                shape: Shape::DualQuorum,
+                state: State::Watching,
+                at_unix: 5,
+            },
+        )
+        .unwrap();
+        let f = frontier(104, 3);
+        let tip = fake.tip();
+        let mut tf = TwinFreeze::new();
+        let t0 = Instant::now();
+        for m in 0..5 {
+            tick(
+                &fake,
+                dir.path(),
+                &mut tf,
+                &seen(t0 + MIN * m, &tip, &f, None),
+                9,
+            )
+            .await;
+        }
+        assert_eq!(fake.changes(), vec!["reconsiderblock gone".to_string()]);
+        assert!(read_record(dir.path()).is_none());
+        assert!(tf.watching().is_none());
     }
 
     #[test]
