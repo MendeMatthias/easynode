@@ -94,7 +94,9 @@ jobs:
           # all three claim leaves; the v0.35.0-rc1 tag narrowed it to one
           # (68f2bf3e), which would split from 0.34.15. Both tags are frozen.
           echo "--- v0.34.15 must PASS the HTLC check (all three leaves) ---"
-          out="$(env -u GITHUB_ACTIONS bash scripts/check-engine-tag.sh v0.34.15 2>&1)"; rc=$?
+          # "&& rc=0 || rc=$?": Actions runs steps with bash -e, and a bare failing
+          # assignment would end the step before the expected failure is read.
+          out="$(env -u GITHUB_ACTIONS bash scripts/check-engine-tag.sh v0.34.15 2>&1)" && rc=0 || rc=$?
           echo "$out"
           if [ "$rc" != 0 ] || ! grep -q 'applies the 32-byte HTLC preimage rule to all three' <<<"$out"; then
             echo "::error::the guard no longer certifies v0.34.15's HTLC rule. It has stopped"
@@ -103,7 +105,9 @@ jobs:
           fi
           echo
           echo "--- v0.35.0-rc1 must FAIL the HTLC check (narrowed rule) ---"
-          out="$(env -u GITHUB_ACTIONS bash scripts/check-engine-tag.sh v0.35.0-rc1 2>&1)"; rc=$?
+          # "&& rc=0 || rc=$?": Actions runs steps with bash -e, and a bare failing
+          # assignment would end the step before the expected failure is read.
+          out="$(env -u GITHUB_ACTIONS bash scripts/check-engine-tag.sh v0.35.0-rc1 2>&1)" && rc=0 || rc=$?
           echo "$out"
           if [ "$rc" = 0 ] || ! grep -q 'narrows the 32-byte HTLC preimage rule' <<<"$out"; then
             echo "::error::the guard ACCEPTS v0.35.0-rc1, whose HTLC rule splits from 0.34.15"

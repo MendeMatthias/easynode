@@ -9287,7 +9287,10 @@ mod tests {
                      so btxd's own mainnet updater stays on: {args:?}",
                     btxd.display()
                 );
-                if matches!(backend, btx_core::backend::Backend::Cpu | btx_core::backend::Backend::Cuda) {
+                if matches!(
+                    backend,
+                    btx_core::backend::Backend::Cpu | btx_core::backend::Backend::Cuda
+                ) {
                     assert!(
                         args.iter().any(|a| a.starts_with("-matmulrcexecution=")),
                         "{NODE_RELEASE_TAG} at {} on {backend:?} lost -matmulrcexecution: {args:?}",
