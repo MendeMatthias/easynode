@@ -64,6 +64,10 @@ DEST="$APP_DIR/src-tauri/resources/node-pkg"
 # shellcheck source=lib/engine-pin.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/engine-pin.sh"
 assert_matches_engine_pin "$APP_DIR" "$VERSION"
+# Both upstream archive formats (0.34 .tar.gz, 0.35 .tar.xz + SHA384), the
+# layout gate and the exact-version check. See the file.
+# shellcheck source=lib/release-archive.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/release-archive.sh"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "error: this stages the LINUX node package and must run on Linux." >&2
@@ -76,15 +80,20 @@ if [[ -z "$SRC" ]]; then
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
   echo "==> downloading $TARBALL_URL"
-  curl -fsSL --retry 3 -o "$tmp/pkg.tgz" "$TARBALL_URL"
-  echo "$TARBALL_SHA256  $tmp/pkg.tgz" | sha256sum -c -
-  tar -xzf "$tmp/pkg.tgz" -C "$tmp"
-  SRC="$tmp/btx-$VERSION"
+  curl -fsSL --retry 3 -o "$tmp/pkg.archive" "$TARBALL_URL"
+  release_archive_verify "$tmp/pkg.archive" "$TARBALL_SHA256"
+  SRC="$(release_archive_extract "$tmp/pkg.archive" "$tmp/x")"
 fi
 
 if [[ ! -x "$SRC/bin/btxd" ]]; then
   echo "error: no BTX node package at $SRC (expected bin/btxd)." >&2
   echo "       Set EASYBTX_NODE_PKG_SRC to an extracted release package dir." >&2
+  exit 1
+fi
+# The copy below is libexec/*.real-shaped; refuse 0.35's layout until adapted.
+require_034_layout "$SRC"
+if ! btxd_reports_exact_version "$SRC/bin/btxd" "$VERSION"; then
+  echo "error: $SRC/bin/btxd is not exactly v$VERSION (reported: $("$SRC/bin/btxd" --version 2>&1 | head -1))" >&2
   exit 1
 fi
 

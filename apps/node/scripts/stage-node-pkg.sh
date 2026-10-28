@@ -36,12 +36,20 @@ VERSION="0.34.15"
 # shellcheck source=lib/engine-pin.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/engine-pin.sh"
 assert_matches_engine_pin "$APP_DIR" "$VERSION"
+# Download/verify/unpack for both upstream archive formats (0.34 .tar.gz and
+# 0.35 .tar.xz), plus the layout gate and exact-version check. See the file.
+# shellcheck source=lib/release-archive.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/release-archive.sh"
 
+# 0.35 renamed the archive: btx-035-macos-arm64.tar.xz, with SHA384SUMS, and
+# the rc1 Mac btxd's own code signature is INVALID (macOS kills it with
+# SIGKILL until it is re-signed). Move this URL and the digest together.
 TARBALL_URL="https://github.com/btxchain/btx/releases/download/v${VERSION}/btx-${VERSION}-arm64-apple-darwin.tar.gz"
 # Upstream has re-generated release assets in place before, and a silent swap
 # must FAIL here, never ship unnoticed. v0.34.15 publishes NO SHA256SUMS at
 # all; this is GitHub's asset digest for the file, which equals the hash
 # upstream lists on btxchain/btx PR 223. It pins the bytes, not a signature.
+# 64 hex = sha256, 96 hex = sha384 (release_archive_verify takes either).
 TARBALL_SHA256="6e1ec111fcfedb6da356e3897d3d224c07396c82b8897a83fdcfa558b781c4a8"
 
 SRC="${EASYBTX_NODE_PKG_SRC:-}"
@@ -50,15 +58,17 @@ if [[ -z "$SRC" && -x "$HOME/btx-node-research/btx-$VERSION/bin/btxd" ]]; then
 fi
 if [[ -z "$SRC" ]]; then
   # No local package: fetch the pinned release, exactly like the Linux leg.
-  # `shasum -a 256`, NOT `sha256sum` — the latter is not on stock macOS.
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
   echo "==> downloading $TARBALL_URL"
-  curl -fsSL --retry 3 -o "$tmp/pkg.tgz" "$TARBALL_URL"
-  echo "$TARBALL_SHA256  $tmp/pkg.tgz" | shasum -a 256 -c -
-  tar -xzf "$tmp/pkg.tgz" -C "$tmp"
-  SRC="$tmp/btx-$VERSION"
+  curl -fsSL --retry 3 -o "$tmp/pkg.archive" "$TARBALL_URL"
+  release_archive_verify "$tmp/pkg.archive" "$TARBALL_SHA256"
+  SRC="$(release_archive_extract "$tmp/pkg.archive" "$tmp/x")"
 fi
+
+# Everything below copies libexec/*.real and re-signs only those. Refuse any
+# other layout (0.35's bin/btxd-is-the-binary) instead of staging half of it.
+require_034_layout "$SRC"
 
 if [[ ! -x "$SRC/bin/btxd" ]]; then
   echo "error: no BTX node package at $SRC (expected bin/btxd)." >&2
@@ -71,7 +81,8 @@ fi
 # install path, and node.rs derives the version-gated CLI flags from that path —
 # so staging the wrong bytes here arms `-matmulrcexecution` against a btxd that
 # rejects it fatally. Cheap to check, expensive to miss.
-if ! "$SRC/bin/btxd" --version 2>/dev/null | grep -q "v${VERSION}"; then
+# Exact, not a substring: VERSION=0.35.0 must not accept a v0.35.0rc1 binary.
+if ! btxd_reports_exact_version "$SRC/bin/btxd" "$VERSION"; then
   echo "error: $SRC/bin/btxd is not v$VERSION (reported: $("$SRC/bin/btxd" --version 2>&1 | head -1))" >&2
   exit 1
 fi

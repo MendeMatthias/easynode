@@ -9248,6 +9248,59 @@ mod tests {
         }
     }
 
+    /// The install key must parse as `vMAJOR.MINOR.PATCH…`, because three
+    /// launch rules read the engine version from it and fail SAFE-BUT-SILENT
+    /// when it does not: `-autoupdate=0` is dropped (btxd's own updater is ON
+    /// by default on mainnet since v0.31.0, so the engine could swap itself
+    /// under our pin), `-matmulrcexecution` is dropped (a CPU/CUDA host loses
+    /// strict-device), and `engine_follows_network_rules` reads "untrusted".
+    /// None of those shows up as an error. So ask the launch itself, with this
+    /// build's key in both the nominal path and the real install-dir shape,
+    /// whether all three still hold. A key like `0.35.0` (no `v`) still parses;
+    /// one like `btx-035` or `rc1-…` does not, and this test is what says so.
+    #[test]
+    fn the_pinned_engine_launches_with_its_self_updater_off() {
+        assert!(
+            btx_core::node::engine_follows_network_rules(NODE_RELEASE_TAG),
+            "install key {NODE_RELEASE_TAG} does not parse as v0.34.14+; keep it \
+             `v<major>.<minor>.<patch>[-qualifier]` or every version-gated launch rule drops"
+        );
+        let mut paths = vec![super::nominal_btxd_path()];
+        if let Some(dir) = btx_core::installer::install_dir(NODE_RELEASE_TAG) {
+            paths.push(dir.join("bin").join("btxd"));
+        }
+        for btxd in &paths {
+            for backend in [
+                btx_core::backend::Backend::Metal,
+                btx_core::backend::Backend::Cuda,
+                btx_core::backend::Backend::Cpu,
+            ] {
+                let (_, args, _) = btx_core::node::build_node_command(
+                    btxd,
+                    std::path::Path::new("/dd"),
+                    std::path::Path::new("/dd/btx.conf"),
+                    backend,
+                );
+                assert!(
+                    args.iter().any(|a| a == "-autoupdate=0"),
+                    "{NODE_RELEASE_TAG} at {} on {backend:?} launches WITHOUT -autoupdate=0, \
+                     so btxd's own mainnet updater stays on: {args:?}",
+                    btxd.display()
+                );
+                if matches!(
+                    backend,
+                    btx_core::backend::Backend::Cpu | btx_core::backend::Backend::Cuda
+                ) {
+                    assert!(
+                        args.iter().any(|a| a.starts_with("-matmulrcexecution=")),
+                        "{NODE_RELEASE_TAG} at {} on {backend:?} lost -matmulrcexecution: {args:?}",
+                        btxd.display()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_shipped_pin_makes_a_deliberate_keeper_decision() {
         assert!(
