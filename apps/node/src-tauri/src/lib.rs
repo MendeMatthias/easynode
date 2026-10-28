@@ -71,6 +71,7 @@ pub fn run() {
             commands::node_footprint,
             commands::remove_node_data_now,
             commands::open_global_stats,
+            commands::open_btx_community,
             commands::close_choice,
             commands::set_on_close,
             commands::esplora_preflight,
