@@ -9622,6 +9622,16 @@ pub async fn open_global_stats() -> Result<(), String> {
     btx_core::platform::open_url(URL).map_err(|e| format!("couldn't open the stats page: {e}"))
 }
 
+/// Open the official BTX community Telegram group in the default browser.
+/// The BTX core group set it up on 2026-10-26 with entry/anti-spam
+/// protection; this is its public entry link, never a private t.me/+ invite.
+/// Fixed URL, same rule as `open_global_stats`.
+#[tauri::command]
+pub async fn open_btx_community() -> Result<(), String> {
+    const URL: &str = "https://t.me/BTX_COMMUNITY_ENTRY";
+    btx_core::platform::open_url(URL).map_err(|e| format!("couldn't open the community link: {e}"))
+}
+
 #[cfg(test)]
 mod signed_start_tests {
     use super::{

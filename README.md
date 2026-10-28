@@ -365,6 +365,12 @@ because "open source" is often read as "no control anywhere".
   installed by the in-app updater. A fork cannot push an update to anybody
   running this app.
 
+## Community
+
+Questions, ideas, or just want to meet other people running BTX? Join the
+official BTX community group on Telegram:
+[BTX Community (Telegram)](https://t.me/BTX_COMMUNITY_ENTRY).
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Security issues go through
