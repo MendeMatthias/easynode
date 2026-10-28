@@ -229,7 +229,14 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     //
     // So it sits here beside Jarek's archive and NOT in BTX_ARCHIVE_PEERS: a
     // second, independent site for old BLOCKS, but not a source of old
-    // signatures, which is what that list and its noban grant are for. Lars's
+    // signatures, which is what that list and its noban grant are for.
+    // Being in this list still makes it a MANUAL peer, and a trusted mirror
+    // asks a manual peer for signatures (IsTrustedMirrorAuthorityPeer), the
+    // same standing the pool node above has with the same bit 31. That is
+    // who gets ASKED, not whose word is taken: every signature it relays is
+    // checked against the pinned signer keys, so the cost of a bad answer is
+    // a wasted request. Like every manual peer it is exempt from the ban
+    // hammer while dialled; it holds no noban grant of its own. Lars's
     // "Archive 1", 85.215.122.100:19335, was stuck on a one-block orphan at
     // 261,839 during the same check and is deliberately not listed. Add it
     // with a reading of its own once it follows the tip again.
