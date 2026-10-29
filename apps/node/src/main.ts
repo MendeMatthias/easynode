@@ -102,6 +102,19 @@ type NodePhase =
   | { phase: "stopped" }
   | { phase: "error"; message: string };
 
+/** `NodeStatusInfo.tx_relay` (btx_core::node_api::TxRelayHealth). */
+export type TxRelayHealth =
+  | { state: "unknown"; reason: string }
+  | { state: "receiving"; peers: number; peers_sending: number; tx_bytes_in: number }
+  | {
+      state: "isolated";
+      peers: number;
+      hours_connected: number;
+      peers_wanting_tx: number;
+      priced_out: number;
+      peers_open: number;
+    };
+
 export interface SnapshotServeStatus {
   /** true while the offer is on the wire; null when unmeasured. */
   offering: boolean | null;
@@ -290,6 +303,13 @@ interface NodeStatusInfo {
     feeding_us: number;
     served_by_us: number;
   } | null;
+  /**
+   * Whether the node exchanges transactions with its peers, not just blocks
+   * (btx_core::node_api::TxRelayHealth). The role card already shows it as
+   * its "Transactions" line, sentence rendered in Rust; this is the verdict
+   * itself. Null when stopped or the peer census did not answer.
+   */
+  tx_relay: TxRelayHealth | null;
   /**
    * The stall discriminator's verdict for a frozen trusted mirror, or on any
    * node the catch-up help's conclusion that no archive peer serves old

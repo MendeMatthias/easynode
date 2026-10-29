@@ -1670,6 +1670,7 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     *state.rc_status_cache.lock().await = None;
     *state.stall_verdict.lock().await = None;
     *state.archive_peers_cache.lock().await = None;
+    *state.tx_relay_cache.lock().await = None;
     state.peer_nicknames_cache.lock().await.clear();
     *state.archive_service.lock().await = None;
     *state.matmul_trusted.lock().await = None;
@@ -2639,6 +2640,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
     let stall_slot = state.stall_verdict.clone();
     let rc_cache_slot = state.rc_status_cache.clone();
     let archive_slot = state.archive_peers_cache.clone();
+    let tx_relay_slot = state.tx_relay_cache.clone();
     let nickname_slot = state.peer_nicknames_cache.clone();
     let archive_service_slot = state.archive_service.clone();
     let matmul_trusted_slot = state.matmul_trusted.clone();
@@ -3058,6 +3060,24 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         .as_ref()
                         .map(|ps| btx_core::node_api::summarize_archive_peers(ps));
                     *archive_slot.lock().await = archive_summary.clone();
+                    // Free, from the same peer objects: is this node actually
+                    // exchanging transactions, or only blocks? A node can be
+                    // synced, well peered and serving, and never receive one.
+                    // A node in initial block download asks for none, so the
+                    // judge is told and answers "not known yet" then.
+                    let tx_relay = peer_infos.as_ref().map(|ps| {
+                        btx_core::node_api::judge_tx_relay(
+                            &btx_core::node_api::summarize_tx_relay(
+                                ps,
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs() as i64)
+                                    .unwrap_or(0),
+                            ),
+                            chain.initial_block_download,
+                        )
+                    });
+                    *tx_relay_slot.lock().await = tx_relay.clone();
                     // Free: the peer objects are already in hand this tick.
                     *nickname_slot.lock().await = peer_infos
                         .as_ref()
@@ -3780,6 +3800,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                                 .map(|t| t.total_bytes_sent);
                             // This tick's shared census — no dedicated fetch.
                             r.archive_peers = archive_summary.clone();
+                            r.tx_relay = tx_relay.clone();
                             r.stall = stall_slot.lock().await.clone();
                             r.trusted_mirror = trusted_mirror;
                             r.serving_attestations = settings.attestation_serve_enabled;
@@ -4414,6 +4435,7 @@ pub async fn stop_node_inner(state: &AppState) {
     // them made get_node_status report the dead run's stall as live.
     *state.stall_verdict.lock().await = None;
     *state.archive_peers_cache.lock().await = None;
+    *state.tx_relay_cache.lock().await = None;
     state.peer_nicknames_cache.lock().await.clear();
     *state.archive_service.lock().await = None;
     *state.matmul_trusted.lock().await = None;
@@ -4765,6 +4787,11 @@ pub struct NodeStatusInfo {
     /// trusted mirror is the root cause of the silent-stall class and should
     /// be surfaced BEFORE the height freezes. `None` when stopped/unanswered.
     pub archive_peers: Option<btx_core::node_api::ArchivePeerSummary>,
+    /// Whether the node is exchanging transactions with its peers, not just
+    /// blocks (`receiving` | `isolated` | `unknown`). The role card shows it as
+    /// its "Transactions" line, rendered in Rust; this is the verdict itself.
+    /// `None` when stopped or the peer census did not answer.
+    pub tx_relay: Option<btx_core::node_api::TxRelayHealth>,
     /// The stall discriminator's verdict once the tip has been frozen past the
     /// verdict window (mirrors only). `None` = healthy or no verdict. The
     /// refresher clears it the moment progress resumes.
@@ -5132,7 +5159,19 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         // would hold it back.
         .with_unchecked_history(history.unchecked)
     });
-    let role_lines = role.as_ref().map(|r| r.lines()).unwrap_or_default();
+    // Whether the node exchanges transactions, from the refresher's per-tick
+    // census like archive_peers below. It rides the role card as one more line,
+    // after where the node stands on the chain; no line when there is no
+    // measurement, and none on a card that is not shown.
+    let tx_relay = if running {
+        state.tx_relay_cache.lock().await.clone()
+    } else {
+        None
+    };
+    let mut role_lines = role.as_ref().map(|r| r.lines()).unwrap_or_default();
+    if let (false, Some(h)) = (role_lines.is_empty(), tx_relay.as_ref()) {
+        role_lines.push(btx_core::node_api::tx_relay_line(h));
+    }
     let signing_live = role.as_ref().is_some_and(|r| r.signs_for_mirrors());
     let signer_applies_here = *state.signer_applies_here.lock().await;
 
@@ -5328,6 +5367,7 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         gpu_start_hung: btx_core::node::gpu_start_hung(&datadir),
         graphics_word: btx_core::node::graphics_word(setup_backend()).to_string(),
         archive_peers,
+        tx_relay,
         stall,
         node_profile: settings.node_profile.clone(),
         datadir_pruned: btx_core::node::datadir_has_pruned(&datadir),
