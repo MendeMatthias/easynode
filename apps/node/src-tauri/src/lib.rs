@@ -58,6 +58,7 @@ pub fn run() {
             tools::tools_fast_forward_run,
             tools::tools_fast_forward_status,
             commands::set_keep_awake,
+            commands::set_gpu_recovery_restarts_wsl,
             commands::set_node_profile,
             commands::set_follow_signatures,
             commands::set_attestation_serve,
@@ -70,6 +71,7 @@ pub fn run() {
             commands::node_footprint,
             commands::remove_node_data_now,
             commands::open_global_stats,
+            commands::open_btx_community,
             commands::close_choice,
             commands::set_on_close,
             commands::esplora_preflight,
@@ -166,6 +168,18 @@ pub fn run() {
                 eprintln!(
                     "[node-app] this install will sign confirmations for mirrors from now on; \
                      the welcome panel will say so"
+                );
+            }
+            // The owner's rule of 2026-10-12: every feature on, a machine that
+            // cannot run one simply does not, anyone can switch one off. The
+            // four that were never on by default (wallet panel, Explorer mode,
+            // Esplora, snapshot serving) are turned on once, before the node
+            // starts, so they apply to this run. See
+            // `NodeAppSettings::migrate_features_on`.
+            if NodeAppSettings::migrate_features_on(&node_datadir()) {
+                eprintln!(
+                    "[node-app] turned on the wallet panel, Explorer mode, Esplora and snapshot \
+                     serving; each runs only where it can, and the welcome panel says so"
                 );
             }
 

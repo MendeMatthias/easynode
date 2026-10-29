@@ -85,6 +85,17 @@ const HIDDEN: ValidationView = { state: null, note: "", cls: "" };
 // "Full" and "Basic" grade the CHECKING, not the node. Every install keeps the
 // whole chain (prune=0) and serves it to peers — there is no light mode here to
 // fall back to — so "Basic" must never read as a lesser KIND of node.
+/** The watchdog writes one sentence for the diagnostics and the screen
+ *  alike (btx_core::watchdog `StallVerdict::summary`), lower case and without
+ *  a full stop, to follow "Watchdog: " in the copied diagnostics. On the card
+ *  it is a sentence of its own. */
+function asSentence(s: string): string {
+  const t = s.trim();
+  if (!t) return t;
+  const capped = t.charAt(0).toUpperCase() + t.slice(1);
+  return /[.!?]$/.test(capped) ? capped : `${capped}.`;
+}
+
 export function validationView(status: ValidationInput): ValidationView {
   if (!status.running) return HIDDEN;
 
@@ -97,7 +108,7 @@ export function validationView(status: ValidationInput): ValidationView {
   if (status.stall) {
     return {
       state: "Needs attention",
-      note: status.stall.summary,
+      note: asSentence(status.stall.summary),
       cls: "is-stalled",
     };
   }

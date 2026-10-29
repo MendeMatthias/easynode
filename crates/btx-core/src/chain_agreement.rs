@@ -257,11 +257,27 @@ pub struct SourceRow {
     pub reason: Option<String>,
 }
 
+/// What a comparison says about THIS node, as opposed to about a source. Both
+/// BEHIND and DISAGREE can be about either: "api.btxscan.io/witness is behind
+/// the others" and "Byron Bay explorer has a different block" are about a
+/// source, and the status headline must not turn on those.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThisNode {
+    /// The sources hold newer blocks than this node, on the same chain.
+    Behind,
+    /// No operator holds this node's block, and two or more hold another.
+    Differs,
+}
+
 /// One comparison, with every sentence the screen and the report need.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Agreement {
     pub outcome: Outcome,
     pub status: Status,
+    /// The outcome when it is about this node; `None` when it is about a
+    /// source, or about nothing.
+    pub this_node: Option<ThisNode>,
     /// The row's verdict word: ATTACHED, NOT CHECKED HERE (the weakest input,
     /// spec P5), or NOT RUN when there was nothing to compare.
     pub verdict: String,
@@ -288,6 +304,9 @@ pub struct ScreenRow {
     pub status: String,
     /// The outcome word, or NOT RUN when the comparison is too old.
     pub word: String,
+    /// `behind` | `differs` when the row is about this node, else null; null
+    /// too once the comparison is too old to show.
+    pub this_node: Option<ThisNode>,
     pub headline: String,
     pub scope: String,
     pub meaning: Option<String>,
@@ -572,6 +591,16 @@ pub fn decide(height: u64, own: &Own, reads: &[Read], observed_at: u64) -> Agree
         )
     };
 
+    // Read off the branch the decision took: DISAGREE with no operator on
+    // this node's side is "Your node has a different block ... than N
+    // independent operators", and BEHIND with `own_behind` is "Your node is
+    // behind the others". Every other outcome is about a source or nothing.
+    let this_node = match outcome {
+        Outcome::Disagree if agreeing_ops.is_empty() => Some(ThisNode::Differs),
+        Outcome::Behind if own_behind => Some(ThisNode::Behind),
+        _ => None,
+    };
+
     let (verdict, reason) = if status == Status::Unknown {
         let why = if own_hash.is_none() {
             format!(
@@ -597,6 +626,7 @@ pub fn decide(height: u64, own: &Own, reads: &[Read], observed_at: u64) -> Agree
     Agreement {
         outcome,
         status,
+        this_node,
         verdict: verdict.into(),
         reason,
         height,
@@ -636,6 +666,7 @@ impl Agreement {
             return ScreenRow {
                 status: "unknown".into(),
                 word: NOT_RUN.into(),
+                this_node: None,
                 headline: format!(
                     "The last comparison is more than {} minutes old.",
                     MAX_AGE_SECS / 60
@@ -648,6 +679,7 @@ impl Agreement {
         ScreenRow {
             status: self.status.as_str().to_lowercase(),
             word: self.outcome.as_str().into(),
+            this_node: self.this_node,
             // Spec D5: the good answer is "Nothing wrong seen", with its
             // scope beside it, and never more than that.
             headline: if self.status == Status::Ok {
@@ -1268,6 +1300,77 @@ mod tests {
         assert_eq!(r.word, "AGREE");
         assert_eq!(r.as_of, "as of 14:13 UTC");
         assert_eq!(r.scope, a.scope);
+    }
+
+    // The status headline reads `this_node` (apps/node/src/headline.ts): it
+    // may only turn on a row about this node, never on one about a source.
+
+    #[test]
+    fn the_screen_row_says_when_this_node_is_the_one_behind() {
+        let reads = [
+            read("btxscan", Some(240_050), Some(A)),
+            read("byronbay", Some(240_050), Some(A)),
+        ];
+        let a = decide(240_000, &own(240_006, A), &reads, T);
+        assert_eq!(a.this_node, Some(ThisNode::Behind));
+        assert_eq!(a.screen(T + 60).this_node, Some(ThisNode::Behind));
+    }
+
+    #[test]
+    fn a_source_behind_is_not_about_this_node() {
+        let reads = [
+            read("btxscan", Some(240_030), Some(A)),
+            read("witness-2", Some(240_010), Some(A)),
+            read("byronbay", Some(240_030), Some(A)),
+        ];
+        let a = decide(240_000, &own(240_030, A), &reads, T);
+        assert_eq!(a.outcome, Outcome::Behind);
+        assert_eq!(a.screen(T + 60).this_node, None);
+    }
+
+    #[test]
+    fn the_screen_row_says_when_no_operator_holds_this_nodes_block() {
+        let reads = [
+            read("btxscan", Some(240_010), Some(B)),
+            read("witness-1", Some(240_010), Some(B)),
+            read("byronbay", Some(240_010), Some(B)),
+        ];
+        let a = decide(240_000, &own(240_010, A), &reads, T);
+        assert_eq!(a.screen(T + 60).this_node, Some(ThisNode::Differs));
+    }
+
+    #[test]
+    fn one_source_on_another_branch_is_about_that_source() {
+        let reads = [
+            read("btxscan", Some(240_010), Some(A)),
+            read("witness-1", Some(240_010), Some(A)),
+            read("byronbay", Some(240_010), Some(B)),
+        ];
+        let a = decide(240_000, &own(240_010, A), &reads, T);
+        assert_eq!(a.outcome, Outcome::Disagree);
+        assert_eq!(a.screen(T + 60).this_node, None);
+    }
+
+    #[test]
+    fn a_single_operator_against_this_node_names_nobody() {
+        // One operator cannot say which of the two moved (the red rule).
+        let reads = [
+            read("btxscan", Some(240_010), Some(B)),
+            read("witness-1", Some(240_010), Some(B)),
+        ];
+        let a = decide(240_000, &own(240_010, A), &reads, T);
+        assert_eq!(a.outcome, Outcome::NotEnoughSources);
+        assert_eq!(a.screen(T + 60).this_node, None);
+    }
+
+    #[test]
+    fn an_old_comparison_says_nothing_about_this_node() {
+        let reads = [
+            read("btxscan", Some(240_050), Some(A)),
+            read("byronbay", Some(240_050), Some(A)),
+        ];
+        let a = decide(240_000, &own(240_006, A), &reads, T);
+        assert_eq!(a.screen(T + MAX_AGE_SECS + 1).this_node, None);
     }
 
     #[test]

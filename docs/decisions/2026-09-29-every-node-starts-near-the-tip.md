@@ -153,6 +153,22 @@ public keys. All of an operator's keys together count once. The list for
   background check of history below 228,000 finishes. Nothing in the list does
   that: his confirmer refuses to sign while his node reports an unvalidated
   snapshot chainstate (section 3), which it does until that check finishes.
+- **Jarek** (Byron Bay): `02d12c324ea7eb838bc6f45f047f6ec023cba7042447daaef7b3ac560d186fe030`,
+  the RTX 3070 validator behind archive.btxbyronbay.com. Added in 0.7.16 by
+  the owner's decision of 2026-10-18, after btxchain/btx#239, where Jarek
+  agreed to cut on this grid. His validator exports at every multiple of 1,000
+  while its own tip is that block and publishes the single-signature manifest
+  at `https://api-explorer.btxbyronbay.com/snapshots/` (`latest.json` names
+  the newest). At 251,000 his statement was the 3060's, byte for byte, and so
+  was the file (`confirmed_snapshot::tests::mende_and_jarek_confirm_251000_on_mainnet`).
+  The website picks his manifests up and adds his signature only to a
+  statement it already holds (`site/scripts/pickup-byron-cuts.mjs` in the
+  website repository), so his cut, made at the tip, never opens a statement
+  or a dispute before the 3060's is 144 deep. **An operator key, not a pin**:
+  it confirms a snapshot and has no authority over blocks, and the loader
+  never hands it to the engine (`trim_to_pinned`). Pinning it for blocks is a
+  separate decision with its own cost (the `AuthorityNamespace` note beside
+  `BTX_TRUSTED_ATTESTATION_PUBKEYS`).
 
 **Published.** The same file, byte for byte, is
 `site/src/lib/snapshot-operators.json` in the website repository, and the

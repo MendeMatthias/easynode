@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>easyNode UI preview</title>
+    <style>
+      body { font: 14px/1.5 system-ui, sans-serif; background: #0b0f14; color: #d7e0ea; margin: 24px; }
+      a { color: #4ade80; }
+      li { margin: 4px 0; }
+      code { color: #9fb3c8; }
+    </style>
+  </head>
+  <body>
+    <h1>easyNode UI preview</h1>
+    <p>The real app UI with the backend mocked (preview/scenarios.ts). Open a scenario at the app's window size, 560 by 780. Add <code>&amp;open=settings</code>, <code>ask</code>, <code>tools</code>, <code>wallet</code>, <code>info</code>, <code>future</code>, <code>close</code>, <code>quitting</code>, <code>update</code> or <code>compact</code>.</p>
+    <ul id="list"></ul>
+    <script type="module">
+      import { scenarioList } from "./scenarios.ts";
+      const ul = document.getElementById("list");
+      for (const s of scenarioList) {
+        const li = document.createElement("li");
+        const a = document.createElement("a");
+        a.href = `/?s=${s.key}`;
+        a.textContent = s.key;
+        li.append(a, ` ${s.label}`);
+        ul.append(li);
+      }
+    </script>
+  </body>
+</html>

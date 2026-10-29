@@ -306,13 +306,13 @@ impl ForkAlarm {
                 let mins = since_secs / 60;
                 if *bodies_unserved {
                     format!(
-                        "Your node has known of {behind} block headers beyond its own blocks \
+                        "Your node has known of {behind} newer blocks beyond its own \
                          for {mins} minutes and the gap is not closing: no connected peer is \
                          serving them. Your view of the chain may be behind."
                     )
                 } else {
                     format!(
-                        "Your node has known of {behind} block headers beyond its own blocks \
+                        "Your node has known of {behind} newer blocks beyond its own \
                          for {mins} minutes and the gap is not closing. Its peers are serving \
                          normally and btxd reports no missing body, so the hold-up is on this \
                          machine rather than the network. Your view of the chain may be behind."
@@ -450,7 +450,7 @@ mod tests {
             !msg.contains(SERVED_BODY_TIP_MARKER_PHRASE),
             "must not accuse peers without evidence: {msg}"
         );
-        assert!(msg.contains("41 block headers"), "{msg}");
+        assert!(msg.contains("41 newer blocks"), "{msg}");
         assert!(msg.contains("574 minutes"), "{msg}");
         assert!(
             msg.contains("on this machine rather than the network"),

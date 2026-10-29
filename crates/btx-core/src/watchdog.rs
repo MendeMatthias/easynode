@@ -423,7 +423,7 @@ pub fn discriminate(f: &StallFacts) -> Option<StallVerdict> {
         class: StallClass::BodyMissing,
         summary: Cow::Borrowed(
             "this node has asked for the next blocks and no peer has served them yet; \
-                  this is peer selection, not corruption — archive/noban peers usually fix it",
+                  this is peer selection, not corruption, and archive/noban peers usually fix it",
         ),
     })
 }
@@ -531,7 +531,7 @@ fn no_qualifying_peer_verdict() -> StallVerdict {
     StallVerdict {
         class: StallClass::NoQualifyingPeer,
         summary: Cow::Borrowed(
-            "no connected peer is allowed to hand this node signed confirmations — \
+            "no connected peer is allowed to hand this node signed confirmations, so the app is \
                   redialling the known archive peers (an RPC addnode counts as manual and \
                   passes the gate with no restart)",
         ),

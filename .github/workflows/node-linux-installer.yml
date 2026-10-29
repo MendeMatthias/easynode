@@ -144,9 +144,19 @@ env:
   # version v0.34.12`, SMOKE PASSED, and the artifact carries libcublasLt.so.13.
   # Artifact 394140055 bytes. The install key is plain `v0.34.12`, equal to what
   # the binary reports.
-  PROVEN_BTXD_RUN_ID: "36723618840"
-  PROVEN_BTXD_ARTIFACT: "btxd-linux-5f32c4c4d1cb033180bcd40a461deae2c1bc1ee1"
-  PROVEN_BTXD_COMMIT: "5f32c4c4d1cb033180bcd40a461deae2c1bc1ee1"
+  #
+  # MOVED 2026-10-10 to the upstream TAG v0.34.15 = 476f3f23, because mainnet
+  # block 244000 switched on consensus checks 0.34.12 lacks (commands.rs has
+  # the reasoning). Run 38062016894, dispatched on claude/engine-0.34.15 with
+  # the ref read from the pin: completed success, log proved `tree pristine at
+  # 476f3f23...`, `native model network ... OFF`, architectures present sm_120
+  # sm_75 sm_86 sm_89 in btxd and libbtx_matmul_backend.a, `BTX daemon version
+  # v0.34.15`, SMOKE PASSED, and the artifact carries libcublasLt.so.13.
+  # Artifact 394270094 bytes. The install key is plain `v0.34.15`, equal to
+  # what the binary reports.
+  PROVEN_BTXD_RUN_ID: "38062016894"
+  PROVEN_BTXD_ARTIFACT: "btxd-linux-476f3f23e15228bb3e6119ed1e139a9b25424ce8"
+  PROVEN_BTXD_COMMIT: "476f3f23e15228bb3e6119ed1e139a9b25424ce8"
 
 jobs:
   build-node-linux:
