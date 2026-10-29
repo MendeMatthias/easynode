@@ -1125,6 +1125,15 @@ pub async fn get_net_totals(rpc: &dyn Rpc) -> AppResult<NetTotals> {
     serde_json::from_value(v).map_err(|e| crate::error::AppError::Decode(e.to_string()))
 }
 
+/// btxd's own uptime in seconds (`uptime`). It is what `getnettotals` resets
+/// with, which the app's run clock is not: an app relaunch adopts a running
+/// engine, counters and all.
+pub async fn get_engine_uptime(rpc: &dyn Rpc) -> AppResult<u64> {
+    let v = rpc.call("uptime", json!([])).await?;
+    v.as_u64()
+        .ok_or_else(|| crate::error::AppError::Decode(format!("uptime is not a count: {v}")))
+}
+
 /// Unload the named wallet (`unloadwallet <name>`). Used by `reset_account` so
 /// the wallet dir can be moved without the node holding an open handle on it.
 pub async fn unload_wallet(rpc: &dyn Rpc, name: &str) -> AppResult<()> {

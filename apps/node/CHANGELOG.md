@@ -8,6 +8,15 @@ root).
 
 ## [Unreleased]
 
+**You can count your node in the network's totals.** easybtx.com can now say
+how much the easyNode network uploads to other nodes, over the last day, the
+last week and since counting began, but only from nodes that report it. A new
+switch in Settings, under For operators, does that: off unless you turn it
+on. It sends the same numbers a signing node already sends with its key
+(versions, uptime, block height, connection counts, bytes uploaded), and no
+wallet, address or key. A signing node that offers its key is counted
+already. easybtx.com accepts the new report since EasyBTX#584.
+
 **Your node now says whether it is exchanging transactions, not just
 blocks.** A node can be synced, well connected and serving blocks, and still
 never receive a transaction from anyone. On 6 September that was the real
