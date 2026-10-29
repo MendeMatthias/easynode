@@ -215,6 +215,32 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // catch-up help matches these against the engine's peer addresses; if the
     // host moves, the name above is where to look first.
     "134.199.150.193:19335",
+    // Lars Zimmer's FULL-HISTORY archive ("Archive 2"), announced by its
+    // operator 2026-10-28 in the BTX Unicorns "Nodes & Ops" topic, with Jpp's
+    // help, as online 24/7, monitored, and free to use for syncing new nodes.
+    // Measured from this project's Mac 2026-10-28 22:27Z-22:42Z: /BTX:0.34.15/,
+    // protocol 800002, services 0x82000d09 (NETWORK, WITNESS, SHIELDED,
+    // NETWORK_LIMITED, P2P_V2, MATMUL_TRUSTED_MIRROR and the attestation-archive
+    // bit 31), and on the same tip as btxscan for six readings in a row
+    // (`getheaders` from btxscan's tip answered 0 headers). `getdata` for block
+    // 1,000 and block 150,000 (1,048,962 bytes, parent 06754227…) returned the
+    // right blocks. `getmmattest` returned two signatures for 261,840 but none
+    // for 240,000 or 227,313, which btxscan's 19335 served in the same minute.
+    //
+    // So it sits here beside Jarek's archive and NOT in BTX_ARCHIVE_PEERS: a
+    // second, independent site for old BLOCKS, but not a source of old
+    // signatures, which is what that list and its noban grant are for.
+    // Being in this list still makes it a MANUAL peer, and a trusted mirror
+    // asks a manual peer for signatures (IsTrustedMirrorAuthorityPeer), the
+    // same standing the pool node above has with the same bit 31. That is
+    // who gets ASKED, not whose word is taken: every signature it relays is
+    // checked against the pinned signer keys, so the cost of a bad answer is
+    // a wasted request. Like every manual peer it is exempt from the ban
+    // hammer while dialled; it holds no noban grant of its own. Lars's
+    // "Archive 1", 85.215.122.100:19335, was stuck on a one-block orphan at
+    // 261,839 during the same check and is deliberately not listed. Add it
+    // with a reading of its own once it follows the tip again.
+    "217.154.143.140:19335",
     // 89.167.80.220 and 51.15.18.10 REMOVED 2026-09-05. Both /BTX:0.32.12/,
     // both measured parked at 185,109 on a pre-fork dead branch and answering
     // 2,000 headers of it to anyone who asks; the validator has carried both
@@ -8144,10 +8170,13 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
         // three TCP dials each from the Mac and are down in the census.
         // 2026-10-11: 1 became 2 — Jarek's full-history archive at
         // 134.199.150.193, measured serving blocks 1,000 and 150,000.
+        // 2026-10-28: 2 became 3 — Lars Zimmer's full-history archive at
+        // 217.154.143.140, measured at the tip and serving blocks 1,000 and
+        // 150,000. His second archive was on an orphan and stays out.
         assert_eq!(
             BTX_BOOTSTRAP_PEERS.len(),
-            2,
-            "BTX_BOOTSTRAP_PEERS should have 2 entries"
+            3,
+            "BTX_BOOTSTRAP_PEERS should have 3 entries"
         );
     }
 
