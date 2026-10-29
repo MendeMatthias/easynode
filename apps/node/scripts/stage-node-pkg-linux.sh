@@ -21,13 +21,13 @@
 # Usage:  apps/node/scripts/stage-node-pkg-linux.sh
 set -euo pipefail
 
-VERSION="0.34.12"
+VERSION="0.34.15"
 TARBALL_URL="https://github.com/btxchain/btx/releases/download/v${VERSION}/btx-${VERSION}-x86_64-linux-gnu.tar.gz"
-# From the release's SHA256SUMS. Upstream has re-generated release assets in
-# place before, and a silent swap must FAIL here, never ship unnoticed. v0.34.12
-# publishes that file UNSIGNED (no SHA256SUMS.asc), so this pins the bytes, not
-# a signature.
-TARBALL_SHA256="933c4c1ab34726fe0a5f4d85c7ee76e88ddd272b89ce85ccdb7bb5c23b20ace8"
+# Upstream has re-generated release assets in place before, and a silent swap
+# must FAIL here, never ship unnoticed. v0.34.15 publishes NO SHA256SUMS at
+# all; this is GitHub's asset digest for the file, which equals the hash
+# upstream lists on btxchain/btx PR 223. It pins the bytes, not a signature.
+TARBALL_SHA256="9dbaef6ffab696535794bfb7ea3b6318fa391578599970ec75a33ff1872e7dec"
 # NOTE: upstream publishes no `aarch64-linux-gnu` asset, so there is no ARM-Linux
 # node to stage. This script is x86_64-only by construction and always was; the
 # gap is called out here so nobody spends an afternoon looking for the tarball.
@@ -64,6 +64,10 @@ DEST="$APP_DIR/src-tauri/resources/node-pkg"
 # shellcheck source=lib/engine-pin.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/engine-pin.sh"
 assert_matches_engine_pin "$APP_DIR" "$VERSION"
+# Both upstream archive formats (0.34 .tar.gz, 0.35 .tar.xz + SHA384), the
+# layout gate and the exact-version check. See the file.
+# shellcheck source=lib/release-archive.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/release-archive.sh"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "error: this stages the LINUX node package and must run on Linux." >&2
@@ -76,15 +80,20 @@ if [[ -z "$SRC" ]]; then
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
   echo "==> downloading $TARBALL_URL"
-  curl -fsSL --retry 3 -o "$tmp/pkg.tgz" "$TARBALL_URL"
-  echo "$TARBALL_SHA256  $tmp/pkg.tgz" | sha256sum -c -
-  tar -xzf "$tmp/pkg.tgz" -C "$tmp"
-  SRC="$tmp/btx-$VERSION"
+  curl -fsSL --retry 3 -o "$tmp/pkg.archive" "$TARBALL_URL"
+  release_archive_verify "$tmp/pkg.archive" "$TARBALL_SHA256"
+  SRC="$(release_archive_extract "$tmp/pkg.archive" "$tmp/x")"
 fi
 
 if [[ ! -x "$SRC/bin/btxd" ]]; then
   echo "error: no BTX node package at $SRC (expected bin/btxd)." >&2
   echo "       Set EASYBTX_NODE_PKG_SRC to an extracted release package dir." >&2
+  exit 1
+fi
+# The copy below is libexec/*.real-shaped; refuse 0.35's layout until adapted.
+require_034_layout "$SRC"
+if ! btxd_reports_exact_version "$SRC/bin/btxd" "$VERSION"; then
+  echo "error: $SRC/bin/btxd is not exactly v$VERSION (reported: $("$SRC/bin/btxd" --version 2>&1 | head -1))" >&2
   exit 1
 fi
 

@@ -1,0 +1,11 @@
+[package]
+name = "rolegen"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+btx-core = { path = "../../../../crates/btx-core" }
+serde_json = "1"
+
+[workspace]

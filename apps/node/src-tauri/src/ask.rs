@@ -84,7 +84,9 @@ pub async fn ask_chain_progress(state: State<'_, AppState>) -> Result<Ask<ChainP
         btx_core::health::sync_readiness(&chainstates, &chain, snapshot_spec().anchor_height);
     Ok(Ask::Ready(ChainProgress {
         height: readiness.height(),
-        headers: chain.headers,
+        // "Block X of ~Y": the network height once blocks move
+        // (`commands::phase_target`, btx_core::network_height).
+        headers: crate::commands::phase_target(&chain, readiness.height()),
         progress: readiness.progress(),
         near_tip: readiness.is_near_tip(),
         peers: peers.unwrap_or(0),
@@ -275,7 +277,7 @@ fn block_error_to_ask(e: AppError) -> Ask<BlockAnswer> {
             code: -1,
             ref message,
         } if message.contains("Block not available") => Ask::Unavailable {
-            message: "Your node hasn't downloaded that block yet — it's still \
+            message: "Your node hasn't downloaded that block yet: it is still \
                           backfilling older history in the background. Ask for a newer \
                           block, or try again later."
                 .into(),
@@ -405,6 +407,17 @@ pub async fn ask_tx_index_status(state: State<'_, AppState>) -> Result<Ask<TxInd
     }
 }
 
+/// Why Explorer mode does not run on a node that prunes, for Ask and Settings.
+pub const EXPLORER_NEEDS_WHOLE_CHAIN: &str = "Not on this node: Explorer mode needs the whole \
+     chain, and this node keeps only the newest blocks.";
+
+/// Whether Explorer mode can run here: no pruning in effect or chosen. The
+/// keeper profile counts before its conf is written, at the next start.
+pub fn explorer_mode_available(datadir: &std::path::Path) -> bool {
+    NodeAppSettings::load(datadir).node_profile != "keeper"
+        && btx_core::setup::explorer_mode_possible_here(datadir)
+}
+
 /// Turn Explorer mode on/off: persist the choice, write/remove `txindex=1` in
 /// the faststart conf, and (when the node is running) restart it gracefully so
 /// btxd picks the flag up. The node stays fully usable while the index builds.
@@ -415,6 +428,12 @@ pub async fn set_explorer_mode(
     on: bool,
 ) -> Result<(), String> {
     let datadir = node_datadir();
+    // BTX refuses to start with pruning and a transaction index together
+    // (src/init.cpp:2077): turning this on for a keeper or a pruned folder
+    // used to write `txindex=1` and leave the node unable to start.
+    if on && !explorer_mode_available(&datadir) {
+        return Err(EXPLORER_NEEDS_WHOLE_CHAIN.to_string());
+    }
     let conf = datadir.join("faststart").join("faststart.conf");
     btx_core::setup::set_conf_kv(&conf, "txindex", if on { Some("1") } else { None })
         .map_err(|e| e.to_string())?;

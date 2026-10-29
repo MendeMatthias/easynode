@@ -104,12 +104,42 @@ fn toggle_node(app: &AppHandle) {
 }
 
 /// Project the phase onto the tray's status + toggle items. Called from the
-/// status refresher and the start/stop paths; cheap and best-effort.
+/// start/stop paths; cheap and best-effort. The status refresher calls
+/// [`reflect_status`], which also knows whether the node is stuck.
 pub fn reflect_phase(app: &AppHandle, phase: &NodePhase) {
-    let Some(handles) = app.try_state::<TrayHandles>() else {
-        return;
-    };
-    let (status, running) = match phase {
+    reflect_status(app, phase, false);
+}
+
+/// Whether the tray calls a running node stuck: the watchdog's verdict
+/// (frozen 15 minutes, `btx_core::watchdog`), or a tip older than
+/// `TIP_STALE_AFTER_SECS` with no newer block known. A node that knows of
+/// newer blocks and has an old tip is usually closing a gap from an older
+/// snapshot; only the window holds the trend that tells a closing gap from a
+/// pinned one (catchup-trend.ts), so the tray leaves that case to it.
+pub fn stuck_for_tray(stall_verdict: bool, tip_stale: bool, blocks_behind: u64) -> bool {
+    stall_verdict || (tip_stale && blocks_behind < 2)
+}
+
+/// "245,498".
+fn group(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The tray's status line and whether the node run is active. Pure, so it
+/// is tested. `stuck` turns "running" into "not following", the word the
+/// window's headline uses (headline.ts): on 2026-10-12 every node following
+/// signatures stood at block 245,498 for hours while this line said
+/// "running".
+pub fn tray_status(phase: &NodePhase, stuck: bool) -> (String, bool) {
+    match phase {
         NodePhase::Welcome => ("Node: not set up yet".to_string(), false),
         NodePhase::Downloading { progress } => {
             (format!("Setting up… {:.0}%", progress * 100.0), false)
@@ -121,10 +151,24 @@ pub fn reflect_phase(app: &AppHandle, phase: &NodePhase) {
         NodePhase::Syncing { progress, .. } => {
             (format!("Node: syncing {:.0}%", progress * 100.0), true)
         }
-        NodePhase::Ready { height, .. } => (format!("Node: running · block {height}"), true),
+        NodePhase::Ready { height, .. } if stuck => (
+            format!("Node: not following · block {}", group(*height)),
+            true,
+        ),
+        NodePhase::Ready { height, .. } => {
+            (format!("Node: running · block {}", group(*height)), true)
+        }
         NodePhase::Stopped => ("Node: stopped".to_string(), false),
         NodePhase::Error { .. } => ("Node: needs attention".to_string(), false),
+    }
+}
+
+/// [`reflect_phase`], with whether the node is stuck ([`stuck_for_tray`]).
+pub fn reflect_status(app: &AppHandle, phase: &NodePhase, stuck: bool) {
+    let Some(handles) = app.try_state::<TrayHandles>() else {
+        return;
     };
+    let (status, running) = tray_status(phase, stuck);
     let _ = handles.status.set_text(status);
     let _ = handles
         .toggle
@@ -139,4 +183,89 @@ pub fn reflect_phase(app: &AppHandle, phase: &NodePhase) {
             | NodePhase::Welcome
     );
     let _ = handles.toggle.set_enabled(actionable);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_node_at_its_tip_reads_running_with_the_block_grouped() {
+        let p = NodePhase::Ready {
+            height: 245_760,
+            peers: 9,
+            blocks_behind: 0,
+        };
+        assert_eq!(
+            tray_status(&p, false),
+            ("Node: running · block 245,760".to_string(), true)
+        );
+    }
+
+    // 2026-10-12: every node following signatures stood at 245,498 for
+    // hours while this line said "running".
+    #[test]
+    fn a_stuck_node_reads_not_following() {
+        let p = NodePhase::Ready {
+            height: 245_498,
+            peers: 9,
+            blocks_behind: 0,
+        };
+        assert_eq!(
+            tray_status(&p, true),
+            ("Node: not following · block 245,498".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn stuck_only_changes_a_running_node() {
+        assert_eq!(
+            tray_status(&NodePhase::Stopped, true),
+            ("Node: stopped".to_string(), false)
+        );
+        let s = NodePhase::Syncing {
+            height: 200_000,
+            headers: 245_760,
+            progress: 0.62,
+            peers: 8,
+        };
+        assert_eq!(
+            tray_status(&s, false),
+            ("Node: syncing 62%".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn the_watchdog_verdict_is_stuck() {
+        assert!(stuck_for_tray(true, false, 0));
+    }
+
+    #[test]
+    fn an_old_tip_with_nothing_newer_known_is_stuck() {
+        assert!(stuck_for_tray(false, true, 0));
+        assert!(stuck_for_tray(false, true, 1));
+    }
+
+    #[test]
+    fn an_old_tip_while_catching_up_is_not_called_stuck_here() {
+        // A node closing a gap from an older snapshot has an old tip by
+        // construction; only the window has the trend that tells a closing
+        // gap from a pinned one (catchup-trend.ts), so the tray stays quiet.
+        assert!(!stuck_for_tray(false, true, 2));
+        assert!(!stuck_for_tray(false, true, 460));
+    }
+
+    #[test]
+    fn nothing_wrong_is_not_stuck() {
+        assert!(!stuck_for_tray(false, false, 0));
+    }
+
+    #[test]
+    fn grouping_puts_a_comma_every_three_digits() {
+        assert_eq!(group(0), "0");
+        assert_eq!(group(999), "999");
+        assert_eq!(group(1_000), "1,000");
+        assert_eq!(group(245_498), "245,498");
+        assert_eq!(group(1_234_567), "1,234,567");
+    }
 }

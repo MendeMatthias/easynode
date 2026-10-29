@@ -1,6 +1,9 @@
 # Signer keys on a signed list (design note, not built)
 
-Status: a note for later. 0.7.2 does not build this. It ships the other half:
+Status: a note for later, still not built as of 0.7.5. How a key would get
+onto this list over time (heard, track record, candidate, promoted, dropped)
+is in `docs/earned-trust.md`; promotion there is always a human signature on
+this list. 0.7.2 shipped the other half:
 a mirror whose pinned keys sign nothing it can accept now says so
 (`StallClass::PinsRejectEverySignature`, `crates/btx-core/src/watchdog.rs`),
 and Copy diagnostics lists the live pin and the shipped keys it lacks.

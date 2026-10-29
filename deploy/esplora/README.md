@@ -18,6 +18,7 @@ is worth doing at all.
 | `build-caddy.sh` | builds a Caddy WITH the rate-limit plugin this front needs |
 | `install-systemd.sh` | installs the units, `--mode witness` (default) or `--mode esplora` |
 | `btx-witness.service.template` | the witness server as a unit; runs on any node, pruned or not |
+| `btx-confirmer.service.template` | the snapshot confirmer as a unit, for a listed operator without the app |
 | `test-witness.sh` | proves the node here can serve as a fork witness |
 | `test-front.sh` | starts the real Caddyfile against stubs and checks every claim in it |
 | `test-guardian.sh` | runs the freshness guardian against stubs and pins that it agrees with the Rust |
@@ -68,6 +69,34 @@ engine and rewrote the cookie, and from 11:46:06Z every request logged
 `HTTP 401 Unauthorized` while the public endpoint answered `the node did not
 answer` with `x-btx-freshness: unverified`, until `systemctl --user restart
 btx-witness` at 11:47:37Z.
+
+A **confirmer** co-signs the snapshot network's statements, or dissents, by
+its own node's diary. It is for an operator on the snapshot network's list
+whose node the app does not run. It needs a node that checks blocks itself
+and has its signing key configured (`matmulattestationsignerkeyfile=`), as it
+does to sign blocks:
+
+```bash
+(cd crates/btx-core && cargo build --release --bin btx-confirmer)
+sudo install -m755 crates/btx-core/target/release/btx-confirmer /usr/local/bin/
+sudo install -d -o USER /var/lib/btx-confirmer /var/lib/btx/snapshot-confirmer
+sudo cp deploy/esplora/btx-confirmer.service.template /etc/systemd/system/btx-confirmer.service
+# replace USER (the user btxd runs as), PUBKEY (the node's signing public key,
+# the one on the operator list) and the paths, then
+sudo systemctl enable --now btx-confirmer
+journalctl -fu btx-confirmer
+```
+
+It keeps its diary and the log of what it signed in `--state`, and the copy
+the node signs in `<datadir>/snapshot-confirmer/`. It takes the node's signing
+public key from `--pubkey`, so it never opens the private key file; the node
+signs with the private half. Without `--pubkey` it derives the public key from
+the file `<datadir>/btx.conf` names, else `<datadir>/attestation-signer.key`,
+or `--signer-key`, and wipes the private key from memory at once. It refuses to start, with exit status
+3 and the reason, on another chain or replay context, on a node that follows
+signatures, without a key, or with a key not on the list. Until the node's
+background check of older history finishes it records and signs nothing.
+`install-systemd.sh` does not install it.
 
 **Esplora** serves the whole API, balances included, and needs `prune=0`, the
 full ~124 GiB chain and an index on top:

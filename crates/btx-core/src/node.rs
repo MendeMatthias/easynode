@@ -128,9 +128,9 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // 05:00Z; getaddednodeinfo connected=false; a fresh onetry produced no
     // peer; three spaced probes from the Mac were refused. Refused, not slow.
     //
-    // It stays in BTX_ARCHIVE_PEERS below, because it is the only archive this
-    // app ships and upstream's maintainer node has come back before; being
-    // there it is still dialled, just after the three seeds that answer. What
+    // It stayed in BTX_ARCHIVE_PEERS below until 2026-10-03 (measured dead
+    // there too, see that list), because upstream's maintainer node had come
+    // back before; there it was still dialled, after the seeds that answer. What
     // it must not be is the FIRST dial every fresh node makes. Put it back here
     // the day a real node handshakes it again, with that reading.
     //
@@ -149,8 +149,9 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // seconds apart, eight-second timeout, refused on all three. Corroborated
     // by the easybtx.com census, which lists this seed as down with 0% uptime
     // over its stored history. Its noban grant in BTX_LIVE_BODY_SOURCE_IPS
-    // stays, as the two retired above kept theirs. Put it back the day a real
-    // node handshakes it again, with that reading.
+    // stayed until 2026-10-29 and is now revoked with the two above (see
+    // BTX_REVOKED_WHITELIST_IPS). Put it back the day a real node handshakes
+    // it again, with that reading, and the grant with it.
     //
     //   "89.85.40.184:19335"  0/3 refused — 2026-10-01
     // 139.59.106.83 REMOVED 2026-09-01. Three independent confirmations that it
@@ -197,6 +198,50 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // AND current (docs/archival-capacity.md).
     // 2026-09-05 19:49Z: answered at 210862 (minority branch, ten behind it).
     "109.199.124.187:19335",
+    // archive.btxbyronbay.com, Jarek's FULL-HISTORY archive, offered by its
+    // operator 2026-10-11 ("serves the entire chain: every block header and
+    // every full block"). Measured from this project's Mac the same day, by
+    // name and by this IP: /BTX:0.34.15/, protocol 800002, start height
+    // 244,596 (the pool seed above read 244,597 in the same minute), services
+    // 0x2000d09 = NETWORK, WITNESS, SHIELDED, NETWORK_LIMITED, P2P_V2 and
+    // MATMUL_TRUSTED_MIRROR. Then asked for deep bodies: `getdata` for block
+    // 1,000 returned it in 0.6 s and for block 150,000 (1,048,962 bytes) in
+    // 2.3 s, each naming the right parent (894cc48f… and 06754227…).
+    //
+    // It sits here, after the live-chain seed, and NOT in BTX_ARCHIVE_PEERS:
+    // it carries no MATMUL_ATTESTATION_ARCHIVE bit and is itself a trusted
+    // mirror, so it cannot hand signatures to a mirror, which is what that
+    // list is for. What it does hold is the whole chain, which no other entry
+    // in either list does. Literal IP, like every entry here, because the
+    // catch-up help matches these against the engine's peer addresses; if the
+    // host moves, the name above is where to look first.
+    "134.199.150.193:19335",
+    // Lars Zimmer's FULL-HISTORY archive ("Archive 2"), announced by its
+    // operator 2026-10-28 in the BTX Unicorns "Nodes & Ops" topic, with Jpp's
+    // help, as online 24/7, monitored, and free to use for syncing new nodes.
+    // Measured from this project's Mac 2026-10-28 22:27Z-22:42Z: /BTX:0.34.15/,
+    // protocol 800002, services 0x82000d09 (NETWORK, WITNESS, SHIELDED,
+    // NETWORK_LIMITED, P2P_V2, MATMUL_TRUSTED_MIRROR and the attestation-archive
+    // bit 31), and on the same tip as btxscan for six readings in a row
+    // (`getheaders` from btxscan's tip answered 0 headers). `getdata` for block
+    // 1,000 and block 150,000 (1,048,962 bytes, parent 06754227…) returned the
+    // right blocks. `getmmattest` returned two signatures for 261,840 but none
+    // for 240,000 or 227,313, which btxscan's 19335 served in the same minute.
+    //
+    // So it sits here beside Jarek's archive and NOT in BTX_ARCHIVE_PEERS: a
+    // second, independent site for old BLOCKS, but not a source of old
+    // signatures, which is what that list and its noban grant are for.
+    // Being in this list still makes it a MANUAL peer, and a trusted mirror
+    // asks a manual peer for signatures (IsTrustedMirrorAuthorityPeer), the
+    // same standing the pool node above has with the same bit 31. That is
+    // who gets ASKED, not whose word is taken: every signature it relays is
+    // checked against the pinned signer keys, so the cost of a bad answer is
+    // a wasted request. Like every manual peer it is exempt from the ban
+    // hammer while dialled; it holds no noban grant of its own. Lars's
+    // "Archive 1", 85.215.122.100:19335, was stuck on a one-block orphan at
+    // 261,839 during the same check and is deliberately not listed. Add it
+    // with a reading of its own once it follows the tip again.
+    "217.154.143.140:19335",
     // 89.167.80.220 and 51.15.18.10 REMOVED 2026-09-05. Both /BTX:0.32.12/,
     // both measured parked at 185,109 on a pre-fork dead branch and answering
     // 2,000 headers of it to anyone who asks; the validator has carried both
@@ -231,6 +276,26 @@ pub const BTX_ARCHIVE_PEERS: &[&str] = &[
     // but dials nobody who holds its signatures stays at 227,312 all the same.
     // Signers already dial it (signer::BTX_MIRRORS_FED_BY_SIGNERS), once.
     "20.86.181.203:19338",
+    // 2026-10-10: btxscan's OTHER node on the same box, port 19335, the one
+    // with the whole chain. Owner's decision the same evening, after 0.7.9
+    // shipped Jarek's archive. Measured from this project's Mac:
+    // /BTX:0.34.15/, at the tip (start height 244,623), services 0x82000d09 =
+    // NETWORK, WITNESS, SHIELDED, NETWORK_LIMITED, P2P_V2,
+    // MATMUL_TRUSTED_MIRROR and MATMUL_ATTESTATION_ARCHIVE. `getdata` for block
+    // 150,000 returned its 1,048,962 bytes in 0.9 s naming parent 06754227…,
+    // where 19338 above and 109.199.124.187 answered NOTFOUND. GETMMATTEST
+    // returned `02d5efca`'s signature, the key signing the chain, for 244,652,
+    // for 240,000 and for 227,313 `d5f0e92f` itself. So it is both halves of
+    // what this list is for: signatures for a mirror, and the old blocks the
+    // catch-up help asks for.
+    //
+    // Same machine as 19338: a second node for when one of the two stalls
+    // (as 19338 did on 2026-10-10, handshaking nobody while btxscan sat at
+    // 244,097), not a second site. The independent full-history source is
+    // Jarek's archive in BTX_BOOTSTRAP_PEERS; this one has no MATMUL bits of
+    // its own to lose a race over. 20.86.181.203 already holds the noban grant
+    // in BTX_ARCHIVE_WHITELIST_IPS, which covers both ports.
+    "20.86.181.203:19335",
     // 207.56.229.99, 114.150.94.235 and 195.137.245.82 were measured 0/3 on
     // 2026-09-08 and are listed with that measurement in BTX_BOOTSTRAP_PEERS
     // above. An archive that does not answer cannot be a download source, and
@@ -243,10 +308,21 @@ pub const BTX_ARCHIVE_PEERS: &[&str] = &[
     // 2026-08-31: upstream's maintainer-grade node. Runs the unreleased 0.34.6
     // and advertises MATMUL_ATTESTATION_ARCHIVE (observed live the same day),
     // and confirmed again 2026-09-08 from a running node: NETWORK, CONSENSUS
-    // and ATTESTATION_ARCHIVE, 12.1 MB served in six minutes. After the two
-    // removals above this is the ONLY archive this app ships, which is worth
-    // knowing before anyone reasons about how many we have.
-    "37.230.134.222:19335",
+    // and ATTESTATION_ARCHIVE, 12.1 MB served in six minutes.
+    //
+    // ── MEASURED DEAD 2026-10-03, so it leaves the list ─────────────────────
+    // Refused since 2026-09-12 23:31Z, recorded in BTX_BOOTSTRAP_PEERS above
+    // where it left the head. Probed again from this project's Mac at 23:35Z:
+    // three TCP attempts, four seconds apart, eight-second timeout, 0/3. It
+    // goes now because btx-sentinel, the box watcher, dials every shipped seed
+    // and would otherwise alarm on it every hour. Its noban grant in
+    // BTX_ARCHIVE_WHITELIST_IPS stayed until 2026-10-29 and is now revoked
+    // (see BTX_REVOKED_WHITELIST_IPS for why a dead host's grant goes). With
+    // it gone, btxscan's mirror above is the ONLY archive this app ships,
+    // which is worth knowing before anyone reasons about how many we have.
+    // Put it back the day a real node handshakes it again, with that reading.
+    //
+    //   "37.230.134.222:19335"  0/3 refused — 2026-10-03
     // 185.204.25.227 removed 2026-08-31: refused TCP outright in every probe
     // that day and upstream's re-vetted census no longer lists it.
 ];
@@ -392,18 +468,30 @@ pub fn manual_peers() -> Vec<&'static str> {
 /// incoming-only, and the connection addnode creates is OUTGOING — a bare
 /// whitelist therefore does nothing for it. `noban` is what turns an ordinary
 /// consensus/archive peer into a preferred-download + attestation-authority
-/// peer on a trusted mirror. Whitelist takes IPs, not hostnames, so the DNS
-/// archives appear here by their resolved IPs (resolution 2026-08-17:
-/// node.btx.dev=146.190.179.86, node.btxchain.org=206.189.253.106,
-/// node.btx.tools=164.90.246.229). A stale IP line is harmless — it simply
-/// matches no peer.
+/// peer on a trusted mirror. Whitelist takes IPs, not hostnames.
+///
+/// ONLY LIVE, SHIPPED PEERS. Every entry here must be the host of a peer in
+/// [`block_source_peers`]; `noban_grants_only_name_shipped_block_sources`
+/// fails the build otherwise. This list used to say "a stale IP line is
+/// harmless, it simply matches no peer", and on that reasoning a retired
+/// archive kept its grant. That holds only while nobody else holds the
+/// address. Cloud and residential IPs get reassigned, and whoever gets one of
+/// these next would get ban immunity on inbound and outbound connections,
+/// preferred block download on a trusted mirror, and attestation authority the
+/// moment it advertised the archive bit, from every install, with nothing on
+/// screen. A dead host's grant buys us nothing while it is dead, so it goes
+/// when the peer goes, into [`BTX_REVOKED_WHITELIST_IPS`].
 pub const BTX_ARCHIVE_WHITELIST_IPS: &[&str] = &[
-    // btxscan.io's mirror, the archive peer added 2026-09-24 (BTX_ARCHIVE_PEERS).
+    // btxscan.io's two nodes on one box, 19338 (mirror, added 2026-09-24) and
+    // 19335 (full node, added 2026-10-10), both in BTX_ARCHIVE_PEERS. One
+    // grant covers both ports.
     "20.86.181.203",
-    "207.56.229.99",
-    "37.230.134.222",
-    "114.150.94.235",
-    "195.137.245.82",
+    // 207.56.229.99, 114.150.94.235 and 195.137.245.82 (0/3 since 2026-09-08)
+    // and 37.230.134.222 (refused since 2026-09-12, left BTX_ARCHIVE_PEERS
+    // 2026-10-03) were here, measured dead, until 2026-10-29. Their grants are
+    // revoked; see BTX_REVOKED_WHITELIST_IPS. Put one back together with its
+    // peer entry, the day a real node handshakes it again.
+    //
     // 146.190.179.86, 206.189.253.106 and 164.90.246.229 left on 2026-09-09.
     // They are node.btx.dev, node.btxchain.org and node.btx.tools, which are
     // discovery relays rather than archives (see BTX_DISCOVERY_PEERS), and this
@@ -436,17 +524,56 @@ pub const BTX_ARCHIVE_WHITELIST_IPS: &[&str] = &[
 ///
 /// The managed block is rewritten on every start, so an address that leaves
 /// this list loses its grant at the next launch, same as an archive.
+///
+/// EMPTY SINCE 2026-10-29. All three entries had already left
+/// [`BTX_BOOTSTRAP_PEERS`] measured dead, and the same rule as
+/// [`BTX_ARCHIVE_WHITELIST_IPS`] applies: a grant lives only as long as its
+/// peer is shipped. The list stays, empty, because the job it describes is
+/// real. Adding the current head seed here is a new grant and the owner's
+/// call, not a cleanup.
 pub const BTX_LIVE_BODY_SOURCE_IPS: &[&str] = &[
-    // LuckyPool, measured 2026-09-08 handshaking with CONSENSUS +
-    // ATTESTATION_ARCHIVE (see BTX_BOOTSTRAP_PEERS for the full reading).
+    // Were here until 2026-10-29, revoked (BTX_REVOKED_WHITELIST_IPS):
+    //   "213.224.31.105"  LuckyPool, measured 2026-09-08 with CONSENSUS +
+    //                     ATTESTATION_ARCHIVE; onetry 300 s, no peer, 2026-09-12
+    //   "13.140.141.180"  answered getdata for the live branch's first block
+    //                     2026-09-05; 0/3 ConnectionRefused 2026-09-11
+    //   "89.85.40.184"    served the validator's 383-block reorganisation
+    //                     2026-09-05; 0/3 refused 2026-10-01
+];
+
+/// Every IP this app has ever granted `noban` that it no longer grants.
+///
+/// The managed conf block already drops these on the next start. This list is
+/// for the other copy: the append-only 0.6.7 candidate wrote bare
+/// `whitelist=in,out,noban@<ip>` lines OUTSIDE the block, and
+/// `setup::set_managed_whitelist_block` only claims such a line while its IP is
+/// still asserted. The moment an IP leaves the constants, its old bare line
+/// would read as the operator's own and keep the grant forever on exactly the
+/// installs that ran that build. A same-format line for an IP listed here is
+/// therefore removed, wherever it sits in the conf.
+///
+/// Reconstructed 2026-10-29 from every revision of the two grant lists above:
+/// together with 20.86.181.203 (still granted) these are all eleven public IPs
+/// they ever held. Append when a grant goes; never remove an entry unless the
+/// IP is granted again (`revoked_noban_ips_are_not_shipped_or_granted`
+/// enforces that).
+pub const BTX_REVOKED_WHITELIST_IPS: &[&str] = &[
+    // Archives, measured dead: 0/3 since 2026-09-08 (first three) and refused
+    // since 2026-09-12 (37.230.134.222). Revoked 2026-10-29.
+    "207.56.229.99",
+    "114.150.94.235",
+    "195.137.245.82",
+    "37.230.134.222",
+    // Live body sources, measured dead 2026-09-11..10-01. Revoked 2026-10-29.
     "213.224.31.105",
-    // The one node found on the live chain 2026-09-05 19:49Z that answered
-    // getdata for the live branch's first block with the body.
     "13.140.141.180",
-    // Served the validator's whole 383-block reorganisation on 2026-09-05
-    // after it was dialled as a manual peer, having been banned by this side's
-    // own getmmattest hammer earlier the same day.
     "89.85.40.184",
+    // node.btx.dev, node.btxchain.org, node.btx.tools as resolved 2026-08-17:
+    // discovery relays, grant dropped from the constants 2026-09-09. Listed so
+    // the legacy bare lines go too.
+    "146.190.179.86",
+    "206.189.253.106",
+    "164.90.246.229",
 ];
 
 /// Every noban-whitelist target for THIS start: the pinned archive IPs, the
@@ -1534,6 +1661,25 @@ fn node_has_reorg_policy(btxd: &Path) -> bool {
     (major, minor, patch) >= (0, 34, 12)
 }
 
+/// Whether an engine installed under `tag` still follows the network's
+/// consensus rules, i.e. is v0.34.14 or newer. Mainnet block 244000 switched
+/// on three checks that came with 0.34.14 (BTX_SECURITY_ACTIVATION_HEIGHT,
+/// chainparams.cpp:181 at v0.34.15): a 32-byte HTLC preimage, recovery proofs
+/// in the shielded block budget, and a Phase-1-only MatMul header that may not
+/// become the best header. An older engine can accept blocks every current
+/// node refuses and follow them onto its own chain while reporting itself
+/// healthy, so the app never launches one as a fallback. Fails closed: an
+/// unreadable tag is not trusted.
+pub fn engine_follows_network_rules(tag: &str) -> bool {
+    let Some(v) = parse_tag_version(tag) else {
+        return false;
+    };
+    let major = v.first().copied().unwrap_or(0);
+    let minor = v.get(1).copied().unwrap_or(0);
+    let patch = v.get(2).copied().unwrap_or(0);
+    (major, minor, patch) >= (0, 34, 14)
+}
+
 /// The `-matmulrcexecution` mode this host should run, or `None` to leave
 /// btxd's own default in place.
 ///
@@ -1638,7 +1784,7 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
 /// Compressed secp256k1 public keys trusted to attest Profile-1 ExactReplay.
 ///
 /// Threshold is 1, so this list is a UNION and an extra key can only widen what
-/// the node accepts — it can never cause a rejection. That is why all four sit
+/// the node accepts — it can never cause a rejection. That is why all seven sit
 /// here rather than only the two upstream currently publishes.
 ///
 /// Why more than one is required at all. Measured on a parked GPU-less datadir
@@ -1682,6 +1828,36 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
 ///     At M=1 this makes that one machine a full authority for every mirror,
 ///     the trade jpp's operator standard (M=2, independent keys) is meant to
 ///     retire once a second key signs the valid chain.
+///   * `026da4e3`, `03047189`, `02c9cfb7` — the zbtx operator's three keys,
+///     added in 0.7.5 by owner decision. witness-2, a mirror pinning 9 keys,
+///     counted `026da4e3` on 96-97 of the last 100 blocks on 3-4 Oct 2026,
+///     next to `02d5efca`, the only other easyNode-pinned key signing then.
+///     The other two are the same operator's keys (its other machines,
+///     grouped under one operator in `snapshot-operators.json`), pinned in
+///     the same release so a later move to them does not cost a second
+///     namespace change. The cost, per the warning below: the
+///     `AuthorityNamespace` moves once. Measured on 4 Oct 2026 on this Mac
+///     with v0.34.12, two scratch mirrors, `~/.easybtx` untouched:
+///       - A copy of this Mac's old datadir (block 185,855): 4 pins for
+///         15 min (+1,129 blocks), restart with 7 pins for 30 min (+2,079
+///         blocks). It started (the stored snapshot manifest re-verified
+///         under the larger set) and synced at a similar rate (75 and 69
+///         blocks a minute, both crawling on old-block fetches).
+///       - A fresh mirror from the signed snapshot 225,927, caught up to
+///         the tip on the 4 pins. That night `02d5efca` went quiet after
+///         238,007 and the 4-pin mirror stood still there for 10 min while
+///         the chain went on to 238,030: block 238,008 had "no in-memory
+///         quorum". Restarted with the 7 pins, it accepted its first new
+///         block 61 s after start, was at the tip (238,031) in the same
+///         minute, and followed every block for 30 min (238,044 against
+///         witness-2's 238,045). Both starts loaded 0 stored attestations
+///         with either pin set, so the namespace move cost no re-acquire
+///         time this mirror could see.
+///     At M=1 each of these keys is a full authority for every mirror, as
+///     `02d5efca` is. That is the owner's decision; the path to M=2 is in
+///     docs/earned-trust.md. Never added here: `037db271` and `03bc9ac2`
+///     (sign on mainnet, owners unrecorded) and jpp's `02e0a965` (a rented
+///     machine, for an M=2 set only).
 ///
 /// ⚠ Changing this list is not free, and the cost is not where you would look
 /// for it. btxd namespaces its durable attestation archive by
@@ -1707,11 +1883,14 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
 /// still proves it: the bounded hot store reloaded from disk still counts, the
 /// durable history behind it does not. Measure a real mirror datadir across
 /// this change before it ships.
-pub const BTX_TRUSTED_ATTESTATION_PUBKEYS: [&str; 4] = [
+pub const BTX_TRUSTED_ATTESTATION_PUBKEYS: [&str; 7] = [
     "03d90c148db37da28ce47ce15bade88a177728d663da4bc9ba765943b7d4e4f0aa",
     "0224e80df33697385b54b3c69bae1f097f533c0c43e93c29f73ee97319d4a5e04c",
     "028995b25c887ee03eb53a41312d33c8eccf48f261ecf9e91fe2b1e8e50373258a",
     "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675",
+    "026da4e3a07676cada5488123033fb1057faeb7fe6a7d50b2ae3921431e0f4bbf1",
+    "03047189023913e1922c80c895ee2a9e2eff6df05438654749e1a4f95019578a24",
+    "02c9cfb77d7e4dce0cd6b7968fee1dd53d31ef06c764185e120c825fab8c0572a0",
 ];
 
 /// The mirrors' threshold. It never rises: a mirror on a snapshot stored
@@ -4163,7 +4342,7 @@ impl NodeController {
                 return Err(AppError::Disk(format!(
                     "not starting the node: {} has {:.1} GiB free and btxd needs at least {} GiB \
                      to write blocks and chainstate without corrupting them. Free some \
-                     space and start it again — the chain on disk is fine.",
+                     space and start it again; the chain on disk is fine.",
                     datadir.display(),
                     free as f64 / GIB as f64,
                     crate::setup::NODE_START_DISK_FLOOR / GIB,
@@ -5929,6 +6108,37 @@ consensus-validator service.";
     /// (easybtx-node.log) and exits 1 before debug.log says anything. The
     /// second is its sibling for `-deepforkautoresolve=0`
     /// (chainstatemanager_args.cpp:187-190).
+    /// Mainnet block 244000 switched on three consensus checks that came with
+    /// 0.34.14. An install key below that must never be launched as a
+    /// fallback, whatever its shape, and an unreadable one is not trusted.
+    #[test]
+    fn only_an_engine_with_the_244000_rules_follows_the_network() {
+        for tag in [
+            "v0.34.14",
+            "v0.34.15",
+            "v0.34.15-abcdef12",
+            "v0.35.0",
+            "v1.0.0",
+        ] {
+            assert!(engine_follows_network_rules(tag), "{tag} has the rules");
+        }
+        for tag in [
+            "v0.34.13",
+            "v0.34.12",
+            "v0.34.9",
+            "v0.34.6-3013c2c2",
+            "v0.33.3-pr105b",
+            "v0.33.2",
+            "",
+            "latest",
+        ] {
+            assert!(
+                !engine_follows_network_rules(tag),
+                "{tag} must not be launched"
+            );
+        }
+    }
+
     #[test]
     fn a_reorg_policy_refusal_is_named_and_is_not_a_reason_to_wipe() {
         for log in [
@@ -7974,11 +8184,28 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
         // a live v0.34.9 peer connection: services 0x82000d08,
         // MATMUL_ATTESTATION_ARCHIVE among them, and it served `02d5efca`'s
         // signatures for the tip, 227,400 and 227,313 on request.
+        // 2026-10-03: 2 became 1. 37.230.134.222 has refused since 2026-09-12
+        // 23:31Z and refused again 0/3 from the Mac at 23:35Z, and btx-sentinel
+        // would otherwise alarm on it every hour. Its noban grant stayed
+        // until 2026-10-29 (see the assertion below).
+        // 2026-10-10: 1 became 2. 20.86.181.203:19335, btxscan's full node on
+        // the same box: services 0x82000d09 (NETWORK and
+        // MATMUL_ATTESTATION_ARCHIVE), served block 150,000 and `02d5efca`'s
+        // signatures for 244,652, 240,000 and 227,313.
         assert_eq!(
-            BTX_ARCHIVE_PEERS.len(),
-            2,
-            "37.230.134.222 and btxscan's 20.86.181.203:19338 are the measured \
-             archives; adding one needs a reading, not a hostname"
+            BTX_ARCHIVE_PEERS,
+            &["20.86.181.203:19338", "20.86.181.203:19335"],
+            "btxscan's two nodes are the measured archives; adding one needs a \
+             reading, not a hostname"
+        );
+        // 2026-10-29: this used to assert the opposite, that a retired
+        // archive keeps its grant. A dead host's IP can be handed to someone
+        // else, who would then hold noban on every install; the grant goes
+        // with the peer now (BTX_ARCHIVE_WHITELIST_IPS says why).
+        assert!(
+            !BTX_ARCHIVE_WHITELIST_IPS.contains(&"37.230.134.222")
+                && BTX_REVOKED_WHITELIST_IPS.contains(&"37.230.134.222"),
+            "a retired archive loses its noban grant with its peer entry"
         );
         // A tripwire, not a fact about the network: pinned so that adding or
         // dropping a seed cannot pass unnoticed. 2026-09-05: 9 became 7 — one
@@ -7999,10 +8226,15 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
         // BTX_ARCHIVE_PEERS and leaves the head.
         // 2026-10-01: 3 became 1 — 89.85.40.184 and 194.93.48.158 refused
         // three TCP dials each from the Mac and are down in the census.
+        // 2026-10-11: 1 became 2 — Jarek's full-history archive at
+        // 134.199.150.193, measured serving blocks 1,000 and 150,000.
+        // 2026-10-28: 2 became 3 — Lars Zimmer's full-history archive at
+        // 217.154.143.140, measured at the tip and serving blocks 1,000 and
+        // 150,000. His second archive was on an orphan and stays out.
         assert_eq!(
             BTX_BOOTSTRAP_PEERS.len(),
-            1,
-            "BTX_BOOTSTRAP_PEERS should have 1 entry"
+            3,
+            "BTX_BOOTSTRAP_PEERS should have 3 entries"
         );
     }
 
@@ -8101,6 +8333,89 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), ips.len(), "no duplicate whitelist targets");
+    }
+
+    fn peer_host(peer: &str) -> &str {
+        peer.rsplit_once(':').map(|(h, _)| h).unwrap_or(peer)
+    }
+
+    /// A noban grant names a peer this build actually dials for blocks, or it
+    /// does not exist. Retiring a seed from the peer lists without dropping
+    /// its grant used to be the norm ("a stale IP line is harmless"); it is
+    /// not, because the IP can be handed to someone else and the grant goes
+    /// with it. This makes that drift fail the build instead of a review.
+    #[test]
+    fn noban_grants_only_name_shipped_block_sources() {
+        let hosts: Vec<&str> = block_source_peers().into_iter().map(peer_host).collect();
+        for ip in BTX_ARCHIVE_WHITELIST_IPS
+            .iter()
+            .chain(BTX_LIVE_BODY_SOURCE_IPS.iter())
+        {
+            assert!(
+                hosts.contains(ip),
+                "{ip} holds a noban grant but is not a shipped block source \
+                 ({hosts:?}); retire the grant with the peer, into \
+                 BTX_REVOKED_WHITELIST_IPS"
+            );
+        }
+        let resolved = resolve_managed_whitelist_ips();
+        for ip in BTX_REVOKED_WHITELIST_IPS {
+            assert!(
+                !resolved.iter().any(|r| r == ip),
+                "revoked {ip} is still asserted: {resolved:?}"
+            );
+        }
+    }
+
+    /// The revocation list only ever names IPs this build does not ship: an
+    /// entry that is also a live peer or a live grant would strip that peer's
+    /// legacy line while the block re-adds it, which is confusing at best,
+    /// and almost certainly means someone put a peer back without taking it
+    /// off this list.
+    #[test]
+    fn revoked_noban_ips_are_not_shipped_or_granted() {
+        let shipped: Vec<&str> = BTX_BOOTSTRAP_PEERS
+            .iter()
+            .chain(BTX_ARCHIVE_PEERS.iter())
+            .map(|p| peer_host(p))
+            .collect();
+        for ip in BTX_REVOKED_WHITELIST_IPS {
+            assert!(
+                ip.parse::<std::net::IpAddr>().is_ok(),
+                "{ip} is not an IP literal"
+            );
+            assert!(
+                !shipped.contains(ip),
+                "revoked {ip} is a shipped peer again"
+            );
+            assert!(
+                !BTX_ARCHIVE_WHITELIST_IPS.contains(ip) && !BTX_LIVE_BODY_SOURCE_IPS.contains(ip),
+                "revoked {ip} is granted again"
+            );
+        }
+        // Every IP the grant lists ever held (2026-10-29 reconstruction from
+        // git history) is either still granted or revoked: nothing fell out
+        // of both lists, which is what would leave a legacy line behind.
+        for ip in [
+            "20.86.181.203",
+            "207.56.229.99",
+            "114.150.94.235",
+            "195.137.245.82",
+            "37.230.134.222",
+            "213.224.31.105",
+            "13.140.141.180",
+            "89.85.40.184",
+            "146.190.179.86",
+            "206.189.253.106",
+            "164.90.246.229",
+        ] {
+            assert!(
+                BTX_ARCHIVE_WHITELIST_IPS.contains(&ip)
+                    || BTX_LIVE_BODY_SOURCE_IPS.contains(&ip)
+                    || BTX_REVOKED_WHITELIST_IPS.contains(&ip),
+                "{ip} was once granted noban and is now in neither list"
+            );
+        }
     }
 
     /// DRIFT GUARDS for the keeper's generated conf (keeper/install-btx-keeper.sh).
@@ -8914,6 +9229,201 @@ matmul: metal runtime_probe_ok, selecting metal\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── 0.7.5: the three zbtx signer keys (owner decision, threshold 1) ──
+
+    /// The zbtx operator's three keys, in the order node.rs pins them.
+    const ZBTX_KEYS: [&str; 3] = [
+        "026da4e3a07676cada5488123033fb1057faeb7fe6a7d50b2ae3921431e0f4bbf1",
+        "03047189023913e1922c80c895ee2a9e2eff6df05438654749e1a4f95019578a24",
+        "02c9cfb77d7e4dce0cd6b7968fee1dd53d31ef06c764185e120c825fab8c0572a0",
+    ];
+
+    /// How many times each shipped key appears as a `-matmultrustedpubkey=`
+    /// argument, case-blind.
+    fn pin_count(args: &[String], key: &str) -> usize {
+        args.iter()
+            .filter(|a| {
+                a.strip_prefix("-matmultrustedpubkey=")
+                    .is_some_and(|v| v.eq_ignore_ascii_case(key))
+            })
+            .count()
+    }
+
+    /// 0.7.5 pins the zbtx operator's three keys after the four already
+    /// shipped, and nothing else. Literals, for the same reason as the
+    /// upstream-key test: the failure being guarded against is a list that
+    /// quietly differs from the decision. `037db271` and `03bc9ac2` sign on
+    /// mainnet but nobody recorded who runs them, and jpp's `02e0a965` runs
+    /// on a rented machine, so it belongs in an M=2 set only
+    /// (docs/earned-trust.md). None of them is a pin at M=1.
+    #[test]
+    fn the_pin_carries_the_three_zbtx_keys_and_none_of_the_unrecorded_ones() {
+        assert_eq!(BTX_TRUSTED_ATTESTATION_PUBKEYS.len(), 7);
+        // The four shipped before 0.7.5 keep their places: never reordered.
+        assert_eq!(
+            BTX_TRUSTED_ATTESTATION_PUBKEYS[..4],
+            [
+                "03d90c148db37da28ce47ce15bade88a177728d663da4bc9ba765943b7d4e4f0aa",
+                "0224e80df33697385b54b3c69bae1f097f533c0c43e93c29f73ee97319d4a5e04c",
+                "028995b25c887ee03eb53a41312d33c8eccf48f261ecf9e91fe2b1e8e50373258a",
+                "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675",
+            ]
+        );
+        assert_eq!(BTX_TRUSTED_ATTESTATION_PUBKEYS[4..], ZBTX_KEYS);
+        for k in BTX_TRUSTED_ATTESTATION_PUBKEYS {
+            assert!(
+                crate::operators::parse_key(k).is_some(),
+                "a valid compressed secp256k1 point: {k}"
+            );
+            assert_eq!(k, k.to_ascii_lowercase(), "lowercase: {k}");
+        }
+        let distinct: std::collections::HashSet<String> = BTX_TRUSTED_ATTESTATION_PUBKEYS
+            .iter()
+            .map(|k| k.to_ascii_lowercase())
+            .collect();
+        assert_eq!(distinct.len(), 7, "every pin distinct");
+        for prefix in ["037db271", "03bc9ac2", "02e0a965"] {
+            assert!(
+                !BTX_TRUSTED_ATTESTATION_PUBKEYS
+                    .iter()
+                    .any(|k| k.starts_with(prefix)),
+                "{prefix} must not be pinned at M=1"
+            );
+        }
+        assert_eq!(
+            BTX_TRUSTED_ATTESTATION_THRESHOLD, 1,
+            "the threshold stays 1"
+        );
+    }
+
+    /// A mirror pushes every one of the seven keys, each exactly once, and
+    /// one threshold of 1.
+    #[test]
+    fn a_mirror_launch_pins_all_seven_keys_exactly_once() {
+        let dir = signed_snapshot_datadir("zbtx-mirror");
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.12/lin/btxd"),
+            &dir,
+            &conf,
+            Backend::Cpu,
+        );
+        assert_eq!(validation_modes(&args), vec!["trusted"], "{args:?}");
+        for k in BTX_TRUSTED_ATTESTATION_PUBKEYS {
+            assert_eq!(pin_count(&args, k), 1, "{k}: {args:?}");
+        }
+        assert_eq!(
+            args.iter()
+                .filter(|a| a.starts_with("-matmultrustedpubkey="))
+                .count(),
+            7,
+            "{args:?}"
+        );
+        assert_eq!(
+            args.iter()
+                .filter(|a| *a == "-matmultrustedthreshold=1")
+                .count(),
+            1,
+            "{args:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node that already pins a zbtx key by hand, in `btx_rw.conf` or in
+    /// its conf, is not given that key again on the command line: the engine
+    /// refuses "Duplicate -matmultrustedpubkey" at init. Every other key
+    /// still goes on once. Both arms: the mirror, and a validating node on a
+    /// signed snapshot.
+    #[test]
+    fn a_zbtx_key_already_pinned_by_hand_is_not_pushed_again() {
+        let dir = signed_snapshot_datadir("zbtx-dupes");
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        let conf = dir.join("hand.conf");
+        // Upper case in the conf, as a hand edit might write it.
+        std::fs::write(
+            &conf,
+            format!(
+                "server=1\nmatmultrustedpubkey={}\n",
+                ZBTX_KEYS[1].to_ascii_uppercase()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("btx_rw.conf"),
+            format!("matmultrustedpubkey={}\n", ZBTX_KEYS[0]),
+        )
+        .unwrap();
+        let btxd = Path::new("/x/btx/v0.34.12/lin/btxd");
+        for backend in [Backend::Cpu, Backend::Cuda, Backend::Metal] {
+            let (_, args, _) = build_node_command(btxd, &dir, &conf, backend);
+            assert_eq!(pin_count(&args, ZBTX_KEYS[0]), 0, "{backend:?}: {args:?}");
+            assert_eq!(pin_count(&args, ZBTX_KEYS[1]), 0, "{backend:?}: {args:?}");
+            for k in BTX_TRUSTED_ATTESTATION_PUBKEYS
+                .iter()
+                .filter(|k| !ZBTX_KEYS[..2].contains(k))
+            {
+                assert_eq!(pin_count(&args, k), 1, "{backend:?} {k}: {args:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A signer whose own key is one of the zbtx keys (the zbtx operator's
+    /// own machine running easyNode) pins that key once: the self-pin, and
+    /// the signed-snapshot pins skip it.
+    ///
+    /// There is no private key on hand for any zbtx key, so, as in
+    /// `a_signer_whose_own_key_is_a_trusted_pubkey_is_not_pinned_twice`,
+    /// this builds the validating arm's two contributions the way
+    /// `build_node_command` does: `signing_key_self_pin`'s key, then
+    /// `validating_snapshot_pin_args` with that key in `already`.
+    #[test]
+    fn a_signer_whose_own_key_is_a_zbtx_key_pins_it_once() {
+        let dir = signed_snapshot_datadir("zbtx-self");
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        for own in ZBTX_KEYS {
+            let mut args = vec![format!("-matmultrustedpubkey={own}")];
+            args.extend(validating_snapshot_pin_args(
+                &dir,
+                &BTX_TRUSTED_ATTESTATION_PUBKEYS,
+                &[own.to_string()],
+            ));
+            for k in BTX_TRUSTED_ATTESTATION_PUBKEYS {
+                assert_eq!(pin_count(&args, k), 1, "own {own}, {k}: {args:?}");
+            }
+            assert_eq!(
+                args.iter()
+                    .filter(|a| a.starts_with("-matmultrustedthreshold="))
+                    .count(),
+                1
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A keyless validating node on a signed snapshot pins all seven keys
+    /// once, in consensus mode still.
+    #[test]
+    fn a_validating_node_on_a_signed_snapshot_pins_all_seven_once() {
+        let dir = signed_snapshot_datadir("zbtx-validating");
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        for backend in [Backend::Cuda, Backend::Metal] {
+            let (_, args, _) =
+                build_node_command(Path::new("/x/btx/v0.34.12/lin/btxd"), &dir, &conf, backend);
+            assert!(!validation_modes(&args).contains(&"trusted"), "{args:?}");
+            for k in BTX_TRUSTED_ATTESTATION_PUBKEYS {
+                assert_eq!(pin_count(&args, k), 1, "{backend:?} {k}: {args:?}");
+            }
+            for k in ZBTX_KEYS {
+                assert_eq!(pin_count(&args, k), 1, "{backend:?} {k}: {args:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Section 7, step 5: the marker makes exactly the load launch a mirror
     /// (the app's start path takes the signing key out of the conf for it;
     /// `build_node_command` does not), and clearing it gives the validating
@@ -9209,7 +9719,7 @@ matmul: metal runtime_probe_ok, selecting metal\n\
     #[test]
     fn pins_only_grow_and_the_threshold_stays() {
         let (ever, threshold) = pins_file();
-        assert_eq!(ever.len(), 4, "the file lost a line");
+        assert_eq!(ever.len(), 7, "the file lost a line");
         pins_only_grow(&ever, &BTX_TRUSTED_ATTESTATION_PUBKEYS).unwrap();
         assert!(
             BTX_TRUSTED_ATTESTATION_THRESHOLD <= threshold,

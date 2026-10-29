@@ -79,6 +79,10 @@ pub struct DiagnosticsInput {
     /// The refresher's signature window (`crate::watchdog::SignatureWindow`),
     /// `None` until it holds two samples this run.
     pub signature_window: Option<crate::watchdog::SignatureDeltas>,
+    /// The last "same chain as other sources" comparison
+    /// (`crate::chain_agreement::Agreement::diagnostics_lines`), each line
+    /// already indented. Empty until the first comparison of this run.
+    pub chain_agreement: Vec<String>,
     pub stall: Option<String>,
     /// What the catch-up help is doing this run (`crate::catchup_assist`,
     /// `CatchUp::diagnostics`), one line each. Empty when no refresher ran.
@@ -87,6 +91,11 @@ pub struct DiagnosticsInput {
     /// (`crate::read_block_recovery`): the step under way and the last
     /// outcome, one line each. Empty when there is neither.
     pub recovery: Vec<String>,
+    /// What the snapshot network did in this run: the diary, the confirmer,
+    /// the producer (`crate::snapshot_confirmer::NetworkReport::lines`), one
+    /// line each. Empty when no refresher ran. Public material only: heights,
+    /// short block hashes, operator names and counts, never a key.
+    pub snapshots: Vec<String>,
     pub log_warnings: Vec<String>,
 }
 
@@ -109,7 +118,7 @@ pub(crate) fn group(n: u64) -> String {
 /// this is that same conversion, parameterised on a given time rather than
 /// always reading the real clock, so [`relative_ago`] can be tested against a
 /// fixed one).
-fn format_utc_minute(unix_secs: i64) -> String {
+pub(crate) fn format_utc_minute(unix_secs: i64) -> String {
     let days = unix_secs.div_euclid(86_400);
     let rem = unix_secs.rem_euclid(86_400);
     // Civil-from-days (Howard Hinnant), proleptic Gregorian.
@@ -263,6 +272,30 @@ pub fn render(i: &DiagnosticsInput) -> String {
                     ));
                 }
             }
+            // The number every "blocks behind" reader uses since 0.7.11
+            // (crate::network_height), and the frontier it came from.
+            let frontier = match c
+                .signed_frontier
+                .as_ref()
+                .and_then(|f| f.height.map(|h| (h, f)))
+            {
+                Some((h, f)) => format!(
+                    "signed frontier {} {}",
+                    group(h),
+                    if f.on_active_chain == Some(true) {
+                        "on this chain"
+                    } else {
+                        "on another branch"
+                    }
+                ),
+                None => "no signed frontier".into(),
+            };
+            let network = c.network_height();
+            o.push(format!(
+                "  {frontier} · network height {} ({} above the tip)",
+                group(network),
+                group(network.saturating_sub(c.blocks))
+            ));
         }
         None => o.push("  not answering".into()),
     }
@@ -344,6 +377,18 @@ pub fn render(i: &DiagnosticsInput) -> String {
         ));
     }
     signatures_block(&mut o, i);
+    o.push("Chain agreement".into());
+    if i.chain_agreement.is_empty() {
+        o.push("  not checked yet this run".into());
+    }
+    o.extend(i.chain_agreement.iter().cloned());
+    o.push("Snapshots".into());
+    if i.snapshots.is_empty() {
+        o.push("  nothing to report".into());
+    }
+    for l in &i.snapshots {
+        o.push(format!("  {l}"));
+    }
     let notices = i
         .chain
         .as_ref()
@@ -1389,12 +1434,17 @@ mod tests {
             attested_tip: None,
             trusted: None,
             signature_window: None,
+            chain_agreement: Vec::new(),
             stall: None,
             catch_up: vec![
                 crate::catchup_assist::refuses_old_line("109.199.124.187:19335"),
                 crate::catchup_assist::refuses_old_line("203.0.113.7:19335"),
             ],
             recovery: Vec::new(),
+            snapshots: vec![
+                "diary: 12 heights, newest 233400 (block 11bd18812b6afcd1)".into(),
+                format!("confirmer, last round: 198.51.100.4:443 refused, key file {wif}"),
+            ],
             log_warnings: vec![format!(
                 "[warning] signing key backup contains {wif}, update check via \
                  http://84.32.49.226:19335/status failed"
@@ -1406,7 +1456,7 @@ mod tests {
             published_hosts: crate::node::published_peer_hosts(),
         };
         let out = report(&input, &context);
-        for gone in [wif.as_str(), "84.32.49.226", "203.0.113.7"] {
+        for gone in [wif.as_str(), "84.32.49.226", "203.0.113.7", "198.51.100.4"] {
             assert!(!out.contains(gone), "{gone} survived end to end:\n{out}");
         }
         assert!(
@@ -1424,6 +1474,7 @@ mod tests {
             "Peers (1 in, 1 out)",
             "peer 4: 109.199.124.187:19335",
             "Engine notices",
+            "Snapshots\n  diary: 12 heights, newest 233400 (block 11bd18812b6afcd1)",
             "Last warning lines of debug.log",
         ] {
             assert!(out.contains(kept), "{kept} missing end to end:\n{out}");
@@ -1502,6 +1553,12 @@ mod tests {
     }
 
     #[test]
+    fn a_node_that_did_nothing_for_the_snapshot_network_says_so() {
+        let r = render(&DiagnosticsInput::default());
+        assert!(r.contains("Snapshots\n  nothing to report\n"), "{r}");
+    }
+
+    #[test]
     fn the_report_has_every_section_and_no_em_dash() {
         let input = DiagnosticsInput {
             generated_at: "2026-09-29 14:05 UTC".into(),
@@ -1543,7 +1600,7 @@ mod tests {
             trusted: Some(MatmulTrustedStatus {
                 trusted_mirror: true,
                 threshold: 1,
-                trusted_signers: 4,
+                trusted_signers: 7,
                 trusted_signer_pubkeys: crate::node::BTX_TRUSTED_ATTESTATION_PUBKEYS
                     .iter()
                     .map(|k| k.to_string())
@@ -1555,13 +1612,20 @@ mod tests {
                 ..Default::default()
             }),
             signature_window: None,
+            chain_agreement: Vec::new(),
             stall: None,
             catch_up: vec!["not asking any peer for blocks right now".into()],
             recovery: Vec::new(),
+            snapshots: vec![
+                "diary: 12 heights, newest 233400 (block 11bd18812b6afcd1)".into(),
+                "confirmer: 3 rounds (0 stopped), co-signed 1, dissented 0".into(),
+            ],
             log_warnings: vec!["[warning] something".into()],
         };
         let r = render(&input);
         for part in [
+            "Snapshots\n  diary: 12 heights, newest 233400 (block 11bd18812b6afcd1)\n  \
+             confirmer: 3 rounds",
             "easyNode diagnostics",
             "App 0.7.0",
             "Role: follows signatures",
@@ -1574,7 +1638,7 @@ mod tests {
             "recent history",
             "Engine notices (1)",
             "not shown on the home screen",
-            "Signatures\n  pin: 1 of 4 keys (0 post-quantum) · enough unblocked keys for the quorum: yes",
+            "Signatures\n  pin: 1 of 7 keys (0 post-quantum) · enough unblocked keys for the quorum: yes",
             "since the engine started: accepted 3,073 · rejected 1,735 · duplicates 1,532",
             "every key this app ships is in the pin",
             "Catch-up help\n  not asking any peer for blocks right now",
@@ -1605,6 +1669,32 @@ mod tests {
             r.contains("Read-block recovery\n  step: signatures, phase: running"),
             "{r}"
         );
+    }
+
+    /// "Am I on the right chain?" (crate::chain_agreement), under its own
+    /// heading after the Signatures block, and "not checked yet" until the
+    /// first comparison of this run.
+    #[test]
+    fn the_chain_agreement_has_its_own_block() {
+        let quiet = render(&DiagnosticsInput::default());
+        assert!(
+            quiet.contains("Chain agreement\n  not checked yet this run"),
+            "{quiet}"
+        );
+        let input = DiagnosticsInput {
+            chain_agreement: vec![
+                "  AGREE · OK · ATTACHED, NOT CHECKED HERE · as of 2026-10-03 14:05 UTC".into(),
+            ],
+            ..Default::default()
+        };
+        let r = render(&input);
+        assert!(
+            r.contains("Chain agreement\n  AGREE · OK · ATTACHED, NOT CHECKED HERE"),
+            "{r}"
+        );
+        let sig = r.find("Signatures").unwrap();
+        let agree = r.find("Chain agreement").unwrap();
+        assert!(sig < agree, "{r}");
     }
 
     /// The operator's case as Copy diagnostics shows it: two old keys
@@ -1687,7 +1777,7 @@ mod tests {
         let status: MatmulTrustedStatus = serde_json::from_value(serde_json::json!({
             "trusted_mirror": true,
             "threshold": 1,
-            "trusted_signers": 4,
+            "trusted_signers": SHIPPED.len(),
             "trusted_signer_pubkeys": SHIPPED,
             "blocked_pubkeys": [SHIPPED[2].to_ascii_uppercase()],
             "pin_quorum_reachable": true
@@ -1754,6 +1844,49 @@ mod tests {
         assert!(
             r.contains("  tip median time 2026-09-29 13:50 UTC, about 15 minutes ago"),
             "missing the tip's age:\n{r}"
+        );
+    }
+
+    /// The number every "blocks behind" reader uses since 0.7.11
+    /// (crate::network_height) is in the report, with the signed frontier it
+    /// came from and whether that is on this node's chain.
+    #[test]
+    fn chain_section_says_the_network_height_and_the_signed_frontier() {
+        let frontier = |on: bool| crate::node_api::AttestedTip {
+            height: Some(245_260),
+            on_active_chain: Some(on),
+            ..Default::default()
+        };
+        let input = |on: bool| DiagnosticsInput {
+            chain: Some(BlockchainInfo {
+                blocks: 240_000,
+                headers: 240_010,
+                signed_frontier: Some(frontier(on)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = render(&input(true));
+        assert!(
+            r.contains("  signed frontier 245,260 on this chain · network height 245,260 (5,260 above the tip)"),
+            "{r}"
+        );
+        let r = render(&input(false));
+        assert!(
+            r.contains("  signed frontier 245,260 on another branch · network height 240,010 (10 above the tip)"),
+            "{r}"
+        );
+        let r = render(&DiagnosticsInput {
+            chain: Some(BlockchainInfo {
+                blocks: 240_000,
+                headers: 240_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(
+            r.contains("  no signed frontier · network height 240,000 (0 above the tip)"),
+            "{r}"
         );
     }
 

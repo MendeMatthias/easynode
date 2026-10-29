@@ -27,7 +27,7 @@ pub const START_RECORD_FILE: &str = "snapshot-start.json";
 pub enum StartSource {
     /// A snapshot two operators confirmed.
     Confirmed,
-    /// The pair compiled into this app (225,927).
+    /// The pair compiled into this app (245,300 since 0.7.11, 239,111 from 0.7.6).
     Pinned,
     /// The snapshot compiled into the BTX engine.
     Engine,

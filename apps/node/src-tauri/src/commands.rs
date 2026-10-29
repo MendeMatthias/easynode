@@ -359,19 +359,58 @@ use crate::state::{
 // consensus start, 1-of-1 mirror refused, signer self-pin present, manifest
 // rows cuda/sm_120 and metal/m4_class).
 //
-// THE INSTALL KEY IS `v0.34.12`, bare, equal to what btxd reports. No release
-// ever used it, so every install re-provisions on update and fetches the
+// THE INSTALL KEY WAS `v0.34.12`, bare, equal to what btxd reports. No release
+// ever used it, so every install re-provisioned on update and fetched the
 // engine once, as the move to `v0.34.9` did.
-pub const NODE_RELEASE_TAG: &str = "v0.34.12";
+//
+// ── 2026-10-10: v0.34.15, BECAUSE BLOCK 244000 IS A FLAG DAY ────────────────
+//
+// Tag `v0.34.15` = `476f3f23e15228bb3e6119ed1e139a9b25424ce8` (annotated tag,
+// tagged 2026-10-06; upstream PR 223). Why it cannot wait: 0.34.14 schedules
+// three consensus checks at mainnet height 244000
+// (BTX_SECURITY_ACTIVATION_HEIGHT, chainparams.cpp:181): a 32-byte HTLC
+// preimage, recovery proofs counted in the shielded block budget, and
+// nMatMulPhase1HeaderNotMostWorkHeight, so a MatMul header that only passed
+// the compact-target precheck can no longer become the best header (5be6edd6).
+// 0.34.12 has none of the three, so past 244000 it can follow headers and
+// accept blocks every 0.34.14+ node refuses. The chain passed 244000 before
+// this pin moved (easybtx.com measured 244282 on 2026-10-10). 0.34.15 rather
+// than 0.34.14 because 0.34.14 can sit without connecting blocks after a
+// restart or outage (a unique followed tip-child waited for a fresh rcadmit
+// ticket); 0.34.15 ExactReplays it. Upstream's notice also warns that a block
+// 0.34.12 accepts could split 0.34.13 nodes, so no install should stop there.
+//
+// What else moved, read at the SHA. PR 211 (the bounded-mode livelock named
+// above) is in. An unset `-reorgpolicy` is legacy again from 0.34.14
+// (node/chainstatemanager_args.cpp:155); node.rs still passes
+// `-reorgpolicy=legacy` explicitly, which is the same mode and keeps the launch
+// line independent of the default. The qualified-device warning above is
+// REVERSED: a qualified GPU digest that disagrees with a header is now a
+// retryable local failure (`qualified_device_digest_mismatch_retryable`,
+// matmul/matmul_v4_rc_gkr.cpp), not a final InvalidConsensus, so a GPU that
+// computes wrong no longer rejects a valid block for good. chainparams.cpp
+// adds no assumeutxo base: 219000 and 228000 are unchanged, so snapshot_spec()
+// stays on 219000 for the reasons above. Both guards pass on the tag
+// (check-engine-tag.sh: 5 of 5 on the sentinel, shielded commitment 94343b76;
+// check-engine-fleet-ready.sh: degraded consensus start, 1-of-1 mirror
+// refused, signer self-pin present, manifest rows cuda/sm_120 and
+// metal/m4_class, the same two as 0.34.12). Upstream publishes no SHA256SUMS
+// for 0.34.15; the archive hashes the staging scripts pin are GitHub's asset
+// digests, which equal the ones numair lists on PR 223.
+//
+// THE INSTALL KEY IS `v0.34.15`, bare, equal to what btxd reports. No release
+// ever used it, so every install re-provisions on update and fetches the
+// engine once.
+pub const NODE_RELEASE_TAG: &str = "v0.34.15";
 
 /// The exact upstream commit NODE_RELEASE_TAG names: the commit upstream's
-/// annotated tag `v0.34.12` points at. Kept set although the key is itself
+/// annotated tag `v0.34.15` points at. Kept set although the key is itself
 /// an upstream tag, so the guards, `engine_pin_ref` and the engine build
 /// workflows check out a SHA that cannot move under us, and the CI artifacts
 /// are named for the commit (`btxd-<os>-<sha>`), which is what the installer
 /// workflows' identity checks compare. If upstream ever re-tags, this does not
 /// move by itself; re-run both guards on the new commit and choose a new key.
-pub const NODE_RELEASE_COMMIT: &str = "5f32c4c4d1cb033180bcd40a461deae2c1bc1ee1";
+pub const NODE_RELEASE_COMMIT: &str = "476f3f23e15228bb3e6119ed1e139a9b25424ce8";
 
 /// The pinned assumeutxo snapshot this app bootstraps from: height 219000,
 /// [`btx_core::snapshot::v0_34_9_spec`], pinned from upstream's manifest and
@@ -1066,6 +1105,27 @@ pub(crate) const ALREADY_STARTING: &str = "the node is already starting, give it
 /// Spawn (or attach to) the node and bring the app to a running state:
 /// RPC client armed, snapshot-load guaranteed in the background, keep-awake
 /// held, and the status refresher loop driving the phase.
+/// What a start does when this release's engine could not be provisioned over
+/// the one already installed under `installed`. It used to launch `installed`
+/// whatever it was, which is the failure the upgrade branch exists to prevent:
+/// past a flag day the old engine forks off while the screen says Ready. Since
+/// mainnet block 244000 that is every engine below 0.34.14, including the
+/// 0.34.12 every 0.7.x install holds, so such a start stops here with the
+/// reason on screen, and the next Start tries the upgrade again. An installed
+/// engine that still follows the rules keeps the old fallback.
+fn after_failed_engine_upgrade(installed: &str, err: &str) -> Result<(), String> {
+    if btx_core::node::engine_follows_network_rules(installed) {
+        return Ok(());
+    }
+    Err(format!(
+        "The node engine could not be updated to {NODE_RELEASE_TAG}: {err}. The engine \
+         installed now, {installed}, does not follow the network's rules since block \
+         244,000 and could end up on its own chain while looking healthy, so it is not \
+         started. Fix the cause above if it names one (often free disk space), then press \
+         Start to try the update again."
+    ))
+}
+
 pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Result<(), String> {
     // One start at a time, held through a drop guard so a panic releases it.
     // The double-spawn guard further down keys on a live child in
@@ -1238,8 +1298,17 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
                         tag = NODE_RELEASE_TAG.to_string();
                     }
                     Err(e) => {
-                        // Non-fatal: keep launching the old, known-good tag.
-                        eprintln!("[node-app] node upgrade provisioning failed (using {tag}): {e}");
+                        // Non-fatal only while the installed engine still
+                        // follows the network's rules; see
+                        // `after_failed_engine_upgrade`.
+                        eprintln!(
+                            "[node-app] node upgrade provisioning failed (installed {tag}): {e}"
+                        );
+                        setup_log(
+                            &datadir,
+                            &format!("engine upgrade to {NODE_RELEASE_TAG} failed (installed {tag}): {e}"),
+                        );
+                        after_failed_engine_upgrade(&tag, &e.to_string())?;
                     }
                 }
             }
@@ -1247,7 +1316,7 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     }
 
     let paths: FaststartResult = returning_launch_paths(&datadir, &tag)
-        .ok_or_else(|| "node binaries not installed yet — run setup first".to_string())?;
+        .ok_or_else(|| "node binaries not installed yet; run setup first".to_string())?;
 
     // Double-spawn guard: a controller whose child is still alive means a
     // previous start is in flight (e.g. a long warmup). Overwriting it would
@@ -1256,7 +1325,7 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     if let Some(controller) = state.node.lock().await.as_mut() {
         if controller.child_has_exited() == Some(false) {
             return Err(
-                "the node is still starting up (this can take a while after an unclean shutdown) — give it a moment"
+                "the node is still starting up (this can take a while after an unclean shutdown); give it a moment"
                     .to_string(),
             );
         }
@@ -1460,13 +1529,16 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     // idempotent, costs one small file read, and also self-heals a conf the
     // MINER rewrote through the shared ~/.easybtx datadir.
     //
-    // Deliberately NOT part of NODE_FASTSTART_CONF: Explorer mode is opt-in,
-    // and the default conf must stay the lean one.
-    if let Err(e) = btx_core::setup::set_conf_kv(
-        &paths.faststart_conf,
-        "txindex",
-        settings.txindex_enabled.then_some("1"),
-    ) {
+    // Not part of NODE_FASTSTART_CONF, which the keeper conf replaces
+    // wholesale. Applied only where no pruning is in effect: BTX v0.34.15
+    // refuses to start with pruning and a transaction index together
+    // (src/init.cpp:2077), so `txindex=1` on a keeper or a pruned folder
+    // would leave the node unable to start at all.
+    let explorer_on =
+        settings.txindex_enabled && btx_core::setup::explorer_mode_possible_here(&datadir);
+    if let Err(e) =
+        btx_core::setup::set_conf_kv(&paths.faststart_conf, "txindex", explorer_on.then_some("1"))
+    {
         // Never fatal: a node that starts without the index is still a node.
         eprintln!("[node-app] could not re-apply txindex to the conf: {e}");
     }
@@ -1565,6 +1637,7 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     *state.matmul_trusted.lock().await = None;
     *state.signature_window.lock().await = Default::default();
     *state.signed_frontier.lock().await = None;
+    *state.chain_agreement.lock().await = None;
     *state.catch_up_help.lock().await = Default::default();
     *state.recent_signers.lock().await = None;
     *state.fork.lock().await = None;
@@ -1909,8 +1982,9 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     maybe_start_esplora(state, &datadir).await;
     maybe_start_witness(state, &datadir).await;
     // The snapshot keeper, if chosen: re-offers the recorded pair once this
-    // node is at the tip (the offer never survives a restart), and refreshes
-    // it every 500 blocks. Gated against the LIVE node on every tick.
+    // node is at the tip (the offer never survives a restart), and takes a
+    // fresh one at every multiple of 100 blocks, offered once it is 144 blocks
+    // deep. Gated against the LIVE node on every tick.
     maybe_start_snapshot_serve(state, &datadir).await;
     // A Fast-forward the app was closed in the middle of is watched to its
     // end, now that the node is up.
@@ -1940,7 +2014,7 @@ async fn spawn_node_with_lock_retry(
         // A quit that started mid-retry must win: spawning after the graceful
         // quit's stop pass has already run would orphan a fresh btxd.
         if state.quitting.load(Ordering::SeqCst) {
-            return Err("the app is quitting — not starting the node".to_string());
+            return Err("the app is quitting, so the node is not starting".to_string());
         }
         // Whether this attempt had to clear a holder decides two things: the
         // long stop-wait below, and whether the post-spawn survival watch runs
@@ -2441,6 +2515,70 @@ fn spawn_warmup_watcher(app: AppHandle, state: &AppState, datadir: PathBuf) {
     });
 }
 
+/// "Same chain as other sources" (btx_core::chain_agreement): every
+/// `CHECK_EVERY_SECS` while this run lasts, compare this node's block at a
+/// height below every tip with the public sources'. Read-only GETs with a
+/// short timeout, and display only: nothing it finds changes what the node
+/// accepts, its peers or its keys. Ends with the run (the refresher's
+/// generation) and does nothing without a node.
+fn spawn_chain_agreement_checker(state: &AppState, gen: u64) {
+    let gen_counter = state.refresher_gen.clone();
+    let rpc_slot = state.rpc.clone();
+    let slot = state.chain_agreement.clone();
+    tauri::async_runtime::spawn(async move {
+        let client = btx_core::chain_agreement::client();
+        // The first comparison a minute in, once the node answers; a node
+        // still warming up is asked again a minute later, not five.
+        let mut wait = 60;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            if gen_counter.load(Ordering::SeqCst) != gen {
+                return; // superseded by a restart / stop
+            }
+            let Some(rpc) = rpc_slot.lock().await.clone() else {
+                return; // node stopped
+            };
+            let Ok(chain) = get_blockchain_info(&rpc).await else {
+                wait = 60;
+                continue;
+            };
+            wait = btx_core::chain_agreement::CHECK_EVERY_SECS;
+            let ask = rpc.clone();
+            let agreement = btx_core::chain_agreement::check(
+                &client,
+                &btx_core::chain_agreement::SOURCES,
+                chain.blocks,
+                |h| async move {
+                    btx_core::rpc::Rpc::call(&ask, "getblockhash", serde_json::json!([h]))
+                        .await
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                },
+            )
+            .await;
+            if gen_counter.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            if let Some(a) = agreement {
+                *slot.lock().await = Some(a);
+            }
+        }
+    });
+}
+
+/// The status screen's "Same chain as other sources" row: only while the
+/// node runs and once a comparison exists. The sentences are the core's.
+pub(crate) fn chain_agreement_row(
+    running: bool,
+    agreement: Option<&btx_core::chain_agreement::Agreement>,
+    now: u64,
+) -> Option<btx_core::chain_agreement::ScreenRow> {
+    if !running {
+        return None;
+    }
+    agreement.map(|a| a.screen(now))
+}
+
 /// The status refresher: every 3 s read chain info + chainstates + peers and
 /// project them into the phase (Syncing / Ready). Exits when superseded by a
 /// newer generation (restart) or when the node is stopped. Repeated RPC
@@ -2466,6 +2604,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
     let nickname_slot = state.peer_nicknames_cache.clone();
     let archive_service_slot = state.archive_service.clone();
     let matmul_trusted_slot = state.matmul_trusted.clone();
+    let last_verifier_restart_slot = state.last_verifier_restart.clone();
     let signature_window_slot = state.signature_window.clone();
     let signed_frontier_slot = state.signed_frontier.clone();
     let catch_up_slot = state.catch_up_help.clone();
@@ -2475,11 +2614,13 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
     let fork_slot = state.fork.clone();
     let tip_time_slot = state.tip_median_time.clone();
     let engine_warnings_slot = state.engine_warnings.clone();
+    let snapshot_network_slot = state.snapshot_network.clone();
     let history_slot = state.history_check.clone();
     let started_from_slot = state.started_from.clone();
     let node_slot = state.node.clone();
     let attached_slot = state.attached_to.clone();
     let anchor = snapshot_spec().anchor_height;
+    spawn_chain_agreement_checker(state, gen);
 
     tauri::async_runtime::spawn(async move {
         // This run's start, for the service report's uptime field (the
@@ -2546,6 +2687,14 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         // CHANGED, which is what the stall rule measures.
         let mut bootstrap_headers: Option<u64> = None;
         let mut bootstrap_moved_at = std::time::Instant::now();
+        // The snapshot network (btx_core::diary, btx_core::snapshot_confirmer):
+        // the chain's genesis, read once; whether a diary step or a confirmer
+        // round is running; the confirmer's counter, which starts near the
+        // top so the first round goes out about two minutes in.
+        let mut snapshot_genesis: Option<String> = None;
+        let diary_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let confirm_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut confirm_tick: u32 = CONFIRM_FIRST_TICK;
         // Catch-up help (btx_core::catchup_assist, decision 2026-09-29 §11):
         // while the node is behind and its newest block has stood still for
         // 30 seconds, whatever requests the engine has out, ask this app's
@@ -2553,6 +2702,25 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         // headers, the batch out, the peers that dropped us over old blocks)
         // lasts for this run only.
         let mut catch_up = btx_core::catchup_assist::CatchUp::for_this_app();
+        // Twin-freeze recovery (btx_core::twin_freeze). REMOVE WHEN 0.35
+        // SHIPS: btxchain/btx#280 and #285 fix the engine side.
+        let mut twin_freeze = btx_core::twin_freeze::TwinFreeze::new();
+        // The block height at this run's first answer, so the rule below can
+        // tell a verifier lost mid-run (blocks were connected) from one that
+        // never qualified, and when the engine's "cannot verify" warning
+        // first stood (cleared the moment it goes).
+        let mut run_first_blocks: Option<u64> = None;
+        let mut verifier_lost_since: Option<std::time::Instant> = None;
+        // The engine's last answer to "did you lose a card you had in use",
+        // so the refresher asks it at most once a minute.
+        let mut engine_card_answer: Option<(std::time::Instant, bool)> = None;
+        // The chain-state write (btx_core::state_flush): when it was last
+        // asked for (this run's start counts, so the first is five minutes
+        // in), whether that request still waits, and whether the last one
+        // worked, so the log says the first result and then only changes.
+        let mut flush_asked = std::time::Instant::now();
+        let flush_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flush_last_ok: Arc<std::sync::Mutex<Option<bool>>> = Arc::default();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             if gen_counter.load(Ordering::SeqCst) != gen {
@@ -2601,8 +2769,157 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     // render time against the clock then.
                     *tip_time_slot.lock().await = Some(chain.median_time);
                     // What the engine is warning about, from the same answer.
-                    *engine_warnings_slot.lock().await =
-                        btx_core::engine_warnings::from_node(&chain);
+                    let warnings_now = btx_core::engine_warnings::from_node(&chain);
+                    let cannot_verify_now = warnings_now.iter().any(|w| {
+                        matches!(
+                            w,
+                            btx_core::engine_warnings::EngineWarning::CannotVerifyBlocks { .. }
+                        )
+                    });
+                    *engine_warnings_slot.lock().await = warnings_now;
+                    // A verifier lost mid-run gets a restart, which re-runs the
+                    // startup qualification in a new process; on the 3060 the
+                    // engine's in-process re-tests failed for 13 hours
+                    // (btx_core::engine_warnings::restart_for_lost_verifier).
+                    // Inside WSL the restart is of WSL itself, since an engine
+                    // restart does not bring the card back there
+                    // (btx_core::engine_warnings::lost_verifier_remedy).
+                    let first = *run_first_blocks.get_or_insert(chain.blocks);
+                    verifier_lost_since = if cannot_verify_now {
+                        Some(verifier_lost_since.unwrap_or_else(std::time::Instant::now))
+                    } else {
+                        None
+                    };
+                    if !cannot_verify_now {
+                        engine_card_answer = None;
+                    }
+                    let validating = matmul_trusted_slot.lock().await.as_ref().is_some_and(|t| {
+                        t.matmul_validation_mode.eq_ignore_ascii_case("consensus")
+                    });
+                    let verified_this_run = chain.blocks > first;
+                    let lost_for = verifier_lost_since.map(|t| t.elapsed());
+                    let settings_now = NodeAppSettings::load(&node_datadir());
+                    // Never restart WSL under a node another app owns: its
+                    // stop only detaches, and `wsl --shutdown` would kill that
+                    // app and its btxd uncleanly (audit of #205).
+                    let ours = attached_node_is_ours_to_stop(*attached_slot.lock().await);
+                    let remedy = btx_core::engine_warnings::lost_verifier_remedy(
+                        btx_core::wsl::this_host_runs_in_wsl(),
+                        settings_now.gpu_recovery_restarts_wsl && ours,
+                    );
+                    let wsl_path =
+                        remedy == btx_core::engine_warnings::LostVerifierRemedy::RestartWsl;
+                    // A run that verifies blocks ends a streak of WSL restarts.
+                    if verified_this_run && settings_now.gpu_wsl_restart_streak > 0 {
+                        NodeAppSettings::update(&node_datadir(), |s| s.gpu_wsl_restart_streak = 0);
+                    }
+                    let since_wsl_restart = settings_now
+                        .gpu_wsl_restart_last_unix
+                        .map(|t| std::time::Duration::from_secs(unix_now_secs().saturating_sub(t)));
+                    let since_last = last_verifier_restart_slot.lock().await.map(|t| t.elapsed());
+                    let streak = settings_now.gpu_wsl_restart_streak;
+                    let rule = |engine_lost_card: bool| {
+                        validating
+                            && if wsl_path {
+                                btx_core::engine_warnings::restart_wsl_for_lost_verifier(
+                                    lost_for,
+                                    verified_this_run,
+                                    engine_lost_card,
+                                    since_wsl_restart,
+                                    since_last,
+                                    streak,
+                                )
+                            } else {
+                                btx_core::engine_warnings::restart_for_lost_verifier(
+                                    lost_for,
+                                    verified_this_run,
+                                    engine_lost_card,
+                                    since_last,
+                                )
+                            }
+                    };
+                    // An app started after the card was lost adopts the same
+                    // engine and never connects a block in its own run, so the
+                    // rule alone would leave it frozen (end-to-end run of
+                    // 2026-10-14). The engine remembers losing a card it had in
+                    // use. Asked only when its answer would change what
+                    // happens, and at most once a minute: a card refused at
+                    // startup carries the same warning for as long as it runs.
+                    let mut engine_lost_card = false;
+                    let mut fire = rule(false);
+                    if !fire && rule(true) {
+                        engine_lost_card = match engine_card_answer {
+                            Some((at, lost))
+                                if at.elapsed() < std::time::Duration::from_secs(60) =>
+                            {
+                                lost
+                            }
+                            _ => {
+                                use btx_core::rpc::Rpc as _;
+                                let lost = rpc
+                                    .call("getmininginfo", serde_json::json!([]))
+                                    .await
+                                    .is_ok_and(|v| {
+                                        btx_core::engine_warnings::engine_lost_its_card(&v)
+                                    });
+                                engine_card_answer = Some((std::time::Instant::now(), lost));
+                                lost
+                            }
+                        };
+                        fire = engine_lost_card;
+                    }
+                    if fire {
+                        *last_verifier_restart_slot.lock().await = Some(std::time::Instant::now());
+                        let mins = lost_for.map(|t| t.as_secs() / 60).unwrap_or(0);
+                        let what = if wsl_path {
+                            "stopping the node and restarting WSL, which is what brings the \
+                             graphics card back after a driver update"
+                        } else {
+                            "restarting the node so the engine checks the graphics card again"
+                        };
+                        let msg = if verified_this_run {
+                            format!(
+                                "the block verifier has been unavailable for {mins} min in a run \
+                                 that had been checking blocks (stopped at {}); {what}",
+                                chain.blocks
+                            )
+                        } else if engine_lost_card {
+                            format!(
+                                "the block verifier has been unavailable for {mins} min, and the \
+                                 engine reports losing the graphics card it had in use (stopped \
+                                 at {}); {what}",
+                                chain.blocks
+                            )
+                        } else {
+                            format!(
+                                "the block verifier is still unavailable {mins} min into the run \
+                                 after easyNode's own WSL restart, as when a driver install was \
+                                 still going; {what}, once more"
+                            )
+                        };
+                        eprintln!("[node-app] {msg}");
+                        setup_log(&node_datadir(), &msg);
+                        let restart_app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let state = restart_app.state::<AppState>();
+                            if state.rpc.lock().await.is_none()
+                                || state.quitting.load(Ordering::SeqCst)
+                            {
+                                return; // stopped or quitting meanwhile: leave it
+                            }
+                            if wsl_path {
+                                recover_by_restarting_wsl(&restart_app, &state).await;
+                                return;
+                            }
+                            if let Err(e) = restart_node_projected(&restart_app, &state).await {
+                                eprintln!(
+                                    "[node-app] the restart for a lost block verifier failed: {e}"
+                                );
+                            }
+                        });
+                        // The restart's stop supersedes this refresher.
+                        return;
+                    }
                     // Housekeeping: free the ~450 MB bootstrap snapshot the
                     // moment its load is confirmed (C3-gated; safe while btxd
                     // runs — it never holds the file after loadtxoutset).
@@ -2717,10 +3034,14 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                             // Already in hand at this tick and, until now, used
                             // only to discriminate stalls ninety lines below —
                             // never shown to the person reading the badge.
-                            blocks_behind: chain.headers.saturating_sub(readiness.height()),
+                            // The network height, not headers alone: after
+                            // mainnet 244,000 headers stay near blocks while a
+                            // node catches up (`phase_target`).
+                            blocks_behind: phase_target(&chain, readiness.height())
+                                .saturating_sub(readiness.height()),
                         }
                     } else {
-                        let mut headers = chain.headers;
+                        let mut headers = phase_target(&chain, readiness.height());
                         let mut progress = readiness.progress();
                         // Headers phase (chain height still 0): RPC reports
                         // headers=0 through PRE-sync and a ~0 verification
@@ -2745,7 +3066,26 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         }
                     };
                     *phase_slot.lock().await = new_phase.clone();
-                    crate::tray::reflect_phase(&app, &new_phase);
+                    // The tray says "not following" on the facts the window's
+                    // headline turns amber on without the window's trend: the
+                    // watchdog's verdict (last tick's), or an old tip with
+                    // nothing newer known (tray::stuck_for_tray). The window
+                    // may be hidden, so the tray cannot wait for it.
+                    let stuck = match &new_phase {
+                        NodePhase::Ready { blocks_behind, .. } => {
+                            let now_unix = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            crate::tray::stuck_for_tray(
+                                stall_slot.lock().await.is_some(),
+                                btx_core::node_api::tip_is_stale(chain.median_time, now_unix),
+                                *blocks_behind,
+                            )
+                        }
+                        _ => false,
+                    };
+                    crate::tray::reflect_status(&app, &new_phase, stuck);
 
                     // Latch btxd's rc verdict OURSELVES (bounded tail read,
                     // only until latched — same rule as get_node_status).
@@ -2916,7 +3256,12 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     // already made. Never judged during initial block
                     // download, when headers lead blocks by design.
                     {
-                        let behind = chain.headers.saturating_sub(chain.blocks);
+                        // The network height (btx_core::network_height): after
+                        // mainnet 244,000 headers alone stay near blocks while
+                        // a node catches up, and this window, the alarm below
+                        // and the engine's priority all went quiet with them.
+                        let network = chain.network_height();
+                        let behind = network.saturating_sub(chain.blocks);
                         if behind > btx_core::fork::HEADERS_AHEAD_ALARM {
                             gap_since.get_or_insert((std::time::Instant::now(), behind));
                         } else {
@@ -3058,7 +3403,7 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                             btx_core::fork::fork_alarm(
                                 &fork_tips,
                                 chain.blocks,
-                                chain.headers,
+                                network,
                                 gap,
                                 at_served_body_tip,
                             )
@@ -3148,8 +3493,57 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         }
                     }
 
+                    // ── Twin-freeze recovery (REMOVE WHEN 0.35 SHIPS) ───────
+                    // A GPU-less mirror on 0.34.15 can sit for hours on the
+                    // losing block of a one-block race (btxchain/btx#280,
+                    // #285). btx_core::twin_freeze sets that one block aside
+                    // with invalidateblock under strict conditions, and puts
+                    // it back with reconsiderblock if the node does not move
+                    // on. It reads nothing more unless the frontier this tick
+                    // already read is 2+ ahead on another branch.
+                    {
+                        let dd = node_datadir();
+                        let tag = NodeAppSettings::load(&dd)
+                            .btx_release_tag
+                            .unwrap_or_else(|| NODE_RELEASE_TAG.to_string());
+                        let own_signing_key = btx_core::read_block_recovery::has_own_signing_key(
+                            &dd,
+                            &[&dd.join("btx.conf"), &dd.join("btx_rw.conf")],
+                        );
+                        let facts = btx_core::twin_freeze::NodeFacts {
+                            trusted_mirror,
+                            own_signing_key,
+                            engine_tag: &tag,
+                            initial_block_download: chain.initial_block_download,
+                            blocks: chain.blocks,
+                            frontier: frontier.as_ref(),
+                        };
+                        let now_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        for line in btx_core::twin_freeze::run(
+                            &rpc,
+                            &dd,
+                            &mut twin_freeze,
+                            &facts,
+                            || btx_core::node::node_log_tail(&dd, 64 * 1024),
+                            std::time::Instant::now(),
+                            now_unix,
+                        )
+                        .await
+                        {
+                            let msg = format!("twin-freeze recovery: {line}");
+                            eprintln!("[node-app] {msg}");
+                            setup_log(&dd, &msg);
+                        }
+                    }
+
                     // ── Trusted-mirror stall watchdog tick ──────────────────
-                    let heights = (readiness.height(), chain.headers);
+                    // The network height, not headers alone: after mainnet
+                    // 244,000 headers stay near blocks while a node catches
+                    // up, and the stall diagnosis below never saw a gap.
+                    let heights = (readiness.height(), chain.network_height());
                     // Progress rule (refined — see btx_core::watchdog): while
                     // a connectable gap exists, only BLOCK movement counts.
                     // BTX mints a header every ~90 s, so the old any-change
@@ -3460,6 +3854,99 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                             }
                         }
                     }
+
+                    // ── The diary and the confirmer (snapshot network) ──────
+                    //
+                    // Every node that checks blocks itself writes down its own
+                    // chain state when the tip is on the grid of 100
+                    // (btx_core::diary); a node on the operator list also
+                    // co-signs a statement waiting on easybtx.com, or dissents
+                    // from it, only by that diary (btx_core::snapshot_confirmer).
+                    // Both run off the tick, on a handle with a longer
+                    // timeout: gettxoutsetinfo hashes the whole UTXO set, and
+                    // a round of HTTP can outlast the tick. Off the grid this
+                    // costs nothing: the height is already in hand.
+                    if snapshot_genesis.is_none() {
+                        snapshot_genesis = btx_core::diary::chain_id(&rpc).await;
+                    }
+                    // The refresher is the only one that sets the flags;
+                    // the spawned step clears its own when it is done.
+                    let steps = snapshot_steps(
+                        chain.blocks,
+                        confirm_tick,
+                        diary_in_flight.load(Ordering::SeqCst),
+                        confirm_in_flight.load(Ordering::SeqCst),
+                    );
+                    confirm_tick = steps.confirm_tick;
+                    if steps.diary {
+                        diary_in_flight.store(true, Ordering::SeqCst);
+                        let rpc = rpc.with_timeout(SNAPSHOT_RPC_TIMEOUT);
+                        let in_flight = diary_in_flight.clone();
+                        let report = snapshot_network_slot.clone();
+                        let mode = btx_core::role::validation_mode(
+                            matmul_trusted_slot.lock().await.as_ref(),
+                        );
+                        tauri::async_runtime::spawn(async move {
+                            diary_step(&rpc, mode, &report).await;
+                            in_flight.store(false, Ordering::SeqCst);
+                        });
+                    }
+                    if steps.confirm {
+                        confirm_in_flight.store(true, Ordering::SeqCst);
+                        let rpc = rpc.with_timeout(SNAPSHOT_RPC_TIMEOUT);
+                        let in_flight = confirm_in_flight.clone();
+                        let report = snapshot_network_slot.clone();
+                        let trusted = matmul_trusted_slot.lock().await.clone();
+                        let genesis = snapshot_genesis.clone();
+                        tauri::async_runtime::spawn(async move {
+                            confirm_round(&rpc, trusted, genesis, &report).await;
+                            in_flight.store(false, Ordering::SeqCst);
+                        });
+                    }
+
+                    // ── Write the chain state to disk (every 5 minutes) ─────
+                    //
+                    // btxd writes on its own only every 50 to 70 minutes, so
+                    // a hard kill or a power cut used to cost up to an hour
+                    // of blocks: 36 on the 3060 on 2026-10-15, after a
+                    // Windows restart killed its btxd (btx_core::state_flush).
+                    // Off the tick, like the diary: the write waits for the
+                    // engine's main lock. Any node and any role, never during
+                    // initial block download. That includes a node another
+                    // app owns (the miner's): the request changes nothing but
+                    // when its engine writes, and on a validating node the
+                    // diary step above already sends it a gettxoutsetinfo at
+                    // every grid height, whoever owns it.
+                    if btx_core::state_flush::flush_due(
+                        flush_asked.elapsed(),
+                        chain.initial_block_download,
+                        chain.blocks,
+                        flush_in_flight.load(Ordering::SeqCst),
+                    ) {
+                        flush_asked = std::time::Instant::now();
+                        flush_in_flight.store(true, Ordering::SeqCst);
+                        let rpc = rpc.with_timeout(btx_core::state_flush::FLUSH_TIMEOUT);
+                        let in_flight = flush_in_flight.clone();
+                        let last_ok = flush_last_ok.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let started = std::time::Instant::now();
+                            let result = btx_core::state_flush::flush(&rpc)
+                                .await
+                                .map(|()| started.elapsed())
+                                .map_err(|e| e.to_string());
+                            let previous = last_ok
+                                .lock()
+                                .map(|mut l| l.replace(result.is_ok()))
+                                .unwrap_or(None);
+                            if let Some(msg) =
+                                btx_core::state_flush::outcome_line(previous, &result)
+                            {
+                                eprintln!("[node-app] {msg}");
+                                setup_log(&node_datadir(), &msg);
+                            }
+                            in_flight.store(false, Ordering::SeqCst);
+                        });
+                    }
                 }
                 Err(AppError::Rpc { code: -28, .. }) => {
                     // Warming up (shielded rebuild / verify) — alive, keep calm.
@@ -3565,6 +4052,19 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
 /// conclusion without a line in the log. Never during a header bootstrap
 /// (plan decision 9): its node has loaded no snapshot and is restarted when
 /// the headers are in.
+/// What the phase counts toward from one `getblockchaininfo`: the network
+/// height (btx_core::network_height) once the node has blocks, because after
+/// mainnet 244,000 `headers` alone stays near `blocks` while a node catches
+/// up; the raw header count while it is still fetching headers (`height` 0),
+/// which is the number that moves on the "Counting the chain" screen.
+pub(crate) fn phase_target(chain: &btx_core::node_api::BlockchainInfo, height: u64) -> u64 {
+    if height == 0 {
+        chain.headers
+    } else {
+        chain.network_height()
+    }
+}
+
 fn catch_up_tick<'a>(
     header_bootstrap: bool,
     blocks: u64,
@@ -3851,6 +4351,7 @@ pub async fn stop_node_inner(state: &AppState) {
     *state.matmul_trusted.lock().await = None;
     *state.signature_window.lock().await = Default::default();
     *state.signed_frontier.lock().await = None;
+    *state.chain_agreement.lock().await = None;
     *state.catch_up_help.lock().await = Default::default();
     *state.fork.lock().await = None;
     *state.tip_median_time.lock().await = None;
@@ -3965,6 +4466,12 @@ pub struct NodeStatusInfo {
     /// shown, defaulted ON, and prevented nothing — and toggling it off and
     /// back on, the obvious recovery, also did nothing and still returned Ok.
     pub keep_awake_supported: bool,
+    /// Whether this app runs inside WSL2, where the GPU recovery switch
+    /// applies (`btx_core::wsl::this_host_runs_in_wsl`). Settings shows the
+    /// switch only here.
+    pub in_wsl: bool,
+    /// The GPU recovery switch: restart WSL when the block verifier is lost.
+    pub gpu_recovery_restarts_wsl: bool,
     /// What this platform calls the place a closed window keeps running: the
     /// "menu bar" on macOS, the "system tray" everywhere else.
     ///
@@ -3977,6 +4484,10 @@ pub struct NodeStatusInfo {
     pub tray_term: String,
     /// Explorer mode (txindex) — the persisted user choice.
     pub txindex_enabled: bool,
+    /// Whether Explorer mode can run on this node at all: no pruning in
+    /// effect or chosen (`ask::explorer_mode_available`). Settings greys the
+    /// switch out with the reason when it cannot.
+    pub explorer_available: bool,
     /// Attestation serving (`matmulattestationserve=1`) — the persisted user
     /// choice, or a hand-set conf flag the start path adopted. A change
     /// applies on the next node (re)start.
@@ -4218,6 +4729,13 @@ pub struct NodeStatusInfo {
     pub esplora_indexing: bool,
     pub esplora_freshness: Option<String>,
     pub esplora_message: Option<String>,
+    /// Why Esplora cannot run on this machine at all, said calmly; `None`
+    /// when it can, or when it is off.
+    pub esplora_unavailable: Option<String>,
+    /// "Same chain as other sources" (btx_core::chain_agreement), its
+    /// sentences rendered in Rust. `None` when stopped or before the first
+    /// comparison of this run.
+    pub chain_agreement: Option<btx_core::chain_agreement::ScreenRow>,
     /// Serve the two routes a wallet needs to settle a fork. Unlike Esplora
     /// mode this needs no second binary and no particular prune posture, so
     /// `witness_running` is simply whether it is on and the node is up.
@@ -4380,6 +4898,20 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         engine_notes.push(btx_core::engine_warnings::EngineNote {
             message,
             needs_attention: false,
+        });
+    }
+    // The twin-freeze recovery's line (REMOVE WHEN 0.35 SHIPS): a block set
+    // aside and being watched, or one handled in the last day.
+    if let Some((message, needs_attention)) = btx_core::twin_freeze::status_note(
+        &datadir,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    ) {
+        engine_notes.push(btx_core::engine_warnings::EngineNote {
+            message,
+            needs_attention,
         });
     }
 
@@ -4600,6 +5132,14 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
     // made the exposure warning switch off the moment somebody saved
     // 127.0.0.1, while the live server went on answering 0.0.0.0 for the rest
     // of the session. The Esplora row above already gets this right.
+    let chain_agreement = chain_agreement_row(
+        running,
+        state.chain_agreement.lock().await.as_ref(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    );
     let (witness_running, witness_serving_on) = match &*state.witness.lock().await {
         Some(s) => (true, Some(s.addr.to_string())),
         None => (false, None),
@@ -4649,12 +5189,15 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         welcome_shown: settings.welcome_shown,
         keep_awake: settings.keep_awake,
         keep_awake_supported: btx_core::power::sleep_assertion_supported(),
+        in_wsl: btx_core::wsl::this_host_runs_in_wsl(),
+        gpu_recovery_restarts_wsl: settings.gpu_recovery_restarts_wsl,
         tray_term: if cfg!(target_os = "macos") {
             "menu bar".to_string()
         } else {
             "system tray".to_string()
         },
         txindex_enabled: settings.txindex_enabled,
+        explorer_available: crate::ask::explorer_mode_available(&datadir),
         attestation_serve_enabled: settings.attestation_serve_enabled,
         signer_enabled: settings.signer_enabled,
         signer_applies_here,
@@ -4741,7 +5284,9 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         esplora_running,
         esplora_indexing,
         esplora_freshness: esplora_verdict.map(|v| v.freshness.as_str().to_string()),
+        chain_agreement,
         esplora_message,
+        esplora_unavailable: state.esplora_unavailable.lock().await.clone(),
         last_update_check_at: settings.last_update_check_at.clone(),
         last_update_check_outcome: settings.last_update_check_outcome.clone(),
         last_update_check_detail: settings.last_update_check_detail.clone(),
@@ -4980,6 +5525,209 @@ pub async fn restart_node_projected(
     stop_node_inner(state).await;
     set_phase(app, state, NodePhase::Stopped).await;
     start_node_projected(app, state).await
+}
+
+/// Recover the GPU block verifier by restarting WSL (`btx_core::wsl`), after a
+/// driver update on the Windows host.
+///
+/// Order matters (audit of #205, 2026-10-14):
+/// 1. Build the command first. A distro, user or path that cannot be
+///    embedded safely must leave the node running, so the engine is
+///    restarted instead and nothing is stopped for nothing.
+/// 2. Record the restart in the settings file before it happens: the
+///    process that makes it does not survive it, and the next run needs the
+///    record to keep its gap (`restart_wsl_for_lost_verifier`).
+/// 3. Stop btxd cleanly, since `wsl --shutdown` would kill it mid-flush.
+/// 4. Hand the restart to Windows. If that fails, start the node again.
+/// 5. Safety net: WSL normally takes this app down within seconds. If it is
+///    still running two minutes later, the restart did not happen (blocked
+///    by antivirus, say), so the node starts again here rather than staying
+///    stopped. What the Windows side did is in `%TEMP%\easynode-wsl-restart.log`.
+async fn recover_by_restarting_wsl(app: &AppHandle, state: &State<'_, AppState>) {
+    let log = |note: &str| {
+        eprintln!("[node-app] {note}");
+        setup_log(&node_datadir(), note);
+    };
+    let command = match prepare_wsl_restart() {
+        Ok(c) => c,
+        Err(e) => {
+            log(&format!(
+                "cannot restart WSL ({e}); restarting the node instead"
+            ));
+            if let Err(e) = restart_node_projected(app, state).await {
+                log(&format!(
+                    "the restart for a lost block verifier failed: {e}"
+                ));
+            }
+            return;
+        }
+    };
+    NodeAppSettings::update(&node_datadir(), |s| {
+        s.gpu_wsl_restart_last_unix = Some(unix_now_secs());
+        s.gpu_wsl_restart_streak = s.gpu_wsl_restart_streak.saturating_add(1);
+    });
+    stop_node_inner(state).await;
+    set_phase(app, state, NodePhase::Stopped).await;
+    if let Err(e) = run_wsl_restart(&command) {
+        log(&format!(
+            "could not restart WSL ({e}); starting the node again"
+        ));
+        if let Err(e) = start_node_projected(app, state).await {
+            log(&format!(
+                "the restart for a lost block verifier failed: {e}"
+            ));
+        }
+        return;
+    }
+    log("WSL restarts in a few seconds; easyNode starts again by itself about a minute later");
+    tokio::time::sleep(WSL_RESTART_GRACE).await;
+    if state.quitting.load(Ordering::SeqCst) || state.rpc.lock().await.is_some() {
+        return;
+    }
+    log(&format!(
+        "WSL was not restarted within {} s (on Windows, see %TEMP%\\{}); starting the node again",
+        WSL_RESTART_GRACE.as_secs(),
+        btx_core::wsl::RESTART_LOG_NAME
+    ));
+    if let Err(e) = start_node_projected(app, state).await {
+        log(&format!(
+            "the restart for a lost block verifier failed: {e}"
+        ));
+    }
+}
+
+/// How long the app waits for `wsl --shutdown` to take it down before it
+/// concludes the restart did not happen. The script waits 3 s before shutting
+/// down, so two minutes is a wide margin.
+const WSL_RESTART_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long the outer PowerShell may take to hand the job over. It only starts
+/// the inner one, which takes about a second; a hung interop call must not
+/// park the recovery with the node stopped.
+const WSL_HANDOFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Build the PowerShell command that restarts WSL and brings easyNode back,
+/// without running anything: the outer script, encoded for `-EncodedCommand`.
+///
+/// Two PowerShell processes, so the one doing the work is not a child of WSL
+/// interop: the outer one only starts the inner one detached and exits. Both
+/// scripts travel as `-EncodedCommand`, so nothing in them is re-quoted.
+fn prepare_wsl_restart() -> Result<String, String> {
+    let user = std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .ok_or("USER is not set")?;
+    let relaunch = std::env::var("APPIMAGE")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .map(|p| p.display().to_string())
+        })
+        .ok_or("cannot tell which program to start again")?;
+    let distro = this_wsl_distro();
+    let script = btx_core::wsl::restart_wsl_script(distro.as_deref(), &user, &relaunch)
+        .ok_or("the distro, user or program path needs quoting")?;
+    let outer = format!(
+        "Start-Process -WindowStyle Hidden -FilePath powershell.exe -ArgumentList \
+         '-NoProfile','-NonInteractive','-WindowStyle','Hidden','-EncodedCommand','{}'",
+        encode_powershell(&script)
+    );
+    Ok(encode_powershell(&outer))
+}
+
+/// This distro's name: `WSL_DISTRO_NAME`, which a boot hook or a systemd unit
+/// does not set, else what `wslpath -w /` says. `None` restarts the default
+/// distro, which may not be this one when a PC has several.
+fn this_wsl_distro() -> Option<String> {
+    if let Some(d) = std::env::var("WSL_DISTRO_NAME")
+        .ok()
+        .filter(|d| !d.is_empty())
+    {
+        return Some(d);
+    }
+    let out = std::process::Command::new("wslpath")
+        .args(["-w", "/"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    btx_core::wsl::distro_from_unc_root(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Run the command from [`prepare_wsl_restart`]: Windows PowerShell through
+/// WSL interop, and through its interpreter when the interop handler is gone.
+/// Waits at most [`WSL_HANDOFF_TIMEOUT`].
+fn run_wsl_restart(encoded: &str) -> Result<(), String> {
+    let args = [
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-EncodedCommand",
+        encoded,
+    ];
+    let spawn = |program: &str, before: &[&str]| {
+        std::process::Command::new(program)
+            .args(before)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    };
+    let mut child = match spawn(btx_core::wsl::POWERSHELL_FROM_WSL, &[]) {
+        // ENOEXEC: the WSLInterop handler is gone, which is what another
+        // distro's systemd-binfmt does to the whole VM at its boot (the 3060,
+        // 2026-10-13 20:14 UTC). Its interpreter still runs a Windows program.
+        Err(e) if e.raw_os_error() == Some(ENOEXEC) => {
+            eprintln!(
+                "[node-app] Windows programs are not recognised here ({e}); starting \
+                 PowerShell through {} instead",
+                btx_core::wsl::INTEROP_INTERPRETER
+            );
+            spawn(
+                btx_core::wsl::INTEROP_INTERPRETER,
+                &[btx_core::wsl::POWERSHELL_FROM_WSL],
+            )
+        }
+        other => other,
+    }
+    .map_err(|e| format!("cannot start Windows PowerShell through WSL interop: {e}"))?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("Windows PowerShell exited with {status}")),
+            Ok(None) if started.elapsed() >= WSL_HANDOFF_TIMEOUT => {
+                let _ = child.kill();
+                return Err(format!(
+                    "Windows PowerShell did not hand the job over within {} s",
+                    WSL_HANDOFF_TIMEOUT.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
+            Err(e) => return Err(format!("cannot wait for Windows PowerShell: {e}")),
+        }
+    }
+}
+
+/// Wall-clock seconds since 1970, for records that outlive this process.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `execve` refused the binary format (Linux errno 8).
+const ENOEXEC: i32 = 8;
+
+/// PowerShell's `-EncodedCommand`: base64 of the script in UTF-16LE.
+fn encode_powershell(script: &str) -> String {
+    use base64::Engine;
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// End a header bootstrap: stop the node, clear the marker, start it again the
@@ -6593,6 +7341,7 @@ pub async fn set_esplora(state: State<'_, AppState>, on: bool) -> Result<String,
         NodeAppSettings::update(&datadir, |s| s.esplora_enabled = false);
         stop_esplora(&state).await;
         *state.esplora_error.lock().await = None;
+        *state.esplora_unavailable.lock().await = None;
         return Ok("Esplora off. Wallets pointed at this node stop getting answers.".to_string());
     }
     let facts = esplora_facts(&state, &datadir).await;
@@ -6687,27 +7436,46 @@ async fn start_esplora(
     Ok(())
 }
 
+/// Settings' calm line for a machine without electrs and Caddy.
+const ESPLORA_NOT_INSTALLED: &str =
+    "Not on this computer: it needs electrs and Caddy, which easyNode \
+     does not install. It starts by itself once both are here.";
+/// Settings' calm line for a node that keeps only the newest blocks.
+const ESPLORA_PRUNED: &str = "Not on this node: wallets need the whole chain, and this node keeps \
+     only the newest blocks.";
+
 /// Every node start: honour the persisted choice, and record rather than
 /// hide why it could not be honoured.
 async fn maybe_start_esplora(state: &AppState, datadir: &Path) {
+    *state.esplora_unavailable.lock().await = None;
     if !NodeAppSettings::load(datadir).esplora_enabled {
         return;
     }
+    // On by default since 2026-10-12, so on nearly every install one of these
+    // two holds. Neither is a failure: the programs are not shipped with the
+    // app, and a node that keeps only the newest blocks cannot serve history.
+    // Said calmly (`esplora_unavailable`), never in amber.
     let (electrs, caddy) = match (find_binary(ELECTRS_BIN), find_binary(CADDY_BIN)) {
         (Some(e), Some(c)) => (e, c),
-        (None, _) => {
-            let msg = missing_binary_message(ELECTRS_BIN);
-            eprintln!("[esplora] not starting: {msg}");
-            *state.esplora_error.lock().await = Some(msg);
-            return;
-        }
-        (_, None) => {
-            let msg = missing_binary_message(CADDY_BIN);
-            eprintln!("[esplora] not starting: {msg}");
-            *state.esplora_error.lock().await = Some(msg);
+        _ => {
+            eprintln!("[esplora] not starting: electrs or caddy is not installed");
+            *state.esplora_error.lock().await = None;
+            *state.esplora_unavailable.lock().await = Some(ESPLORA_NOT_INSTALLED.to_string());
             return;
         }
     };
+    let facts = esplora_facts(state, datadir).await;
+    if let Some(
+        btx_core::esplora::EsploraBlocker::ConfIsPruned { .. }
+        | btx_core::esplora::EsploraBlocker::DatadirAlreadyPruned { .. }
+        | btx_core::esplora::EsploraBlocker::KeeperProfile,
+    ) = btx_core::esplora::check(&facts).blocker
+    {
+        eprintln!("[esplora] not starting: this node does not keep the whole chain");
+        *state.esplora_error.lock().await = None;
+        *state.esplora_unavailable.lock().await = Some(ESPLORA_PRUNED.to_string());
+        return;
+    }
     if let Err(e) = start_esplora(state, datadir, &electrs, &caddy).await {
         eprintln!("[esplora] not starting: {e}");
     }
@@ -6915,14 +7683,27 @@ pub async fn set_witness_listen(
 
 // ── Snapshot serving ─────────────────────────────────────────────────────────
 // btx_core::snapshot_serve is the design. In one paragraph: a node that
-// validates and signs exports the UTXO set at the tip, waits ten
-// confirmations because the dump bases on the 0-conf tip and siblings arrive
-// every ~25 blocks, offers the matured pair over P2P, re-makes the links to
-// the mirrors because service bits travel only in the handshake, refreshes
-// every 500 blocks, and re-offers after every node start because the offer
-// lives in the running process only. The keeper below is that loop. Every
-// decision in it is a pure function in the core module with a test; this is
-// orchestration and reporting.
+// validates and signs exports the UTXO set when its tip is exactly on the
+// grid (every multiple of 100 blocks), writing its own diary entry for that
+// height first; each export waits on its own until its block is 144 deep,
+// because the dump bases on the 0-conf tip and siblings arrive every ~25
+// blocks; the producer's checks (btx_core::snapshot_producer: held blocks
+// refused, the base still on the chain, the statement against the node's own
+// diary, every chainstate validated) then have the last word before the pair
+// is offered over P2P; the links to the mirrors are re-made because service
+// bits travel only in the handshake; the offered pair goes to easybtx.com
+// when the node's key is on the operator list; and the recorded pair is
+// re-offered, after the same checks, after every node start because the
+// offer lives in the running process only. The keeper below is that loop.
+// Every decision in it is a function in the core modules with a test; this
+// is orchestration and reporting.
+
+/// Requests that hash or write the whole UTXO set (`gettxoutsetinfo`,
+/// `dumptxoutsetattested`) or refuse a long held branch (`invalidateblock`)
+/// can outlast the RPC client's 60 s on mainnet. They run off the status
+/// refresher's tick and in the keeper's own task, so a longer wait blocks
+/// nothing else.
+const SNAPSHOT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 fn set_snapshot_status(
     slot: &Arc<std::sync::Mutex<Option<snap::ServeStatus>>>,
@@ -6944,25 +7725,273 @@ async fn snapshot_serve_facts(state: &AppState, datadir: &Path) -> snap::Snapsho
     }
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The keeper's poll: every few seconds while the tip is within two blocks
+/// of a grid height, since the export has to happen while the tip is exactly
+/// there; every half minute otherwise.
+fn keeper_poll(tip: Option<u64>) -> std::time::Duration {
+    if tip.is_some_and(|t| snap::blocks_to_grid(t, snap::EXPORT_GRID) <= 2) {
+        std::time::Duration::from_secs(3)
+    } else {
+        std::time::Duration::from_secs(30)
+    }
+}
+
+/// Status-refresher ticks (three seconds each) between confirmer rounds.
+const CONFIRM_EVERY_TICKS: u32 = (btx_core::snapshot_confirmer::CONFIRM_EVERY_SECS / 3) as u32;
+/// Where the confirmer's counter starts: near the top, so the first round
+/// goes out about two minutes into a run.
+const CONFIRM_FIRST_TICK: u32 = CONFIRM_EVERY_TICKS.saturating_sub(40);
+
+/// What the status refresher starts for the snapshot network on one tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotSteps {
+    /// A diary step: the tip is on the grid and no step is running.
+    diary: bool,
+    /// A confirmer round: the counter is up and no round is running.
+    confirm: bool,
+    /// The counter for the next tick.
+    confirm_tick: u32,
+}
+
+/// The refresher's snapshot-network decision for one tick, from the tip,
+/// the counter and whether a diary step or a confirmer round is still
+/// running. A round that is still running when the counter is up is not
+/// skipped: the counter keeps climbing and the next free tick starts it.
+/// Whether this node may confirm at all (mode, signer, key on the list) is
+/// `confirm_round`'s first question, through `snapshot_confirmer::why_not`.
+fn snapshot_steps(
+    blocks: u64,
+    confirm_tick: u32,
+    diary_busy: bool,
+    confirm_busy: bool,
+) -> SnapshotSteps {
+    let tick = confirm_tick.saturating_add(1);
+    let confirm = tick >= CONFIRM_EVERY_TICKS && !confirm_busy;
+    SnapshotSteps {
+        diary: btx_core::diary::on_grid(blocks) && !diary_busy,
+        confirm,
+        confirm_tick: if confirm { 0 } else { tick },
+    }
+}
+
+/// What the diary step said, for the log and Copy diagnostics. `None` when
+/// it is not news (already written, the tip off the grid).
+fn diary_note(outcome: &Result<btx_core::diary::DiaryOutcome, String>) -> Option<String> {
+    use btx_core::diary::DiaryOutcome;
+    match outcome {
+        Ok(DiaryOutcome::Recorded(e)) => Some(format!(
+            "wrote {} (block {}, {} coins)",
+            e.height,
+            e.block_hash.get(..16).unwrap_or(&e.block_hash),
+            e.coins
+        )),
+        Ok(DiaryOutcome::TipMoved) => Some(
+            "the tip moved while the chain state was read; the next chance is 100 blocks later"
+                .to_string(),
+        ),
+        Ok(DiaryOutcome::NotValidating) => Some(
+            "not kept: this node follows signatures instead of checking blocks itself".to_string(),
+        ),
+        Ok(DiaryOutcome::Unvalidated) => Some(
+            "not kept: this node is still checking older history in the background".to_string(),
+        ),
+        Ok(DiaryOutcome::AlreadyRecorded(_) | DiaryOutcome::NotOnGrid) => None,
+        Err(e) => Some(e.clone()),
+    }
+}
+
+/// One diary step (btx_core::diary), from the status refresher while the
+/// tip is on the grid. Every validating node keeps the diary, producer or
+/// not. Logged and reported when the news changes, so a tip that sits on a
+/// grid height for a minute says it once.
+async fn diary_step(
+    rpc: &RpcClient,
+    mode: btx_core::role::ValidationMode,
+    report: &Arc<tokio::sync::Mutex<btx_core::snapshot_confirmer::NetworkReport>>,
+) {
+    let dd = node_datadir();
+    let outcome = btx_core::diary::record_at_tip(rpc, &dd, mode).await;
+    let Some(note) = diary_note(&outcome) else {
+        return;
+    };
+    let mut r = report.lock().await;
+    if r.diary.as_deref() != Some(note.as_str()) {
+        eprintln!("[snapshot] diary: {note}");
+        r.diary = Some(note);
+    }
+}
+
+/// One confirmer round (btx_core::snapshot_confirmer), from the status
+/// refresher every ten minutes. When the node does not confirm, the report
+/// says why and nothing is asked of easybtx.com. Only the public key is read
+/// here (`signer::read_signer_pubkey` derives it from the key file and
+/// returns nothing else); the engine signs with the private key itself.
+async fn confirm_round(
+    rpc: &RpcClient,
+    trusted: Option<btx_core::node_api::MatmulTrustedStatus>,
+    genesis: Option<String>,
+    report: &Arc<tokio::sync::Mutex<btx_core::snapshot_confirmer::NetworkReport>>,
+) {
+    use btx_core::snapshot_confirmer as confirmer;
+    let dd = node_datadir();
+    let env = btx_core::operators::regtest_env();
+    let off = |why: String| async move {
+        let mut r = report.lock().await;
+        if r.confirmer_off.as_deref() != Some(why.as_str()) {
+            eprintln!("[snapshot] confirmer off: {why}");
+            r.confirmer_off = Some(why);
+        }
+    };
+    let (Some(trusted), Some(genesis)) = (trusted, genesis) else {
+        off("the node has not answered yet".into()).await;
+        return;
+    };
+    let key_hex = btx_core::signer::read_signer_pubkey(&dd);
+    if let Some(why) = confirmer::why_not(&trusted, key_hex.as_deref(), &genesis, env.as_deref()) {
+        off(why.into()).await;
+        return;
+    }
+    // why_not read both already; these cannot fail after it.
+    let (Some(our_key), Some(chain)) = (
+        key_hex.as_deref().and_then(btx_core::operators::parse_key),
+        btx_core::operators::Chain::from_genesis_hex(&genesis),
+    ) else {
+        return;
+    };
+    let site = btx_core::snapshot_site::Site::from_env();
+    let client = btx_core::snapshot_site::client();
+    let (site, client) = match (site, client) {
+        (Ok(s), Ok(c)) => (s, c),
+        (Err(e), _) | (_, Err(e)) => {
+            let mut guard = report.lock().await;
+            let r = &mut *guard;
+            r.confirmer_off = None;
+            if let Some(line) = r
+                .confirmer
+                .stopped(&confirmer::NoRound::Site(e), &mut r.seen)
+            {
+                eprintln!("[snapshot] {line}");
+            }
+            return;
+        }
+    };
+    let work = snap::snapshot_dir(&dd).join(confirmer::WORK_DIR);
+    let c = confirmer::Confirmer {
+        rpc,
+        client: &client,
+        site: &site,
+        state_dir: &dd,
+        work_dir: &work,
+        our_key,
+        holds: btx_core::confirmed_load::Holds::compiled(),
+        regtest_env: env.as_deref(),
+    };
+    let round = c.round(chain).await;
+    let mut guard = report.lock().await;
+    let r = &mut *guard;
+    r.confirmer_off = None;
+    let lines = match round {
+        Ok(verdicts) => r.confirmer.add(&verdicts, &mut r.seen),
+        Err(why) => r.confirmer.stopped(&why, &mut r.seen).into_iter().collect(),
+    };
+    for line in lines {
+        eprintln!("[snapshot] {line}");
+    }
+}
+
+/// The producer's last step, said in one line for the log and Copy
+/// diagnostics. `None` when nothing happened (not due).
+fn producer_line(
+    outcome: &btx_core::snapshot_producer::SendOutcome,
+    height: u64,
+) -> Option<String> {
+    use btx_core::snapshot_producer::{SendOutcome, SubmissionOutcome};
+    Some(match outcome {
+        SendOutcome::NotDue => return None,
+        SendOutcome::NotListed => format!(
+            "offering block {height} on the network; this node's key is not on the operator \
+             list, so nothing is sent to easybtx.com"
+        ),
+        SendOutcome::NotSent(n) if n.retry() => {
+            format!("not sending block {height} yet: {n}; trying again in ten minutes")
+        }
+        SendOutcome::NotSent(n) => format!("not sending block {height}: {n}"),
+        SendOutcome::Sent(s) => {
+            let short = s.statement_hash.get(..16).unwrap_or(&s.statement_hash);
+            match &s.outcome {
+                SubmissionOutcome::Sent {
+                    file,
+                    operators,
+                    confirmed,
+                    ..
+                } => format!(
+                    "sent block {height} to easybtx.com (statement {short}, file {file}, signed by \
+                     {}{})",
+                    if operators.is_empty() {
+                        "no listed operator yet".to_string()
+                    } else {
+                        operators.join(", ")
+                    },
+                    if *confirmed { ", confirmed" } else { "" }
+                ),
+                _ => format!("sent block {height} to easybtx.com (statement {short})"),
+            }
+        }
+        SendOutcome::Failed { error } => format!(
+            "sending block {height} to easybtx.com failed; trying again in ten minutes: {error}"
+        ),
+        SendOutcome::GivenUp { reason } => {
+            format!("not sending block {height} to easybtx.com: {reason}")
+        }
+    })
+}
+
 /// The keeper: one loop per node start, superseded by the generation counter
-/// the moment the node stops or the role is switched off. A cycle in flight
-/// asks `keep_going` at every poll and aborts without offering anything.
+/// the moment the node stops or the role is switched off. Each tick: the
+/// gate, an export when the tip is exactly on the grid, one round over the
+/// exports waiting to be 144 deep, a re-offer of the recorded pair after a
+/// node start, and the offered pair to easybtx.com when it is due.
 fn spawn_snapshot_keeper(state: &AppState, datadir: PathBuf) {
     let gen = state.snapshot_serve_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let gen_counter = state.snapshot_serve_gen.clone();
     let rpc_slot = state.rpc.clone();
     let status_slot = state.snapshot_serve.clone();
+    let report_slot = state.snapshot_network.clone();
     let quitting = state.quitting.clone();
     tauri::async_runtime::spawn(async move {
         let dir = snap::snapshot_dir(&datadir);
         let alive =
             move || gen_counter.load(Ordering::SeqCst) == gen && !quitting.load(Ordering::SeqCst);
+        // The producer's checks, the hook every export, offer and re-offer
+        // goes through.
+        let checks = btx_core::snapshot_producer::ProducerChecks {
+            diary_dir: datadir.clone(),
+            holds: btx_core::confirmed_load::Holds::compiled(),
+            regtest_env: btx_core::operators::regtest_env(),
+        };
+        // The website and its client, made once per keeper.
+        let site = btx_core::snapshot_site::Site::from_env()
+            .and_then(|s| btx_core::snapshot_site::client().map(|c| (s, c)));
+        // What this keeper has said in the log, so a pair that waits or is
+        // refused is said once, not every tick.
+        let mut said: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut say = move |line: String| {
+            if said.insert(line.clone()) {
+                eprintln!("[snapshot] {line}");
+            }
+        };
         // A node that just came up needs a moment before its first answers
-        // mean anything; after that, a tick every half minute.
+        // mean anything.
         let mut wait = std::time::Duration::from_secs(15);
         loop {
             tokio::time::sleep(wait).await;
-            wait = std::time::Duration::from_secs(30);
             if !alive() {
                 return;
             }
@@ -6970,29 +7999,32 @@ fn spawn_snapshot_keeper(state: &AppState, datadir: PathBuf) {
                 set_snapshot_status(&status_slot, None);
                 return; // the stop path owns the rest
             };
+            let slow = rpc.with_timeout(SNAPSHOT_RPC_TIMEOUT);
             let facts = snap::read_facts(&rpc, Some(btx_core::disk::free_disk_mb(&datadir))).await;
-            let record = snap::load_record(&dir);
             let tip = facts.blocks;
-            let base = record.as_ref().map(|r| r.height);
-            let stale_by = tip.zip(base).map(|(t, b)| t.saturating_sub(b));
-            let from_record = |s: &mut snap::ServeStatus| {
+
+            if let Some(b) = snap::check(&facts).blocker {
+                let record = snap::load_record(&dir);
+                let mut s = snap::ServeStatus {
+                    offering: snap::offer_live(&rpc).await,
+                    message: snap::explain(&b),
+                    // A machine that follows signatures cannot produce a
+                    // snapshot, and since 2026-10-12 the switch is on by
+                    // default there too: that is "not on this computer", not
+                    // something to fix, so it is not amber.
+                    needs_attention: !b.is_transient()
+                        && !matches!(b, snap::SnapshotBlocker::NotValidating { .. }),
+                    stale_by: tip
+                        .zip(record.as_ref().map(|r| r.height))
+                        .map(|(t, h)| t.saturating_sub(h)),
+                    ..Default::default()
+                };
                 if let Some(r) = record.as_ref() {
                     s.base_height = Some(r.height);
                     s.base_hash = Some(r.block_hash.clone());
                     s.file_size = Some(r.file_size);
                     s.sha256 = Some(r.sha256.clone());
                 }
-                s.stale_by = stale_by;
-            };
-
-            if let Some(b) = snap::check(&facts).blocker {
-                let mut s = snap::ServeStatus {
-                    offering: snap::offer_live(&rpc).await,
-                    message: snap::explain(&b),
-                    needs_attention: !b.is_transient(),
-                    ..Default::default()
-                };
-                from_record(&mut s);
                 set_snapshot_status(&status_slot, Some(s));
                 // A permanent blocker needs a person; polling it every half
                 // minute changes nothing and fills the log.
@@ -7000,101 +8032,193 @@ fn spawn_snapshot_keeper(state: &AppState, datadir: PathBuf) {
                 continue;
             }
 
-            if snap::refresh_due(tip.unwrap_or(0), base) {
-                eprintln!(
-                    "[snapshot] tip {} is {} blocks past base {}; exporting a fresh snapshot",
-                    tip.unwrap_or(0),
-                    stale_by.unwrap_or(0),
-                    base.map(|b| b.to_string()).unwrap_or_else(|| "none".into())
-                );
-                let phase_slot = status_slot.clone();
-                let previous = record.clone();
-                let on_phase = move |p: snap::CyclePhase| {
-                    let mut s = snap::ServeStatus {
-                        // The OLD offer stays live while the new base matures.
-                        offering: previous.as_ref().map(|_| true),
-                        message: p.message(),
-                        phase: Some(p),
-                        ..Default::default()
-                    };
-                    if let Some(r) = previous.as_ref() {
-                        s.base_height = Some(r.height);
-                        s.base_hash = Some(r.block_hash.clone());
-                    }
-                    set_snapshot_status(&phase_slot, Some(s));
+            // Phases go to the Settings row as they happen; the end of the
+            // tick writes the whole status again.
+            let phase_slot = status_slot.clone();
+            let offered_before = snap::load_record(&dir);
+            let on_phase = move |p: snap::CyclePhase| {
+                let mut s = snap::ServeStatus {
+                    // The OLD offer stays live while a new base matures.
+                    offering: offered_before.as_ref().map(|_| true),
+                    message: p.message(),
+                    phase: Some(p),
+                    ..Default::default()
                 };
-                let keep_going = alive.clone();
-                match snap::run_cycle(
-                    &rpc,
-                    &dir,
-                    snap::MATURE_POLL,
-                    snap::MATURE_DEADLINE,
-                    &keep_going,
-                    &on_phase,
-                )
-                .await
+                if let Some(r) = offered_before.as_ref() {
+                    s.base_height = Some(r.height);
+                    s.base_hash = Some(r.block_hash.clone());
+                }
+                set_snapshot_status(&phase_slot, Some(s));
+            };
+
+            // ── Export, only with the tip exactly on the grid ───────────────
+            let mut export_problem: Option<String> = None;
+            let last =
+                snap::last_exported(snap::load_record(&dir).as_ref(), &snap::load_waiting(&dir));
+            // `alive` is asked again right before each step that acts: the
+            // switch can go off while a tick is in flight.
+            if alive() && tip.is_some_and(|t| snap::export_due(t, snap::EXPORT_GRID, last)) {
+                say(format!(
+                    "the tip is at {}, a multiple of {}; exporting a snapshot",
+                    tip.unwrap_or(0),
+                    snap::EXPORT_GRID
+                ));
+                match snap::export_on_grid(&slow, &dir, snap::EXPORT_GRID, &checks, &on_phase).await
                 {
-                    Ok(r) => eprintln!(
-                        "[snapshot] offering base {} ({} bytes, sha256 {}, file_hash {}, {} chunks)",
-                        r.height, r.file_size, r.sha256, r.file_hash, r.chunk_count
-                    ),
+                    Ok(p) => say(format!(
+                        "exported block {} ({}); it is offered once it is {} blocks deep",
+                        p.height,
+                        p.block_hash,
+                        snap::CONFIRMATIONS_REQUIRED
+                    )),
                     Err(e) => {
-                        eprintln!("[snapshot] cycle failed: {e}");
-                        let mut s = snap::ServeStatus {
-                            offering: snap::offer_live(&rpc).await,
-                            message: format!("The last export did not complete: {e}. Trying again."),
-                            ..Default::default()
-                        };
-                        from_record(&mut s);
-                        set_snapshot_status(&status_slot, Some(s));
-                        wait = std::time::Duration::from_secs(300);
+                        say(format!("export: {e}"));
+                        export_problem = Some(e);
                     }
                 }
-                continue;
             }
 
+            // ── Each waiting export, 144 deep and checked, is offered ───────
+            let mut waiting_note: Option<(u64, u64)> = None;
+            for ev in snap::mature(
+                &slow,
+                &dir,
+                snap::MATURE_DEADLINE,
+                &checks,
+                &on_phase,
+                &alive,
+            )
+            .await
+            {
+                match ev {
+                    snap::MatureEvent::Offered(r) => say(format!(
+                        "offering base {} ({} bytes, sha256 {}, file_hash {}, {} chunks)",
+                        r.height, r.file_size, r.sha256, r.file_hash, r.chunk_count
+                    )),
+                    snap::MatureEvent::Dropped { base, why } => {
+                        say(format!("dropped the export at block {base}: {why}"))
+                    }
+                    snap::MatureEvent::NotYet { base, why } => {
+                        say(format!("the export at block {base} waits: {why}"))
+                    }
+                    snap::MatureEvent::Waiting {
+                        base,
+                        confirmations,
+                        ..
+                    } => waiting_note = Some((base, confirmations)),
+                }
+            }
+
+            // ── After a node start, the recorded pair again ─────────────────
             if snap::offer_live(&rpc).await != Some(true) {
                 match snap::reoffer(
-                    &rpc,
+                    &slow,
                     &dir,
                     facts.blocks,
                     facts.headers,
                     facts.initial_block_download,
+                    &checks,
+                    &alive,
                 )
                 .await
                 {
                     Ok(snap::ReofferOutcome::Reoffered { height }) => {
                         eprintln!("[snapshot] re-offered base {height} after a node start")
                     }
-                    Ok(snap::ReofferOutcome::BaseNotCanonical { height }) => eprintln!(
-                        "[snapshot] base {height} is no longer on the active chain; \
-                         not re-offering, the next refresh replaces it"
-                    ),
+                    Ok(snap::ReofferOutcome::BaseNotCanonical { height }) => say(format!(
+                        "base {height} is no longer on the active chain; not re-offering, the \
+                         next export replaces it"
+                    )),
+                    Ok(snap::ReofferOutcome::Refused { height, why }) => {
+                        say(format!("not re-offering block {height}: {why}"))
+                    }
+                    Ok(snap::ReofferOutcome::SwitchedOff { .. }) => return,
                     Ok(_) => {}
-                    Err(e) => eprintln!("[snapshot] re-offer failed: {e}"),
+                    Err(e) => say(format!("re-offer failed: {e}")),
                 }
             }
 
+            // ── The offered pair to easybtx.com (design, section 4) ─────────
+            if !alive() {
+                return;
+            }
+            let record = snap::load_record(&dir);
+            if let Some(r) = record.as_ref() {
+                let line = match &site {
+                    Ok((site, client)) => producer_line(
+                        &btx_core::snapshot_producer::send_offered(
+                            &slow,
+                            &checks,
+                            client,
+                            site,
+                            &dir,
+                            r,
+                            unix_now(),
+                        )
+                        .await,
+                        r.height,
+                    ),
+                    Err(e) => Some(format!("nothing is sent to the website: {e}")),
+                };
+                if let Some(line) = line {
+                    let mut rep = report_slot.lock().await;
+                    if rep.producer.as_deref() != Some(line.as_str()) {
+                        eprintln!("[snapshot] {line}");
+                        rep.producer = Some(line);
+                    }
+                }
+            }
+
+            // Switched off during the send: the stop path cleared the row.
+            if !alive() {
+                return;
+            }
             let offering = snap::offer_live(&rpc).await;
             let peers_offering = snap::peers_offering(&rpc).await;
+            let mut message = match (record.as_ref(), offering) {
+                (Some(r), Some(true)) => snap::ServeStatus::serving_message(r, tip, peers_offering),
+                (Some(r), _) => format!(
+                    "A snapshot at block {} is on disk and not offered yet; the node has to be \
+                     at the tip, the block still on the chain, and the checks passed.",
+                    r.height
+                ),
+                (None, _) => format!(
+                    "Nothing offered yet. A snapshot is taken at the next multiple of {} blocks \
+                     and offered once it is {} blocks deep.",
+                    snap::EXPORT_GRID,
+                    snap::CONFIRMATIONS_REQUIRED
+                ),
+            };
+            if let Some((base, c)) = waiting_note {
+                message.push_str(&format!(
+                    " Block {base} is exported and waiting: {c} of {} blocks deep.",
+                    snap::CONFIRMATIONS_REQUIRED
+                ));
+            }
+            if let Some(e) = &export_problem {
+                message.push_str(&format!(
+                    " The last export did not complete ({e}). The next one is taken at the next \
+                     multiple of {} blocks.",
+                    snap::EXPORT_GRID
+                ));
+            }
             let mut s = snap::ServeStatus {
                 offering,
                 peers_offering,
-                message: match (record.as_ref(), offering) {
-                    (Some(r), Some(true)) => {
-                        snap::ServeStatus::serving_message(r, tip, peers_offering)
-                    }
-                    (Some(r), _) => format!(
-                        "A snapshot at block {} is on disk and not offered yet; the node has to be \
-                         at the tip and the block still on the chain.",
-                        r.height
-                    ),
-                    (None, _) => "Nothing exported yet.".to_string(),
-                },
+                message,
+                stale_by: tip
+                    .zip(record.as_ref().map(|r| r.height))
+                    .map(|(t, h)| t.saturating_sub(h)),
                 ..Default::default()
             };
-            from_record(&mut s);
+            if let Some(r) = record.as_ref() {
+                s.base_height = Some(r.height);
+                s.base_hash = Some(r.block_hash.clone());
+                s.file_size = Some(r.file_size);
+                s.sha256 = Some(r.sha256.clone());
+            }
             set_snapshot_status(&status_slot, Some(s));
+            wait = keeper_poll(tip);
         }
     });
 }
@@ -7147,10 +8271,16 @@ pub async fn set_snapshot_serve(state: State<'_, AppState>, on: bool) -> Result<
     }
     spawn_snapshot_keeper(&state, datadir);
     Ok(
-        "On. The first snapshot is exported at the tip and offered once it has ten \
-         confirmations, about fifteen minutes; after that it is refreshed every 500 blocks."
+        "On. A snapshot is taken each time the chain reaches a multiple of 100 blocks \
+         and offered once it is 144 blocks deep, about three and a half hours later."
             .to_string(),
     )
+}
+
+#[tauri::command]
+pub async fn set_gpu_recovery_restarts_wsl(on: bool) -> Result<(), String> {
+    NodeAppSettings::update(&node_datadir(), |s| s.gpu_recovery_restarts_wsl = on);
+    Ok(())
 }
 
 #[tauri::command]
@@ -7392,10 +8522,23 @@ pub async fn node_footprint(state: State<'_, AppState>) -> Result<NodeFootprint,
 #[cfg(test)]
 mod tests {
     use super::{
-        attached_node_is_ours_to_stop, ends_header_bootstrap, header_bootstrap_end_message,
-        pre_launch_plan, refused_record, snapshot_spec, witness_started_message, AttachedTo,
-        PreLaunchPlan, NODE_RELEASE_COMMIT, NODE_RELEASE_TAG,
+        after_failed_engine_upgrade, attached_node_is_ours_to_stop, encode_powershell,
+        ends_header_bootstrap, header_bootstrap_end_message, pre_launch_plan, refused_record,
+        snapshot_spec, witness_started_message, AttachedTo, PreLaunchPlan, NODE_RELEASE_COMMIT,
+        NODE_RELEASE_TAG,
     };
+
+    /// `-EncodedCommand` is base64 of UTF-16LE. `Write-Output ok` encodes to
+    /// this in PowerShell itself:
+    /// `[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('Write-Output ok'))`.
+    #[test]
+    fn powershell_scripts_are_encoded_as_utf16le_base64() {
+        assert_eq!(encode_powershell("a"), "YQA=");
+        assert_eq!(
+            encode_powershell("Write-Output ok"),
+            "VwByAGkAdABlAC0ATwB1AHQAcAB1AHQAIABvAGsA"
+        );
+    }
 
     /// To the plugin a refused update IS no update, so the webview reports
     /// "no-update". The record must say what happened instead.
@@ -7761,6 +8904,53 @@ mod tests {
         assert_eq!(*state.catch_up_help.lock().await, Default::default());
     }
 
+    /// What the phase counts toward, after mainnet 244,000: headers stay near
+    /// blocks while a node catches up, and the signed frontier on its own
+    /// chain is the gap (btx_core::network_height). Measured on a test
+    /// install: the app said 4,888 behind when the real gap was about 5,260.
+    #[test]
+    fn the_phase_counts_toward_the_network_height_once_blocks_move() {
+        use btx_core::node_api::{AttestedTip, BlockchainInfo};
+        let catching_up = BlockchainInfo {
+            blocks: 240_000,
+            headers: 244_888,
+            signed_frontier: Some(AttestedTip {
+                height: Some(245_260),
+                on_active_chain: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(super::phase_target(&catching_up, 240_000), 245_260);
+        assert_eq!(
+            super::phase_target(&catching_up, 240_000).saturating_sub(240_000),
+            5_260
+        );
+        // Still fetching headers, no block yet: the count that moves on the
+        // "Counting the chain" screen is the header count, not the signers'.
+        let counting = BlockchainInfo {
+            blocks: 0,
+            headers: 120_000,
+            signed_frontier: Some(AttestedTip {
+                height: Some(245_260),
+                on_active_chain: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(super::phase_target(&counting, 0), 120_000);
+        // A frontier on another branch is no part of this node's gap.
+        let elsewhere = BlockchainInfo {
+            signed_frontier: Some(AttestedTip {
+                height: Some(245_260),
+                on_active_chain: Some(false),
+                ..Default::default()
+            }),
+            ..catching_up.clone()
+        };
+        assert_eq!(super::phase_target(&elsewhere, 240_000), 244_888);
+    }
+
     /// The help ticks on reads that answered, and only then: a failed read
     /// handed on as an empty answer would stop it as if nothing were above
     /// the tip (no tips) or count every peer as gone (no peers), and end its
@@ -7871,7 +9061,7 @@ mod tests {
         // and read only (its text is left exactly as it was).
         let rw = format!("matmultrustedpubkey={}\n", SHIPPED[3]);
         std::fs::write(dir.path().join("btx_rw.conf"), &rw).unwrap();
-        let live: Vec<String> = all[..3].to_vec();
+        let live: Vec<String> = all.iter().filter(|k| *k != SHIPPED[3]).cloned().collect();
         let ev = super::signature_evidence(Some(deltas), &live, dir.path(), None).unwrap();
         assert_eq!(ev.shipped_keys_missing, 1);
         assert_eq!(ev.missing_explained_by, Some("btx_rw.conf"));
@@ -8121,6 +9311,59 @@ mod tests {
         }
     }
 
+    /// The install key must parse as `vMAJOR.MINOR.PATCH…`, because three
+    /// launch rules read the engine version from it and fail SAFE-BUT-SILENT
+    /// when it does not: `-autoupdate=0` is dropped (btxd's own updater is ON
+    /// by default on mainnet since v0.31.0, so the engine could swap itself
+    /// under our pin), `-matmulrcexecution` is dropped (a CPU/CUDA host loses
+    /// strict-device), and `engine_follows_network_rules` reads "untrusted".
+    /// None of those shows up as an error. So ask the launch itself, with this
+    /// build's key in both the nominal path and the real install-dir shape,
+    /// whether all three still hold. A key like `0.35.0` (no `v`) still parses;
+    /// one like `btx-035` or `rc1-…` does not, and this test is what says so.
+    #[test]
+    fn the_pinned_engine_launches_with_its_self_updater_off() {
+        assert!(
+            btx_core::node::engine_follows_network_rules(NODE_RELEASE_TAG),
+            "install key {NODE_RELEASE_TAG} does not parse as v0.34.14+; keep it \
+             `v<major>.<minor>.<patch>[-qualifier]` or every version-gated launch rule drops"
+        );
+        let mut paths = vec![super::nominal_btxd_path()];
+        if let Some(dir) = btx_core::installer::install_dir(NODE_RELEASE_TAG) {
+            paths.push(dir.join("bin").join("btxd"));
+        }
+        for btxd in &paths {
+            for backend in [
+                btx_core::backend::Backend::Metal,
+                btx_core::backend::Backend::Cuda,
+                btx_core::backend::Backend::Cpu,
+            ] {
+                let (_, args, _) = btx_core::node::build_node_command(
+                    btxd,
+                    std::path::Path::new("/dd"),
+                    std::path::Path::new("/dd/btx.conf"),
+                    backend,
+                );
+                assert!(
+                    args.iter().any(|a| a == "-autoupdate=0"),
+                    "{NODE_RELEASE_TAG} at {} on {backend:?} launches WITHOUT -autoupdate=0, \
+                     so btxd's own mainnet updater stays on: {args:?}",
+                    btxd.display()
+                );
+                if matches!(
+                    backend,
+                    btx_core::backend::Backend::Cpu | btx_core::backend::Backend::Cuda
+                ) {
+                    assert!(
+                        args.iter().any(|a| a.starts_with("-matmulrcexecution=")),
+                        "{NODE_RELEASE_TAG} at {} on {backend:?} lost -matmulrcexecution: {args:?}",
+                        btxd.display()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_shipped_pin_makes_a_deliberate_keeper_decision() {
         assert!(
@@ -8136,6 +9379,38 @@ mod tests {
             btx_core::installer::conf_for_profile("full", NODE_RELEASE_TAG),
             btx_core::installer::NODE_FASTSTART_CONF
         );
+    }
+
+    /// A failed engine upgrade used to launch the installed engine whatever it
+    /// was. Past block 244000 that is 0.34.12 on every 0.7.x install, which
+    /// lacks the network's rules, so the start must stop and say why.
+    #[test]
+    fn a_failed_upgrade_never_falls_back_to_an_engine_without_the_rules() {
+        let err = "not enough free disk to un-prune it";
+        let refused = after_failed_engine_upgrade("v0.34.12", err)
+            .expect_err("0.34.12 must not be launched past 244000");
+        assert!(refused.contains(err), "the reason is kept: {refused}");
+        assert!(refused.contains("v0.34.12"), "{refused}");
+        assert!(refused.contains(NODE_RELEASE_TAG), "{refused}");
+        assert!(refused.contains("244,000"), "{refused}");
+        assert!(refused.contains("Start"), "it says how to retry: {refused}");
+        assert!(!refused.contains('\u{2014}'), "{refused}");
+        for old in ["v0.34.13", "v0.34.9", "v0.34.6-3013c2c2", ""] {
+            assert!(after_failed_engine_upgrade(old, err).is_err(), "{old}");
+        }
+    }
+
+    /// The fallback is still worth having for an engine that follows the
+    /// rules: a node on a good older engine beats no node.
+    #[test]
+    fn a_failed_upgrade_keeps_an_engine_that_follows_the_rules() {
+        for ok in ["v0.34.14", "v0.34.15"] {
+            assert_eq!(
+                after_failed_engine_upgrade(ok, "copy failed"),
+                Ok(()),
+                "{ok}"
+            );
+        }
     }
 
     /// "snapshot_spec() moves WITH this constant" was a comment, and nothing
@@ -8168,6 +9443,10 @@ mod tests {
             // the_pinned_compiled_base_is_below_every_refused_block forbids
             // until a compiled load checks for refused blocks after loading.
             "v0.34.12" => 219_000,
+            // Adds no base: chainparams.cpp at 476f3f23 changes only the
+            // 244000 activation constants, so 219000 and 228000 stand as on
+            // 0.34.12, and the pin stays on 219000 for the same reasons.
+            "v0.34.15" => 219_000,
             other => panic!(
                 "no record of the assumeutxo bases {other} carries: read `git show \
                  {other}:src/kernel/chainparams.cpp` (m_assumeutxo_data), add its row \
@@ -8392,13 +9671,28 @@ fn remove_node_files(dd: &Path) -> Result<btx_core::disk::ReclaimReport, String>
     Ok(report)
 }
 
-/// Open the network-wide stats page (btxprice.com/stats) in the default
+/// Open the network-wide stats page (easybtx.com/stats) in the default
 /// browser. Fixed URL on purpose: the webview never chooses what to open,
 /// so there is no arbitrary-URL surface.
+///
+/// It opened btxprice.com/stats until 0.7.11. Measured 2026-10-12 02:30 UTC:
+/// btxprice.com resolves (104.248.108.126) and times out on port 443, while
+/// easybtx.com/stats answers 200 with the chain height, the node census, the
+/// pools and the fork timeline.
 #[tauri::command]
 pub async fn open_global_stats() -> Result<(), String> {
-    const URL: &str = "https://btxprice.com/stats";
+    const URL: &str = "https://easybtx.com/stats";
     btx_core::platform::open_url(URL).map_err(|e| format!("couldn't open the stats page: {e}"))
+}
+
+/// Open the official BTX community Telegram group in the default browser.
+/// The BTX core group set it up on 2026-10-26 with entry/anti-spam
+/// protection; this is its public entry link, never a private t.me/+ invite.
+/// Fixed URL, same rule as `open_global_stats`.
+#[tauri::command]
+pub async fn open_btx_community() -> Result<(), String> {
+    const URL: &str = "https://t.me/BTX_COMMUNITY_ENTRY";
+    btx_core::platform::open_url(URL).map_err(|e| format!("couldn't open the community link: {e}"))
 }
 
 #[cfg(test)]
@@ -9799,15 +11093,15 @@ mod signed_start_tests {
     fn a_chain_that_reaches_the_fallback_start_settles_its_first_load() {
         let anchor = super::snapshot_spec().anchor_height;
         let fallback = btx_core::attested_snapshot::fallback_start(anchor);
-        assert_eq!(fallback, 225_927);
+        assert_eq!(fallback, 245_300);
         assert!(!chain_outgrew_first_load(None, anchor), "no answer");
         assert!(!chain_outgrew_first_load(Some(0), anchor));
         assert!(!chain_outgrew_first_load(Some(fallback - 1), anchor));
         assert!(chain_outgrew_first_load(Some(fallback), anchor));
         assert!(chain_outgrew_first_load(Some(fallback + 5_000), anchor));
         // An engine that compiles a higher base moves the bar with it.
-        assert!(!chain_outgrew_first_load(Some(227_000), 228_000));
-        assert!(chain_outgrew_first_load(Some(228_000), 228_000));
+        assert!(!chain_outgrew_first_load(Some(249_999), 250_000));
+        assert!(chain_outgrew_first_load(Some(250_000), 250_000));
     }
 
     /// Final review I1, the review's probe turned around: a relaunch (a
@@ -10781,6 +12075,70 @@ mod slot_probe_tests {
         assert!(gen_check < release && release < after);
     }
 
+    /// "Same chain as other sources" shows only while the node runs and once
+    /// a comparison exists; an old one is the core's grey NOT RUN row, never
+    /// the last green.
+    #[test]
+    fn the_chain_agreement_row_needs_a_running_node_and_a_comparison() {
+        use btx_core::chain_agreement::{decide, Own, Read};
+        let a = |h: &str| "a".repeat(64).replace('a', h);
+        let reads = [
+            Read {
+                id: "btxscan".into(),
+                tip: Some(240_010),
+                tip_at: 1_000,
+                hash: Some(a("1")),
+                error: None,
+            },
+            Read {
+                id: "byronbay".into(),
+                tip: Some(240_010),
+                tip_at: 1_000,
+                hash: Some(a("1")),
+                error: None,
+            },
+        ];
+        let own = Own {
+            tip: 240_010,
+            hash: Some(a("1")),
+        };
+        let agreement = decide(240_000, &own, &reads, 1_000);
+        assert_eq!(
+            super::chain_agreement_row(false, Some(&agreement), 1_000),
+            None
+        );
+        assert_eq!(super::chain_agreement_row(true, None, 1_000), None);
+        let row = super::chain_agreement_row(true, Some(&agreement), 1_060).unwrap();
+        assert_eq!(row.word, "AGREE");
+        assert_eq!(row.status, "ok");
+        let old = super::chain_agreement_row(true, Some(&agreement), 1_000 + 31 * 60).unwrap();
+        assert_eq!(old.status, "unknown");
+    }
+
+    /// The comparison runs beside the refresher: it ends with the run (the
+    /// same generation), does nothing without a node, and asks no more often
+    /// than every CHECK_EVERY_SECS.
+    #[test]
+    fn the_chain_agreement_checker_ends_with_the_run_and_waits_between_checks() {
+        let src = include_str!("commands.rs");
+        let body = src
+            .split("\nfn spawn_chain_agreement_checker(")
+            .nth(1)
+            .expect("the checker exists")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(body.contains("gen_counter.load(Ordering::SeqCst) != gen"));
+        assert!(body.contains("rpc_slot.lock().await.clone() else"));
+        assert!(body.contains("chain_agreement::CHECK_EVERY_SECS"));
+        let refresher = src.split("\nfn spawn_status_refresher(").nth(1).unwrap();
+        assert!(refresher
+            .split("\n}\n")
+            .next()
+            .unwrap()
+            .contains("spawn_chain_agreement_checker(state, gen)"));
+    }
+
     /// The refresher asks for the adopted node only when the slot has no
     /// child AND the app is attached to its own orphan, and reads the pid
     /// through the name-checked helper.
@@ -10796,5 +12154,259 @@ mod slot_probe_tests {
         let read = call.find("verified_btxd_pidfile_pid(").unwrap();
         let adopted = call.find("retune_adopted_engine(pid").unwrap();
         assert!(guard < read && read < adopted);
+    }
+}
+
+/// The snapshot network in the app: the keeper's poll near the grid, what the
+/// diary step and the producer say, the refresher's wiring, and the words
+/// beside the switch.
+#[cfg(test)]
+mod snapshot_network_tests {
+    use super::{
+        diary_note, keeper_poll, producer_line, snapshot_steps, CONFIRM_EVERY_TICKS,
+        CONFIRM_FIRST_TICK,
+    };
+    use btx_core::diary::{DiaryEntry, DiaryOutcome};
+    use btx_core::snapshot_producer::{SendOutcome, Submission, SubmissionOutcome};
+    use std::time::Duration;
+
+    #[test]
+    fn the_keeper_looks_every_few_seconds_only_right_before_a_grid_height() {
+        assert_eq!(keeper_poll(Some(233_398)), Duration::from_secs(3));
+        assert_eq!(keeper_poll(Some(233_399)), Duration::from_secs(3));
+        assert_eq!(keeper_poll(Some(233_397)), Duration::from_secs(30));
+        // On the grid the export happens in that very tick.
+        assert_eq!(keeper_poll(Some(233_400)), Duration::from_secs(30));
+        assert_eq!(keeper_poll(None), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn the_diary_step_says_what_it_wrote_and_stays_quiet_otherwise() {
+        let e = DiaryEntry {
+            height: 233_400,
+            block_hash: "11bd18812b6afcd1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            hash_serialized: "ab".repeat(32),
+            coins: 140_936,
+            chain_tx: 250_000,
+            recorded_at: 0,
+        };
+        assert_eq!(
+            diary_note(&Ok(DiaryOutcome::Recorded(e))).as_deref(),
+            Some("wrote 233400 (block 11bd18812b6afcd1, 140936 coins)")
+        );
+        assert_eq!(
+            diary_note(&Ok(DiaryOutcome::AlreadyRecorded(233_400))),
+            None
+        );
+        assert_eq!(diary_note(&Ok(DiaryOutcome::NotOnGrid)), None);
+        for o in [DiaryOutcome::NotValidating, DiaryOutcome::Unvalidated] {
+            assert!(diary_note(&Ok(o)).unwrap().starts_with("not kept: "));
+        }
+        assert!(diary_note(&Ok(DiaryOutcome::TipMoved))
+            .unwrap()
+            .contains("100 blocks later"));
+        assert_eq!(
+            diary_note(&Err("gettxoutsetinfo: timed out".into())).as_deref(),
+            Some("gettxoutsetinfo: timed out")
+        );
+    }
+
+    #[test]
+    fn the_producer_says_one_line_per_outcome_and_nothing_when_not_due() {
+        assert_eq!(producer_line(&SendOutcome::NotDue, 233_400), None);
+        assert!(producer_line(&SendOutcome::NotListed, 233_400)
+            .unwrap()
+            .contains("not on the operator list, so nothing is sent to easybtx.com"));
+        let failed = SendOutcome::Failed {
+            error: "HTTP 503".into(),
+        };
+        assert_eq!(
+            producer_line(&failed, 233_400).as_deref(),
+            Some(
+                "sending block 233400 to easybtx.com failed; trying again in ten minutes: HTTP 503"
+            )
+        );
+        let sent = SendOutcome::Sent(Submission {
+            height: 233_400,
+            block_hash: "11".repeat(32),
+            statement_hash: "d3ee9312".repeat(8),
+            attempts: 1,
+            first_tried_at: 0,
+            last_tried_at: 0,
+            outcome: SubmissionOutcome::Sent {
+                at: 0,
+                file: "stored".into(),
+                operators: vec!["Mende".into()],
+                signers: vec![],
+                confirmed: false,
+            },
+        });
+        assert_eq!(
+            producer_line(&sent, 233_400).as_deref(),
+            Some(
+                "sent block 233400 to easybtx.com (statement d3ee9312d3ee9312, file stored, \
+                 signed by Mende)"
+            )
+        );
+    }
+
+    /// Every validating node keeps the diary from the refresher, off the
+    /// tick, and the confirmer's first round goes out about two minutes in,
+    /// then every ten.
+    #[test]
+    fn the_refresher_keeps_the_diary_and_runs_the_confirmer_off_the_tick() {
+        assert_eq!(
+            btx_core::snapshot_confirmer::CONFIRM_EVERY_SECS,
+            600,
+            "ten minutes"
+        );
+        // Off the grid, nothing busy: the counter climbs, no diary step.
+        let off_grid = 226_150;
+        let mut tick = CONFIRM_FIRST_TICK;
+        let mut rounds_at = Vec::new();
+        for n in 1..=440u32 {
+            let s = snapshot_steps(off_grid, tick, false, false);
+            assert!(!s.diary);
+            if s.confirm {
+                rounds_at.push(n);
+            }
+            tick = s.confirm_tick;
+        }
+        // The first round two minutes in (40 ticks of 3 s), then every ten
+        // minutes (200 ticks).
+        assert_eq!(rounds_at, vec![40, 240, 440]);
+
+        // A round still running when the counter is up: none starts, the
+        // counter is not reset, and the first free tick starts one.
+        let up = CONFIRM_EVERY_TICKS - 1;
+        let busy = snapshot_steps(off_grid, up, false, true);
+        assert!(!busy.confirm);
+        assert_eq!(busy.confirm_tick, CONFIRM_EVERY_TICKS);
+        let busy = snapshot_steps(off_grid, busy.confirm_tick, false, true);
+        assert!(!busy.confirm);
+        let free = snapshot_steps(off_grid, busy.confirm_tick, false, false);
+        assert!(free.confirm);
+        assert_eq!(free.confirm_tick, 0);
+
+        // The diary on the grid only, never two at once, and on its own:
+        // a running confirmer round does not hold it back.
+        assert!(snapshot_steps(226_200, 0, false, true).diary);
+        assert!(!snapshot_steps(226_200, 0, true, false).diary);
+        assert!(!snapshot_steps(226_201, 0, false, false).diary);
+
+        // And the refresher acts on this decision, with the slow handle.
+        let src = include_str!("commands.rs");
+        let refresher = src
+            .split("\nfn spawn_status_refresher(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .unwrap();
+        for part in [
+            "let steps = snapshot_steps(",
+            "if steps.diary {",
+            "if steps.confirm {",
+            "diary_step(&rpc, mode, &report)",
+            "confirm_round(&rpc, trusted, genesis, &report)",
+            "rpc.with_timeout(SNAPSHOT_RPC_TIMEOUT)",
+        ] {
+            assert!(refresher.contains(part), "the refresher lost {part}");
+        }
+    }
+
+    /// The 5-minute chain-state write (btx_core::state_flush) is asked from
+    /// the refresher's answered-tick arm, on its own long handle, off the
+    /// tick, and its waiting flag is cleared when the request ends.
+    #[test]
+    fn the_refresher_asks_for_the_chain_state_write_off_the_tick() {
+        let src = include_str!("commands.rs");
+        let refresher = src
+            .split("\nfn spawn_status_refresher(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .unwrap();
+        let answered_arm_ends = refresher
+            .find("Err(AppError::Rpc { code: -28, .. })")
+            .expect("the warming-up arm");
+        let gate = refresher
+            .find("btx_core::state_flush::flush_due(")
+            .expect("the refresher lost the chain-state write");
+        assert!(
+            gate < answered_arm_ends,
+            "only on a tick whose read answered"
+        );
+        let step = &refresher[gate..answered_arm_ends];
+        let spawn = step
+            .find("tauri::async_runtime::spawn(")
+            .expect("off the tick");
+        for (part, after_spawn) in [
+            ("chain.initial_block_download,", false),
+            ("flush_in_flight.load(Ordering::SeqCst),", false),
+            ("flush_asked = std::time::Instant::now();", false),
+            ("flush_in_flight.store(true, Ordering::SeqCst);", false),
+            (
+                "rpc.with_timeout(btx_core::state_flush::FLUSH_TIMEOUT)",
+                false,
+            ),
+            ("btx_core::state_flush::flush(&rpc)", true),
+            (
+                "btx_core::state_flush::outcome_line(previous, &result)",
+                true,
+            ),
+            ("in_flight.store(false, Ordering::SeqCst);", true),
+        ] {
+            let at = step
+                .find(part)
+                .unwrap_or_else(|| panic!("the write step lost {part}"));
+            assert_eq!(
+                at > spawn,
+                after_spawn,
+                "{part} on the wrong side of the spawn"
+            );
+        }
+    }
+
+    /// The words beside the switch and its answer name the grid and the
+    /// depth the keeper uses, and none of the old timings.
+    #[test]
+    fn the_switch_says_every_100_blocks_and_144_deep() {
+        let html = include_str!("../../index.html");
+        let ts = include_str!("../../src/main.ts");
+        let rs = include_str!("commands.rs");
+        let copy = "About 9 MB, taken every 100 blocks and offered once it is 144 blocks deep, \
+                    about three and a half hours later";
+        assert!(html.contains(copy) && ts.contains(copy));
+        let answer = rs
+            .split("pub async fn set_snapshot_serve(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(answer.contains("a multiple of 100 blocks"));
+        assert!(answer.contains("144 blocks deep, about three and a half hours later"));
+        for text in [html, ts, answer] {
+            for old in ["every 500 blocks", "refreshed every"] {
+                assert!(!text.contains(old), "{old} is still there");
+            }
+        }
+        for text in [copy, answer] {
+            assert!(!text.contains('\u{2014}') && !text.contains("ten confirmations"));
+        }
+        assert_eq!(btx_core::snapshot_serve::EXPORT_GRID, 100);
+        assert_eq!(btx_core::snapshot_serve::CONFIRMATIONS_REQUIRED, 144);
+    }
+}
+
+#[cfg(test)]
+mod twin_freeze_removal {
+    /// btx_core::twin_freeze works around btxchain/btx#280 and #285, which
+    /// 0.35 fixes. On the bump that pins 0.35 this fails: delete the module,
+    /// its refresher step and status line, and this test
+    /// (docs/btx-update-protocol.md, Part B).
+    #[test]
+    fn engine_pin_still_needs_twin_freeze() {
+        assert!(
+            btx_core::twin_freeze::engine_needs_it(super::NODE_RELEASE_TAG),
+            "{} is pinned: remove btx_core::twin_freeze and its wiring",
+            super::NODE_RELEASE_TAG
+        );
     }
 }

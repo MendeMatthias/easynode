@@ -15,8 +15,10 @@
 # Precisely: the omitted platform gets Err(TargetsNotFound) from the plugin
 # (get_urls runs before the version compare), NOT a quiet "no update available".
 # main.ts only surfaces check errors on a MANUAL check, so the automatic one is
-# silent and nothing is downloaded — but "Check now" will tell those users
-# "Couldn't check right now — are you online?". Harmless, and expected.
+# silent and nothing is downloaded. Since 0.6.20 "Check now" tells those
+# users the current release has no build for their platform (easynode #66).
+# Not harmless for OLDER copies there: they are offered nothing at all, not
+# their platform's last build (0.7.13 left every Mac below 0.7.12 so).
 #
 # The trap this avoids is the opposite move — keeping another platform's key
 # while pointing it at its OLD asset. The manifest has ONE top-level version, so

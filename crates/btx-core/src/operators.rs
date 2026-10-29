@@ -346,6 +346,9 @@ mod tests {
     const ALEKS_2: &str = "03047189023913e1922c80c895ee2a9e2eff6df05438654749e1a4f95019578a24";
     const ALEKS_3: &str = "02c9cfb77d7e4dce0cd6b7968fee1dd53d31ef06c764185e120c825fab8c0572a0";
     const JPP: &str = "02e0a9653b49ad74900dec86b86770735579e8e64859028a76129c71a70e1cadb5";
+    /// Byron Bay's RTX 3070 validator (btxchain/btx#239), the signer of the
+    /// cuts at api-explorer.btxbyronbay.com/snapshots/.
+    const JAREK: &str = "02d12c324ea7eb838bc6f45f047f6ec023cba7042447daaef7b3ac560d186fe030";
     // Throwaway regtest keys from the spike (P, C, D). Never used anywhere else.
     pub(crate) const P: &str = "0343faebbc3a28f2e452132477192cb5455f0c0f2cfdab01c9217c43c2cbc3e464";
     pub(crate) const C: &str = "02c05d68daeabe9e5f0556fcdca6c5a4011eca1d46ee34826d444d1d95b15e6c0f";
@@ -359,17 +362,18 @@ mod tests {
         serde_json::from_str(OPERATORS_JSON).unwrap()
     }
 
-    /// The published list (section 1): three operators, in this order, each
+    /// The published list (section 1): four operators, in this order, each
     /// key under the person it belongs to.
     #[test]
-    fn the_published_file_lists_mende_aleksander_and_jpp() {
+    fn the_published_file_lists_mende_aleksander_jpp_and_jarek() {
         let list = mainnet();
-        assert_eq!(list.names(), vec!["Mende", "Aleksander", "jpp"]);
+        assert_eq!(list.names(), vec!["Mende", "Aleksander", "jpp", "Jarek"]);
         assert_eq!(list.operator_of(&key(MENDE)), Some("Mende"));
         for k in [ALEKS_1, ALEKS_2, ALEKS_3] {
             assert_eq!(list.operator_of(&key(k)), Some("Aleksander"), "{k}");
         }
         assert_eq!(list.operator_of(&key(JPP)), Some("jpp"));
+        assert_eq!(list.operator_of(&key(JAREK)), Some("Jarek"));
         assert_eq!(list.operator_of(&key(P)), None);
     }
 
@@ -393,7 +397,7 @@ mod tests {
             assert!(parse_key(k).is_some(), "on the curve: {k}");
             n += 1;
         }
-        assert_eq!(n, 5 + 4, "five operator keys and four pins");
+        assert_eq!(n, 6 + 7, "six operator keys and seven pins");
     }
 
     #[test]
@@ -426,13 +430,36 @@ mod tests {
             mainnet_mirror_pins().len(),
             crate::node::BTX_TRUSTED_ATTESTATION_PUBKEYS.len()
         );
-        // The one operator key every node pins today is the 3060's.
+        // The operator keys every node pins since 0.7.5: the 3060's and the
+        // zbtx operator's three. jpp's and Jarek's keys are operator keys,
+        // not pins: they confirm a snapshot, and give no authority over blocks.
         let list = mainnet();
-        let pinned_operators: Vec<&str> = mainnet_mirror_pins()
+        let pinned_operators: std::collections::BTreeMap<&str, usize> = mainnet_mirror_pins()
             .iter()
             .filter_map(|k| list.operator_of(k))
-            .collect();
-        assert_eq!(pinned_operators, vec!["Mende"]);
+            .fold(Default::default(), |mut m, op| {
+                *m.entry(op).or_default() += 1;
+                m
+            });
+        assert_eq!(
+            pinned_operators,
+            [("Aleksander", 3), ("Mende", 1)].into_iter().collect()
+        );
+        for k in [ALEKS_1, ALEKS_2, ALEKS_3, MENDE] {
+            assert!(f.mirror_pins.contains(&k.to_string()), "{k} is a pin");
+        }
+        assert!(
+            !f.mirror_pins.contains(&JPP.to_string()),
+            "jpp is not a pin"
+        );
+        assert!(
+            !f.mirror_pins.contains(&JAREK.to_string()),
+            "Jarek is not a pin"
+        );
+        // The file keeps its pins sorted.
+        let mut sorted = f.mirror_pins.clone();
+        sorted.sort();
+        assert_eq!(f.mirror_pins, sorted);
     }
 
     /// The website compares its copy byte for byte, so the file has one
@@ -461,6 +488,24 @@ mod tests {
                 "jpp".to_string()
             ],
             "list order, not signing order"
+        );
+    }
+
+    /// Jarek's signature next to the 3060's is two operators, which is what
+    /// confirms a snapshot. On 2026-10-17 both signed the same statement at
+    /// 251,000 and their files were byte for byte the same (sha256
+    /// `3d539a87...`). His key alone is one operator, and confirms nothing.
+    #[test]
+    fn jarek_and_mende_are_two_operators_and_jarek_alone_is_one() {
+        let list = mainnet();
+        assert_eq!(
+            list.distinct_operators(&[key(JAREK), key(MENDE)]),
+            vec!["Mende".to_string(), "Jarek".to_string()],
+            "list order, not signing order"
+        );
+        assert_eq!(
+            list.distinct_operators(&[key(JAREK)]),
+            vec!["Jarek".to_string()]
         );
     }
 

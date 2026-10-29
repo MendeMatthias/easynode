@@ -660,12 +660,67 @@ pub fn client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-async fn fetch_text(client: &reqwest::Client, url: &str) -> Option<String> {
-    let r = client.get(url).send().await.ok()?;
-    if !r.status().is_success() {
-        return None;
+/// Why a read-only GET produced no text. Kept apart from the words a screen
+/// shows, so each caller says it its own way (`crate::chain_agreement` names
+/// the reason; this guardian only needs "no answer").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchError {
+    /// The server answered with a status that is not a success.
+    Status(u16),
+    /// No answer within the client's timeout.
+    Timeout,
+    /// Anything else (refused, DNS, TLS, a body cut off), in one line.
+    Other(String),
+    /// The body ran past the caller's cap ([`get_text_capped`]); the rest
+    /// was not read.
+    TooLarge(usize),
+}
+
+impl From<reqwest::Error> for FetchError {
+    fn from(e: reqwest::Error) -> Self {
+        if e.is_timeout() {
+            FetchError::Timeout
+        } else {
+            FetchError::Other(e.to_string().lines().next().unwrap_or("").to_string())
+        }
     }
-    r.text().await.ok()
+}
+
+/// One read-only GET, the body as text, or why there is none.
+pub async fn get_text(client: &reqwest::Client, url: &str) -> Result<String, FetchError> {
+    let r = client.get(url).send().await?;
+    if !r.status().is_success() {
+        return Err(FetchError::Status(r.status().as_u16()));
+    }
+    Ok(r.text().await?)
+}
+
+/// [`get_text`], reading at most `max` bytes of the body, in chunks: a source
+/// that answers with something huge costs `max`, not the whole of it.
+pub async fn get_text_capped(
+    client: &reqwest::Client,
+    url: &str,
+    max: usize,
+) -> Result<String, FetchError> {
+    let mut r = client.get(url).send().await?;
+    if !r.status().is_success() {
+        return Err(FetchError::Status(r.status().as_u16()));
+    }
+    if r.content_length().is_some_and(|n| n > max as u64) {
+        return Err(FetchError::TooLarge(max));
+    }
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = r.chunk().await? {
+        if body.len() + chunk.len() > max {
+            return Err(FetchError::TooLarge(max));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+async fn fetch_text(client: &reqwest::Client, url: &str) -> Option<String> {
+    get_text(client, url).await.ok()
 }
 
 pub async fn fetch_census(client: &reqwest::Client, url: &str) -> Option<Census> {

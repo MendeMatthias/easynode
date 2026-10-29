@@ -5,6 +5,7 @@ import {
   NO_GPU_REASON,
   announcer,
   chipNoticeVisible,
+  diskShortfall,
   setupArgs,
   startChoiceView,
   switchLaterShown,
@@ -188,5 +189,32 @@ describe("chipNoticeVisible", () => {
     // Refused, but not (yet) following signatures: "Nothing for you to do"
     // would not be true.
     expect(chipNoticeVisible(true, false, null, "v0.34.9")).toBe(false);
+  });
+});
+
+// The disk check ran only after "Set up my node" was pressed, then showed its
+// error below the fold, while both numbers had been on screen all along.
+describe("diskShortfall", () => {
+  it("says nothing when the free space is unknown or enough", () => {
+    expect(diskShortfall(0, 140 * 1024, "full")).toBeNull();
+    expect(diskShortfall(140 * 1024, 140 * 1024, "full")).toBeNull();
+    expect(diskShortfall(300 * 1024, 140 * 1024, "full")).toBeNull();
+  });
+
+  it("names Keeper mode when a full node does not fit", () => {
+    expect(diskShortfall(12.4 * 1024, 140 * 1024, "full")).toBe(
+      "This computer has 12.4 GiB free and a full node needs 140.0 GiB. Free up some space first, " +
+        "or turn on Keeper mode in Settings, which keeps far less of the chain.",
+    );
+  });
+
+  it("does not offer Keeper mode to a keeper", () => {
+    expect(diskShortfall(12.4 * 1024, 20 * 1024, "keeper")).toBe(
+      "This computer has 12.4 GiB free and the node needs 20.0 GiB. Free up some space first.",
+    );
+  });
+
+  it("has a place on the setup screen, next to the two numbers", () => {
+    expect(INDEX).toMatch(/id="wizard-free-disk"[\s\S]{0,400}id="wizard-disk-short"/);
   });
 });

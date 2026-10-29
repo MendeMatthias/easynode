@@ -75,9 +75,23 @@ pub struct RpcClient {
     /// that is down. Keeping the PATH is what lets a 401 be answered by
     /// re-reading the file instead of by giving up.
     cookie_path: Option<std::path::PathBuf>,
+    /// This handle's own request timeout, in place of the client's 60 s
+    /// ([`RpcClient::with_timeout`]). `None` keeps the 60 s.
+    timeout: Option<Duration>,
 }
 
 impl RpcClient {
+    /// The same node and credentials, with requests allowed `timeout` instead
+    /// of 60 s. For the few calls that can take longer on mainnet
+    /// (`gettxoutsetinfo` hashes the whole UTXO set), always off the status
+    /// refresher's tick.
+    pub fn with_timeout(&self, timeout: Duration) -> Self {
+        Self {
+            timeout: Some(timeout),
+            ..self.clone()
+        }
+    }
+
     pub fn new(
         base_url: impl Into<String>,
         user: impl Into<String>,
@@ -95,6 +109,7 @@ impl RpcClient {
             url: base_url.into(),
             creds: std::sync::Arc::new(std::sync::RwLock::new((user.into(), pass.into()))),
             cookie_path: None,
+            timeout: None,
         }
     }
 
@@ -112,6 +127,7 @@ impl RpcClient {
             url: format!("{}/wallet/{}", base, pct_encode(name)),
             creds: self.creds.clone(),
             cookie_path: self.cookie_path.clone(),
+            timeout: self.timeout,
         }
     }
 
@@ -174,13 +190,16 @@ impl RpcClient {
     }
 
     async fn send(&self, creds: &(String, String), body: &Value) -> AppResult<reqwest::Response> {
-        self.client
+        let mut req = self
+            .client
             .post(&self.url)
             .basic_auth(&creds.0, Some(&creds.1))
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| AppError::Http(e.to_string()))
+            .json(body);
+        if let Some(t) = self.timeout {
+            // Overrides the client's 60 s for this request only.
+            req = req.timeout(t);
+        }
+        req.send().await.map_err(|e| AppError::Http(e.to_string()))
     }
 }
 
@@ -268,6 +287,31 @@ impl Rpc for RpcClient {
 mod tests {
     use super::*;
     use mockito::{Matcher, Server};
+
+    /// A node that takes the request and never answers. `with_timeout` is
+    /// the only thing that ends the wait (the shared default is 60 s), and it
+    /// leaves the client it came from, and its credentials, as they were.
+    #[tokio::test]
+    async fn with_timeout_bounds_one_handle_and_shares_the_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                open.push(s);
+            }
+        });
+        let base = RpcClient::new(format!("http://{addr}"), "u", "p");
+        let slow = base.with_timeout(Duration::from_millis(300));
+        assert_eq!(slow.timeout, Some(Duration::from_millis(300)));
+        assert_eq!(base.timeout, None);
+        assert!(std::sync::Arc::ptr_eq(&slow.creds, &base.creds));
+        let started = std::time::Instant::now();
+        let r = slow.call("gettxoutsetinfo", json!([])).await;
+        assert!(r.is_err(), "{r:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        hold.abort();
+    }
 
     #[tokio::test]
     async fn call_returns_result_field() {

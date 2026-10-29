@@ -1,76 +1,319 @@
-# Next easyNode session — paste this as the first message
+# Next easyNode session: the handover
 
-Everything below is done and live. This is the handoff.
-
----
-
-## Paste this to start
-
-> Pick up easyNode. 0.6.21 is live on Mac, Linux and Windows and the network is
-> not split. Two things are queued and one is a real piece of work:
->
-> 1. **Merge PR #81** (README status note comes down — #35 is closed). I have to
->    tick the bypass box myself; GitHub will not let me approve my own PR.
-> 2. **0.6.22 whenever convenient.** Two fixes sit unreleased on main: #79 (a port
->    collision is no longer reported as an unrecognised error) and #80 (the
->    watchdog's frozen-node recovery was dialling three peers that cannot serve a
->    block). Neither is urgent. Follow docs/node-release-recipe.md; I must run
->    the signing and feed steps myself because your sandbox blocks the key.
-> 3. **The service tier — this is the actual next feature.** Start by showing me a
->    table mapping every capability the app already measures (GPU qualification,
->    disk, prune posture, uptime, reachability) against every job the network
->    needs (full validator, fork witness, archive, Esplora, seed). Do not write
->    code until I have seen that table. The point: a machine with no GPU is NOT
->    useless, and the app currently implies it is.
+State on 2026-10-14, after 0.7.15 (Linux and Windows). Verified against the
+released bytes, not
+just the local build, except where it says otherwise.
 
 ---
 
-## Context the next session needs
+## Update 2026-10-18: Jarek confirms snapshots
 
-**The vision, in Mende's words:** *different computer hardware = different
-services for the network.* One install, and the machine contributes whatever it
-is actually capable of.
+**Jarek (Byron Bay) is the second snapshot operator** (#218, owner's decision
+of 2026-10-18, after btxchain/btx#239). His validator key `02d12c32…fe030`
+is in `crates/btx-core/snapshot-operators.json` as an operator, NOT a pin:
+it confirms snapshots, has no say over blocks, and `trim_to_pinned` keeps it
+from the engine. He cuts at every multiple of 1,000 while his own tip is that
+block and publishes the single-signature manifest at
+`https://api-explorer.btxbyronbay.com/snapshots/`. At 251,000 his statement
+and file were the 3060's, byte for byte
+(`confirmed_snapshot::tests::mende_and_jarek_confirm_251000_on_mainnet`).
 
-**Why the service tier matters.** A GPU-less machine stalls below the fork
-height — that needs a golden manifest row from upstream and is not fixable here.
-But it can still witness forks for wallets (0.6.20, works on any node including
-a pruned 10 GB one), serve history, and seed fresh nodes. The app never tells
-anyone that. `service_report.rs` already calls itself "the opt-in seed of the
-Keepers idea". The pieces exist; the join does not.
+**The website picks his cuts up** (EasyBTX #599, `.github/workflows/byron-cuts.yml`,
+hourly at :41, no secret). It posts a cut only onto a statement the website
+already holds from the 3060, which posts at 144 deep. His tip-time cut never
+opens a statement or a dispute on its own. A cut that differs fails the job
+for a human to look at. First real run, 2026-10-17 22:5x UTC: his signature
+merged into 251,000 (record confirmed, operators Mende and Jarek), but
+writing the public manifest answered 503. `@vercel/blob`'s `useCache: false`
+adds `?cache=0`, which the PUBLIC store refuses with 400 whether the blob
+exists or not. Fixed in EasyBTX #601 (private reads only). After it deploys,
+the next statement that adds a signature runs `republishStale` and
+`/api/snapshots/latest` serves 251,000. Check that, then check that easyNode's
+loader takes it.
 
-**Open, not ours:** btxchain/btx#142 — the engine refuses a live-chain node as a
-body source and then bans it for asking about its own chain. Root cause of the
-5 September fork. Tracked in #38.
+**Older apps are unaffected.** They check a confirmed pointer against their own
+compiled list, where Jarek is missing. `peek_confirmed` fails quietly (no
+Fast-forward offer) and `prepare_start` falls back to the pinned 245,300 pair,
+just as with the 404. Only 0.7.16 and later take the confirmed pair.
 
-**Unanswered product question:** 0.6.21 shipped a native Windows build, which
-reverses the site's stated *"we are not building a newer native Windows app"*.
-Copy was rewritten honestly (WSL2 is the route measured against a GPU; the
-native build is not). Pulling `windows-x86_64` from a future feed is small if
-Mende wants it out.
+**0.7.16 is the version bump in #220.** It goes out for Linux and Windows with
+#216, #217 and #218. The order above still holds: the Mac's 0.7.15 first, and
+once #220 is on main, that Mac build must come from `e76315b`. Or skip it:
+build 0.7.16 for all three platforms, and the Mac gap closes with it.
 
-**Two working habits that paid off, worth keeping:**
-- Verify claims against the engine source at `~/btx-ship` (v0.34.6 @ 9eb4e005)
-  before acting on them. An audit finding this month said to use
-  `-matmulvalidation=relay`; the source says relay refuses to start with a
-  wallet present. It would have shipped broken.
-- Measure peers from a *running* node, and read the census **late**. A reading
-  taken two minutes in showed a good peer as dead and nearly retired it; four
-  minutes later it was a fully handshaked attestation archive.
+**The 3060 skipped 249,600 and 250,000** (no statement at either). Jarek's
+cuts land only on multiples of 1,000, so a skipped one costs a day without a
+new confirmed snapshot. Being investigated on the 3060 PC itself (its logs).
+
+**Jarek has a brief** (Mende sent it in the nodes Telegram group,
+2026-10-18): the pickup contract, "don't post to /api/snapshots/statement
+yourself", and proposals that are not agreed yet (cut every 100, his key in
+a future M=2 block set, explorers checking each other, a second AInode model
+host).
+
+## Where things stand (2026-10-14)
+
+**Published: easyNode 0.7.15 for Linux and Windows** (`node-v0.7.15`,
+release id 413015565, built by CI from main's `e76315b`, #212, runs
+38607810262 and 38607825843): #211 on top of 0.7.14, so a card lost
+mid-run is recovered even when easyNode itself restarted after the loss.
+The site moved Linux and Windows to it (EasyBTX #590). Before it,
+**easyNode 0.7.14 for Linux and Windows** (`node-v0.7.14`, built
+by CI from `6ac2e60`, tree identical to main's `f637808`, #209), the audit
+fixes of #208 on top of 0.7.13. Same checks as 0.7.13 below: draft first,
+every asset re-downloaded identical, signatures verified against the released
+bytes, Latest still v0.30.0. The Mac is next, below.
+
+**On main, not released (2026-10-16): the 5-minute chain-state write**
+(`btx_core::state_flush`). It becomes 0.7.16 for Linux and Windows only after
+the Mac's 0.7.15 is in `node-v0.7.15` (it was not on 10-16: only the
+AppImage, the `.deb`, the Windows setup, their `.sig`s and `SHA256SUMS`). The
+Mac can take it straight into 0.7.16.
+What 10-15 taught, so nobody re-derives it: btxd writes on its own every 50
+to 70 min (validation.cpp:127), `gettxoutsetinfo` forces a write first
+(rpc/blockchain.cpp:1488), and btxd retries its addnodes every ~15 s by
+itself (net.cpp `ThreadOpenAddedConnections`), so an app-side re-dial adds
+nothing. The 6 peerless minutes after the 10-15 restart were the 3060's
+TP-Link Wi-Fi failing to associate until 10:53:46 (WLAN-AutoConfig 8002,
+"The driver disconnected while associating"); on 10-14 it took 9 minutes.
+Its Ethernet port is unplugged.
+
+## Tomorrow on the Mac: add the Mac build to node-v0.7.15
+
+The Linux and Windows assets of `node-v0.7.15` are published and signed. Do
+NOT rebuild or re-sign them; the Mac build goes into the SAME release, the way
+0.7.8 to 0.7.12 did. Until it ships, every Mac below 0.7.12 is offered nothing
+(the feed names 0.7.15 with no Mac key), which is why this is first.
+
+1. `git pull` on main (`e76315b` or later; `tauri.conf.json` says 0.7.15).
+2. Prove the staged `apps/node/src-tauri/resources/node-pkg` is the shipped
+   engine: byte for byte against 0.7.12's Mac bundle (btxd `a315d86e…`), as in
+   recipe step 4. Never run `stage-node-pkg.sh`.
+3. Build: `cd apps/node && TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/easybtx.key)"
+   TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" npx tauri build --bundles app,updater`,
+   then the `.dmg` with `hdiutil` (Applications symlink plus the `.app`, UDZO).
+4. Rename the tarball to `BTX-Node_0.7.15_aarch64.app.tar.gz`, sign THAT name
+   (`npx tauri signer sign -f ~/.tauri/easybtx.key -p "" <file>`), and verify it
+   with `apps/node/scripts/verify-updater-sig.py`.
+5. Upload the tarball, its `.sig` and `BTX-Node_0.7.15_aarch64.dmg` to
+   `node-v0.7.15`. Replace `SHA256SUMS` with five lines: the three published
+   lines unchanged, plus the tarball and the `.dmg`, as 0.7.12's had. Keep
+   `make_latest` `"false"`, and check `/releases/latest` is still v0.30.0.
+6. Feed with all three platforms WITHOUT re-signing Linux and Windows
+   (`build-node-feed.sh` re-signs every file it is given). Download the
+   published `.sig` files of the AppImage, the `.deb` and the setup `.exe`,
+   then `python3 apps/node/scripts/gen-node-feed.py --version 0.7.15 --tag
+   node-v0.7.15 --mac-sig <tgz>.sig --linux-sig <AppImage>.sig --deb-sig
+   <deb>.sig --win-sig <exe>.sig --notes "easyNode 0.7.15. See
+   https://easybtx.com/node/changelog" --pub-date <now, UTC> --out
+   latest-node.json`.
+7. Site PR on EasyBTX: copy both feeds into `site/public/updater/`; move
+   `REL_MAC`, `relPageMac` and `dl.mac` in `site/src/pages/node.astro` to
+   `node-v0.7.15`; rewrite every "the Mac stays on 0.7.12" sentence on `/node`
+   and `/node/how-to` (grep `0.7.12`); change the 0.7.15 changelog heading's
+   platform tag to `mac + linux + windows` in easynode and re-sync
+   `apps/node/CHANGELOG.md`. Run `scripts/check-download-links.sh`. Merge only
+   once the Mac assets answer 200.
+8. Edit the `node-v0.7.15` release notes: add the Mac (the `.dmg`, and the
+   updater tarball) to the first line, and drop both Mac sentences at the
+   end (the Mac staying on 0.7.12, and a Mac on 0.7.11 or older being
+   offered nothing). The notes of node-v0.7.13 and node-v0.7.14 already say
+   they have no Mac build, and so do their changelog headings.
+9. Watch a Mac on 0.7.12 or older update itself, and one below 0.7.8.
+
+## 0.7.13, the release 0.7.14 hardens
+
+**Published: easyNode 0.7.13 for Linux and Windows** (`node-v0.7.13`, seven
+assets re-downloaded identical, every updater signature verified against the
+released bytes, Latest still v0.30.0, release notes say the Mac stays on
+0.7.12; site PR EasyBTX #585 merged as `d8f08bec` and deployed, the live feed
+reads 0.7.13 with `linux-x86_64` and `windows-x86_64` only). Built by CI from
+`3abafff`, whose tree is identical to main's `26eb878` (#206). Engine
+unchanged: BTX v0.34.15. The 3060 updated itself to it through the website at
+22:02 UTC on 10-13 (AppImage `12eff640…`), btxd running throughout.
+
+What it carries (easynode #199, #205, #206): a node that loses its GPU block
+verifier mid-run gets it back by itself. Inside WSL it restarts WSL (an
+engine restart does not help there, measured with a deliberate NVIDIA install
+on 10-13); elsewhere it restarts the engine. The cause of the 10-11 freeze was
+Windows Update installing a driver under the running engine
+(`docs/incident-2026-10-11-3060-verifier-quarantine.md`).
+
+**The audit fixes** (#208, shipped in 0.7.14). Two read-only
+audits of #204 to #206 found a WSL restart that ignored a node owned by
+another app, a 3-hour gap lost across the restart it causes (a possible
+restart every ~20 min), no safety net when Windows failed to restart WSL, the
+observer's lost exec bit, and wording. All fixed, and shipped as 0.7.14.
+
+**The 3060's own setup changed** (not in the repo): a boot task starts WSL
+with nobody logged in; `.wslconfig` has `instanceIdleTimeout=-1`; zbtx3's key
+`02c9cfb7` is pinned in `btx_rw.conf`; the observer runs #204 from this clone.
+The AInode project's WSL distros run in the same VM, and `AInode-build` boots
+`systemd-binfmt`, which wipes the WSLInterop handler for every distro: the
+recovery's `/init` fallback exists for that.
+
+## Before that: 0.7.12 (2026-10-12)
+
+**Published: easyNode 0.7.12 on Mac, Linux and Windows** (`node-v0.7.12`,
+ten assets re-downloaded identical, every updater signature verified
+against the released bytes, Latest still v0.30.0; site PR EasyBTX #577
+merged as `0e3d1221`). Engine unchanged: BTX v0.34.15, the Mac node package
+byte-identical to 0.7.11's (btxd `a315d86e`). What it carries (easynode
+#189 to #197):
+
+- **Every feature on by default, running only where it can, all
+  switchable** (the owner's rule of 2026-10-12): wallet panel, Explorer mode,
+  snapshot serving, Esplora and launch at login joined the services already
+  on. Existing installs get them once (`migrate_features_on`) and the
+  welcome panel lists them. Explorer mode is applied only where no pruning is
+  in effect (`btx_core::setup::explorer_mode_possible_here`), which also
+  fixed a Keeper that turned it on from Ask and then could not start (BTX
+  refuses pruning plus txindex, `src/init.cpp:2077`). The whole chain held
+  349,792 transactions (07:52 UTC), so the index is tens of MB. Snapshot
+  loads and Fast-forward pass on regtest with `-txindex=1` on the shipped
+  engine.
+- **The headline follows the chain cards** (`apps/node/src/headline.ts`):
+  NOT FOLLOWING / BEHIND / DIFFERENT BRANCH / DISK ALMOST FULL instead of a
+  green LIVE over a stuck node; the tray (`tray::stuck_for_tray`) and the
+  compact light follow.
+- Settings in four groups, Escape and focus for panels, the close dialog no
+  longer opens behind a panel, one status poll at a time, and the rest of
+  `docs/node-ui-audit-2026-10-12.md`.
+
+**Before that: easyNode 0.7.11 on Mac, Linux and Windows** (`node-v0.7.11` on
+MendeMatthias/EasyBTX-releases, ten assets, every one re-downloaded identical
+and every updater signature verified against the released bytes; repo Latest
+still v0.30.0). Engine unchanged: BTX v0.34.15 (`476f3f23`).
+
+**The website serves 0.7.11** (EasyBTX #576, `0c3f08b`, deployed by the owner
+at about 07:36 UTC on 10-12; Vercel had made no deployment for the merge on
+its own). Checked from the live feed the way the app updates: all four
+updates (Mac, AppImage, .deb, Windows) download, verify against the app's
+updater key, and match the release's SHA256SUMS; the /node page's four
+download links answer 200.
+
+**Followers are stuck, and that is a signer problem, not a code one**
+(read-only on btxscan's node, 07:35 UTC, tip 245,972):
+
+- `02d5efca` (the 3060) has signed nothing since 245,498. It stays connected
+  to btxscan with a starting height of 245,498.
+- `02c9cfb7` (zbtx3, pinned since 0.7.5) signed 245,500 to 245,764 and then
+  stopped (block 245,764 is from 02:12 UTC), so followers moved up overnight
+  and stand at 245,764 again.
+- Only `037db271` signs the tip. It is deliberately not pinned (owner
+  unrecorded, see the pin list's doc and
+  `the_pin_carries_the_three_zbtx_keys_and_none_of_the_unrecorded_ones`).
+
+To see who signs a block: `getmatmulattestations <hash>` returns raw hex;
+the signer is the 33-byte key after `21`
+(`grep -o '210[23][0-9a-f]\{64\}'`).
+
+What 0.7.11 did (easynode #187):
+
+- **The built-in start moved from 239,111 to 245,300**
+  ([utxo-snapshot-245300](https://github.com/MendeMatthias/EasyBTX-releases/releases/tag/utxo-snapshot-245300)).
+  Every check 0.7.6 used, except a load on a fresh mainnet node (none runs on
+  the release Mac); instead the UTXO set hash and coin count were recomputed
+  from the file by a script that reproduces the 239,111 pair exactly.
+- **One network height for every "blocks behind" reader**
+  (`btx_core::network_height`, `docs/decisions/2026-10-12-network-height.md`):
+  the highest of blocks, the best header, and the signed frontier when it is
+  on the node's own chain. After block 244,000 `headers` alone stays near
+  `blocks` while a node catches up.
+
+What the website fix did (EasyBTX #575, deployed 21:10 UTC on 10-11): the
+snapshot routes take a write's etag from `head()`, not `get()`. Before, every
+conditional update of a stored record failed, so no snapshot file was ever
+stored and no co-signature could ever merge. Verified live: the 3060's
+producer stored block 245,300's file six minutes after the deploy.
+
+## The UI audit (shipped in 0.7.12)
+
+An audit of every screen (`docs/node-ui-audit-2026-10-12.md`) and its fixes
+(easynode #189, #190, #191). The one that matters: the headline said a green LIVE
+over a node following signatures that had been stuck for hours, while the
+cards below said it was not following. `apps/node/src/headline.ts` now
+derives the badge, the line and the light from what the cards say; the tray
+says "not following" too (`tray::stuck_for_tray`). The next release (0.7.12)
+ships them. Two items in the audit are decisions, not fixes: the role card's
+wording for home users (it tells them to "pin a second key") and grouping
+Settings.
+
+To look at any screen without a node: `npm --prefix apps/node run
+preview:states`, then `http://localhost:1440/preview/index.html`.
+
+## Open work, in priority order
+
+00. **The Mac build of 0.7.15**: "Tomorrow on the Mac" above. Build 0.7.15,
+    not 0.7.14: node-v0.7.14 stays Linux and Windows only.
+01. **Done 2026-10-14: the WSL recovery, end to end, in the real app.** A
+    real card reset on the 3060 under 0.7.14: the app restarted WSL at 15
+    minutes and the node was checking blocks again 62 s later, no clicks
+    (timeline in docs/incident-2026-10-11-3060-verifier-quarantine.md). It
+    showed one gap, fixed by #211 and released in 0.7.15: an app started
+    after the loss never acted (`engine_lost_its_card`). To repeat it: an
+    admin `pnputil /restart-device` on the card while the app has verified
+    blocks; a GPU-memory hog does NOT cause the loss (WDDM pages GPU memory
+    out, measured 2026-10-14).
+
+0. **Upstream btxchain/btx#225 would end co-signing as the confirmer does
+   it.** Open, not merged, "a later 0.34.16 can carry it" (its author,
+   2026-10-07). Its `af9020cd` makes `signutxosnapshotmanifest` rebuild the
+   statement from the signing node's own active tip and refuse unless every
+   field matches. The confirmer (`snapshot_confirmer.rs`) co-signs a
+   statement 144 blocks deep that it checked against its diary, relying on
+   the RPC signing blindly (its header says so), so under #225 every
+   co-signature and every dissent is refused. `confirmed_snapshot_regtest`
+   already catches this: its confirmer co-signs block 100 from a node with
+   no blocks. Run it against any new engine before bumping.
+   The way that still works under #225: two operators agree by each
+   PRODUCING the statement at the same grid height (the snapshot keeper
+   exports at every multiple of 100 when its tip reaches it, and the website
+   merges identical statements by hash). Measured on regtest with the shipped
+   v0.34.15, 2026-10-12: two validating nodes on one chain exported
+   byte-identical files (8,055 bytes) and identical statements at block 100.
+   Since 0.7.12 snapshot serving is on by default on every node that
+   validates and signs, so an operator-listed easyNode (zbtx's) now produces
+   too. Check that the website's merge and the producer's upload really do
+   this with two producers before relying on it, and redesign the confirmer
+   before taking an engine with #225.
+
+1. **A second operator confirms: done, waiting on EasyBTX #601** (see the
+   2026-10-18 update above). Jarek co-signs every multiple of 1,000. Until
+   then, every statement since 5 October carried only `02d5efca`.
+   Aleksander (zbtx1 to zbtx3) and jpp would still make it sturdier. zbtx1 sits on a dead branch from
+   244,089 (first block `24528d1139a71aa694e65bf54dc47a3e2652d4716f94fa43c3d1a3738fb16ba7`).
+   No co-signature attempt reached the website at all. The overnight report
+   (`~/Desktop/easyNode-overnight-report.md`) has the commands for each of
+   them.
+2. **A validating node on a lost one-block twin still under-counts.** Its
+   signed frontier is off its own chain (`on_active_chain` false), so the
+   network height leaves it out; on a node that follows signatures `headers`
+   carries it anyway. Counting a frontier whose branch leaves ours within 6
+   blocks needs the fork point. See the decision's "What this does not do".
+3. **Only the newest statement gets a file.** The producer uploads its offered
+   pair; older statements stay `missing`. Fine for `latest`, which wants the
+   newest, but a confirmer's co-signature on an older one never confirms.
 
 ## Release facts that cost time to rediscover
 
-- Version lives in FIVE files: package.json, package-lock.json (×2),
-  tauri.conf.json, Cargo.toml, Cargo.lock. Plus CHANGELOG.
-- Rename the mac tarball to `BTX-Node_<ver>_aarch64.app.tar.gz` before the feed
-  sees it, and let `build-node-feed.sh --mac` sign the renamed file. Do NOT
-  carry the bundler's `.sig` over: it names `easyBTX Node.app.tar.gz` in its
-  signed comment, and 0.6.31 and later refuse an update signed under any name
-  but its release name.
-- Build the `.dmg` by hand with `hdiutil` — the recipe's build command skips it,
-  but the website's Mac button points at it.
-- Append the mac sums to `SHA256SUMS` manually; there is no mac node CI.
-- Publish the release BEFORE the site feed, never the reverse.
-- The site renders `apps/node/CHANGELOG.md` from **the EasyBTX repo's own copy**.
-  They drift. Sync them.
-- `MendeMatthias/EasyBTX` has no review requirement — those PRs merge from the
-  CLI. `MendeMatthias/easynode` does, and Mende must use the UI bypass.
+- The recipe is docs/node-release-recipe.md; memory notes in
+  `~/.claude/projects/-Users-bonuz-repos-easynode/memory/` say which steps the
+  classifier has blocked and which ran.
+- `apps/node/src-tauri/resources/node-pkg` is git-ignored and can be stale in
+  a fresh worktree (it was v0.34.6). Restage it from the previous release's
+  Mac bundle and diff it byte for byte (btxd `a315d86e…` for v0.34.15).
+- No `minisign` on the release Mac. `build-node-feed.sh` verifies with
+  `verify-updater-sig.py`; for the "verify like the app does" step a tiny Rust
+  bin on the cached `minisign-verify = "=0.2.5"` crate works offline.
+- easybtx.com's request logs are readable with `npx vercel@59.26.0 logs
+  --project easy-btx --scope mendematthias-projects --since 24h --query <path>
+  --json` (about 50 rows a query, about a day of retention). That is how the
+  snapshot 503s were found.
+- **A test install runs a mainnet node on the release Mac**
+  (`~/btx-test/app2`, btxd on `~/.easybtx`), stalled on a stale block at
+  242,639 on 10-11. Not started by the release work; the owner decides.
+- No node runs on the release Mac by the owner's decision, so the feed and
+  publish scripts need `OBSERVER_OVERRIDE=1` after proving "no split, live
+  chain" from easybtx.com/api/nodes, both pools, witness-1 and api.btxscan.io.
+- Never re-cut a published version.

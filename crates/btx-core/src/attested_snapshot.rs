@@ -9,9 +9,10 @@
 //!    signed, checked here by [`crate::confirmed_snapshot`] before anything
 //!    is downloaded past the manifest. Nothing the website says is trusted;
 //!    the pointer only says where to look.
-//! 2. The pair published before any of this existed ([`pinned_pair`], base
-//!    225,927). One operator signed it, but its sizes and hashes are compiled
-//!    into the app, so it is trusted as the app is.
+//! 2. The pair compiled into this app ([`pinned_pair`], base 245,300 since
+//!    0.7.11, 239,111 from 0.7.6, 225,927 before). One operator signed it, but
+//!    its sizes and hashes are compiled into the app, so it is trusted as the
+//!    app is.
 //! 3. The snapshot compiled into the engine (`crate::snapshot`).
 //!
 //! The engine loads a signed pair only when a key this node pins signed its
@@ -59,19 +60,34 @@ pub struct AttestedPair {
     pub manifest_sha256: String,
 }
 
-/// The pair published before the pointer existed: base 225,927, on the chain
-/// both sides of the 227,313 split share. Read from the published files on
-/// 2026-09-26: the manifest (statement version 2, 140,731 coins) carries one
-/// signature, by `02d5efca`, the key every mirror pins since 0.6.30, and its
-/// `snapshot_file_hash` equals the file's byte-reversed double SHA-256
-/// (`f234192d…`). The sizes and SHA-256 values below are those files'.
+/// The pair every node starts from while no snapshot is confirmed: base
+/// 245,300, exported by the 3060's own validating node (engine v0.34.15) and
+/// sent by its producer to easybtx.com on 2026-10-11, the first file the
+/// website ever stored and checked; published as `utxo-snapshot-245300`.
+/// Until 0.7.11 this was 239,111 (0.7.6), which by then left a new node about
+/// 6,300 blocks to catch up, and 225,927 before that.
+///
+/// Checked before it was pinned, on 2026-10-11 (UTC): the base is block
+/// 245,300 on api.btxscan.io and on btxscan's v0.34.15 node (253
+/// confirmations), and the signer's statement names the same block; the
+/// statement's chain transaction count (349,043) equals `getchaintxstats` at
+/// that block; on that chain 227,313 is the valid `d5f0e92f…` and neither held
+/// root is present; the chain id, replay context and shielded pin are
+/// mainnet's; the manifest's one signature, by `02d5efca`, verifies; and the
+/// UTXO set hash (`d39b8733…`) and coin count (236,526) were recomputed from
+/// the file itself, every coin parsed and hashed in the node's key order, by a
+/// script that reproduces the 239,111 pair's values exactly. Not done this
+/// time: a load on a fresh mainnet node (no node runs on the release Mac). A
+/// pin that fails to load leaves the chainstate as it was and the node goes
+/// on to the engine's compiled snapshot (`crate::snapshot`). The sizes and
+/// SHA-256 values below are the published files'.
 pub fn pinned_pair() -> AttestedPair {
     AttestedPair {
-        height: 225_927,
-        block_hash: "06780445dae193010e099e6425c5430f121416b067b8d68a8a5c3b52e8a4b932".into(),
-        file_size: 9_045_522,
-        sha256: "5f386c9c8be5a6c28bc5b63352903325cfe6a64a68c68b38f49ea4ac85f9ca05".into(),
-        manifest_sha256: "8adc90c2b4514334d0bc0e1dafa5f3bc85ed0cfcc55d051a586e117794e332ed".into(),
+        height: 245_300,
+        block_hash: "0d20af508b6edccb6f47a0a91d12fa2ed3d44ed8b2105cfc340c7fee8730bf22".into(),
+        file_size: 13_375_946,
+        sha256: "b152992f6356129065f7af57738f7737ac68dd4a3b255016775a8e2e19fc166c".into(),
+        manifest_sha256: "c58a9a873e2fa5ac4dbfe4fa526eaf1767721017e109715c60dd4dc304234ea3".into(),
     }
 }
 
@@ -935,19 +951,56 @@ mod tests {
     fn the_pin_is_a_real_pair_above_the_compiled_snapshot() {
         let p = pinned_pair();
         assert!(check(&p, COMPILED).is_ok());
-        // Below the 23 September split, on the chain both sides share.
-        assert!(p.height < 227_313);
+        // Until 0.7.6 the pin sat below the 23 September split (227,313), on
+        // the chain both sides shared, while mirrors still followed the longer
+        // branch. 0.7.6 moved it past every block this app refuses
+        // (`crate::known_invalid`): on the pinned base's chain, 227,313 is the
+        // valid `d5f0e92f…`, and 228,146 and 229,400 are neither held root
+        // (read on the signer's node and on api.btxscan.io, 2026-10-05, and for
+        // 0.7.11's 245,300 on btxscan's v0.34.15 node, 2026-10-11).
+        assert!(p.height > 229_400);
         let mut broken = p.clone();
         broken.sha256.pop();
         assert!(check(&broken, COMPILED).is_err());
+    }
+
+    /// The compiled pin and the published manifest it names agree in every
+    /// field the app compiles: the manifest's SHA-256, its statement's height,
+    /// block and file size, one signature, by the 3060, valid. The fixture is
+    /// the published `snapshot-manifest-245300.json`, byte for byte.
+    #[test]
+    fn the_pin_names_the_published_manifest_and_its_statement() {
+        use sha2::{Digest, Sha256};
+        const MANIFEST: &[u8] =
+            include_bytes!("../tests/fixtures/confirmed_snapshot/mainnet-245300.manifest");
+        let p = pinned_pair();
+        assert_eq!(
+            crate::operators::hex(&Sha256::digest(MANIFEST)),
+            p.manifest_sha256
+        );
+        let m = cs::parse(MANIFEST).unwrap();
+        assert_eq!(m.statement.height() as u64, p.height);
+        assert_eq!(m.statement.block_hash().display_hex(), p.block_hash);
+        assert_eq!(m.statement.file_size(), p.file_size);
+        assert_eq!(m.signatures.len(), 1);
+        assert_eq!(
+            crate::operators::hex(&m.signatures[0].key),
+            "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675"
+        );
+        assert!(cs::signature_is_valid(
+            &m.statement.hash(),
+            &m.signatures[0].key,
+            &m.signatures[0].der
+        ));
     }
 
     /// Section 9: a confirmed snapshot must beat the pinned pair, and an
     /// engine that one day compiles a higher base beats both.
     #[test]
     fn the_fallback_start_is_the_higher_of_the_pin_and_the_compiled_base() {
-        assert_eq!(fallback_start(COMPILED), 225_927);
-        assert_eq!(fallback_start(228_000), 228_000);
+        assert_eq!(fallback_start(COMPILED), 245_300);
+        assert_eq!(fallback_start(240_000), 245_300);
+        assert_eq!(fallback_start(250_000), 250_000);
     }
 
     #[test]
@@ -1668,7 +1721,7 @@ mod tests {
     /// Before a release: the pinned pair is still published byte for byte.
     /// `cargo test -p btx-core -- --ignored the_pinned_pair_is_still_published`
     #[tokio::test]
-    #[ignore = "network: downloads 9 MB from GitHub"]
+    #[ignore = "network: downloads 12 MB from GitHub"]
     async fn the_pinned_pair_is_still_published() {
         let tmp = tempfile::tempdir().unwrap();
         let client = http_client().unwrap();
