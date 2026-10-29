@@ -1398,6 +1398,10 @@ $("global-stats-link").addEventListener("click", () => {
   void invoke("open_global_stats").catch((e) => showToast(String(e)));
 });
 
+$("community-link").addEventListener("click", () => {
+  void invoke("open_btx_community").catch((e) => showToast(String(e)));
+});
+
 $("open-datadir-btn").addEventListener("click", () => {
   void invoke("open_data_folder").catch((e) => showToast(String(e)));
 });

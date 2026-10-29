@@ -2702,6 +2702,9 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         // headers, the batch out, the peers that dropped us over old blocks)
         // lasts for this run only.
         let mut catch_up = btx_core::catchup_assist::CatchUp::for_this_app();
+        // Twin-freeze recovery (btx_core::twin_freeze). REMOVE WHEN 0.35
+        // SHIPS: btxchain/btx#280 and #285 fix the engine side.
+        let mut twin_freeze = btx_core::twin_freeze::TwinFreeze::new();
         // The block height at this run's first answer, so the rule below can
         // tell a verifier lost mid-run (blocks were connected) from one that
         // never qualified, and when the engine's "cannot verify" warning
@@ -3487,6 +3490,52 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         .await
                         {
                             return;
+                        }
+                    }
+
+                    // ── Twin-freeze recovery (REMOVE WHEN 0.35 SHIPS) ───────
+                    // A GPU-less mirror on 0.34.15 can sit for hours on the
+                    // losing block of a one-block race (btxchain/btx#280,
+                    // #285). btx_core::twin_freeze sets that one block aside
+                    // with invalidateblock under strict conditions, and puts
+                    // it back with reconsiderblock if the node does not move
+                    // on. It reads nothing more unless the frontier this tick
+                    // already read is 2+ ahead on another branch.
+                    {
+                        let dd = node_datadir();
+                        let tag = NodeAppSettings::load(&dd)
+                            .btx_release_tag
+                            .unwrap_or_else(|| NODE_RELEASE_TAG.to_string());
+                        let own_signing_key = btx_core::read_block_recovery::has_own_signing_key(
+                            &dd,
+                            &[&dd.join("btx.conf"), &dd.join("btx_rw.conf")],
+                        );
+                        let facts = btx_core::twin_freeze::NodeFacts {
+                            trusted_mirror,
+                            own_signing_key,
+                            engine_tag: &tag,
+                            initial_block_download: chain.initial_block_download,
+                            blocks: chain.blocks,
+                            frontier: frontier.as_ref(),
+                        };
+                        let now_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        for line in btx_core::twin_freeze::run(
+                            &rpc,
+                            &dd,
+                            &mut twin_freeze,
+                            &facts,
+                            || btx_core::node::node_log_tail(&dd, 64 * 1024),
+                            std::time::Instant::now(),
+                            now_unix,
+                        )
+                        .await
+                        {
+                            let msg = format!("twin-freeze recovery: {line}");
+                            eprintln!("[node-app] {msg}");
+                            setup_log(&dd, &msg);
                         }
                     }
 
@@ -4849,6 +4898,20 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         engine_notes.push(btx_core::engine_warnings::EngineNote {
             message,
             needs_attention: false,
+        });
+    }
+    // The twin-freeze recovery's line (REMOVE WHEN 0.35 SHIPS): a block set
+    // aside and being watched, or one handled in the last day.
+    if let Some((message, needs_attention)) = btx_core::twin_freeze::status_note(
+        &datadir,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    ) {
+        engine_notes.push(btx_core::engine_warnings::EngineNote {
+            message,
+            needs_attention,
         });
     }
 
@@ -9622,6 +9685,16 @@ pub async fn open_global_stats() -> Result<(), String> {
     btx_core::platform::open_url(URL).map_err(|e| format!("couldn't open the stats page: {e}"))
 }
 
+/// Open the official BTX community Telegram group in the default browser.
+/// The BTX core group set it up on 2026-10-26 with entry/anti-spam
+/// protection; this is its public entry link, never a private t.me/+ invite.
+/// Fixed URL, same rule as `open_global_stats`.
+#[tauri::command]
+pub async fn open_btx_community() -> Result<(), String> {
+    const URL: &str = "https://t.me/BTX_COMMUNITY_ENTRY";
+    btx_core::platform::open_url(URL).map_err(|e| format!("couldn't open the community link: {e}"))
+}
+
 #[cfg(test)]
 mod signed_start_tests {
     use super::{
@@ -12319,5 +12392,21 @@ mod snapshot_network_tests {
         }
         assert_eq!(btx_core::snapshot_serve::EXPORT_GRID, 100);
         assert_eq!(btx_core::snapshot_serve::CONFIRMATIONS_REQUIRED, 144);
+    }
+}
+
+#[cfg(test)]
+mod twin_freeze_removal {
+    /// btx_core::twin_freeze works around btxchain/btx#280 and #285, which
+    /// 0.35 fixes. On the bump that pins 0.35 this fails: delete the module,
+    /// its refresher step and status line, and this test
+    /// (docs/btx-update-protocol.md, Part B).
+    #[test]
+    fn engine_pin_still_needs_twin_freeze() {
+        assert!(
+            btx_core::twin_freeze::engine_needs_it(super::NODE_RELEASE_TAG),
+            "{} is pinned: remove btx_core::twin_freeze and its wiring",
+            super::NODE_RELEASE_TAG
+        );
     }
 }

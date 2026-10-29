@@ -97,7 +97,8 @@ rc, while the network is calm.
   - Still open:
     - #272: the 126,978 stop
     - #280, #285: GPU-less mirror freezes after signed one-block twins. Today's fix is a
-      reversible `invalidateblock <losing twin>`.
+      reversible `invalidateblock <losing twin>`. easyNode does this on its own on 0.34.x mirrors
+      (`btx_core::twin_freeze`, to remove at 0.35, see B3.4 step 8).
     - #281: `getblockstats` breaks on about 4,264 shielded and penalized blocks
     - #283, #284: CI silently skipped 164 test suites
 - **Wallet**: macOS ML-DSA keys did not derive from the seed, so wallets made by macOS btxd 0.34.x
@@ -388,6 +389,11 @@ Full recipe: `docs/node-release-recipe.md`. Release state: `NEXT-SESSION.md`.
 8. 0.35 specifics: check for a datadir/DB migration (if any, an engine rollback is impossible; say so in the notes),
    the new assumeutxo rows, the wallet and descriptor RPC shape, `BLOCK_VALIDATION_EPOCH`, and
    `getblockchaininfo.headers` (the "blocks behind" under-count is still open).
+   - **Remove the twin-freeze recovery** once the pinned engine contains #280 and #285: delete
+     `crates/btx-core/src/twin_freeze.rs`, its `lib.rs` line, the refresher step and status line in
+     `apps/node/src-tauri/src/commands.rs` (search `REMOVE WHEN 0.35 SHIPS`), and the test
+     `engine_pin_still_needs_twin_freeze`, which fails on purpose once `NODE_RELEASE_TAG` reaches 0.35.
+     The module already turns itself off on any 0.35 engine. Check first that #280 and #285 are in the final tag.
 9. App version in 5 places: `apps/node/package.json:5`, package-lock (×2), `tauri.conf.json:4`, `Cargo.toml:3`,
    Cargo.lock. Then changelog, build, and `gh release` on `MendeMatthias/EasyBTX-releases` as `node-vX.Y.Z`
    **with `--latest=false`**. **Hold the signer box (B3.0) before the feed goes live.**
