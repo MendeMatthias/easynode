@@ -150,6 +150,57 @@ shielded_check() {
   echo "    confirmed_snapshot.rs compiles (${compiled:0:8}...${compiled:60:4})."
 }
 
+# --- 7, defined here: the 32-byte HTLC preimage rule covers all three leaves -
+# From mainnet height 244,000 (nP2MRHTLCPreimage32Height, v0.34.14+) a claim
+# whose leaf "pins the preimage length" must reveal a 32-byte preimage.
+# v0.34.15 classifies THREE leaf shapes that way in
+# src/script/pqm.cpp P2MRClaimLeafPinsPreimageLength: the pinned SHA-256 leaf,
+# the legacy SHA-256 leaf and the HASH160 htlc_tx leaf. The v0.35.0-rc1 tag
+# (commit 68f2bf3e) narrowed it to the first one only, so an rc1 node accepts a
+# legacy-leaf claim that every 0.34.15 node rejects: a chain split waiting for
+# the first such transaction. Upstream restored the three-leaf rule in 6b94704b
+# (2026-10-14) on every btx-035 branch, but the rc1 TAG still carries the
+# narrowing. This check reads the source, not the history, so it works on a
+# raw fetch in CI and catches the same narrowing however it comes back.
+#
+# Fail closed: a tag that has the activation height but no readable function
+# is a shape change, not a pass. Only a tag that has neither (it predates the
+# rule, v0.34.12 and older) is "not applicable".
+htlc_check() {
+  local pqm cp_has fn_body missing parser
+  pqm="$WORK/pqm.cpp"
+  fetch_source "src/script/pqm.cpp" "$pqm" \
+    || die "could not read src/script/pqm.cpp for $TAG" \
+      "An unverifiable tag is not a safe tag."
+  cp_has="$(grep -c 'nP2MRHTLCPreimage32Height' "$FILE" || true)"
+  # The function body: from its definition line to the first closing brace in
+  # column 0, comment text removed (a parser named only in a comment must not count).
+  fn_body="$(awk '/^bool P2MRClaimLeafPinsPreimageLength\(/{m=1} m{print} m && /^}/{exit}' "$pqm" \
+    | sed -e 's:/\*[^*]*\*/: :g' -e 's://.*$::')"
+  if [ -z "$fn_body" ]; then
+    if [ "$cp_has" = "0" ]; then
+      echo "htlc check: not applicable, $TAG predates the 32-byte HTLC preimage rule."
+      return 0
+    fi
+    die "$TAG has nP2MRHTLCPreimage32Height but no P2MRClaimLeafPinsPreimageLength in pqm.cpp" \
+      "The rule moved or was renamed. Read pqm.cpp for this tag by hand and fix" \
+      "this guard to match the new shape. Do not skip it."
+  fi
+  missing=""
+  for parser in ParseP2MRHTLCSha256Leaf ParseP2MRHTLCSha256LegacyLeaf ParseP2MRHTLCTxLeaf; do
+    printf '%s\n' "$fn_body" | grep -qE "(^|[^A-Za-z0-9_])${parser}[[:space:]]*\(" \
+      || missing="$missing $parser"
+  done
+  if [ -n "$missing" ]; then
+    die "$TAG narrows the 32-byte HTLC preimage rule: P2MRClaimLeafPinsPreimageLength no longer covers:$missing" \
+      "v0.34.15 applies the rule to all three leaf shapes from height 244,000." \
+      "A node built from this tag accepts claims the live network rejects (chain split)." \
+      "This is the v0.35.0-rc1 regression (68f2bf3e, fixed upstream in 6b94704b)." \
+      "Ship a build that contains 6b94704b, never the rc1 tag."
+  fi
+  echo "OK: $TAG applies the 32-byte HTLC preimage rule to all three claim leaves."
+}
+
 # --- 6, defined here: the confirmed-snapshot rehearsal on regtest -----------
 # Section 12 of docs/decisions/2026-09-29-every-node-starts-near-the-tip.md,
 # before any engine bump: the replay contexts the engine reports are the ones
@@ -249,6 +300,19 @@ fi
   "Source was: $SOURCE"
 echo "source: $SOURCE"
 
+# Any other source file at the same ref, from the same place chainparams.cpp
+# came from (the clone when it has the ref, else raw GitHub). Returns 1 on a
+# failed or empty fetch; callers turn that into a hard failure.
+fetch_source() {
+  local path="$1" out="$2"
+  if [ "$SOURCE" = "local clone $BTX_CLONE" ]; then
+    git -C "$BTX_CLONE" show "$REF:$path" > "$out" 2>/dev/null || return 1
+  else
+    curl -fsSL --max-time 60 "$RAW_BASE/$REF/$path" -o "$out" 2>/dev/null || return 1
+  fi
+  [ -s "$out" ]
+}
+
 # --- 3. every assignment, comment TEXT removed -----------------------------
 # chainparams.cpp also has explanatory comment lines that name the symbol, so
 # comments have to go before matching. Strip the comment text, never the whole
@@ -334,6 +398,7 @@ if [ -z "$BAD" ]; then
   echo "    the disabled sentinel $SENTINEL."
   echo "    No mainnet stall-recovery height. This engine follows the majority chain."
   shielded_check
+  htlc_check
   regtest_check
   if [ -z "$OVERRIDE_TAG" ] && [ -n "$ACKNOWLEDGED_FORKED_TAG" ] && [ "$TAG" = "$ACKNOWLEDGED_FORKED_TAG" ]; then
     echo

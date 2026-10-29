@@ -2741,12 +2741,25 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         // headers, the batch out, the peers that dropped us over old blocks)
         // lasts for this run only.
         let mut catch_up = btx_core::catchup_assist::CatchUp::for_this_app();
+        // Twin-freeze recovery (btx_core::twin_freeze). REMOVE WHEN 0.35
+        // SHIPS: btxchain/btx#280 and #285 fix the engine side.
+        let mut twin_freeze = btx_core::twin_freeze::TwinFreeze::new();
         // The block height at this run's first answer, so the rule below can
         // tell a verifier lost mid-run (blocks were connected) from one that
         // never qualified, and when the engine's "cannot verify" warning
         // first stood (cleared the moment it goes).
         let mut run_first_blocks: Option<u64> = None;
         let mut verifier_lost_since: Option<std::time::Instant> = None;
+        // The engine's last answer to "did you lose a card you had in use",
+        // so the refresher asks it at most once a minute.
+        let mut engine_card_answer: Option<(std::time::Instant, bool)> = None;
+        // The chain-state write (btx_core::state_flush): when it was last
+        // asked for (this run's start counts, so the first is five minutes
+        // in), whether that request still waits, and whether the last one
+        // worked, so the log says the first result and then only changes.
+        let mut flush_asked = std::time::Instant::now();
+        let flush_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flush_last_ok: Arc<std::sync::Mutex<Option<bool>>> = Arc::default();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             if gen_counter.load(Ordering::SeqCst) != gen {
@@ -2807,33 +2820,122 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                     // startup qualification in a new process; on the 3060 the
                     // engine's in-process re-tests failed for 13 hours
                     // (btx_core::engine_warnings::restart_for_lost_verifier).
+                    // Inside WSL the restart is of WSL itself, since an engine
+                    // restart does not bring the card back there
+                    // (btx_core::engine_warnings::lost_verifier_remedy).
                     let first = *run_first_blocks.get_or_insert(chain.blocks);
                     verifier_lost_since = if cannot_verify_now {
                         Some(verifier_lost_since.unwrap_or_else(std::time::Instant::now))
                     } else {
                         None
                     };
+                    if !cannot_verify_now {
+                        engine_card_answer = None;
+                    }
                     let validating = matmul_trusted_slot.lock().await.as_ref().is_some_and(|t| {
                         t.matmul_validation_mode.eq_ignore_ascii_case("consensus")
                     });
+                    let verified_this_run = chain.blocks > first;
+                    let lost_for = verifier_lost_since.map(|t| t.elapsed());
+                    let settings_now = NodeAppSettings::load(&node_datadir());
+                    // Never restart WSL under a node another app owns: its
+                    // stop only detaches, and `wsl --shutdown` would kill that
+                    // app and its btxd uncleanly (audit of #205).
+                    let ours = attached_node_is_ours_to_stop(*attached_slot.lock().await);
+                    let remedy = btx_core::engine_warnings::lost_verifier_remedy(
+                        btx_core::wsl::this_host_runs_in_wsl(),
+                        settings_now.gpu_recovery_restarts_wsl && ours,
+                    );
+                    let wsl_path =
+                        remedy == btx_core::engine_warnings::LostVerifierRemedy::RestartWsl;
+                    // A run that verifies blocks ends a streak of WSL restarts.
+                    if verified_this_run && settings_now.gpu_wsl_restart_streak > 0 {
+                        NodeAppSettings::update(&node_datadir(), |s| s.gpu_wsl_restart_streak = 0);
+                    }
+                    let since_wsl_restart = settings_now
+                        .gpu_wsl_restart_last_unix
+                        .map(|t| std::time::Duration::from_secs(unix_now_secs().saturating_sub(t)));
                     let since_last = last_verifier_restart_slot.lock().await.map(|t| t.elapsed());
-                    if validating
-                        && btx_core::engine_warnings::restart_for_lost_verifier(
-                            verifier_lost_since.map(|t| t.elapsed()),
-                            chain.blocks > first,
-                            since_last,
-                        )
-                    {
+                    let streak = settings_now.gpu_wsl_restart_streak;
+                    let rule = |engine_lost_card: bool| {
+                        validating
+                            && if wsl_path {
+                                btx_core::engine_warnings::restart_wsl_for_lost_verifier(
+                                    lost_for,
+                                    verified_this_run,
+                                    engine_lost_card,
+                                    since_wsl_restart,
+                                    since_last,
+                                    streak,
+                                )
+                            } else {
+                                btx_core::engine_warnings::restart_for_lost_verifier(
+                                    lost_for,
+                                    verified_this_run,
+                                    engine_lost_card,
+                                    since_last,
+                                )
+                            }
+                    };
+                    // An app started after the card was lost adopts the same
+                    // engine and never connects a block in its own run, so the
+                    // rule alone would leave it frozen (end-to-end run of
+                    // 2026-10-14). The engine remembers losing a card it had in
+                    // use. Asked only when its answer would change what
+                    // happens, and at most once a minute: a card refused at
+                    // startup carries the same warning for as long as it runs.
+                    let mut engine_lost_card = false;
+                    let mut fire = rule(false);
+                    if !fire && rule(true) {
+                        engine_lost_card = match engine_card_answer {
+                            Some((at, lost))
+                                if at.elapsed() < std::time::Duration::from_secs(60) =>
+                            {
+                                lost
+                            }
+                            _ => {
+                                use btx_core::rpc::Rpc as _;
+                                let lost = rpc
+                                    .call("getmininginfo", serde_json::json!([]))
+                                    .await
+                                    .is_ok_and(|v| {
+                                        btx_core::engine_warnings::engine_lost_its_card(&v)
+                                    });
+                                engine_card_answer = Some((std::time::Instant::now(), lost));
+                                lost
+                            }
+                        };
+                        fire = engine_lost_card;
+                    }
+                    if fire {
                         *last_verifier_restart_slot.lock().await = Some(std::time::Instant::now());
-                        let mins = verifier_lost_since
-                            .map(|t| t.elapsed().as_secs() / 60)
-                            .unwrap_or(0);
-                        let msg = format!(
-                            "the block verifier has been unavailable for {mins} min in a run that \
-                             had been checking blocks (stopped at {}); restarting the node so the \
-                             engine checks the graphics card again",
-                            chain.blocks
-                        );
+                        let mins = lost_for.map(|t| t.as_secs() / 60).unwrap_or(0);
+                        let what = if wsl_path {
+                            "stopping the node and restarting WSL, which is what brings the \
+                             graphics card back after a driver update"
+                        } else {
+                            "restarting the node so the engine checks the graphics card again"
+                        };
+                        let msg = if verified_this_run {
+                            format!(
+                                "the block verifier has been unavailable for {mins} min in a run \
+                                 that had been checking blocks (stopped at {}); {what}",
+                                chain.blocks
+                            )
+                        } else if engine_lost_card {
+                            format!(
+                                "the block verifier has been unavailable for {mins} min, and the \
+                                 engine reports losing the graphics card it had in use (stopped \
+                                 at {}); {what}",
+                                chain.blocks
+                            )
+                        } else {
+                            format!(
+                                "the block verifier is still unavailable {mins} min into the run \
+                                 after easyNode's own WSL restart, as when a driver install was \
+                                 still going; {what}, once more"
+                            )
+                        };
                         eprintln!("[node-app] {msg}");
                         setup_log(&node_datadir(), &msg);
                         let restart_app = app.clone();
@@ -2843,6 +2945,10 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                                 || state.quitting.load(Ordering::SeqCst)
                             {
                                 return; // stopped or quitting meanwhile: leave it
+                            }
+                            if wsl_path {
+                                recover_by_restarting_wsl(&restart_app, &state).await;
+                                return;
                             }
                             if let Err(e) = restart_node_projected(&restart_app, &state).await {
                                 eprintln!(
@@ -3426,6 +3532,52 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         }
                     }
 
+                    // ── Twin-freeze recovery (REMOVE WHEN 0.35 SHIPS) ───────
+                    // A GPU-less mirror on 0.34.15 can sit for hours on the
+                    // losing block of a one-block race (btxchain/btx#280,
+                    // #285). btx_core::twin_freeze sets that one block aside
+                    // with invalidateblock under strict conditions, and puts
+                    // it back with reconsiderblock if the node does not move
+                    // on. It reads nothing more unless the frontier this tick
+                    // already read is 2+ ahead on another branch.
+                    {
+                        let dd = node_datadir();
+                        let tag = NodeAppSettings::load(&dd)
+                            .btx_release_tag
+                            .unwrap_or_else(|| NODE_RELEASE_TAG.to_string());
+                        let own_signing_key = btx_core::read_block_recovery::has_own_signing_key(
+                            &dd,
+                            &[&dd.join("btx.conf"), &dd.join("btx_rw.conf")],
+                        );
+                        let facts = btx_core::twin_freeze::NodeFacts {
+                            trusted_mirror,
+                            own_signing_key,
+                            engine_tag: &tag,
+                            initial_block_download: chain.initial_block_download,
+                            blocks: chain.blocks,
+                            frontier: frontier.as_ref(),
+                        };
+                        let now_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        for line in btx_core::twin_freeze::run(
+                            &rpc,
+                            &dd,
+                            &mut twin_freeze,
+                            &facts,
+                            || btx_core::node::node_log_tail(&dd, 64 * 1024),
+                            std::time::Instant::now(),
+                            now_unix,
+                        )
+                        .await
+                        {
+                            let msg = format!("twin-freeze recovery: {line}");
+                            eprintln!("[node-app] {msg}");
+                            setup_log(&dd, &msg);
+                        }
+                    }
+
                     // ── Trusted-mirror stall watchdog tick ──────────────────
                     // The network height, not headers alone: after mainnet
                     // 244,000 headers stay near blocks while a node catches
@@ -3816,6 +3968,50 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         let genesis = snapshot_genesis.clone();
                         tauri::async_runtime::spawn(async move {
                             confirm_round(&rpc, trusted, genesis, &report).await;
+                            in_flight.store(false, Ordering::SeqCst);
+                        });
+                    }
+
+                    // ── Write the chain state to disk (every 5 minutes) ─────
+                    //
+                    // btxd writes on its own only every 50 to 70 minutes, so
+                    // a hard kill or a power cut used to cost up to an hour
+                    // of blocks: 36 on the 3060 on 2026-10-15, after a
+                    // Windows restart killed its btxd (btx_core::state_flush).
+                    // Off the tick, like the diary: the write waits for the
+                    // engine's main lock. Any node and any role, never during
+                    // initial block download. That includes a node another
+                    // app owns (the miner's): the request changes nothing but
+                    // when its engine writes, and on a validating node the
+                    // diary step above already sends it a gettxoutsetinfo at
+                    // every grid height, whoever owns it.
+                    if btx_core::state_flush::flush_due(
+                        flush_asked.elapsed(),
+                        chain.initial_block_download,
+                        chain.blocks,
+                        flush_in_flight.load(Ordering::SeqCst),
+                    ) {
+                        flush_asked = std::time::Instant::now();
+                        flush_in_flight.store(true, Ordering::SeqCst);
+                        let rpc = rpc.with_timeout(btx_core::state_flush::FLUSH_TIMEOUT);
+                        let in_flight = flush_in_flight.clone();
+                        let last_ok = flush_last_ok.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let started = std::time::Instant::now();
+                            let result = btx_core::state_flush::flush(&rpc)
+                                .await
+                                .map(|()| started.elapsed())
+                                .map_err(|e| e.to_string());
+                            let previous = last_ok
+                                .lock()
+                                .map(|mut l| l.replace(result.is_ok()))
+                                .unwrap_or(None);
+                            if let Some(msg) =
+                                btx_core::state_flush::outcome_line(previous, &result)
+                            {
+                                eprintln!("[node-app] {msg}");
+                                setup_log(&node_datadir(), &msg);
+                            }
                             in_flight.store(false, Ordering::SeqCst);
                         });
                     }
@@ -4338,6 +4534,12 @@ pub struct NodeStatusInfo {
     /// shown, defaulted ON, and prevented nothing — and toggling it off and
     /// back on, the obvious recovery, also did nothing and still returned Ok.
     pub keep_awake_supported: bool,
+    /// Whether this app runs inside WSL2, where the GPU recovery switch
+    /// applies (`btx_core::wsl::this_host_runs_in_wsl`). Settings shows the
+    /// switch only here.
+    pub in_wsl: bool,
+    /// The GPU recovery switch: restart WSL when the block verifier is lost.
+    pub gpu_recovery_restarts_wsl: bool,
     /// What this platform calls the place a closed window keeps running: the
     /// "menu bar" on macOS, the "system tray" everywhere else.
     ///
@@ -4770,6 +4972,20 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
             needs_attention: false,
         });
     }
+    // The twin-freeze recovery's line (REMOVE WHEN 0.35 SHIPS): a block set
+    // aside and being watched, or one handled in the last day.
+    if let Some((message, needs_attention)) = btx_core::twin_freeze::status_note(
+        &datadir,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    ) {
+        engine_notes.push(btx_core::engine_warnings::EngineNote {
+            message,
+            needs_attention,
+        });
+    }
 
     // Take a CLONE of the handle and drop the guard before any await. Holding
     // `state.rpc` across a network round-trip is what every other call site in
@@ -5045,6 +5261,8 @@ pub async fn get_node_status(state: State<'_, AppState>) -> Result<NodeStatusInf
         welcome_shown: settings.welcome_shown,
         keep_awake: settings.keep_awake,
         keep_awake_supported: btx_core::power::sleep_assertion_supported(),
+        in_wsl: btx_core::wsl::this_host_runs_in_wsl(),
+        gpu_recovery_restarts_wsl: settings.gpu_recovery_restarts_wsl,
         tray_term: if cfg!(target_os = "macos") {
             "menu bar".to_string()
         } else {
@@ -5381,6 +5599,209 @@ pub async fn restart_node_projected(
     stop_node_inner(state).await;
     set_phase(app, state, NodePhase::Stopped).await;
     start_node_projected(app, state).await
+}
+
+/// Recover the GPU block verifier by restarting WSL (`btx_core::wsl`), after a
+/// driver update on the Windows host.
+///
+/// Order matters (audit of #205, 2026-10-14):
+/// 1. Build the command first. A distro, user or path that cannot be
+///    embedded safely must leave the node running, so the engine is
+///    restarted instead and nothing is stopped for nothing.
+/// 2. Record the restart in the settings file before it happens: the
+///    process that makes it does not survive it, and the next run needs the
+///    record to keep its gap (`restart_wsl_for_lost_verifier`).
+/// 3. Stop btxd cleanly, since `wsl --shutdown` would kill it mid-flush.
+/// 4. Hand the restart to Windows. If that fails, start the node again.
+/// 5. Safety net: WSL normally takes this app down within seconds. If it is
+///    still running two minutes later, the restart did not happen (blocked
+///    by antivirus, say), so the node starts again here rather than staying
+///    stopped. What the Windows side did is in `%TEMP%\easynode-wsl-restart.log`.
+async fn recover_by_restarting_wsl(app: &AppHandle, state: &State<'_, AppState>) {
+    let log = |note: &str| {
+        eprintln!("[node-app] {note}");
+        setup_log(&node_datadir(), note);
+    };
+    let command = match prepare_wsl_restart() {
+        Ok(c) => c,
+        Err(e) => {
+            log(&format!(
+                "cannot restart WSL ({e}); restarting the node instead"
+            ));
+            if let Err(e) = restart_node_projected(app, state).await {
+                log(&format!(
+                    "the restart for a lost block verifier failed: {e}"
+                ));
+            }
+            return;
+        }
+    };
+    NodeAppSettings::update(&node_datadir(), |s| {
+        s.gpu_wsl_restart_last_unix = Some(unix_now_secs());
+        s.gpu_wsl_restart_streak = s.gpu_wsl_restart_streak.saturating_add(1);
+    });
+    stop_node_inner(state).await;
+    set_phase(app, state, NodePhase::Stopped).await;
+    if let Err(e) = run_wsl_restart(&command) {
+        log(&format!(
+            "could not restart WSL ({e}); starting the node again"
+        ));
+        if let Err(e) = start_node_projected(app, state).await {
+            log(&format!(
+                "the restart for a lost block verifier failed: {e}"
+            ));
+        }
+        return;
+    }
+    log("WSL restarts in a few seconds; easyNode starts again by itself about a minute later");
+    tokio::time::sleep(WSL_RESTART_GRACE).await;
+    if state.quitting.load(Ordering::SeqCst) || state.rpc.lock().await.is_some() {
+        return;
+    }
+    log(&format!(
+        "WSL was not restarted within {} s (on Windows, see %TEMP%\\{}); starting the node again",
+        WSL_RESTART_GRACE.as_secs(),
+        btx_core::wsl::RESTART_LOG_NAME
+    ));
+    if let Err(e) = start_node_projected(app, state).await {
+        log(&format!(
+            "the restart for a lost block verifier failed: {e}"
+        ));
+    }
+}
+
+/// How long the app waits for `wsl --shutdown` to take it down before it
+/// concludes the restart did not happen. The script waits 3 s before shutting
+/// down, so two minutes is a wide margin.
+const WSL_RESTART_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long the outer PowerShell may take to hand the job over. It only starts
+/// the inner one, which takes about a second; a hung interop call must not
+/// park the recovery with the node stopped.
+const WSL_HANDOFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Build the PowerShell command that restarts WSL and brings easyNode back,
+/// without running anything: the outer script, encoded for `-EncodedCommand`.
+///
+/// Two PowerShell processes, so the one doing the work is not a child of WSL
+/// interop: the outer one only starts the inner one detached and exits. Both
+/// scripts travel as `-EncodedCommand`, so nothing in them is re-quoted.
+fn prepare_wsl_restart() -> Result<String, String> {
+    let user = std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .ok_or("USER is not set")?;
+    let relaunch = std::env::var("APPIMAGE")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .map(|p| p.display().to_string())
+        })
+        .ok_or("cannot tell which program to start again")?;
+    let distro = this_wsl_distro();
+    let script = btx_core::wsl::restart_wsl_script(distro.as_deref(), &user, &relaunch)
+        .ok_or("the distro, user or program path needs quoting")?;
+    let outer = format!(
+        "Start-Process -WindowStyle Hidden -FilePath powershell.exe -ArgumentList \
+         '-NoProfile','-NonInteractive','-WindowStyle','Hidden','-EncodedCommand','{}'",
+        encode_powershell(&script)
+    );
+    Ok(encode_powershell(&outer))
+}
+
+/// This distro's name: `WSL_DISTRO_NAME`, which a boot hook or a systemd unit
+/// does not set, else what `wslpath -w /` says. `None` restarts the default
+/// distro, which may not be this one when a PC has several.
+fn this_wsl_distro() -> Option<String> {
+    if let Some(d) = std::env::var("WSL_DISTRO_NAME")
+        .ok()
+        .filter(|d| !d.is_empty())
+    {
+        return Some(d);
+    }
+    let out = std::process::Command::new("wslpath")
+        .args(["-w", "/"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    btx_core::wsl::distro_from_unc_root(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Run the command from [`prepare_wsl_restart`]: Windows PowerShell through
+/// WSL interop, and through its interpreter when the interop handler is gone.
+/// Waits at most [`WSL_HANDOFF_TIMEOUT`].
+fn run_wsl_restart(encoded: &str) -> Result<(), String> {
+    let args = [
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-EncodedCommand",
+        encoded,
+    ];
+    let spawn = |program: &str, before: &[&str]| {
+        std::process::Command::new(program)
+            .args(before)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    };
+    let mut child = match spawn(btx_core::wsl::POWERSHELL_FROM_WSL, &[]) {
+        // ENOEXEC: the WSLInterop handler is gone, which is what another
+        // distro's systemd-binfmt does to the whole VM at its boot (the 3060,
+        // 2026-10-13 20:14 UTC). Its interpreter still runs a Windows program.
+        Err(e) if e.raw_os_error() == Some(ENOEXEC) => {
+            eprintln!(
+                "[node-app] Windows programs are not recognised here ({e}); starting \
+                 PowerShell through {} instead",
+                btx_core::wsl::INTEROP_INTERPRETER
+            );
+            spawn(
+                btx_core::wsl::INTEROP_INTERPRETER,
+                &[btx_core::wsl::POWERSHELL_FROM_WSL],
+            )
+        }
+        other => other,
+    }
+    .map_err(|e| format!("cannot start Windows PowerShell through WSL interop: {e}"))?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("Windows PowerShell exited with {status}")),
+            Ok(None) if started.elapsed() >= WSL_HANDOFF_TIMEOUT => {
+                let _ = child.kill();
+                return Err(format!(
+                    "Windows PowerShell did not hand the job over within {} s",
+                    WSL_HANDOFF_TIMEOUT.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
+            Err(e) => return Err(format!("cannot wait for Windows PowerShell: {e}")),
+        }
+    }
+}
+
+/// Wall-clock seconds since 1970, for records that outlive this process.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `execve` refused the binary format (Linux errno 8).
+const ENOEXEC: i32 = 8;
+
+/// PowerShell's `-EncodedCommand`: base64 of the script in UTF-16LE.
+fn encode_powershell(script: &str) -> String {
+    use base64::Engine;
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// End a header bootstrap: stop the node, clear the marker, start it again the
@@ -7954,6 +8375,12 @@ pub async fn set_snapshot_serve(state: State<'_, AppState>, on: bool) -> Result<
 }
 
 #[tauri::command]
+pub async fn set_gpu_recovery_restarts_wsl(on: bool) -> Result<(), String> {
+    NodeAppSettings::update(&node_datadir(), |s| s.gpu_recovery_restarts_wsl = on);
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn set_keep_awake(state: State<'_, AppState>, on: bool) -> Result<(), String> {
     let datadir = node_datadir();
     NodeAppSettings::update(&datadir, |s| s.keep_awake = on);
@@ -8227,10 +8654,23 @@ mod stats_share_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        after_failed_engine_upgrade, attached_node_is_ours_to_stop, ends_header_bootstrap,
-        header_bootstrap_end_message, pre_launch_plan, refused_record, snapshot_spec,
-        witness_started_message, AttachedTo, PreLaunchPlan, NODE_RELEASE_COMMIT, NODE_RELEASE_TAG,
+        after_failed_engine_upgrade, attached_node_is_ours_to_stop, encode_powershell,
+        ends_header_bootstrap, header_bootstrap_end_message, pre_launch_plan, refused_record,
+        snapshot_spec, witness_started_message, AttachedTo, PreLaunchPlan, NODE_RELEASE_COMMIT,
+        NODE_RELEASE_TAG,
     };
+
+    /// `-EncodedCommand` is base64 of UTF-16LE. `Write-Output ok` encodes to
+    /// this in PowerShell itself:
+    /// `[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('Write-Output ok'))`.
+    #[test]
+    fn powershell_scripts_are_encoded_as_utf16le_base64() {
+        assert_eq!(encode_powershell("a"), "YQA=");
+        assert_eq!(
+            encode_powershell("Write-Output ok"),
+            "VwByAGkAdABlAC0ATwB1AHQAcAB1AHQAIABvAGsA"
+        );
+    }
 
     /// To the plugin a refused update IS no update, so the webview reports
     /// "no-update". The record must say what happened instead.
@@ -9003,6 +9443,59 @@ mod tests {
         }
     }
 
+    /// The install key must parse as `vMAJOR.MINOR.PATCH…`, because three
+    /// launch rules read the engine version from it and fail SAFE-BUT-SILENT
+    /// when it does not: `-autoupdate=0` is dropped (btxd's own updater is ON
+    /// by default on mainnet since v0.31.0, so the engine could swap itself
+    /// under our pin), `-matmulrcexecution` is dropped (a CPU/CUDA host loses
+    /// strict-device), and `engine_follows_network_rules` reads "untrusted".
+    /// None of those shows up as an error. So ask the launch itself, with this
+    /// build's key in both the nominal path and the real install-dir shape,
+    /// whether all three still hold. A key like `0.35.0` (no `v`) still parses;
+    /// one like `btx-035` or `rc1-…` does not, and this test is what says so.
+    #[test]
+    fn the_pinned_engine_launches_with_its_self_updater_off() {
+        assert!(
+            btx_core::node::engine_follows_network_rules(NODE_RELEASE_TAG),
+            "install key {NODE_RELEASE_TAG} does not parse as v0.34.14+; keep it \
+             `v<major>.<minor>.<patch>[-qualifier]` or every version-gated launch rule drops"
+        );
+        let mut paths = vec![super::nominal_btxd_path()];
+        if let Some(dir) = btx_core::installer::install_dir(NODE_RELEASE_TAG) {
+            paths.push(dir.join("bin").join("btxd"));
+        }
+        for btxd in &paths {
+            for backend in [
+                btx_core::backend::Backend::Metal,
+                btx_core::backend::Backend::Cuda,
+                btx_core::backend::Backend::Cpu,
+            ] {
+                let (_, args, _) = btx_core::node::build_node_command(
+                    btxd,
+                    std::path::Path::new("/dd"),
+                    std::path::Path::new("/dd/btx.conf"),
+                    backend,
+                );
+                assert!(
+                    args.iter().any(|a| a == "-autoupdate=0"),
+                    "{NODE_RELEASE_TAG} at {} on {backend:?} launches WITHOUT -autoupdate=0, \
+                     so btxd's own mainnet updater stays on: {args:?}",
+                    btxd.display()
+                );
+                if matches!(
+                    backend,
+                    btx_core::backend::Backend::Cpu | btx_core::backend::Backend::Cuda
+                ) {
+                    assert!(
+                        args.iter().any(|a| a.starts_with("-matmulrcexecution=")),
+                        "{NODE_RELEASE_TAG} at {} on {backend:?} lost -matmulrcexecution: {args:?}",
+                        btxd.display()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_shipped_pin_makes_a_deliberate_keeper_decision() {
         assert!(
@@ -9322,6 +9815,16 @@ fn remove_node_files(dd: &Path) -> Result<btx_core::disk::ReclaimReport, String>
 pub async fn open_global_stats() -> Result<(), String> {
     const URL: &str = "https://easybtx.com/stats";
     btx_core::platform::open_url(URL).map_err(|e| format!("couldn't open the stats page: {e}"))
+}
+
+/// Open the official BTX community Telegram group in the default browser.
+/// The BTX core group set it up on 2026-10-26 with entry/anti-spam
+/// protection; this is its public entry link, never a private t.me/+ invite.
+/// Fixed URL, same rule as `open_global_stats`.
+#[tauri::command]
+pub async fn open_btx_community() -> Result<(), String> {
+    const URL: &str = "https://t.me/BTX_COMMUNITY_ENTRY";
+    btx_core::platform::open_url(URL).map_err(|e| format!("couldn't open the community link: {e}"))
 }
 
 #[cfg(test)]
@@ -11942,6 +12445,58 @@ mod snapshot_network_tests {
         }
     }
 
+    /// The 5-minute chain-state write (btx_core::state_flush) is asked from
+    /// the refresher's answered-tick arm, on its own long handle, off the
+    /// tick, and its waiting flag is cleared when the request ends.
+    #[test]
+    fn the_refresher_asks_for_the_chain_state_write_off_the_tick() {
+        let src = include_str!("commands.rs");
+        let refresher = src
+            .split("\nfn spawn_status_refresher(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .unwrap();
+        let answered_arm_ends = refresher
+            .find("Err(AppError::Rpc { code: -28, .. })")
+            .expect("the warming-up arm");
+        let gate = refresher
+            .find("btx_core::state_flush::flush_due(")
+            .expect("the refresher lost the chain-state write");
+        assert!(
+            gate < answered_arm_ends,
+            "only on a tick whose read answered"
+        );
+        let step = &refresher[gate..answered_arm_ends];
+        let spawn = step
+            .find("tauri::async_runtime::spawn(")
+            .expect("off the tick");
+        for (part, after_spawn) in [
+            ("chain.initial_block_download,", false),
+            ("flush_in_flight.load(Ordering::SeqCst),", false),
+            ("flush_asked = std::time::Instant::now();", false),
+            ("flush_in_flight.store(true, Ordering::SeqCst);", false),
+            (
+                "rpc.with_timeout(btx_core::state_flush::FLUSH_TIMEOUT)",
+                false,
+            ),
+            ("btx_core::state_flush::flush(&rpc)", true),
+            (
+                "btx_core::state_flush::outcome_line(previous, &result)",
+                true,
+            ),
+            ("in_flight.store(false, Ordering::SeqCst);", true),
+        ] {
+            let at = step
+                .find(part)
+                .unwrap_or_else(|| panic!("the write step lost {part}"));
+            assert_eq!(
+                at > spawn,
+                after_spawn,
+                "{part} on the wrong side of the spawn"
+            );
+        }
+    }
+
     /// The words beside the switch and its answer name the grid and the
     /// depth the keeper uses, and none of the old timings.
     #[test]
@@ -11969,5 +12524,21 @@ mod snapshot_network_tests {
         }
         assert_eq!(btx_core::snapshot_serve::EXPORT_GRID, 100);
         assert_eq!(btx_core::snapshot_serve::CONFIRMATIONS_REQUIRED, 144);
+    }
+}
+
+#[cfg(test)]
+mod twin_freeze_removal {
+    /// btx_core::twin_freeze works around btxchain/btx#280 and #285, which
+    /// 0.35 fixes. On the bump that pins 0.35 this fails: delete the module,
+    /// its refresher step and status line, and this test
+    /// (docs/btx-update-protocol.md, Part B).
+    #[test]
+    fn engine_pin_still_needs_twin_freeze() {
+        assert!(
+            btx_core::twin_freeze::engine_needs_it(super::NODE_RELEASE_TAG),
+            "{} is pinned: remove btx_core::twin_freeze and its wiring",
+            super::NODE_RELEASE_TAG
+        );
     }
 }

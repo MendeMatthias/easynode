@@ -221,8 +221,9 @@ cannot_verify_in() {
 #   $1 frozen_rows  consecutive samples with the same block count
 #   $2 tip_age      seconds since the tip block's timestamp ("" = unknown)
 # Exit 0 = stale_tip. Both must hold: no new block for STALE_ROWS samples, and
-# a tip older than STALE_AGE, so a slow block or a just-restarted node is not
-# called stale. An unknown age never alarms.
+# a tip older than STALE_AGE, so a slow block is not called stale. The count
+# starts again when btxd goes down or its RPC goes silent. An unknown age
+# never alarms.
 stale_tip_holds() {
   rows="${1:-0}"; age="${2:-}"
   [ -n "$age" ] || return 1
@@ -368,6 +369,9 @@ while true; do
         ;;
     esac
     printf '%s\t\t\t\t\t\t\t%s\n' "$now" "$state" >> "$TSV"
+    # A node that comes back starts a new count: its first sample after a
+    # restart is not "the same block count" as before it (audit of #204).
+    frozen=0; last_blocks=""
     sleep "$INTERVAL"; continue
   fi
 
@@ -375,6 +379,7 @@ while true; do
   if [ -z "$ci" ]; then
     say "btxd is up but RPC is silent"
     printf '%s\t\t\t\t\t\t\trpc_silent\n' "$now" >> "$TSV"
+    frozen=0; last_blocks=""
     sleep "$INTERVAL"; continue
   fi
 
@@ -456,6 +461,10 @@ except Exception:
   fi
   if [ -n "$alarm" ]; then
     state="$alarm"
+    # One alarm replacing another says so, the way an alarm ending does.
+    if [ -n "$alarm_state" ] && [ "$alarm" != "$alarm_state" ]; then
+      say "$alarm_state cleared at blocks $blocks; now $alarm"
+    fi
     if [ "$alarm" != "$alarm_state" ] || [ $((alarm_said % 15)) -eq 0 ]; then
       say "$msg"
       printf 'node-observer: %s\n' "$msg" >&2

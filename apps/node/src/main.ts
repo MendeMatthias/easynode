@@ -138,6 +138,8 @@ interface NodeStatusInfo {
   welcome_shown: boolean;
   keep_awake: boolean;
   keep_awake_supported: boolean;
+  in_wsl: boolean;
+  gpu_recovery_restarts_wsl: boolean;
   tray_term: string;
   txindex_enabled: boolean;
   /** Explorer mode can run here: no pruning in effect or chosen. */
@@ -1390,6 +1392,9 @@ $("settings-btn").addEventListener("click", async () => {
   if (lastStatus) {
     $("setting-datadir").textContent = lastStatus.datadir;
     $<HTMLInputElement>("keepawake-toggle").checked = lastStatus.keep_awake;
+    // Only inside WSL does a driver update need a WSL restart to recover.
+    $("wslrecover-row").hidden = !lastStatus.in_wsl;
+    $<HTMLInputElement>("wslrecover-toggle").checked = lastStatus.gpu_recovery_restarts_wsl;
     // Only macOS can actually hold the assertion. Rather than leave a switch
     // that is on and inert, say what the machine will really do. The row stays
     // visible because sleep is still the user's problem to solve — it just
@@ -1439,6 +1444,10 @@ $("global-stats-link").addEventListener("click", () => {
   void invoke("open_global_stats").catch((e) => showToast(String(e)));
 });
 
+$("community-link").addEventListener("click", () => {
+  void invoke("open_btx_community").catch((e) => showToast(String(e)));
+});
+
 $("open-datadir-btn").addEventListener("click", () => {
   void invoke("open_data_folder").catch((e) => showToast(String(e)));
 });
@@ -1457,6 +1466,11 @@ $<HTMLInputElement>("autostart-toggle").addEventListener("change", async (e) => 
 $<HTMLInputElement>("keepawake-toggle").addEventListener("change", (e) => {
   const on = (e.target as HTMLInputElement).checked;
   void invoke("set_keep_awake", { on }).catch((err) => showToast(String(err)));
+});
+
+$<HTMLInputElement>("wslrecover-toggle").addEventListener("change", (e) => {
+  const on = (e.target as HTMLInputElement).checked;
+  void invoke("set_gpu_recovery_restarts_wsl", { on }).catch((err) => showToast(String(err)));
 });
 
 $<HTMLInputElement>("keeper-toggle").addEventListener("change", (e) => {

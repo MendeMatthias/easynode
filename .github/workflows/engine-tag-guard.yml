@@ -90,4 +90,29 @@ jobs:
             exit 1
           fi
           echo
-          echo "guard self-check passed: it accepts a clean tag and rejects a forked one."
+          # The 32-byte HTLC preimage rule (height 244,000). v0.34.15 applies it to
+          # all three claim leaves; the v0.35.0-rc1 tag narrowed it to one
+          # (68f2bf3e), which would split from 0.34.15. Both tags are frozen.
+          echo "--- v0.34.15 must PASS the HTLC check (all three leaves) ---"
+          # "&& rc=0 || rc=$?": Actions runs steps with bash -e, and a bare failing
+          # assignment would end the step before the expected failure is read.
+          out="$(env -u GITHUB_ACTIONS bash scripts/check-engine-tag.sh v0.34.15 2>&1)" && rc=0 || rc=$?
+          echo "$out"
+          if [ "$rc" != 0 ] || ! grep -q 'applies the 32-byte HTLC preimage rule to all three' <<<"$out"; then
+            echo "::error::the guard no longer certifies v0.34.15's HTLC rule. It has stopped"
+            echo "reading pqm.cpp correctly. Fix the guard."
+            exit 1
+          fi
+          echo
+          echo "--- v0.35.0-rc1 must FAIL the HTLC check (narrowed rule) ---"
+          # "&& rc=0 || rc=$?": Actions runs steps with bash -e, and a bare failing
+          # assignment would end the step before the expected failure is read.
+          out="$(env -u GITHUB_ACTIONS bash scripts/check-engine-tag.sh v0.35.0-rc1 2>&1)" && rc=0 || rc=$?
+          echo "$out"
+          if [ "$rc" = 0 ] || ! grep -q 'narrows the 32-byte HTLC preimage rule' <<<"$out"; then
+            echo "::error::the guard ACCEPTS v0.35.0-rc1, whose HTLC rule splits from 0.34.15"
+            echo "(or rejects it for another reason). The HTLC check is toothless. Fix it."
+            exit 1
+          fi
+          echo
+          echo "guard self-check passed: it accepts clean tags and rejects a forked one and a narrowed HTLC rule."

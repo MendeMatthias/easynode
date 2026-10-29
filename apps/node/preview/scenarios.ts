@@ -45,6 +45,8 @@ const base: Json = {
   welcome_shown: true,
   keep_awake: true,
   keep_awake_supported: true,
+  in_wsl: false,
+  gpu_recovery_restarts_wsl: true,
   tray_term: "menu bar",
   txindex_enabled: true,
   explorer_available: true,
@@ -489,6 +491,7 @@ export function answer(cmd: string, args: Record<string, unknown>): unknown {
     case "node_footprint":
       return { running, cpu_pct: running ? 3.4 : null, mem_mb: running ? 612 : 0, chain_mb: 9.8 * 1024 };
     case "open_global_stats":
+    case "open_btx_community":
     case "open_data_folder":
     case "mark_welcome_shown":
     case "record_update_check":

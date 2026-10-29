@@ -15,18 +15,105 @@ switch in Settings, under For operators, does that: off unless you turn it
 on. It sends the same numbers a signing node already sends with its key
 (versions, uptime, block height, connection counts, bytes uploaded), and no
 wallet, address or key. A signing node that offers its key is counted
-already. Needs easybtx.com to accept the new report (EasyBTX#584) first.
+already. easybtx.com accepts the new report since EasyBTX#584.
 
-**A node whose graphics card check fails mid-run restarts itself.** On 11
-October at 19:48 UTC the node engine on this project's RTX 3060 signer took
-its graphics card out of block checking and tested it again about every
-hour, and the card failed each time, for 13 hours. The node stopped at block
-245,498 and signed nothing, and every node that follows signatures stopped
-with it. Now,
-when the engine says it cannot check blocks for 15 minutes in a run where it
-had been checking them, easyNode restarts the node, which runs the card check
-again. At most once every 3 hours, and never for a card that did not pass at
-startup.
+## [0.7.16] - 2026-10-18 · linux + windows (mac follows when built)
+
+**Jarek confirms chain snapshots, so a new node can start about a day from
+the tip.** A snapshot counts as confirmed only when two different operators
+on the list compiled into easyNode signed the same statement, and until now
+only the project's own RTX 3060 signed, so every new node started from the
+built-in snapshot at block 245,300, thousands of blocks back. Jarek (Byron
+Bay), who runs the archive at archive.btxbyronbay.com, now cuts a signed
+snapshot at every multiple of 1,000 blocks on his own GPU validator. At block
+251,000 his statement and the 3060's were the same, byte for byte, and so
+were the files. easyNode 0.7.16 adds him to the list, so a statement both
+signed is confirmed, and a new node starts from it. His key confirms
+snapshots only. It is not a key easyNode trusts for blocks, and his signature
+is never passed to the engine. An older easyNode still starts from block
+245,300.
+
+**A power cut or a hard restart costs a few blocks, not up to an hour of
+them.** The engine writes its chain state to disk on its own only about once
+an hour; a clean stop writes everything, a hard one loses what came after the
+last write. On 15 October a Windows restart killed the node on the project's
+RTX 3060 44 minutes after its last write, so it had to download and check 36
+blocks again, and it was back at the tip 41 minutes after boot. easyNode now
+asks the engine to write its state every 5 minutes, which took 71 ms there.
+It does so on every node except one whose newest block is more than 30 days
+old, as on a first download, where the engine's own schedule is the right
+one.
+
+The same morning the node sat 6 minutes without peers. That was the PC's
+Wi-Fi taking 6 minutes to connect after the restart; the engine retried its
+peers every 15 seconds throughout and was connected 7 seconds after the
+Wi-Fi was, so nothing in easyNode changes for it.
+
+## [0.7.15] - 2026-10-14 · linux + windows (mac follows when built)
+
+**A lost graphics card is recovered even when easyNode itself restarted
+after the loss.** On 14 October a real graphics-card reset on the project's
+RTX 3060 was recovered with no clicks: easyNode waited its 15 minutes,
+restarted WSL, and the node was checking blocks again a minute later. The
+same test showed a gap. easyNode judged whether the card had been working
+from its own run, so an easyNode started after the loss (its window closed
+with the display, the person reopened it, an update relaunched it) never
+acted, and the node stayed frozen. It now also asks the engine, which
+remembers losing a card it had been using. A card refused at startup still
+never causes a restart, and the limits stay as they were: at most two WSL
+restarts for one loss, and otherwise one every 3 hours.
+
+## [0.7.14] - 2026-10-14 · linux + windows (no mac build; the mac goes from 0.7.12 to 0.7.15)
+
+**The WSL recovery from 0.7.13 is safer.** An audit of it, and a second test
+with a real graphics-card reset on 13 October, found what follows; all of it
+is fixed.
+
+- It restarts WSL only for easyNode's own node. Attached to another app's node
+  (the miner's, say), it used to leave that node running and then kill it
+  with WSL, uncleanly.
+- The limit of one WSL restart every 3 hours now holds across the restart.
+  It was kept in memory, which the restart itself ends, so a card that
+  qualified at startup and then failed again could cost a WSL restart every
+  20 minutes. A record now lives in the settings file, and a card that keeps
+  failing costs at most two: the first, and one more if the run after it
+  comes up without the card within the hour, as when a driver install is
+  still going.
+- easyNode prepares the restart before it stops anything, so a restart it
+  cannot make leaves the node running. It gives Windows 30 seconds to take
+  the job over, and if WSL has not restarted two minutes later it starts the
+  node again. The Windows side writes what it did to
+  `%TEMP%\easynode-wsl-restart.log` and tries starting easyNode again up to three
+  times.
+- Started by a boot script, easyNode now still finds the name of its own WSL
+  distribution, instead of restarting the default one.
+- The message about a card that fails the engine's check says restarting the
+  computer clears it only when it follows a driver update; the same message
+  shows for a card refused at startup.
+
+## [0.7.13] - 2026-10-13 · linux + windows (no mac build; the mac goes from 0.7.12 to 0.7.15)
+
+**A node that loses its graphics card mid-run gets it back by itself.** On
+11 October at 19:49 UTC Windows Update installed a graphics driver under the
+running node on this project's RTX 3060 signer. The node engine took the card
+out of block checking and tested it again about every hour, and the card
+failed each time, for 13 hours. The node stopped at block 245,498 and signed
+nothing, and nodes that follow signatures stopped with it, except where
+another signer's key carried them further. Now, when
+the engine says it cannot check blocks for 15 minutes in a run where it had
+been checking them, easyNode acts, at most once every 3 hours and never for a
+card that did not pass at startup:
+
+- Inside WSL on Windows it stops the node cleanly and restarts WSL, then
+  starts again by itself. A driver installed on purpose on 13 October showed
+  that restarting only the node does not bring the card back there, and that
+  restarting WSL does, in seconds. Restarting WSL stops every Linux program on
+  that PC, so Settings has a switch for it, shown only inside WSL and on by
+  default.
+- On Linux and macOS it restarts the node, which runs the card check again.
+- When the check still fails, the message now says what clears it: restart
+  the computer. It used to say "restarting easyNode", which does not help
+  after a driver update.
 
 ## [0.7.12] - 2026-10-12
 
@@ -247,7 +334,7 @@ or restarts anything. It reads only the node's RPC cookie. Build it with
 `cargo build --release --bin btx-confirmer` in `crates/btx-core`; a systemd
 template is in `deploy/esplora/`.
 
-## [0.7.6] - 2026-10-05
+## [0.7.6] - 2026-10-05 · linux + windows (mac stayed on 0.7.5)
 
 **A new node starts about 260 blocks behind the tip instead of 13,400.**
 Until a snapshot is confirmed by two operators, every new node starts from the

@@ -384,6 +384,17 @@
             </label>
           </div>
 
+          <div class="setting-row" id="wslrecover-row" hidden>
+            <div class="setting-text">
+              <span class="setting-name">Restart WSL to recover the graphics card</span>
+              <span class="setting-desc">After a graphics driver update the node cannot check blocks until WSL restarts. easyNode does it by itself, which also stops any other Linux program running on this PC</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="wslrecover-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">When you close the window</span>
@@ -863,6 +874,9 @@
               <p class="info-fineprint" id="fp-note">Start your node to see live numbers.</p>
             </div>
           </div>
+          <button id="community-link" class="link-row" type="button">
+            <span>BTX Community (Telegram) <span class="link-ext" aria-hidden="true">↗</span></span>
+          </button>
           <button id="future-btn" class="btn-secondary" type="button">What's coming next →</button>
         </div>
       </div>
