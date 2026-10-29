@@ -57,6 +57,8 @@ const base: Json = {
   signing_live: true,
   signer_publish_enabled: true,
   signer_offer: { delivered: true, at: iso(7 * 60_000), detail: "Your key went to easybtx.com with this check-in" },
+  stats_share_enabled: false,
+  stats_share: null,
   archive_service: { state: "serving_history" },
   archive_service_message: "Serving the full range of signed history to nodes that ask for it.",
   archive_service_needs_attention: false,

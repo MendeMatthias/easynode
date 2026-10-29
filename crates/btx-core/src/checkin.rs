@@ -8,9 +8,19 @@
 //!
 //! # What actually turns it on, since 0.6.26
 //!
-//! One thing: **choosing to sign confirmations for mirrors**
-//! ([`crate::signer`]). A node that does not sign never sends a check-in, and
-//! the app has no other caller for this module.
+//! Two things, each the operator's own choice:
+//!
+//! - **Signing confirmations for mirrors** ([`crate::signer`]). The check-in
+//!   then carries the public key, for the reasons below.
+//! - **Being counted in the network's stats** (`stats_share_enabled`, off
+//!   unless turned on). The check-in then carries no key, only the counters,
+//!   and easybtx.com sums what each node uploaded between two check-ins into
+//!   the fleet's "served" figure (`/api/nodes`, `selfReported.served`). Before
+//!   this, the only answer to "what does the easyNode network give?" was each
+//!   app's own number, which it told nobody.
+//!
+//! A node that does neither never sends a check-in, and the app has no other
+//! caller for this module.
 //!
 //! That is not a coincidence of scheduling, it is the reason the feature
 //! shipped. A signing key that nobody pins signs into the void, so a volunteer
@@ -76,10 +86,14 @@ use std::path::{Path, PathBuf};
 
 /// Schema of the payload below. Must match the receiving endpoint.
 ///
-/// 2 adds `signer_pubkey`. The endpoint accepts exactly this value and refuses
-/// 1, which costs nothing: this client existed from 0.6.17 with no caller, so
-/// no released app ever sent a schema 1 check-in.
-pub const CHECKIN_SCHEMA: u32 = 2;
+/// 2 adds `signer_pubkey`. The endpoint refuses 1, which costs nothing: this
+/// client existed from 0.6.17 with no caller, so no released app ever sent a
+/// schema 1 check-in.
+///
+/// 3 adds `inbound_peers` and `engine_uptime_secs`. The endpoint accepts 2 and
+/// 3 (EasyBTX#584) and refuses either new field under 2, so that change has to
+/// be live before an app that sends 3 ships, or every check-in is a 422.
+pub const CHECKIN_SCHEMA: u32 = 3;
 
 /// Where a check-in goes. `EASYBTX_CHECKIN_ENDPOINT` overrides it, which is how
 /// the end-to-end test on the release box points a real node at a local
@@ -137,6 +151,15 @@ pub struct Checkin {
     /// This is the whole reason the app calls this module. See the header, and
     /// [`crate::signer`] for where the key comes from.
     pub signer_pubkey: Option<String>,
+    /// Peers that connected TO this node (`connections_in`), or `None` when
+    /// btxd did not answer. The direction in which a node serves: `peers`
+    /// also counts the ones it dialled itself.
+    pub inbound_peers: Option<u64>,
+    /// btxd's own `uptime`, or `None` when it did not answer. `bytes_sent`
+    /// resets when the ENGINE restarts, while `uptime_secs` is this app's run,
+    /// which resets on an app relaunch over an engine that keeps running. The
+    /// receiver needs this one to tell a restart from a quiet interval.
+    pub engine_uptime_secs: Option<u64>,
 }
 
 /// The engine version in the shape the endpoint accepts (`v0.34.6`), from the
@@ -299,7 +322,7 @@ pub async fn send_checkin(
 /// hundred bytes every fifteen minutes. The timeout is short on purpose: this
 /// runs inside the status refresher's tick, and a stalled connection must not
 /// hold up the tick that keeps the screen honest.
-pub async fn offer_signing_key(endpoint: &str, checkin: &Checkin) -> AppResult<CheckinOutcome> {
+pub async fn post_checkin(endpoint: &str, checkin: &Checkin) -> AppResult<CheckinOutcome> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -316,9 +339,11 @@ mod tests {
     /// null rather than omitting the field: the site accepts a null as absent,
     /// and an omitted-or-renamed field is how a contract quietly breaks.
     #[test]
-    fn schema_two_carries_the_key_and_a_non_signer_sends_null() {
+    fn the_payload_carries_the_key_and_a_non_signer_sends_null() {
         let v = serde_json::to_value(sample()).unwrap();
-        assert_eq!(v["schema"], 2);
+        // Pinned as a literal, not the constant: the endpoint accepts 2 and 3,
+        // and this is the number it will be sent.
+        assert_eq!(v["schema"], 3);
         assert_eq!(
             v["signer_pubkey"],
             "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675"
@@ -468,6 +493,8 @@ mod tests {
             signer_pubkey: Some(
                 "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675".into(),
             ),
+            inbound_peers: Some(4),
+            engine_uptime_secs: Some(7200),
         }
     }
 
@@ -485,6 +512,8 @@ mod tests {
             btxd_version: None,
             bytes_sent: None,
             listening_port: None,
+            inbound_peers: None,
+            engine_uptime_secs: None,
             ..sample()
         };
         println!(
@@ -533,7 +562,11 @@ mod tests {
                 "blocks",
                 "btxd_version",
                 "bytes_sent",
+                // Added with schema 3, and to the site's schema 3 key set in
+                // EasyBTX#584.
+                "engine_uptime_secs",
                 "headers",
+                "inbound_peers",
                 "listening_port",
                 "node_id",
                 "peers",

@@ -6,6 +6,17 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
+## [Unreleased]
+
+**You can count your node in the network's totals.** easybtx.com can now say
+how much the easyNode network uploads to other nodes, over the last day, the
+last week and since counting began, but only from nodes that report it. A new
+switch in Settings, under For operators, does that: off unless you turn it
+on. It sends the same numbers a signing node already sends with its key
+(versions, uptime, block height, connection counts, bytes uploaded), and no
+wallet, address or key. A signing node that offers its key is counted
+already. easybtx.com accepts the new report since EasyBTX#584.
+
 ## [0.7.16] - 2026-10-18 · linux + windows (mac follows when built)
 
 **Jarek confirms chain snapshots, so a new node can start about a day from
