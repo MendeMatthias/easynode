@@ -34,9 +34,14 @@ The node versions and ships **independently of the easyBTX miner**, on its own
 
 ## The feed
 
-**Endpoint, baked into the app at build time:**
+**Endpoints, baked into the app at build time, in this order:**
+`https://easybtx.com/updater/node-{{bundle_type}}.json`, then
 `https://easybtx.com/updater/latest-node.json`
-(`apps/node/src-tauri/tauri.conf.json` → `plugins.updater.endpoints`)
+(`apps/node/src-tauri/tauri.conf.json`, `plugins.updater.endpoints`). The
+plugin puts the install type in the first (`deb`, `appimage`, `app`, `nsis`,
+`msi`, `rpm` or `unknown`). Only `node-deb.json` exists; every other name
+answers 404 and the plugin moves on to `latest-node.json`. 0.6.32 and older
+read `latest-node.json` only. See "The .deb feed" below.
 
 Deliberately **not** `releases/latest/download/…`: the node shares the
 `EasyBTX-releases` repo with the miner, and GitHub's "latest" pointer is
@@ -63,10 +68,18 @@ It does NOT yield a quiet "no update available". In tauri-plugin-updater 2.10.1
 missing from a higher-versioned feed gets `Err(TargetsNotFound)`. What makes it
 harmless is `main.ts` `updateCheck`: it only surfaces an error when the check was
 MANUAL, so the automatic 6-hourly check swallows it and the client stays put,
-downloading nothing. The visible cost is the **Check now** button, which reports
-"Couldn't check right now — are you online?" to anyone on an omitted platform.
-Expect a little support noise from whichever platform you leave out, and do not
-mistake that report for a broken feed.
+downloading nothing. The visible cost is the **Check now** button. Before 0.6.20
+it reported "Couldn't check right now — are you online?" to anyone on an
+omitted platform; since 0.6.20 (easynode #66, `f2530af`) it says the current
+release has no build for this platform and where the downloads are.
+
+**An omitted platform's OLDER copies get nothing either.** The feed names one
+version, so while a release skips a platform, a copy on that platform older
+than its last build is offered no update at all, not that last build. 0.7.13
+skipped the Mac: every Mac below 0.7.12 was offered nothing, including any
+below 0.7.8 still on the 0.34.12 engine the site warns about (release audit,
+2026-10-14). Say so on the site and in the release notes, and make the
+skipped platform's build soon.
 
 So a single-platform release still ships a feed carrying only that platform's
 key, and the others stay on their last real build.
@@ -111,7 +124,33 @@ correct, because they already have the build you wanted them to have. A mac on
 |---|---|
 | `darwin-aarch64` | `.app.tar.gz` (**not** the .dmg — that is manual-install only) |
 | `linux-x86_64` | the `.AppImage` (same file users download) |
+| `linux-x86_64-deb` | the `.deb`, in `node-deb.json` ONLY, never in `latest-node.json` |
 | `windows-x86_64` | the `-setup.exe` (v2 reuses it; not a `.nsis.zip`) |
+
+### The .deb feed, `node-deb.json` (from 0.7.0)
+
+A `.deb` install reads `https://easybtx.com/updater/node-deb.json` first. It is
+the same schema as `latest-node.json` with exactly one platform key,
+`linux-x86_64-deb`; its url is `.../node-v<V>/BTX-Node_<V>_amd64.deb` and its
+signature is that file's `.sig`, signed under that name. The app installs it
+with `pkexec dpkg -i`, after one password prompt. The design is
+`docs/decisions/2026-09-28-deb-installs-update-themselves.md`.
+
+- **`linux-x86_64-deb` never goes into `latest-node.json`.** easyNode 0.6.32
+  refuses a whole release that lists a key it does not know, so that one key
+  would stop every 0.6.32 install from updating, on every platform.
+  `gen-node-feed.py` refuses to write it there, and the website's
+  `scripts/check-node-links.py` fails the site PR.
+- **`node-deb.json` moves with the Linux download**: its version is
+  `REL_LINUX` and the `.deb` link on `/node`, in the same site PR as
+  `latest-node.json`.
+- **No other `node-*.json` is ever published, and nothing but a static file
+  answers under `/updater`.** An install reads its typed feed instead of
+  `latest-node.json`; a 204 there, or a 200 page that is not a feed, stops its
+  updates.
+- **A missing `node-deb.json` is safe, and removing it is the rollback.** A
+  `.deb` install then reads `latest-node.json`, declines the AppImage without
+  downloading it, and shows the command to install by hand.
 
 ---
 
@@ -142,15 +181,21 @@ on.
 
 Two 0.34.5 specifics a release cutter needs:
 
-* On 0.34.5 and newer, non-Metal hosts run CONSENSUS mode, not the trusted
-  mirror: the engine admits a capable card by measurement at startup
-  (verified on an RTX 3060: self-qualifies, advertises MATMUL_CONSENSUS),
-  and the 1-of-1 mirror both requires an alarming override and depends on an
-  attestation supply that measured dead. `crates/btx-core/src/node.rs`
-  encodes this; do not hand a 0.34.5 host mirror flags.
-* A host with no capable card starts degraded, follows headers, and stalls
-  below the Epoch-A height. The release notes must say which machines
-  validate and which only follow. Do not imply everyone is a validator.
+* On 0.34.5 and newer a non-Metal host is split on its backend
+  (`docs/decisions/2026-09-15-keyless-cpu-hosts-are-trusted-mirrors.md`).
+  With the NVIDIA driver present it runs CONSENSUS mode: the engine admits a
+  capable card by measurement at startup (verified on an RTX 3060:
+  self-qualifies, advertises MATMUL_CONSENSUS). With no driver it runs the
+  1-of-1 trusted mirror WITH `-allowsinglekeytrustedmirror=1`, because a
+  card-less host in consensus mode stalls and can never carry the archive
+  bit, and the attestation supply the 08-31 rule measured dead has been live
+  since 2026-09-01. `crates/btx-core/src/node.rs` encodes both arms, and the
+  mode is explicit on the command line either way.
+* A host WITH the driver but without a capable card (Pascal, Turing, a weak
+  Ampere) still starts degraded, follows headers, and stalls below the
+  Epoch-A height. The release notes must say which machines validate, which
+  follow on signatures, and which only follow headers. Do not imply everyone
+  is a validator.
 
 ### 2026-09-05: the pin moved PAST the newest tag, and why that was allowed
 
@@ -187,6 +232,78 @@ What that changed mechanically, so the next cutter is not surprised:
 * `node-win-installer.yml`'s guard compares `NODE_RELEASE_TAG` with the proven
   Windows btxd and will fail until a Windows btxd exists at this commit. That
   is the guard doing its job; Windows stays on 0.6.6 meanwhile.
+
+### 2026-09-15: upstream tagged 0.34.6, one commit past our pin
+
+The tag exists: **`v0.34.6` = `3013c2c22a9a453e778d6cc426734567d819fa59`**,
+tagged 2026-09-13. `git log 9eb4e005..3013c2c2` is exactly one commit, "Make
+SHA-256 the only new HTLC lock and stop treating header-only peers as
+replacement body sources": `net_processing.cpp` (a peer that only ever sent
+headers no longer counts as a replacement body source;
+`PeerCountsAsAlternativeBodyDownloadSource` requires `has_served_block`),
+`validation.cpp/.h` (`RefreshDeferredReorgHeartbeat` keeps the mining guard's
+deferred-reorg window armed), `policy.cpp` (SHA-256 HTLC leaves standard),
+`script/pqm.*`, `descriptor.cpp`, `sign.cpp`, wallet code, tests, and a COMMENT
+in `consensus/params.h`. No consensus rule moves. `chainparams.cpp` is
+byte-identical to 9eb4e005, so the 203000 assumeutxo base stays and the table
+is clean of 199299/199300; `snapshot_spec()` does not move. The golden manifest
+and `contrib/matmul-v4` are byte-identical to the pin (two-step seal check:
+field 8 `855f220b`, field 9 `b9c6e4852ab1dc1cc7f998c7199a16f4b9fbd37af16fe00872f1fad2491adbc3`,
+recomputed seal of 855f220b matches). Both guards pass on the literal SHA:
+`check-engine-tag.sh` 5/5 sentinel, `check-engine-fleet-ready.sh` degraded
+consensus start, 1-of-1 mirror refused, manifest rows cuda/sm_120 and
+metal/m4_class. Upstream's release notes say "CLIENT_VERSION is 0.34.6"; its
+official binaries need glibc 2.38, so we keep building from source.
+
+So the first half of the rule above holds again, and the pin moved, for 0.6.23.
+What changed mechanically, so the next cutter is not surprised:
+
+* **`NODE_RELEASE_TAG` is `v0.34.6-3013c2c2`, not `v0.34.6`.** The app
+  re-provisions a returning user ONLY when this key changes
+  (`start_node_inner`, `if tag != NODE_RELEASE_TAG`), and every install since
+  0.6.18 already holds the 9eb4e005 build in a directory named `v0.34.6`.
+  Keeping the name and moving the commit would have shipped the tag build to
+  fresh installs only, with nothing on screen saying so. This is the
+  `v0.33.3-pr105b` shape from 0.6.1: a suffixed install key while the binary
+  reports the unsuffixed version, the staged package declaring what it really
+  carries in `.btxd-version`, and provisioning verifying against that. The
+  suffix is the commit's short SHA so the directory says which engine is
+  inside and can never collide with an upstream tag. The convention, held by
+  the scripts: the key is `<version btxd reports>[-<qualifier>]`, and
+  `engine_pin_version` in `engine-pin.sh` strips the qualifier.
+* **`NODE_RELEASE_COMMIT` is `3013c2c2…` and stays SET** although the tag
+  exists, because the key is not an upstream ref and nothing can fetch it by
+  name. The guards, `engine_pin_ref` and both engine build workflows fetch and
+  check out that SHA; their output now says "pin names its commit: verifying
+  … at commit …" instead of "untagged pin".
+* The `-source` staging scripts compare the version part of the key against
+  `btxd --version`, so `stage-node-pkg-linux-source.sh ~/btx-ship/build v0.34.6`
+  is still the call, and with no second argument they derive `v0.34.6` from
+  the pin themselves. The download-based scripts still sit on 0.34.5 and refuse,
+  which remains correct: upstream's 0.34.6 binaries do not run on 22.04.
+* `check-engine-fleet-ready.sh v0.34.6` (the tag as an ARGUMENT) now checks
+  upstream's tag object. Before this change that argument equalled
+  `NODE_RELEASE_TAG` and was silently routed to the pinned commit instead; the
+  two are the same commit today, so the answer is the same, but read the
+  "verifying … at commit" line rather than assuming which one you got.
+* **Linux engine, built in CI at the tag commit:** `btxd-linux.yml` run
+  34914768284, dispatched from main with `btxchain_ref=3013c2c2…`, completed
+  success. Its log proved `tree pristine at 3013c2c2…`, `BUILD_GIT_DIRTY 0`,
+  architectures present `sm_100 sm_120 sm_75 sm_86 sm_89` in both btxd and
+  `libbtx_matmul_backend.a`, `BTX daemon version v0.34.6`, `SMOKE PASSED`.
+  `node-linux-installer.yml` pins that run, its artifact
+  `btxd-linux-3013c2c2…` (393720371 bytes) and the commit.
+* **Windows engine, built in CI at the tag commit:** `btxd-windows.yml` run
+  34914770368, dispatched from main with `btxchain_ref=3013c2c2…`, both jobs
+  green including "regtest smoke on real Windows", artifact
+  `btxd-windows-3013c2c2…` (19079508 bytes). `node-win-installer.yml` moves all
+  four pins together: run id, artifact, `PROVEN_BTXD_VERSION: v0.34.6` (what
+  the binary reports) and `PROVEN_BTXD_TAG: v0.34.6-3013c2c2` (the install
+  key, compared against `NODE_RELEASE_TAG`). This is the first time since 0.6.1
+  that VERSION and TAG differ there, which is what that guard was rewritten for.
+* `btxd-windows.yml`'s `btxchain_ref` default now spells this commit. It sat on
+  `1e51f0d1` (three engines stale) from 2026-08-12, so a blank dispatch built
+  an engine that parks at 184,999.
 
 ### The fork check: necessary, never sufficient
 
@@ -248,6 +365,19 @@ it finds none at all, and it fails when the assignment count is not five, so a
 line that stops matching cannot silently read as clean. Run it rather than
 retyping the grep. It does **not** run the assumeutxo check below. Run that one
 by hand.
+
+It also checks, on every run, that the newest mainnet snapshot the tag compiles
+pins the shielded commitment `confirmed_snapshot.rs` compiles. If the two
+differ, every node would refuse every confirmed snapshot. Before any engine
+bump, also run it with the candidate engine's btxd:
+`EASYNODE_TEST_BTXD=/path/to/btxd ENGINE_TAG_GUARD_REGTEST=1 scripts/check-engine-tag.sh <tag>`.
+That runs `crates/btx-core/tests/confirmed_snapshot_regtest.rs`: the replay
+contexts the engine reports must be the ones `confirmed_snapshot.rs` compiles,
+a fresh regtest chain must carry the compiled shielded commitment, and a
+validating node on a signed snapshot must still restart. A context that moves
+would stop every node on a signed snapshot from starting, because the engine
+re-checks the stored manifest at every start
+(docs/decisions/2026-09-29-every-node-starts-near-the-tip.md, section 12).
 
 ⚠ **Always pass the tag: `scripts/check-engine-tag.sh <tag>`.** Run with no
 argument it checks the pin in `commands.rs`, and today that exits 0 even though
@@ -338,12 +468,51 @@ node fell behind the tip and began self-forking, and the wallet RPCs then hung o
 `cs_main` so the balance was unreadable anyway. The panel warns about this above
 50 blocks behind, and it advises rather than unloading anything itself.
 
-**Do NOT pass `-cadenceburstmax=0`**, even though an operator who hit the cadence
-hold will tell you to. It disables a real dump-and-run protection, and the hold is
-already disarmed for a catching-up node: `kernel/chainstatemanager_opts.h:331`
-says IBD, a stale tip, and recovery_escape each disarm it so partition catch-up
-runs at body-download speed. They hit it because their tip was live when the
-majority surged past them. Different state, opposite answer.
+**Do NOT pass `-cadenceburstmax=0`** as a blanket setting, even though an operator
+who hit the cadence hold will tell you to. It disables a real dump-and-run
+protection (btxd itself logs a warning when it is 0, pointing at
+`doc/design/0.34-dump-and-run-reorg.md`).
+
+🔴 **The reason this paragraph used to give was wrong, and the conclusion is right
+for a different reason. Re-verified 2026-09-18 against v0.34.5 and v0.34.6.**
+
+It used to cite `kernel/chainstatemanager_opts.h:331` ("IBD, a stale tip, and
+recovery_escape each disarm it"). That constexpr `CadenceHoldShouldHold` has **no
+callers outside its own definition**; production is
+`ChainstateManager::CadenceHoldShouldHold` at `src/validation.cpp:11794`, and it
+has **no tip-age test at all**. `docs/LEARNINGS-mac-mining.md` corrected that on
+2026-08-31, but that correction is itself incomplete: it stops at the wrapper and
+never opens `GetCadenceHoldAllowedHeight`, which the wrapper calls and which
+carries the two disarms that actually matter.
+
+What the engine really does (mainnet `nPowTargetSpacing = 90`, default
+`burst_max = 3`). `GetCadenceHoldAllowedHeight` returns
+`origin_height + burst_max + (now − origin_time)/90`, and:
+
+- `CadenceHoldFollowedCatchUpDisarms(extends_tip, followed_ahead, yield=100)` is
+  `extends_tip && followed_ahead >= 100`. It **folds the anchor**, after which
+  `origin_height` is the live tip, so the ceiling rises as the tip rises. Its own
+  comment names the symptom it fixed: *"live node: 423 headers ahead, tip stalled"*.
+- `CadenceHoldSnapshotCatchUpDisarms(...)` returns INT_MAX outright for snapshot
+  catch-up toward disk-loaded headers.
+
+| gap to best header, same chain | behaviour |
+|---|---|
+| **>= 100** | anchor folded, ceiling tracks the tip, **catches up normally** |
+| **3 to 99** | anchor pinned at a fixed height, ceiling rises 1 per 90 s while the chain also makes ~1 per 90 s, so the gap **never closes** |
+
+So a node that is *far* behind is fine and a node that is *slightly* behind is
+stuck, which is the opposite of the intuition everyone brings to this. Our own
+`~/.easybtx/faststart/faststart.conf` recorded the evidence and nobody read it that
+way: *"85 blocks closed in 12m45s with this at 0, and the gap re-opened to **41**
+within 2 hours of removing it."* 41 is inside the paced band.
+
+**Therefore:** keep the blanket flag off, because the case this paragraph was
+worried about is already handled upstream. If the 3-to-99 band needs addressing,
+use the conditional shape in `docs/2026-09-01-next-train-notes.md` (pass the flag
+only while behind, drop it at tip) or, better, report the band upstream as a
+refinement of btxchain/btx#140. Do not re-simplify this to either "always 0" or
+"the hold is harmless"; both have been believed here and both are wrong.
 
 **Before any restart, check free disk.** Their worst moment was a node that
 crashed on "Disk space is too low", failed its flush on stop, and could not
@@ -369,13 +538,95 @@ git show <tag>:src/kernel/chainparams.cpp \
 # any 199'299 or 199'300 line means the tag ships a withdrawn base
 ```
 
-**Our own snapshot pin is safely below the split, so this is a check for future
+**Our own snapshot pin sits on no contested base, so this is a check for future
 pins rather than a live problem.** `snapshot_spec()` in
-`apps/node/src-tauri/src/commands.rs` returns `v0_33_2_spec()` from
-`crates/btx-core/src/snapshot.rs`, whose `anchor_height` is `179_000`. Both read
-and confirmed 2026-08-28. Any future release that moves that pin forward must
-land it on a base the candidate engine still carries and upstream has not
-withdrawn.
+`apps/node/src-tauri/src/commands.rs` returns `v0_34_9_spec()` from
+`crates/btx-core/src/snapshot.rs`, whose `anchor_height` is `219_000`: past the
+withdrawn 199299/199300 bases, on the chain upstream's table and checkpoints
+agree on, and 8,313 blocks below the 227313 split, so both branches share it.
+Read and confirmed 2026-09-23. Any future release that moves that pin forward
+must land it on a base the candidate engine still carries and upstream has not
+withdrawn. Since the v0.34.9 engine the pairing is a test,
+`the_snapshot_pin_is_the_newest_base_the_pinned_engine_carries`: an engine
+version it has no row for fails it until somebody reads that tag's
+`m_assumeutxo_data` and adds one.
+
+**The pin downloads OUR copy of the file.** Upstream publishes 219000 only on a
+PRE-release (`assumeutxo-219000`); the v0.34.9 release ships binaries and
+SHA256SUMS only, and a pre-release can be edited or deleted without a new tag.
+First-run setup aborts when the snapshot download fails, so the file is mirrored
+byte for byte on `MendeMatthias/EasyBTX-releases`, pre-release
+`assumeutxo-219000`, with upstream's sums and manifest beside it, and the pin
+names the mirror (`the_pinned_snapshot_downloads_from_a_host_we_control` holds
+it there). **Keep that pre-release for as long as a release that pins it is
+installed.** A future pin: mirror the file first, check it against the tag's
+`m_assumeutxo_data` with `scripts/check-snapshot-hash.py`, then pin the copy.
+Before cutting a release, from `apps/node/src-tauri`:
+
+```bash
+cargo test --locked the_pinned_snapshot_is_still_published -- --ignored
+# downloads the pinned file, checks its size and SHA-256 against the pin
+```
+
+**Check the file's contents, which needs no node.** A load proves the file
+hashes to the `hash_serialized` the engine compiles in, and that part does not
+need a node: `scripts/check-snapshot-hash.py` recomputes it from the file the
+way the engine does. Take `--expect` and `--base` from the candidate tag's
+`m_assumeutxo_data` entry, not from upstream's manifest:
+
+```bash
+python3 scripts/check-snapshot-hash.py btx-assumeutxo-219000.dat \
+  --expect 3c065aabb529eaab5646825927d9f20a91426dc7e83b4890b575324f5bfccc99 \
+  --base dc51220bc7e5db96e29df9d817ae6179245d33eb8adcaaff765cfec83fdb87c3
+# MATCH, exit 0. On the 203000 file (--expect 6754314323ab...2040) it
+# reproduces the value a real load proved in 0.6.13.
+```
+
+Done for 219000 on 2026-09-23: MATCH. The 64-byte shielded section after the
+coins, which the script does not hash, is byte-identical to the 203000 file's.
+
+**Then a real `loadtxoutset`, the stronger check. Done for 219000 on
+2026-09-23.** The 203000 pin had one before it shipped (v0.34.5 returned
+`base_height` 203000 and the manifest's block hash). For 219000, the 0.6.28
+engine (v0.34.9, `1c7c2ffb…`) on a fresh datadir returned `base_height` 219000,
+`tip_hash` `dc51220b…3fdb87c3` and `coins_loaded` 142076, and activated the
+snapshot chainstate.
+
+⚠ **Which peers the node talks to decides whether it gets there at all.** The
+first attempt that day dialed anyone and never reached the base: its header
+pre-sync twice climbed to about 180000 and started over, for an hour and a half,
+while a dozen peers failed with `low-work headers sync failure`. The second
+attempt connected ONLY to the app's curated peers (the `-addnode` list in
+`node.rs` and the seeds, resolved to addresses), each also as
+`-whitelist=in,out,noban@<ip>` the way the app's conf lists them, and had
+headers at the tip in about a minute.
+
+Measured again the same evening, and the cause is not the sync slot, which is
+what this paragraph first said. It is the low-work pre-sync, and `noban` is
+what skips it. v0.34.9 re-checks a low-work header chain before storing any of
+it, and on this chain the check is quadratic in height (MatMul ASERT difficulty
+replayed over a synthetic index with no skip pointers, back to the anchor at
+50000). One healthy peer without the grant took 32 minutes to deliver headers
+to 219000. Every peer that answers a `getheaders` gets its own pre-sync, all on
+one message-handler thread; with parked peers answering too, rounds take
+minutes, answers stop joining the pre-sync they belong to, and the abort reads
+`non-continuous headers ... (presync phase)` followed by `low-work headers sync
+failure`. That is the dozen failures above, reproduced: the app's launch without
+its whitelist had 66076 headers after 45 minutes, fifteen pre-syncs and ten
+such failures, the mirror and 109.199.124.187 among them. So `-connect` alone
+does not help; the grant on every connected peer does. Since the header
+bootstrap (`node.rs`, HEADER BOOTSTRAP) the app does exactly this for a fresh
+datadir, then restarts into the ordinary launch past the anchor. By hand:
+
+```bash
+btxd -datadir=<scratch> -listen=0 -port=29335 -rpcport=29334 \
+  -connect=<each curated peer> -whitelist=in,out,noban@<each curated ip>
+# once getblockchaininfo reports headers past 219000:
+btx-cli -datadir=<scratch> -rpcport=29334 -rpcclienttimeout=0 \
+  loadtxoutset <path>/btx-assumeutxo-219000.dat
+# expect base_height 219000 and tip_hash
+# dc51220bc7e5db96e29df9d817ae6179245d33eb8adcaaff765cfec83fdb87c3
+```
 
 Full reasoning in `LEARNINGS-mac-mining.md` §19.
 
@@ -628,8 +879,18 @@ anything is signed, published or flipped live:
    since their common ancestor, or `headers − blocks` > 20 for over 10 minutes,
    blocks the release and blocks any public sentence about chain position.
 2. `scripts/observer-ok.sh` must exit 0: the observer's last row is younger
-   than five minutes and its state is `ok` (`node-observer.sh` writes `FORK`
-   for the two conditions above). `build-node-feed.sh` and
+   than five minutes, its state is `ok` (`node-observer.sh` writes `FORK`
+   for the two conditions above), AND it is no more than
+   `BTX_OBSERVER_MAX_BEHIND` (20, the number in step 1) blocks behind.
+   ⚠ The gap check is separate on purpose, since 2026-09-15. The observer
+   calls a node that is behind but closing `ok` deliberately, so that a Mac
+   catching up after days offline does not page anyone, and that is correct
+   for an alarm and wrong for a release gate. Before this the script would
+   have passed a node 4,827 blocks behind: `~/node-observer.tsv` holds 8,576
+   rows written `ok` at more than 20 behind, 489 of them on 2026-09-15 alone,
+   when a Mac paced by the cadence burst hold (btxchain/btx#140) read
+   `behind=98 state=ok` at the exact minute the gate was run.
+   `build-node-feed.sh` and
    `publish-node-release.sh` run it first and refuse otherwise, in the dry run
    too. A manual flip (`gh_release.py publish …`) is not covered by a script,
    so run `scripts/observer-ok.sh` by hand immediately before it.
@@ -666,11 +927,12 @@ anything is signed, published or flipped live:
    ⚠ Dispatch it with **`btxchain_ref=<btxd commit SHA>`** — the same COMMIT SHA
    rule step 3 states for Linux, and for the same reason: artifact names cannot
    contain `/`, so a branch name fails the upload after a full build. It is
-   `9eb4e0050e08ea3ef768bac276dac9cbd2e84542` (v0.34.6), which is
-   `NODE_RELEASE_COMMIT` in `commands.rs` — read it from there rather than from
-   this page. This line said `1e51f0d1` until 2026-09-09, three engine versions
-   stale, and following it would have pinned the Windows build to an engine
-   that parks at 184,999 while Mac and Linux shipped 0.34.6.
+   `3013c2c22a9a453e778d6cc426734567d819fa59` (upstream's tag v0.34.6, since
+   2026-09-15; `9eb4e005` before that), which is `NODE_RELEASE_COMMIT` in
+   `commands.rs` — read it from there rather than from this page. This line
+   said `1e51f0d1` until 2026-09-09, three engine versions stale, and
+   following it would have pinned the Windows build to an engine that parks at
+   184,999 while Mac and Linux shipped 0.34.6.
 
    This step used to read `btxchain_ref=v<node version>`, which is wrong twice
    over: the node's version (0.6.x) and btxd's ref are unrelated namespaces, and
@@ -754,24 +1016,38 @@ anything is signed, published or flipped live:
    tarball is built by hand and has no CI sums file. The gate does not cover
    it, and this page must not be read as saying it does.
 
+   ⚠ **Sign every build under its release name, the mac tarball included.** A
+   signature names the file it was made over, in its signed comment, and
+   easyNode 0.6.31 and later take an update only when every entry in the feed
+   was signed under the release name for its platform and the feed's version
+   (`update_binding.rs`). The bundler signs the mac tarball as
+   `easyBTX Node.app.tar.gz`, which names no version: rename it to
+   `BTX-Node_<ver>_aarch64.app.tar.gz` first and sign THAT (`build-node-feed.sh
+   --mac` checks the name and signs it). `gen-node-feed.py` and
+   `verify-updater-sig.py` refuse a signature made under any other name,
+   because a feed carrying one would stop every 0.6.31+ install from updating.
+
 6. **Build the feed** (signs the keyless CI artifacts locally and
    minisign-verifies each one against the app's embedded pubkey
    `RWSiwrxz2pJDXR4AchfYB5DQzvD8VbIE3D87Ft4D/km76xZIikK6XE9y`). Pass only the
    platforms this release actually ships:
    ```bash
    bash apps/node/scripts/build-node-feed.sh --version <ver> \
-     [--mac <mac.app.tar.gz>] [--linux <linux.AppImage>] [--win <win-setup.exe>] \
-     [--notes "<notes>"]
+     [--mac <mac.app.tar.gz>] [--linux <linux.AppImage>] [--deb <linux.deb>] \
+     [--win <win-setup.exe>] [--notes "<notes>"]
    ```
-   It **writes** `site/public/updater/latest-node.json`. Never hand-edit that file.
-   Every platform key it emits points at an asset at `<ver>`, so those assets
-   must be attached to the release in step 7 before this feed is deployed in
-   step 8.
+   It **writes** `latest-node.json` into `$FEED_OUT_DIR` (default
+   `apps/node/dist-feed`), and with `--deb` also `node-deb.json` beside it. A
+   Linux release always passes both `--linux` and `--deb`. Never hand-edit
+   either file. Every platform key they emit points at an asset at `<ver>`, so
+   those assets and their `.sig` files must be attached to the release in
+   step 7 before the feeds are deployed in step 8.
 
 7. **Publish.** This is now a script, `apps/node/scripts/publish-node-release.sh`,
    and you should use it rather than the commands below. It does the draft ->
    upload -> re-download -> verify -> flip sequence in the right order, refuses
-   an artifact with no signature, refuses one whose signature does not verify
+   an artifact with no signature (the `.tar.gz`, the `.AppImage`, the
+   `-setup.exe` and, since 0.7.0, the `.deb`), refuses one whose signature does not verify
    against the pubkey in `tauri.conf.json`, and checks afterwards that the
    repo-global Latest pointer did not move.
 
@@ -837,9 +1113,21 @@ anything is signed, published or flipped live:
    embedded pubkey, and `sha256sum -c` the published `SHA256SUMS`. A signature
    that only ever verified locally proves nothing about what users will fetch.
 
-8. **Merge the site PR** so Vercel deploys the new feed — and only AFTER the
+8. **Merge the site PR** so Vercel deploys the new feed, and only AFTER the
    GitHub release is live with every asset returning 200, or easybtx.com serves
-   download buttons that 404.
+   download buttons that 404. The PR copies `latest-node.json` into
+   `site/public/updater/`, and on a Linux release `node-deb.json` too, in the
+   same commit as the `REL_LINUX` bump; `scripts/check-node-links.py` fails
+   the PR when they disagree.
+
+   On the 0.7.0 site PR only: the `/node` paragraph that begins "One exception
+   on Linux: a .deb install is told, not updated" stops being true. Replace it
+   with: "<strong>On Linux, a .deb install updates too, from 0.7.0 on.</strong>
+   It asks for your password once, the way installing any system package does.
+   A .deb copy older than 0.7.0 is told about the new version, and you install
+   it by hand one last time with the command on this page. On a machine with no
+   desktop to show the prompt, a .deb copy tries once, then shows the command to
+   install it by hand. The AppImage updates itself without asking."
 
    Pins live in `site/src/pages/node.astro`: `REL_CURRENT` + `relPage` +
    `dl.mac` + `dl.win` move on a **mac/windows** release, `REL_LINUX` +
@@ -862,6 +1150,12 @@ anything is signed, published or flipped live:
 ## Verifying before you trust it
 
 - `curl -s https://easybtx.com/updater/latest-node.json | jq .version`
+- On a Linux release: `curl -s https://easybtx.com/updater/node-deb.json | jq '.version, (.platforms | keys)'`
+  prints the new version and `["linux-x86_64-deb"]`, nothing else.
+- `for t in appimage app nsis; do curl -s -o /dev/null -w "node-$t.json %{http_code}\n" https://easybtx.com/updater/node-$t.json; done`
+  prints `404` for each: the AppImage's, the Mac app's and the Windows
+  installer's typed feeds. Anything in 2xx or 3xx for one of them stops every
+  0.7.0+ copy of that kind from updating.
 - Confirm the released asset bytes match what was signed (sha256 the downloaded
   file against the local build).
 - Observe a real upgrade: quit and reopen an older app — the check fires on
@@ -930,18 +1224,22 @@ glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
 
 1. Engine, from a PRISTINE worktree at the pinned ref (the provenance canary
    fails on any dirty file and the node then runs while silently not
-   validating). The ref is the tag, or for an untagged pin the
-   `NODE_RELEASE_COMMIT` SHA; `engine_pin_ref apps/node` prints it:
+   validating). The ref is the `NODE_RELEASE_COMMIT` SHA when there is one
+   (there is: the install key is not an upstream ref), else the tag;
+   `engine_pin_ref apps/node` prints it:
 
    ```
    git -C <btx-clone> worktree add --detach ~/btx-ship "$(. apps/node/scripts/lib/engine-pin.sh; engine_pin_ref apps/node)"
    # 0.6.18: 9eb4e0050e08ea3ef768bac276dac9cbd2e84542
+   # 0.6.23: 3013c2c22a9a453e778d6cc426734567d819fa59 (upstream tag v0.34.6)
+   # next:   84b998b4f3272775aaf8c241ac11dc683f4c4e23 (upstream tag v0.34.9)
    cd ~/btx-ship
    cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
      -DBUILD_DAEMON=ON -DBUILD_CLI=ON \
      -DBUILD_UTIL=OFF -DBUILD_TX=OFF -DBUILD_WALLET_TOOL=OFF \
      -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_TESTS=OFF -DBUILD_FUZZ_BINARY=OFF \
      -DENABLE_WALLET=ON -DWITH_SQLITE=ON -DWITH_ZMQ=ON \
+     -DWITH_MODELNET=OFF \
      -DCMAKE_IGNORE_PATH=/mnt/c \
      -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.3/bin/nvcc \
      -DCMAKE_CUDA_ARCHITECTURES="75;86;89;120"
@@ -967,16 +1265,18 @@ glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
 
 2. Stage into the app: `apps/node/scripts/stage-node-pkg-linux-source.sh
    ~/btx-ship/build v0.34.6`; the second argument is the version btxd REPORTS,
-   i.e. the tag name, not the commit. It vendors the whole non system library
-   closure (including the ~490 MB cuBLASLt) with ORIGIN rpaths and refuses
-   anything unresolved.
+   i.e. the install key without its `-suffix`, not the key and not the commit
+   (omit it and the script derives the same value from the pin). It vendors
+   the whole non system library closure (including the ~490 MB cuBLASLt) with
+   ORIGIN rpaths and refuses anything unresolved.
 
 3. App: in a NATIVE ext4 checkout (never /mnt/c, never shared node_modules),
    `npm ci`, the three test suites, then `NO_STRIP=true cargo tauri build`.
    NO_STRIP keeps the GPU kernels intact through AppImage packaging.
 
 4. Gates, always on the EXTRACTED bundles, never the staging tree:
-   `.btxd-version` reads the pinned tag name, the bundled btxd and btx-cli execute under
+   `.btxd-version` reads the version part of the pinned key (`v0.34.6`, never
+   the `-suffix`), the bundled btxd and btx-cli execute under
    `env -u LD_LIBRARY_PATH PATH=/usr/bin:/bin`, ldd resolves inside the
    tree, cuobjdump lists every pinned architecture (sm_75/86/89/120, plus
    upstream's own sm_100; the vendored cuBLASLt contributes more, nine in all

@@ -46,32 +46,47 @@ Usage:
   gen-node-feed.py --version 0.5.1 --tag node-v0.5.1 \
      --mac-sig <file> --linux-sig <file> --win-sig <file> ... --out latest-node.json
 
+  # A Linux release also passes the .deb's signature. It goes into its own
+  # feed, node-deb.json, written beside --out, and never into latest-node.json:
+  gen-node-feed.py --version 0.7.0 --tag node-v0.7.0 \
+     --linux-sig <file> --deb-sig <file> ... --out latest-node.json
+
   gen-node-feed.py --self-test
 """
 import argparse
 import base64
 import binascii
+import contextlib
+import io
 import json
 import os
 import re
+import sys
 import tempfile
+import time
 
 REPO = "https://github.com/MendeMatthias/EasyBTX-releases/releases/download"
 # Release asset names follow the node convention BTX-Node_<ver>_<arch>.<ext>.
+# PLATFORM_SUFFIXES in apps/node/src-tauri/src/update_binding.rs is the same
+# table, and a test there reads this file to keep the two equal.
 #
-# linux-x86_64 is the AppImage, deliberately, and there is no `.deb` key: the
-# updater cannot install one. BundleType::Deb reaches install_deb and fails
-# InvalidUpdaterFormat, and when bundle detection returns None it falls through
-# to install_appimage, which renames over a root-owned /usr path and gets
-# EACCES. Adding a deb entry here would not give deb users an update path; it
-# would make every one of them download ~450 MB on a six-hour timer to reach a
-# guaranteed failure. They are told to update by hand instead (README, and the
-# banner the app shows when an install fails).
+# linux-x86_64 is the AppImage. linux-x86_64-deb is the .deb, and it lives in
+# its OWN feed, node-deb.json, which only a .deb install reads (the app asks
+# for node-{{bundle_type}}.json first; docs/decisions/2026-09-28-deb-installs-
+# update-themselves.md). It must never appear in latest-node.json: easyNode
+# 0.6.32 refuses a whole release that lists a key it does not know, so one
+# stray key there stops every 0.6.32 install from updating, on every platform.
 ASSET = {
     "darwin-aarch64": "BTX-Node_{v}_aarch64.app.tar.gz",
     "linux-x86_64": "BTX-Node_{v}_amd64.AppImage",
+    "linux-x86_64-deb": "BTX-Node_{v}_amd64.deb",
     "windows-x86_64": "BTX-Node_{v}_x64-setup.exe",
 }
+DEB_KEY = "linux-x86_64-deb"
+# The keys latest-node.json may carry: every one but the .deb's.
+MAIN_KEYS = tuple(k for k in ASSET if k != DEB_KEY)
+MAIN_FEED_NAME = "latest-node.json"
+DEB_FEED_NAME = "node-deb.json"
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 TAURI_CONF = os.path.join(_HERE, "..", "src-tauri", "tauri.conf.json")
@@ -120,7 +135,21 @@ def load_pubkey_from_conf(path=TAURI_CONF):
         raise ValueError(f"no plugins.updater.pubkey in {path}")
 
 
-def _check_sig(target, sig, want_key_id=None):
+def _signed_name(decoded):
+    """The file name a minisign signature was made over: the `file:` field of
+    its trusted comment, read from the THIRD line exactly as the app's
+    verifier reads it (minisign-verify's Signature::decode). The first line is
+    an untrusted comment and may say anything."""
+    lines = decoded.split("\n")
+    if len(lines) < 3 or not lines[2].startswith("trusted comment: "):
+        return None
+    for field in lines[2][len("trusted comment: "):].rstrip("\r").split("\t"):
+        if field.startswith("file:"):
+            return field[len("file:"):]
+    return None
+
+
+def _check_sig(target, sig, want_key_id=None, want_name=None):
     if not sig or not sig.strip():
         raise ValueError(f"{target}: empty signature")
     # A tauri .sig file is base64 wrapping the real minisign signature, which
@@ -149,14 +178,33 @@ def _check_sig(target, sig, want_key_id=None):
             f"trusts {want_key_id[::-1].hex().upper()} — this feed would be "
             f"REJECTED by every client. Wrong signing key."
         )
+    if want_name is None:
+        return
+    # easyNode 0.6.31 and later take an update only when every entry's build
+    # was signed under the release name for its platform and this version
+    # (update_binding.rs). One entry signed under another name, the bundler's
+    # "easyBTX Node.app.tar.gz" for instance, and they refuse the release, so
+    # this feed would stop their updates. Refused here, before it can ship.
+    named = _signed_name(decoded)
+    if named != want_name:
+        raise ValueError(
+            f"{target}: signed as {named!r}, but this release must be signed as "
+            f"{want_name!r}. easyNode 0.6.31 and later refuse any other name. "
+            f"Rename the file to {want_name} and sign it again "
+            f"(build-node-feed.sh does both)."
+        )
 
 
-def build_feed(version, tag, notes, pub_date, mac_sig=None, linux_sig=None,
-               win_sig=None, pubkey=None):
+def _check_version_tag(version, tag):
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError(f"version must be X.Y.Z, got {version!r}")
     if version not in tag:
         raise ValueError(f"tag {tag!r} does not contain version {version!r}")
+
+
+def build_feed(version, tag, notes, pub_date, mac_sig=None, linux_sig=None,
+               win_sig=None, pubkey=None):
+    _check_version_tag(version, tag)
     want = pubkey_key_id(pubkey) if pubkey else None
     sigs = {
         "darwin-aarch64": mac_sig,
@@ -171,12 +219,89 @@ def build_feed(version, tag, notes, pub_date, mac_sig=None, linux_sig=None,
         )
     platforms = {}
     for target, sig in supplied.items():
-        _check_sig(target, sig, want)
+        _check_sig(target, sig, want, ASSET[target].format(v=version))
         # URL is DERIVED, never passed in: that is what makes the stale-key
         # loop described at the top of this file unrepresentable here.
         url = f"{REPO}/{tag}/{ASSET[target].format(v=version)}"
         platforms[target] = {"signature": sig.strip(), "url": url}
     return {"version": version, "notes": notes, "pub_date": pub_date, "platforms": platforms}
+
+
+def build_deb_feed(version, tag, notes, pub_date, deb_sig, pubkey=None):
+    """node-deb.json: the feed only a .deb install reads, with exactly one key.
+
+    Its entry is checked like every other: the app's key, and signed under the
+    release name BTX-Node_<version>_amd64.deb, or easyNode refuses it."""
+    _check_version_tag(version, tag)
+    want = pubkey_key_id(pubkey) if pubkey else None
+    name = ASSET[DEB_KEY].format(v=version)
+    _check_sig(DEB_KEY, deb_sig, want, name)
+    return {"version": version, "notes": notes, "pub_date": pub_date,
+            "platforms": {DEB_KEY: {"signature": deb_sig.strip(),
+                                    "url": f"{REPO}/{tag}/{name}"}}}
+
+
+def feed_problem(path, feed):
+    """Why `feed` must not be written to `path`, or None.
+
+    node-deb.json lists exactly the .deb's key. Every other feed never lists
+    it: easyNode 0.6.32 refuses a whole release that lists a key it does not
+    know, so the key in latest-node.json would stop every 0.6.32 install from
+    updating, on every platform.
+
+    The name is compared without case: on APFS and NTFS `Node-Deb.json` IS
+    node-deb.json, and the main feed written there replaced the .deb's."""
+    keys = sorted(feed.get("platforms") or {})
+    name = os.path.basename(path)
+    if name.lower() == DEB_FEED_NAME:
+        if keys != [DEB_KEY]:
+            return f"{DEB_FEED_NAME} must list exactly {DEB_KEY}, not {keys}"
+    elif DEB_KEY in keys:
+        return (f"{DEB_KEY} must never be written to {name}: easyNode 0.6.32 "
+                f"refuses a whole release that lists a key it does not know, so "
+                f"every 0.6.32 install would stop updating. It belongs in "
+                f"{DEB_FEED_NAME} only.")
+    return None
+
+
+# What Tauri's updater accepts in `pub_date`: an RFC 3339 timestamp. An empty
+# or unparseable value makes it refuse the WHOLE manifest, on every platform,
+# before it compares versions: easyNode 0.7.5 logged "invalid value for
+# `pub_date`: the 'year' component could not be parsed" against the 0.7.6
+# feed, which this script wrote with `"pub_date": ""` when it was run without
+# --pub-date (build-node-feed.sh supplies one; it had been bypassed).
+PUB_DATE_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})")
+
+
+def pub_date_or_now(value):
+    """The feed's pub_date: `value` when it is a timestamp the updater
+    parses, the current UTC second when none was given, else ValueError."""
+    if not value:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if not PUB_DATE_RE.fullmatch(value):
+        raise ValueError(
+            f"--pub-date {value!r} is not an RFC 3339 timestamp such as "
+            f"2026-10-05T12:25:49Z. The updater refuses a whole feed whose "
+            f"pub_date it cannot parse.")
+    return value
+
+
+def same_file(a, b):
+    """Whether `a` and `b` name one file: the same file when both exist, else
+    the same path once links are resolved and case is ignored, which is how
+    APFS and NTFS see it. Erring towards "the same" only ever refuses a write."""
+    if os.path.exists(a) and os.path.exists(b):
+        return os.path.samefile(a, b)
+    return os.path.realpath(a).lower() == os.path.realpath(b).lower()
+
+
+def write_feed(path, feed):
+    """write_atomic, after feed_problem has found nothing wrong."""
+    problem = feed_problem(path, feed)
+    if problem:
+        raise ValueError(problem)
+    write_atomic(path, feed)
 
 
 def write_atomic(path, data):
@@ -195,15 +320,20 @@ def write_atomic(path, data):
         raise
 
 
-def _fake_sig(key_id=b"\x01\x02\x03\x04\x05\x06\x07\x08"):
-    """A structurally valid tauri .sig carrying a chosen key id."""
+def _fake_sig(key_id=b"\x01\x02\x03\x04\x05\x06\x07\x08", name="x"):
+    """A structurally valid tauri .sig carrying a chosen key id and file name."""
     body = base64.b64encode(b"ED" + key_id + b"\x00" * 64).decode()
     raw = (
         "untrusted comment: signature from tauri secret key\n"
         f"{body}\n"
-        "trusted comment: x\nZg==\n"
+        f"trusted comment: timestamp:0\tfile:{name}\nZg==\n"
     )
     return base64.b64encode(raw.encode()).decode()
+
+
+def _named(target, version, key_id=b"\x01\x02\x03\x04\x05\x06\x07\x08"):
+    """A fake signature for `target`, signed under its release name."""
+    return _fake_sig(key_id, ASSET[target].format(v=version))
 
 
 def _fake_pubkey(key_id=b"\x01\x02\x03\x04\x05\x06\x07\x08"):
@@ -213,10 +343,11 @@ def _fake_pubkey(key_id=b"\x01\x02\x03\x04\x05\x06\x07\x08"):
 
 
 def self_test():
-    sig = _fake_sig()
     pub = _fake_pubkey()
+    mac, linux, win = (_named(t, "0.5.1") for t in
+                       ("darwin-aarch64", "linux-x86_64", "windows-x86_64"))
     feed = build_feed("0.5.1", "node-v0.5.1", "notes", "2026-07-15T00:00:00Z",
-                      sig, sig, sig, pubkey=pub)
+                      mac, linux, win, pubkey=pub)
     assert set(feed["platforms"]) == {"darwin-aarch64", "linux-x86_64", "windows-x86_64"}, feed
     assert feed["platforms"]["darwin-aarch64"]["url"].endswith(
         "node-v0.5.1/BTX-Node_0.5.1_aarch64.app.tar.gz"
@@ -227,25 +358,28 @@ def self_test():
 
     # A single-platform feed is legitimate, and its URL is minted at the NEW
     # version — the stale-key loop cannot be expressed.
-    only_linux = build_feed("0.6.5", "node-v0.6.5", "n", "d", linux_sig=sig, pubkey=pub)
+    only_linux = build_feed("0.6.5", "node-v0.6.5", "n", "d",
+                            linux_sig=_named("linux-x86_64", "0.6.5"), pubkey=pub)
     assert set(only_linux["platforms"]) == {"linux-x86_64"}, only_linux
     assert only_linux["platforms"]["linux-x86_64"]["url"].endswith(
         "node-v0.6.5/BTX-Node_0.6.5_amd64.AppImage"
     ), only_linux
 
     # Mac-only and windows-only both work too.
-    assert set(build_feed("0.6.4", "node-v0.6.4", "n", "d", mac_sig=sig,
+    assert set(build_feed("0.6.4", "node-v0.6.4", "n", "d",
+                          mac_sig=_named("darwin-aarch64", "0.6.4"),
                           pubkey=pub)["platforms"]) == {"darwin-aarch64"}
-    assert set(build_feed("0.6.4", "node-v0.6.4", "n", "d", win_sig=sig,
+    assert set(build_feed("0.6.4", "node-v0.6.4", "n", "d",
+                          win_sig=_named("windows-x86_64", "0.6.4"),
                           pubkey=pub)["platforms"]) == {"windows-x86_64"}
 
     # Signatures are still verified, and a wrong signing key is caught.
-    wrong = _fake_sig(b"\x09\x09\x09\x09\x09\x09\x09\x09")
+    wrong = _named("linux-x86_64", "0.5.1", b"\x09\x09\x09\x09\x09\x09\x09\x09")
     for bad in (
-        lambda: build_feed("9.9.9", "node-v0.5.1", "", "", sig, sig, sig),   # version/tag mismatch
+        lambda: build_feed("9.9.9", "node-v0.5.1", "", "", mac, linux, win),   # version/tag mismatch
         lambda: build_feed("0.5.1", "node-v0.5.1", "", ""),                  # no platforms at all
         lambda: build_feed("0.5.1", "node-v0.5.1", "", "", mac_sig="not a sig"),  # bad sig
-        lambda: build_feed("0.5", "node-v0.5", "", "", mac_sig=sig),         # non-semver
+        lambda: build_feed("0.5", "node-v0.5", "", "", mac_sig=mac),         # non-semver
         lambda: build_feed("0.5.1", "node-v0.5.1", "", "", linux_sig=wrong, pubkey=pub),  # wrong key
     ):
         try:
@@ -254,11 +388,219 @@ def self_test():
         except ValueError:
             pass
 
+    # Every entry must be signed under ITS release name at THIS version, or
+    # easyNode 0.6.31+ refuses the whole release (update_binding.rs).
+    unbound = (
+        # The bundler's own signature, which named the 0.6.30 Mac build.
+        ("darwin-aarch64", _fake_sig(name="easyBTX Node.app.tar.gz")),
+        # A genuine older build, offered as this version.
+        ("linux-x86_64", _named("linux-x86_64", "0.5.0")),
+        # Another platform's build under this platform's key.
+        ("linux-x86_64", _named("windows-x86_64", "0.5.1")),
+        # The miner, which the same key signs.
+        ("linux-x86_64", _fake_sig(name="easyBTX_0.5.1_amd64.AppImage")),
+    )
+    for target, bad_sig in unbound:
+        arg = {"darwin-aarch64": "mac_sig", "linux-x86_64": "linux_sig"}[target]
+        try:
+            build_feed("0.5.1", "node-v0.5.1", "", "", pubkey=pub, **{arg: bad_sig})
+            raise AssertionError(f"accepted an unbound {target} signature")
+        except ValueError as e:
+            assert "must be signed as" in str(e), e
+
+    # The untrusted first line is not the trusted comment, however it reads.
+    forged = base64.b64decode(_named("linux-x86_64", "0.5.0")).decode().split("\n")
+    forged[0] = "trusted comment: timestamp:0\tfile:BTX-Node_0.5.1_amd64.AppImage"
+    forged = base64.b64encode("\n".join(forged).encode()).decode()
+    try:
+        build_feed("0.5.1", "node-v0.5.1", "", "", linux_sig=forged, pubkey=pub)
+        raise AssertionError("read the untrusted comment as the signed one")
+    except ValueError:
+        pass
+
+    # The .deb has a feed of its own, node-deb.json, with exactly one key.
+    deb = build_deb_feed("0.6.33", "node-v0.6.33", "n", "d",
+                         _named(DEB_KEY, "0.6.33"), pubkey=pub)
+    assert set(deb["platforms"]) == {DEB_KEY}, deb
+    assert deb["platforms"][DEB_KEY]["url"] == (
+        f"{REPO}/node-v0.6.33/BTX-Node_0.6.33_amd64.deb"), deb
+    assert deb["version"] == "0.6.33", deb
+    # Its build is bound like every other: the AppImage's signature under the
+    # .deb's key, an older .deb, or the wrong key are all refused.
+    for bad_sig in (_named("linux-x86_64", "0.6.33"), _named(DEB_KEY, "0.6.32"),
+                    _named(DEB_KEY, "0.6.33", b"\x09" * 8)):
+        try:
+            build_deb_feed("0.6.33", "node-v0.6.33", "", "", bad_sig, pubkey=pub)
+            raise AssertionError("accepted an unbound .deb signature")
+        except ValueError:
+            pass
+
+    # And the .deb key goes into node-deb.json and nowhere else: easyNode
+    # 0.6.32 refuses a whole release that lists a key it does not know, so the
+    # key in latest-node.json would stop every 0.6.32 install from updating.
+    main = build_feed("0.6.33", "node-v0.6.33", "n", "d",
+                      linux_sig=_named("linux-x86_64", "0.6.33"), pubkey=pub)
+    poisoned = json.loads(json.dumps(main))
+    poisoned["platforms"][DEB_KEY] = deb["platforms"][DEB_KEY]
+    with tempfile.TemporaryDirectory() as d:
+        for name, feed in ((MAIN_FEED_NAME, poisoned), ("feed.json", poisoned),
+                           (DEB_FEED_NAME, main), (DEB_FEED_NAME, poisoned)):
+            path = os.path.join(d, name)
+            try:
+                write_feed(path, feed)
+                raise AssertionError(f"wrote {sorted(feed['platforms'])} to {name}")
+            except ValueError:
+                pass
+            assert not os.path.exists(path), f"{name} was written anyway"
+        write_feed(os.path.join(d, MAIN_FEED_NAME), main)
+        write_feed(os.path.join(d, DEB_FEED_NAME), deb)
+        with open(os.path.join(d, DEB_FEED_NAME)) as f:
+            assert json.load(f) == deb
+
+    # main() itself, the way build-node-feed.sh runs it: every destination is
+    # checked before anything is written, so a refused write never leaves the
+    # other feed published beside it, and "wrote" is printed only for a file
+    # that was written.
+    with tempfile.TemporaryDirectory() as d:
+        _self_test_main(d, pub)
+
+    # pub_date: a timestamp passes through, a missing one becomes now, and
+    # anything the updater cannot parse is refused before a feed is written.
+    assert pub_date_or_now("2026-10-05T12:25:49Z") == "2026-10-05T12:25:49Z"
+    assert pub_date_or_now("2026-10-05T12:25:49.5+02:00") == "2026-10-05T12:25:49.5+02:00"
+    for missing in ("", None):
+        assert PUB_DATE_RE.fullmatch(pub_date_or_now(missing)), missing
+    for bad in ("d", "2026-10-05", "yesterday", " 2026-10-05T12:25:49Z"):
+        try:
+            pub_date_or_now(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"pub_date {bad!r} was accepted")
+
     # The REAL embedded pubkey must parse, so a conf change cannot silently
     # disable key-id verification.
     real = pubkey_key_id(load_pubkey_from_conf())
     assert len(real) == 8, real
     print(f"gen-node-feed self-test OK (app trusts key id {real[::-1].hex().upper()})")
+
+
+def _run_main(argv):
+    """main() as the command line runs it: what it printed, and what it raised."""
+    out = io.StringIO()
+    saved = sys.argv
+    sys.argv = ["gen-node-feed.py"] + argv
+    try:
+        with contextlib.redirect_stdout(out):
+            main()
+        return out.getvalue(), None
+    except (ValueError, OSError) as e:
+        return out.getvalue(), e
+    finally:
+        sys.argv = saved
+
+
+def _self_test_main(d, pub):
+    """The --self-test cases that run main(), in the empty directory `d`."""
+    v = "0.7.0"
+    conf = os.path.join(d, "tauri.conf.json")
+    with open(conf, "w") as f:
+        json.dump({"plugins": {"updater": {"pubkey": pub}}}, f)
+
+    def sig_file(name, sig):
+        path = os.path.join(d, name)
+        with open(path, "w") as f:
+            f.write(sig)
+        return path
+
+    good_linux = sig_file("linux.sig", _named("linux-x86_64", v))
+    bad_linux = sig_file("linux-bad.sig", _named("linux-x86_64", "0.6.32"))
+    good_deb = sig_file("deb.sig", _named(DEB_KEY, v))
+    base = ["--version", v, "--tag", f"node-v{v}", "--pubkey-conf", conf]
+
+    def folder(name):
+        path = os.path.join(d, name)
+        os.makedirs(path)
+        return path
+
+    def contents(dirpath):
+        """Every regular file in `dirpath`, by name, with what it holds."""
+        out = {}
+        for n in sorted(os.listdir(dirpath)):
+            p = os.path.join(dirpath, n)
+            if os.path.isfile(p):
+                with open(p) as f:
+                    out[n] = f.read()
+        return out
+
+    def refused(argv, why):
+        """main() refuses `argv`, writes nothing, and never says it wrote."""
+        out_dir = os.path.dirname(argv[argv.index("--out") + 1])
+        before = contents(out_dir)
+        printed, err = _run_main(base + argv)
+        assert err is not None, f"{why}: main() accepted {argv}"
+        assert "wrote" not in printed, f"{why}: printed {printed!r}"
+        assert contents(out_dir) == before, f"{why}: {sorted(contents(out_dir))}"
+        return err
+
+    feeds = folder("feeds")
+    main_out = os.path.join(feeds, MAIN_FEED_NAME)
+    deb_out = os.path.join(feeds, DEB_FEED_NAME)
+
+    # A bad AppImage signature beside a good .deb one: neither feed is written.
+    refused(["--linux-sig", bad_linux, "--deb-sig", good_deb, "--out", main_out],
+            "a bad --linux-sig")
+    # --out mistyped as the .deb's feed: refused before the .deb's is written.
+    refused(["--linux-sig", good_linux, "--deb-sig", good_deb, "--out", deb_out],
+            "--out node-deb.json with --deb-sig")
+    refused(["--linux-sig", good_linux, "--out", deb_out], "--out node-deb.json")
+    assert os.listdir(feeds) == [], os.listdir(feeds)
+
+    # Both feeds, written once and read back.
+    printed, err = _run_main(base + ["--linux-sig", good_linux, "--deb-sig", good_deb,
+                                     "--out", main_out])
+    assert err is None, err
+    assert sorted(os.listdir(feeds)) == sorted([DEB_FEED_NAME, MAIN_FEED_NAME]), os.listdir(feeds)
+    assert f"wrote {deb_out}" in printed and f"wrote {main_out}" in printed, printed
+    with open(main_out) as f:
+        assert sorted(json.load(f)["platforms"]) == ["linux-x86_64"]
+    with open(deb_out) as f:
+        assert sorted(json.load(f)["platforms"]) == [DEB_KEY]
+
+    # The .deb's feed name in other case. On APFS that IS node-deb.json, and
+    # writing the main feed there silently replaced the .deb's.
+    for name in ("Node-Deb.json", "NODE-DEB.JSON"):
+        out = os.path.join(feeds, name)
+        refused(["--linux-sig", good_linux, "--deb-sig", good_deb, "--out", out],
+                f"--out {name} with --deb-sig")
+        refused(["--linux-sig", good_linux, "--out", out], f"--out {name}")
+
+    # An --out that is the .deb's feed under a second name is the same file.
+    link = os.path.join(feeds, "main.json")
+    os.link(deb_out, link)
+    refused(["--linux-sig", good_linux, "--deb-sig", good_deb, "--out", link],
+            "--out a hard link to node-deb.json")
+    os.remove(link)
+
+    # And one that resolves to it before it exists.
+    fresh = folder("fresh")
+    dangling = os.path.join(fresh, "main.json")
+    try:
+        os.symlink(DEB_FEED_NAME, dangling)
+    except (OSError, NotImplementedError):
+        dangling = None  # Windows without the symlink privilege
+    if dangling:
+        refused(["--linux-sig", good_linux, "--deb-sig", good_deb, "--out", dangling],
+                "--out a link to a node-deb.json not written yet")
+        assert os.listdir(fresh) == ["main.json"], os.listdir(fresh)
+
+    # A write that fails says so, and never that it wrote: here --out is a
+    # directory, which passes every check and then cannot be replaced.
+    blocked = folder("blocked")
+    os.makedirs(os.path.join(blocked, MAIN_FEED_NAME))
+    err = refused(["--linux-sig", good_linux, "--out",
+                   os.path.join(blocked, MAIN_FEED_NAME)], "a write that fails")
+    assert isinstance(err, OSError), err
 
 
 def _read(path):
@@ -274,6 +616,8 @@ def main():
     p.add_argument("--mac-sig")
     p.add_argument("--linux-sig")
     p.add_argument("--win-sig")
+    p.add_argument("--deb-sig",
+                   help=f"the .deb's .sig; writes {DEB_FEED_NAME} beside --out")
     p.add_argument("--notes", default="")
     p.add_argument("--pub-date", default="")
     p.add_argument("--out")
@@ -284,27 +628,55 @@ def main():
         return self_test()
     if not (a.version and a.tag and a.out):
         p.error("need --version --tag --out")
-    if not (a.mac_sig or a.linux_sig or a.win_sig):
-        p.error("need at least one of --mac-sig / --linux-sig / --win-sig")
-    feed = build_feed(
-        a.version, a.tag, a.notes, a.pub_date,
-        _read(a.mac_sig) if a.mac_sig else None,
-        _read(a.linux_sig) if a.linux_sig else None,
-        _read(a.win_sig) if a.win_sig else None,
-        pubkey=load_pubkey_from_conf(a.pubkey_conf),
-    )
+    if not (a.mac_sig or a.linux_sig or a.win_sig or a.deb_sig):
+        p.error("need at least one of --mac-sig / --linux-sig / --win-sig / --deb-sig")
+    pubkey = load_pubkey_from_conf(a.pubkey_conf)
+    a.pub_date = pub_date_or_now(a.pub_date)
+    # Both feeds are built, and so checked, before either is written: a bad
+    # signature on one must not leave the other half-published beside it.
+    deb = None
+    if a.deb_sig:
+        deb = build_deb_feed(a.version, a.tag, a.notes, a.pub_date,
+                             _read(a.deb_sig), pubkey=pubkey)
+    feed = None
+    if a.mac_sig or a.linux_sig or a.win_sig:
+        feed = build_feed(
+            a.version, a.tag, a.notes, a.pub_date,
+            _read(a.mac_sig) if a.mac_sig else None,
+            _read(a.linux_sig) if a.linux_sig else None,
+            _read(a.win_sig) if a.win_sig else None,
+            pubkey=pubkey,
+        )
+    # And so is every destination: a refused write must not leave the other
+    # feed written beside it (a mistyped `--out .../node-deb.json` used to
+    # write the .deb's feed and then refuse the main one).
+    deb_out = os.path.join(os.path.dirname(os.path.abspath(a.out)), DEB_FEED_NAME)
+    for path, f in ((deb_out, deb), (a.out, feed)):
+        problem = f and feed_problem(path, f)
+        if problem:
+            raise ValueError(problem)
+    if deb and feed and same_file(deb_out, a.out):
+        raise ValueError(f"--out {a.out} is {deb_out}, where the .deb's feed goes. "
+                         f"Pass --out .../{MAIN_FEED_NAME}.")
+    if deb:
+        write_feed(deb_out, deb)
+        print(f"wrote {deb_out}: version {deb['version']}, platform {DEB_KEY}")
+    if not feed:
+        return
+    # Written first, then said: a write that fails never reads as done.
+    write_feed(a.out, feed)
     names = ", ".join(sorted(feed["platforms"]))
     print(f"wrote {a.out} — version {feed['version']}, platforms: {names}")
-    missing = sorted(set(ASSET) - set(feed["platforms"]))
+    missing = sorted(set(MAIN_KEYS) - set(feed["platforms"]))
     if missing:
         print(f"NOTE: no key for {', '.join(missing)} — those clients stay on "
               f"their current build and download nothing, which is the intended "
               f"safe state when they are not part of this release.")
         print("      (Mechanically the plugin returns TargetsNotFound; main.ts "
               "only surfaces check errors on a MANUAL check, so the automatic "
-              "one is silent. Expect 'Check now' on those platforms to say "
-              "\"Couldn't check right now — are you online?\" — harmless.)")
-    write_atomic(a.out, feed)
+              "one is silent. Since 0.6.20 'Check now' there says the release has no "
+              "build for that platform. Copies there OLDER than that platform's "
+              "last build are offered nothing until it ships: say so on the site.)")
 
 
 if __name__ == "__main__":

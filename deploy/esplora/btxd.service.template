@@ -16,8 +16,12 @@ Type=simple
 # outranks the conf file (measured on the release box on 2026-09-04). The
 # command line outranks both. -parkdeepreorg=0 for the reason easyNode 0.6.19
 # gives: a parked node could not rejoin the live chain after the 2026-09-05
-# split without an operator.
-ExecStart=/usr/local/bin/btxd -datadir=/var/lib/btx -conf=/var/lib/btx/btx.conf -prune=0 -parkdeepreorg=0
+# split without an operator. -reorgpolicy=legacy because this unit runs engine
+# 0.34.12 or newer (btxscan does): their default -reorgpolicy=bounded refuses
+# -parkdeepreorg=0 at start ("conflicts with -reorgpolicy=bounded"), and
+# legacy keeps the behaviour above. An engine older than 0.34.12 refuses
+# -reorgpolicy as an unknown argument: drop it there.
+ExecStart=/usr/local/bin/btxd -datadir=/var/lib/btx -conf=/var/lib/btx/btx.conf -prune=0 -parkdeepreorg=0 -reorgpolicy=legacy
 ExecStop=/usr/local/bin/btx-cli -datadir=/var/lib/btx stop
 Restart=on-failure
 RestartSec=10

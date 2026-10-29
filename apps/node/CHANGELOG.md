@@ -6,7 +6,1530 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
-## [Unreleased]
+## [0.7.16] - 2026-10-18 · linux + windows (mac follows when built)
+
+**Jarek confirms chain snapshots, so a new node can start about a day from
+the tip.** A snapshot counts as confirmed only when two different operators
+on the list compiled into easyNode signed the same statement, and until now
+only the project's own RTX 3060 signed, so every new node started from the
+built-in snapshot at block 245,300, thousands of blocks back. Jarek (Byron
+Bay), who runs the archive at archive.btxbyronbay.com, now cuts a signed
+snapshot at every multiple of 1,000 blocks on his own GPU validator. At block
+251,000 his statement and the 3060's were the same, byte for byte, and so
+were the files. easyNode 0.7.16 adds him to the list, so a statement both
+signed is confirmed, and a new node starts from it. His key confirms
+snapshots only. It is not a key easyNode trusts for blocks, and his signature
+is never passed to the engine. An older easyNode still starts from block
+245,300.
+
+**A power cut or a hard restart costs a few blocks, not up to an hour of
+them.** The engine writes its chain state to disk on its own only about once
+an hour; a clean stop writes everything, a hard one loses what came after the
+last write. On 15 October a Windows restart killed the node on the project's
+RTX 3060 44 minutes after its last write, so it had to download and check 36
+blocks again, and it was back at the tip 41 minutes after boot. easyNode now
+asks the engine to write its state every 5 minutes, which took 71 ms there.
+It does so on every node except one whose newest block is more than 30 days
+old, as on a first download, where the engine's own schedule is the right
+one.
+
+The same morning the node sat 6 minutes without peers. That was the PC's
+Wi-Fi taking 6 minutes to connect after the restart; the engine retried its
+peers every 15 seconds throughout and was connected 7 seconds after the
+Wi-Fi was, so nothing in easyNode changes for it.
+
+## [0.7.15] - 2026-10-14 · linux + windows (mac follows when built)
+
+**A lost graphics card is recovered even when easyNode itself restarted
+after the loss.** On 14 October a real graphics-card reset on the project's
+RTX 3060 was recovered with no clicks: easyNode waited its 15 minutes,
+restarted WSL, and the node was checking blocks again a minute later. The
+same test showed a gap. easyNode judged whether the card had been working
+from its own run, so an easyNode started after the loss (its window closed
+with the display, the person reopened it, an update relaunched it) never
+acted, and the node stayed frozen. It now also asks the engine, which
+remembers losing a card it had been using. A card refused at startup still
+never causes a restart, and the limits stay as they were: at most two WSL
+restarts for one loss, and otherwise one every 3 hours.
+
+## [0.7.14] - 2026-10-14 · linux + windows (no mac build; the mac goes from 0.7.12 to 0.7.15)
+
+**The WSL recovery from 0.7.13 is safer.** An audit of it, and a second test
+with a real graphics-card reset on 13 October, found what follows; all of it
+is fixed.
+
+- It restarts WSL only for easyNode's own node. Attached to another app's node
+  (the miner's, say), it used to leave that node running and then kill it
+  with WSL, uncleanly.
+- The limit of one WSL restart every 3 hours now holds across the restart.
+  It was kept in memory, which the restart itself ends, so a card that
+  qualified at startup and then failed again could cost a WSL restart every
+  20 minutes. A record now lives in the settings file, and a card that keeps
+  failing costs at most two: the first, and one more if the run after it
+  comes up without the card within the hour, as when a driver install is
+  still going.
+- easyNode prepares the restart before it stops anything, so a restart it
+  cannot make leaves the node running. It gives Windows 30 seconds to take
+  the job over, and if WSL has not restarted two minutes later it starts the
+  node again. The Windows side writes what it did to
+  `%TEMP%\easynode-wsl-restart.log` and tries starting easyNode again up to three
+  times.
+- Started by a boot script, easyNode now still finds the name of its own WSL
+  distribution, instead of restarting the default one.
+- The message about a card that fails the engine's check says restarting the
+  computer clears it only when it follows a driver update; the same message
+  shows for a card refused at startup.
+
+## [0.7.13] - 2026-10-13 · linux + windows (no mac build; the mac goes from 0.7.12 to 0.7.15)
+
+**A node that loses its graphics card mid-run gets it back by itself.** On
+11 October at 19:49 UTC Windows Update installed a graphics driver under the
+running node on this project's RTX 3060 signer. The node engine took the card
+out of block checking and tested it again about every hour, and the card
+failed each time, for 13 hours. The node stopped at block 245,498 and signed
+nothing, and nodes that follow signatures stopped with it, except where
+another signer's key carried them further. Now, when
+the engine says it cannot check blocks for 15 minutes in a run where it had
+been checking them, easyNode acts, at most once every 3 hours and never for a
+card that did not pass at startup:
+
+- Inside WSL on Windows it stops the node cleanly and restarts WSL, then
+  starts again by itself. A driver installed on purpose on 13 October showed
+  that restarting only the node does not bring the card back there, and that
+  restarting WSL does, in seconds. Restarting WSL stops every Linux program on
+  that PC, so Settings has a switch for it, shown only inside WSL and on by
+  default.
+- On Linux and macOS it restarts the node, which runs the card check again.
+- When the check still fails, the message now says what clears it: restart
+  the computer. It used to say "restarting easyNode", which does not help
+  after a driver update.
+
+## [0.7.12] - 2026-10-12
+
+**Everything is on, and anything can be switched off.** The wallet,
+Explorer mode (look up any past transaction in Ask), serving a chain
+snapshot and Esplora are now on by default, next to the services that
+already were, and your node starts with your computer. Each one runs only
+where it can: a Mac that follows signatures does not make snapshots, a
+Keeper does not build the transaction index, and Esplora waits until its
+programs are installed. Where a feature cannot run, Settings greys its
+switch out and says why in one line. If you already run a node, these turn
+on once with this update and the welcome panel lists them; switch off
+whatever you do not want, and it stays off.
+
+**Settings are in four groups.** This computer, Helping the network, For
+operators (folded) and Disk, instead of one long list. Explorer mode has a
+switch there now; it used to be offered only from Ask.
+
+**Fixed: a Keeper could turn on Explorer mode and then not start.** The node
+engine refuses to run with pruning and a transaction index together; the
+app now never asks for both.
+
+**The headline no longer says LIVE over a node that has stopped following
+the chain.** On 12 October a node that follows signatures sat on one block
+for six hours under a green "Your node is live and helping the network",
+while the cards below it said the node was not following the chain. The
+headline and the light now say the same thing as those cards: NOT FOLLOWING
+in amber once the app's own checks call the node stuck (for a node that
+follows signatures that can be 15 minutes in, for any node it is at most 2
+hours), BEHIND when newer blocks exist that the node cannot get, and
+DIFFERENT BRANCH when no other source holds your node's block. When other
+sources are only a few blocks ahead, it stays LIVE and says so in the line
+under it. The word itself turns amber or red when something is wrong, and
+the small window shows the same light, with the headline when you hover it.
+The status line in the menu bar (the tray on Windows and Linux) says "not
+following" on a stuck node instead of "running", and groups the block
+number.
+
+**A disk so full that the node may stop is said at the top.** The warning
+sat in the disk card, far below a green LIVE. The headline now says DISK
+ALMOST FULL in amber, the moment the disk card turns red.
+
+**Setup says the disk is too small before you press the button.** It used to
+find out only after "Set up my node", and show it below the fold. Now the
+free space turns red and a line under it says what is missing, and that
+Keeper mode needs far less.
+
+**A stopped node shows what happened and Start node at the top.** Both used
+to sit at the bottom of the screen, below every card.
+
+**"Global network stats" opens easybtx.com/stats.** It opened
+btxprice.com/stats, which no longer answers.
+
+**Screen readers hear the status change.** When the headline moves to a new
+state (NOT FOLLOWING, STOPPED, LIVE again), it is said once.
+
+**Panels close with Escape.** Opening a panel moves the keyboard into it,
+closing it gives the keyboard back to the button that opened it, and Tab
+stays inside the open panel.
+
+**Closing the window while Ask, Tools or What's next was open seemed to do
+nothing.** The "Close BTX Node?" question opened behind the panel. It now
+opens on top.
+
+**A node that stops answering no longer freezes the screen silently.** The
+app asks for its status every 1.5 seconds and waits up to two minutes for a
+node that accepts the question and never answers. It used to keep asking on
+top of the unanswered questions while the screen showed the last answer as
+if it were current. It now asks one at a time, and after 10 seconds says
+"Waiting for your node to answer" under the headline.
+
+**One unit and one clock.** "Helping the network" and the Remove button
+printed sizes divided by 1024 as "GB", next to disk figures in GiB; they say
+GiB and MiB now. The time your key last went to easybtx.com reads "06:12",
+like every other time on the screen, instead of "6:12:19 AM".
+
+**No dashes in the app's messages.** Wallet errors, Ask's answer about an
+old block, start errors and two of the stall notes used em-dashes; they are
+plain sentences now.
+
+**Smaller fixes.** "Start node" in Ask says why when the node cannot start,
+instead of doing nothing visible. About and What's next describe the app as
+it is today: there is a wallet, Ask and Quick start have shipped. The tile
+that shows the engine's version is called "BTX engine", so it is not
+confused with the app's own version in the header. The note under Node mode
+reads as a sentence.
+
+## [0.7.11] - 2026-10-12
+
+**A new node starts a few hundred blocks behind the tip instead of about 6,300.**
+Until two operators confirm a snapshot, every new node starts from the
+snapshot built into the app. That was block 239,111 from 5 October, and the
+chain has grown about 1,400 blocks a day since. The built-in start is now
+block 245,300, taken on 11 October by this project's own validating node and
+signed by its key, `02d5efca`. Before it was built in we checked that its
+block is the one btxscan.io shows at that height, that its signature is
+valid, and, coin by coin, that the snapshot holds exactly what the signer
+said it does. A node that is already running is not affected.
+
+**"Blocks behind" is right again.** Since block 244,000 the node engine only
+counts a newer block header once it has checked that block or a signer has
+signed it. So while a node was catching up, the app counted too few blocks
+behind: one test install said 4,888 when the real gap was about 5,260. The
+help that fetches missing blocks, the stall check and the warning about
+falling behind the signers went quiet with it. The app now also reads the
+newest block the signers have signed on your node's own chain, and counts
+from whichever is highest. The main screen says "Catching up to block N",
+and Copy diagnostics shows the signed block and the number the app counts
+toward.
+
+**Snapshots can be confirmed now.** Each new snapshot is sent to easybtx.com,
+where a second operator's node adds its signature. Until 11 October the
+website could not keep a snapshot file or record a second signature, so no
+snapshot could ever be confirmed. That is fixed on the website, and the first
+snapshot file was stored the same night. A snapshot still needs two operators
+before new nodes start from it; until then they start from the built-in one
+above.
+
+## [0.7.10] - 2026-10-11
+
+**A second source of signatures and old blocks.** The app now also dials the
+second node behind btxscan.io, which keeps the whole chain and hands out the
+signed confirmations a node that follows signatures needs. We checked it
+first: it runs BTX 0.34.15, is at the tip, sent back an old block (150,000)
+when asked, and gave the signatures of the key that signs the chain for new
+and old blocks alike. It lives on the same machine as the btxscan node the
+app already used, so it helps when one of the two gets stuck, and Jarek's
+archive from 0.7.9 stays the independent one.
+
+## [0.7.9] - 2026-10-10
+
+**A node that is far behind can fetch old blocks again.** A node that is
+catching up asks the peers built into the app for the blocks it is missing.
+We measured those peers on 10 October: both of them keep only recent blocks,
+and both answered "not found" when asked for an old one. So a new node,
+which starts about 5,500 blocks behind, or one that was switched off for more
+than a few hours, could only wait for the rest of the network to send the
+blocks on its own. The app now also dials archive.btxbyronbay.com, a node that
+keeps the whole chain, offered by its operator Jarek. Before adding it we
+checked it: it runs BTX 0.34.15, is at the tip, and sent back old blocks
+(1,000 and 150,000) when asked, each one the right block.
+
+Nothing else changes. The node engine stays BTX 0.34.15, so this update does
+not download the engine again.
+
+## [0.7.8] - 2026-10-10
+
+**The node engine moves to BTX 0.34.15, because the network's rules changed
+at block 244,000.** From that block on, three new checks are part of the rules
+every up-to-date node enforces: a stricter rule for one kind of timed payment
+(HTLC), proofs in private transactions now count toward a block's size budget,
+and a block header that only passed a quick first check can no longer be
+treated as the newest block. The engine this app shipped until now, 0.34.12,
+does not have these checks, so past block 244,000 it could accept blocks the
+rest of the network refuses and end up on a different chain. The chain passed
+244,000 before this release, so please update. On the first start after the
+update the app fetches the new engine once, as it did for 0.34.12.
+
+**If the new engine cannot be installed, the old one no longer starts.**
+Until now, when an update could not put the new engine in place (not enough
+free disk, for example), the app quietly kept running the engine it already
+had. From now on it does that only if the old engine follows the network's
+current rules. 0.34.12 does not, so the node stops instead, the screen says
+why, and pressing Start tries the update again once the cause is fixed. A node
+that is honestly stopped is better than one that says Ready on the wrong
+chain.
+
+**Why 0.34.15 and not 0.34.14.** 0.34.14 brought the new rules, but a node
+coming back from a restart or an outage could sit there without adding blocks.
+0.34.15 fixes that. Upstream also warns that 0.34.13 can split from the rest
+of the network, so this app skips both.
+
+**A graphics card that computes a block wrong no longer rejects it for good.**
+On 0.34.12, when a qualified graphics card disagreed with a block, the node
+treated the block as invalid with no second opinion, so a card making a
+mistake could push your node off the real chain. On 0.34.15 that is a local
+failure the node tries again, and the block is not marked invalid.
+
+Nothing else about how your node runs changes. It still follows the chain with
+the most work behind it (the engine's "legacy" reorg setting, which is the
+engine's default again from 0.34.14 on), and a new node still starts from the
+same snapshot at block 219,000.
+
+## [0.7.7] - 2026-10-05
+
+**Every node that checks blocks itself now keeps a diary of its chain.**
+Each time the chain reaches a multiple of 100 blocks, the node writes down
+what its own chain looked like at that block: the block, the hash of all
+unspent coins, how many there are and how many transactions the chain holds.
+It keeps the newest 100 of these in `snapshot-diary.json` in the data folder.
+A node that follows signatures, or that started from a snapshot and is still
+checking the older history, writes nothing until that check is done.
+
+**Snapshots are now taken every 100 blocks and sent only once they are 144
+blocks deep.** If you serve a chain snapshot, a fresh one is exported each
+time the chain reaches a multiple of 100 blocks. It is offered once its block
+is 144 blocks deep, about three and a half hours later, and only after the
+node checks it again: the block is still on its chain, the known bad
+branches are refused, and the snapshot matches the node's own diary in every
+detail. If your node's key is on the operator list, it also sends the
+snapshot to easybtx.com. Before, a snapshot was refreshed every 500 blocks
+and offered after ten confirmations.
+
+**Operators' nodes confirm each other's snapshots.** A node whose key is on
+the operator list looks at the snapshots waiting on easybtx.com every ten
+minutes. It co-signs one only when its own diary matches it in every detail.
+If its diary disagrees, it sends a signed dissent instead, and no node is
+offered a confirmed snapshot until the owner has looked. Once two operators
+agree on a snapshot, new nodes start from it instead of from the one built
+into the app. Copy diagnostics has a new "Snapshots" section that says what
+your node's diary, confirmer and snapshot sending did in this run.
+
+**Operators who run a plain btxd can confirm too.** `btx-confirmer` is a
+small program that runs beside a btxd which checks blocks itself and signs
+with a key on the operator list. It keeps the same diary and confirms or
+dissents exactly as the app does, and nothing else: it never exports, loads
+or restarts anything. It reads only the node's RPC cookie. Build it with
+`cargo build --release --bin btx-confirmer` in `crates/btx-core`; a systemd
+template is in `deploy/esplora/`.
+
+## [0.7.6] - 2026-10-05 · linux + windows (mac stayed on 0.7.5)
+
+**A new node starts about 260 blocks behind the tip instead of 13,400.**
+Until a snapshot is confirmed by two operators, every new node starts from the
+signed snapshot built into the app. That was block 225,927, published on 21
+September, and by now it left a new node about 13,400 blocks to catch up:
+roughly three days on an RTX 3060. The built-in start is now block 239,111,
+exported on 5 October by this project's own validating node and signed by its
+key, `02d5efca`. Before it was built in, it was checked on a fresh node: it
+loaded in under two seconds and was following new blocks within a minute. Its
+block is the one api.btxscan.io shows at that height. A node that is already
+running is not affected; this only changes where a new one starts.
+
+**A node that also mines on the same graphics card catches up more slowly.**
+Not a change in this version, but measured while making it: on an RTX 3060, a
+node that shared the card with a miner checked about 67 blocks an hour while
+catching up, and about 200 to 250 an hour with the card to itself. At the tip
+both keep up, because the network makes about 40 blocks an hour.
+
+## [0.7.5] - 2026-10-04
+
+**An archive peer that stopped answering is off the start list.**
+`37.230.134.222` has refused connections since 12 September and refused our
+test connections again on 3 October, so a node no longer spends one of its
+first tries on it. The node still keeps its trusted grant for that address,
+so it can come back the day it answers again. The one archive easyNode now
+ships is btxscan.io's mirror.
+
+**The node now also trusts three signer keys from an independent operator.**
+A node that follows signatures now accepts blocks signed by that operator
+as well as by the keys it trusted before, so it can keep moving when only
+one of them is signing. It now trusts seven keys instead of four. The
+threshold stays at 1: one signature from a trusted key is still enough for
+a block. If you already listed one of these keys in your own conf or
+`btx_rw.conf`, the app does not add it a second time. Measured on 4
+October: when this project's own signer went quiet at block 238,007, a
+node on the old four keys stood still there; with the new keys the same
+node was back at the tip in about a minute and kept up.
+
+## [0.7.4] - 2026-10-03
+
+**The status screen says whether your node is on the same chain as other sources.**
+
+- A new row, **Same chain as other sources**, compares your node's block with
+  api.btxscan.io, the easyBTX witnesses and the Byron Bay explorer every five
+  minutes, at a height a few blocks below every tip. It says AGREE, BEHIND,
+  STALE TIP, DISAGREE or NOT ENOUGH SOURCES, who agrees at which block, and
+  when it last looked.
+- Sources run by the same operator count once. The row is only green when two
+  independent operators show the same block as your node. When fewer answer,
+  it is grey. When only one answers and its block differs, it is amber and
+  says so carefully, because either side could be on another branch.
+- It uses the same words and rules as the Network health section on
+  easybtx.com. It only shows what it finds: it changes nothing about the chain
+  your node follows.
+- **Copy diagnostics** has a "Chain agreement" block with each source's answer.
+
+The node engine stays BTX 0.34.12, the same as 0.7.3.
+
+## [0.7.3] - 2026-10-03
+
+**A node that stops on "Failed to read block" gets itself running again.**
+Some nodes that follow signatures and started from a snapshot stopped after
+an hour or so with the engine error "Failed to read block", and then stopped
+again within a second every time they were started. The cause is in the node
+engine: while the node checks older history in the background, a shortcut for
+nodes that follow signatures can send that background check to a block it
+never downloaded. The real fix belongs in the engine. Thanks to the owner who
+sent the logs.
+
+- When the node stops on this error, easyNode now starts it again by itself
+  and says so on the status screen.
+- If it stops the same way again at the start and it follows signatures
+  without a signing key of its own, easyNode first puts the node's stored
+  signatures aside in a dated folder and starts again. The node fetches the
+  signatures again from its peers. A node with its own signing key keeps its
+  signatures where they are.
+- If that is not enough, or that step does not apply, easyNode puts the chain
+  folders aside and starts again from the snapshot, the same way a new install
+  does. If that fails too, easyNode puts the folders back and the screen says
+  where they are.
+- **Copy diagnostics** in Tools now shows what the recovery did.
+
+This gets a stuck node running again. Until the engine is fixed, a node can
+still stop this way while it runs; it then starts again by itself.
+
+The node engine stays BTX 0.34.12, the same as 0.7.2.
+
+## [0.7.2] - 2026-10-01
+
+**A node that hears signatures but trusts none of them now says so.**
+A node that follows signatures only moves when a key it trusts has signed the
+next block. If its list of trusted keys is out of date, signatures keep
+arriving, the node turns every one of them away, and it stops. Until now
+nothing on screen said so. Thanks to the operator who reported it.
+
+- After 15 minutes without moving, with signatures arriving and none accepted,
+  the status screen says what is happening. If an update is waiting, it says the
+  update may bring a newer key list. If not, it says the keys this node trusts
+  may have stopped signing for now.
+- If the node is missing one of the keys this app ships, the screen also names
+  the file in the node folder where that is set. The app does not change that
+  file itself.
+- **Copy diagnostics** in Tools now has a Signatures part: the trusted keys,
+  any shipped key that is missing or blocked, and how many signatures were
+  accepted and turned away.
+
+**On a Mac, the node now lets you go first.**
+Some owners found their Mac hard to use with the node running. On a Mac the
+node uses the graphics chip to check blocks, and that is the same chip that
+draws your screen. Until now the node ran at the same priority as the apps
+you were using.
+
+- On a Mac the node now runs as a background task, so macOS lets your apps go
+  first more often. On our one test Mac, graphics work in the foreground was
+  held up less while the node checked its graphics chip, though not in every
+  moment.
+- Starting the node can take a little longer, because its graphics check gives
+  way too. On our test Mac it still finished in under four minutes. If the
+  check runs past three minutes, the node gets normal priority until it is
+  done, so a slow Mac is not cut short by this change.
+- While the node is far behind (more than about 12 hours of blocks), loads a
+  snapshot, or shuts down, it runs at normal priority. Once it is caught up it
+  goes back to the background.
+- After this update, a node that kept running through the update is moved to
+  the background within about half a minute once it is caught up. It does not
+  need a restart.
+- Nodes that sign blocks do the same. Linux and Windows are unchanged.
+
+**Two peers that stopped answering are off the start list.**
+`89.85.40.184` and `194.93.48.158` refused our test connections on 1 October
+and the easybtx.com census lists both as down, so a new node no longer spends
+its first tries on them. They can come back the day they answer again.
+
+The node engine stays BTX 0.34.12, the same as 0.7.1.
+
+## [0.7.1] - 2026-10-01
+
+**A node that stops while starting now tells you why, and gets going again on its own.**
+A few nodes on 0.7.0 stopped after running for a while and then would not start
+again. The screen only said "the node's RPC never became reachable (no .cookie
+yet)", and pressing Start did not help. Thanks to the operators who reported it.
+
+What happened: before the node engine opens the connection this app uses, it
+checks the graphics card. That check can take a few minutes. If the engine
+stopped or got stuck during it, the app did not notice. It waited, gave no
+reason, and did not try again.
+
+What 0.7.1 does instead:
+
+- **It says why.** The app watches the engine for the whole start. If the engine
+  stops, you see the reason in plain words, and the app tries again by itself.
+- **It gives a slow check time.** A graphics check that is just slow gets up to
+  ten minutes, with a note on screen while it runs.
+- **It keeps the node running.** If the graphics card gets stuck in that check,
+  the node follows signatures instead of not starting at all, and the status
+  screen tells you so. **Check blocks** in Settings tries the card again
+  whenever you like.
+- **It cleans up.** Stop and Quit now also end an engine that is stuck while
+  starting. If the graphics driver will not let it go, the app tells you to
+  restart the computer instead of starting a second copy on top of it.
+
+The node engine stays BTX 0.34.12, the same as 0.7.0.
+
+## [0.7.0] - 2026-09-30
+
+**A node that fell behind catches up again, and a new node starts near the tip.**
+Nodes far behind had been gaining a block only every few minutes, because the
+three discovery relays held on to their block requests. Now the relays only
+hand out addresses, and when the chain still stands still, the app asks peers
+that keep the full history for the next blocks by name. Setup asks one
+question, Quick start or Full check. A new node starts from a snapshot near the
+tip that two operators signed, and once a newer confirmed snapshot is out,
+Tools can fast-forward a node that has fallen far behind to it. Tools also puts
+restart, Copy diagnostics and a small command window behind one button. A .deb
+install now updates itself. And the node engine moves to BTX 0.34.12. The
+details follow.
+
+**Tools: the things support used to need a terminal for, behind one button.**
+A new wrench button at the top opens Tools. From there you can restart the
+node, ask good peers for a block your node is stuck on, open the data folder,
+and see every notice the node engine reports, including the ones the home
+screen leaves out and why. **Copy diagnostics** puts a short report on your
+clipboard to paste into a support chat. It shows you the report first and
+leaves out anything private: keys, wallet details, other people's addresses
+and your home folder. For the curious, a command window runs a short list of
+read-only node commands, and asks before the two that do something.
+
+**The role card no longer says "At the tip" on a node that is not there.** It
+used to say so whenever the node knew of no newer blocks, and a node cut off
+from everyone, or left on a branch the others have moved on from, knows of no
+newer blocks either. Now a newest block more than two hours old, or signed
+blocks the node does not have, overrule it, and the line says which one it is.
+
+**A .deb install updates itself, after one password prompt.** Until now only
+the AppImage updated itself on Linux. A copy installed from the .deb downloaded
+the AppImage on every check, could not install it, and tried again six hours
+later. From this version on, a .deb copy reads a feed of its own and installs
+the new .deb after asking for your password once, the way any system package
+does. Where there is no .deb to install, it downloads nothing and shows the
+command to install it by hand. On every platform, an update that downloaded but
+failed to install is not downloaded again by the automatic checks; Check now
+still tries. A .deb copy on 0.6.32 or older moves to this version by hand one
+last time, with the command on easybtx.com/node.
+
+**New nodes start closer to the tip, from a snapshot two operators confirmed.**
+When you set up a node, easyNode looks for the newest chain snapshot that at
+least two of the people on its operator list have signed (today Mende,
+Aleksander and jpp), checks every signature itself, and starts your node there
+instead of thousands of blocks back. A node that checks blocks itself loads it
+in one short extra start, then goes back to checking every new block, and it
+still checks its older history in the background. A node that checks blocks
+itself also lists the signing keys mirrors follow, which it needs to keep
+starting from that snapshot; they never replace its own checks, and it passes
+their signatures on to its peers, as mirrors do. The node remembers who
+confirmed its start point, and names them under the check of older history
+and in Copy diagnostics. If there is no such snapshot yet, or the operators
+disagree about one, your node starts from the snapshot easyNode already ships,
+at block 225,927. A node that checks blocks itself used to start further back,
+from the one built into the node engine, and now takes easyNode's in the same
+short extra start.
+
+**Setup asks one question: Quick start or Full check.** Both start from a
+recent signed snapshot and check the older history in the background. Quick
+start follows signatures and is ready in minutes. Full check also checks every
+new block on this computer's graphics card, and takes longer the first time.
+On Linux with an NVIDIA graphics card, Full check is selected first. On a Mac,
+Quick start is selected first, because some Mac graphics chips don't pass the
+engine's check; you can still pick Full check. A computer without a graphics
+card the engine can use gets Quick start, and the screen says why. For now
+that includes every Windows PC: the Windows engine can't use a graphics card.
+Where Full check is possible, you can switch later in Settings. If the engine
+turns down a Mac's graphics chip and the app moves the node to following
+signatures, the status screen says so once.
+
+**The status screen shows the check of older history.** A node that starts
+from a snapshot, with either choice, checks the history below the snapshot in
+the background. One line and a thin bar under the status now show how far
+that has got, for example "Checking older history: 131,200 of 225,927 (58%)",
+and go away when it is done. There is no time estimate, because the engine
+sets the pace. A node that checks blocks on a signed snapshot says so on its
+role card.
+
+**A node that is catching up is no longer told it is not following the
+chain.** That sentence is kept for a node whose newest block is over two hours
+old and that knows of nothing newer. While the gap is closing, the card stays
+hidden. In the first minutes it says "Checking whether your node is catching
+up...". If the gap is not closing, it turns amber and says how many blocks an
+hour your node adds against the network's 40. A node that is still syncing is
+judged by the blocks it adds, and a fresh install that is still counting the
+chain's headers stays calm.
+
+**A slow node no longer leaves the dead branch before Branch B is refused.**
+Before a node leaves the dead branch it first refuses Branch B, so B cannot
+become the chain it follows. Until now, a node that took too long to say
+whether it had seen B's first block was treated as one that had never seen it,
+and the dead branch could be left with B still open. Now only the node saying
+it has never seen that block counts. No answer, or any other error, keeps the
+dead branch waiting and the app asks again.
+
+**A node that starts far behind no longer waits on peers that cannot send
+blocks.** The app kept a steady connection to three introducer nodes that only
+know other nodes' addresses, and the node engine kept asking them for its next
+blocks and waiting. A node that started from a snapshot gained a block only
+every few minutes. Now the app asks them for addresses and lets them go. On 30
+September a test node gained one block in three and a half minutes with them,
+and 561 blocks in the five and a half minutes after they were gone.
+
+**A node that is far behind now asks for its next blocks by name.** Most
+nodes on the network keep only recent blocks, and the node engine asks them
+for an older block only after two minutes of waiting, so a node that started
+days behind gained about one block every two minutes. When your node is 20 or
+more blocks behind and its newest block has not changed for 30 seconds, even
+while the engine waits on a peer that does not answer, the app now asks its
+own archive peers for the next 100 blocks by name, waits for them to arrive,
+and repeats. For older blocks it asks peers that keep the whole chain first.
+A peer that drops the connection twice when asked for older blocks is not
+asked for them again until the app or the node restarts, and Copy
+diagnostics in Tools names it. If none of the archive peers connected serves
+older blocks to your node, the app stops asking them and the status card
+says so. The app stops asking as soon as the engine is fetching blocks on
+its own again. On 29 September, asking this way moved a test node 7,490
+blocks in 8 minutes, from a peer that serves old blocks to it. It never
+adds, bans or disconnects a peer, and never asks for a branch the app
+refuses.
+
+**Fast-forward, for a node that has fallen far behind.** When a confirmed
+snapshot is more than 1,000 blocks ahead of your node, or your node's peers
+are not sending the older blocks it needs, Tools offers to fast-forward to it
+and says who confirmed it. Your node stops for a few minutes to load it, then
+carries on from there; your wallets and keys stay where they are. If anything
+goes wrong on the way, the old chain data goes back and Tools says what
+happened. If part of the old chain data has gone missing from the folder it
+was set aside in, it cannot go back: the app says so, and Remove node data
+can then clear the chain data for a fresh setup. While the snapshot operators
+disagree about a snapshot, Fast-forward is off, and Tools says so.
+
+**easyNode now runs BTX engine 0.34.12, up from 0.34.9.** When the engine
+rejects a block, it now retires the whole branch of headers built on it,
+instead of keeping that branch as a longer chain it cannot get. A node that
+follows signatures catches up better across gaps. The other fixes of 0.34.10
+to 0.34.12 come with it. Your node keeps following the chain with the most
+work, as before: easyNode starts this engine in its legacy reorg mode, because
+the engine's new default would stop at a deep reorg and wait for someone to
+act. If an engine ever does stop at one, the status screen now says so. The
+update carries the new engine, and the first start after it puts the engine
+in place, once.
+
+## [0.6.32] - 2026-09-28
+
+**Every node is held off two branches until BTX's developers rule on them.**
+On 27 September a branch that left the valid chain at 228,145 (`8240c62e…` at
+228,146) began serving its blocks: about 3,280 of them, all paying one address,
+held back since 24 September. Its first block checks out, so it is not invalid,
+and BTX's developers have not said which chain wins. But every node this app
+starts follows the heaviest chain it can check, so a node that re-checks that
+branch switches to it, and every node that follows signatures goes wherever its
+signer goes. This update refuses the branch's first block on every node, the
+way the invalid branch of 23 September is refused, and says so in the node
+log.
+
+It also refuses the first block of the dead branch from 229,400 (`b3a099ad…`),
+where btxscan.io and this project's signer stopped on 26 September. A node on
+it drops to 229,399 and follows the valid chain from there as ordinary new
+blocks. The first branch is refused first, so a node leaving the dead branch
+never finds the other as the heaviest chain in reach; if the first cannot be
+refused yet, the second waits.
+
+Be clear about what this is: a decision, not a verdict. If the developers rule
+for that branch, a following update lifts the hold, reconsidering the block on
+every node, and `EASYBTX_NODE_REFUSE_KNOWN_INVALID=0` turns refusals off on one
+machine today.
+
+**It also brings everything listed under 0.6.31, which was never published
+on its own.** Coming from 0.6.30, this is the update that takes an update only
+when it was signed for that version (found by jpp), starts a new node that
+follows signatures near the tip, tells a node that is behind how long it has
+left, tells a computer too slow to keep up and offers it to follow signatures,
+shows the engine's own warnings in plain words, and no longer cuts off a node
+that is still stopping.
+
+The engine does not change: this is still BTX v0.34.9, the same builds as
+0.6.28 to 0.6.30, so no node re-installs its engine.
+
+## [0.6.31] - 2026-09-27
+
+Never published on its own: everything below ships in 0.6.32.
+
+**The update that starts a new node near the tip, tells a node that is
+behind how long it has left, and takes an update only when it was signed for
+that version.** The engine does not change: this is still BTX v0.34.9, the
+same three builds as 0.6.28 to 0.6.30, so no node re-installs its engine. A
+new node that follows signatures starts from a snapshot this project's signer
+signed instead of block 219,000; a computer too slow to keep up, or whose
+graphics chip stops passing the engine's check, is told so and can follow
+signatures instead; every node that is behind says how long it has left, or
+that it will not catch up; and the status screen shows the engine's own
+warnings in plain words. An update signed for another version is refused, a
+gap found by jpp. Stopping no longer cuts off a node that is still working,
+and Esplora mode never calls an endpoint on the invalid side of the split
+fresh.
+
+**An update is taken only when its signature was made for that version.** The
+app has always refused an update the release key did not sign. It now also
+refuses one whose signature was made for another version, another platform or
+the easyBTX miner, which signs with the same key, so an old or wrong build
+cannot be passed off as a new one. It also never takes an update below the
+highest version it has run. A refused update is written to the update log and
+shown in Settings as a failed check with its reason, and the download on
+easybtx.com/node always works by hand. The release scripts refuse to publish a
+feed the app would refuse. Found by jpp.
+
+**A computer too slow to keep up is told so, and can follow signatures
+instead.** A Mac or an NVIDIA PC checks every block itself, and one that checks
+them slower than the chain makes them never reaches the tip: the one Mac
+measured, an M2 Pro, does about 27 an hour against the chain's 40. When the
+status screen measures that, far under the chain's pace for fifteen minutes and
+more, it says so with both numbers and offers to follow signatures instead, as
+a Windows PC does. Nothing changes until the owner clicks twice; the node then
+restarts, stops checking the proof of work itself and cannot sign. Settings
+has the switch back, and the same choice for anyone who wants it. A node held
+to the chain's own pace, the cadence hold, is never offered it: that is not a
+slow machine.
+
+**The status screen says what the node engine itself is warning about.** The
+engine keeps a list of standing warnings, and the app never read it. It now
+shows them in plain words, where they belong:
+
+- A graphics chip that stops passing the engine's own check now reads NOT
+  FOLLOWING, with the engine's reason and what helps: restart easyNode, which
+  runs the check again, or follow signatures instead, which the status screen
+  now offers on such a machine and Settings always has for it. Until now the
+  app only read the engine's verdict from its startup, so a chip that failed
+  an hour into a run kept showing a green LIVE, and a machine whose chip
+  failed had no switch to follow signatures at all. This is also how a signer
+  whose card stops qualifying after an engine update would show up.
+- When the network's signers have confirmed blocks this node has not even
+  received, the chain card says so. It is the first sign of a node sitting on
+  a branch the rest of the network has left, minutes in, while every other
+  number still looks healthy.
+- A wrong computer clock gets a sentence saying how to fix it, and an engine
+  that says it is out of date says so.
+- A chain the node refused, for the wrong difficulty or for breaking the
+  rules, is explained calmly, so a block explorer showing different numbers
+  makes sense. Nothing to do there, and it does not look like an alarm.
+
+Warnings nobody can act on stay off the screen: the engine's pacing while it
+catches up, and its deep-reorg notice. That one stays up until the next
+restart, and on this network it mostly means a node has just rejoined the
+main chain after being stuck on a dead branch; blaming an attack for the
+recovery helps nobody.
+
+**A new node that follows signatures starts a few hundred blocks from the tip,
+not ten thousand below it.** A native Windows PC, an M5 or a PC without an
+NVIDIA driver cannot check blocks itself, so it follows this project's signer,
+`02d5efca…`. Until now it started from the snapshot compiled into its engine,
+block 219,000, and then needed a signature for every block since, which one
+reachable peer held; while that peer was stuck, a new node crawled. It now
+starts from the newest snapshot the signer has exported and signed, published
+beside the app's releases and loaded with `loadtxoutsetattested`. The engine
+refuses a snapshot that a key the node trusts did not sign, so where it is
+downloaded from does not have to be trusted. The trade, decided on 26
+September: until its background check reaches that snapshot's height and
+compares the balances, the node takes the signer's word for them as well as
+for each block. A node that checks blocks itself is unchanged, and anything
+that goes wrong on the way falls back to block 219,000 as before. The status
+card no longer says two independent operators sign for such a node; since the
+23 September split, one does.
+
+**A node that is behind says how long it has left, or that it is not catching
+up and by how much.** A new install starts from block 219,000, more than 10,000
+blocks below the tip, and the status line said "still catching up" and a
+number, which gave nobody a way to tell a two-hour wait from one that never
+ends. On 26 September a new node reported 4 blocks in 30 minutes, and the only
+way its owner could learn whether that would ever finish was to ask. The line
+now carries the node's own pace, measured over up to the last hour: "about 2
+days to go at this pace" while the gap closes, and "It adds about 8 blocks an
+hour while the network adds about 40" when it does not. The figures appear
+after fifteen minutes of measuring, and until then the line reads as before.
+They are the node's own measurement, not a promise: a node that speeds up or
+slows down gets a new figure.
+
+**Stopping or quitting no longer cuts a node off while it is still working.**
+A node gets 90 seconds to shut down, which is the low end of the 90 to 120
+seconds measured on a Mac at a much shorter chain, and after that it was
+force-stopped, mid-save or mid-check, and the next start spent minutes
+rebuilding. Now a node that is still working after those 90 seconds is waited
+for: up to ten minutes while it is still writing its log, and up to six hours
+while it is still using the processor. The second matters on this engine: a
+block check cannot be cancelled by a stop, writes nothing to the log while it
+runs, and on a processor rather than a graphics card can take hours. A node
+that is doing neither is stopped as before. While a stop runs long, the window
+says so instead of freezing on the last status. And quitting the app no longer
+kills a node that is taking longer than the app waits: it is left to finish on
+its own, and the next start picks it up, as it already did after a Windows
+update. Raised in a review by jpp.
+
+**Esplora mode never calls an endpoint on the invalid side of a split fresh.**
+The census now marks the branch that starts at 227,313 `b28c3e84…` invalid,
+and the guardian that decides whether a wallet endpoint is fresh read neither
+of the new fields. It could have called an endpoint on that branch fresh, and
+it would have taken an invalid chain flagged heaviest as its reference. It now
+says unverified in both cases and names the chain and block. Contributed by
+jpp.
+
+## [0.6.30] - 2026-09-25
+
+**The update that lets a node which follows signatures move again.** The engine
+does not change: this is still BTX v0.34.9, the same three builds as 0.6.28 and
+0.6.29, so no node re-installs its engine. BTX has 0.34.11 as a release
+candidate and a 0.34.12 branch in review; the engine moves when one of them is
+final. Measured before release: a reference node of exactly this kind, stuck at
+219,000, reached the tip on the valid chain in 34 minutes once it had the key
+and the peer below, and a copy of it that had a key added over its existing
+chain started normally and kept following the tip.
+
+**A node that follows signatures moves again, on the valid chain.** Since 0.6.29
+such a node, which is an M5, a PC without an NVIDIA driver or a native Windows
+PC, refuses the invalid branch of the 23 September split and then waits at
+227,312, because none of the three signing keys it trusted had signed the valid
+chain. This update adds the one key that does, `02d5efca…`, this project's own
+signer: on 24 September it signed every one of the last 100 valid blocks and
+was the only key doing so. It also adds btxscan.io's node as a peer the app
+dials, because it is the one reachable node found holding that key's
+signatures; a node that trusts the key but cannot fetch its signatures would
+still wait.
+
+Be clear about what this costs. At one signature per block, which is how these
+nodes have always run, every key they trust can move them on its own, so this
+one machine now does. The plan is two independent keys with both required, as
+BTX's developers propose for every mirror, once a second key signs the valid
+chain. A node that checks blocks itself, an Apple Silicon Mac or a PC with a
+capable NVIDIA card, does not use these keys and is unchanged.
+
+## [0.6.29] - 2026-09-24
+
+**The app update that keeps every node off the invalid branch of the 23
+September split.** The engine does not change: this is still BTX v0.34.9, the
+same three builds as 0.6.28, so no node re-installs its engine. BTX published
+0.34.10 early on the 24th, and its developers name the coming 0.34.11 as the
+release mirrors and pools should move to, so the engine moves in a later
+update. What this one changes is what the app asks of the node, below.
+
+A node that follows signatures instead of checking blocks, which is an M5, a
+PC without an NVIDIA driver and, from this update, a native Windows PC, trusts
+three signing keys pinned in the app. On the morning of the 24th none of them
+had signed the valid chain since the split, so such a node now stops at
+227,312, the last block both branches share, rather than confirming blocks the
+network's validators reject. It moves on when one of those keys signs the valid
+chain.
+
+**Every node refuses the invalid branch of the 23 September split.** The app now
+asks the node to mark block 227,313 `b28c3e84…` invalid, the one instruction
+BTX's developers gave every node operator that night, as soon as the node has
+seen its header. A node that checks blocks on 0.34.9 already rules that branch
+out, but two kinds of node did not. A mirror, which is an M5 or a PC without an
+NVIDIA driver, follows whatever its pinned signers sign, and the mirrors the
+census reached were on that branch. A mirror that is on it rolls back to
+227,312 and stops there until a signer it trusts signs the valid chain, which
+is safer than confirming blocks the network's validators reject. And a node
+that had the branch's headers but not its blocks showed "a longer chain exists
+that this node cannot obtain", pointing at the invalid branch; once the branch
+is marked invalid that warning stops. The mark is kept in the node's own data,
+so it holds across restarts, and `EASYBTX_NODE_REFUSE_KNOWN_INVALID=0` turns it
+off. The list of refused blocks holds this one block and is meant to be
+emptied again once BTX ships an engine that refuses it by itself.
+
+**A new node gets its block headers from the app's own peers first, and has
+them in about a minute.** Before it keeps a single header from a peer outside
+its trusted list, the v0.34.9 engine re-checks that peer's chain in a pre-check
+that gets slower with every block. Measured on an M2 Pro on 23 September, one
+healthy peer took 32 minutes to hand a new node its headers this way. Every
+other node a new install met ran its own pre-check on the same thread, and the
+network has many nodes stuck on old forks that answer. In five first runs with
+the app's settings, headers reached the fast-start point about a minute after
+they began arriving twice; once it took 18 minutes, and twice they were still
+short of it after 20 and 30 minutes. A new node now connects only to the app's
+four block-serving peers, each trusted for that one start, until its headers
+pass the fast-start point: about a minute in three runs, one of them with the
+first of those peers unreachable. Then it restarts once and connects to the
+whole network as before; on a Mac the restart repeats the startup check, one to
+two minutes. If those peers deliver nothing for five minutes, it gives up on
+them and starts the usual way. Not yet run in a built app.
+
+**A native Windows PC with an NVIDIA card follows the signed chain instead of
+stalling.** The Windows engine is cross-compiled without any GPU code, so it
+cannot check blocks on any card. Since 0.6.23 the app nevertheless started
+every Windows PC that has the NVIDIA driver in the mode meant for checking
+blocks, because it looked only for the driver, and going by the code such a
+node started degraded and stalled. The app now asks whether this platform's
+engine can use the card as well, and on Windows the answer is no, so such a PC
+runs as a trusted mirror like a PC without the driver: it follows the chain
+the pinned signers have signed and can serve history, trusting those keys
+instead of checking the maths itself, and it is no longer offered the signing
+role it could never use. The Linux build under WSL2 is unchanged and still
+checks blocks on a capable card, which makes it the route for a Windows
+machine that should validate. Not yet run on a Windows PC.
+
+**The fast start file now comes from easyBTX's own releases.** New nodes
+download the height 219,000 snapshot from a byte-for-byte copy on easyBTX's
+release page instead of from the pre-release where BTX's developers publish it,
+which they can change or remove at any time. A missing file would have stopped
+every first run at the download step. The file is the same one, checked against
+the same size and SHA-256 as in 0.6.28.
+
+## [0.6.28] - 2026-09-23
+
+**Corrected on 24 September: the longer branch is the invalid one.** The first
+version of this entry called the other side of the 23 September split "the
+losing side" and said an upgraded node would cross to the heavier branch. BTX's
+developers said the opposite that night. The valid chain is the one whose block
+227,313 is `d5f0e92f…`. The longer branch starts from `b28c3e84…` at 227,313,
+and btxscan.io, luckypool.io and the signed-confirmation mirrors the census
+reached were all on it. By their account it fails ExactReplay on both the
+processor and the graphics chip, and upstream's next release, 0.34.10, will
+refuse it (upstream PR #203, still open on the 23rd). The census agreed in the
+one way it can: that evening every reachable node on 0.34.9 that checks blocks
+itself was on the `d5f0e92f…` chain, and none was on the longer one. Two nodes
+calling themselves 0.34.10, a version upstream has not released, were on the
+longer branch. We checked the two hashes on a node of our own that night: the
+header chain served by `109.199.124.187` and `194.93.48.158` carries
+`d5f0e92f…` at 227,313, on top of the block both branches share at 227,312
+(`8c36f9a6…`), where btxscan.io carried `b28c3e84…`. That it fails ExactReplay
+is BTX's developers' finding, not ours. An upgraded node that checks blocks
+should stay where it is, and does.
+
+**Until confirmations are real again, do not send or accept BTX.** Anything
+before block 227,313 is on both branches and is safe. A payment confirmed on
+the longer branch only is on a chain the network's validating nodes reject.
+
+**The engine moves to upstream's v0.34.9, which decides a disputed block
+instead of leaving it undecided.** At 00:13 UTC on 23 September the network
+split at height 227,313. What 0.34.6 does wrong, read in its source: when a
+node that checks blocks on its graphics chip computes a different digest from
+the one a block's header claims, it files the block as unconfirmed and leaves
+it to be retried by a second qualified device, which a machine with one
+graphics chip does not have, so nothing ever settles it. 0.34.9 (upstream
+`2bfc9716`) recomputes such a block on the processor with the same algorithm
+and rules it valid or invalid, which is how its nodes rule the longer branch
+out.
+
+**What holds the valid chain back is not the engine.** Late on the 23rd every
+reachable node on the valid chain stood at 227,374. Headers for it ran past
+227,440, but the blocks behind them had been mined on rented machines with no
+inbound port, so no public node had them, and no node accepts a block it cannot
+download. Until those blocks reach a public node, the valid chain stands still,
+whatever engine a node runs.
+
+**How fast a machine checks blocks still decides how soon it reaches the tip.**
+Every block costs one full MatMul replay. A Linux box with an NVIDIA card was
+measured at 3.8 blocks a minute on 0.34.6. An M2 Pro's own startup check timed
+one replay at 80 to 125 seconds on 0.34.6 and on 0.34.9 alike, and in the app
+it connected 0.45 blocks a minute. That is less than the chain produces, so a
+Mac of that class that checks blocks falls behind on either engine. This update
+does not change that; which Macs are fast enough is measured nowhere yet.
+
+**A node that follows signatures follows whichever chain its signers sign.** An
+M5 and a PC without an NVIDIA driver do not check blocks; they trust the three
+signing keys pinned in this app. The mirrors the census reached on the 23rd
+were on the longer branch. The signer BTX's developers name as on the valid
+chain all along, `02d5efca…`, is not one of the three keys this app pins. Until
+that changes, treat a mirror's confirmations after 227,313 as unproven.
+
+The peer BTX's developers point nodes at for the valid chain, `89.85.40.184`,
+is the first one this app dials. On the afternoon of the 23rd it and
+`109.199.124.187` both answered on the valid chain, at 227,355.
+
+**0.34.9 refuses to start a node that signs, so this release pins the node's
+own key.** Since 0.6.26 every node that checks blocks also signs them, with a
+key the app keeps in the node's folder and pins nowhere. 0.34.9 refuses exactly
+that at startup, with an error about an attestation blocklist that is in fact
+empty (upstream `235d39be`): its new count of usable signers includes a local
+post-quantum key but not a local secp256k1 one. The app now also pins the
+node's own key, which puts the engine in the state 0.34.6 reached by itself,
+measured side by side on the same Mac: the same signer status in every field,
+plus one extra warning. Without it, this update would have stopped every node
+with signing on, which is every Mac with an M1 to M4 and every NVIDIA machine
+that checks blocks, unless its owner switched signing off. The fleet guard now
+checks this pairing and fails the bump without the fix.
+
+**Tested as an upgrade on an M2 Pro, and what that did not prove.** A keeper
+install shaped like 0.6.27 (engine 0.34.6, signing on) was opened with this
+build. The first attempt found the refusal above. With the fix, the app
+installed the new engine over the old one, btxd passed its Metal self-check
+(`m4_class`, strict-device, ready), reported `/BTX:0.34.9/`, kept its signing
+key and reported the same signer state as 0.34.6, started no model helper and
+opened no model port. It then loaded the 203,000 snapshot itself, checked
+blocks above it on the Metal GPU and signed each one with its own key. What
+it cannot show is the chain it ends up on. It learned both branches' headers
+and ranks the heavier one first, which is the invalid one (see the correction
+at the top of this entry), but at 0.45 blocks a minute this Mac would
+need about five weeks to reach 227,313 from 203,000, the base the tested build
+started from. New nodes now start from 219,000 instead, about 8,300 blocks
+below the split, which on the same Mac is about two weeks; the fast start
+entry below says what that does and does not change.
+
+**Built without upstream's model network.** 0.34.7 switched on a "Native Model
+Network" by default: a helper, `btx-modeld`, that btxd starts by itself on port
+29447 on every network interface, to fetch and serve AI models. It also needs
+OpenSSL 3.5, which neither the Linux build machine (Ubuntu 22.04) nor the
+Windows cross-compiler has. This app runs a node for money, so all three
+engines are built with the model network compiled out: no helper, no port, no
+model downloads. One trace stays: btxd writes a small resource-governor file
+into a `modelnet` folder inside the node's data every two seconds, model
+network or not.
+
+**What else changes in the engine, read from the diff.** No consensus rule
+moves at a height, the 203,000 bootstrap snapshot and the golden manifest are
+byte-identical, a second bootstrap snapshot at 219,000 is added, and no option
+the app passes was removed. A node that signs no
+longer rolls its own checked chain back onto a lighter sibling because the
+sibling carries a signature (`2ac77d56`); since 0.6.26 every node that
+validates signs, so that fix is ours too. The block-wide count of signature
+operations now includes `OP_CHECKSIGFROMSTACK` and can no longer be zeroed by
+an annex (`477b4e63`, `cd4301fc`), which only matters for blocks near the
+limit. Signers can now pin post-quantum ML-DSA-44 keys beside secp256k1 ones;
+the app pins and counts secp256k1 keys only, so a signer that moved to ML-DSA
+alone would be missing from its signer card.
+
+**One wallet route closes.** 0.34.9 refuses `importwallet` outright
+("importwallet is disabled (legacy WIF)"), so the text file `dumpwallet` writes
+can no longer be imported. How the app now answers such a file is the dumpwallet
+entry further down.
+
+**Which machines check blocks themselves is unchanged, and it is still two
+kinds.** The sealed golden manifest lists NVIDIA `sm_120` and Apple
+`m4_class`, which btxd assigns to M1 through M4. Every other machine starts
+degraded. A PC whose NVIDIA card does not reproduce the golden digest starts in
+consensus mode without the consensus service bit and cannot check blocks, so it
+stalls; a PC without an NVIDIA driver, and an M5, follow the signers as a
+trusted mirror. The Linux engine no longer carries native code for NVIDIA's
+data-centre `sm_100` cards, because upstream made that build path opt-in;
+`sm_75`, `sm_86`, `sm_89` and `sm_120` are all there.
+
+On native Windows the first of those cases is every PC with an NVIDIA driver,
+whatever its card. The Windows engine carries no GPU code at all: the
+cross-compiler finds no CUDA compiler, and `btxd.exe` imports no CUDA library.
+The app still sends a PC that has `nvcuda.dll` down the consensus path, which
+that engine cannot take, so going by the build and the app's code such a node
+starts degraded and stalls. This was read from the binary and the code, not
+run on a Windows PC, and it is not new in this release. On such a PC, run the
+Linux build under WSL2, whose engine has the kernels, or set
+`EASYBTX_NODE_TRUSTED_MIRROR=1` to make the native app a mirror.
+
+**Every install moves.** The install key is plain `v0.34.9`, replacing
+`v0.34.6-3013c2c2`, so every existing install re-provisions onto the new engine
+at its first start after the update. CI built the tag commit on all three
+platforms. macOS and Linux were built from a pristine tree with
+`BUILD_GIT_DIRTY 0`: macOS passes upstream's release gate, links Metal and
+passed a regtest smoke; Linux passed a regtest smoke with its kernels present.
+Windows is the mingw cross-compile, and two of its three patches edit the
+source tree before the build, so it is not built from a pristine tree, and by
+upstream's own rule its build info records it as dirty. It passed a regtest
+smoke on a real Windows runner. Upstream published 0.34.9's
+`SHA256SUMS` unsigned this time. Our engines are built from source, so that
+touches only the contributor staging scripts, which pin the archive bytes.
+
+**New nodes start from block 219,000 instead of 203,000.** v0.34.9 carries a
+second fast start base at height 219,000 beside the 203,000 one, and a new node
+now loads that. It sits about 8,300 blocks below the 227,313 split, on the
+stretch both branches share. Measured against the chain on 23 September, it
+leaves 8,761 blocks to catch up after loading instead of 24,761, and the
+download stays about 9 MB. It is fewer blocks to catch up, not less work: the
+node still re-checks everything below the base in the background, so what
+changes is how soon it reaches the tip. The gain is biggest on fast machines,
+and a machine that cannot keep up with the chain gains nothing from it.
+Upstream publishes this file on a pre-release, `assumeutxo-219000`, not with
+v0.34.9 itself, so we checked it rather than trusting the name: its size and
+SHA-256 match upstream's manifest and sums, and the file names block 219,000 as
+`dc51220b…3fdb87c3`, the block v0.34.9 compiles in and btxscan reports at that
+height. Its contents check out too: recomputed from the file itself, its coins
+hash to the value v0.34.9 compiles in for that height, the check a node makes
+before it accepts the file. A node that already loaded the 203,000 snapshot
+keeps it and downloads nothing, because v0.34.9 carries that base unchanged.
+One that downloaded the 203,000 file but never loaded it fetches the new one on
+its next start. A node that loaded 203,000 and is still below 219,000 reads
+Syncing after the update instead of Live until it passes 219,000. Nothing
+changed on the node; it had thousands of blocks to go either way.
+
+**A node can now serve a snapshot of the chain to new nodes.** Every new
+node still bootstraps from a file compiled into the engine, and the newest
+one lags the chain by thousands of blocks. BTX has had the mechanism to do
+better since 0.34, four commands that export the chain state, sign it, offer
+it over the network and let another node fetch and load it, and measured on
+20 September across 62 reachable peers nobody used it. On 21 September one
+home RTX 3060 produced, served and round-tripped the first one, with four
+shell scripts and a person watching them. This release makes that a switch:
+"Serve a chain snapshot" in Settings. A node that checks blocks itself and
+signs exports the chain state at the tip (0.15 s, the node is not disturbed:
+its lock was held for 7 ms), waits ten confirmations because the export is
+taken at the unconfirmed tip and the first one ever taken was orphaned in 40
+seconds, offers the matured file, refreshes it every 500 blocks, keeps the
+last two, and re-offers after every node start because the offer lives in
+the running process only and was lost four times in a day before that was
+understood. It also re-makes the links to the mirrors after every offer: the
+engine sends its service bits once, in the connection handshake, so a peer
+connected before the offer never learns of it, which is why the explorer
+lost sight of the first snapshot for two hours. Off by default, refused with
+the reason on a node that follows attestations instead of checking blocks or
+holds no signing key. What this does not do: change what any node LOADS.
+Loading an attested snapshot means trusting the signers for the chain state,
+and that stays a separate decision. See docs/snapshot-serve.md.
+
+**A dumpwallet file gets a plain answer instead of an engine error.** v0.34.9,
+the engine this release moves to, switches `importwallet` off under BTX's
+post-quantum policy: it refuses every file with "BTX PQ policy: importwallet
+is disabled (legacy WIF); use importdescriptors with P2MR". easyNode still sent
+a dumpwallet text there. On the 0.34.6 engine it already failed for almost
+everyone: on the descriptor wallets easyNode creates, btxd answered "Only
+legacy wallets are supported by this command", shown raw, and only after the
+plaintext private keys had been staged on disk. The exception was a legacy
+wallet.dat restored on Windows, whose engine is built with Berkeley DB, and
+v0.34.9 closes that route anyway. The file is now recognised and answered
+before anything is staged or sent to the node: what the file is, that easyNode
+no longer imports it, that nothing was changed, and that a .btxwallet file or
+a wallet.dat from a current BTX node brings the wallet across instead. The
+advice for a file the app does not recognise stops naming the dumpwallet
+format.
+
+**A legacy wallet.dat gets a plain answer instead of an engine error.**
+easyNode sent a Berkeley DB wallet.dat, the legacy kind Bitcoin Core wrote
+before descriptor wallets, to `restorewallet` and let the engine decide.
+Measured on 23 September against the v0.34.9 macOS engine, which is built
+without Berkeley DB like the Linux one: it answered "Wallet file verification
+failed. Failed to open database path '...'. Build does not support Berkeley DB
+database format.", shown raw. It left nothing behind, so a later import under
+the same name still worked. The Windows engine is built with Berkeley DB and,
+going by its source, loads the file, into a legacy wallet that cannot hold
+BTX: mainnet has taken only P2MR outputs since its first block, and a legacy
+wallet's keys are secp256k1 and cannot give a P2MR address. `migratewallet`,
+which reads the file without Berkeley DB, is no route either. It keeps the old
+keys as secp256k1 descriptors, and on v0.34.9 it fails partway through for a
+wallet with an HD seed and leaves it half migrated. The file is now recognised
+and answered before anything is staged or sent to the node, the same on every
+engine, including one easyNode is attached to and did not provision: what the
+file is, why no BTX can be in it, that nothing was changed, and that a
+.btxwallet file or a wallet.dat from a current BTX node brings a BTX wallet
+across.
+
+## [0.6.27] - 2026-09-20
+
+**Your node now tells you when it is standing on a single signer, which until
+this release it could not, however many keys it pinned.** A node that follows
+signed confirmations accepts a block once ONE key it trusts has signed it, so
+what decides whether it keeps working is not how many keys the config lists but
+how many are actually delivering. Those are different numbers and nothing here
+measured the second one. btxscan.io is the worked example: four keys pinned,
+552 of its last 600 blocks carried by exactly one of them, nothing at all from
+the other three, and it had stopped twice that way with every other indicator
+on the machine green.
+
+The line that says so has existed since 0.6.26 and has never been shown to
+anybody, because nothing in the app ever set the number behind it. Underneath
+that was the real gap: the window that counts signers was only kept by a node
+holding a signing key of its own. A plain mirror, which is every machine
+without a capable graphics card and the node most exposed to this, measured
+nothing at all. It now keeps that window whether or not it holds a key. A node
+that checks proofs itself still does not, because it depends on no signer.
+
+Two guards, because a warning that cries wolf is one nobody reads by the time
+it is true. It says nothing until it has read twenty blocks, so a node that
+started forty seconds ago is not told it stands on one signer, and nothing at
+all until the node has caught up, because a syncing node reads a window from
+below the height confirmations begin at and would report none arriving.
+
+**Signature counts no longer freeze while confirmations are still arriving.**
+Measured on 2026-09-20 during a deliberate test, with a signer switched off at
+the wall to see whether the explorer depended on it: four blocks carried no
+signature from a key that, ten minutes later, had signed all four. Same
+heights, same hashes, no reorg. The window re-read only the newest block, so
+every height below it kept whatever had arrived by the time it was first read,
+and a signer's own count stayed permanently short. It now re-reads the newest
+six.
+
+Also in this release: a peer that refused every connection for five hours after
+being put at the head of the list is no longer left there (#86).
+
+Nothing about how the node validates, signs or serves changed. The engine is
+unchanged from 0.6.26.
+
+## [0.6.26] - 2026-09-17 · linux + windows (mac follows when built)
+
+**Every node with a capable graphics card now signs confirmations for the
+mirrors, so the explorer no longer depends on one home computer.** The
+explorer at btxscan.io, the wallets behind it and every GPU-less node follow the
+chain through signed confirmations, because they cannot check the proof of work
+themselves. Four keys are pinned there and one of them signed, from an RTX 3060
+in a home. On 16 September at 15:23Z that machine was switched off and the
+explorer stopped at 221,448 while the network went on to 221,464 and past; a
+test transaction sent through the frozen explorer was relayed and mined five
+minutes later, so money moved and nobody could see it there. Seventeen archive
+nodes helped nothing, because they pass signatures on and cannot make them, and
+the engine has said so on every start: "single-key trusted mirror ... configure
+a second independent signer". 0.6.23 gave the archive half to every GPU-less PC.
+This release gives the signer half to every node that checks blocks itself.
+From this release such a node keeps one signing key in its data folder, hands
+it to the engine, and signs a confirmation for every block it checks. The key
+is made on the machine, once, and never leaves it; the engine refuses to start
+without one (measured against the shipped 0.34.6: "Cannot read MatMul
+attestation signing key file"), so the app makes it rather than asking. A node
+that follows signatures instead of checking blocks, which is every machine
+without an NVIDIA driver and every refused Mac, cannot sign, and the setting
+says so there rather than pretending. **On by default for new installs, and
+turned on once for an existing node that was never asked**, the same rule as
+0.6.25, with the welcome panel saying so on the next launch; a switch somebody
+turned off stays off.
+
+**Your key finds the people who pin it, on its own.** A signing key that
+nobody pins signs into the void, and the only way to change that used to be a
+person copying 66 characters out of a settings panel and pasting them into a
+chat. That works for the handful of people who already know each other and for
+nobody else, which is the opposite of what a network short of signers needs. So
+a node that signs now offers its **public** key to easybtx.com every fifteen
+minutes, and mirror operators read the list and choose from it. Nothing else
+goes with it: the public key, a random local id, the app and engine versions,
+this run's block height and peer count, and the service bits your node already
+broadcasts to every peer. No wallet, no address, no private key, and no node
+that isn't signing ever sends anything at all. Settings shows exactly what was
+sent and when it arrived, and the switch beside it stops the offer while
+leaving your node signing.
+
+**What you are being asked for is trust, not bandwidth, and the app says so.**
+Settings shows your public signing key with a copy button and this sentence
+under it: a mirror that pins this key takes your node's word for the proof of
+work, with no second check. Offering is not pinning. Whoever runs a mirror
+decides, on their own machine, and nothing in this app can make that decision
+for them. Your node already dials the explorer's mirror when signing is on, so
+no port needs forwarding: a signature only helps a mirror that hears it,
+signatures travel to connected peers, and a node relays only the keys it pins,
+which is why this project's own signer has kept that link by hand since
+2 September.
+
+**The role card says whether the key is actually doing anything.** "Signing
+key: Signing, on N of the last 100 blocks", read from the node's own stored
+confirmations, not from the setting. A configured key that is on none of the
+recent blocks reads as exactly that, in amber. This is the surface that was
+missing on 3 September, when a key was pinned in good faith and produced
+nothing for eleven days without anybody being told.
+
+**A signer is only useful while it is up.** Closing the window while the node
+is signing says, in the close dialog, that a mirror trusting only this key
+stops at its last block while the node is off. Keep-awake was already on by
+default. Launch at login is turned on when the welcome panel that announces
+signing is closed; both switches stay in Settings.
+
+**The witness answers one more question, for the census.** `GET
+/signers/recent` on the witness (the same server behind witness-1.easybtx.com)
+says which keys signed the last hundred blocks, as JSON, from a window it keeps
+current at two calls per new block. easybtx.com's node census has no other way
+to count live signers, and on 16 September that count was one. The two block
+routes are unchanged; every address, transaction and mempool route stays a 404.
+
+## [0.6.25] - 2026-09-16 · mac + linux + windows
+
+**A node you already run starts helping too.** 0.6.24 turned on serving
+confirmations, answering wallets and the local service report, but only for
+installs made after it. Every node that already existed updated and then
+contributed exactly what it did the day before. The measurement that showed the
+cost: on 16 September the network census saw 59 nodes and 21 of them serving
+confirmations. Thirty-eight were not, including this project's own mining
+machine, which had updated itself that morning. From this release an existing
+node turns on the services **it was never asked about**, once, and the app says
+which on the next launch so nobody finds out later. A setting somebody switched
+off stays off: the file records the difference between a choice and a silence,
+and only silence is filled in. Serving the Esplora API and Keeper mode are
+untouched either way, because one needs the whole 124 GiB chain and two
+programs the app does not install, and the other prunes.
+
+
+## [0.6.24] - 2026-09-16 · mac + linux + windows
+
+**Your node starts helping BTX the minute it finishes installing.** A new node
+used to do nothing for the network until somebody found three switches in
+Settings, and almost nobody does. From this release a fresh install serves
+confirmations, answers wallets and keeps a service report, and the app says so
+on first run instead of doing it quietly. Serving confirmations hands other
+nodes the signatures that prove old blocks, and it costs about 208 bytes a
+block. It has been the network's scarcest service: the census found a single
+reachable full-history archive on 17 August. Eighteen nodes have served it
+since 0.6.21, which is what stopped the signing link being a single point of
+failure, and is why this is now on from the start rather than waiting to be
+found. Answering wallets binds
+127.0.0.1 only, so no port is opened and only this computer is served, which
+is enough for a wallet here to settle a fork against a node its owner runs
+rather than someone else's server. The service report is a file in your data
+folder and is uploaded nowhere. Every one of them is in Settings and can be
+turned off. Serving the Esplora API stays off, because it needs the whole
+124 GiB chain and two programs the app does not install, and Keeper mode stays
+off, because it prunes and a pruned node cannot rebuild after an unclean
+shutdown. **Nothing changes for a node that already exists.** The new defaults
+reach a machine with no settings file, so no update starts a service on
+anybody's computer, and a switch somebody turned off stays off. There is a
+test for that specifically.
+
+**The app stops telling you your peers are the problem when they are not.** A
+node whose blocks fall behind its headers showed an amber card reading "the gap
+is not closing: no connected peer is serving them". It had no way to know that.
+Measured here on 16 September: 41 blocks behind for 574 minutes with 16 peers
+connected, 7 of them tracked, the best 35 blocks ahead and delivering, while
+the node's own log showed it already holding blocks it had not connected. The
+card now says that only when btxd itself reports an unserved body, and
+otherwise says the hold-up is on this machine rather than the network. The
+sentence mattered: it sent two earlier investigations, on 6 and 13 September,
+looking at routers and peer lists for a problem that was neither.
+
+**The status card says whether the gap is actually closing.** "Still catching
+up" is a promise about the future, and a node more than three blocks behind is
+paced by the engine to one block per block interval, which is the one speed at
+which a gap never closes. Measured on 15 September: a Mac held between 84 and
+99 blocks behind for hours while that line said it was catching up. The card
+now reads the trend rather than the number and says "not catching up" when the
+gap is not moving, while a node genuinely grinding through a large deficit
+still reads as catching up. The release gate learned the same lesson:
+`observer-ok.sh` refused only a forked or silent node, and the observer calls a
+node that is behind but closing healthy on purpose, so the gate would have
+passed a release cut from a node 4,827 blocks behind. Its own log holds 8,576
+such readings. It now also refuses on the gap itself.
+
+**A btxd restart no longer locks the witness out of its own node.** btxd
+writes a new RPC cookie on every start, and a witness that read it once kept
+authenticating with the dead one. Measured 2026-09-15 on
+`witness-1.easybtx.com`: btxd restarted at 11:45:44Z for the 0.6.23 engine,
+from 11:46:06Z every witness request logged `HTTP 401 Unauthorized`, and the
+public endpoint, which the wallet's fork check and btxscan's health check
+now depend on, answered `the node did not answer` with `x-btx-freshness:
+unverified` until the unit was restarted at 11:47:37Z. The binary there
+predated the 8 September reload; the reload itself now compares the cookie
+on disk with the credentials each request actually sent rather than with
+the shared state, so eight requests refused together all recover instead of
+one, it logs one line per reload with the file's mtime and never its
+contents, and tests pin the 401-then-200, 401-then-401 and unchanged-cookie
+sequences. The systemd template restarts the witness always, after five
+seconds.
+
+## [0.6.23] - 2026-09-15 · mac + linux + windows
+
+**Your node says which role it actually fills, and whether that helps.** The
+status card could say a node was running, at the frontier, and advertising the
+archive service. It never said what the machine was actually doing for the
+network: checking blocks itself or following other people's signatures,
+whether a key it holds produces anything, whether any other node can reach it.
+Three things went wrong in that silence. On 3 September an operator offered a
+signing key; it was pinned and produced zero signatures for eleven days,
+because his node runs as a trusted mirror and a mirror consumes attestations
+rather than producing them. Nothing was broken, nothing was logged, and no
+screen could have said "this key signs nothing here". This project's own
+signer advertises the archive service while holding a key, which the engine
+clamps to the last sixteen blocks; on 13 September the explorer needed one
+signature from about 800 blocks back, every peer it asked refused, and it sat
+frozen for twenty-one hours. And a machine without a graphics card the engine
+accepts is launched in consensus mode, starts degraded, follows headers,
+advertises neither the consensus nor the archive service, and stalls below the
+Epoch A height while its operator believes it is helping.
+
+A small card now reads the engine's own answers (`getmatmultrustedstatus` and
+`getnetworkinfo`, both calls the app was already making) and says, one line
+each: how this node validates, whether it holds a signing key and whether that
+key can sign anything here, what history it serves, whether anyone has
+connected to it, and where it stands on the chain, each with one plain
+sentence on whether that helps other nodes. An engine that does not answer is
+reported as unknown, never as "no": absence of an answer is exactly how the
+pinned key went unnoticed. A node that has been up under half an hour with no
+inbound connection is not yet told it is unreachable, the same grace the
+"Helping the network" card already gives. The lines are decided and tested in
+Rust; the screen only lays them out.
+
+**The engine moves to upstream's tagged v0.34.6.** Upstream tagged 0.34.6 on
+13 September at commit `3013c2c2`, exactly one commit past the `9eb4e005`
+branch build that 0.6.18 through 0.6.22 have shipped. That restores the rule
+this project set for itself when it shipped an untagged engine: ship no engine
+bump until a tag exists that upstream itself calls clean AND both guards pass
+on the box cutting the release. Both do, on the literal commit: the fork guard
+finds the withdrawn stall-recovery height disabled on all five networks, and
+the fleet guard finds a degraded consensus start allowed, the 1-of-1 mirror
+refused, and the same two device classes in the sealed golden manifest as
+before (NVIDIA `sm_120`, Apple M4-class).
+
+What the one commit changes, read from the diff rather than from the release
+notes: a peer that has only ever sent headers no longer counts as a source to
+fetch a competing chain's block bodies from, the mining guard's deferred-reorg
+window is kept armed while a reorg is pending, and SHA-256 becomes the only new
+HTLC lock the wallet creates. No consensus rule moves; `chainparams.cpp` is
+byte-identical to the previous pin, so the 203,000 bootstrap base and the
+golden manifest are unchanged, and the manifest's seal re-verifies. CI built
+the tag commit from a pristine tree on both platforms: Linux with
+`BUILD_GIT_DIRTY 0` and kernels for `sm_75/86/89/100/120`, Windows through the
+mingw cross-compile and its regtest smoke on a real Windows runner. Both report
+`BTX daemon version v0.34.6`.
+
+The app installs it under the key `v0.34.6-3013c2c2` rather than `v0.34.6`, and
+that is the part a returning user actually receives. The install directory is
+named after the key, and the app re-provisions an existing install only when
+the key changes; every install since 0.6.18 already sits in a directory called
+`v0.34.6` holding the old build, so keeping the name would have shipped the
+tag to fresh installs only, silently. The suffix is the commit's short hash, so
+the directory says which engine is inside without running it. The binary still
+reports `v0.34.6`, the staged package declares that in `.btxd-version`, and
+provisioning verifies the binary against the declaration, exactly as the
+`v0.33.3-pr105b` key did in 0.6.1. The chain in `~/.easybtx` is untouched by
+the swap.
+
+**A PC with no graphics card now follows the chain instead of stopping at it,
+and can serve the explorer's history.** Since 0.6.15 every Windows and Linux
+node has started in consensus mode. On a machine with a capable NVIDIA card
+that is right: the engine measures the card at startup and the node validates
+every block itself, as this project's RTX 3060 has since 1 September. On a
+machine with no card it was a node that helped nobody. The engine starts it
+degraded, it follows headers, it stops below block 185,000 where the new proof
+of work begins, and it can never advertise the archive service, because the
+engine (`init.cpp:2662-2673`, identical at our pinned commit `9eb4e005`, at
+the `v0.34.6` tag and on the unreleased 0.34.7 branch) grants that service only
+to a trusted mirror or to a signer whose card is ready. Its owner believed it
+was helping.
+
+The role the network is short of needs neither a card nor a key. A node with
+NO signing key serves attestation history with no window limit at all, where a
+signer is clamped to the last sixteen blocks (0.6.22 said this about our own
+signer). On 13 September the explorer sat frozen for twenty-one hours for want
+of one historical signature that no peer it asked would serve. A keyless mirror
+would have answered.
+
+So the app now looks for the NVIDIA driver before it starts the node. A machine
+that has it (`nvcuda.dll` on Windows, `libcuda.so.1` on Linux, both measured on
+this project's 3060 box) is launched in consensus mode exactly as before. A
+machine that does not is launched as a trusted mirror: the same three pinned
+signer keys the Mac fallback already uses, threshold one, the
+`-allowsinglekeytrustedmirror=1` the 0.34 engine requires, and the mode stated
+on the command line rather than left to the engine's default, for the reason
+0.6.16 learned in five seconds. It follows the signed chain, and when "Serve
+signed confirmations" is on, which the engine turns on by default in this
+mode, it advertises the archive service and serves history at any height. The
+status card calls it "Mirror" and says what is being trusted.
+
+The trade, in the words of the decision record
+(`docs/decisions/2026-09-15-keyless-cpu-hosts-are-trusted-mirrors.md`): at
+threshold 1 every pinned key is a full authority alone, so one stolen signing
+key could make these nodes accept MatMul-invalid blocks; btxd itself warns
+about this at init. Mirrors also freeze when signers go quiet (2026-09-05/06
+incidents) rather than validating on their own. A node that stalled for certain
+and served nobody becomes one that follows on signatures, can serve, and
+freezes if the signers do. The 31 August reasoning that put every PC in
+consensus mode rested on an attestation supply that had measured dead in
+mid-August; this project's validator has signed since 1 September and
+LuckyPool's node carries attestations too, so that premise no longer holds.
+
+What this does not fix, said so nobody expects it to: a PC whose NVIDIA card
+has the driver but fails the engine's startup check (an older or weaker card)
+still reads as a CUDA machine, still starts in consensus mode, and still stops
+below block 185,000, with the card reading "Stopped" as before. The engine's
+own verdict after start is the signal that would route such a machine to the
+mirror, and using it is the next step, not this one. `EASYBTX_NODE_TRUSTED_MIRROR=1`
+in the environment puts it on the mirror by hand meanwhile, and `=0` on a
+machine with no card is the one-flag return to the 0.6.15 through 0.6.22
+posture.
+
+Verified offline on this box against the shipped 0.34.6 engine, with exactly
+the flags a card-less PC receives and no peers: the engine reaches "Done
+loading" in two seconds, `getmatmultrustedstatus` reads `trusted_mirror true`,
+`local_signer false`, `serves_attestations true`, three signers at threshold
+one, and the node advertises the trusted-mirror and attestation-archive
+service bits with the consensus bit clear; switching serving off drops the
+archive bit and nothing else. Macs are untouched: an Apple Silicon Mac still
+passes no mode flag and validates for itself, and the M5 fallback path is
+unchanged. A PC with a capable card is untouched.
+
+**Every update check now says what it did, on screen and on disk.** The app
+checks for a new version on launch and every six hours, and until now the
+result of that check went to exactly one place: the sentence beside the "Check
+now" button, and only when somebody had pressed it. An automatic check that
+found nothing said nothing. An automatic check that failed said nothing
+either, by design, because a six-hourly banner about being offline would have
+been noise. Measured 2026-09-15: this project's own signer box ran 0.6.21 for
+eight hours after the feed served 0.6.22, with two six-hourly checks due in
+that window, and nothing on the machine could say whether those checks ran,
+failed, or ran and found nothing. The release recipe has a step called
+"observe a real upgrade", and there was nothing to observe it with.
+
+Two things now hold the answer. Every check writes one line to
+`update-check.log` in the data folder, beside `setup.log` and through the same
+private file helper: when, which of five outcomes (`no-update`,
+`check-failed`, `found`, `install-failed`, `installed`), and a short detail
+that says whether the check was automatic or pressed, the version offered, and
+the error text when there was one. The file is kept under 64 KiB, so a node
+that runs for years does not grow it forever. And the last of those lines is
+kept in the app's settings file, from which Settings renders a permanent line
+under the button: "Last check: today 14:03 — you're on the latest version",
+or "couldn't check", or "v0.6.23 installed". It is rendered from the persisted
+value, so it is there at launch before any check has run this session, and it
+reads the same after the relaunch an install causes. The five words are one
+list on both sides of the app, and a test keeps them equal; the Rust side
+refuses a sixth unwritten. Writing the line can never change what the updater
+does: a failure to record is a console warning, and the one place the app is
+about to end its own process, the restart after an install, waits at most two
+seconds for the line to land first.
+
+The six-hourly check itself has also moved, out of the window and into the
+app's Rust side. Until now the recheck was a JavaScript timer inside the
+webview, and the hypothesis behind those eight silent hours, held as a
+hypothesis because the only measurement is the two checks that fell due and
+left no trace while the launch-time check on the same box did work right
+after a relaunch, is that WebKitGTK slows or suspends the timers of a hidden
+window, and this app spends its life hidden in the menu bar. The recheck now
+runs on a timer nothing throttles, two minutes after launch and every six
+hours after, through the same updater and into the same log with the same
+five words; the check at launch and the "Check now" button are unchanged. The
+log is what settles the question on the next release: six-hourly lines from a
+node left in the tray confirm it, and their absence points elsewhere.
+
+## [0.6.22] - 2026-09-15 · linux + windows (mac follows when built)
+
+**Your node will tell you when its own view of the chain has gone stale.**
+Every chain signal on the status card was derived from the peers this node
+happens to have: blocks, headers, `getchaintips`, and therefore the fork
+verdict too. When a node and its peers are stuck together, all of them agree
+that nothing is wrong. That is not a thought experiment. On 13 September the
+network's explorer sat 878 blocks behind for twenty-one hours while its own
+health check reported green the entire time, because every threshold it owned
+compared that node against references that were stuck with it.
+
+A block's timestamp cannot agree with a stuck peer set: it comes from the
+chain. The card now says so when the newest block this node holds is more than
+two hours old, and that sentence outranks a fork warning, because a fork says
+there is a better chain we cannot reach while a stale tip says we are not
+following any chain at all. The check itself was already written and tested in
+this repository; it had simply only ever been wired into the wallet panel.
+
+**A node holding a signing key is no longer described as an archive serving
+history.** The engine clamps a node that holds a key to the last sixteen
+blocks and refuses everything older, while a node with NO key answers the full
+range. The app did not know the difference, so the machine least able to serve
+history was reported as "doing its job" — including this project's own signer,
+which is one of the peers the explorer asked on 13 September and was refused
+by. The status now names that state, and says plainly that what the network is
+short of is keyless archives.
+
+**The Esplora front's site address is a `Host` matcher**, which is documented
+now rather than rediscovered: a tunnel that forwards the public hostname
+unchanged matches no site block, and Caddy answers 200 with an empty body that
+reads exactly like a request that never arrived. `deploy/esplora/README.md`
+carries the one-line curl that settles it in seconds.
+
+**The electrs index is no longer an unmeasured cost.** A megabyte-sized BTX
+block carries one transaction of about 200 bytes and the rest is MatMul
+payload, so the whole chain holds roughly 43 MB of transaction data and the
+index that sits on top of it is under a gigabyte, not a fraction of 124 GiB.
+That makes keeping block files on a slow disk a correct design rather than a
+compromise.
 
 ## [0.6.21] - 2026-09-09 · mac + linux + windows
 
@@ -116,7 +1639,6 @@ dialling the right peers is what lets a node obtain the chain, never what lets
 it validate the fork.
 
 Internal: `withGlobalTauri` is off — the interface never used it.
-
 
 ## [0.6.20] - 2026-09-06 · linux
 

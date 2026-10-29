@@ -9,8 +9,14 @@
 
 mod ask;
 mod commands;
+mod fast_forward;
+mod read_block_recovery;
 mod state;
+mod tools;
 mod tray;
+mod update_binding;
+mod update_log;
+mod update_timer;
 mod wallet;
 
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
@@ -20,7 +26,15 @@ use crate::state::{node_datadir, AppState, NodeAppSettings, NodePhase};
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        // Every update the plugin offers must be signed under this app's
+        // name at the version the feed announces (update_binding). Both
+        // update paths, the webview's and the six-hourly timer's, go through
+        // this comparator.
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .default_version_comparator(update_binding::comparator)
+                .build(),
+        )
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -33,15 +47,31 @@ pub fn run() {
             commands::start_node,
             commands::stop_node,
             commands::open_data_folder,
+            tools::tools_console_run,
+            tools::tools_console_confirm,
+            tools::tools_engine_notices,
+            tools::tools_diagnostics,
+            tools::tools_fetch_stuck_blocks,
+            tools::tools_restart_check,
+            tools::tools_restart_node,
+            tools::tools_fast_forward_check,
+            tools::tools_fast_forward_run,
+            tools::tools_fast_forward_status,
             commands::set_keep_awake,
+            commands::set_gpu_recovery_restarts_wsl,
             commands::set_node_profile,
+            commands::set_follow_signatures,
             commands::set_attestation_serve,
+            commands::set_signer,
+            commands::set_signer_publish,
             commands::set_node_nickname,
             commands::set_service_report,
+            commands::mark_welcome_shown,
             commands::reclaim_disk_now,
             commands::node_footprint,
             commands::remove_node_data_now,
             commands::open_global_stats,
+            commands::open_btx_community,
             commands::close_choice,
             commands::set_on_close,
             commands::esplora_preflight,
@@ -49,6 +79,11 @@ pub fn run() {
             commands::set_esplora_listen,
             commands::set_witness,
             commands::set_witness_listen,
+            commands::set_snapshot_serve,
+            commands::record_update_check,
+            commands::remember_failed_update,
+            commands::forget_failed_update,
+            commands::peek_update_refusal,
             ask::ask_chain_progress,
             ask::ask_supply,
             ask::ask_next_halving,
@@ -70,6 +105,15 @@ pub fn run() {
         .setup(|app| {
             tray::build_tray(app.handle())?;
 
+            // The high-water mark update_binding refuses to go below.
+            update_binding::remember_running_version(&node_datadir(), &app.package_info().version);
+
+            // The six-hourly self-update check, on a tokio timer rather than
+            // the webview's setInterval, which the hypothesis in update_timer
+            // says WebKitGTK throttles for a hidden window. The front end
+            // still checks at launch and on the button; this is the recheck.
+            update_timer::spawn(app.handle().clone());
+
             // E2E/QA seam: EASYBTX_NODE_E2E_AUTOSETUP=1 runs the full setup
             // pipeline at launch without a wizard click. HARD-GATED on
             // EASYBTX_NODE_DATADIR also being set: an autosetup against the
@@ -83,10 +127,60 @@ pub fn run() {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let state = handle.state::<AppState>();
-                    if let Err(message) = commands::guarded_setup(&handle, &state).await {
+                    if let Err(message) = commands::guarded_setup(&handle, &state, None).await {
                         eprintln!("[e2e] setup pipeline failed: {message}");
                     }
                 });
+            }
+
+            // A returning install contributes too, once, before the node
+            // starts so the services are on for this run rather than the next.
+            //
+            // 0.6.24 gave the three cheap services to new installs only. The
+            // census on 2026-09-16 then showed what that leaves behind: 59
+            // nodes seen, 21 serving attestations. This turns them on for
+            // everyone who was never asked, leaves a deliberate `false` alone,
+            // and arms the panel so nobody finds out by accident. See
+            // `NodeAppSettings::migrate_contributions`.
+            if NodeAppSettings::migrate_contributions(&node_datadir()) {
+                eprintln!(
+                    "[node-app] enabled the services this install was never asked about; \
+                     the welcome panel will say which"
+                );
+            }
+            // And the signer role, for the same population and the same
+            // reason, with one more fact in hand: whether this host can sign
+            // at all. The rule is the host's lasting role
+            // (`host_follows_signatures`, the launch's own rule without a
+            // validating node's one-time mirror launch, which says nothing
+            // about whether the host can sign), asked of the engine tag this
+            // build ships, since the binary's real path is not known until
+            // the start path resolves it and the rule reads only the tag. On
+            // 2026-09-16 every mirror on the network was following one key on
+            // one home computer; this is what asks every node with a capable
+            // card to do the same job. See `NodeAppSettings::migrate_signer`.
+            let applies_here = !btx_core::node::host_follows_signatures(
+                &commands::nominal_btxd_path(),
+                &node_datadir(),
+                btx_core::backend::node_host_backend(),
+            );
+            if NodeAppSettings::migrate_signer(&node_datadir(), applies_here) {
+                eprintln!(
+                    "[node-app] this install will sign confirmations for mirrors from now on; \
+                     the welcome panel will say so"
+                );
+            }
+            // The owner's rule of 2026-10-12: every feature on, a machine that
+            // cannot run one simply does not, anyone can switch one off. The
+            // four that were never on by default (wallet panel, Explorer mode,
+            // Esplora, snapshot serving) are turned on once, before the node
+            // starts, so they apply to this run. See
+            // `NodeAppSettings::migrate_features_on`.
+            if NodeAppSettings::migrate_features_on(&node_datadir()) {
+                eprintln!(
+                    "[node-app] turned on the wallet panel, Explorer mode, Esplora and snapshot \
+                     serving; each runs only where it can, and the welcome panel says so"
+                );
             }
 
             // Returning user: the app's promise is "open it and your node

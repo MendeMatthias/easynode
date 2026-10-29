@@ -68,10 +68,52 @@ env:
   # scripts/check-engine-tag.sh clears. VERSION is what the binary reports and
   # TAG is the app's install key; they are equal here only because upstream's
   # tag and its CLIENT_VERSION agree at v0.34.6. Do not collapse them.
-  PROVEN_BTXD_RUN_ID: "33997938941"
-  PROVEN_BTXD_ARTIFACT: "btxd-windows-9eb4e0050e08ea3ef768bac276dac9cbd2e84542"
-  PROVEN_BTXD_VERSION: "v0.34.6"
-  PROVEN_BTXD_TAG: "v0.34.6"
+  #
+  # MOVED 2026-09-15 to upstream's TAG v0.34.6 = 3013c2c2, one commit past
+  # 9eb4e005 (no consensus change; commands.rs has the diff). Run 34914770368,
+  # dispatched from main with btxchain_ref=3013c2c2…: both jobs green, the
+  # mingw cross-compile and "regtest smoke on real Windows", artifact
+  # btxd-windows-3013c2c2… (19079508 bytes). All four pins move together, and
+  # this time VERSION and TAG DIVERGE, which is the case the note above was
+  # written for: the binary still reports v0.34.6 (upstream did not bump
+  # CLIENT_VERSION for the tag commit, it only tagged it), while the app's
+  # install key is v0.34.6-3013c2c2 so that every install already holding the
+  # 9eb4e005 build under the bare `v0.34.6` key re-provisions onto this one.
+  # The staging script asserts VERSION against btxd.exe --version and writes
+  # it to .btxd-version; the guard below asserts TAG against NODE_RELEASE_TAG.
+  #
+  # MOVED 2026-09-23 to upstream's TAG v0.34.9 = 84b998b4, built with
+  # -DWITH_MODELNET=OFF (commands.rs has why). Run 35867391955, dispatched on
+  # claude/engine-v0.34.9 with btxchain_ref=84b998b4…: both jobs green, the
+  # mingw cross-compile (the `near` patch still rewrote 2 sites, the Ascend stub
+  # registered, `native model network ... OFF`) and "regtest smoke on real
+  # Windows", artifact btxd-windows-84b998b4… (19471556 bytes). All four pins
+  # move together. VERSION and TAG are equal again: the binary reports v0.34.9
+  # and the install key is plain v0.34.9, because no install ever used that
+  # key. Still two fields, for the next time they diverge.
+  #
+  # MOVED 2026-09-30 to upstream's TAG v0.34.12 = 5f32c4c4, built with
+  # -DWITH_MODELNET=OFF (commands.rs has why 0.34.12 runs in legacy reorg
+  # mode). Run 36723745858, dispatched on main with btxchain_ref=5f32c4c4...:
+  # both jobs green, the mingw cross-compile (the `near` patch rewrote 2 sites,
+  # the Ascend stub added, `native model network ... OFF`) and "regtest smoke on
+  # real Windows" (`BTX daemon version v0.34.12`), artifact
+  # btxd-windows-5f32c4c4... (19524914 bytes). All four pins move together.
+  # VERSION and TAG are equal: the binary reports v0.34.12 and the install key
+  # is plain v0.34.12.
+  #
+  # MOVED 2026-10-10 to upstream's TAG v0.34.15 = 476f3f23, because mainnet
+  # block 244000 switched on consensus checks 0.34.12 lacks (commands.rs has
+  # the reasoning). Run 38062021519, dispatched on claude/engine-0.34.15 with
+  # the new default ref: both jobs green, the mingw cross-compile (`native model
+  # network ... OFF`) and "regtest smoke on real Windows" (`BTX daemon version
+  # v0.34.15`, SMOKE PASSED), artifact btxd-windows-476f3f23... (19644349
+  # bytes). All four pins move together. VERSION and TAG are equal: the binary
+  # reports v0.34.15 and the install key is plain v0.34.15.
+  PROVEN_BTXD_RUN_ID: "38062021519"
+  PROVEN_BTXD_ARTIFACT: "btxd-windows-476f3f23e15228bb3e6119ed1e139a9b25424ce8"
+  PROVEN_BTXD_VERSION: "v0.34.15"
+  PROVEN_BTXD_TAG: "v0.34.15"
 
 permissions:
   contents: read
@@ -102,7 +144,7 @@ jobs:
           workspaces: apps/node/src-tauri
 
       - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 20
           cache: npm

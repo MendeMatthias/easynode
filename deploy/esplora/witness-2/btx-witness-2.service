@@ -1,0 +1,38 @@
+[Unit]
+Description=BTX fork witness 2 (serves /blocks/tip/height, /block-height/<h> and /signers/recent from btxd2)
+After=network-online.target btxd2.service
+Wants=network-online.target
+
+[Service]
+# deploy/esplora/btx-witness.service.template, filled in for the api.btxscan.io
+# box: the node it reads is btxd2 (datadir /data/btx2, JSON-RPC on
+# 127.0.0.1:8434, cookie auth). install-witness-2.sh writes this exact text;
+# a test keeps the two identical.
+User=azureuser
+Type=simple
+# Loopback only. Caddy on the same box serves it as
+# https://api.btxscan.io/witness/ with TLS and the per-IP rate limit.
+ExecStart=/usr/local/bin/btx-witness --datadir /data/btx2 --rpc 127.0.0.1:8434 --listen 127.0.0.1:3081
+# always, not on-failure: a witness that has exited for any reason has left
+# the census without its second source. It also exits at start when btxd2 does
+# not answer, and five seconds brings it back once btxd2 is up.
+Restart=always
+RestartSec=5
+
+# It reads btxd2's .cookie and answers three GETs. It needs nothing else.
+# The cookie is /data/btx2/.cookie, 0600 azureuser: readable by User= above.
+# ProtectSystem=strict makes /data read-only for this process, which is all it
+# needs, and ProtectHome does not reach /data at all. The witness re-reads the
+# cookie after a 401, so a btxd2 restart (new cookie) needs no restart here.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/data/btx2
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

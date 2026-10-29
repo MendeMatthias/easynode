@@ -24,6 +24,12 @@
 - **[gpu-qualification-rtx3060.md](gpu-qualification-rtx3060.md)**: a full
   transcript from an RTX 3060 validating and signing on mainnet, including the
   part that does not flatter us.
+- **[decisions/](decisions/)**: one file per decision that changes what a node
+  does, dated, with the options weighed, the measurements behind the choice,
+  how to verify it on a real machine, and the rollback. First entry:
+  [2026-09-15-keyless-cpu-hosts-are-trusted-mirrors.md](decisions/2026-09-15-keyless-cpu-hosts-are-trusted-mirrors.md),
+  why a PC with no NVIDIA driver now follows the signed chain as a keyless
+  mirror instead of stalling below block 185,000.
 
 ## About the citations in code comments
 

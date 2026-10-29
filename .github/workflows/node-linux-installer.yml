@@ -110,9 +110,53 @@ env:
   # artifact NAME is unchanged and the "both pins move together" warning above
   # is satisfied trivially — it guards against moving the run id when the ref
   # changed, which is not what happened here.
-  PROVEN_BTXD_RUN_ID: "34223411886"
-  PROVEN_BTXD_ARTIFACT: "btxd-linux-9eb4e0050e08ea3ef768bac276dac9cbd2e84542"
-  PROVEN_BTXD_COMMIT: "9eb4e0050e08ea3ef768bac276dac9cbd2e84542"
+  #
+  # MOVED 2026-09-15 to the upstream TAG v0.34.6 = 3013c2c2, one commit past
+  # 9eb4e005 (no consensus change; commands.rs has the diff). All three pins
+  # move together this time because the ref DID change. Run 34914768284,
+  # dispatched from main with btxchain_ref=3013c2c2…: completed success, log
+  # proved `tree pristine at 3013c2c2…`, BUILD_GIT_DIRTY 0, architectures
+  # present sm_100 sm_120 sm_75 sm_86 sm_89 in both btxd and
+  # libbtx_matmul_backend.a, `BTX daemon version v0.34.6`, SMOKE PASSED.
+  # Artifact 393720371 bytes. The app's install key is now `v0.34.6-3013c2c2`
+  # while the binary still reports v0.34.6; the guard below reads
+  # `.btxd-version` for the version and BTXD_COMMIT for identity, so neither
+  # side of that needs the other to be spelled the same.
+  #
+  # MOVED 2026-09-23 to the upstream TAG v0.34.9 = 84b998b4, built with
+  # -DWITH_MODELNET=OFF (commands.rs has why). All three pins move together
+  # because the ref changed. Run 35867387801, dispatched on
+  # claude/engine-v0.34.9 with the pin as its ref: completed success, log proved
+  # `tree pristine at 84b998b4…`, `native model network ... OFF`,
+  # BUILD_GIT_DIRTY 0, architectures present sm_120 sm_75 sm_86 sm_89,
+  # `BTX daemon version v0.34.9`, SMOKE PASSED, and the artifact carries
+  # libcublasLt.so.13. Artifact 394084995 bytes. sm_100 is no longer in the
+  # binary: upstream made its sm_100 path opt-in (cmake/BTXCudaSm100.cmake), and
+  # it was never in the requested set. The install key is plain `v0.34.9` now,
+  # equal to what the binary reports.
+  #
+  # MOVED 2026-09-30 to the upstream TAG v0.34.12 = 5f32c4c4, built with
+  # -DWITH_MODELNET=OFF as before (commands.rs has why 0.34.12 runs in legacy
+  # reorg mode). All three pins move together because the ref changed. Run
+  # 36723618840, dispatched on main with btxchain_ref=5f32c4c4: completed
+  # success, log proved `tree pristine at 5f32c4c4...`, `native model network
+  # ... OFF`, architectures present sm_120 sm_75 sm_86 sm_89, `BTX daemon
+  # version v0.34.12`, SMOKE PASSED, and the artifact carries libcublasLt.so.13.
+  # Artifact 394140055 bytes. The install key is plain `v0.34.12`, equal to what
+  # the binary reports.
+  #
+  # MOVED 2026-10-10 to the upstream TAG v0.34.15 = 476f3f23, because mainnet
+  # block 244000 switched on consensus checks 0.34.12 lacks (commands.rs has
+  # the reasoning). Run 38062016894, dispatched on claude/engine-0.34.15 with
+  # the ref read from the pin: completed success, log proved `tree pristine at
+  # 476f3f23...`, `native model network ... OFF`, architectures present sm_120
+  # sm_75 sm_86 sm_89 in btxd and libbtx_matmul_backend.a, `BTX daemon version
+  # v0.34.15`, SMOKE PASSED, and the artifact carries libcublasLt.so.13.
+  # Artifact 394270094 bytes. The install key is plain `v0.34.15`, equal to
+  # what the binary reports.
+  PROVEN_BTXD_RUN_ID: "38062016894"
+  PROVEN_BTXD_ARTIFACT: "btxd-linux-476f3f23e15228bb3e6119ed1e139a9b25424ce8"
+  PROVEN_BTXD_COMMIT: "476f3f23e15228bb3e6119ed1e139a9b25424ce8"
 
 jobs:
   build-node-linux:
@@ -153,7 +197,7 @@ jobs:
           workspaces: apps/node/src-tauri
 
       - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 20
           cache: npm
@@ -186,7 +230,7 @@ jobs:
           echo "btxd pin: run ${PROVEN_BTXD_RUN_ID}, artifact ${PROVEN_BTXD_ARTIFACT}"
 
       - name: Download the proven btxd (from btxd-linux.yml)
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ env.PROVEN_BTXD_ARTIFACT }}
           path: btxd-dist

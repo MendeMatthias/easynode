@@ -240,9 +240,173 @@ impl Drop for ConfLock {
     }
 }
 
+/// The node engine's own lock on its data folder: `<datadir>/.lock`, taken
+/// exactly as the engine takes it (v0.34.9 `src/util/fs.cpp`, `FileLock`):
+/// an `fcntl(F_SETLK)` write lock on the whole file on Unix, and
+/// `LockFileEx` exclusive over the whole range on Windows (what std's
+/// `File::try_lock` makes there). While this is held, a btxd started on the
+/// folder refuses to start ("Cannot obtain a lock on directory"), whichever
+/// app launches it; and taking it at all proves that no btxd holds the
+/// folder now. `datadir` is the network folder the engine keeps its chain
+/// in (mainnet: the data folder itself; regtest: its `regtest`).
+///
+/// SCOPE. An `fcntl` lock belongs to the process, not the descriptor: this
+/// process closing any other descriptor on `.lock` would drop it, so nothing
+/// else here opens that file. It is released when this is dropped, and when
+/// the process ends, however it ends.
+pub struct EngineLock {
+    _file: std::fs::File,
+}
+
+/// Why [`EngineLock::take`] did not take the lock.
+#[derive(Debug)]
+pub enum EngineLockError {
+    /// Another process holds it: a node runs on the folder.
+    Held,
+    /// The lock file could not be opened or locked at all.
+    Io(io::Error),
+}
+
+impl std::fmt::Display for EngineLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EngineLockError::Held => write!(f, "a node holds the data folder's lock"),
+            EngineLockError::Io(e) => write!(f, "the data folder's lock: {e}"),
+        }
+    }
+}
+
+impl EngineLock {
+    /// Take the lock now, without waiting. The file is made when it is not
+    /// there, as the engine makes it.
+    pub fn take(datadir: &Path) -> Result<Self, EngineLockError> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(datadir.join(".lock"))
+            .map_err(EngineLockError::Io)?;
+        Self::lock(&file)?;
+        Ok(Self { _file: file })
+    }
+
+    #[cfg(unix)]
+    fn lock(file: &std::fs::File) -> Result<(), EngineLockError> {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: a plain C struct, all zeroes is a valid value, and every
+        // field the call reads is set below.
+        let mut whole: libc::flock = unsafe { std::mem::zeroed() };
+        whole.l_type = libc::F_WRLCK as _;
+        whole.l_whence = libc::SEEK_SET as _;
+        whole.l_start = 0;
+        whole.l_len = 0;
+        // SAFETY: a descriptor this function's caller owns, and a pointer to
+        // a flock that outlives the call.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &whole) } == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EAGAIN) | Some(libc::EACCES) => Err(EngineLockError::Held),
+            _ => Err(EngineLockError::Io(e)),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn lock(file: &std::fs::File) -> Result<(), EngineLockError> {
+        match file.try_lock() {
+            Ok(()) => Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => Err(EngineLockError::Held),
+            Err(std::fs::TryLockError::Error(e)) => Err(EngineLockError::Io(e)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What [`the_engine_lock_keeps_a_second_holder_out`] runs in another
+    /// process: this test binary again, with only this test, told the folder
+    /// by `EASYNODE_ENGINE_LOCK_PROBE`. It takes the lock and holds it until
+    /// `release` appears in the folder (a bounded wait), writing `held`
+    /// once it has it; or it writes `refused` and ends. Run on its own, with
+    /// no folder named, it does nothing.
+    #[test]
+    fn engine_lock_probe() {
+        let Some(dir) = std::env::var_os("EASYNODE_ENGINE_LOCK_PROBE") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        match EngineLock::take(&dir) {
+            Ok(lock) => {
+                std::fs::write(dir.join("held"), b"").unwrap();
+                for _ in 0..600 {
+                    if dir.join("release").exists() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                drop(lock);
+            }
+            Err(EngineLockError::Held) => std::fs::write(dir.join("refused"), b"").unwrap(),
+            Err(EngineLockError::Io(e)) => panic!("{e}"),
+        }
+    }
+
+    /// Runs [`engine_lock_probe`] in a second process on `dir`.
+    fn probe(dir: &Path) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "fsx::tests::engine_lock_probe", "--nocapture"])
+            .env("EASYNODE_ENGINE_LOCK_PROBE", dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_for(path: &Path) -> bool {
+        for _ in 0..600 {
+            if path.exists() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// Review I5: while one process holds the engine's lock, another cannot
+    /// take it, and can once it is let go. An `fcntl` lock never conflicts
+    /// within one process, so the second holder is another process.
+    #[test]
+    fn the_engine_lock_keeps_a_second_holder_out() {
+        let d = tempfile::tempdir().unwrap();
+        let held = EngineLock::take(d.path()).unwrap();
+        assert!(
+            d.path().join(".lock").is_file(),
+            "made as the engine makes it"
+        );
+        let mut second = probe(d.path());
+        assert!(second.wait().unwrap().success());
+        assert!(
+            d.path().join("refused").exists(),
+            "the second holder is kept out"
+        );
+        assert!(!d.path().join("held").exists());
+        drop(held);
+        std::fs::remove_file(d.path().join("refused")).unwrap();
+        let mut third = probe(d.path());
+        assert!(wait_for(&d.path().join("held")), "free once let go");
+        // And while that one holds it, this process cannot take it either.
+        assert!(matches!(
+            EngineLock::take(d.path()),
+            Err(EngineLockError::Held)
+        ));
+        std::fs::write(d.path().join("release"), b"").unwrap();
+        assert!(third.wait().unwrap().success());
+        assert!(EngineLock::take(d.path()).is_ok());
+    }
 
     #[test]
     fn replaces_the_file_and_leaves_no_temp_behind() {

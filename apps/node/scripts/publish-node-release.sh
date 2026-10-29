@@ -92,12 +92,13 @@ echo "==> assets in $ASSET_DIR"
 for f in "${ALL[@]}"; do echo "      $f"; done
 echo
 
-# Anything the updater serves (.tar.gz, .AppImage, .exe) needs a sibling .sig.
+# Anything the updater serves (.tar.gz, .AppImage, .exe, and since 0.7.0 the
+# .deb, which a .deb install fetches through node-deb.json) needs a sibling .sig.
 missing=0
 for f in "${ALL[@]}"; do
   case "$f" in
     *.sig|SHA256SUMS*|*.json) continue ;;
-    *.tar.gz|*.AppImage|*.exe)
+    *.tar.gz|*.AppImage|*.exe|*.deb)
       if [[ ! -f "$ASSET_DIR/$f.sig" ]]; then
         echo "error: $f has no $f.sig. The updater cannot serve an unsigned artifact." >&2
         missing=1

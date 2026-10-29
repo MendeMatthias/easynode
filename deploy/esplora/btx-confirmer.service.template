@@ -1,0 +1,53 @@
+[Unit]
+Description=BTX snapshot confirmer (co-signs or dissents by this node's own diary)
+After=network-online.target btxd.service
+Wants=network-online.target
+
+[Service]
+# Replace USER, PUBKEY and the two paths for your host. PUBKEY is the node's
+# signing public key (66 hex digits, the one on the operator list); with it the
+# confirmer never opens the private key file. USER is the user btxd runs as:
+# the node itself rewrites the copy it signs in /var/lib/btx/snapshot-confirmer,
+# so both must be able to write there.
+#
+# THE POINT OF THIS UNIT. An operator on the snapshot network's list whose node
+# the easyNode app does not run still confirms snapshots (design section 5a).
+# This is the app's confirmer, nothing else: it keeps the diary (the node's own
+# UTXO hash at every multiple of 100), and every ten minutes signs a statement
+# waiting on easybtx.com only when that diary agrees, or sends a dissent when it
+# does not. It never exports, loads, pins or restarts anything, and listens on
+# nothing.
+#
+# The node must check blocks itself (not a trusted mirror) and have its signing
+# key configured (matmulattestationsignerkeyfile=), as it does to sign blocks,
+# and that key must be on the operator list. Until its background check of
+# older history finishes (getchainstates all validated) it records and signs
+# nothing, and says so.
+#
+# Before the first start:
+#   install -d -o USER /var/lib/btx-confirmer /var/lib/btx/snapshot-confirmer
+User=USER
+Type=simple
+ExecStart=/usr/local/bin/btx-confirmer --datadir /var/lib/btx --state /var/lib/btx-confirmer --pubkey PUBKEY --rpc 127.0.0.1:19334
+# always, not on-failure: a confirmer that has exited has stopped counting.
+# Five seconds keeps a btxd restart inside one tip poll. Exit 3 is a refusal
+# (another chain or replay context, a mirror, no key, a key not on the list):
+# restarting would only refuse again, so it is not restarted.
+Restart=always
+RestartSec=5
+RestartPreventExitStatus=3
+
+# It reads the node's cookie, asks the node and easybtx.com, and
+# writes in exactly two places.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryDenyWriteExecute=true
+ReadWritePaths=/var/lib/btx-confirmer /var/lib/btx/snapshot-confirmer
+
+[Install]
+WantedBy=multi-user.target

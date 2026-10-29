@@ -184,6 +184,64 @@ printf 'a433ed21d83356c1f13e49e6969e27e33cf4de78a71f809a268c13483b020676\n' > "$
 expect "not holding it, with no deep branch known" unverified btx-unverified "why=race-at-census-tip"
 
 echo
+echo "── an invalid chain is never the witness, and never fresh ──"
+# The 2026-09-26 16:37Z shape, trimmed: the valid chain A is heaviest, and E,
+# the branch from b28c3e84… at 227313, is marked invalid. By the feed's own
+# figures E carries more work since 227312 than A does.
+# $1 = A's "heaviest", $2 = E's "heaviest", $3 = A's "invalid"
+write_invalid_census() {
+  cat > "$WORK/census.json" <<JSON
+{"schema":2,"checkedAt":$(now),"chains":{"split":true,"tipHeight":230074,"chains":[
+ {"id":"A","tipHeight":230074,"tipHash":"d7078b67cdba8587","forkHeight":null,"nodes":1,
+  "log2WorkSinceFork":24.156,"competing":true,"heaviest":$1,"invalid":$3,"invalidBlock":null,
+  "partial":false,"settled":[{"height":230067,"hash":"78526bf08837071a"},{"height":230068,"hash":"1a1c06c8cf2cc9c1"}]},
+ {"id":"E","tipHeight":228908,"tipHash":"817155a71e0fba5b","forkHeight":227312,"nodes":5,
+  "log2WorkSinceFork":25.106,"competing":true,"heaviest":$2,"invalid":true,
+  "invalidBlock":{"height":227313,"hash":"b28c3e846344ba74"},"partial":false,
+  "settled":[{"height":228901,"hash":"4050d3063dd21453"},{"height":228902,"hash":"87483fbfb7a950cb"}]}]}}
+JSON
+}
+rm -f "$WORK"/h*
+write_invalid_census true false false
+printf '230075' > "$WORK/tip"
+full d5f0e92f > "$WORK/h227313"
+full 1a1c06c8cf2cc9c1 > "$WORK/h230068"
+expect "on the valid chain, beside a heavier invalid one" fresh btx-fresh "why=settled-block-matches"
+
+rm -f "$WORK"/h*
+printf '228908' > "$WORK/tip"
+full b28c3e846344ba74 > "$WORK/h227313"
+full 87483fbfb7a950cb > "$WORK/h228902"
+full 817155a71e0fba5b > "$WORK/h228908"
+expect "serving the invalid chain" unverified btx-unverified "why=on-invalid-chain chain=E"
+# Flagged heaviest, as a census ranking by work alone would. This read fresh.
+write_invalid_census false true false
+expect "the invalid chain flagged heaviest" unverified btx-unverified "why=heaviest-chain-invalid chain=E"
+
+rm -f "$WORK"/h*
+write_invalid_census true false true
+printf '230074' > "$WORK/tip"
+full 1a1c06c8cf2cc9c1 > "$WORK/h230068"
+full d7078b67cdba8587 > "$WORK/h230074"
+expect "every chain invalid" unverified btx-unverified "why=heaviest-chain-invalid chain=A"
+
+# A branch marked invalid that left A inside the racing window shares A's
+# settled pairs, so the settled test alone read fresh. Its invalid block decides.
+cat > "$WORK/census.json" <<JSON
+{"schema":2,"checkedAt":$(now),"chains":{"split":true,"tipHeight":230074,"chains":[
+ {"id":"A","tipHeight":230074,"tipHash":"d7078b67cdba8587","forkHeight":null,"nodes":1,
+  "competing":true,"heaviest":true,"invalid":false,"invalidBlock":null,"partial":false,
+  "settled":[{"height":230067,"hash":"78526bf08837071a"},{"height":230068,"hash":"1a1c06c8cf2cc9c1"}]},
+ {"id":"X","tipHeight":230074,"tipHash":"eeeeeeeeeeeeeeee","forkHeight":230071,"nodes":1,
+  "competing":false,"heaviest":false,"invalid":true,
+  "invalidBlock":{"height":230072,"hash":"eeee00000000eeee"},"partial":false,"settled":[]}]}}
+JSON
+full eeee00000000eeee > "$WORK/h230072"
+full eeeeeeeeeeeeeeee > "$WORK/h230074"
+expect "on an invalid branch inside the racing window" unverified btx-unverified "why=on-invalid-chain chain=X"
+rm -f "$WORK"/h*
+
+echo
 echo "── exactly one marker exists, always ──"
 n="$(ls "$RUN" | wc -l)"
 [ "$n" = "1" ] && ok "one marker file in the run directory" || bad "$n marker files: $(ls "$RUN" | tr '\n' ' ')"

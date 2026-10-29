@@ -10,11 +10,58 @@ import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { AmbientLine } from "./ambient";
-import { validationView } from "./validation";
-import { classifyCheckFailure, checkFailureMessage } from "./update-check";
+import {
+  followResultText,
+  followRowVisible,
+  followToggleOn,
+  gpuHungSignerNote,
+  stalledFollowOffer,
+  validationView,
+} from "./validation";
+import {
+  CHAIN_BLOCKS_PER_HOUR,
+  type CatchupSample,
+  type StaleCard,
+  cannotCatchUp,
+  catchupLine,
+  chainCardMessage,
+  recordReading,
+  staleCard,
+  trendReading,
+} from "./catchup-trend";
+import { type HistoryCheck, historyCheckView } from "./history-check";
+import { type ChainAgreementRow, chainAgreementView } from "./chain-agreement";
+import {
+  NO_GPU_REASON,
+  type StartChoice,
+  announcer,
+  chipNoticeVisible,
+  diskShortfall,
+  setupArgs,
+  startChoiceView,
+  switchLaterShown,
+} from "./start-choice";
+import {
+  classifyCheckFailure,
+  checkFailureMessage,
+  handInstallBanner,
+  hhmm,
+  handInstallNotice,
+  installErrorFromDetail,
+  lastCheckLine,
+  noUpdateMessage,
+  updateCheckRecord,
+  type LastUpdateCheck,
+  type UpdateCheckBranch,
+  type UpdateCheckEvent,
+} from "./update-check";
 import { contributionView } from "./contribution";
+import { explorerRow } from "./feature-rows";
+import { type VisualMode, announceChange, headline, waitingLine } from "./headline";
+import { initOverlayKeys } from "./overlay-keys";
 import { mountPowerCore } from "./power-core";
 import { initAsk } from "./ask";
+import { initTools } from "./tools";
 import { initWallet, reflectWalletEnabled } from "./wallet";
 type PowerCore = ReturnType<typeof mountPowerCore>;
 
@@ -55,7 +102,26 @@ type NodePhase =
   | { phase: "stopped" }
   | { phase: "error"; message: string };
 
-export interface NodeStatusInfo {
+export interface SnapshotServeStatus {
+  /** true while the offer is on the wire; null when unmeasured. */
+  offering: boolean | null;
+  base_height: number | null;
+  base_hash: string | null;
+  /** Blocks the tip has moved past the offered base. */
+  stale_by: number | null;
+  file_size: number | null;
+  sha256: string | null;
+  /** Peers that advertise a snapshot of their own. */
+  peers_offering: number | null;
+  /** Where a cycle is, while one runs. */
+  phase: { kind: string } | null;
+  /** The sentence beside the switch. */
+  message: string;
+  /** The message names something the operator has to change. */
+  needs_attention: boolean;
+}
+
+interface NodeStatusInfo {
   running: boolean;
   phase: NodePhase;
   uptime_secs: number;
@@ -68,16 +134,35 @@ export interface NodeStatusInfo {
   node_tag: string;
   installed: boolean;
   setup_complete: boolean;
+  /** False only on a brand new install that has not seen the welcome panel. */
+  welcome_shown: boolean;
   keep_awake: boolean;
   keep_awake_supported: boolean;
+  in_wsl: boolean;
+  gpu_recovery_restarts_wsl: boolean;
   tray_term: string;
   txindex_enabled: boolean;
+  /** Explorer mode can run here: no pruning in effect or chosen. */
+  explorer_available: boolean;
   /**
    * Serve historical signed confirmations back to the network
    * (matmulattestationserve). Persisted choice or an adopted hand-set conf
    * flag; a change applies on the next node (re)start.
    */
   attestation_serve_enabled: boolean;
+  /** The signer role (btx_core::signer): the switch; whether this host can
+   *  sign at all (null before the first start, false on a mirror host); the
+   *  public key to show and copy (null when off or when there is no key);
+   *  and whether the engine reports this node holding a key AND validating,
+   *  which is the only state in which quitting freezes somebody's mirror. */
+  signer_enabled: boolean;
+  signer_applies_here: boolean | null;
+  signer_pubkey: string | null;
+  signing_live: boolean;
+  /** Offer the public key to easybtx.com so mirror operators can pin it, and
+   *  what came of the last attempt this run (null until one has been made). */
+  signer_publish_enabled: boolean;
+  signer_offer: { delivered: boolean; at: string; detail: string } | null;
   /** What we are really providing: `state` is serving_history |
    *  degraded_to_live_window | not_serving | unknown. */
   archive_service: { state: string; blocks_behind?: number } | null;
@@ -85,6 +170,33 @@ export interface NodeStatusInfo {
   // place. Null until the refresher has completed a tick.
   archive_service_message: string | null;
   archive_service_needs_attention: boolean;
+  /**
+   * Which role this node fills on the network, decided in Rust
+   * (btx_core::role) from the engine's own answers, never from a setting.
+   * Null when the node is stopped or getnetworkinfo did not answer.
+   * `validation_mode` is consensus | trusted | relay | unknown;
+   * `holds_signing_key` is null when the engine did not answer, which is not
+   * evidence of no key.
+   */
+  role: {
+    validation_mode: string;
+    holds_signing_key: boolean | null;
+    advertises_consensus: boolean;
+    advertises_archive: boolean;
+    reachable_inbound: boolean;
+    inbound: number;
+    uptime_secs: number;
+    blocks_behind: number | null;
+    /** How many of the newest blocks carry this node's own signature, read
+     *  from its stored attestations; null until read or when there is no
+     *  key. `signed` is out of `seen`, not out of `window`. */
+    signed_recent: { signed: number; seen: number; window: number } | null;
+  } | null;
+  /** One line per fact with its sentence pre-rendered in Rust, like
+   *  archive_service_message: the copy lives in one place, with tests. Empty
+   *  when `role` is null. `helps` is true | false | null — null when the
+   *  engine did not say, or when the fact is simply neutral. */
+  role_lines: { label: string; value: string; helps: boolean | null; note: string }[];
   /** A longer chain this node cannot obtain blocks for; null when healthy or
    *  not yet measured. `kind` is longer_branch | waiting_for_bodies |
    *  headers_ahead — waiting_for_bodies is the same branch shape as
@@ -93,6 +205,27 @@ export interface NodeStatusInfo {
    *  is rendered in Rust (fork_message), like archive_service_message. */
   fork: { kind: string; since_secs?: number } | null;
   fork_message: string | null;
+  /** The tip's own age against the wall clock, not against what our peers
+   *  believe. Every other chain signal here — blocks, headers, getchaintips,
+   *  and so `fork` too — is derived from the peers we happen to have, so a
+   *  node stuck together with its peers looks healthy in all of them. A block
+   *  timestamp cannot agree with a stuck peer set. The sentence is rendered in
+   *  Rust, like fork_message. */
+  tip_stale: boolean;
+  tip_age_secs: number | null;
+  tip_stale_message: string | null;
+  /** The network's signers have confirmed blocks this node has not even
+   *  received: the one early sign of a node on a branch the network left,
+   *  when blocks equal headers and the tip is not old yet. Rendered in Rust
+   *  (btx_core::engine_warnings), like fork_message. */
+  behind_signers_message: string | null;
+  /** Everything else btxd is warning about, one sentence each, those that ask
+   *  for attention first. Rendered in Rust; empty when there is nothing. */
+  engine_notes: { message: string; needs_attention: boolean }[];
+  /** "Same chain as other sources" (btx_core::chain_agreement), its
+   *  sentences rendered in Rust. Null when stopped or before the first
+   *  comparison of this run. */
+  chain_agreement: ChainAgreementRow | null;
   node_nickname: string;
   broadcast_nickname: string | null;
   subversion: string | null;
@@ -106,8 +239,34 @@ export interface NodeStatusInfo {
   rc_may_fall_behind: boolean;
   rc_reason: string | null;
   rc_stalled: boolean;
+  /** btxd's standing warning that it cannot check the next block, as the
+   *  Block checking card's sentence. Null when the engine is not saying it. */
+  rc_unverifiable_message: string | null;
   /** Following the chain via an attestation quorum instead of local replay. */
   rc_trusted_mirror: boolean;
+  /** The owner chose to follow signatures on a machine that could validate. */
+  follow_signatures: boolean;
+  /** This machine may check blocks itself, as far as the app can know before
+   *  the engine's first start. The setup screen greys out Full check when not. */
+  full_check_possible: boolean;
+  /** The setup screen selects Full check first: an NVIDIA machine. False on a
+   *  Mac, where Quick start comes first and Full check can still be picked. */
+  full_check_first: boolean;
+  /** The engine refused this Mac's graphics chip, so the node follows
+   *  signatures. The status screen says so once per engine. */
+  chip_refused: boolean;
+  /** A validating start hung in the engine's GPU check, so the app moved the
+   *  node to following signatures (validation.ts says why; Settings' switch
+   *  tries the card again). */
+  gpu_start_hung: boolean;
+  /** "graphics chip" on a Mac, "graphics card" elsewhere. */
+  graphics_word: string;
+  /** How far the background check of the snapshot's older history has got;
+   *  null when there is none running. */
+  history_check: HistoryCheck | null;
+  /** The history line's second sentence: where the chain started and who
+   *  confirmed it, for the chain running now (btx_core::snapshot_start). */
+  started_from: string | null;
   /**
    * Bytes uploaded to peers this run. Null when stopped or when the node did
    * not answer `getnettotals` — the UI drops the claim rather than showing a
@@ -128,9 +287,14 @@ export interface NodeStatusInfo {
     served_by_us: number;
   } | null;
   /**
-   * The stall discriminator's verdict for a frozen trusted mirror (null =
-   * healthy / no verdict). class is one of "body_missing" |
-   * "attestation_missing" | "no_qualifying_peer" | "msghand_spin".
+   * The stall discriminator's verdict for a frozen trusted mirror, or on any
+   * node the catch-up help's conclusion that no archive peer serves old
+   * blocks to it (null = healthy / no verdict). class is one of
+   * "body_missing" | "block_fetch_gated" | "attestation_missing" |
+   * "no_qualifying_peer" | "msghand_spin" | "old_blocks_refused" |
+   * "pins_reject_every_signature" (signatures arrive and the node accepts
+   * none of them: its signer key list is out of date, or the keys it trusts
+   * stopped signing). Every class renders the same way, from `summary`.
    */
   stall: { class: string; summary: string } | null;
   /** The user's node profile CHOICE ("full" | "keeper"). */
@@ -152,6 +316,8 @@ export interface NodeStatusInfo {
   esplora_freshness: string | null;
   /** The guardian's reason while running, else why the front is not. */
   esplora_message: string | null;
+  /** Why Esplora cannot run on this machine at all, said calmly. */
+  esplora_unavailable: string | null;
   /** Answer block-hash questions for wallets. Needs no second binary and no
    *  particular prune posture: the server is compiled into this app. */
   witness_enabled: boolean;
@@ -163,6 +329,18 @@ export interface NodeStatusInfo {
   /** True when the bind address accepts connections from other machines. */
   witness_public: boolean;
   witness_message: string | null;
+  /** Produce and serve an attested snapshot of the chain state: the choice,
+   *  and the keeper's last word (null while off or the node is down). */
+  snapshot_serve_enabled: boolean;
+  snapshot_serve: SnapshotServeStatus | null;
+  /** The last self-update check as the backend persisted it: when it finished
+   *  (RFC 3339, UTC), one of the five words in UPDATE_CHECK_OUTCOMES, and the
+   *  short detail recorded with it. Null/empty until the first check finishes.
+   *  The "Last check" line under the Check-now button is rendered from these
+   *  on every tick, so the automatic path is no longer silent. */
+  last_update_check_at: string | null;
+  last_update_check_outcome: string | null;
+  last_update_check_detail: string;
 }
 
 /**
@@ -326,9 +504,9 @@ function fmtInt(n: number): string {
   return n.toLocaleString("en-US");
 }
 
-// One derivation of "what state is the node in" — the orbs, the ambient line,
-// and the Start/Stop button all read THIS, so they can never disagree.
-type VisualMode = "ready" | "syncing" | "stopped" | "error" | "stalled";
+// What phase the node run is in, for the Start/Stop button. The orbs and the
+// ambient line read headline.ts, which starts from this and turns a running
+// node amber when a card below says it is not following the chain.
 /**
  * `rcStalled` = btxd reported it cannot check the new proof of work. The process
  * is up and answering RPC, so every phase signal still says "ready" — but the
@@ -403,6 +581,49 @@ function setStep(active: number, downloadPct?: number) {
   }
 }
 
+/** The owner's pick on the setup screen, null until they touch it, so the
+ *  default can follow what the machine can do (start-choice.ts). */
+let pickedChoice: StartChoice | null = null;
+
+function reflectStartChoice(status: NodeStatusInfo, inProgress: boolean): void {
+  const view = startChoiceView(status.full_check_possible, status.full_check_first, pickedChoice);
+  const quick = $<HTMLInputElement>("choice-quick");
+  const full = $<HTMLInputElement>("choice-full");
+  quick.checked = view.selected === "quick_start";
+  full.checked = view.selected === "full_check";
+  // No changing course once setup has started; the choice is already recorded.
+  quick.disabled = inProgress;
+  full.disabled = inProgress || view.fullCheckDisabled;
+  $("choice-quick-label").classList.toggle("is-selected", quick.checked);
+  $("choice-full-label").classList.toggle("is-selected", full.checked);
+  $("choice-full-label").classList.toggle("is-disabled", view.fullCheckDisabled);
+  // Locked, not dimmed: the pick stays readable while setup runs.
+  $("choice-quick-label").classList.toggle("is-locked", inProgress);
+  $("choice-full-label").classList.toggle("is-locked", inProgress);
+  const reason = $("choice-full-reason");
+  reason.hidden = !view.fullCheckDisabled;
+  reason.textContent = view.fullCheckDisabled ? NO_GPU_REASON : "";
+  $("start-choice-switch").hidden = !switchLaterShown(status.full_check_possible);
+}
+
+/** What the setup button sends: the owner's pick, or the default for this
+ *  machine. */
+function currentChoice(): StartChoice {
+  return startChoiceView(
+    lastStatus?.full_check_possible ?? false,
+    lastStatus?.full_check_first ?? false,
+    pickedChoice,
+  ).selected;
+}
+
+for (const id of ["choice-quick", "choice-full"]) {
+  $<HTMLInputElement>(id).addEventListener("change", (e) => {
+    const box = e.target as HTMLInputElement;
+    if (box.checked) pickedChoice = box.value as StartChoice;
+    if (lastStatus) reflectStartChoice(lastStatus, setupInFlight);
+  });
+}
+
 function renderWizard(status: NodeStatusInfo) {
   showScreen("wizard");
   const p = status.phase;
@@ -413,6 +634,8 @@ function renderWizard(status: NodeStatusInfo) {
     p.phase === "starting" ||
     p.phase === "warming" ||
     p.phase === "loading_snapshot";
+
+  reflectStartChoice(status, inProgress);
 
   // The button IS the live readout while setting up; idle otherwise.
   if (inProgress) setSetupButton(true, setupPhaseLabel(p));
@@ -428,6 +651,16 @@ function renderWizard(status: NodeStatusInfo) {
   // install the preflight would pass at 20. Always the fresh figure: a resume
   // is gated lower, but overstating is the direction that never strands anyone.
   $("wizard-disk-needed").textContent = fmtGB(status.disk_required_mb);
+  // Short of space: said next to the two numbers before the click, not only
+  // in the error card after it. Not during setup or over its error, which
+  // already say it.
+  const short =
+    inProgress || p.phase === "error"
+      ? null
+      : diskShortfall(status.disk_free_mb, status.disk_required_mb, status.node_profile);
+  $("wizard-free-disk").classList.toggle("is-short", short !== null);
+  $("wizard-disk-short").hidden = short === null;
+  $("wizard-disk-short").textContent = short ?? "";
 
   switch (p.phase) {
     case "downloading":
@@ -512,6 +745,315 @@ function renderContribution(status: NodeStatusInfo) {
   $("contribution-detail").textContent = view.detail;
 }
 
+/** The one-time greeting on a brand new install.
+ *
+ *  Shown once, and only when the backend says so. `welcome_shown` is false
+ *  only when there was no settings file at all, so an existing user updating
+ *  the app is never greeted for a node they set up weeks ago
+ *  (NodeAppSettings::welcome_shown carries the serde trick that makes those
+ *  two cases differ).
+ *
+ *  The services it lists are already ON, from the defaults. This panel exists
+ *  so that is said out loud rather than done quietly, and so the node can be
+ *  given a name while somebody is looking at it. */
+let welcomeOpen = false;
+
+
+function maybeShowWelcome(status: NodeStatusInfo) {
+  if (welcomeOpen || status.welcome_shown || !status.setup_complete) return;
+  welcomeOpen = true;
+  // The signing item is for a host that can sign. `signer_applies_here` is
+  // null until the first start decides; a panel that waited for it would miss
+  // the moment, so null is taken as "probably" and the item is shown, which
+  // is the honest default on every machine with an NVIDIA driver.
+  const signs = status.signer_enabled && status.signer_applies_here !== false;
+  $("welcome-signer-item").hidden = !signs;
+  // Snapshot serving needs the same host, and Explorer mode a node that
+  // keeps the whole chain; elsewhere they do nothing, so they are not listed.
+  $("welcome-snapshot-item").hidden = !(signs && status.snapshot_serve_enabled);
+  $("welcome-explorer-item").hidden = !(status.txindex_enabled && status.explorer_available);
+  const input = $<HTMLInputElement>("welcome-nickname");
+  // An existing install reaching this panel through the contribution
+  // migration may already be named. Showing an empty box would read as "your
+  // node has no name", and leaving it empty on Done would look like it had
+  // been cleared. Prefill so the name is visible and survives untouched.
+  input.value = status.node_nickname ?? "";
+  $("welcome-overlay").hidden = false;
+  input.focus();
+}
+
+async function closeWelcome() {
+  const input = $<HTMLInputElement>("welcome-nickname");
+  const err = $("welcome-nickname-error");
+  const btn = $<HTMLButtonElement>("welcome-done");
+  btn.disabled = true;
+  try {
+    // The box is PREFILLED with the stored name, so it now reflects the true
+    // current value and an empty box is a deliberate "remove my name" rather
+    // than "nothing typed". Send whatever it holds. Skipping the empty case
+    // was correct only while the box always started blank.
+    await invoke<string>("set_node_nickname", { name: input.value });
+  } catch (e) {
+    // Same rule as the Settings field: the Rust side refuses anything btxd
+    // would reject, so this is a sentence about what to type. Keep the panel
+    // open so the name is not silently lost.
+    err.textContent = String(e);
+    err.hidden = false;
+    btn.disabled = false;
+    return;
+  }
+  // A node only helps while it is up, so launch at login is on for every
+  // node (the owner's rule of 2026-10-12; it used to be for signers only).
+  // The panel says so, this is where it happens, once and best-effort: the
+  // plugin is unavailable in dev and the switch in Settings stays the
+  // person's. Keep-awake is already on by default for the same reason.
+  try {
+    await enable();
+  } catch (e) {
+    console.warn("could not turn launch-at-login on", e);
+  }
+  // Mark it seen only after the name is settled, so a refusal above cannot
+  // cost the user the panel.
+  try {
+    await invoke("mark_welcome_shown");
+  } catch (e) {
+    console.error("could not mark the welcome as shown", e);
+  }
+  $("welcome-overlay").hidden = true;
+  btn.disabled = false;
+}
+
+/**
+ * The signer row in Settings. Three things it must say: whether this host can
+ * sign at all (a mirror host cannot, and a switch that pretends otherwise is
+ * worse than none), what the public key is, and that what is being asked for
+ * is trust. The trust sentence is static HTML under the key; this only fills
+ * in the facts.
+ */
+function reflectSignerRow(status: NodeStatusInfo): void {
+  const t = $<HTMLInputElement>("signer-toggle");
+  if (document.activeElement !== t) t.checked = status.signer_enabled;
+  const desc = $("signer-desc");
+  const hungNote = gpuHungSignerNote(status);
+  if (hungNote) {
+    desc.textContent = hungNote;
+  } else if (status.signer_applies_here === false) {
+    desc.textContent =
+      "This machine follows other nodes' signatures rather than checking blocks itself, so it cannot sign. The setting is kept for a machine with a graphics card the engine accepts";
+  } else if (status.signing_live) {
+    desc.textContent =
+      "Your node signs each block it checks, and the engine confirms it is signing now. The nodes that cannot check blocks themselves, the explorer's included, can follow yours";
+  } else {
+    desc.textContent =
+      "Your node signs each block it checks, so the nodes that cannot check blocks themselves, the explorer's included, can follow yours. Applies on next start";
+  }
+  const row = $("signer-key-row");
+  const key = status.signer_enabled ? status.signer_pubkey : null;
+  row.hidden = !key;
+  if (key) $("signer-pubkey").textContent = key;
+
+  // The delivery row only exists while there is a key to deliver.
+  const pubRow = $("signer-publish-row");
+  pubRow.hidden = !key;
+  const pubToggle = $<HTMLInputElement>("signer-publish-toggle");
+  if (document.activeElement !== pubToggle) pubToggle.checked = status.signer_publish_enabled;
+  const line = $("signer-publish-status");
+  const offer = status.signer_offer;
+  if (!status.signer_publish_enabled) {
+    line.textContent =
+      "Not being offered. Send the key above to a mirror operator yourself if you want it pinned.";
+    line.hidden = false;
+  } else if (offer) {
+    // The backend's sentence, with the local time appended: a person wants to
+    // know it happened and when, and the backend has no business formatting a
+    // clock for them.
+    const when = new Date(offer.at);
+    const stamp = Number.isNaN(when.getTime()) ? "" : ` (${hhmm(when)})`;
+    line.textContent = `${offer.detail}${stamp}`;
+    line.hidden = false;
+  } else if (status.signing_live) {
+    line.textContent = "Your key goes out with the next check-in, within fifteen minutes.";
+    line.hidden = false;
+  } else {
+    line.hidden = true;
+  }
+  line.classList.toggle("needs-attention", !!offer && !offer.delivered);
+}
+
+$<HTMLInputElement>("signer-publish-toggle").addEventListener("change", async (e) => {
+  const box = e.target as HTMLInputElement;
+  const on = box.checked;
+  const result = $("signer-publish-result");
+  box.disabled = true;
+  try {
+    const msg = await invoke<string>("set_signer_publish", { on });
+    result.classList.remove("is-error");
+    result.textContent = msg;
+  } catch (err) {
+    box.checked = !on;
+    result.classList.add("is-error");
+    result.textContent = String(err);
+  }
+  result.hidden = false;
+  box.disabled = false;
+  void tick();
+});
+
+/** The status screen's offer to follow signatures: on a machine whose chip
+ *  cannot check blocks at all (validation.ts `stalledFollowOffer`), or on one
+ *  that checks blocks itself, running, behind, and measured adding far fewer
+ *  blocks an hour than the chain makes (catchup-trend.ts `cannotCatchUp`,
+ *  which the cadence hold never trips). Nothing changes until the owner
+ *  clicks. */
+function reflectFollowOffer(status: NodeStatusInfo): void {
+  const card = $("follow-card");
+  const p = status.phase;
+  const stalled =
+    p.phase === "ready" || p.phase === "syncing" ? stalledFollowOffer(status) : null;
+  if (stalled !== null) {
+    card.hidden = false;
+    $("follow-msg").textContent = stalled;
+    return;
+  }
+  const added =
+    p.phase === "ready" &&
+    !status.rc_stalled &&
+    status.rc_validates_independently &&
+    p.blocks_behind >= LAG_WORTH_SAYING
+      ? cannotCatchUp(catchupSamples, Date.now())
+      : null;
+  if (added === null) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  const pace = added === 0 ? "has added no blocks lately" : `adds about ${added} block${added === 1 ? "" : "s"} an hour`;
+  $("follow-msg").textContent =
+    `This computer checks every block itself and ${pace}, fewer than the ${CHAIN_BLOCKS_PER_HOUR} ` +
+    "the network makes, so it will not catch up this way. It can follow signatures instead, as a " +
+    "Windows PC does: it then stops checking the proof of work itself and cannot sign. You can " +
+    "switch back in Settings.";
+}
+
+function reflectFollowRow(status: NodeStatusInfo): void {
+  // Only where it is a choice: a machine that checks blocks, one whose chip
+  // failed the check, one whose card hung the start-up check, or one whose
+  // owner already chose. A machine that follows signatures anyway has none.
+  $("follow-row").hidden = !followRowVisible(status);
+  const t = $<HTMLInputElement>("follow-toggle");
+  if (document.activeElement !== t) t.checked = followToggleOn(status);
+}
+
+async function setFollowSignatures(on: boolean): Promise<void> {
+  await invoke("set_follow_signatures", { on });
+  void tick();
+}
+
+// Two steps, like Remove: the first click says what happens, the second does
+// it. The node restarts, so this is not a toggle to brush by accident.
+let followArmTimer: ReturnType<typeof setTimeout> | undefined;
+$("follow-btn").addEventListener("click", async () => {
+  const btn = $<HTMLButtonElement>("follow-btn");
+  if (btn.dataset.armed !== "1") {
+    btn.dataset.armed = "1";
+    btn.textContent = "Click again to restart and follow signatures";
+    clearTimeout(followArmTimer);
+    followArmTimer = setTimeout(() => {
+      btn.dataset.armed = "";
+      btn.textContent = "Follow signatures instead";
+    }, 6000);
+    return;
+  }
+  clearTimeout(followArmTimer);
+  btn.dataset.armed = "";
+  btn.disabled = true;
+  btn.textContent = "Restarting…";
+  try {
+    await setFollowSignatures(true);
+    $("follow-card").hidden = true;
+    catchupSamples = [];
+  } catch (err) {
+    showToast(String(err));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Follow signatures instead";
+  }
+});
+
+$<HTMLInputElement>("follow-toggle").addEventListener("change", async (e) => {
+  const box = e.target as HTMLInputElement;
+  const on = box.checked;
+  const result = $("follow-result");
+  box.disabled = true;
+  try {
+    await setFollowSignatures(on);
+    // The restart has run by now; when "check blocks" hung the card again,
+    // the node is back on signatures and the line says so.
+    let after: NodeStatusInfo | null = null;
+    try {
+      after = await invoke<NodeStatusInfo>("get_node_status");
+    } catch {
+      // No status: say what was asked for.
+    }
+    result.classList.remove("is-error");
+    result.textContent = followResultText(
+      on,
+      after?.gpu_start_hung === true,
+      after?.graphics_word,
+    );
+    catchupSamples = [];
+  } catch (err) {
+    box.checked = !on;
+    result.classList.add("is-error");
+    result.textContent = String(err);
+  }
+  result.hidden = false;
+  box.disabled = false;
+});
+
+$<HTMLInputElement>("signer-toggle").addEventListener("change", async (e) => {
+  const box = e.target as HTMLInputElement;
+  const on = box.checked;
+  const result = $("signer-result");
+  box.disabled = true;
+  try {
+    const msg = await invoke<string>("set_signer", { on });
+    result.classList.remove("is-error");
+    result.textContent = msg;
+  } catch (err) {
+    box.checked = !on;
+    result.classList.add("is-error");
+    result.textContent = String(err);
+  }
+  result.hidden = false;
+  box.disabled = false;
+  // The key row appears the moment the key exists, not at the next poll.
+  void tick();
+});
+
+$("signer-copy-btn").addEventListener("click", async () => {
+  const btn = $<HTMLButtonElement>("signer-copy-btn");
+  const text = ($("signer-pubkey").textContent ?? "").trim();
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    btn.textContent = "Copied";
+  } catch {
+    btn.textContent = "Couldn't copy";
+  }
+  setTimeout(() => (btn.textContent = "Copy key"), 1500);
+});
+
+/** The gap samples behind the "catching up" wording. Module scope because the
+ *  poll loop calls renderStatus repeatedly and the trend needs history; the
+ *  arithmetic itself is pure and tested in catchup-trend.test.ts. */
+let catchupSamples: CatchupSample[] = [];
+/** The badge the last render showed, for announceChange; null before the
+ *  first status screen. */
+let lastHeadlineBadge: string | null = null;
+/** Speaks the headline's changes of state (#status-announce). */
+const announceStatus = announcer($("status-announce"));
+
 function renderStatus(status: NodeStatusInfo) {
   showScreen("status");
   const p = status.phase;
@@ -521,13 +1063,73 @@ function renderStatus(status: NodeStatusInfo) {
   const errCard = $("status-error");
 
   reflectPeerNames(status);
-  reflectFork(status);
+  reflectEngineNotes(status);
+  renderChainAgreement(status);
+  reflectChipNotice(status);
+  reflectHistoryCheck(status);
+  renderRole(status);
+  reflectSignerRow(status);
+  // The close dialog's warning follows the wire on every tick, so a dialog
+  // opened an hour into a run says what the node is doing now.
+  $("close-signer-warning").hidden = !status.signing_live;
   reflectEsploraRow(status);
+  reflectExplorerRow(status);
   reflectWitnessRow(status);
+  reflectSnapshotServeRow(status);
+  reflectFollowRow(status);
 
-  const mode = visualMode(p, status.rc_stalled);
+  // Record the gap on every poll while the node runs, so the wording below
+  // can tell a closing gap from a pinned one, and a syncing node that adds
+  // blocks from one that has stopped. Cheap, bounded, and the only place the
+  // sample is available. Which phases feed it, with what gap, and which start
+  // it over is catchup-trend.ts `trendReading`.
+  const reading = trendReading(p, Date.now());
+  catchupSamples = recordReading(catchupSamples, reading, Date.now());
+
+  // After the sample above, so the stale card judges the trend as it is now.
+  // Judged once a tick: the chain card and the headline read the same one.
+  const stale = staleCard(status.tip_stale_message, reading, catchupSamples, Date.now(), syncingStaleAmber);
+  syncingStaleAmber = reading.kind === "syncing" && stale?.tone === "amber";
+  reflectFork(status, stale);
+  reflectFollowOffer(status);
+
+  // The badge, the line under it and the orb, from one function
+  // (headline.ts), so the headline cannot say LIVE over a card that says the
+  // node is not following the chain.
+  const head = headline(p, {
+    rcStalled: status.rc_stalled,
+    rcMayFallBehind: status.rc_may_fall_behind,
+    stale,
+    forkMessage: status.fork_message,
+    behindSignersMessage: status.behind_signers_message,
+    tipAgeSecs: status.tip_age_secs,
+    stallClass: status.stall?.class ?? null,
+    agreement: status.chain_agreement?.this_node ?? null,
+    // "Near tip" is a boolean with no lag term: it flips the moment the
+    // snapshot chainstate loads at a height fixed in the release, so a fresh
+    // install reads LIVE while still thousands of blocks short. The line says
+    // the gap, and from the gap's own trend whether it is closing
+    // (catchup-trend.ts, where the wording and its history are).
+    catchup:
+      p.phase === "ready" && p.blocks_behind >= LAG_WORTH_SAYING
+        ? catchupLine(p.blocks_behind, catchupSamples, Date.now())
+        : null,
+    // The same test the disk card's red "may stop" line uses, below.
+    diskCritical: status.disk_free_mb > 0 && status.disk_free_mb < status.disk_critical_mb,
+  });
+  const said = announceChange(lastHeadlineBadge, head);
+  lastHeadlineBadge = head.badge;
+  if (said) announceStatus(said);
+  badge.textContent = head.badge;
+  sub.textContent = head.sub;
+  const mode = head.mode;
+  // The badge takes the orb's colour when something is wrong, so the word
+  // reads as a warning without the orb beside it (styles.css).
+  badge.dataset.mode = mode;
+  // Compact mode is only the light; hovering it is the one way to read why
+  // it is amber or red.
+  $("compact-light").title = head.sub ? `${head.badge}: ${head.sub}` : head.badge;
   orb.className = `status-orb is-${mode}`;
-  errCard.hidden = true;
 
   // Ambient line + compact orb mirror the main orb's state — one mapping.
   ambientMain.setMode(ambientMode(mode));
@@ -538,69 +1140,17 @@ function renderStatus(status: NodeStatusInfo) {
   lastActive = mode === "ready" || mode === "syncing";
   core?.setActive(lastActive);
 
+  // A node that is not running shows what happened and how to start it right
+  // under the headline (styles.css `.is-idle`); they sat at the bottom of a
+  // long scroll, below every card.
+  screenStatus.classList.toggle("is-idle", p.phase === "stopped" || p.phase === "error");
+  errCard.hidden = p.phase !== "error";
+  if (p.phase === "error") $("status-error-msg").textContent = p.message;
+
   let height = 0;
-  switch (p.phase) {
-    case "ready":
-      if (status.rc_stalled) {
-        // Running, connected, answering RPC — and NOT following the chain.
-        // Say that plainly instead of the confident green LIVE.
-        badge.textContent = "NOT FOLLOWING";
-        sub.textContent = "Your node is running but cannot check new blocks on this machine";
-      } else if (status.rc_may_fall_behind) {
-        badge.textContent = "LIVE";
-        sub.textContent = "Your node is helping the network, checking blocks on the processor";
-      } else if (p.blocks_behind >= LAG_WORTH_SAYING) {
-        // "Near tip" is a boolean with no lag term: it flips the moment the
-        // snapshot chainstate loads at a height fixed in the release, so a
-        // fresh install reads LIVE while still thousands of blocks short and
-        // grinding. Still LIVE — it is running and connected — but say the gap
-        // rather than let "helping the network" stand on its own.
-        badge.textContent = "LIVE";
-        sub.textContent = `Your node is live, still catching up — ${fmtInt(p.blocks_behind)} blocks behind`;
-      } else {
-        // "LIVE", not "READY": the node is running and serving the network now —
-        // "ready" reads like it's waiting to do something.
-        badge.textContent = "LIVE";
-        sub.textContent = "Your node is live and helping the network";
-      }
-      height = p.height;
-      $("stat-peers").textContent = fmtInt(p.peers);
-      break;
-    case "syncing":
-      if (p.height === 0 && p.headers > 0) {
-        // Headers phase (pre-sync/sync): the chain itself hasn't started —
-        // show the header count doing the moving.
-        badge.textContent = `FETCHING HEADERS ${(p.progress * 100).toFixed(0)}%`;
-        sub.textContent = `Counting the chain — ${fmtInt(p.headers)} block headers so far`;
-      } else {
-        badge.textContent = `SYNCING ${(p.progress * 100).toFixed(1)}%`;
-        sub.textContent = `Catching up — headers at ${fmtInt(p.headers)}`;
-      }
-      height = p.height;
-      $("stat-peers").textContent = fmtInt(p.peers);
-      break;
-    case "starting":
-    case "loading_snapshot":
-      badge.textContent = p.phase === "starting" ? "STARTING" : "LOADING SNAPSHOT";
-      sub.textContent = "This can take a moment";
-      break;
-    case "warming":
-      badge.textContent = "GETTING READY";
-      sub.textContent = `${p.message} — nothing is wrong, your node is checking its data. This can take a while after a hard shutdown.`;
-      break;
-    case "stopped":
-      badge.textContent = "STOPPED";
-      sub.textContent = "The node is not running";
-      break;
-    case "error":
-      badge.textContent = "NEEDS ATTENTION";
-      sub.textContent = "";
-      errCard.hidden = false;
-      $("status-error-msg").textContent = p.message;
-      break;
-    default:
-      badge.textContent = "…";
-      sub.textContent = "";
+  if (p.phase === "ready" || p.phase === "syncing") {
+    height = p.height;
+    $("stat-peers").textContent = fmtInt(p.peers);
   }
 
   // A new block arrived — send one gentle note through the frequency line.
@@ -629,7 +1179,7 @@ function renderStatus(status: NodeStatusInfo) {
     warn.hidden = false;
     warn.classList.add("is-critical");
     warn.textContent =
-      "Very low disk space — the node may stop. Free some space or use Reclaim in Settings.";
+      "Very low disk space: the node may stop. Free some space or use Reclaim in Settings.";
   } else if (status.disk_free_mb > 0 && status.disk_free_mb < status.disk_warn_mb) {
     warn.hidden = false;
     warn.classList.remove("is-critical");
@@ -653,7 +1203,43 @@ let lastStatus: NodeStatusInfo | null = null;
 /** One-shot latch so the wizard error card scrolls into view only when it first appears. */
 let wizardErrorShown = false;
 
+/** When the status poll in flight started, or null when none is. One poll at
+ *  a time: get_node_status asks btxd twice with a 60 s timeout each, and at
+ *  one poll every 1.5 s a btxd that accepted connections and never answered
+ *  stacked up dozens of them, each asking it twice more, and their answers
+ *  could land out of order. */
+let pollStartedAt: number | null = null;
+/** A tick asked for while one was in flight (an action's "refresh now"):
+ *  run once more as soon as it lands, so the action's result still shows. */
+let pollAgain = false;
+
 async function tick() {
+  if (pollStartedAt !== null) {
+    pollAgain = true;
+    return;
+  }
+  pollStartedAt = Date.now();
+  try {
+    await pollStatus();
+  } finally {
+    pollStartedAt = null;
+    if (pollAgain) {
+      pollAgain = false;
+      void tick();
+    }
+  }
+}
+
+/** While a poll is slow, say so under the badge instead of letting the last
+ *  screen stand as if it were current (headline.ts `waitingLine`). The next
+ *  status that lands rewrites the line. */
+function reflectWaiting(): void {
+  if (pollStartedAt === null || !lastStatus || screenStatus.hidden) return;
+  const line = waitingLine(Date.now() - pollStartedAt);
+  if (line) $("status-sub").textContent = line;
+}
+
+async function pollStatus() {
   try {
     const status = await invoke<NodeStatusInfo>("get_node_status");
     lastStatus = status;
@@ -666,8 +1252,13 @@ async function tick() {
     // changes — or vanishes when the node stops — is reflected while it is
     // being looked at, not only on the next open.
     reflectArchiveService(status);
+    // Same reason, same place: the "Last check" line is in Settings and is
+    // rendered from what the backend persisted, so it is right at launch and
+    // right within a tick of a check finishing, whoever started the check.
+    reflectLastUpdateCheck(status);
     reflectWalletEnabled(status.wallet_enabled);
     if (status.setup_complete) setupDone = true;
+    maybeShowWelcome(status);
 
     if (setupDone && !setupInFlight) {
       renderStatus(status);
@@ -702,6 +1293,7 @@ async function beginSetup() {
   // Immediate feedback on the click: the button becomes a spinner + live label
   // and the "come back later" note appears, before any backend round-trip.
   setSetupButton(true, "Setting up your node…");
+  if (lastStatus) reflectStartChoice(lastStatus, true);
   $<HTMLButtonElement>("retry-btn").disabled = true;
   wizardProgress.hidden = false;
   setStep(0);
@@ -713,7 +1305,7 @@ async function beginSetup() {
     // Completion truth comes from the polled status.setup_complete — a
     // resolved invoke is NOT proof (the backend rejects a duplicate run with
     // an error, and older builds resolved it silently).
-    await invoke("begin_setup");
+    await invoke("begin_setup", setupArgs(currentChoice()));
   } catch (e) {
     $("wizard-error-msg").textContent = String(e);
     wizardError.hidden = false;
@@ -754,6 +1346,9 @@ $("settings-btn").addEventListener("click", async () => {
   if (lastStatus) {
     $("setting-datadir").textContent = lastStatus.datadir;
     $<HTMLInputElement>("keepawake-toggle").checked = lastStatus.keep_awake;
+    // Only inside WSL does a driver update need a WSL restart to recover.
+    $("wslrecover-row").hidden = !lastStatus.in_wsl;
+    $<HTMLInputElement>("wslrecover-toggle").checked = lastStatus.gpu_recovery_restarts_wsl;
     // Only macOS can actually hold the assertion. Rather than leave a switch
     // that is on and inert, say what the machine will really do. The row stays
     // visible because sleep is still the user's problem to solve — it just
@@ -765,7 +1360,7 @@ $("settings-btn").addEventListener("click", async () => {
         const desc = awakeRow.querySelector(".setting-desc");
         if (desc) {
             desc.textContent =
-                "Not available on this system — set your computer's own sleep settings to Never";
+                "Not available on this system: set your computer's own sleep settings to Never";
         }
     }
     $<HTMLInputElement>("serve-toggle").checked = lastStatus.attestation_serve_enabled;
@@ -775,12 +1370,14 @@ $("settings-btn").addEventListener("click", async () => {
     // bit while silently degraded to the live window looked completely fine.
     reflectArchiveService(lastStatus);
     reflectNickname(lastStatus);
+    reflectSignerRow(lastStatus);
     $<HTMLInputElement>("report-toggle").checked = lastStatus.service_report_enabled;
     $<HTMLInputElement>("wallet-toggle").checked = lastStatus.wallet_enabled;
     reflectOnClose(lastStatus.on_close);
     reflectKeeperRow(lastStatus);
     reflectEsploraRow(lastStatus);
     reflectWitnessRow(lastStatus);
+    reflectSnapshotServeRow(lastStatus);
   }
   // The preflight is a question about the machine, so it is asked when the
   // panel opens rather than on the status poll: it reads the conf, the node
@@ -801,6 +1398,10 @@ $("global-stats-link").addEventListener("click", () => {
   void invoke("open_global_stats").catch((e) => showToast(String(e)));
 });
 
+$("community-link").addEventListener("click", () => {
+  void invoke("open_btx_community").catch((e) => showToast(String(e)));
+});
+
 $("open-datadir-btn").addEventListener("click", () => {
   void invoke("open_data_folder").catch((e) => showToast(String(e)));
 });
@@ -819,6 +1420,11 @@ $<HTMLInputElement>("autostart-toggle").addEventListener("change", async (e) => 
 $<HTMLInputElement>("keepawake-toggle").addEventListener("change", (e) => {
   const on = (e.target as HTMLInputElement).checked;
   void invoke("set_keep_awake", { on }).catch((err) => showToast(String(err)));
+});
+
+$<HTMLInputElement>("wslrecover-toggle").addEventListener("change", (e) => {
+  const on = (e.target as HTMLInputElement).checked;
+  void invoke("set_gpu_recovery_restarts_wsl", { on }).catch((err) => showToast(String(err)));
 });
 
 $<HTMLInputElement>("keeper-toggle").addEventListener("change", (e) => {
@@ -1003,7 +1609,7 @@ function reflectWitnessRow(status: NodeStatusInfo): void {
     desc.textContent = status.witness_message;
     desc.classList.add("needs-attention");
   } else {
-    desc.textContent = "Saved — it starts with the node";
+    desc.textContent = "Saved: it starts with the node";
   }
 
   const listenDesc = $("witness-listen-desc");
@@ -1012,6 +1618,85 @@ function reflectWitnessRow(status: NodeStatusInfo): void {
     ? "Any machine that can reach this address can ask. Nothing about your wallet or your coins is exposed: it answers block hashes and refuses everything else"
     : "This machine only, unless you change it. Use 0.0.0.0 to let other machines ask. Applies at the next node start";
 }
+
+const SNAPSHOT_SERVE_STATIC_COPY =
+  "Export the chain state at the tip, sign it, and let new nodes fetch it instead of catching up from a months-old file. Needs a node that checks blocks itself and signs. About 9 MB, taken every 100 blocks and offered once it is 144 blocks deep, about three and a half hours later";
+
+$<HTMLInputElement>("snapshot-serve-toggle").addEventListener("change", async (e) => {
+  const box = e.target as HTMLInputElement;
+  const on = box.checked;
+  const result = $("snapshot-serve-result");
+  box.disabled = true;
+  try {
+    const msg = await invoke<string>("set_snapshot_serve", { on });
+    result.classList.remove("is-error");
+    result.textContent = msg;
+  } catch (err) {
+    box.checked = !on;
+    result.classList.add("is-error");
+    result.textContent = String(err);
+  }
+  result.hidden = false;
+  box.disabled = false;
+});
+
+/**
+ * The snapshot row says what the keeper last said: off, saved and waiting
+ * for the node, refused (the gate's sentence, in amber), a cycle's phase, or
+ * what is on offer and how old it is. It never claims an offer is live on the
+ * strength of the setting; `offering` comes from the node's own service bits.
+ */
+function reflectSnapshotServeRow(status: NodeStatusInfo): void {
+  const t = $<HTMLInputElement>("snapshot-serve-toggle");
+  if (document.activeElement !== t) t.checked = status.snapshot_serve_enabled;
+  const desc = $("snapshot-serve-desc");
+  desc.classList.remove("needs-attention");
+  if (!status.snapshot_serve_enabled) {
+    desc.textContent = SNAPSHOT_SERVE_STATIC_COPY;
+  } else if (status.snapshot_serve) {
+    desc.textContent = status.snapshot_serve.message;
+    desc.classList.toggle("needs-attention", status.snapshot_serve.needs_attention);
+  } else {
+    desc.textContent = "Saved: it starts with the node";
+  }
+}
+
+/** Explorer mode's row (feature-rows.ts explorerRow). */
+function reflectExplorerRow(status: NodeStatusInfo): void {
+  const row = explorerRow(status);
+  const t = $<HTMLInputElement>("explorer-toggle");
+  if (document.activeElement !== t && !explorerToggleBusy) t.checked = row.checked;
+  t.disabled = row.disabled || explorerToggleBusy;
+  $("explorer-desc").textContent = row.desc;
+}
+
+// The switch restarts a running node to apply the change (ask.rs
+// set_explorer_mode), so it is seconds, and a second click waits.
+let explorerToggleBusy = false;
+$<HTMLInputElement>("explorer-toggle").addEventListener("change", async (e) => {
+  const box = e.target as HTMLInputElement;
+  const on = box.checked;
+  const result = $("explorer-result");
+  explorerToggleBusy = true;
+  box.disabled = true;
+  result.classList.remove("is-error");
+  result.textContent = on ? "Turning on, the node restarts…" : "Turning off, the node restarts…";
+  result.hidden = false;
+  try {
+    await invoke("set_explorer_mode", { on });
+    result.textContent = on
+      ? "On. The index builds in the background while the node keeps working."
+      : "Off. The index is no longer kept.";
+  } catch (err) {
+    box.checked = !on;
+    result.classList.add("is-error");
+    result.textContent = String(err);
+  } finally {
+    explorerToggleBusy = false;
+    box.disabled = false;
+    void tick();
+  }
+});
 
 const ESPLORA_STATIC_COPY =
   "Serve the Esplora API to wallets from your own full node. Needs the whole chain on disk (never a pruned node), electrs and Caddy built from deploy/esplora, and disk for the index";
@@ -1031,6 +1716,11 @@ function reflectEsploraRow(status: NodeStatusInfo): void {
   desc.classList.remove("needs-attention");
   if (!status.esplora_enabled) {
     desc.textContent = ESPLORA_STATIC_COPY;
+  } else if (status.esplora_unavailable) {
+    // On by default since 2026-10-12, and on nearly every install it cannot
+    // run: its programs are not shipped, or the node keeps only the newest
+    // blocks. Not a fault, so not amber.
+    desc.textContent = status.esplora_unavailable;
   } else if (status.esplora_indexing) {
     // Work in progress, NOT a problem: no amber. A first index on a full chain
     // runs for hours and the node serves the network the whole time.
@@ -1046,7 +1736,7 @@ function reflectEsploraRow(status: NodeStatusInfo): void {
         : "";
     const fresh = status.esplora_freshness ?? "not judged yet";
     desc.textContent =
-      `Serving on ${where}${pending} — freshness: ${fresh}` +
+      `Serving on ${where}${pending} · freshness: ${fresh}` +
       (status.esplora_message ? ` (${status.esplora_message})` : "");
     if (status.esplora_freshness !== "fresh") desc.classList.add("needs-attention");
   } else if (status.esplora_message) {
@@ -1060,7 +1750,7 @@ function reflectEsploraRow(status: NodeStatusInfo): void {
       "On, but electrs and the front are not running. Stop and start the node to try again; the log is in the esplora folder inside your data folder.";
     desc.classList.add("needs-attention");
   } else {
-    desc.textContent = "Saved — electrs and the front start with the node";
+    desc.textContent = "Saved: electrs and the front start with the node";
   }
 }
 
@@ -1112,7 +1802,7 @@ function reflectNickname(status: NodeStatusInfo): void {
     wire.textContent = status.subversion; // textContent: this came off the node
     desc.append(wire);
     if (status.node_nickname && !status.subversion.includes(`(${status.node_nickname})`)) {
-      desc.append(" — your new name applies the next time the node starts");
+      desc.append(" · your new name applies the next time the node starts");
     }
   } else {
     desc.textContent =
@@ -1170,23 +1860,230 @@ function reflectArchiveService(status: NodeStatusInfo): void {
   el.classList.toggle("needs-attention", status.archive_service_needs_attention);
 }
 
+/** Whether the stale sentence was amber on a syncing node at the last poll.
+ *  A syncing node's card keeps amber until its hour's pace is back at the
+ *  chain's (catchup-trend.ts `staleCard`, `wasAmber`), so it does not blink. */
+let syncingStaleAmber = false;
+
 /**
- * A longer chain exists that this node cannot obtain blocks for. Shown in
- * amber beside the height and never guessed: the sentence is btx_core::fork's,
- * the facts are btxd's own getchaintips. Hidden the moment the verdict
- * clears, so a stale alarm never outlives the condition, and hidden on any
- * phase that is not running: a stopped node has no view of the chain to be
- * behind with.
+ * The chain card, one sentence about whether this node follows the chain:
+ * its newest block is hours old by the clock, a longer chain exists that it
+ * cannot obtain blocks for, or it is behind the signers. Amber, and never
+ * guessed: the sentences are Rust's (btx_core::fork, engine_warnings), the
+ * facts btxd's own. Before the catch-up trend is measured it can instead say
+ * "Checking whether your node is catching up..." in the quiet colours, which
+ * is not a verdict and yields to both of the others (catchup-trend.ts
+ * `staleCard` and `chainCardMessage`). Hidden the moment the verdict clears,
+ * so a stale alarm never outlives the condition, and hidden on any phase that
+ * is not running: a stopped node has no view of the chain to be behind with.
  */
-function reflectFork(status: NodeStatusInfo): void {
+function reflectFork(status: NodeStatusInfo, stale: StaleCard | null): void {
   const card = $("fork-card");
   const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
-  if (!running || !status.fork_message) {
+  const shown = chainCardMessage(stale, status.fork_message, status.behind_signers_message);
+  if (!running || !shown) {
     card.hidden = true;
     return;
   }
   card.hidden = false;
-  $("fork-msg").textContent = status.fork_message;
+  card.classList.toggle("is-calm", shown.calm);
+  $("fork-msg").textContent = shown.message;
+}
+
+/** The background check of the snapshot's older history: one line and a thin
+ *  bar under the status line while it runs (history-check.ts). Hidden on a
+ *  node that is not running, and the moment the engine reports it done. */
+function reflectHistoryCheck(status: NodeStatusInfo): void {
+  const wrap = $("history-check");
+  const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
+  const view = running ? historyCheckView(status.history_check, status.started_from) : null;
+  if (!view) {
+    wrap.hidden = true;
+    return;
+  }
+  wrap.hidden = false;
+  $("history-line").textContent = view.line;
+  $("history-fill").style.width = `${view.pct}%`;
+  $("history-bar").setAttribute("aria-valuenow", String(view.pct));
+}
+
+/** The note after the engine turned this Mac's chip down, once per engine
+ *  (start-choice.ts `chipNoticeVisible`). Remembered in localStorage by engine
+ *  tag; where storage is unavailable it still closes for this run. */
+const CHIP_NOTICE_KEY = "ebtx-node.chip-notice-seen";
+let chipNoticeClosed = false;
+/** The always-present live region that says the notice, then lets it go. */
+const announceChip = announcer($("chip-announce"));
+
+function reflectChipNotice(status: NodeStatusInfo): void {
+  let seen: string | null = null;
+  try {
+    seen = localStorage.getItem(CHIP_NOTICE_KEY);
+  } catch {
+    // No storage: show it until OK is pressed in this run.
+  }
+  const card = $("chip-card");
+  const shown =
+    !chipNoticeClosed &&
+    chipNoticeVisible(status.chip_refused, status.rc_trusted_mirror, seen, status.node_tag);
+  // Spoken through the region that is always there, once, as the notice
+  // appears (a poll that rewrote the same text could repeat it), and cleared
+  // a few seconds later, since the card still shows it.
+  if (shown && card.hidden) announceChip($("chip-msg").textContent ?? "");
+  if (!shown && $("chip-announce").textContent) announceChip("");
+  card.hidden = !shown;
+}
+
+/** The element focus moves to when `leaving` is about to hide with focus in
+ *  it: the next one on the screen that can take focus, or the one before it
+ *  when there is none after. Without this a keyboard user is dropped back to
+ *  the top of the page. */
+function focusTargetAfter(leaving: HTMLElement, screen: HTMLElement): HTMLElement | null {
+  const candidates = Array.from(
+    screen.querySelectorAll<HTMLElement>(
+      'button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter(
+    (el) => !leaving.contains(el) && !el.matches(":disabled") && el.getClientRects().length > 0,
+  );
+  const after = candidates.find(
+    (el) => leaving.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING,
+  );
+  const before = candidates.filter(
+    (el) => leaving.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_PRECEDING,
+  );
+  return after ?? before[before.length - 1] ?? null;
+}
+
+$("chip-ok").addEventListener("click", () => {
+  chipNoticeClosed = true;
+  try {
+    if (lastStatus) localStorage.setItem(CHIP_NOTICE_KEY, lastStatus.node_tag);
+  } catch {
+    // Closed for this run; it may show again on the next.
+  }
+  const card = $("chip-card");
+  // Only when the card held focus (a keyboard press, or a browser that
+  // focuses a clicked button): hiding it would drop focus to the page.
+  const next = card.contains(document.activeElement) ? focusTargetAfter(card, screenStatus) : null;
+  card.hidden = true;
+  announceChip("");
+  next?.focus();
+});
+
+/**
+ * What btxd itself is warning about, beyond what the Block checking and chain
+ * cards already say: a wrong clock, an engine that is out of date, a chain
+ * the node refused. The sentences are btx_core::engine_warnings'; this only
+ * lays them out, amber for the ones that ask something of the person, quiet
+ * for the ones that only explain. Hidden on any phase that is not running,
+ * like the fork card.
+ */
+function reflectEngineNotes(status: NodeStatusInfo): void {
+  const card = $("engine-card");
+  const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
+  if (!running || status.engine_notes.length === 0) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  card.classList.toggle(
+    "is-calm",
+    !status.engine_notes.some((n) => n.needs_attention),
+  );
+  const list = $("engine-notes");
+  // Elements and textContent, never innerHTML: an unrecognised warning is
+  // shown in the engine's own words.
+  list.textContent = "";
+  for (const note of status.engine_notes) {
+    const p = document.createElement("p");
+    p.className = note.needs_attention ? "" : "is-calm";
+    p.textContent = note.message;
+    list.appendChild(p);
+  }
+}
+
+/**
+ * "Same chain as other sources": the word, who agrees at which block and
+ * when, and for anything but AGREE what differs and what it means. The
+ * sentences are btx_core::chain_agreement's; chain-agreement.ts picks the
+ * tone. Hidden on any phase that is not running, like the role card.
+ */
+function renderChainAgreement(status: NodeStatusInfo): void {
+  const card = $("agree-card");
+  const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
+  const view = chainAgreementView(status.chain_agreement, running);
+  if (!view) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  card.classList.remove("is-ok", "is-caution", "is-warning", "is-unknown");
+  card.classList.add(view.tone);
+  $("agree-word").textContent = view.word;
+  $("agree-scope").textContent = view.scope;
+  // Elements and textContent, never innerHTML: the sentences name sources.
+  const list = $("agree-lines");
+  list.textContent = "";
+  for (const line of view.lines) {
+    const p = document.createElement("p");
+    p.textContent = line;
+    list.appendChild(p);
+  }
+}
+
+/**
+ * "Your node's role": one line per fact about what this machine is actually
+ * doing for the network, each with a sentence on whether that helps. The facts
+ * and the sentences are btx_core::role's — this only lays them out. Hidden on
+ * any phase that is not running, like the fork card: a stopped node fills no
+ * role, and the last live answer must not stay up as if it did.
+ */
+function renderRole(status: NodeStatusInfo): void {
+  const card = $("role-card");
+  const running = status.phase.phase === "ready" || status.phase.phase === "syncing";
+  if (!running || !status.role || status.role_lines.length === 0) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  const list = $("role-lines");
+  // Elements and textContent, never innerHTML: the strings are ours today, and
+  // the habit is what keeps that safe on the day one of them is not.
+  list.textContent = "";
+  for (const line of status.role_lines) {
+    const li = document.createElement("li");
+    const verdict =
+      line.helps === true ? "is-helps" : line.helps === false ? "is-not" : "is-unknown";
+    li.className = `role-line ${verdict}`;
+    const row = document.createElement("div");
+    row.className = "role-row";
+    const mark = document.createElement("span");
+    mark.className = "role-mark";
+    // The mark is the only place the verdict is not spelled out in words, so
+    // give a screen reader the words.
+    mark.setAttribute("role", "img");
+    mark.setAttribute(
+      "aria-label",
+      line.helps === true
+        ? "helps the network"
+        : line.helps === false
+          ? "does not help the network"
+          : "not known",
+    );
+    const label = document.createElement("span");
+    label.className = "role-label";
+    label.textContent = line.label;
+    const value = document.createElement("span");
+    value.className = "role-value";
+    value.textContent = line.value;
+    row.append(mark, label, value);
+    const note = document.createElement("p");
+    note.className = "role-note";
+    note.textContent = line.note;
+    li.append(row, note);
+    list.append(li);
+  }
 }
 
 function reflectKeeperRow(status: NodeStatusInfo) {
@@ -1195,7 +2092,7 @@ function reflectKeeperRow(status: NodeStatusInfo) {
   const desc = $("keeper-desc");
   if (status.node_profile === "keeper" && !status.keeper_engine_ready) {
     desc.textContent =
-      "Saved — Keeper mode switches on with the next node engine update (this engine cannot yet prune + serve safely)";
+      "Saved: Keeper mode switches on with the next node engine update (this engine cannot yet prune + serve safely)";
   } else if (status.node_profile === "keeper") {
     desc.textContent =
       "Small node (~10 GB) serving signed confirmations. Applies fully at the next node start";
@@ -1209,7 +2106,7 @@ function reflectKeeperRow(status: NodeStatusInfo) {
       "This folder already deleted old blocks in an earlier run, so it stays small whatever this switch says. Getting every block back means downloading the chain again. It can still help wallets check the chain: that needs the list of blocks, not the blocks";
   } else {
     desc.textContent =
-      "Small node (~10 GB) that serves signed confirmations — the network's scarcest service";
+      "Small node (~10 GB) that serves signed confirmations, the network's scarcest service";
   }
 }
 
@@ -1262,6 +2159,7 @@ async function saveNickname(): Promise<void> {
 }
 
 $("nickname-save").addEventListener("click", () => void saveNickname());
+$("welcome-done").addEventListener("click", () => void closeWelcome());
 $("nickname-input").addEventListener("keydown", (e) => {
   if ((e as KeyboardEvent).key === "Enter") void saveNickname();
 });
@@ -1272,8 +2170,8 @@ $<HTMLInputElement>("serve-toggle").addEventListener("change", (e) => {
     .then(() =>
       showToast(
         on
-          ? "Serving on — applies the next time the node starts"
-          : "Serving off — applies the next time the node starts",
+          ? "Serving on: applies the next time the node starts"
+          : "Serving off: applies the next time the node starts",
       ),
     )
     .catch((err) => showToast(String(err)));
@@ -1294,8 +2192,9 @@ $("remove-node-btn").addEventListener("click", async () => {
   const btn = $<HTMLButtonElement>("remove-node-btn");
   if (btn.dataset.armed !== "1") {
     btn.dataset.armed = "1";
-    const gb = lastStatus ? (lastStatus.datadir_size_mb / 1024).toFixed(0) : "?";
-    btn.textContent = `Click again to remove ~${gb} GB`;
+    // Mebibytes over 1024: GiB, the unit the disk card above prints.
+    const gib = lastStatus ? (lastStatus.datadir_size_mb / 1024).toFixed(0) : "?";
+    btn.textContent = `Click again to remove ~${gib} GiB`;
     clearTimeout(removeArmTimer);
     removeArmTimer = setTimeout(() => {
       btn.dataset.armed = "";
@@ -1311,7 +2210,7 @@ $("remove-node-btn").addEventListener("click", async () => {
     const report = await invoke<ReclaimReport>("remove_node_data_now");
     const out = $("remove-node-result");
     out.hidden = false;
-    out.textContent = `Freed ${fmtGB(report.freed_mb)}. Your node is removed — set it up again anytime.`;
+    out.textContent = `Freed ${fmtGB(report.freed_mb)}. Your node is removed, set it up again anytime.`;
     setupDone = false; // back to the wizard on the next poll
     overlay.hidden = true;
   } catch (e) {
@@ -1504,6 +2403,15 @@ function showToast(msg: string) {
 // banner appears under the header the moment an update is found (ported from
 // the miner's "UPDATE AVAILABLE" cue), and Settings has a "Check now" button
 // so nobody has to wait for the 6-hour timer or a relaunch.
+//
+// Two of the three triggers run here: the check at launch (boot, below) and
+// the button, both through updateCheck(). The six-hourly recheck does NOT: it
+// is a tokio timer in src-tauri/src/update_timer.rs, which runs the same
+// plugin check, records through the same update_log, and emits an
+// "update-check" event that onUpdateCheckEvent paints through the same
+// functions updateCheck() paints with. Why it moved, stated as the hypothesis
+// it is, is in that file's comment; in one line: a setInterval in a hidden
+// WebKitGTK window may never fire, and this app lives hidden.
 let appVersion = "";
 
 /** Show the banner as "<strong>{head}</strong> {tail}". DOM-built, never
@@ -1524,8 +2432,9 @@ function setUpdateResult(text: string): void {
 
 // Failing to CHECK and failing to INSTALL are different events and must not
 // share a catch. A failed check is usually just being offline, and there is
-// nothing for the user to do about it. A failed INSTALL is permanent for that
-// build — a Linux .deb cannot be replaced by the updater at all — and the old
+// nothing for the user to do about it. A failed INSTALL is usually permanent
+// for that build on that machine (a .deb copy that cannot show the password
+// prompt, a folder the app cannot write to), and the old
 // single catch swallowed it on the automatic path, leaving the banner reading
 // "Update available: vX — downloading…" indefinitely, repainted identically at
 // every launch and every six-hour tick. That is worse than silence: it is an
@@ -1533,7 +2442,127 @@ function setUpdateResult(text: string): void {
 // failed and will fail again.
 const MANUAL_DOWNLOAD = "easybtx.com/node";
 
+// The permanent "Last check" line under the Check-now button, rendered from
+// what the backend persisted (see recordUpdateCheck) on every status tick.
+// Until 2026-09-15 the automatic check painted nothing at all: this project's
+// own signer box ran 0.6.21 for eight hours after the feed served 0.6.22, two
+// six-hourly checks fell due in that window, and nothing on the machine could
+// say whether they ran, failed, or found nothing. Rendering from the persisted
+// value rather than from this session's memory is what makes the line true at
+// launch, before any check has run, and after the relaunch an install causes.
+function reflectLastUpdateCheck(status: NodeStatusInfo): void {
+  paintLastUpdateCheck({
+    at: status.last_update_check_at,
+    outcome: status.last_update_check_outcome,
+    detail: status.last_update_check_detail,
+  });
+}
+
+/** The one place the "Last check" line is written, whether the record came
+ *  from the status tick (persisted) or from the Rust timer's event (just
+ *  recorded), so the two cannot render the same record differently. */
+function paintLastUpdateCheck(last: LastUpdateCheck): void {
+  const el = $("update-last-check");
+  el.textContent = lastCheckLine(last, new Date(), MANUAL_DOWNLOAD);
+  // The recorded detail (automatic or pressed, the error text) on hover; the
+  // line itself stays in plain words.
+  el.title = last.detail;
+}
+
+/**
+ * What the screen shows while a check that found something runs its course:
+ * the banner under the header and the sentence beside the button. Shared by
+ * updateCheck() and by onUpdateCheckEvent, so a check the Rust timer ran looks
+ * exactly like one that ran here. The two quiet outcomes, no-update and
+ * check-failed, paint nothing on the automatic path on either side (a manual
+ * press paints its own sentence in updateCheck); the "Last check" line is
+ * where they show. `error` is the install error's text, used only by
+ * install-failed.
+ */
+function paintUpdateProgress(outcome: string, version: string, error: string): void {
+  switch (outcome) {
+    case "found":
+      showUpdateBanner(`Update available: v${version}`, "· downloading…");
+      setUpdateResult(`Update available: v${version} · downloading…`);
+      break;
+    case "install-failed":
+      // Always visible, manual or not, and never worded as a network problem:
+      // the common cause is a package format this updater cannot replace.
+      showUpdateBanner(`Update v${version} couldn't install`, `· download it from ${MANUAL_DOWNLOAD}`);
+      setUpdateResult(
+        `Automatic update failed: get v${version} from ${MANUAL_DOWNLOAD} (${error.slice(0, 80)})`
+      );
+      break;
+    case "installed":
+      showUpdateBanner(`v${version} ready`, "· restarting…");
+      break;
+    default:
+      break;
+  }
+}
+
+/**
+ * An update this copy will not download on its own (update_binding.rs): a
+ * .deb copy offered only the AppImage, or a version whose install already
+ * failed here. The banner says so and the sentence beside "Check now" gives
+ * the steps. `text` is what update_binding kept or a recorded detail; for
+ * anything else this paints nothing.
+ */
+function paintHandInstall(text: string): void {
+  const notice = handInstallNotice(text);
+  if (!notice) return;
+  const banner = handInstallBanner(notice);
+  showUpdateBanner(banner.head, banner.tail);
+  setUpdateResult(notice);
+}
+
+// A check the Rust timer ran has settled (src-tauri/src/update_timer.rs). The
+// backend has already written the record; this paints what updateCheck()
+// would have painted had the check run here, through the same functions,
+// and the "Last check" line from the record itself rather than waiting for
+// the next status tick to read it back.
+function onUpdateCheckEvent(ev: UpdateCheckEvent): void {
+  paintUpdateProgress(ev.outcome, ev.version, installErrorFromDetail(ev.detail));
+  paintHandInstall(ev.detail);
+  paintLastUpdateCheck({ at: ev.at, outcome: ev.outcome, detail: ev.detail });
+}
+
+// Write down how this check ended: one line in <datadir>/update-check.log and
+// the last outcome in the settings file, through the backend. Called at EVERY
+// exit of updateCheck below, and update-check.test.ts reads this file to make
+// sure that stays true. Fire-and-forget by contract: a failure to record is a
+// console warning and changes nothing about the update itself. The settled
+// promise is returned for the one caller that is about to end the process and
+// wants the line on disk first.
+function recordUpdateCheck(branch: UpdateCheckBranch, manual: boolean): Promise<void> {
+  const rec = updateCheckRecord(branch, manual ? "manual" : "automatic");
+  return invoke("record_update_check", { outcome: rec.outcome, detail: rec.detail }).then(
+    () => undefined,
+    (e) => console.warn("update-check: could not record the outcome", e),
+  );
+}
+
+// What update_binding kept about the check that just ran: why it declined or
+// refused the offer, or null. Read before recordUpdateCheck, which takes it.
+// A failure to read it is a console warning and a null, never a reason for
+// the check to fail.
+function peekUpdateRefusal(): Promise<string | null> {
+  return invoke<string | null>("peek_update_refusal").catch((e) => {
+    console.warn("update-check: could not read the refusal", e);
+    return null;
+  });
+}
+
 async function updateCheck(manual = false): Promise<void> {
+  // "Check now" always tries. The automatic checks leave alone a version whose
+  // install already failed here (update_binding.rs); a press forgets that
+  // first. Awaited, so the check below sees it cleared; a failure to clear is
+  // a console warning and the check goes ahead.
+  if (manual) {
+    await invoke("forget_failed_update").catch((e) =>
+      console.warn("update-check: could not clear the failed version", e),
+    );
+  }
   let update: Awaited<ReturnType<typeof checkForUpdate>>;
   try {
     update = await checkForUpdate();
@@ -1544,47 +2573,87 @@ async function updateCheck(manual = false): Promise<void> {
     // saying it was sent Mac owners hunting a fault that did not exist on the
     // day 0.6.20 shipped Linux-only. classifyCheckFailure tells the two apart
     // by the plugin's own wording; update-check.test.ts pins both strings.
+    // Quiet on screen is no longer quiet everywhere: the outcome is recorded
+    // either way, with the classified reason.
+    const failure = classifyCheckFailure(e);
     if (manual) {
-      setUpdateResult(
-        checkFailureMessage(classifyCheckFailure(e), appVersion, MANUAL_DOWNLOAD),
-      );
+      setUpdateResult(checkFailureMessage(failure, appVersion, MANUAL_DOWNLOAD));
     }
+    void recordUpdateCheck({ branch: "check-failed", failure }, manual);
     return;
   }
 
   if (!update) {
+    // To the plugin a declined or refused offer is "no update". Read why
+    // before the record below takes it, so the screen says what the record
+    // will: the steps for an update to install by hand, or the refusal.
+    const declined = await peekUpdateRefusal();
+    paintHandInstall(declined ?? "");
     if (manual) {
-      setUpdateResult(
-        appVersion ? `You're on the latest version (v${appVersion}).` : "You're on the latest version."
+      setUpdateResult(noUpdateMessage(declined, appVersion, MANUAL_DOWNLOAD));
+    }
+    void recordUpdateCheck({ branch: "no-update", currentVersion: appVersion }, manual);
+    return;
+  }
+
+  paintUpdateProgress("found", update.version, "");
+  // Recorded before the download, so a check that found something and then
+  // died mid-download still left the finding behind. The six-hourly timer
+  // reads it too: while the last record is a `found` under an hour old it
+  // leaves this check alone (update_timer.rs), so a .deb copy waiting in its
+  // password prompt is not sent a second download and a second prompt.
+  void recordUpdateCheck({ branch: "found", version: update.version }, manual);
+
+  // Downloaded and verified first, then installed, so a failure knows which
+  // half it was. A download that broke off is retried at the next check, as
+  // before. A verified download that would not install is remembered, and the
+  // automatic checks leave that version alone, so a copy that cannot install
+  // it does not fetch it again every six hours. "Check now" still tries.
+  //
+  // On a .deb copy the install waits in the password prompt until someone
+  // answers it. That wait happens inside the plugin: its install command runs
+  // the blocking install on one of the backend's async workers, and that is
+  // the plugin's code, left alone here. The six-hourly timer runs its own
+  // install on the blocking pool instead (update_timer.rs).
+  let downloaded = false;
+  try {
+    await update.download();
+    downloaded = true;
+    await update.install();
+  } catch (e) {
+    // The plugin frees the downloaded package only after an install that
+    // succeeded, so a failed one would hold it (150-470 MB) until the app
+    // quits. Freed here, fire-and-forget: a failure to free is a console
+    // warning and changes nothing else.
+    void update.close().catch((err) =>
+      console.warn("update-check: could not free the downloaded package", err),
+    );
+    if (downloaded) {
+      void invoke("remember_failed_update", { version: update.version }).catch((err) =>
+        console.warn("update-check: could not remember the failed version", err),
       );
     }
+    paintUpdateProgress("install-failed", update.version, String(e));
+    void recordUpdateCheck({ branch: "install-failed", version: update.version, error: e }, manual);
     return;
   }
 
-  showUpdateBanner(`Update available: v${update.version}`, "— downloading…");
-  setUpdateResult(`Update available: v${update.version} — downloading…`);
-
-  try {
-    await update.downloadAndInstall();
-  } catch (e) {
-    // Always visible, manual or not, and never worded as a network problem:
-    // the common cause is a package format this updater cannot replace.
-    showUpdateBanner(
-      `Update v${update.version} couldn't install`,
-      `— download it from ${MANUAL_DOWNLOAD}`
-    );
-    setUpdateResult(
-      `Automatic update failed — get v${update.version} from ${MANUAL_DOWNLOAD} (${String(e).slice(0, 80)})`
-    );
-    return;
-  }
-
-  showUpdateBanner(`v${update.version} ready`, "— restarting…");
+  paintUpdateProgress("installed", update.version, "");
+  // Awaited, with a bound, unlike the others: relaunch() ends this process,
+  // and a record still in the IPC queue when it does is a record that was
+  // never written. Two seconds is a bound on a local file append that takes
+  // microseconds; it exists so a wedged backend cannot hold the restart
+  // hostage. The promise never rejects, so the flow cannot change here.
+  await Promise.race([
+    recordUpdateCheck({ branch: "installed", version: update.version }, manual),
+    new Promise<void>((resolve) => setTimeout(resolve, 2000)),
+  ]);
   try {
     await relaunch();
   } catch (e) {
-    showUpdateBanner(`v${update.version} is installed`, "— restart the app to finish");
+    showUpdateBanner(`v${update.version} is installed`, "· restart the app to finish");
     setUpdateResult(`Installed. Restart to finish. (${String(e).slice(0, 80)})`);
+    void recordUpdateCheck({ branch: "relaunch-failed", version: update.version, error: e }, manual);
   }
 }
 
@@ -1651,7 +2720,10 @@ void (async () => {
   // initAsk/initWallet means a throw in those can't leave the X unwired.
   initCloseDialog();
   initAsk();
+  initTools();
   initWallet();
+  // Escape, focus in and back, and Tab kept inside the open panel.
+  initOverlayKeys();
   try {
     const v = await getVersion();
     appVersion = v;
@@ -1661,7 +2733,17 @@ void (async () => {
     /* dev without tauri */
   }
   await tick();
-  setInterval(() => void tick(), 1500);
+  setInterval(() => {
+    reflectWaiting();
+    void tick();
+  }, 1500);
   void updateCheck();
-  setInterval(() => void updateCheck(), 6 * 60 * 60 * 1000);
+  // The six-hourly recheck used to be a setInterval here. It is now the Rust
+  // timer in src-tauri/src/update_timer.rs, so there is ONE periodic path and
+  // it is not a JavaScript timer in a window that spends its life hidden;
+  // this is how its results reach the screen. Registered after the launch
+  // check is started, which is fine: the timer's first tick is two minutes
+  // out, and an event that arrives before a listener exists is dropped by
+  // Tauri, never queued to be painted twice.
+  void listen<UpdateCheckEvent>("update-check", (e) => onUpdateCheckEvent(e.payload));
 })();

@@ -222,8 +222,36 @@ agrees with itself is worth exactly as much as the grep behind it.
 One of those seven got better rather than merely correct. `esplora.rs` refused
 to quote any disk figure at all, on the grounds that the base was unsettled.
 The base is settled now, so the warning names it — and still declines a total,
-because nobody has measured the electrs index that sits on top. Saying which
+because nobody had measured the electrs index that sits on top. Saying which
 half is known beats both a confident total and a blanket "we don't know".
+
+**That half is now bounded, 2026-09-14.** The chain holds almost no
+transaction data. This document already records that a large-mode block is
+PoW payload rather than traffic — height 120000 is 1,048,948 bytes carrying
+exactly one transaction — but not how big that one transaction *is*, which is
+the number an index estimate actually needs. Sampled by taking each hash from
+a node's own `getblockhash` and asking an archival Esplora about that exact
+hash, so the explorer is trusted only about a block we identified ourselves:
+
+| height | block | the one tx |
+|---:|---:|---:|
+| 100,000 | 1,048,948 B | 182 B |
+| 150,000 | 1,048,962 B | 196 B |
+| 184,000 | 1,048,966 B | 200 B |
+| 185,000+ | ~8.4 kB | coinbase, 0 in / 2 out |
+
+About 216,000 transactions at roughly 200 bytes each is **~43 MB of
+transaction data across the whole chain**. `gettxoutsetinfo` agrees on the
+scale: 141,832 txouts, 95,098 transactions, `disk_size` 11.7 MiB. The
+vendored electrs is Blockstream's `new-index` fork, which stores full
+transactions — but there is almost nothing to store, so expect a **sub-GiB**
+index. Do not reach for a Bitcoin-derived ratio here; it is wrong by three
+orders of magnitude.
+
+The consequence is architectural. The 124 GiB is inert padding, streamed
+sequentially once while indexing and essentially never re-read at random, so
+`-blocksdir` on a slow disk is the correct design rather than a compromise:
+the hot working set is chainstate plus index, and that fits any SSD.
 
 The gate is the part that mattered. `DISK_REQUIRED_FRESH` was 120 GiB against a
 124 GiB chain, so **the gate had fallen below the thing it exists to gate**.
@@ -235,6 +263,8 @@ if the gate is ever set below it.
 
 ## What we have not done
 
+- **The electrs index is no longer unmeasured** — it is bounded above. What
+  remains unmeasured is its size in practice, after a real index build.
 - **Not tested whether the preadopt blocks can seed an archive** instead of
   re-downloading 25 GB. It is the obvious move and it may well work via a
   reindex, but it means handling a live validator's datadir, and this node is

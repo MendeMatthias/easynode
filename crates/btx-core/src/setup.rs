@@ -13,6 +13,26 @@ use std::path::Path;
 /// datadir lock and the cookie wait timed out.
 pub const RPC_URL: &str = "http://127.0.0.1:19334";
 
+/// The RPC endpoint this run talks to: [`RPC_URL`], or `EASYBTX_NODE_RPC_URL`
+/// when it is set.
+///
+/// The override completes the throwaway-install harness that
+/// `EASYBTX_NODE_DATADIR` starts. Both exist for the same reason and neither is
+/// for users: this project's release box runs the network's signer out of
+/// `~/.easybtx` on port 19334, so a test install with its own datadir still had
+/// its app polling the LIVE node's port, failing cookie auth, and sitting on
+/// "reconnecting" forever — which is how a whole feature can be tested without
+/// the app ever having reached a node (measured here on 2026-09-16).
+///
+/// An unset or blank value is the constant, so nothing changes for anybody who
+/// does not set it.
+pub fn rpc_url() -> String {
+    match std::env::var("EASYBTX_NODE_RPC_URL") {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => RPC_URL.to_string(),
+    }
+}
+
 /// The un-pruned chain's BLOCK PAYLOAD, measured 2026-09-04 and stated in GiB.
 ///
 /// Method, because this number has been wrong in four places at once: BTX block
@@ -113,6 +133,33 @@ pub fn disk_required(fresh: bool, pruned: bool) -> u64 {
 /// `Some(false)` for `prune=0`, `None` when there is no conf or no key.
 pub fn conf_is_pruned(conf_path: &Path) -> Option<bool> {
     conf_kv(conf_path, "prune").map(|v| v.trim() != "0")
+}
+
+/// Whether the engine may run with `txindex=1` (Explorer mode) here. BTX
+/// v0.34.15 refuses to start with pruning and a transaction index together
+/// ("Prune mode is incompatible with -txindex.", src/init.cpp:2077 at
+/// 476f3f23), so it is only for a node that keeps the whole chain: no
+/// `prune=` in effect, where `btx_rw.conf` outranks the app's conf, and no
+/// block file deleted yet. Pure, so the rule is tested; the reading of the
+/// three facts is [`explorer_mode_possible_here`].
+pub fn explorer_mode_possible(
+    conf_pruned: Option<bool>,
+    rw_conf_pruned: Option<bool>,
+    datadir_pruned: bool,
+) -> bool {
+    let prune_in_effect = rw_conf_pruned.or(conf_pruned).unwrap_or(false);
+    !prune_in_effect && !datadir_pruned
+}
+
+/// [`explorer_mode_possible`] for a node folder: its `faststart/faststart.conf`,
+/// its `btx_rw.conf`, and whether `blocks/` has already lost `blk00000.dat`
+/// (`crate::node::datadir_has_pruned`).
+pub fn explorer_mode_possible_here(datadir: &Path) -> bool {
+    explorer_mode_possible(
+        conf_is_pruned(&datadir.join("faststart").join("faststart.conf")),
+        conf_is_pruned(&datadir.join("btx_rw.conf")),
+        crate::node::datadir_has_pruned(datadir),
+    )
 }
 
 /// What writing a conf with `now_pruned` posture needs on disk, given what the
@@ -294,6 +341,108 @@ pub fn prune_retired_addnodes_in_conf(conf_path: &Path, keep: &[&str]) -> usize 
     }
 }
 
+/// Remove `addnode=<host>` lines for exactly `remove`, leaving every other
+/// line untouched, byte for byte, including its own line ending. Pure →
+/// testable.
+///
+/// Exists for a narrower job than [`prune_retired_addnodes_str`], which takes
+/// a KEEP list and rewrites everything not in it, and in doing so loses each
+/// surviving line's own line ending, because it splits on
+/// [`str::lines`] (which strips a trailing `\r\n` or `\n`) and rejoins with a
+/// bare `\n`. That is fine for that function's job (converging the conf on
+/// exactly the current shipped census) but wrong for this one: migrating an
+/// old conf off a few specific, named lines (the discovery relays' old
+/// `addnode=` entries) should touch only those lines, leaving every other
+/// line exactly as it was, whether or not that line happens to be one this
+/// build ships. That is not a CRLF guarantee for the file as a whole:
+/// `prune_retired_addnodes_in_conf` and `set_managed_whitelist_block` both
+/// still run later in the same start and rewrite the whole file to LF
+/// regardless, the same way `prune_retired_addnodes_str` does. So this walks
+/// the raw text keeping each line's own terminator, and only drops the ones
+/// that match `remove`.
+pub fn remove_addnodes_str(conf: &str, remove: &[&str]) -> String {
+    // Split `conf` into raw chunks, each ending right after its own `\n` (with
+    // any preceding `\r` still attached, i.e. whatever terminator the line
+    // actually had), and the last chunk terminator-less if the file did not
+    // end in a newline. The trim below strips that terminator for the
+    // comparison without touching the chunk itself.
+    let mut chunks: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for (i, b) in conf.bytes().enumerate() {
+        if b == b'\n' {
+            chunks.push(&conf[start..=i]);
+            start = i + 1;
+        }
+    }
+    if start < conf.len() {
+        chunks.push(&conf[start..]);
+    }
+
+    // Mirror the engine's own line parsing (`GetConfigOptions`,
+    // src/common/config.cpp:35-78 at 84b998b4) rather than matching only the
+    // exact byte form this app itself writes: cut at the first `#`
+    // (config.cpp:41-44), trim (config.cpp:45, pattern " \t\r\n"), then split
+    // on the first `=` and trim both sides (config.cpp:56-58). That is what
+    // lets the engine (and so an operator's hand edit) read `addnode =
+    // <host>` or a trailing `# comment` the same as the plain form this app
+    // writes, and this cleanup has to recognise the same lines the engine
+    // does to actually retire them.
+    const PATTERN: &[char] = &[' ', '\t', '\r', '\n'];
+    chunks
+        .into_iter()
+        .filter(|raw| {
+            let before_hash = raw.split_once('#').map_or(*raw, |(before, _)| before);
+            let trimmed = before_hash.trim_matches(PATTERN);
+            let Some(eq) = trimmed.find('=') else {
+                // No section handling here, unlike the engine (which would
+                // read a `[main]`-scoped line as `main.addnode`, a different
+                // key from the top-level `addnode`): a line with no `=`,
+                // sections included, is never an addnode line.
+                return true;
+            };
+            let name = trimmed[..eq].trim_matches(PATTERN);
+            if name != "addnode" {
+                return true;
+            }
+            let value = trimmed[eq + 1..].trim_matches(PATTERN);
+            !remove.contains(&value)
+        })
+        .collect::<String>()
+}
+
+/// Rewrite `conf_path` to drop `addnode=<host>` lines for exactly `remove`.
+/// Returns how many lines were removed, 0 when the file was already correct
+/// or unreadable, and in that case the file is never opened for writing, so
+/// its mtime is untouched along with its content.
+///
+/// Used to migrate a conf written by an earlier version off `addnode=` lines
+/// for peers this build now dials a different way (the discovery relays, as
+/// `-seednode=`, see `node::BTX_DISCOVERY_PEERS`), independent of whatever
+/// the current manual census happens to be.
+pub fn remove_addnodes_in_conf(conf_path: &Path, remove: &[&str]) -> usize {
+    // Hold the conf lock across the WHOLE read-modify-write: reading before
+    // another writer's rename and writing after it is how an edit gets lost.
+    // See `fsx::ConfLock` for what that costs on this file and what the lock
+    // does and does not bind.
+    let _guard = crate::fsx::ConfLock::acquire(conf_path);
+    let Ok(original) = std::fs::read_to_string(conf_path) else {
+        return 0;
+    };
+    let rewritten = remove_addnodes_str(&original, remove);
+    if rewritten == original {
+        return 0;
+    }
+    let removed = original
+        .lines()
+        .count()
+        .saturating_sub(rewritten.lines().count());
+    if crate::fsx::atomic_write(conf_path, rewritten.as_bytes()).is_ok() {
+        removed
+    } else {
+        0
+    }
+}
+
 /// Managed-block markers for the archive noban whitelist. Everything between
 /// them is OWNED by the app and rewritten wholesale on every start.
 pub const WHITELIST_BLOCK_BEGIN: &str =
@@ -320,8 +469,11 @@ pub const WHITELIST_BLOCK_END: &str = "# END easybtx-managed archive whitelist";
 ///
 /// Migration/dedupe: bare `whitelist=in,out,noban@<ip>` lines OUTSIDE the
 /// block are claimed into it when their ip is one we are asserting anyway
-/// (what the append-only version wrote); every other whitelist line is the
-/// operator's and survives untouched. An unterminated block (BEGIN without
+/// (what the append-only version wrote). The same-format line for an IP in
+/// [`crate::node::BTX_REVOKED_WHITELIST_IPS`] is dropped outright: it is a
+/// grant this app wrote and has since revoked, and keeping it would undo the
+/// revocation on every install that ran the append-only build. Every other
+/// whitelist line is the operator's and survives untouched. An unterminated block (BEGIN without
 /// END — a truncated write) is treated as ours to the end of file.
 pub fn set_managed_whitelist_block(conf_path: &Path, ips: &[String]) -> AppResult<()> {
     // Hold the conf lock across the WHOLE read-modify-write: reading before
@@ -358,6 +510,9 @@ pub fn set_managed_whitelist_block(conf_path: &Path, ips: &[String]) -> AppResul
         if let Some(ip) = t.strip_prefix("whitelist=in,out,noban@") {
             if ips.iter().any(|i| i == ip) {
                 continue; // claimed into the managed block (dedupe)
+            }
+            if crate::node::BTX_REVOKED_WHITELIST_IPS.contains(&ip) {
+                continue; // a grant this app once wrote and has since revoked
             }
         }
         out.push(l.to_string());
@@ -528,6 +683,10 @@ pub fn set_conf_kv(conf_path: &Path, key: &str, value: Option<&str>) -> AppResul
 ///
 /// The cookie is re-read on every attempt: btxd regenerates it per start, so a
 /// client built from a stale cookie would 401 forever.
+///
+/// This form cannot see the process. A caller that spawned the node itself
+/// should use [`wait_for_node_rpc_watching`], which stops the moment the child
+/// is gone.
 pub async fn wait_for_node_rpc(
     datadir: &Path,
     url: &str,
@@ -535,16 +694,79 @@ pub async fn wait_for_node_rpc(
     poll_ms: u64,
     warmup_max_polls: u32,
 ) -> Result<RpcClient, String> {
+    match wait_for_node_rpc_watching(datadir, url, max_polls, poll_ms, warmup_max_polls, || false)
+        .await
+    {
+        RpcWait::Ready(client) => Ok(client),
+        RpcWait::Exited { last, .. } | RpcWait::TimedOut { last, .. } => Err(last),
+    }
+}
+
+/// How a watched RPC wait ended. No `Debug`: `RpcClient` deliberately has
+/// none, because it would print the RPC credentials.
+pub enum RpcWait {
+    /// The node answered `getblockchaininfo`.
+    Ready(RpcClient),
+    /// The child exited while the wait ran. `last` is what the wait had seen
+    /// so far, which for an init exit is nearly always "no .cookie yet": the
+    /// cause is in the child's own log, not here. `warming` as for
+    /// `TimedOut`: it had answered RPC_IN_WARMUP, so it died with its RPC up.
+    Exited { last: String, warming: bool },
+    /// A budget ran out with the child still there. `warming` is true when
+    /// the node answered RPC_IN_WARMUP at least once, so its RPC is up and a
+    /// graceful `stop` can reach it; false means it never answered at all.
+    TimedOut { last: String, warming: bool },
+}
+
+/// [`wait_for_node_rpc`], watching the child: `child_gone` is asked once per
+/// poll, and the wait ends with [`RpcWait::Exited`] the first time it says
+/// yes.
+///
+/// Why (2026-10-01, Zan's two Linux nodes after 0.6.32 to 0.7.0). The app's
+/// launch watch only looks at the child for 5 s. Engine v0.34.12 runs its GPU
+/// readiness (CUDA probe, self-qualification and canary,
+/// `InitializeMatMulRCReadinessPostDaemon`, init.cpp:2928) and opens the
+/// durable attestation archive (init.cpp:2888-2900, which verifies every
+/// record) BEFORE `AppInitServers` binds RPC and writes the cookie
+/// (init.cpp:3100-3104). On a CUDA consensus host that is well over 5 s, so
+/// every init exit after those steps landed inside this wait, which never
+/// looked at the process: three minutes against a dead btxd, then "no .cookie
+/// yet", with no cause read from its log and no retry. On regtest RC is off
+/// and init is instant, which is why that path was never exercised.
+///
+/// The probe is a plain `FnMut() -> bool` so this crate does not need to know
+/// where the caller keeps its child. It is asked once more after a budget
+/// runs out, so a child that died in the same moment is reported as an exit
+/// (read its log, retry) rather than a timeout (stop a live process).
+pub async fn wait_for_node_rpc_watching<F: FnMut() -> bool>(
+    datadir: &Path,
+    url: &str,
+    max_polls: u32,
+    poll_ms: u64,
+    warmup_max_polls: u32,
+    mut child_gone: F,
+) -> RpcWait {
     let cookie = datadir.join(".cookie");
     let mut last = String::from("the node's RPC never became reachable (no .cookie yet)");
     let mut unreachable_polls: u32 = 0;
     let mut warmup_polls: u32 = 0;
     while unreachable_polls < max_polls && warmup_polls < warmup_max_polls {
+        if child_gone() {
+            return RpcWait::Exited {
+                last,
+                warming: warmup_polls > 0,
+            };
+        }
         if let Ok(client) = RpcClient::from_cookie(url, &cookie) {
             match crate::node_api::get_blockchain_info(&client).await {
-                Ok(_) => return Ok(client),
+                Ok(_) => return RpcWait::Ready(client),
                 Err(AppError::Rpc { code: -28, message }) => {
                     last = format!("node is warming up: {message}");
+                    // Its RPC is up from here on, so the polls spent waiting
+                    // for the cookie do not count against a later blip.
+                    if warmup_polls == 0 {
+                        unreachable_polls = 0;
+                    }
                     warmup_polls += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
                     continue;
@@ -557,7 +779,16 @@ pub async fn wait_for_node_rpc(
         unreachable_polls += 1;
         tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
     }
-    Err(last)
+    if child_gone() {
+        return RpcWait::Exited {
+            last,
+            warming: warmup_polls > 0,
+        };
+    }
+    RpcWait::TimedOut {
+        last,
+        warming: warmup_polls > 0,
+    }
 }
 
 #[cfg(test)]
@@ -725,6 +956,201 @@ mod tests {
         assert_eq!(super::prune_retired_addnodes_in_conf(&missing, &["a:1"]), 0);
     }
 
+    // ---- named addnode removal (discovery relays as seed nodes) -----------
+    //
+    // Unlike `prune_retired_addnodes_str` (a KEEP list: anything not in it
+    // goes), this is a REMOVE list: exactly the named hosts go and every
+    // other line, kept or not, is untouched byte for byte, including its own
+    // line ending, which `prune_retired_addnodes_str` does not preserve
+    // (`.lines()` strips CRLF and `.join("\n")` puts LF back on every kept
+    // line). That distinction is the point here: a conf carrying `addnode=`
+    // lines for the discovery relays from an earlier version must lose
+    // exactly those three lines, with everything else (an operator's own
+    // addnode, a comment, a CRLF ending) left exactly as it was.
+
+    #[test]
+    fn remove_addnodes_str_drops_exactly_the_named_lines_and_nothing_else() {
+        let relays = [
+            "node.btx.dev:19335",
+            "node.btxchain.org:19335",
+            "node.btx.tools:19335",
+        ];
+        let conf = "server=1\r\n\
+                     addnode=207.56.229.99:19335\r\n\
+                     addnode=node.btx.dev:19335\r\n\
+                     # addnode=node.btx.dev:19335 kept for the record\r\n\
+                     addnode=node.btxchain.org:19335\r\n\
+                     addnode=node.btx.tools:19335\r\n\
+                     prune=0\r\n";
+        let out = super::remove_addnodes_str(conf, &relays);
+
+        for relay in relays {
+            assert!(
+                !out.lines().any(|l| l.trim() == format!("addnode={relay}")),
+                "{relay} line must be gone from:\n{out}"
+            );
+        }
+        assert!(
+            out.contains("addnode=207.56.229.99:19335\r\n"),
+            "an unrelated addnode line stays, CRLF included: {out:?}"
+        );
+        assert!(
+            out.contains("# addnode=node.btx.dev:19335 kept for the record\r\n"),
+            "a comment mentioning a relay is not configuration: {out:?}"
+        );
+        assert!(out.contains("server=1\r\n") && out.contains("prune=0\r\n"));
+
+        // Byte for byte: every surviving line keeps its OWN line ending. Only
+        // the three removed lines' CRLFs should be gone.
+        let original_crlfs = conf.matches("\r\n").count();
+        let out_crlfs = out.matches("\r\n").count();
+        assert_eq!(
+            out_crlfs,
+            original_crlfs - 3,
+            "a surviving CRLF line must not be flattened to LF: {out:?}"
+        );
+        let bytes = out.as_bytes();
+        assert!(
+            bytes
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b != b'\n' || i.checked_sub(1).map(|j| bytes[j]) == Some(b'\r')),
+            "a bare LF was introduced on a file that only ever used CRLF: {out:?}"
+        );
+    }
+
+    #[test]
+    fn remove_addnodes_str_is_a_no_op_when_nothing_matches() {
+        let conf = "server=1\naddnode=207.56.229.99:19335\n";
+        assert_eq!(
+            super::remove_addnodes_str(conf, &["node.btx.dev:19335"]),
+            conf,
+            "an already-correct conf must come back byte identical"
+        );
+    }
+
+    #[test]
+    fn remove_addnodes_str_matches_the_engines_spaced_form() {
+        // The engine reads `name = value` with spaces around `=` the same as
+        // `name=value` (GetConfigOptions, src/common/config.cpp:57-59 at
+        // 84b998b4: split on the first `=`, then `TrimString` both sides).
+        let conf = "server=1\naddnode = node.btx.dev:19335\n";
+        assert_eq!(
+            super::remove_addnodes_str(conf, &["node.btx.dev:19335"]),
+            "server=1\n",
+            "a spaced addnode line for a named relay must still be removed"
+        );
+    }
+
+    #[test]
+    fn remove_addnodes_str_matches_leading_whitespace_and_a_trailing_comment() {
+        // Same engine read: leading/trailing whitespace on the line is
+        // trimmed, and a `#` cuts the value before it is compared
+        // (GetConfigOptions, src/common/config.cpp:41-44 at 84b998b4).
+        let conf = "server=1\n  addnode=node.btx.dev:19335  # note\n";
+        assert_eq!(
+            super::remove_addnodes_str(conf, &["node.btx.dev:19335"]),
+            "server=1\n",
+            "leading/trailing whitespace and a trailing comment must not save the line"
+        );
+    }
+
+    #[test]
+    fn remove_addnodes_str_keeps_a_spaced_non_relay_addnode() {
+        let conf = "server=1\naddnode = 1.2.3.4\n";
+        assert_eq!(
+            super::remove_addnodes_str(conf, &["node.btx.dev:19335"]),
+            conf,
+            "an operator's own addnode, spaced or not, is never a relay's business"
+        );
+    }
+
+    #[test]
+    fn remove_addnodes_str_removes_a_relay_line_under_a_section_header_too() {
+        // No section handling here (unlike the engine's `GetConfigOptions`,
+        // which would read this as `main.addnode` and treat it as a
+        // different key from the top-level `addnode`): matching only the
+        // existing behaviour, a `[main]` line has no `=` and is never an
+        // addnode line, so it is always kept.
+        let conf = "[main]\naddnode=node.btx.dev:19335\n";
+        assert_eq!(
+            super::remove_addnodes_str(conf, &["node.btx.dev:19335"]),
+            "[main]\n",
+            "the section header itself is never touched"
+        );
+    }
+
+    #[test]
+    fn remove_addnodes_in_conf_does_not_rewrite_when_nothing_matches() {
+        let dir =
+            std::env::temp_dir().join(format!("ebtx-relay-removal-noop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("faststart.conf");
+        let original = "server=1\naddnode=207.56.229.99:19335\n";
+        std::fs::write(&conf, original).unwrap();
+
+        // A content-only comparison still passes with the no-rewrite guard
+        // (`rewritten == original`, in `remove_addnodes_in_conf`) deleted,
+        // since `atomic_write` would just write the same bytes back under a
+        // new inode. On unix, also prove the file itself was left alone: same
+        // inode, same mtime.
+        #[cfg(unix)]
+        let before = {
+            use std::os::unix::fs::MetadataExt as _;
+            let m = std::fs::metadata(&conf).unwrap();
+            (m.ino(), m.mtime(), m.mtime_nsec())
+        };
+
+        let removed = super::remove_addnodes_in_conf(&conf, &["node.btx.dev:19335"]);
+        assert_eq!(removed, 0);
+        assert_eq!(
+            std::fs::read_to_string(&conf).unwrap(),
+            original,
+            "a conf without the named lines must not be rewritten"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let m = std::fs::metadata(&conf).unwrap();
+            let after = (m.ino(), m.mtime(), m.mtime_nsec());
+            assert_eq!(
+                before, after,
+                "the file itself must not be rewritten: inode and mtime must be unchanged"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_addnodes_in_conf_drops_the_named_lines_on_disk() {
+        let dir = std::env::temp_dir().join(format!("ebtx-relay-removal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("faststart.conf");
+        std::fs::write(
+            &conf,
+            "server=1\naddnode=node.btx.dev:19335\naddnode=207.56.229.99:19335\n",
+        )
+        .unwrap();
+
+        let removed = super::remove_addnodes_in_conf(&conf, &["node.btx.dev:19335"]);
+        assert_eq!(removed, 1);
+        let out = std::fs::read_to_string(&conf).unwrap();
+        assert!(!out.contains("node.btx.dev"));
+        assert!(out.contains("addnode=207.56.229.99:19335"));
+        assert!(out.contains("server=1"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_addnodes_in_conf_reports_zero_on_a_missing_file() {
+        let missing = std::env::temp_dir().join("ebtx-relay-removal-missing.conf");
+        std::fs::remove_file(&missing).ok();
+        assert_eq!(
+            super::remove_addnodes_in_conf(&missing, &["node.btx.dev:19335"]),
+            0
+        );
+    }
+
     use super::*;
 
     fn ips(v: &[&str]) -> Vec<String> {
@@ -757,6 +1183,44 @@ mod tests {
         let f = std::fs::read_to_string(&fresh).unwrap();
         assert!(f.lines().any(|l| l == "whitelist=in,out,noban@9.9.9.9"));
         assert!(f.starts_with(WHITELIST_BLOCK_BEGIN));
+    }
+
+    /// A legacy bare line for a REVOKED grant goes, even though its IP is no
+    /// longer asserted. Without this, an install that ran the append-only
+    /// build keeps noban for a retired archive forever: the line would read as
+    /// the operator's. Operator lines in another format, or for other IPs,
+    /// still survive.
+    #[test]
+    fn managed_whitelist_block_drops_legacy_lines_for_revoked_ips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conf = tmp.path().join("faststart.conf");
+        std::fs::write(
+            &conf,
+            "server=1\n\
+             whitelist=in,out,noban@207.56.229.99\n\
+             whitelist=in,out,noban@37.230.134.222\n\
+             whitelist=in,out,noban@89.85.40.184\n\
+             whitelist=noban@37.230.134.222\n\
+             whitelist=in,out,noban@192.168.1.50\n",
+        )
+        .unwrap();
+        set_managed_whitelist_block(&conf, &ips(&["20.86.181.203"])).unwrap();
+        let s = std::fs::read_to_string(&conf).unwrap();
+        for gone in ["207.56.229.99", "89.85.40.184"] {
+            assert!(!s.contains(gone), "revoked {gone} must not survive: {s}");
+        }
+        assert!(
+            !s.contains("whitelist=in,out,noban@37.230.134.222"),
+            "revoked same-format line goes: {s}"
+        );
+        assert!(
+            s.contains("whitelist=noban@37.230.134.222"),
+            "an operator line in another format is theirs: {s}"
+        );
+        assert!(s.contains("whitelist=in,out,noban@192.168.1.50"));
+        assert!(s
+            .lines()
+            .any(|l| l == "whitelist=in,out,noban@20.86.181.203"));
     }
 
     /// THE POINT of the managed block: dropping an IP from the list revokes
@@ -1069,6 +1533,48 @@ maxreorgdepthwarn=9
         assert_eq!(conf_is_pruned(&conf), Some(true));
     }
 
+    // BTX v0.34.15 refuses to start with pruning and a transaction index
+    // together (src/init.cpp:2077, "Prune mode is incompatible with
+    // -txindex."), so Explorer mode is only for a node that keeps everything.
+
+    #[test]
+    fn explorer_mode_needs_no_pruning_in_effect_and_no_deleted_blocks() {
+        assert!(explorer_mode_possible(Some(false), None, false));
+        assert!(explorer_mode_possible(None, None, false));
+        assert!(
+            !explorer_mode_possible(Some(true), None, false),
+            "the keeper conf"
+        );
+        assert!(
+            !explorer_mode_possible(None, None, true),
+            "blocks already deleted"
+        );
+    }
+
+    #[test]
+    fn btx_rw_conf_outranks_the_apps_conf_for_explorer_mode() {
+        // The 3060 on 2026-09-06: conf prune=0, btx_rw.conf prune=4096.
+        assert!(!explorer_mode_possible(Some(false), Some(true), false));
+        assert!(explorer_mode_possible(Some(true), Some(false), false));
+    }
+
+    #[test]
+    fn explorer_mode_possible_here_reads_both_confs_and_the_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        std::fs::create_dir_all(d.join("faststart")).unwrap();
+        std::fs::create_dir_all(d.join("blocks")).unwrap();
+        std::fs::write(d.join("faststart/faststart.conf"), "prune=0\n").unwrap();
+        std::fs::write(d.join("blocks/blk00000.dat"), b"x").unwrap();
+        assert!(explorer_mode_possible_here(d));
+        std::fs::write(d.join("btx_rw.conf"), "prune=4096\n").unwrap();
+        assert!(!explorer_mode_possible_here(d));
+        std::fs::remove_file(d.join("btx_rw.conf")).unwrap();
+        std::fs::remove_file(d.join("blocks/blk00000.dat")).unwrap();
+        std::fs::write(d.join("blocks/blk00003.dat"), b"x").unwrap();
+        assert!(!explorer_mode_possible_here(d), "blk00000 gone: pruned");
+    }
+
     #[test]
     fn a_keeper_install_is_not_gated_on_the_full_chain() {
         let gib = 1024 * 1024 * 1024;
@@ -1260,5 +1766,184 @@ maxreorgdepthwarn=9
             err.contains("warming up"),
             "expected the warmup message to surface, got: {err}"
         );
+    }
+
+    // ── wait_for_node_rpc_watching: the wait that watches the child ────────
+
+    /// ZAN'S TWO NODES, 2026-10-01. A btxd that dies AFTER the 5 s launch
+    /// watch (engine v0.34.12 runs its GPU readiness before it binds RPC, so
+    /// on a CUDA host every init exit lands there) must end the wait at once,
+    /// not after 360 polls against a process that is already gone.
+    #[tokio::test]
+    async fn a_child_that_exits_during_the_wait_ends_it_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut probes = 0u32;
+        let started = std::time::Instant::now();
+        // A budget of 1000 polls x 10 ms: a wait that ignored the probe would
+        // take ten seconds, one that honours it well under one.
+        let got =
+            wait_for_node_rpc_watching(dir.path(), "http://127.0.0.1:1", 1000, 10, 1000, || {
+                probes += 1;
+                probes >= 3
+            })
+            .await;
+        assert!(matches!(got, RpcWait::Exited { .. }), "expected Exited");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            probes <= 4,
+            "kept polling after the child was gone: {probes}"
+        );
+    }
+
+    /// The probe says the child is alive: a node that never writes a cookie
+    /// runs the whole budget and times out, and says it never answered.
+    #[tokio::test]
+    async fn a_live_child_without_a_cookie_times_out_and_never_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        match wait_for_node_rpc_watching(dir.path(), "http://127.0.0.1:1", 3, 10, 100, || false)
+            .await
+        {
+            RpcWait::TimedOut { last, warming } => {
+                assert!(last.contains("cookie"), "{last}");
+                assert!(!warming, "nothing ever answered");
+            }
+            _ => panic!("expected a timeout"),
+        }
+    }
+
+    /// Warmup is unchanged by the probe: -28 answers are alive, use the long
+    /// budget, and the timeout says the node was answering.
+    #[tokio::test]
+    async fn a_warming_child_keeps_the_warmup_budget_under_the_watch() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"result":null,"error":{"code":-28,"message":"Verifying blocks…"},"id":"easybtx"}"#,
+            )
+            .expect_at_least(4)
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".cookie"), "__cookie__:secret").unwrap();
+        match wait_for_node_rpc_watching(dir.path(), &server.url(), 1, 10, 4, || false).await {
+            RpcWait::TimedOut { last, warming } => {
+                assert!(last.contains("warming up"), "{last}");
+                assert!(warming, "the node answered -28, so it was reachable");
+            }
+            _ => panic!("expected the warmup budget to expire"),
+        }
+    }
+
+    /// The polls spent before the node first answered warmup do not count
+    /// against it afterwards (Task A review M3): once it answers -28 its RPC
+    /// is up, and a later blip gets the whole no-answer budget again.
+    #[tokio::test]
+    async fn the_first_warmup_answer_resets_the_no_answer_budget() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"result":null,"error":{"code":-28,"message":"Loading block index…"},"id":"easybtx"}"#,
+            )
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cookie = dir.path().join(".cookie");
+        let mut probes = 0u32;
+        // Polls 1 and 2: no cookie. Poll 3: the cookie appears and the node
+        // answers -28 once. Poll 4 on: the cookie is gone again. With the
+        // reset the no-answer budget of 3 starts over at poll 4 and ends
+        // after poll 6; without it, it ended at poll 4.
+        let probe = || {
+            probes += 1;
+            match probes {
+                3 => std::fs::write(&cookie, "__cookie__:secret").unwrap(),
+                4 => std::fs::remove_file(&cookie).unwrap(),
+                _ => {}
+            }
+            false
+        };
+        let got = wait_for_node_rpc_watching(dir.path(), &server.url(), 3, 10, 100, probe).await;
+        assert!(
+            matches!(got, RpcWait::TimedOut { warming: true, .. }),
+            "expected a timeout after warmup"
+        );
+        assert!(probes >= 6, "the budget started over: {probes} probes");
+    }
+
+    /// An exit says whether the node had answered warmup first, so the
+    /// caller does not call a node whose RPC was up one that died "before its
+    /// RPC came up" (Task A review M6).
+    #[tokio::test]
+    async fn an_exit_after_warmup_says_it_was_warming() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"result":null,"error":{"code":-28,"message":"Verifying blocks…"},"id":"easybtx"}"#,
+            )
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".cookie"), "__cookie__:secret").unwrap();
+        let mut probes = 0u32;
+        let probe = || {
+            probes += 1;
+            probes > 2
+        };
+        let got = wait_for_node_rpc_watching(dir.path(), &server.url(), 5, 10, 100, probe).await;
+        assert!(
+            matches!(got, RpcWait::Exited { warming: true, .. }),
+            "expected an exit after warmup"
+        );
+        let cold =
+            wait_for_node_rpc_watching(dir.path(), "http://127.0.0.1:1", 5, 10, 100, || true).await;
+        assert!(matches!(cold, RpcWait::Exited { warming: false, .. }));
+    }
+
+    /// A ready node is ready whatever the probe would say later.
+    #[tokio::test]
+    async fn a_ready_node_is_ready_under_the_watch() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"result":{"blocks":10,"headers":10,"verificationprogress":1.0,"initialblockdownload":false},"error":null,"id":"easybtx"}"#,
+            )
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".cookie"), "__cookie__:secret").unwrap();
+        let got = wait_for_node_rpc_watching(dir.path(), &server.url(), 5, 10, 100, || false).await;
+        assert!(matches!(got, RpcWait::Ready(_)), "expected Ready");
+    }
+
+    /// The budget ran out and the child died in the same moment: that is an
+    /// exit, so the caller reads its log and retries instead of stopping a
+    /// process that is not there.
+    #[tokio::test]
+    async fn an_exit_seen_as_the_budget_ends_is_an_exit_not_a_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut probes = 0u32;
+        // max_polls 2: probes 1 and 2 run inside the loop, probe 3 after it.
+        let got = wait_for_node_rpc_watching(dir.path(), "http://127.0.0.1:1", 2, 10, 100, || {
+            probes += 1;
+            probes >= 3
+        })
+        .await;
+        assert!(matches!(got, RpcWait::Exited { .. }), "expected Exited");
     }
 }
