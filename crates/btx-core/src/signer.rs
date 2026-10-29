@@ -504,6 +504,19 @@ pub struct SignedRecent {
 /// A failed read leaves that height unrecorded and stops the pass; the next
 /// call picks it up. Never an error: a window that is short of a few blocks is
 /// still a true statement about the blocks it holds.
+///
+/// One answer is not a failure: on a signing node `getmatmulattestations` also
+/// signs, and for a block whose height this signer already spent on a twin it
+/// answers `height-occupied` and returns nothing, every time. Measured on the
+/// project's 3060 on 2026-10-14 at block 248,089, after a one-block race: the
+/// pass stopped there on every call, so `/signers/recent` reported 4 of 100
+/// blocks until that height left the window. Such a height is skipped, left
+/// unread (so `seen` stays honest), and the walk goes on.
+/// The engine's answer when a signer is asked to sign a block at a height it
+/// already signed for another block (`Attestation signing failed:
+/// height-occupied`, RPC error -32603).
+pub const HEIGHT_OCCUPIED: &str = "height-occupied";
+
 pub async fn refresh_recent_signers(
     rpc: &dyn Rpc,
     window: &mut RecentSigners,
@@ -517,11 +530,17 @@ pub async fn refresh_recent_signers(
         let Some(hash) = v.as_str().map(str::to_string) else {
             return;
         };
-        let Ok(a) = rpc
+        let a = match rpc
             .call("getmatmulattestations", serde_json::json!([hash]))
             .await
-        else {
-            return;
+        {
+            Ok(a) => a,
+            Err(crate::error::AppError::Rpc { message, .. })
+                if message.contains(HEIGHT_OCCUPIED) =>
+            {
+                continue;
+            }
+            Err(_) => return,
         };
         let atts: Vec<String> = a
             .as_array()
@@ -545,6 +564,74 @@ mod tests {
     const REAL_ATTESTATION: &str = "020146faf0ab1a2bba35d46cc0395810c4099365cce27dcaa9256e2d9da398a9759a978c191a323620660e05c3f26e4b678040f642ed71d5d79b2e9343cb3e8d2c5461030004018871af09bde2d5cded09bcf4fd41ccc979680bdc6125312a754981142e5cad322102d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c467546304402205aed6d07d5673463ec7f146de5fa4095ec01ec3c18517835350d8d3317a8ffd7022036cfee81d4408cd634581c48976de2c61ed5bf31a5f45d1763da4833a8d72514";
     const VALIDATOR_KEY: &str =
         "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675";
+
+    /// A node whose attestation call refuses one height the way a signer does
+    /// for a block it lost a race on, and optionally drops the connection
+    /// there instead.
+    struct OccupiedAt {
+        height: u64,
+        drop_connection: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::rpc::Rpc for OccupiedAt {
+        async fn call(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> crate::error::AppResult<serde_json::Value> {
+            match method {
+                "getblockhash" => Ok(serde_json::json!(format!(
+                    "{:064x}",
+                    params[0].as_u64().unwrap_or(0)
+                ))),
+                "getmatmulattestations" => {
+                    let h = u64::from_str_radix(params[0].as_str().unwrap_or(""), 16).unwrap_or(0);
+                    if h != self.height {
+                        Ok(serde_json::json!([REAL_ATTESTATION]))
+                    } else if self.drop_connection {
+                        Err(crate::error::AppError::Http("connection reset".into()))
+                    } else {
+                        // Verbatim from the 3060, block 248,089, 2026-10-14.
+                        Err(crate::error::AppError::Rpc {
+                            code: -32603,
+                            message: "Attestation signing failed: height-occupied".into(),
+                        })
+                    }
+                }
+                other => panic!("unexpected call {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_height_lost_to_a_twin_is_skipped_not_a_wall() {
+        let node = OccupiedAt {
+            height: 5,
+            drop_connection: false,
+        };
+        let mut w = RecentSigners::new();
+        refresh_recent_signers(&node, &mut w, 10, 100).await;
+        let s = w.summary();
+        // Every height from 0 to 10 but 5: the walk went past it.
+        assert_eq!(s.seen, 10, "{s:?}");
+        assert_eq!(s.tip, 10);
+        assert_eq!(s.blocks_with_signature, 10);
+        assert!(w.hash_at(5).is_none(), "the refused height is not invented");
+        // It stays unread, so the next pass asks again (and skips again).
+        assert!(w.heights_to_read(10, 100).contains(&5));
+    }
+
+    #[tokio::test]
+    async fn a_node_that_stops_answering_still_ends_the_pass() {
+        let node = OccupiedAt {
+            height: 5,
+            drop_connection: true,
+        };
+        let mut w = RecentSigners::new();
+        refresh_recent_signers(&node, &mut w, 10, 100).await;
+        assert_eq!(w.summary().seen, 5, "0 to 4, then the pass stops");
+    }
 
     #[test]
     fn a_generated_key_round_trips_and_has_the_btx_shape() {
@@ -831,7 +918,15 @@ mod tests {
     ///   cargo test --lib signer::tests::the_shipped_engine_signs_with_a_generated_key -- --ignored
     /// ```
     ///
-    /// Passed on 2026-09-16 against btxd 0.34.6 (`v0.34.6-3013c2c2`).
+    /// Passed on 2026-09-16 against btxd 0.34.6 (`v0.34.6-3013c2c2`), and on
+    /// 2026-10-10 against v0.34.15 on an M-series Mac.
+    ///
+    /// The wait is ten minutes, the app's own launch budget, not the 30 s it
+    /// once was. From 0.34.12 a consensus engine runs its GPU canary before
+    /// it binds RPC, and on a Mac that is one full production episode:
+    /// measured 2026-10-10 with these exact arguments, RPC answered after
+    /// 99 s on v0.34.12 (canary wall 94.4 s) and 116 s on v0.34.15 (114.7 s).
+    /// A refusal still fails at once: the loop checks the child every poll.
     #[tokio::test]
     #[ignore]
     async fn the_shipped_engine_signs_with_a_generated_key() {
@@ -866,7 +961,7 @@ mod tests {
             .expect("btxd spawns");
         let cookie = dir.path().join(".cookie");
         let mut status = None;
-        for _ in 0..60 {
+        for _ in 0..1200 {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             if let Some(code) = child.try_wait().unwrap() {
                 panic!("btxd exited early with {code}: the engine refused the key");
@@ -887,7 +982,7 @@ mod tests {
                 break;
             }
         }
-        let (rpc, v) = status.expect("btxd answered getmatmultrustedstatus within 30 s");
+        let (rpc, v) = status.expect("btxd answered getmatmultrustedstatus within 10 min");
         let _ = rpc.call("stop", serde_json::json!([])).await;
         let _ = child.wait();
         assert_eq!(v["local_signer"], true, "{v}");

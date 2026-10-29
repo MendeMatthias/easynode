@@ -82,3 +82,24 @@ export function announcer(
     }
   };
 }
+
+/** Mebibytes as the setup screen prints them (main.ts `fmtGB`). */
+const gib = (mb: number): string => `${(mb / 1024).toFixed(1)} GiB`;
+
+/** The sentence under the setup screen's two disk numbers when the free
+ *  space is short of what the install needs, else null. The disk check ran
+ *  only after "Set up my node" was pressed and then showed its error below
+ *  the fold, while both numbers had been on screen all along. This only says
+ *  it earlier: the backend's check before downloading stays the one that
+ *  decides, so the button is left alone. A free space of 0 is "not known"
+ *  (status.disk_free_mb), never "full". */
+export function diskShortfall(freeMb: number, requiredMb: number, profile: string): string | null {
+  if (!(freeMb > 0) || freeMb >= requiredMb) return null;
+  if (profile === "keeper") {
+    return `This computer has ${gib(freeMb)} free and the node needs ${gib(requiredMb)}. Free up some space first.`;
+  }
+  return (
+    `This computer has ${gib(freeMb)} free and a full node needs ${gib(requiredMb)}. Free up some space first, ` +
+    "or turn on Keeper mode in Settings, which keeps far less of the chain."
+  );
+}

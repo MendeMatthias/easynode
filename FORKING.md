@@ -76,7 +76,7 @@ Most forks should keep all of it:
   keys to tell it which blocks are valid. Keeping them means trusting the same
   signers we do. Changing them is a trust decision, so make it on purpose.
 - **Links and reads:** transaction and address links open btxscan.io, the
-  stats button opens btxprice.com, and Esplora mode reads the chain census at
+  stats button opens easybtx.com/stats, and Esplora mode reads the chain census at
   `easybtx.com/api/nodes`.
 
 ## Stay in touch

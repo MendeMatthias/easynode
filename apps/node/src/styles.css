@@ -208,6 +208,8 @@ body {
 .fact { display: flex; justify-content: space-between; gap: var(--space-s); font-size: 13px; }
 .fact-label { color: var(--color-muted); white-space: nowrap; }
 .fact-value { text-align: right; }
+.fact-value.is-short { color: var(--color-danger); }
+.wizard-disk-short { margin: 0; font-size: 12px; line-height: 1.45; color: var(--color-danger); }
 .wizard-note {
   font-size: 12px;
   color: var(--color-muted);
@@ -423,6 +425,8 @@ body {
   font-size: 16px;
   letter-spacing: 0.06em;
 }
+.status-badge[data-mode="stalled"] { color: var(--color-amber); }
+.status-badge[data-mode="error"] { color: var(--color-danger); }
 .status-sub {
   font-size: 12.5px;
   color: var(--color-muted);
@@ -571,6 +575,12 @@ body {
 
 .actions { margin-top: auto; display: flex; flex-direction: column; gap: var(--space-s); }
 .actions .btn-primary { width: 100%; }
+/* A stopped or failed node: what happened and Start node come right under
+   the headline instead of below every card (main.ts sets .is-idle). Visual
+   order only, and only these two move, so reading order stays close. */
+#screen-status.is-idle > .status-orb-wrap { order: -2; }
+#screen-status.is-idle > #status-error,
+#screen-status.is-idle > .actions { order: -1; margin-top: 0; }
 
 .error-card {
   border-color: rgba(248, 113, 113, 0.4);
@@ -693,6 +703,11 @@ body {
   padding: var(--space-m);
 }
 .overlay[hidden] { display: none; }
+/* "Close BTX Node?" and "Quitting" open over whatever panel is up when the
+   window's close button or the tray's Quit is pressed. At the shared z-index
+   they painted behind Ask, Tools and What's next, which come later in the
+   page, and the close button seemed to do nothing. Below the toast (20). */
+#close-overlay { z-index: 15; }
 .overlay-panel {
   width: 100%;
   max-width: 460px;
@@ -715,6 +730,45 @@ body {
   gap: var(--space-m);
 }
 .setting-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+/* Settings in four groups (index.html): each a column of rows with the
+   panel's own spacing, a quiet heading, and a rule between groups. The
+   operators' group is a <details>, folded until opened. */
+.settings-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-m);
+  padding-top: var(--space-m);
+  border-top: 1px solid var(--color-border);
+}
+.settings-group-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-muted);
+  margin: 0;
+}
+.settings-group-fold > summary {
+  cursor: pointer;
+  list-style: none;
+  display: block;
+}
+.settings-group-fold > summary::-webkit-details-marker { display: none; }
+.settings-group-fold > summary::before { content: "▸ "; }
+.settings-group-fold[open] > summary::before { content: "▾ "; }
+.settings-group-hint {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+/* Inside a <details> the rows sit in its content slot, where the group's
+   flex gap does not reach them (WebKit and Chromium), so they space
+   themselves. */
+.settings-group-fold { gap: 0; }
+.settings-group-fold > :not(summary) { margin-top: var(--space-m); }
 .setting-name { font-size: 14px; font-weight: 700; }
 .setting-desc {
   font-size: 12px;
@@ -794,6 +848,9 @@ body {
 }
 .switch input:checked + .slider { background: rgba(247, 147, 26, 0.25); border-color: var(--color-accent); }
 .switch input:checked + .slider::before { transform: translateX(18px); background: var(--color-accent); }
+/* A feature this machine cannot run: the switch is greyed out and the line
+   beside it says why (feature-rows.ts). */
+.switch input:disabled + .slider { opacity: 0.4; cursor: not-allowed; }
 
 /* Toast */
 .toast {

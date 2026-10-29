@@ -79,6 +79,12 @@ pub struct NodeAppSettings {
     /// this is for is exactly those installs.
     #[serde(default)]
     pub signer_migrated: bool,
+    /// True once `migrate_features_on` has run on this install. Same pairing
+    /// as the two flags above: serde `false` so every existing settings file
+    /// is migrated once, struct `true` so a new install (which has the
+    /// features from `Default`) is not.
+    #[serde(default)]
+    pub features_on_migrated: bool,
     /// True once the one-time welcome panel has been shown.
     ///
     /// The two defaults differ ON PURPOSE and it is the whole trick. The
@@ -110,13 +116,38 @@ pub struct NodeAppSettings {
     /// visible toggle in Settings for laptop users who prefer sleep.
     #[serde(default = "default_true")]
     pub keep_awake: bool,
+    /// Inside WSL2 only: when the GPU block verifier is lost mid-run (a
+    /// graphics driver update on the Windows host), restart WSL to get it
+    /// back, since an engine restart does not (measured on the 3060,
+    /// 2026-10-13; `btx_core::engine_warnings::lost_verifier_remedy`). ON by
+    /// default by the owner's rule that the node heals itself. Switchable,
+    /// because restarting WSL stops every Linux program on that PC.
+    #[serde(default = "default_true")]
+    pub gpu_recovery_restarts_wsl: bool,
+    /// When the app last restarted WSL to recover the GPU verifier (unix
+    /// seconds), and how many such restarts since a run last verified blocks.
+    /// Here rather than in memory because the WSL restart ends the process
+    /// that made it (`btx_core::engine_warnings::restart_wsl_for_lost_verifier`).
+    #[serde(default)]
+    pub gpu_wsl_restart_last_unix: Option<u64>,
+    #[serde(default)]
+    pub gpu_wsl_restart_streak: u32,
     /// Explorer mode: the node maintains a full transaction index
-    /// (`txindex=1`) so historical txid lookups answer locally. Off by
-    /// default — enabling is a deliberate, reversible user choice.
+    /// (`txindex=1`) so historical txid lookups answer locally.
+    ///
+    /// ON by default since 2026-10-12, by the owner's rule that every feature
+    /// is on and a machine that cannot run one simply does not. It costs
+    /// little: the whole chain held 349,792 transactions (getchaintxstats on
+    /// btxscan's node, 07:52 UTC that day), so the index is tens of MB, and
+    /// building it reads the chain once while the node stays usable. It is
+    /// applied only where no pruning is in effect
+    /// (`btx_core::setup::explorer_mode_possible_here`): BTX refuses to start
+    /// with both.
     #[serde(default)]
     pub txindex_enabled: bool,
-    /// Wallet view: OFF from factory settings — no wallet surface exists
-    /// until the user flips the Settings toggle. Not a default surface.
+    /// Wallet view: the header button and panel. ON by default since
+    /// 2026-10-12 (the owner's rule above). Showing the panel creates
+    /// nothing: no wallet exists until the user makes or imports one.
     #[serde(default)]
     pub wallet_enabled: bool,
     /// The btxd wallet name created by a `.btxwallet` import (None = nothing
@@ -223,9 +254,11 @@ pub struct NodeAppSettings {
     #[serde(default)]
     pub node_nickname: String,
     /// Serve the Esplora REST API to wallets: electrs and the Caddy front run
-    /// beside btxd (`btx_core::esplora_sidecar`). Off by default. Refused on a
-    /// pruned datadir by `btx_core::esplora`, and the refusal is shown where
-    /// the switch is, never logged away.
+    /// beside btxd (`btx_core::esplora_sidecar`). ON by default since
+    /// 2026-10-12 (the owner's rule above), and it runs only where it can:
+    /// electrs and Caddy are not shipped with the app, and a pruned node
+    /// cannot serve history, so on nearly every install it does nothing and
+    /// Settings says why in plain words (`esplora_unavailable`).
     #[serde(default)]
     pub esplora_enabled: bool,
     /// Where the front listens. Plain HTTP on localhost until an operator
@@ -256,9 +289,9 @@ pub struct NodeAppSettings {
     /// with this node's key at every multiple of 100 blocks, offer it over P2P
     /// once it is 144 blocks deep and checked against the node's own diary,
     /// send it to easybtx.com when the key is on the operator list, and
-    /// re-offer it after every node start. Off by
-    /// default: it only works on a node that validates and signs, and the gate
-    /// says so where the switch is. What is served is ~9 MB and a fetching
+    /// re-offer it after every node start. ON by default since 2026-10-12
+    /// (the owner's rule above): it only works on a node that validates and
+    /// signs, and anywhere else it does nothing and Settings says so calmly. What is served is ~9 MB and a fetching
     /// node takes it in chunks; nothing about this node is exposed beyond a
     /// service bit and the signed file.
     #[serde(default)]
@@ -322,6 +355,7 @@ impl Default for NodeAppSettings {
             // needs no migration; it only needs the panel.
             contribution_migrated: true,
             signer_migrated: true,
+            features_on_migrated: true,
             // A fresh machine has not seen it. See the field's docs for why
             // this disagrees with the serde default.
             welcome_shown: false,
@@ -329,8 +363,13 @@ impl Default for NodeAppSettings {
             first_load_pending: false,
             btx_release_tag: None,
             keep_awake: true,
-            txindex_enabled: false,
-            wallet_enabled: false,
+            gpu_recovery_restarts_wsl: true,
+            gpu_wsl_restart_last_unix: None,
+            gpu_wsl_restart_streak: 0,
+            // On, by the owner's rule of 2026-10-12: every feature is on,
+            // and one a machine cannot run simply does not run there.
+            txindex_enabled: true,
+            wallet_enabled: true,
             wallet_name: None,
             wallet_address: None,
             on_close: default_on_close(),
@@ -347,13 +386,12 @@ impl Default for NodeAppSettings {
             // No nickname. Anything else would publish an identifier the user
             // never chose to publish.
             node_nickname: String::new(),
-            esplora_enabled: false,
+            esplora_enabled: true,
             esplora_listen: default_esplora_listen(),
             witness_enabled: true,
             witness_listen: default_witness_listen(),
-            // Opt-in: needs a validating signer, and it changes what other
-            // nodes can fetch from this one.
-            snapshot_serve_enabled: false,
+            // Does nothing on a node that does not validate and sign.
+            snapshot_serve_enabled: true,
             // No check has finished yet, and the pane says so in those words.
             last_update_check_at: None,
             last_update_check_outcome: None,
@@ -474,6 +512,44 @@ impl NodeAppSettings {
             }
         });
         announce
+    }
+
+    /// Turn on, once, the four features that were never on by default:
+    /// the wallet panel, Explorer mode, Esplora and snapshot serving. The
+    /// owner's rule of 2026-10-12 is that every feature is on, a machine that
+    /// cannot run one simply does not, and anyone can switch any of them off.
+    ///
+    /// Unlike `migrate_contributions` this cannot tell "never chosen" from
+    /// "said no": the app writes every field, so every existing file already
+    /// holds these as `false`. None was ever on by default or offered by a
+    /// panel, so a `false` here is nearly always the old default. They are
+    /// turned on once, the welcome panel is armed to say so, and an "off"
+    /// after that is a choice the next launch keeps.
+    ///
+    /// Returns true when something was turned on (the cue for the panel).
+    pub fn migrate_features_on(datadir: &std::path::Path) -> bool {
+        if !datadir.join(SETTINGS_FILE_NAME).exists() {
+            return false; // a new install; Default covers it
+        }
+        if Self::load(datadir).features_on_migrated {
+            return false;
+        }
+        let mut changed = false;
+        Self::update(datadir, |s| {
+            changed = !(s.wallet_enabled
+                && s.txindex_enabled
+                && s.esplora_enabled
+                && s.snapshot_serve_enabled);
+            s.wallet_enabled = true;
+            s.txindex_enabled = true;
+            s.esplora_enabled = true;
+            s.snapshot_serve_enabled = true;
+            s.features_on_migrated = true;
+            if changed {
+                s.welcome_shown = false;
+            }
+        });
+        changed
     }
 
     pub fn save(&self, datadir: &std::path::Path) -> std::io::Result<()> {
@@ -795,6 +871,17 @@ pub struct AppState {
     /// gate's sentence, a missing binary, a child that exited. Shown beside
     /// the switch. `None` when running or off.
     pub esplora_error: Arc<Mutex<Option<String>>>,
+    /// Why Esplora cannot run on this machine at all (its programs are not
+    /// installed, or the node keeps only the newest blocks), as opposed to
+    /// `esplora_error`, which is a failure worth amber. Since 2026-10-12 the
+    /// switch is on by default, so this is the common case and Settings says
+    /// it calmly.
+    pub esplora_unavailable: Arc<Mutex<Option<String>>>,
+    /// When the app last restarted the engine because its block verifier was
+    /// lost mid-run (`btx_core::engine_warnings::restart_for_lost_verifier`).
+    /// In the app's state rather than the refresher's, because the restart
+    /// replaces the refresher that made it.
+    pub last_verifier_restart: Arc<Mutex<Option<std::time::Instant>>>,
     /// Generation counter for the guardian loop, bumped on every sidecar
     /// start; a loop whose generation is superseded exits.
     pub esplora_gen: Arc<AtomicU64>,
@@ -886,6 +973,8 @@ impl AppState {
             esplora: Arc::new(Mutex::new(None)),
             esplora_verdict: Arc::new(Mutex::new(None)),
             esplora_error: Arc::new(Mutex::new(None)),
+            esplora_unavailable: Arc::new(Mutex::new(None)),
+            last_verifier_restart: Arc::new(Mutex::new(None)),
             esplora_gen: Arc::new(AtomicU64::new(0)),
             witness: Arc::new(Mutex::new(None)),
             witness_error: Arc::new(Mutex::new(None)),
@@ -904,18 +993,35 @@ mod tests {
     fn settings_default_keeps_awake_and_needs_setup() {
         let s = NodeAppSettings::default();
         assert!(s.keep_awake, "keep-awake defaults ON (the app's purpose)");
+        assert!(
+            s.gpu_recovery_restarts_wsl,
+            "GPU recovery by WSL restart defaults ON (the owner's self-healing rule)"
+        );
         assert!(!s.setup_complete);
         assert!(!s.snapshot_loaded);
         assert!(s.btx_release_tag.is_none());
-        assert!(!s.txindex_enabled, "explorer mode is opt-in, never default");
-        assert!(!s.wallet_enabled, "wallet is OFF from factory settings");
+        // The owner's rule of 2026-10-12: every feature is on, the ones a
+        // machine cannot run simply do not run there, and anyone can switch
+        // any of them off in Settings.
+        assert!(
+            s.txindex_enabled,
+            "Explorer mode is on wherever the whole chain is kept"
+        );
+        assert!(
+            s.wallet_enabled,
+            "the wallet panel is there; no wallet exists until one is made"
+        );
         assert!(s.wallet_name.is_none());
         assert_eq!(s.on_close, "ask", "the red X asks until the user decides");
-        assert!(!s.esplora_enabled, "Esplora mode is opt-in, never default");
         assert!(
-            !s.snapshot_serve_enabled,
-            "serving a snapshot is opt-in: it needs a validating signer and changes what peers fetch"
+            s.esplora_enabled,
+            "Esplora runs where electrs and Caddy are installed"
         );
+        assert!(
+            s.snapshot_serve_enabled,
+            "a node that validates and signs serves snapshots; elsewhere it does nothing"
+        );
+        assert!(s.features_on_migrated, "a new install already has them");
         // Changed 2026-09-16, deliberately. A new install now contributes the
         // three things that are cheap and expose nothing, and first run shows
         // them so it is opt-out. Esplora stays opt-in: it needs a second
@@ -1132,6 +1238,61 @@ mod tests {
         assert!(!empty.path().join(SETTINGS_FILE_NAME).exists());
     }
 
+    /// The owner's rule of 2026-10-12, for installs that already exist:
+    /// wallet, Explorer mode, Esplora and snapshot serving were never offered
+    /// as defaults, and every settings file already carries them as `false`
+    /// (the app writes every field), so an absent key cannot mark "never
+    /// chosen" the way it did for `migrate_contributions`. They are turned on
+    /// once, the panel says so, and a later "off" stays off.
+    #[test]
+    fn the_features_on_migration_turns_them_on_once_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            r#"{"setup_complete":true,"welcome_shown":true,"contribution_migrated":true,
+               "signer_migrated":true,"wallet_enabled":false,"txindex_enabled":false,
+               "esplora_enabled":false,"snapshot_serve_enabled":false}"#,
+        )
+        .unwrap();
+        assert!(NodeAppSettings::migrate_features_on(dir.path()));
+        let s = NodeAppSettings::load(dir.path());
+        assert!(
+            s.wallet_enabled && s.txindex_enabled && s.esplora_enabled && s.snapshot_serve_enabled
+        );
+        assert!(s.features_on_migrated);
+        assert!(!s.welcome_shown, "the panel tells them what changed");
+
+        // Once: an off after it is a choice, kept on the next launch.
+        NodeAppSettings::update(dir.path(), |s| {
+            s.wallet_enabled = false;
+            s.welcome_shown = true;
+        });
+        assert!(!NodeAppSettings::migrate_features_on(dir.path()));
+        let s = NodeAppSettings::load(dir.path());
+        assert!(!s.wallet_enabled && s.welcome_shown);
+    }
+
+    #[test]
+    fn the_features_on_migration_is_quiet_when_nothing_changes() {
+        // Everything already on: recorded, nobody interrupted.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE_NAME),
+            r#"{"setup_complete":true,"welcome_shown":true,"wallet_enabled":true,
+               "txindex_enabled":true,"esplora_enabled":true,"snapshot_serve_enabled":true}"#,
+        )
+        .unwrap();
+        assert!(!NodeAppSettings::migrate_features_on(dir.path()));
+        let s = NodeAppSettings::load(dir.path());
+        assert!(s.features_on_migrated && s.welcome_shown);
+
+        // No settings file: a new install, which has them from Default.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!NodeAppSettings::migrate_features_on(empty.path()));
+        assert!(!empty.path().join(SETTINGS_FILE_NAME).exists());
+    }
+
     /// The welcome panel shows once, to a new install, and never to somebody
     /// who set their node up before it existed.
     #[test]
@@ -1184,6 +1345,14 @@ mod tests {
         let legacy = NodeAppSettings::load(dir.path());
         assert!(legacy.setup_complete);
         assert!(legacy.keep_awake, "missing keep_awake defaults true");
+        // An install from before the switch existed gets the self-healing.
+        assert!(
+            legacy.gpu_recovery_restarts_wsl,
+            "missing gpu_recovery_restarts_wsl defaults true"
+        );
+        // And starts with no record of a WSL restart.
+        assert_eq!(legacy.gpu_wsl_restart_last_unix, None);
+        assert_eq!(legacy.gpu_wsl_restart_streak, 0);
         // Corrupt file → defaults, never a panic.
         std::fs::write(dir.path().join(SETTINGS_FILE_NAME), b"not-json").unwrap();
         assert_eq!(

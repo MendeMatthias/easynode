@@ -59,6 +59,28 @@ pub struct BlockchainInfo {
     /// loss; losing `getblockchaininfo` blinds the refresher to everything.
     #[serde(default, deserialize_with = "warnings_in_any_shape")]
     pub warnings: Vec<String>,
+    /// `matmul_signed_frontier`: the highest height a pinned key signed, and
+    /// whether it is on this node's chain. Present on a node that pins a key
+    /// (v0.34.15, measured on btxscan's btxd2 on 2026-10-11). The third
+    /// witness of [`BlockchainInfo::network_height`]. Like the warnings, a
+    /// shape nobody anticipated decodes to `None` and never fails the call.
+    #[serde(
+        rename = "matmul_signed_frontier",
+        default,
+        deserialize_with = "frontier_in_any_shape"
+    )]
+    pub signed_frontier: Option<AttestedTip>,
+}
+
+/// See [`BlockchainInfo::signed_frontier`].
+fn frontier_in_any_shape<'de, D>(d: D) -> Result<Option<AttestedTip>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.is_object()
+        .then(|| serde_json::from_value::<AttestedTip>(v).ok())
+        .flatten())
 }
 
 /// See [`BlockchainInfo::warnings`]. Non-string array entries and blank lines
@@ -98,6 +120,19 @@ impl BlockchainInfo {
     /// that, which is the slow, honest signal.
     pub fn tip_unsafe_to_act_on(&self) -> bool {
         self.is_stale || self.behind_best_header > 0
+    }
+
+    /// How high the chain this node is on reaches: `blocks`, `headers` and
+    /// the signed frontier when it is on this chain, whichever is highest
+    /// ([`crate::network_height`]). What every "blocks behind" reader uses
+    /// since 0.7.11, because after mainnet block 244,000 `headers` alone
+    /// stays near `blocks` while a node catches up.
+    pub fn network_height(&self) -> u64 {
+        crate::network_height::network_height(
+            self.blocks,
+            self.headers,
+            self.signed_frontier.as_ref(),
+        )
     }
 }
 
@@ -1544,6 +1579,7 @@ mod tests {
             is_stale: false,
             behind_best_header: 0,
             warnings: Vec::new(),
+            signed_frontier: None,
         };
         assert!(!caught_up.tip_unsafe_to_act_on());
 
@@ -1621,6 +1657,69 @@ mod tests {
         assert_eq!(bi.median_time, 0);
         assert!(!tip_is_stale(bi.median_time, 1_800_000_000));
         assert!(bi.warnings.is_empty(), "no field, no warnings");
+    }
+
+    #[test]
+    fn the_signed_frontier_decodes_with_the_rest_and_sets_the_network_height() {
+        // btxscan's btxd2, v0.34.15, read only, 2026-10-11 21:5x UTC: the
+        // frontier rides in getblockchaininfo on a node that pins a key.
+        let at_tip = json!({
+            "blocks": 245_546, "headers": 245_546,
+            "verificationprogress": 1.0, "initialblockdownload": false,
+            "matmul_signed_frontier": {
+                "height": 245_546,
+                "hash": "64fd0b8182c7e0407f8d3881eb807d30a1f35af745980c11031e52836835027a",
+                "on_active_chain": true, "on_chain_attested_height": 245_546, "blocks_behind": 0
+            }
+        });
+        let bi: BlockchainInfo = serde_json::from_value(at_tip).unwrap();
+        assert_eq!(
+            bi.signed_frontier.as_ref().and_then(|f| f.height),
+            Some(245_546)
+        );
+        assert_eq!(bi.network_height(), 245_546);
+
+        // Catching up after 244,000: headers held near blocks, the signers ahead.
+        let behind = json!({
+            "blocks": 240_000, "headers": 244_888,
+            "verificationprogress": 0.98, "initialblockdownload": false,
+            "matmul_signed_frontier": {
+                "height": 245_260, "on_active_chain": true,
+                "on_chain_attested_height": 240_000, "blocks_behind": 5_260
+            }
+        });
+        let bi: BlockchainInfo = serde_json::from_value(behind).unwrap();
+        assert_eq!(bi.network_height(), 245_260);
+
+        // No pinned key: no field, and the best header as before.
+        let bare = json!({
+            "blocks": 240_000, "headers": 240_300,
+            "verificationprogress": 0.99, "initialblockdownload": false
+        });
+        let bi: BlockchainInfo = serde_json::from_value(bare).unwrap();
+        assert_eq!(bi.signed_frontier, None);
+        assert_eq!(bi.network_height(), 240_300);
+    }
+
+    #[test]
+    fn a_frontier_of_an_unexpected_shape_never_fails_the_call() {
+        // Losing getblockchaininfo blinds the refresher to everything; losing
+        // the frontier only costs the network height its third witness.
+        for odd in [
+            json!({"height": -1, "on_active_chain": true}),
+            json!("x"),
+            json!(7),
+            json!(null),
+        ] {
+            let v = json!({
+                "blocks": 240_000, "headers": 240_100,
+                "verificationprogress": 0.99, "initialblockdownload": false,
+                "matmul_signed_frontier": odd
+            });
+            let bi: BlockchainInfo = serde_json::from_value(v).unwrap();
+            assert_eq!(bi.signed_frontier, None);
+            assert_eq!(bi.network_height(), 240_100);
+        }
     }
 
     #[test]

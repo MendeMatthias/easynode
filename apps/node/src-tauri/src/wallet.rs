@@ -147,6 +147,14 @@ pub async fn set_wallet_enabled(state: State<'_, AppState>, on: bool) -> Result<
     Ok(())
 }
 
+/// How far the node stands below the network height
+/// (btx_core::network_height), or 0 when getblockchaininfo did not answer.
+/// After mainnet 244,000 `headers - blocks` stays near 0 while a node catches
+/// up, and the panel's catch-up note never showed.
+fn blocks_behind(chain: Option<&api::BlockchainInfo>) -> u64 {
+    chain.map_or(0, |bi| bi.network_height().saturating_sub(bi.blocks))
+}
+
 /// The wallet panel's single data call: settings + (when imported and the
 /// node runs) node-verified balances and recent history.
 #[tauri::command]
@@ -187,10 +195,7 @@ pub async fn wallet_status(state: State<'_, AppState>) -> Result<Ask<WalletView>
         .as_ref()
         .map(|bi| api::tip_is_stale(bi.median_time, now_unix))
         .unwrap_or(false);
-    let blocks_behind = chain
-        .as_ref()
-        .map(|bi| bi.headers.saturating_sub(bi.blocks))
-        .unwrap_or(0);
+    let blocks_behind = blocks_behind(chain.as_ref());
     Ok(Ask::Ready(WalletView {
         enabled: settings.wallet_enabled,
         imported: true,
@@ -637,7 +642,7 @@ pub async fn wallet_create(state: State<'_, AppState>) -> Result<Ask<CreateResul
     let datadir = node_datadir();
     if NodeAppSettings::load(&datadir).wallet_name.is_some() {
         return Ok(Ask::Unavailable {
-            message: "A wallet is already set up — stop watching it first.".into(),
+            message: "A wallet is already set up. Stop watching it first.".into(),
         });
     }
     let Some(rpc) = state.rpc.lock().await.clone() else {
@@ -713,7 +718,7 @@ pub async fn wallet_create(state: State<'_, AppState>) -> Result<Ask<CreateResul
 pub async fn wallet_receive_address(state: State<'_, AppState>) -> Result<Ask<String>, String> {
     let settings = NodeAppSettings::load(&node_datadir());
     let Some(name) = settings.wallet_name.clone() else {
-        return Err("No wallet yet — create or import one first.".into());
+        return Err("No wallet yet. Create or import one first.".into());
     };
     let Some(rpc) = state.rpc.lock().await.clone() else {
         return Ok(Ask::Stopped);
@@ -764,7 +769,7 @@ pub async fn wallet_send(
 
     let settings = NodeAppSettings::load(&node_datadir());
     let Some(name) = settings.wallet_name.clone() else {
-        return Err("No wallet yet — create or import one first.".into());
+        return Err("No wallet yet. Create or import one first.".into());
     };
     let Some(rpc) = state.rpc.lock().await.clone() else {
         return Ok(Ask::Stopped);
@@ -786,7 +791,7 @@ pub async fn wallet_send(
     // rejects a legitimate "send everything" by a rounding crumb.
     if amount > balances.trusted + 1e-12 {
         return Err(format!(
-            "You can spend {:.8} BTX right now — that's less than {:.8}.",
+            "You can spend {:.8} BTX right now, which is less than {:.8}.",
             balances.trusted, amount
         ));
     }
@@ -850,6 +855,25 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::Mutex;
+
+    /// After mainnet 244,000 headers stay near blocks while a node catches
+    /// up, so the wallet's "still catching up" note counts toward the network
+    /// height (btx_core::network_height), or it never shows.
+    #[test]
+    fn the_wallet_counts_blocks_behind_the_network_height() {
+        let bi = api::BlockchainInfo {
+            blocks: 240_000,
+            headers: 240_010,
+            signed_frontier: Some(api::AttestedTip {
+                height: Some(245_260),
+                on_active_chain: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(blocks_behind(Some(&bi)), 5_260);
+        assert_eq!(blocks_behind(None), 0, "no answer, no claim");
+    }
 
     /// Minimal `Rpc` that answers `listwalletdir` from a fixed list, and can be
     /// told to fail instead, so the collision logic is testable with no node.

@@ -111,7 +111,7 @@ fn phase_words(phase: &NodePhase) -> String {
             peers,
             ..
         } => format!(
-            "syncing, height {} of {} headers, {} peers",
+            "syncing, height {} of {}, {} peers",
             group(*height),
             group(*headers),
             peers
@@ -790,7 +790,7 @@ mod tests {
                     progress: 1.0,
                     peers: 0,
                 }),
-                "syncing, height 0 of 0 headers, 0 peers"
+                "syncing, height 0 of 0, 0 peers"
             );
         }
 

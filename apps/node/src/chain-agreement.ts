@@ -16,6 +16,10 @@ export type ChainAgreementRow = {
   status: string;
   /** AGREE | BEHIND | STALE TIP | DISAGREE | NOT ENOUGH SOURCES | NOT RUN */
   word: string;
+  /** behind | differs when the row is about this node rather than a source
+   *  (btx_core::chain_agreement::ThisNode); the status headline reads it.
+   *  Absent from an older backend, which reads as null. */
+  this_node?: "behind" | "differs" | null;
   headline: string;
   scope: string;
   meaning: string | null;

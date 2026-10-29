@@ -1,0 +1,194 @@
+{
+  "catching_up": [
+    {
+      "helps": true,
+      "label": "Validation",
+      "note": "Checks every new block itself. Its older history is still being checked.",
+      "value": "Checking every block itself"
+    },
+    {
+      "helps": null,
+      "label": "Signing key",
+      "note": "Ordinary. Most nodes hold none, and a node without a key can serve the full range of history, which is what the network is short of.",
+      "value": "None"
+    },
+    {
+      "helps": null,
+      "label": "Serving history",
+      "note": "Serving attestations. Waiting to read the signed frontier before reporting whether history is being served.",
+      "value": "On"
+    },
+    {
+      "helps": null,
+      "label": "Reachable",
+      "note": "A reachable node still needs a while to be found. If this line has not changed after half an hour, it is the router or a firewall, not the node.",
+      "value": "No inbound connections yet"
+    },
+    {
+      "helps": false,
+      "label": "Chain position",
+      "note": "Other nodes have signed blocks this one does not have yet, so what it serves is not current. Leaving it running and connected is usually all it needs.",
+      "value": "460 blocks behind the signed chain"
+    }
+  ],
+  "follower_frozen_1h": [
+    {
+      "helps": false,
+      "label": "Validation",
+      "note": "Every recent block reached this node on the signature of a single key. However many keys the config pins, that one machine being switched off, or merely unlucky on a fork, stops this node — and nothing else here will look wrong while it does. Pin a second key that is actually signing.",
+      "value": "Following ONE signer"
+    },
+    {
+      "helps": null,
+      "label": "Signing key",
+      "note": "Ordinary. Most nodes hold none, and a node without a key can serve the full range of history, which is what the network is short of.",
+      "value": "None"
+    },
+    {
+      "helps": false,
+      "label": "Serving history",
+      "note": "Not serving attestations. This node follows the chain for itself.",
+      "value": "Off"
+    },
+    {
+      "helps": false,
+      "label": "Reachable",
+      "note": "Nothing this node holds is on offer until another node can reach it. That is almost always the router or a firewall rather than the node: forwarding port 19335 to this machine is usually the whole fix.",
+      "value": "No inbound connections"
+    },
+    {
+      "helps": true,
+      "label": "Chain position",
+      "note": "Holds every block it knows about, so what it serves is current.",
+      "value": "At the tip"
+    }
+  ],
+  "follower_frozen_6h": [
+    {
+      "helps": false,
+      "label": "Validation",
+      "note": "Every recent block reached this node on the signature of a single key. However many keys the config pins, that one machine being switched off, or merely unlucky on a fork, stops this node — and nothing else here will look wrong while it does. Pin a second key that is actually signing.",
+      "value": "Following ONE signer"
+    },
+    {
+      "helps": null,
+      "label": "Signing key",
+      "note": "Ordinary. Most nodes hold none, and a node without a key can serve the full range of history, which is what the network is short of.",
+      "value": "None"
+    },
+    {
+      "helps": false,
+      "label": "Serving history",
+      "note": "Not serving attestations. This node follows the chain for itself.",
+      "value": "Off"
+    },
+    {
+      "helps": false,
+      "label": "Reachable",
+      "note": "Nothing this node holds is on offer until another node can reach it. That is almost always the router or a firewall rather than the node: forwarding port 19335 to this machine is usually the whole fix.",
+      "value": "No inbound connections"
+    },
+    {
+      "helps": false,
+      "label": "Chain position",
+      "note": "It knows of no newer blocks, yet a new one normally arrives every minute or two. Either it is cut off from the nodes that have them or the whole network is waiting, and until blocks move again what it serves is out of date.",
+      "value": "Not moving, newest block 6 hours old"
+    }
+  ],
+  "follower_one_signer": [
+    {
+      "helps": false,
+      "label": "Validation",
+      "note": "Every recent block reached this node on the signature of a single key. However many keys the config pins, that one machine being switched off, or merely unlucky on a fork, stops this node — and nothing else here will look wrong while it does. Pin a second key that is actually signing.",
+      "value": "Following ONE signer"
+    },
+    {
+      "helps": null,
+      "label": "Signing key",
+      "note": "Ordinary. Most nodes hold none, and a node without a key can serve the full range of history, which is what the network is short of.",
+      "value": "None"
+    },
+    {
+      "helps": false,
+      "label": "Serving history",
+      "note": "Not serving attestations. This node follows the chain for itself.",
+      "value": "Off"
+    },
+    {
+      "helps": false,
+      "label": "Reachable",
+      "note": "Nothing this node holds is on offer until another node can reach it. That is almost always the router or a firewall rather than the node: forwarding port 19335 to this machine is usually the whole fix.",
+      "value": "No inbound connections"
+    },
+    {
+      "helps": true,
+      "label": "Chain position",
+      "note": "Holds every block it knows about, so what it serves is current.",
+      "value": "At the tip"
+    }
+  ],
+  "follower_two_signers": [
+    {
+      "helps": false,
+      "label": "Validation",
+      "note": "Follows the chain through attestations signed by other nodes instead of checking the proof itself, and produces none of its own. 2 different keys carried the recent blocks, so losing one of them does not stop this node.",
+      "value": "Following signed attestations"
+    },
+    {
+      "helps": null,
+      "label": "Signing key",
+      "note": "Ordinary. Most nodes hold none, and a node without a key can serve the full range of history, which is what the network is short of.",
+      "value": "None"
+    },
+    {
+      "helps": false,
+      "label": "Serving history",
+      "note": "Not serving attestations. This node follows the chain for itself.",
+      "value": "Off"
+    },
+    {
+      "helps": false,
+      "label": "Reachable",
+      "note": "Nothing this node holds is on offer until another node can reach it. That is almost always the router or a firewall rather than the node: forwarding port 19335 to this machine is usually the whole fix.",
+      "value": "No inbound connections"
+    },
+    {
+      "helps": true,
+      "label": "Chain position",
+      "note": "Holds every block it knows about, so what it serves is current.",
+      "value": "At the tip"
+    }
+  ],
+  "signer_live": [
+    {
+      "helps": true,
+      "label": "Validation",
+      "note": "Validates the proof of work on its own hardware and takes nobody's word for the chain. This is the job a full node exists for.",
+      "value": "Checking every block itself"
+    },
+    {
+      "helps": true,
+      "label": "Signing key",
+      "note": "Signs a confirmation for every block it validates. Mirrors that pin this key follow it instead of checking the proof themselves, so this is what keeps them moving. At threshold one a pinned key is a full authority: they take this node's word for it.",
+      "value": "Signing, on 100 of the last 100 blocks"
+    },
+    {
+      "helps": false,
+      "label": "Serving history",
+      "note": "Advertising the archive service, but this node holds a signing key, so the engine answers history requests only for the last 16 blocks and refuses everything older. The network is short of KEYLESS archives, which serve the full range.",
+      "value": "Last 16 blocks only"
+    },
+    {
+      "helps": true,
+      "label": "Reachable",
+      "note": "Other nodes can reach this one and take blocks from it.",
+      "value": "4 nodes connected in"
+    },
+    {
+      "helps": true,
+      "label": "Chain position",
+      "note": "Holds every block it knows about, so what it serves is current.",
+      "value": "At the tip"
+    }
+  ]
+}

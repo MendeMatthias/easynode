@@ -44,7 +44,7 @@ describe("contributionView", () => {
     // dialled. Claiming they connected to us was wrong on every ordinary home
     // machine, where inbound is zero and every peer is one we reached out to.
     expect(v.detail).toMatch(/you have connected to 8 nodes/);
-    expect(v.detail).toMatch(/4 GB of the chain/);
+    expect(v.detail).toMatch(/4 GiB of the chain/);
     expect(v.detail).toMatch(/running for 1 hour/);
   });
 
@@ -138,16 +138,18 @@ describe("contributionView", () => {
 describe("formatBytes", () => {
   it("scales to the unit a person would say", () => {
     expect(formatBytes(512)).toBe("512 B");
-    expect(formatBytes(2048)).toBe("2 KB");
-    expect(formatBytes(5 * 1024 * 1024)).toBe("5 MB");
-    expect(formatBytes(1.5 * 1024 * 1024 * 1024)).toBe("1.5 GB");
-    // Past 10 GB the decimal is noise.
-    expect(formatBytes(42 * 1024 * 1024 * 1024)).toBe("42 GB");
+    // Divided by 1024, so the units are KiB, MiB and GiB, as on the disk
+    // cards two rows up ("9.8 GiB"). "GB" understated every figure by 7%.
+    expect(formatBytes(2048)).toBe("2 KiB");
+    expect(formatBytes(5 * 1024 * 1024)).toBe("5 MiB");
+    expect(formatBytes(1.5 * 1024 * 1024 * 1024)).toBe("1.5 GiB");
+    // Past 10 GiB the decimal is noise.
+    expect(formatBytes(42 * 1024 * 1024 * 1024)).toBe("42 GiB");
   });
 
   it("never renders a negative or broken number", () => {
-    expect(formatBytes(-1)).toBe("0 MB");
-    expect(formatBytes(NaN)).toBe("0 MB");
+    expect(formatBytes(-1)).toBe("0 MiB");
+    expect(formatBytes(NaN)).toBe("0 MiB");
   });
 });
 

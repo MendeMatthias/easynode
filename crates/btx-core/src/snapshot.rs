@@ -477,7 +477,7 @@ pub async fn download_snapshot(
                     // it doesn't waste space at the worst time, and say so plainly.
                     let _ = tokio::fs::remove_file(&tmp).await;
                     return Err(format!(
-                        "Couldn't save the blockchain to disk — this machine may be low \
+                        "Couldn't save the blockchain to disk. This machine may be low \
                          on space ({e}). Free up space, then press Retry."
                     ));
                 }
