@@ -64,21 +64,24 @@ const HIDDEN: ContributionView = { headline: null, detail: "", cls: "" };
 /**
  * Round data volumes the way a person would say them out loud.
  *
- * Serving 4.2 GB of chain to strangers is the most concrete evidence of
- * usefulness this app has, so it is worth not printing it as "4404019.2 KB".
+ * Serving 4.2 GiB of chain to strangers is the most concrete evidence of
+ * usefulness this app has, so it is worth not printing it as "4404019.2 KiB".
  */
 export function formatBytes(n: number): string {
-  if (!Number.isFinite(n) || n < 0) return "0 MB";
-  const MB = 1024 * 1024;
-  const GB = 1024 * MB;
-  if (n >= GB) {
-    const gb = n / GB;
-    // One decimal below 10 GB, but never a bare ".0": people say "4 GB".
-    const s = gb >= 10 ? String(Math.round(gb)) : gb.toFixed(1).replace(/\.0$/, "");
-    return `${s} GB`;
+  if (!Number.isFinite(n) || n < 0) return "0 MiB";
+  // Divided by 1024, so the units are MiB and GiB: the disk cards two rows up
+  // print "9.8 GiB" (main.ts fmtGB), and "GB" here understated every figure
+  // by about 7% against them.
+  const MiB = 1024 * 1024;
+  const GiB = 1024 * MiB;
+  if (n >= GiB) {
+    const gib = n / GiB;
+    // One decimal below 10, but never a bare ".0": people say "4 GiB".
+    const s = gib >= 10 ? String(Math.round(gib)) : gib.toFixed(1).replace(/\.0$/, "");
+    return `${s} GiB`;
   }
-  if (n >= MB) return `${Math.round(n / MB)} MB`;
-  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  if (n >= MiB) return `${Math.round(n / MiB)} MiB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KiB`;
   return `${Math.round(n)} B`;
 }
 
@@ -154,7 +157,7 @@ export function contributionView(s: ContributionInput): ContributionView {
   if (s.attestationsServedPeers !== null && s.attestationsServedPeers > 0) {
     parts.push(
       `you have passed signed block confirmations to ${s.attestationsServedPeers} ` +
-        `${s.attestationsServedPeers === 1 ? "node" : "nodes"} — the thing the ` +
+        `${s.attestationsServedPeers === 1 ? "node" : "nodes"}, the thing the ` +
         "network is shortest of right now"
     );
   }

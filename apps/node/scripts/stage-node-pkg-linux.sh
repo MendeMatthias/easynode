@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 # Stage the bundled BTX node package for an easyBTX Node LINUX build.
 #
-# Mirrors stage-node-pkg.sh (macOS) but is far simpler: the upstream Linux
-# release binaries are FULLY STATIC ELFs (verified: `file` reports
-# "statically linked" for libexec/*.real), so there is no .so vendoring or
+# Mirrors stage-node-pkg.sh (macOS) but is far simpler: no .so vendoring or
 # rpath pass — download, verify the pinned sha256, copy, sanity-run.
+#
+# The upstream Linux binaries USED to be fully static ELFs. Since v0.34.9 they
+# are not: libexec/btxd.real NEEDs libssl.so.3 and libcrypto.so.3 (OpenSSL 3.5,
+# bundled in the archive's top-level lib/), plus libzmq, libevent, sqlite and
+# libgomp from the host. bin/btxd, the wrapper, puts ../lib on LD_LIBRARY_PATH
+# when it finds libssl.so.3 there, so those two are staged in lib/ beside bin/
+# and libexec/. From v0.34.12 the archive's lib/ also holds btx-qt's runtime
+# (Qt 6, libstdc++, libevent, libzmq, libgomp and about 90 more); staging all
+# of it would put those in front of the host's copies for btxd too, so only the
+# OpenSSL pair is taken, which is all v0.34.9's lib/ held.
 #
 # Source resolution order:
 #   1. $EASYBTX_NODE_PKG_SRC (explicit override: an extracted package dir)
@@ -13,11 +21,13 @@
 # Usage:  apps/node/scripts/stage-node-pkg-linux.sh
 set -euo pipefail
 
-VERSION="0.34.5"
+VERSION="0.34.15"
 TARBALL_URL="https://github.com/btxchain/btx/releases/download/v${VERSION}/btx-${VERSION}-x86_64-linux-gnu.tar.gz"
-# From the release's signed SHA256SUMS. Upstream has re-generated release
-# assets in place before — a silent swap must FAIL here, never ship unnoticed.
-TARBALL_SHA256="76ad2cab712c29f744c86e93951b4fb09fbbca22f074926d5efb36c3f08c6ba7"
+# Upstream has re-generated release assets in place before, and a silent swap
+# must FAIL here, never ship unnoticed. v0.34.15 publishes NO SHA256SUMS at
+# all; this is GitHub's asset digest for the file, which equals the hash
+# upstream lists on btxchain/btx PR 223. It pins the bytes, not a signature.
+TARBALL_SHA256="9dbaef6ffab696535794bfb7ea3b6318fa391578599970ec75a33ff1872e7dec"
 # NOTE: upstream publishes no `aarch64-linux-gnu` asset, so there is no ARM-Linux
 # node to stage. This script is x86_64-only by construction and always was; the
 # gap is called out here so nobody spends an afternoon looking for the tarball.
@@ -32,8 +42,10 @@ TARBALL_SHA256="76ad2cab712c29f744c86e93951b4fb09fbbca22f074926d5efb36c3f08c6ba7
 #
 # Two separate reasons this tarball is a developer convenience only:
 #
-#   1. No CUDA. Upstream also publishes btx-0.34.5-x86_64-linux-gnu-cuda12.tar.gz
-#      for that, which this deliberately does not fetch, because see (2).
+#   1. No CUDA. Upstream also publishes a -cuda13 archive for that (and a
+#      -cuda12 one up to v0.34.9), which this deliberately does not fetch,
+#      because see (2). v0.34.9's CUDA fatbins are also Blackwell-only
+#      (sm_120), per its release notes.
 #   2. glibc. The official Linux binaries need glibc 2.38, and Ubuntu LTS
 #      machines do not have it, so they will not run for most people anyway.
 #
@@ -52,6 +64,10 @@ DEST="$APP_DIR/src-tauri/resources/node-pkg"
 # shellcheck source=lib/engine-pin.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/engine-pin.sh"
 assert_matches_engine_pin "$APP_DIR" "$VERSION"
+# Both upstream archive formats (0.34 .tar.gz, 0.35 .tar.xz + SHA384), the
+# layout gate and the exact-version check. See the file.
+# shellcheck source=lib/release-archive.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/release-archive.sh"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "error: this stages the LINUX node package and must run on Linux." >&2
@@ -64,10 +80,9 @@ if [[ -z "$SRC" ]]; then
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
   echo "==> downloading $TARBALL_URL"
-  curl -fsSL --retry 3 -o "$tmp/pkg.tgz" "$TARBALL_URL"
-  echo "$TARBALL_SHA256  $tmp/pkg.tgz" | sha256sum -c -
-  tar -xzf "$tmp/pkg.tgz" -C "$tmp"
-  SRC="$tmp/btx-$VERSION"
+  curl -fsSL --retry 3 -o "$tmp/pkg.archive" "$TARBALL_URL"
+  release_archive_verify "$tmp/pkg.archive" "$TARBALL_SHA256"
+  SRC="$(release_archive_extract "$tmp/pkg.archive" "$tmp/x")"
 fi
 
 if [[ ! -x "$SRC/bin/btxd" ]]; then
@@ -75,13 +90,37 @@ if [[ ! -x "$SRC/bin/btxd" ]]; then
   echo "       Set EASYBTX_NODE_PKG_SRC to an extracted release package dir." >&2
   exit 1
 fi
+# The copy below is libexec/*.real-shaped; refuse 0.35's layout until adapted.
+require_034_layout "$SRC"
+if ! btxd_reports_exact_version "$SRC/bin/btxd" "$VERSION"; then
+  echo "error: $SRC/bin/btxd is not exactly v$VERSION (reported: $("$SRC/bin/btxd" --version 2>&1 | head -1))" >&2
+  exit 1
+fi
 
 rm -rf "$DEST"
 mkdir -p "$DEST"
-# Only the runtime tree: bin/ wrappers + libexec/ static daemons. contrib/ and
-# doc/ are source-repo extras the app never reads.
+# Only the runtime tree: bin/ wrappers + libexec/ daemons, and from lib/ only
+# the bundled OpenSSL when the archive carries it (see the header). contrib/
+# and doc/ are source-repo extras the app never reads.
 cp -R "$SRC/bin" "$DEST/bin"
 cp -R "$SRC/libexec" "$DEST/libexec"
+for ssl in "$SRC"/lib/libssl.so* "$SRC"/lib/libcrypto.so*; do
+  [ -e "$ssl" ] || continue
+  mkdir -p "$DEST/lib"
+  cp -P "$ssl" "$DEST/lib/"
+done
+# Without the model plane, exactly as stage-node-pkg.sh does and for the same
+# reason: the archive is built WITH_MODELNET=ON, an ON btxd starts btx-modeld on
+# 0.0.0.0:29447 by itself, the release engine is built OFF, and the app calls
+# none of these. Without btx-modeld btxd logs that it is missing and continues.
+# The model plane is still compiled into this btxd; only the helper is gone.
+for helper in btx-modeld btx-modelcheck btx-open btx-capability btx-capabilityd btx-hcpd btx-hosted; do
+  rm -f "$DEST/bin/$helper" "$DEST/libexec/$helper.real"
+done
+# ...and without the GUI v0.34.12 added (bin/btx-qt, libexec/btx-qt.real and
+# the qt.conf beside it). The app never starts it, and its Qt runtime in lib/
+# is not staged above.
+rm -f "$DEST/bin/btx-qt" "$DEST/libexec/btx-qt.real" "$DEST/libexec/qt.conf"
 chmod +x "$DEST"/bin/* "$DEST"/libexec/*
 
 echo "==> staged node package: $(du -sh "$DEST" | cut -f1) at $DEST"

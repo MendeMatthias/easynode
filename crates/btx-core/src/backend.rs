@@ -29,6 +29,25 @@ impl Backend {
             _ => Backend::Cpu,
         }
     }
+
+    /// Whether a node on this backend may check blocks itself, as far as the
+    /// app can tell before the engine's first start: an Apple Silicon Mac, or
+    /// an NVIDIA card the bundled engine can use. `Cpu` cannot. Whether the
+    /// chip then passes is the engine's verdict after start
+    /// (`node::node_rc_status`); this is only what the setup screen can offer.
+    pub fn may_check_blocks(&self) -> bool {
+        !matches!(self, Backend::Cpu)
+    }
+
+    /// Whether the setup screen selects Full check first on this backend: only
+    /// on an NVIDIA card. A Mac may check blocks and can still pick Full
+    /// check, but engine 0.34.9 does not move a Mac whose chip fails its check
+    /// to Quick start by itself (a `local_accelerator_failure` is not recorded
+    /// as a refusal), so a Mac starts on Quick start (the owner's decision of
+    /// 2026-09-29).
+    pub fn full_check_first(&self) -> bool {
+        matches!(self, Backend::Cuda)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -197,6 +216,181 @@ pub fn resolve_with_override(detected: BackendStatus, force_metal: bool) -> Back
         }
     } else {
         detected
+    }
+}
+
+/// Where the NVIDIA driver installs its CUDA library on Linux. The DRIVER's
+/// library (`libcuda.so.1`), not the toolkit's `libcudart`: the runtime can be
+/// installed on a box with no GPU at all, while the driver library only arrives
+/// with a driver, and a driver is only installed against a card. WSL2 mounts it
+/// from the Windows host under `/usr/lib/wsl/lib` (measured on this project's
+/// RTX 3060 box, 2026-09-15). A distro this list does not know is caught by
+/// `ldconfig -p` in `cuda_driver_library`.
+#[cfg(target_os = "linux")]
+const LINUX_CUDA_DRIVER_LIBRARY_PATHS: &[&str] = &[
+    "/usr/lib/wsl/lib/libcuda.so.1",
+    "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+    "/usr/lib64/libcuda.so.1",
+    "/usr/lib/libcuda.so.1",
+    "/usr/local/nvidia/lib64/libcuda.so.1",
+    "/run/opengl-driver/lib/libcuda.so.1",
+];
+
+/// The path `ldconfig -p` lists for the CUDA driver library, if any. Pure.
+///
+/// A real line, from a WSL2 host with an RTX 3060 (2026-09-15):
+///
+/// ```text
+///     libcuda.so.1 (libc6,x86-64) => /usr/lib/wsl/lib/libcuda.so.1
+/// ```
+///
+/// Only the soname `libcuda.so.1` counts. `libcudart.so.13` is the toolkit
+/// runtime and says nothing about a GPU; `libcudadebugger.so.1` is a tool.
+pub fn libcuda_from_ldconfig(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        if line.split_whitespace().next()? != "libcuda.so.1" {
+            return None;
+        }
+        let (_, path) = line.split_once("=>")?;
+        Some(path.trim().to_string())
+    })
+}
+
+/// The NVIDIA driver's CUDA library on this host, if the driver is installed.
+///
+/// `None` is the node app's launch-time reading of "no GPU btxd could ever
+/// validate on"; see `node_host_backend` for what that answer decides and what
+/// it deliberately does not claim.
+pub fn cuda_driver_library() -> Option<std::path::PathBuf> {
+    cuda_driver_library_impl()
+}
+
+#[cfg(target_os = "windows")]
+fn cuda_driver_library_impl() -> Option<std::path::PathBuf> {
+    // The display driver installs the CUDA driver API here on every NVIDIA
+    // machine, and the CUDA runtime itself loads it from this path. Present on
+    // this project's RTX 3060 Windows host (4,714,728 bytes, 2026-09-15).
+    let root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    let dll = root.join("System32").join("nvcuda.dll");
+    dll.is_file().then_some(dll)
+}
+
+#[cfg(target_os = "linux")]
+fn cuda_driver_library_impl() -> Option<std::path::PathBuf> {
+    if let Some(found) = LINUX_CUDA_DRIVER_LIBRARY_PATHS
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.is_file())
+    {
+        return Some(found);
+    }
+    // A distro the list does not know: ask the loader cache. ldconfig lives in
+    // /sbin, which a desktop session's PATH may not carry, so the absolute
+    // paths come first; the first ldconfig that RUNS gives the answer.
+    for bin in ["/sbin/ldconfig", "/usr/sbin/ldconfig", "ldconfig"] {
+        if let Ok(out) = std::process::Command::new(bin).arg("-p").output() {
+            return libcuda_from_ldconfig(&String::from_utf8_lossy(&out.stdout))
+                .map(std::path::PathBuf::from);
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn cuda_driver_library_impl() -> Option<std::path::PathBuf> {
+    // macOS has had no CUDA driver since 10.13, and the node app runs Metal
+    // there. Nothing to look for.
+    None
+}
+
+/// The backend the NODE app launches btxd with on this host.
+///
+/// * macOS/aarch64 → `Metal`, at compile time: Apple Silicon self-qualifies.
+/// * everywhere else → `Cuda` when the NVIDIA driver's CUDA library is
+///   present, `Cpu` when it is not.
+///
+/// What the answer decides, and what it does NOT claim. Since 2026-09-15
+/// `node::build_node_command` splits non-Metal hosts on it: `Cuda` stays in
+/// explicit consensus mode and `Cpu` launches as a keyless trusted mirror
+/// (docs/decisions/2026-09-15-keyless-cpu-hosts-are-trusted-mirrors.md). So
+/// `Cuda` here means "a GPU exists that btxd COULD qualify", not "the card
+/// qualifies": a Pascal or Turing card carries the same driver and fails the
+/// startup canary, and such a host still takes the consensus path and stalls
+/// below the Epoch-A height. Only btxd's own verdict after start
+/// (`node::node_rc_status`) knows the difference, and routing on that is the
+/// refinement the decision names.
+///
+/// Why not the miner's probe. `detect_backend` asks `btx-matmul-backend-info`,
+/// which applies the matmul library's own device floor and would read a Pascal
+/// card as Cpu. The node packages do not ship that tool: `BUNDLED_NODE_BINARIES`
+/// lists it as best-effort and `apps/node/scripts/stage-node-pkg-linux-source.sh`
+/// copies `btxd` and `btx-cli` only. The driver library is the signal every
+/// install already has, with no new binary and no new dependency.
+///
+/// The `BTX_MATMUL_BACKEND` env this becomes steers MINING, which the node app
+/// never does; btxd chooses its RC validation provider by itself. Measured
+/// 2026-09-15 on this project's mainnet signer, a btxd this app launched with
+/// `BTX_MATMUL_BACKEND=cpu` in its environment: its debug.log reads
+/// `provider=cuda_rc_exact_fused_extract ready=1`. The backend matters here for
+/// the MODE, never for the device.
+///
+/// Says which it chose, and why, on stderr: a wrong classification is a wrong
+/// consensus posture, and the log is where a maintainer looks first.
+///
+/// ⚠ A driver is only half the question: the ENGINE has to carry GPU code too.
+/// On Windows it does not (`BUNDLED_ENGINE_HAS_CUDA`), so from 0.6.23 to this
+/// change every native Windows PC with an NVIDIA driver was classed `Cuda`,
+/// launched in consensus mode its engine could never serve, and stalled.
+/// `pc_host_backend` now asks both halves.
+pub fn node_host_backend() -> Backend {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Backend::Metal
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let driver = cuda_driver_library();
+        let backend = pc_host_backend(driver.is_some(), BUNDLED_ENGINE_HAS_CUDA);
+        match (&driver, backend) {
+            (Some(lib), Backend::Cuda) => eprintln!(
+                "[node] host backend: cuda ({} present), consensus mode on a degraded-start engine",
+                lib.display()
+            ),
+            (Some(lib), _) => eprintln!(
+                "[node] host backend: cpu ({} present, but this platform's engine is built \
+                 without GPU code), trusted mirror on a degraded-start engine",
+                lib.display()
+            ),
+            (None, _) => eprintln!(
+                "[node] host backend: cpu (no NVIDIA driver library found), trusted mirror on a degraded-start engine"
+            ),
+        }
+        backend
+    }
+}
+
+/// Whether the btxd this app ships on this OS carries any GPU (CUDA) code.
+///
+/// Linux: yes, `btxd-linux.yml` builds with nvcc and proves the kernels are in
+/// the binary (sm_75/86/89/120 at v0.34.9). Windows: no. `btxd-windows.yml`
+/// cross-compiles with mingw, whose configure prints "Looking for a CUDA
+/// compiler - NOTFOUND", and the v0.34.9 `btxd.exe` (run 35867391955) imports
+/// only system DLLs and `libgomp-1.dll`, with no CUDA symbol in it, where the
+/// Linux btxd has 165. A Windows engine that can check blocks is the change
+/// that flips this, not a newer driver.
+pub const BUNDLED_ENGINE_HAS_CUDA: bool = !cfg!(target_os = "windows");
+
+/// Pure half of `node_host_backend` for a PC: `Cuda` only when BOTH the NVIDIA
+/// driver is present AND the engine can use it. Either one missing is a host
+/// no btxd of ours could validate on, which is what `Cpu` means to
+/// `node::launches_as_mirror`.
+pub fn pc_host_backend(driver_present: bool, engine_has_cuda: bool) -> Backend {
+    if driver_present && engine_has_cuda {
+        Backend::Cuda
+    } else {
+        Backend::Cpu
     }
 }
 
@@ -415,5 +609,99 @@ mod tests {
         assert_eq!(s.selected, Backend::Metal);
         assert!(s.gpu_available);
         assert_eq!(s.reason, "metal_device_present");
+    }
+}
+
+#[cfg(test)]
+mod host_backend_tests {
+    use super::*;
+
+    /// Verbatim `ldconfig -p` lines from this project's RTX 3060 box (WSL2,
+    /// 2026-09-15). Only the driver's soname counts: the toolkit runtime and
+    /// the debugger library are present on machines with no GPU at all.
+    const LDCONFIG_WITH_DRIVER: &str = "\
+\tlibnvidia-ml.so.1 (libc6,x86-64) => /usr/lib/wsl/lib/libnvidia-ml.so.1
+\tlibcudart.so.13 (libc6,x86-64) => /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.13
+\tlibcudadebugger.so.1 (libc6,x86-64) => /usr/lib/wsl/lib/libcudadebugger.so.1
+\tlibcuda.so.1 (libc6,x86-64) => /usr/lib/wsl/lib/libcuda.so.1
+";
+
+    #[test]
+    fn the_driver_library_is_read_from_the_loader_cache() {
+        assert_eq!(
+            libcuda_from_ldconfig(LDCONFIG_WITH_DRIVER).as_deref(),
+            Some("/usr/lib/wsl/lib/libcuda.so.1")
+        );
+    }
+
+    #[test]
+    fn the_toolkit_runtime_alone_is_not_a_driver() {
+        // A box with CUDA installed for development and no NVIDIA card has
+        // libcudart and no libcuda. Counting the runtime would put such a host
+        // in consensus mode, where it stalls; that is the wrong direction for
+        // this signal to be wrong in.
+        let runtime_only = "\
+\tlibcudart.so.13 (libc6,x86-64) => /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.13
+\tlibcudadebugger.so.1 (libc6,x86-64) => /usr/lib/wsl/lib/libcudadebugger.so.1
+";
+        assert_eq!(libcuda_from_ldconfig(runtime_only), None);
+        assert_eq!(libcuda_from_ldconfig(""), None);
+        // The soname is the first token, not a substring anywhere on the line.
+        assert_eq!(
+            libcuda_from_ldconfig("\tlibfoo.so.1 (libc6,x86-64) => /opt/libcuda.so.1/x\n"),
+            None
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn apple_silicon_is_metal_without_asking() {
+        assert_eq!(node_host_backend(), Backend::Metal);
+    }
+
+    /// On a PC the answer is whatever the driver check and the engine say, and
+    /// never Metal. Impure by nature (it reads this machine), so it asserts
+    /// consistency between the public functions rather than a fixed value.
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[test]
+    fn a_pc_is_never_metal_and_follows_its_driver_and_engine() {
+        let backend = node_host_backend();
+        assert_ne!(backend, Backend::Metal);
+        assert_eq!(
+            backend == Backend::Cuda,
+            cuda_driver_library().is_some() && BUNDLED_ENGINE_HAS_CUDA
+        );
+    }
+
+    /// The whole truth table, run on every platform: a driver alone is not a
+    /// GPU this node can validate on, and neither is an engine alone.
+    #[test]
+    fn a_pc_is_cuda_only_with_both_a_driver_and_an_engine_that_has_gpu_code() {
+        assert_eq!(pc_host_backend(true, true), Backend::Cuda);
+        // Native Windows with an NVIDIA card: the stall this change removes.
+        assert_eq!(pc_host_backend(true, false), Backend::Cpu);
+        assert_eq!(pc_host_backend(false, true), Backend::Cpu);
+        assert_eq!(pc_host_backend(false, false), Backend::Cpu);
+    }
+
+    /// The setup screen offers Full check on a machine with a graphics chip
+    /// the engine could use, and greys it out on one without.
+    #[test]
+    fn only_a_graphics_backend_may_check_blocks() {
+        assert!(Backend::Metal.may_check_blocks());
+        assert!(Backend::Cuda.may_check_blocks());
+        assert!(!Backend::Cpu.may_check_blocks());
+    }
+
+    /// Full check is selected first only on an NVIDIA card. A Mac may still
+    /// pick it, but starts on Quick start, because engine 0.34.9 leaves a Mac
+    /// whose chip fails its check degraded rather than moving it (the owner's
+    /// decision of 2026-09-29).
+    #[test]
+    fn only_an_nvidia_card_has_full_check_selected_first() {
+        assert!(Backend::Cuda.full_check_first());
+        assert!(!Backend::Metal.full_check_first());
+        assert!(Backend::Metal.may_check_blocks(), "a Mac can still pick it");
+        assert!(!Backend::Cpu.full_check_first());
     }
 }

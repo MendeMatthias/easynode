@@ -63,6 +63,10 @@
 #   local tip unknown                                   -> unverified
 #   no census, older than 30 min, or no heaviest chain
 #     with a usable tip                                 -> unverified
+#   the heaviest chain is one the census marks invalid  -> unverified (no witness)
+#   serves an invalid chain's first invalid block, or
+#     its tip                                           -> unverified (an invalid
+#                                                          chain)
 #   a settled block of the heaviest chain MATCHES       -> fresh, or stale when
 #                                                          more than TOLERANCE
 #                                                          below its tip
@@ -82,6 +86,14 @@
 # overstated balance from the wrong chain reaching a signing wallet is worse
 # than a stale one. A feed with no settled pairs (published before #468) falls
 # through to the older rules rather than failing.
+#
+# INVALID CHAINS. The feed marks a chain `invalid` and names its first invalid
+# block (`invalidBlock`). Work on such a chain is no witness, so an invalid
+# heaviest chain is `unverified` rather than a search for another reference,
+# and a node that serves an invalid chain's first invalid block, or its tip, is
+# `unverified` before the settled test runs: a branch that left inside the
+# racing window shares every settled pair of the chain it left. The module docs
+# of esplora_freshness.rs say why.
 set -u
 
 RUN_DIR="${BTX_ESPLORA_RUN:-/run}"
@@ -162,6 +174,24 @@ def holds_tip(chain):
     ours = hash_at(int(hh))
     return None if ours is None else ours.startswith(prefix)
 
+def is_invalid(chain):
+    """The census calls this chain invalid; either field is enough."""
+    return bool(chain.get("invalid")) or chain.get("invalidBlock") is not None
+
+def holds_invalid_part(chain):
+    """Positive evidence only: this node serves the chain's first invalid block,
+    or its tip. Settled pairs are not asked; on a short branch they can sit at
+    or below the fork, where every chain agrees."""
+    b = chain.get("invalidBlock")
+    b = b if isinstance(b, dict) else {}
+    h, pre = b.get("height"), hexprefix(b.get("hash"))
+    if isinstance(h, int) and pre and h <= local:
+        ours = hash_at(h)
+        if ours is not None and ours.startswith(pre):
+            return True
+    th = chain.get("tipHeight")
+    return th is not None and int(th) <= local and holds_tip(chain) is True
+
 def out(state, **kw):
     print("state=" + state + "".join(f" {k}={v}" for k, v in kw.items()))
     sys.exit(0)
@@ -182,9 +212,19 @@ if age > max_age:
     out("unverified", why="census-old", age=age, local=local)
 chains = ((census.get("chains") or {}).get("chains") or [])
 heaviest = next((c for c in chains if c.get("heaviest")), None)
+# Work on an invalid chain is no witness, and no other chain is picked instead.
+if heaviest and is_invalid(heaviest):
+    out("unverified", why="heaviest-chain-invalid", chain=heaviest.get("id"), local=local)
 if not heaviest or heaviest.get("tipHeight") is None or not prefix_of(heaviest):
     out("unverified", why="no-heaviest-chain", local=local)
 hh = int(heaviest["tipHeight"])
+
+# Before anything can read fresh: is this node positively on a chain the census
+# marks invalid? That outranks the settled test, which a branch that left
+# inside the racing window would pass.
+for other in chains:
+    if is_invalid(other) and holds_invalid_part(other):
+        out("unverified", why="on-invalid-chain", chain=other.get("id"), local=local, census=hh)
 
 # FIRST, and best: place this node on a chain POSITIVELY, using a settled block
 # below the racing window. Everything after this is inference.

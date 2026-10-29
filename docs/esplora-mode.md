@@ -418,7 +418,7 @@ the two agree.
 | in this order | evidence | verdict |
 |---|---|---|
 | 1 | the served tip is unknown | `unverified` |
-| 2 | no census, older than 30 min, or no heaviest chain with a usable tip | `unverified` |
+| 2 | no census, older than 30 min, no heaviest chain with a usable tip, or a heaviest chain the census marks `invalid` | `unverified` |
 | 3 | a settled block of the heaviest chain **matches** | `fresh`, or `stale` when more than 3 below its tip |
 | 4 | a settled block of the heaviest chain **differs** | `unverified`, a real divergence; the chain it is on is named when the feed allows |
 | 5 | the endpoint holds the tip of a competing chain that forked more than 6 blocks below the heaviest tip | `unverified`, and the chain and its fork height are named |
@@ -438,6 +438,18 @@ branch is `unverified` however current it looks, because an overstated balance
 from the wrong chain reaching a signing wallet is worse than a stale one. The
 Caddy front answers `unverified` when no marker exists at all
 (`PROVENANCE.md` says why that differs from the original).
+
+**Invalid chains.** The feed marks a chain `invalid` and names its first
+invalid block (`invalidBlock`, a height and a hash prefix). Work on such a
+chain is no witness. Rule 2 treats a heaviest chain so marked as no witness,
+and picks no other chain in its place: the feed carries no figure that
+ranks chains forked at different heights. Between rules 2 and 3, an endpoint
+that serves an invalid chain's first invalid block, or its tip, is
+`unverified`, and the chain is named. That test runs before the settled one
+because a branch that left inside the racing window shares every settled pair
+of the chain it left. Read on 2026-09-26, the census already left the invalid
+branch out of `heaviest` although, by its own figures, that branch carried more
+work since the height both share; the rules do not rely on that.
 
 The measured case, end to end: an endpoint at 211416 that does **not** hold the
 census's heaviest tip 211404, because that tip was a one-block orphan. Before

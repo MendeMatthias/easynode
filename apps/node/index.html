@@ -31,6 +31,12 @@
             <circle cx="12" cy="16.6" r="0.6" fill="currentColor" stroke="none"></circle>
           </svg>
         </button>
+        <button id="tools-btn" class="icon-btn" type="button" aria-label="Tools" aria-haspopup="dialog" title="Tools">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L4 17v3h3l5.3-5.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.1-.6-.6-2.1z"></path>
+          </svg>
+        </button>
         <button id="wallet-btn" class="icon-btn" type="button" aria-label="Wallet" aria-haspopup="dialog" title="Wallet" hidden>
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
                stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -39,7 +45,7 @@
             <circle cx="16.5" cy="13" r="0.7" fill="currentColor" stroke="none"></circle>
           </svg>
         </button>
-        <button id="info-btn" class="icon-btn" type="button" aria-label="About BTX Node" aria-haspopup="dialog">
+        <button id="info-btn" class="icon-btn" type="button" aria-label="About BTX Node" aria-haspopup="dialog" title="About BTX Node">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
                stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <circle cx="12" cy="12" r="9"></circle>
@@ -54,7 +60,7 @@
             <path d="M9 20v-5H4"></path><path d="M15 20v-5h5"></path>
           </svg>
         </button>
-        <button id="settings-btn" class="icon-btn" type="button" aria-label="Settings" aria-haspopup="dialog">
+        <button id="settings-btn" class="icon-btn" type="button" aria-label="Settings" aria-haspopup="dialog" title="Settings">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
                stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <circle cx="12" cy="12" r="3"></circle>
@@ -69,6 +75,16 @@
         <span class="update-banner-icon" aria-hidden="true">✨</span>
         <span id="update-banner-text"><strong>Update available</strong></span>
       </section>
+
+      <!-- What the chip notice below says, spoken once when the notice
+           appears (main.ts reflectChipNotice) and cleared a few seconds
+           later, since the card still shows it. Always present and outside
+           both screens: a live region that appears together with its text
+           may not be announced (VoiceOver on WebKit). Visually hidden. -->
+      <p id="chip-announce" class="visually-hidden" role="status"></p>
+      <!-- The headline's changes of state, said once each (headline.ts
+           announceChange); always present for the same reason. -->
+      <p id="status-announce" class="visually-hidden" role="status"></p>
 
       <!-- ── Wizard (first run) ──────────────────────────────────────── -->
       <section id="screen-wizard" class="screen" hidden>
@@ -90,7 +106,48 @@
               <span class="fact-label">Free on this computer</span>
               <span class="fact-value" id="wizard-free-disk">—</span>
             </div>
+            <!-- Said before the click when the free space is short
+                 (start-choice.ts diskShortfall). -->
+            <p class="wizard-disk-short" id="wizard-disk-short" role="status" hidden></p>
           </div>
+          <!-- The one question (docs/decisions/2026-09-29-quick-start-full-
+               check-and-progress.md). main.ts selects Full check first on an
+               NVIDIA machine and Quick start first on a Mac (the owner's
+               decision of 2026-09-29), and greys Full check out where the
+               machine cannot check blocks (start-choice.ts); begin_setup
+               records the pick before the first start. -->
+          <fieldset class="start-choice" id="start-choice" role="radiogroup" aria-label="How your node starts" aria-describedby="start-choice-note">
+            <label class="choice" id="choice-quick-label">
+              <input type="radio" name="start-choice" value="quick_start" id="choice-quick" />
+              <span class="choice-text">
+                <span class="choice-name">Quick start</span>
+                <span class="choice-desc">Follows signatures, ready in minutes.</span>
+              </span>
+            </label>
+            <label class="choice" id="choice-full-label">
+              <input type="radio" name="start-choice" value="full_check" id="choice-full" />
+              <span class="choice-text">
+                <span class="choice-name">Full check</span>
+                <span class="choice-desc">Validates every block, takes longer the first time.</span>
+                <span class="choice-reason" id="choice-full-reason" hidden></span>
+              </span>
+            </label>
+            <!-- The owner's wording of 2026-09-30. "Confirmed by two node
+                 operators" is true only of a snapshot a second operator has
+                 confirmed (docs/decisions/2026-09-29-quick-start-full-check-
+                 and-progress.md, section 1), and a node that finds none starts
+                 from the pinned snapshot, which carries one signature. So
+                 "recent signed snapshot" stays the honest wording for as long
+                 as that fallback is there. The last sentence shows only where
+                 Full check is possible (start-choice.ts switchLaterShown): on
+                 a machine that cannot check blocks, Settings has no switch. -->
+            <p class="wizard-note start-choice-note" id="start-choice-note">
+              Both start from a recent signed snapshot and check the older
+              history in the background. Full check also checks every new
+              block on this computer's graphics card.
+              <span id="start-choice-switch" hidden>You can switch later in Settings.</span>
+            </p>
+          </fieldset>
           <button id="setup-btn" class="btn-primary" type="button">
             <span class="btn-spinner" aria-hidden="true"></span>
             <span class="btn-label" id="setup-btn-label">Set up my node</span>
@@ -143,6 +200,18 @@
           <canvas class="power-canvas" id="power-canvas" aria-hidden="true"></canvas>
           <div class="status-badge" id="status-badge">—</div>
           <div class="status-sub" id="status-sub"></div>
+          <!-- The background check of the snapshot's older history
+               (NodeStatusInfo.history_check, history-check.ts), with where
+               the node started on a second line (started_from). Gone once the
+               engine reports it done. No time estimate on purpose. The line
+               is the bar's accessible name; the bar carries the percentage.
+               The line itself is hidden from screen readers, so it is heard
+               once, as the bar's name. -->
+          <div class="history-check" id="history-check" hidden>
+            <div class="history-line" id="history-line" aria-hidden="true"></div>
+            <div class="progress-track history-track" id="history-bar" role="progressbar"
+                 aria-labelledby="history-line" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="progress-fill" id="history-fill"></div></div>
+          </div>
         </div>
 
         <div class="stats-grid">
@@ -159,7 +228,7 @@
             <span class="stat-value" id="stat-uptime">—</span>
           </div>
           <div class="stat">
-            <span class="stat-label">Node version</span>
+            <span class="stat-label">BTX engine</span>
             <span class="stat-value" id="stat-version">—</span>
           </div>
         </div>
@@ -173,10 +242,66 @@
           <p id="fork-msg"></p>
         </div>
 
+        <!-- What btxd itself is warning about (btx_core::engine_warnings),
+             beyond what the Block checking and chain cards say: a wrong
+             clock, an out-of-date engine, a chain the node refused. Amber
+             lines ask something of the person; quiet ones only explain. -->
+        <div class="card fork-card engine-card" id="engine-card" hidden>
+          <div id="engine-notes"></div>
+        </div>
+
+        <!-- "Am I on the right chain?" (btx_core::chain_agreement,
+             chain-agreement.ts): this node's block at a height below every
+             tip, next to what api.btxscan.io, the witnesses and the Byron Bay
+             explorer say, every five minutes. The word is always text; colour
+             is a second cue, green only for AGREE, grey when there is not
+             enough to compare. Display only. -->
+        <div class="card agree-card" id="agree-card" hidden>
+          <div class="agree-row">
+            <span class="agree-mark" aria-hidden="true"></span>
+            <span class="agree-label">Same chain as other sources</span>
+            <span class="agree-word" id="agree-word"></span>
+          </div>
+          <p class="agree-scope" id="agree-scope"></p>
+          <div class="agree-lines" id="agree-lines"></div>
+        </div>
+
+        <!-- Once per engine, after the engine refused this Mac's graphics
+             chip and the app moved the node to following signatures
+             (start-choice.ts chipNoticeVisible). OK remembers it. A screen
+             reader hears it through #chip-announce, which is always there. -->
+        <div class="card chip-card" id="chip-card" hidden>
+          <p id="chip-msg">This Mac's graphics chip didn't pass the engine's check, so your node follows signatures. Nothing for you to do.</p>
+          <button id="chip-ok" class="btn-secondary" type="button">OK</button>
+        </div>
+
+        <!-- A machine that checks blocks itself, measured adding far fewer
+             blocks an hour than the chain makes, will never reach the tip;
+             one whose graphics chip failed the engine's check does not move
+             at all. Offered, never done for the owner: the button records the
+             choice (btx_core::node::follows_signatures_by_choice) and restarts
+             the node; Settings takes it back. The owner's decision,
+             2026-09-26. -->
+        <div class="card fork-card follow-card" id="follow-card" hidden>
+          <p id="follow-msg"></p>
+          <button id="follow-btn" class="btn-secondary" type="button">Follow signatures instead</button>
+        </div>
+
+        <!-- Which role this node actually fills, one fact per line, each with
+             a sentence on whether it helps (btx_core::role). Exists because no
+             screen said it: a key pinned on a trusted mirror signed nothing
+             for eleven days (2026-09-03), and a degraded consensus start looks
+             like a full node to the person running it. Facts from the engine,
+             sentences from Rust; the script only lays them out. -->
+        <div class="card role-card" id="role-card" hidden>
+          <div class="role-head">Your node's role</div>
+          <ul class="role-lines" id="role-lines"></ul>
+        </div>
+
         <p class="peer-names" id="peer-names" hidden></p>
 
         <button id="global-stats-link" class="link-row" type="button">
-          Global network stats <span class="link-ext" aria-hidden="true">↗</span>
+          <span>Global network stats <span class="link-ext" aria-hidden="true">↗</span></span>
         </button>
 
         <div class="card disk-card" id="disk-card">
@@ -231,14 +356,12 @@
             <button id="settings-close" class="icon-btn" type="button" aria-label="Close">✕</button>
           </div>
 
-          <div class="setting-row">
-            <div class="setting-text">
-              <span class="setting-name">Data folder</span>
-              <span class="setting-desc" id="setting-datadir">—</span>
-            </div>
-            <button id="open-datadir-btn" class="btn-secondary" type="button">Open</button>
-          </div>
-
+          <!-- Four groups (docs/node-ui-audit-2026-10-12.md, item 4): what this
+               computer does, what the node gives the network, what operators run
+               (folded: most people never need it), and the disk. Only the order
+               and the headings changed; every row and id is as it was. -->
+          <section class="settings-group">
+            <h3 class="settings-group-title">This computer</h3>
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Launch at login</span>
@@ -261,77 +384,15 @@
             </label>
           </div>
 
-          <div class="setting-row setting-row-stacked">
+          <div class="setting-row" id="wslrecover-row" hidden>
             <div class="setting-text">
-              <span class="setting-name">Node nickname</span>
-              <span class="setting-desc" id="nickname-desc">Optional. Every node you connect to sees this name. Leave empty to stay anonymous</span>
-            </div>
-            <div class="nickname-row">
-              <input id="nickname-input" class="wallet-input" type="text" maxlength="24"
-                     placeholder="unnamed" autocomplete="off" spellcheck="false"
-                     aria-describedby="nickname-desc" />
-              <button id="nickname-save" class="btn-secondary" type="button">Save</button>
-            </div>
-            <p class="setting-result" id="nickname-result" hidden></p>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-text">
-              <span class="setting-name">Keeper mode</span>
-              <span class="setting-desc" id="keeper-desc">Small node (~10 GB) that serves signed confirmations — the network's scarcest service</span>
+              <span class="setting-name">Restart WSL to recover the graphics card</span>
+              <span class="setting-desc">After a graphics driver update the node cannot check blocks until WSL restarts. easyNode does it by itself, which also stops any other Linux program running on this PC</span>
             </div>
             <label class="switch">
-              <input type="checkbox" id="keeper-toggle" />
+              <input type="checkbox" id="wslrecover-toggle" />
               <span class="slider"></span>
             </label>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-text">
-              <span class="setting-name">Serve confirmations</span>
-              <span class="setting-desc">On automatically in Keeper mode — a full node can serve its history here too. Applies on next start</span>
-            </div>
-            <label class="switch">
-              <input type="checkbox" id="serve-toggle" />
-              <span class="slider"></span>
-            </label>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-text">
-              <span class="setting-name">Write a local service report</span>
-              <span class="setting-desc">Saves what this node has served to a file in your data folder every few minutes. Local only — nothing is uploaded</span>
-            </div>
-            <label class="switch">
-              <input type="checkbox" id="report-toggle" />
-              <span class="slider"></span>
-            </label>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-text">
-              <span class="setting-name">Serve wallets (Esplora API)</span>
-              <span class="setting-desc" id="esplora-desc">Serve the Esplora API to wallets from your own full node. Needs the whole chain on disk (never a pruned node), electrs and Caddy built from deploy/esplora, and disk for the index</span>
-            </div>
-            <label class="switch">
-              <input type="checkbox" id="esplora-toggle" />
-              <span class="slider"></span>
-            </label>
-          </div>
-          <p class="setting-result" id="esplora-preflight" hidden></p>
-
-          <div class="setting-row setting-row-stacked">
-            <div class="setting-text">
-              <span class="setting-name">Esplora address</span>
-              <span class="setting-desc">Where the front listens. Localhost until you give it a hostname, which gets its own certificate. Applies the next time the node starts</span>
-            </div>
-            <div class="nickname-row">
-              <input id="esplora-listen" class="wallet-input" type="text" maxlength="253"
-                     placeholder="http://127.0.0.1:3080" autocomplete="off" spellcheck="false"
-                     aria-label="Esplora address" />
-              <button id="esplora-listen-save" class="btn-secondary" type="button">Save</button>
-            </div>
-            <p class="setting-result" id="esplora-result" hidden></p>
           </div>
 
           <div class="setting-row">
@@ -350,6 +411,10 @@
             <div class="setting-text">
               <span class="setting-name">Updates</span>
               <span class="setting-desc" id="update-check-result">Checks automatically on launch and every 6 hours</span>
+              <!-- Rendered from what the backend persisted, on every tick: the
+                   automatic check is no longer silent about what it did, and
+                   the line survives the relaunch an install causes. -->
+              <span class="setting-desc" id="update-last-check">Last check: none yet</span>
             </div>
             <button id="update-check-btn" class="btn-secondary" type="button">Check now</button>
           </div>
@@ -381,12 +446,36 @@
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Wallet</span>
-              <span class="setting-desc">Watch a BTX wallet — balances from your own node</span>
+              <span class="setting-desc">Watch a BTX wallet, with balances from your own node</span>
             </div>
             <label class="switch">
               <input type="checkbox" id="wallet-toggle" />
               <span class="slider"></span>
             </label>
+          </div>
+
+          <!-- Explorer mode (txindex), on by default where the whole chain is
+               kept and greyed out with the reason where it is not
+               (feature-rows.ts explorerRow). It used to be offered only from
+               Ask's transaction lookup. -->
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Explorer mode</span>
+              <span class="setting-desc" id="explorer-desc"></span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="explorer-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <p class="setting-result" id="explorer-result" hidden></p>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Data folder</span>
+              <span class="setting-desc" id="setting-datadir">—</span>
+            </div>
+            <button id="open-datadir-btn" class="btn-secondary" type="button">Open</button>
           </div>
 
           <div class="setting-row">
@@ -396,7 +485,185 @@
             </div>
             <button id="future-btn-settings" class="btn-secondary" type="button">See it</button>
           </div>
+          </section>
 
+          <section class="settings-group">
+            <h3 class="settings-group-title">Helping the network</h3>
+          <div class="setting-row setting-row-stacked">
+            <div class="setting-text">
+              <span class="setting-name">Node nickname</span>
+              <span class="setting-desc" id="nickname-desc">Optional. Every node you connect to sees this name. Leave empty to stay anonymous</span>
+            </div>
+            <div class="nickname-row">
+              <input id="nickname-input" class="wallet-input" type="text" maxlength="24"
+                     placeholder="unnamed" autocomplete="off" spellcheck="false"
+                     aria-describedby="nickname-desc" />
+              <button id="nickname-save" class="btn-secondary" type="button">Save</button>
+            </div>
+            <p class="setting-result" id="nickname-result" hidden></p>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Keeper mode</span>
+              <span class="setting-desc" id="keeper-desc">Small node (~10 GB) that serves signed confirmations, the network's scarcest service</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="keeper-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Serve confirmations</span>
+              <span class="setting-desc">On automatically in Keeper mode. A full node can serve its history here too. Applies on next start</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="serve-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <!-- The signer role (btx_core::signer). The switch is the whole
+               ask of the 2026-09-16 outage: btxscan froze because ONE key on
+               one home computer signed, and the app had no way to add a
+               second. The copy under the key says what is being asked for,
+               which is trust rather than bandwidth. -->
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Sign confirmations for mirrors</span>
+              <span class="setting-desc" id="signer-desc">Your node signs each block it checks, so the nodes that cannot check blocks themselves, the explorer's included, can follow yours. Applies on next start</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="signer-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <p class="setting-result" id="signer-result" hidden></p>
+
+          <!-- The way back from the status screen's offer, and the same choice
+               for anyone who wants it on a machine that could check blocks.
+               Hidden on a machine that follows signatures anyway. -->
+          <div class="setting-row" id="follow-row" hidden>
+            <div class="setting-text">
+              <span class="setting-name">Follow signatures instead of checking blocks</span>
+              <span class="setting-desc">For a machine too slow to keep up with the chain, or whose graphics chip cannot check blocks. Your node follows the signatures of a node that checks blocks, as a Windows PC does, stops checking the proof of work itself and cannot sign. It restarts to apply the change</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="follow-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <p class="setting-result" id="follow-result" hidden></p>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Write a local service report</span>
+              <span class="setting-desc">Saves what this node has served to a file in your data folder every few minutes. Local only, nothing is uploaded</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="report-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          </section>
+
+          <details class="settings-group settings-group-fold">
+            <summary class="settings-group-title">For operators<span class="settings-group-hint">Your signing key, answering wallets, snapshots and Esplora</span></summary>
+          <div class="setting-row setting-row-stacked" id="signer-key-row" hidden>
+            <div class="setting-text">
+              <span class="setting-name">Your public signing key</span>
+              <span class="setting-desc">This key is public: every confirmation your node signs carries it. The private key stays in your data folder and never leaves this machine. A mirror that pins this key takes your node's word for the proof of work, with no second check, so hand it only to an operator who asked you for it</span>
+            </div>
+            <div class="nickname-row">
+              <code id="signer-pubkey" class="signer-pubkey" aria-label="Public signing key"></code>
+              <button id="signer-copy-btn" class="btn-secondary" type="button">Copy key</button>
+            </div>
+          </div>
+
+          <div class="setting-row" id="signer-publish-row" hidden>
+            <div class="setting-text">
+              <span class="setting-name">Offer my key to mirror operators</span>
+              <span class="setting-desc" id="signer-publish-desc">Sends the public key above to easybtx.com every fifteen minutes, with your node's version and block height, so the people who run mirrors can find it and decide whether to trust it. Nothing else is sent: no wallet, no address, no private key. Turning this off keeps your node signing</span>
+              <span class="setting-desc" id="signer-publish-status" hidden></span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="signer-publish-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <p class="setting-result" id="signer-publish-result" hidden></p>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Help wallets check the chain</span>
+              <span class="setting-desc" id="witness-desc">Answer one question for wallets: which block is at a given height. It is how a wallet checks it is on the right chain, it costs almost nothing, and your node can already do it</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="witness-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="setting-row setting-row-stacked">
+            <div class="setting-text">
+              <span class="setting-name">Who can ask</span>
+              <span class="setting-desc" id="witness-listen-desc">This machine only, unless you change it. Use 0.0.0.0 to let other machines ask. Applies at the next node start</span>
+            </div>
+            <div class="nickname-row">
+              <input id="witness-listen" class="wallet-input" type="text" maxlength="64"
+                     placeholder="127.0.0.1:3081" autocomplete="off" spellcheck="false"
+                     aria-label="Witness address" />
+              <button id="witness-listen-save" class="btn-secondary" type="button">Save</button>
+            </div>
+            <p class="setting-result" id="witness-result" hidden></p>
+          </div>
+
+          <!-- Producer half of the attested-snapshot mechanism
+               (btx_core::snapshot_serve). Opt-in: it needs a node that
+               validates and signs, and the gate's refusal is shown here. -->
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Serve a chain snapshot</span>
+              <span class="setting-desc" id="snapshot-serve-desc">Export the chain state at the tip, sign it, and let new nodes fetch it instead of catching up from a months-old file. Needs a node that checks blocks itself and signs. About 9 MB, taken every 100 blocks and offered once it is 144 blocks deep, about three and a half hours later</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="snapshot-serve-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <p class="setting-result" id="snapshot-serve-result" hidden></p>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Serve wallets (Esplora API)</span>
+              <span class="setting-desc" id="esplora-desc">Serve the Esplora API to wallets from your own full node. Needs the whole chain on disk (never a pruned node), electrs and Caddy built from deploy/esplora, and disk for the index</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="esplora-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <p class="setting-result" id="esplora-preflight" hidden></p>
+
+          <div class="setting-row setting-row-stacked">
+            <div class="setting-text">
+              <span class="setting-name">Esplora address</span>
+              <span class="setting-desc">Where the front listens. Localhost until you give it a hostname, which gets its own certificate. Applies the next time the node starts</span>
+            </div>
+            <div class="nickname-row">
+              <input id="esplora-listen" class="wallet-input" type="text" maxlength="253"
+                     placeholder="http://127.0.0.1:3080" autocomplete="off" spellcheck="false"
+                     aria-label="Esplora address" />
+              <button id="esplora-listen-save" class="btn-secondary" type="button">Save</button>
+            </div>
+            <p class="setting-result" id="esplora-result" hidden></p>
+          </div>
+          </details>
+
+          <section class="settings-group">
+            <h3 class="settings-group-title">Disk</h3>
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Reclaim disk space</span>
@@ -409,17 +676,157 @@
           <div class="setting-row">
             <div class="setting-text">
               <span class="setting-name">Remove node data</span>
-              <span class="setting-desc">Delete the chain and free its disk space — set up again anytime</span>
+              <span class="setting-desc">Delete the chain and free its disk space. Set up again anytime</span>
             </div>
             <button id="remove-node-btn" class="btn-secondary" type="button">Remove…</button>
           </div>
           <p class="setting-result" id="remove-node-result" hidden></p>
+          </section>
 
           <p class="settings-footer" id="settings-footer"></p>
         </div>
       </div>
 
       <!-- ── About (info) overlay ────────────────────────────────────── -->
+      <!-- One-time greeting on a brand new install. Not a setting: the
+           services it lists are already on (NodeAppSettings::default), and
+           this is where the user is told so and can name the node. Existing
+           installs never see it, see NodeAppSettings::welcome_shown. -->
+      <div class="overlay" id="welcome-overlay" hidden>
+        <div class="overlay-panel" role="dialog" aria-modal="true" aria-labelledby="welcome-title">
+          <div class="overlay-head">
+            <h2 id="welcome-title">Your node is live</h2>
+          </div>
+
+          <p class="welcome-lede" id="welcome-lede">
+            It is already doing these things for BTX. All of them are
+            free to give, none of them opens a port on your router, and every
+            one can be turned off in Settings.
+          </p>
+
+          <ul class="role-lines" id="welcome-role-list">
+            <!-- Shown only where the machine can sign (a card the engine
+                 accepts). On a mirror host it is hidden rather than shown
+                 crossed out: that host already got its own panel. -->
+            <li class="role-line is-helps" id="welcome-signer-item" hidden>
+              <div class="role-row">
+                <span class="role-mark" role="img" aria-label="on"></span>
+                <span class="role-label">Signing confirmations for mirrors</span>
+                <span class="role-value">On</span>
+              </div>
+              <p class="role-note">
+                Your graphics card checks every block, and your node now signs
+                each one it checks. The explorer and the wallets behind it
+                follow those signatures, and until now they all followed one
+                key on one home computer. Your node offers its public key to
+                easybtx.com so the people who run mirrors can find it and
+                decide whether to trust it; the private key never leaves this
+                machine, and both that and the offer can be switched off in
+                Settings.
+              </p>
+            </li>
+            <li class="role-line is-helps">
+              <div class="role-row">
+                <span class="role-mark" role="img" aria-label="on"></span>
+                <span class="role-label">Serving confirmations</span>
+                <span class="role-value">On</span>
+              </div>
+              <p class="role-note">
+                Hands other nodes the signatures that prove old blocks. It is
+                the scarcest thing on the network and costs about 208 bytes a
+                block.
+              </p>
+            </li>
+            <li class="role-line is-helps">
+              <div class="role-row">
+                <span class="role-mark" role="img" aria-label="on"></span>
+                <span class="role-label">Answering wallets</span>
+                <span class="role-value">On</span>
+              </div>
+              <p class="role-note">
+                A BTX wallet on this computer can settle a fork against your
+                own node instead of trusting someone else's server. This
+                answers only this machine.
+              </p>
+            </li>
+            <!-- Only where this node validates and signs (welcome-signer-item's
+                 rule); anywhere else it does nothing, so it is not listed. -->
+            <li class="role-line is-helps" id="welcome-snapshot-item" hidden>
+              <div class="role-row">
+                <span class="role-mark" role="img" aria-label="on"></span>
+                <span class="role-label">Serving a chain snapshot</span>
+                <span class="role-value">On</span>
+              </div>
+              <p class="role-note">
+                Every 100 blocks your node exports the chain state, signs it,
+                and lets new nodes start from it instead of from an older file.
+                About 9 MB each.
+              </p>
+            </li>
+            <li class="role-line is-helps">
+              <div class="role-row">
+                <span class="role-mark" role="img" aria-label="on"></span>
+                <span class="role-label">Keeping a service report</span>
+                <span class="role-value">On</span>
+              </div>
+              <p class="role-note">
+                Writes what your node has served to a file in your data folder.
+                Local only. Nothing is uploaded.
+              </p>
+            </li>
+          </ul>
+
+          <!-- On for the person, by the owner's rule of 2026-10-12 (every
+               feature on, switchable off in Settings). -->
+          <p class="welcome-lede">And for you, also on:</p>
+          <ul class="role-lines" id="welcome-you-list">
+            <li class="role-line is-helps">
+              <div class="role-row">
+                <span class="role-mark" role="img" aria-label="on"></span>
+                <span class="role-label">Starting with your computer</span>
+                <span class="role-value">On</span>
+              </div>
+              <p class="role-note">Your node starts when you sign in, so it keeps helping after a restart.</p>
+            </li>
+            <li class="role-line is-helps">
+              <div class="role-row">
+                <span class="role-mark" role="img" aria-label="on"></span>
+                <span class="role-label">Wallet</span>
+                <span class="role-value">On</span>
+              </div>
+              <p class="role-note">The wallet button in the header. Nothing is created until you make or open a wallet.</p>
+            </li>
+            <li class="role-line is-helps" id="welcome-explorer-item" hidden>
+              <div class="role-row">
+                <span class="role-mark" role="img" aria-label="on"></span>
+                <span class="role-label">Explorer mode</span>
+                <span class="role-value">On</span>
+              </div>
+              <p class="role-note">Ask can look up any past transaction. Your node builds a small index once, in the background.</p>
+            </li>
+          </ul>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Give it a name</span>
+              <span class="setting-desc">
+                Optional, and other nodes see it. Leave it blank to stay unnamed.
+              </span>
+            </div>
+          </div>
+          <div class="nickname-row">
+            <input id="welcome-nickname" class="wallet-input" type="text" maxlength="24"
+                   placeholder="unnamed" autocomplete="off" spellcheck="false"
+                   aria-label="Node nickname" />
+          </div>
+          <p class="setting-result is-error" id="welcome-nickname-error" hidden></p>
+
+          <div class="nickname-row welcome-actions">
+            <button id="welcome-done" class="btn-primary" type="button">Start helping</button>
+          </div>
+        </div>
+      </div>
+
       <div class="overlay" id="info-overlay" hidden>
         <div class="overlay-panel" role="dialog" aria-modal="true" aria-labelledby="info-title">
           <div class="overlay-head">
@@ -428,21 +835,22 @@
           </div>
           <div class="info-body">
             <p>
-              A full node keeps its own complete, verified copy of the BTX
-              blockchain and checks every block against the rules — no trust in
-              anyone else's server. Nodes relay blocks and transactions between
-              peers and help new nodes join.
+              A full node keeps its own copy of the BTX blockchain and relays
+              blocks and transactions between peers, so nobody has to trust one
+              company's server. It helps new nodes join, too.
             </p>
             <p>
-              BTX Node runs one for you: it fast-started from a
-              checksum-verified snapshot, keeps the node healthy in your menu
-              bar, and shows you what it's doing. No wallet, no mining, no
-              account — just you, helping the network stay decentralized.
+              BTX Node runs one for you. It starts from a signed snapshot, so
+              it is ready in minutes, keeps the node healthy from your
+              <span data-tray-term>menu bar</span>, and shows you what it is
+              doing. Quick start follows the signatures of nodes that check
+              every block; Full check has your graphics card check them itself.
+              No mining and no account. A wallet is there if you want one.
             </p>
             <p class="info-fineprint">
               The full chain measured 124 GiB on 2026-09-04 and now grows
               about 8 MB a day, so the space it needs is mostly the history it
-              already has. BTX has no node rewards today — this one is for the
+              already has. BTX has no node rewards today: this one is for the
               network. Settings can remove the chain data anytime.
             </p>
             <div class="info-footprint">
@@ -453,6 +861,9 @@
               <p class="info-fineprint" id="fp-note">Start your node to see live numbers.</p>
             </div>
           </div>
+          <button id="community-link" class="link-row" type="button">
+            <span>BTX Community (Telegram) <span class="link-ext" aria-hidden="true">↗</span></span>
+          </button>
           <button id="future-btn" class="btn-secondary" type="button">What's coming next →</button>
         </div>
       </div>
@@ -467,7 +878,7 @@
 
           <div id="wallet-import-section" hidden>
             <p class="ask-intro">
-              Your own node can make a wallet — or open one you already have.
+              Your own node can make a wallet, or open one you already have.
               Either way the keys live on this computer and your node answers with
               the balance and the history. No website, no account, no third party
               in the middle.
@@ -475,7 +886,7 @@
             <button id="wallet-create-btn" class="btn-primary" type="button">Create a new wallet</button>
             <p class="ask-line wallet-fineprint">
               Makes a post-quantum wallet inside your node and saves its
-              <strong>.btxwallet</strong> file to your Desktop — the same file the
+              <strong>.btxwallet</strong> file to your Desktop, the same file the
               official BTX browser wallet uses. That file IS your money: store
               it somewhere safe and never share it.
             </p>
@@ -504,7 +915,7 @@
               <p class="ask-line" id="wallet-caveat" hidden></p>
               <p class="ask-line wallet-fineprint">
                 Every row is answered by your node. Click one to open it on the
-                public explorer if you want a second pair of eyes — that's the
+                public explorer if you want a second pair of eyes. That is the
                 only time anything leaves this machine, and only the id you clicked.
               </p>
             </div>
@@ -520,7 +931,7 @@
               <p class="ask-line wallet-fineprint">
                 A fresh address for each payment keeps your payments from being
                 tied together in public. Every address you've ever been given
-                keeps working — old ones never expire.
+                keeps working; old ones never expire.
               </p>
             </div>
 
@@ -611,12 +1022,21 @@
               network, or you can stop it and quit. Quitting stops your node until
               you open the app again.
             </p>
+            <!-- Shown only while the engine reports this node holding a key
+                 AND validating: the state in which quitting freezes somebody
+                 else's mirror. From the wire, not from the setting. -->
+            <p class="ask-intro needs-attention" id="close-signer-warning" hidden>
+              This node is signing confirmations that mirrors depend on. While
+              it is off, a mirror that trusts only this key stops at its last
+              block, the way the explorer did on 16 September, and money that
+              moves meanwhile does not show there until it is back.
+            </p>
             <label class="close-remember">
               <input type="checkbox" id="close-remember" />
               Remember my choice (change it later in Settings)
             </label>
             <div class="wallet-btn-row">
-              <button id="close-keep-btn" class="btn-primary" type="button" data-tray-term>Keep running in the menu bar</button>
+              <button id="close-keep-btn" class="btn-primary" type="button" data-tray-term data-autofocus>Keep running in the menu bar</button>
               <button id="close-quit-btn" class="btn-secondary" type="button">Quit BTX Node</button>
             </div>
           </div>
@@ -624,7 +1044,7 @@
             <div class="overlay-head"><h2>Stopping your node safely…</h2></div>
             <p class="ask-intro">
               Letting btxd finish writing so your next start is instant. This is
-              quick — the window closes on its own.
+              quick, and the window closes on its own.
             </p>
           </div>
         </div>
@@ -639,13 +1059,14 @@
           </div>
           <p class="ask-intro">
             Answers come straight from the verified copy of the chain on this
-            computer — no outside service. <span class="cite-dot" aria-hidden="true"></span>
+            computer, with no outside service. <span class="cite-dot" aria-hidden="true"></span>
             means "from your own node".
           </p>
 
           <div class="ask-gate" id="ask-gate" hidden>
             <p>Start your node to ask it questions.</p>
             <button id="ask-start-btn" class="btn-secondary" type="button">Start node</button>
+            <p class="setting-result is-error" id="ask-start-error" role="alert" hidden></p>
           </div>
 
           <div class="ask-list" id="ask-list">
@@ -700,9 +1121,58 @@
           </div>
 
           <button id="ask-global-stats" class="link-row" type="button">
-            The bigger picture — global network stats <span class="link-ext" aria-hidden="true">↗</span>
-            <span class="ask-cite link-row-cite"><span class="cite-dot cite-dot-ext"></span> via btxprice.com — an external site, not your node</span>
+            <span>The bigger picture: global network stats <span class="link-ext" aria-hidden="true">↗</span></span>
+            <span class="ask-cite link-row-cite"><span class="cite-dot cite-dot-ext"></span> via easybtx.com, an external site, not your node</span>
           </button>
+        </div>
+      </div>
+
+      <!-- ── Tools overlay ───────────────────────────────────────────── -->
+      <div class="overlay" id="tools-overlay" hidden>
+        <div class="overlay-panel ask-panel" role="dialog" aria-modal="true" aria-labelledby="tools-title">
+          <div class="overlay-head">
+            <h2 id="tools-title">Tools</h2>
+            <button id="tools-close" class="icon-btn" type="button" aria-label="Close">✕</button>
+          </div>
+          <p class="tools-now" id="tools-now"></p>
+
+          <h3 class="tools-h">Quick actions</h3>
+          <div class="tools-actions">
+            <button id="tools-restart" class="btn-secondary" type="button">Restart node</button>
+            <button id="tools-fetch" class="btn-secondary" type="button">Fetch a stuck block</button>
+            <button id="tools-open-folder" class="btn-secondary" type="button">Open data folder</button>
+            <button id="tools-notices-btn" class="btn-secondary" type="button" aria-expanded="false">Engine notices</button>
+          </div>
+          <p class="setting-result" id="tools-action-result" hidden></p>
+          <div class="tools-notices" id="tools-notices" hidden></div>
+
+          <div id="tools-ff" hidden>
+            <h3 class="tools-h">Fast-forward</h3>
+            <p class="tools-note" id="tools-ff-note">A confirmed snapshot is far ahead of your node.</p>
+            <button id="tools-ff-btn" class="btn-secondary" type="button" hidden></button>
+            <p class="setting-result" id="tools-ff-result" tabindex="-1" hidden></p>
+          </div>
+
+          <h3 class="tools-h">Diagnostics</h3>
+          <button id="tools-diag-btn" class="btn-secondary" type="button">Copy diagnostics</button>
+          <p class="tools-note">Shows what it copies first. Nothing is uploaded; you choose where to paste it.</p>
+          <pre class="tools-pre" id="tools-diag" hidden></pre>
+
+          <details class="tools-console">
+            <summary>Command window (advanced)</summary>
+            <p class="tools-note">Runs a short list of read-only node commands. Type help to see them.</p>
+            <div class="tools-console-row">
+              <input id="tools-line" type="text" spellcheck="false" autocomplete="off" aria-label="Command" placeholder="getblockchaininfo" />
+              <button id="tools-run" class="btn-secondary" type="button">Run</button>
+            </div>
+            <div class="tools-confirm" id="tools-confirm" hidden>
+              <p id="tools-confirm-text"></p>
+              <button id="tools-confirm-yes" class="btn-secondary" type="button">Yes, do it</button>
+              <button id="tools-confirm-no" class="btn-secondary" type="button">Cancel</button>
+            </div>
+            <button id="tools-copy-all" class="link-row" type="button">Copy all</button>
+            <div class="tools-history" id="tools-history"></div>
+          </details>
         </div>
       </div>
 
@@ -714,15 +1184,16 @@
             <button id="future-close" class="icon-btn" type="button" aria-label="Close">✕</button>
           </div>
           <ul class="future-list">
-            <li><strong>Ask your node</strong> — shipped in v0.2: cited answers about the chain, straight from your own node. Tap the <strong>?</strong> in the header.</li>
-            <li><strong>Node supporter identity</strong> — a way for your node to say "I was here", with stats you can share.</li>
-            <li><strong>Compute contribution</strong> — opt in to donate spare compute to useful network work, using the node's built-in service RPC.</li>
-            <li><strong>Following the chain past 185,000 on any machine</strong> — today that needs an Apple Silicon Mac or one of the newest graphics cards. A mode that works everywhere is being built by the BTX team; when it is safe to leave running unattended, it ships here.</li>
-            <li><strong>Making it worth your while</strong> — if the network adds node incentives, this app is where they land first.</li>
+            <li><strong>Node supporter identity:</strong> a way for your node to say "I was here", with stats you can share.</li>
+            <li><strong>Compute contribution:</strong> opt in to donate spare compute to useful network work, using the node's built-in service RPC.</li>
+            <li><strong>Making it worth your while:</strong> if the network adds node incentives, this app is where they land first.</li>
           </ul>
           <p class="info-fineprint">
-            These are plans, not promises — order and shape can change. Already
-            shipped: the wallet, and Windows and Linux builds.
+            These are plans, not promises; order and shape can change. Already
+            shipped: Ask your node (the <strong>?</strong> in the header), the
+            wallet, Quick start for machines that cannot check blocks
+            themselves, signing for the nodes that follow yours, and Windows
+            and Linux builds.
           </p>
         </div>
       </div>

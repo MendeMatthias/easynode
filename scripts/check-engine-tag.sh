@@ -34,14 +34,15 @@
 #
 # WHAT THIS DOES **NOT** COVER, so nobody mistakes its green for full coverage.
 #
-#   * ONLY the mac engine pin. It reads NODE_RELEASE_TAG, which is the release
-#     TAG the mac node app bundles. Windows and Linux node builds do not use a
-#     tag at all: node-win-installer.yml and node-linux-installer.yml build btxd
-#     from commit pin 1e51f0d1, which is v0.33.3 era and therefore predates the
-#     constant entirely (v0.33.3 has no nMatMulStallRecoveryHeight assignment).
-#     Those two platforms are out of scope because they are not exposed, not
-#     because they were checked. If either ever moves to a tag or to a commit at
-#     or after v0.33.4, bring it into this guard rather than assuming.
+#   * ONLY the pin in commands.rs. It reads NODE_RELEASE_TAG (and, when set,
+#     NODE_RELEASE_COMMIT, the exact upstream commit that key names). Since
+#     2026-09-08 all three platforms build from that one pin: btxd-linux.yml
+#     and btxd-macos.yml read it through engine-pin.sh, and the Windows and
+#     Linux installer workflows pin an artifact whose commit must equal it. So
+#     the pin this guard judges is the engine every platform ships; a workflow
+#     that grows its own hardcoded ref is outside this guard until it is made
+#     to read the pin. (This bullet used to say Windows and Linux built from
+#     1e51f0d1 and were out of scope. That stopped being true on 2026-09-08.)
 #   * ONLY this one constant. It says nothing about the withdrawn assumeutxo
 #     bases 199299 (f12a27d0) and 199300 (ff80e629), which v0.34.2, v0.34.3 and
 #     v0.34.4 all still compile, and nothing about the trusted-mirror M>=2
@@ -91,11 +92,14 @@ CHAINPARAMS="src/kernel/chainparams.cpp"
 BTX_CLONE="${BTX_CLONE:-/Users/bonuz/repos/btx}"
 RAW_BASE="https://raw.githubusercontent.com/btxchain/btx"
 
-# An UNTAGGED pin. When commands.rs also declares NODE_RELEASE_COMMIT, the tag
-# string may not exist upstream yet (0.34.6 shipped from release/0.34.6 before
-# upstream tagged it). The guard then fetches source at that SHA instead, so an
-# untagged pin gets exactly the check a tagged one gets. It never substitutes a
-# branch name: a branch moves, a SHA does not. Empty when the tag is real.
+# A pin that names its COMMIT. When commands.rs also declares
+# NODE_RELEASE_COMMIT, the key in NODE_RELEASE_TAG may not be an upstream ref at
+# all: 0.34.6 shipped from release/0.34.6 before upstream tagged it, and since
+# 2026-09-15 the key carries a `-<short sha>` qualifier (`v0.34.6-3013c2c2`) so
+# the app re-provisions onto the tag build. The guard then fetches source at
+# that SHA instead, so such a pin gets exactly the check a bare tag gets. It
+# never substitutes a branch name: a branch moves, a SHA does not. Empty when
+# the key is itself a real upstream tag.
 pin_commit() {
   sed -n 's/^pub const NODE_RELEASE_COMMIT: &str = "\([0-9a-f]\{40\}\)";.*$/\1/p' "$1" | head -1
 }
@@ -116,6 +120,119 @@ die() {
   shift
   for line in "$@"; do echo "  $line" >&2; done
   exit 1
+}
+
+# --- 5, defined here: the compiled shielded commitment ----------------------
+# Section 12 of docs/decisions/2026-09-29-every-node-starts-near-the-tip.md:
+# every confirmed statement must carry the shielded commitment that
+# confirmed_snapshot.rs compiles (MAINNET_SHIELDED_COMMITMENT). An engine whose
+# newest mainnet snapshot pins another one would have every node refuse every
+# confirmed snapshot, so the bump fails here first. It reads the chainparams.cpp
+# fetched below, so it runs wherever this script runs, CI included.
+CONFIRMED_RS="$ROOT/crates/btx-core/src/confirmed_snapshot.rs"
+shielded_check() {
+  local compiled newest
+  compiled="$(grep -A1 '^pub const MAINNET_SHIELDED_COMMITMENT' "$CONFIRMED_RS" 2>/dev/null \
+    | grep -oE '[0-9a-f]{64}' | head -1 || true)"
+  [ -n "$compiled" ] || die "could not read MAINNET_SHIELDED_COMMITMENT from $CONFIRMED_RS" \
+    "Its shape changed. FIX THIS GUARD, do not delete it and do not skip it."
+  newest="$(awk '/^class CMainParams/{m=1} m && /^};/{exit} m' "$FILE" \
+    | grep -oE 'shielded_state_commitment = uint256\{"[0-9a-f]{64}"\}' \
+    | tail -1 | grep -oE '[0-9a-f]{64}' || true)"
+  [ -n "$newest" ] || die "found no mainnet shielded_state_commitment in $CHAINPARAMS for $TAG" \
+    "Either CMainParams moved or its assumeutxo entries changed shape. Read the file by hand."
+  if [ "$compiled" != "$newest" ]; then
+    die "the newest mainnet snapshot in $TAG pins shielded commitment $newest" \
+      "confirmed_snapshot.rs compiles $compiled. Every node would refuse every" \
+      "confirmed snapshot. Do not ship this engine until the two agree."
+  fi
+  echo "OK: the newest mainnet snapshot in $TAG pins the shielded commitment"
+  echo "    confirmed_snapshot.rs compiles (${compiled:0:8}...${compiled:60:4})."
+}
+
+# --- 7, defined here: the 32-byte HTLC preimage rule covers all three leaves -
+# From mainnet height 244,000 (nP2MRHTLCPreimage32Height, v0.34.14+) a claim
+# whose leaf "pins the preimage length" must reveal a 32-byte preimage.
+# v0.34.15 classifies THREE leaf shapes that way in
+# src/script/pqm.cpp P2MRClaimLeafPinsPreimageLength: the pinned SHA-256 leaf,
+# the legacy SHA-256 leaf and the HASH160 htlc_tx leaf. The v0.35.0-rc1 tag
+# (commit 68f2bf3e) narrowed it to the first one only, so an rc1 node accepts a
+# legacy-leaf claim that every 0.34.15 node rejects: a chain split waiting for
+# the first such transaction. Upstream restored the three-leaf rule in 6b94704b
+# (2026-10-14) on every btx-035 branch, but the rc1 TAG still carries the
+# narrowing. This check reads the source, not the history, so it works on a
+# raw fetch in CI and catches the same narrowing however it comes back.
+#
+# Fail closed: a tag that has the activation height but no readable function
+# is a shape change, not a pass. Only a tag that has neither (it predates the
+# rule, v0.34.12 and older) is "not applicable".
+htlc_check() {
+  local pqm cp_has fn_body missing parser
+  pqm="$WORK/pqm.cpp"
+  fetch_source "src/script/pqm.cpp" "$pqm" \
+    || die "could not read src/script/pqm.cpp for $TAG" \
+      "An unverifiable tag is not a safe tag."
+  cp_has="$(grep -c 'nP2MRHTLCPreimage32Height' "$FILE" || true)"
+  # The function body: from its definition line to the first closing brace in
+  # column 0, comment text removed (a parser named only in a comment must not count).
+  fn_body="$(awk '/^bool P2MRClaimLeafPinsPreimageLength\(/{m=1} m{print} m && /^}/{exit}' "$pqm" \
+    | sed -e 's:/\*[^*]*\*/: :g' -e 's://.*$::')"
+  if [ -z "$fn_body" ]; then
+    if [ "$cp_has" = "0" ]; then
+      echo "htlc check: not applicable, $TAG predates the 32-byte HTLC preimage rule."
+      return 0
+    fi
+    die "$TAG has nP2MRHTLCPreimage32Height but no P2MRClaimLeafPinsPreimageLength in pqm.cpp" \
+      "The rule moved or was renamed. Read pqm.cpp for this tag by hand and fix" \
+      "this guard to match the new shape. Do not skip it."
+  fi
+  missing=""
+  for parser in ParseP2MRHTLCSha256Leaf ParseP2MRHTLCSha256LegacyLeaf ParseP2MRHTLCTxLeaf; do
+    printf '%s\n' "$fn_body" | grep -qE "(^|[^A-Za-z0-9_])${parser}[[:space:]]*\(" \
+      || missing="$missing $parser"
+  done
+  if [ -n "$missing" ]; then
+    die "$TAG narrows the 32-byte HTLC preimage rule: P2MRClaimLeafPinsPreimageLength no longer covers:$missing" \
+      "v0.34.15 applies the rule to all three leaf shapes from height 244,000." \
+      "A node built from this tag accepts claims the live network rejects (chain split)." \
+      "This is the v0.35.0-rc1 regression (68f2bf3e, fixed upstream in 6b94704b)." \
+      "Ship a build that contains 6b94704b, never the rc1 tag."
+  fi
+  echo "OK: $TAG applies the 32-byte HTLC preimage rule to all three claim leaves."
+}
+
+# --- 6, defined here: the confirmed-snapshot rehearsal on regtest -----------
+# Section 12 of docs/decisions/2026-09-29-every-node-starts-near-the-tip.md,
+# before any engine bump: the replay contexts the engine reports are the ones
+# the app compiles (confirmed_snapshot.rs), and a node on a signed snapshot
+# still restarts as a validating node. A context that moves strands every
+# node on a signed snapshot: the engine re-checks the stored manifest at each
+# start and refuses to start when it no longer verifies.
+#
+# It needs the candidate engine's btxd, which CI does not have:
+#   EASYNODE_TEST_BTXD=/path/to/btxd scripts/check-engine-tag.sh <tag>
+# Without it the check is skipped with a note. ENGINE_TAG_GUARD_REGTEST=1
+# makes it required, so the release recipe cannot skip it by accident.
+regtest_check() {
+  if [ -z "${EASYNODE_TEST_BTXD:-}" ]; then
+    if [ -n "${ENGINE_TAG_GUARD_REGTEST:-}" ]; then
+      die "ENGINE_TAG_GUARD_REGTEST is set but EASYNODE_TEST_BTXD is not" \
+        "Point EASYNODE_TEST_BTXD at the candidate engine's btxd (btx-cli beside it)."
+    fi
+    echo "regtest check: skipped. Before an engine bump run it with"
+    echo "  EASYNODE_TEST_BTXD=/path/to/btxd ENGINE_TAG_GUARD_REGTEST=1 $0 <tag>"
+    return 0
+  fi
+  echo "regtest check: confirmed snapshots against $EASYNODE_TEST_BTXD"
+  if ! (cd "$ROOT/crates/btx-core" \
+        && cargo test --locked --test confirmed_snapshot_regtest -- --ignored --test-threads=1); then
+    die "the confirmed-snapshot rehearsal failed against $EASYNODE_TEST_BTXD" \
+      "Either the engine's replay context moved, which would stop every node on a" \
+      "signed snapshot from starting, or a validating node on a signed snapshot no" \
+      "longer restarts. Do not ship this engine until confirmed_snapshot.rs agrees."
+  fi
+  echo "OK: the engine's replay contexts are the compiled ones, and a validating"
+  echo "    node restarts on a signed snapshot."
 }
 
 # --- 1. which tag ----------------------------------------------------------
@@ -147,16 +264,17 @@ trap 'rm -rf "$WORK"' EXIT
 FILE="$WORK/chainparams.cpp"
 SOURCE=""
 
-# The ref we fetch. Normally the tag itself; for an untagged pin (see
-# pin_commit above) the commit the tag name stands for. An explicit override
+# The ref we fetch. Normally the tag itself; for a pin that names its commit
+# (see pin_commit above) the commit the key stands for. An explicit override
 # argument is always taken literally, so `check-engine-tag.sh v0.34.7` still
-# means "that upstream tag" and nothing else.
+# means "that upstream tag" and nothing else; a suffixed install key passed as
+# the argument is not an upstream ref and fails the fetch, which is correct.
 REF="$TAG"
 if [ -z "$OVERRIDE_TAG" ]; then
   PIN_COMMIT="$(pin_commit "$COMMANDS_RS")"
   if [ -n "$PIN_COMMIT" ]; then
     REF="$PIN_COMMIT"
-    echo "untagged pin: verifying $TAG at commit $REF"
+    echo "pin names its commit: verifying $TAG at commit $REF (NODE_RELEASE_COMMIT)"
   fi
 fi
 
@@ -181,6 +299,19 @@ fi
 [ -s "$FILE" ] || die "fetched an empty $CHAINPARAMS for tag $TAG" \
   "Source was: $SOURCE"
 echo "source: $SOURCE"
+
+# Any other source file at the same ref, from the same place chainparams.cpp
+# came from (the clone when it has the ref, else raw GitHub). Returns 1 on a
+# failed or empty fetch; callers turn that into a hard failure.
+fetch_source() {
+  local path="$1" out="$2"
+  if [ "$SOURCE" = "local clone $BTX_CLONE" ]; then
+    git -C "$BTX_CLONE" show "$REF:$path" > "$out" 2>/dev/null || return 1
+  else
+    curl -fsSL --max-time 60 "$RAW_BASE/$REF/$path" -o "$out" 2>/dev/null || return 1
+  fi
+  [ -s "$out" ]
+}
 
 # --- 3. every assignment, comment TEXT removed -----------------------------
 # chainparams.cpp also has explanatory comment lines that name the symbol, so
@@ -266,6 +397,9 @@ if [ -z "$BAD" ]; then
   echo "OK: $TAG assigns nMatMulStallRecoveryHeight $TOTAL times, every one of them"
   echo "    the disabled sentinel $SENTINEL."
   echo "    No mainnet stall-recovery height. This engine follows the majority chain."
+  shielded_check
+  htlc_check
+  regtest_check
   if [ -z "$OVERRIDE_TAG" ] && [ -n "$ACKNOWLEDGED_FORKED_TAG" ] && [ "$TAG" = "$ACKNOWLEDGED_FORKED_TAG" ]; then
     echo
     echo "note: ACKNOWLEDGED_FORKED_TAG still names $TAG, which now checks out clean."

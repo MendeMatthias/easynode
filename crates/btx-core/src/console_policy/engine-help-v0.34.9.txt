@@ -1,0 +1,355 @@
+== Blockchain ==
+dumptxoutset "path" ( "type" {"format":["txid","vout","value","coinbase","height","scriptPubKey",...],"rollback":n,"show_header":bool,"separator":"str",...} )
+dumptxoutsetattested "path" "manifest_path"
+fetchattestedutxosnapshot "path" "manifest_path" ( "block_hash" peer_id timeout_ms )
+getbestblockhash
+getblock "blockhash" ( verbosity )
+getblockchaininfo
+getblockcount ( verbose )
+getblockfilter "blockhash" ( "filtertype" )
+getblockfrompeer "blockhash" peer_id
+getblockhash height
+getblockheader "blockhash" ( verbose )
+getblockstats hash_or_height ( stats )
+getchainstates
+getchaintips
+getchaintxstats ( nblocks "blockhash" )
+getdeploymentinfo ( "blockhash" )
+getdescriptoractivity ["blockhash",...] [scanobjects,...] ( include_mempool )
+getdifficulty
+getfinalityinfo
+getmempoolancestors "txid" ( verbose )
+getmempooldescendants "txid" ( verbose )
+getmempoolentry "txid"
+getmempoolinfo ( [fee_rate,...] )
+getrawmempool ( verbose mempool_sequence )
+getshieldedstateinfo
+gettxout "txid" n ( include_mempool )
+gettxoutproof ["txid",...] ( "blockhash" {"prove_witness":bool,...} )
+gettxoutsetinfo ( "hash_type" hash_or_height use_index )
+gettxspendingprevout [{"txid":"hex","vout":n},...]
+importmempool "filepath" ( options )
+listprunelocks
+loadtxoutset "path"
+loadtxoutsetattested "path" "manifest_path"
+maxmempool megabytes
+offerattestedutxosnapshot "path" "manifest_path" ( chunk_size )
+preciousblock "blockhash"
+pruneblockchain height
+savemempool
+scanblocks "action" ( [scanobjects,...] start_height stop_height "filtertype" options )
+scantxoutset "action" ( [scanobjects,...] )
+scriptthreadsinfo
+setprunelock "id" {"desc":"str","height":n or [n,n],"sync":bool,"temporary":bool}
+setscriptthreadsenabled state
+signutxosnapshotmanifest "manifest_path"
+verifychain ( checklevel nblocks )
+verifytxoutproof "proof" ( {"verify_witness":bool,...} )
+waitforblock "blockhash" ( timeout )
+waitforblockheight height ( timeout )
+waitfornewblock ( timeout "current_tip" )
+withdrawattestedutxosnapshot
+
+== Bridge ==
+bridge_buildaggregateartifactbundle "statement_hex" {"proof_artifacts":[{"proof_artifact_hex":"hex"},...],"data_artifacts":[{"data_artifact_hex":"hex"},...]}
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+bridge_builddataartifact "statement_hex" {"kind":"str","payload_commitment":"hex","payload_hex":"hex","artifact_commitment":"hex","artifact_hex":"hex","payload_size_bytes":n,"auxiliary_data_size_bytes":n}
+bridge_buildegressbatchtx "statement_hex" [{"proof_system_id":"hex","verifier_key_hash":"hex"},...] ["proof_receipt_hex",...] [{"address":"str","amount":amount},...] ( {"imported_descriptor_index":n,"imported_receipt_index":n,"output_chunk_sizes":[output_count,...]} )
+Internal bug detected: Unreachable code reached (non-fatal)
+bridge_buildexternalanchor "statement_hex" ["receipt_hex",...] ( {"min_receipts":n,"required_attestors":[{"algo":"str","pubkey":"hex"},...],"revealed_attestors":[{"algo":"str","pubkey":"hex"},...],"attestor_proofs":["proof_hex",...]} )
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+bridge_buildproofanchor "statement_hex" ["proof_receipt_hex",...] ( {"min_receipts":n,"required_proof_system_ids":["proof_system_id",...],"required_verifier_key_hashes":["verifier_key_hash",...],"revealed_descriptors":[{"proof_system_id":"hex","verifier_key_hash":"hex"},...],"descriptor_proofs":["proof_hex",...]} )
+Internal bug detected: Unreachable code reached (non-fatal)
+bridge_buildproofclaim "statement_hex" {"kind":"str"}
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+bridge_buildproofprofile {"version":n,"family":"str","proof_type":"str","claim_system":"str"}
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+bridge_buildrefund "plan_hex" "txid" vout amount "destination" fee ( enforce_timeout )
+bridge_buildshieldedstateprofile ( {"version":n,"commitment_index_key_bytes":n,"commitment_index_value_bytes":n,"snapshot_commitment_bytes":n,"nullifier_index_key_bytes":n,"nullifier_index_value_bytes":n,"snapshot_nullifier_bytes":n,"nullifier_cache_bytes":n,"wallet_materialization_bytes":n,"bounded_anchor_history_bytes":n} )
+bridge_buildshieldtx "plan_hex" "txid" vout amount ( {"min_fee_headroom_multiplier":n,"enforce_fee_headroom":bool,"accept_plan_view_grants":bool,"allow_legacy_audit_view_grants":bool} )
+bridge_buildstateretentionpolicy ( {"version":n,"retain_commitment_index":bool,"retain_nullifier_index":bool,"snapshot_include_commitments":bool,"snapshot_include_nullifiers":bool,"wallet_l1_materialization_bps":n,"snapshot_target_bytes":n} )
+bridge_buildunshieldtx "plan_hex" "txid" vout amount ( {"track_pending":bool,"refund_destination":"str","refund_fee":amount} )
+bridge_buildverifierset [{"algo":"str","pubkey":"hex"},...] {"required_signers":n,"targets":[{"algo":"str","pubkey":"hex"},...]}
+bridge_decodeaggregateartifactbundle "artifact_bundle_hex"
+bridge_decodeaggregatesettlement "aggregate_settlement_hex"
+bridge_decodeattestation "attestation_hex"
+bridge_decodebatchauthorization "authorization_hex"
+bridge_decodebatchcommitment "batch_commitment_hex"
+bridge_decodebatchreceipt "receipt_hex"
+bridge_decodedataartifact "data_artifact_hex"
+bridge_decodeproofadapter "proof_adapter_hex"
+bridge_decodeproofartifact "proof_artifact_hex"
+bridge_decodeproofclaim "claim_hex"
+bridge_decodeproofcompressiontarget "proof_compression_target_hex"
+bridge_decodeproofprofile "proof_profile_hex"
+bridge_decodeproofreceipt "proof_receipt_hex"
+bridge_decodeproverbenchmark "prover_benchmark_hex"
+bridge_decodeproverprofile "prover_profile_hex"
+bridge_decodeproversample "prover_sample_hex"
+bridge_decodeshieldedstateprofile "state_profile_hex"
+bridge_decodestateretentionpolicy "retention_policy_hex"
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+bridge_importpending "plan_hex" "txid" vout amount ( {"refund_destination":"str","refund_fee":amount,"recover_now":bool,"accept_plan_view_grants":bool,"allow_legacy_audit_view_grants":bool} )
+bridge_listarchive ( {"funding_txid":"hex","funding_vout":n,"completion_txid":"hex","max_archive_height":n} )
+bridge_listpending
+bridge_listproofadapters
+bridge_listprovertemplates
+Internal bug detected: Unreachable code reached (non-fatal)
+bridge_planbatchout "operator_key" "refund_key" [{"address":"str","amount":amount},...] ( {"bridge_id":"hex","operation_id":"hex","refund_lock_height":n,"genesis_hash":"hex","batch_commitment_hex":"hex"} )
+Internal bug detected: Unreachable code reached (non-fatal)
+bridge_planout "operator_key" "refund_key" "payout_address" amount ( {"bridge_id":"hex","operation_id":"hex","refund_lock_height":n,"genesis_hash":"hex","batch_commitment_hex":"hex"} )
+bridge_prunearchive {"all":bool,"max_archive_height":n,"funding_txid":"hex","funding_vout":n,"completion_txid":"hex","dry_run":bool,"force":bool}
+bridge_recoverpending ( "txid" vout force )
+bridge_signbatchauthorization "authorizer_address" "direction" {"kind":"str","wallet_id":"hex","destination_id":"hex","amount":amount,"authorization_nonce":"hex"} {"bridge_id":"hex","operation_id":"hex","algorithm":"str"}
+bridge_signbatchreceipt "attestor_address" "statement_hex" ( {"algorithm":"str"} )
+bridge_submitrebalancetx [{"l2_id":"hex","reserve_delta":amount},...] [{"address":"str","amount":amount},...] ( {"settlement_window":n,"gross_flow_commitment":"hex","authorization_digest":"hex","fee":amount} )
+bridge_submitshieldtx "plan_hex" "txid" vout amount ( {"min_fee_headroom_multiplier":n,"enforce_fee_headroom":bool,"track_pending":bool,"refund_destination":"str","refund_fee":amount,"accept_plan_view_grants":bool,"allow_legacy_audit_view_grants":bool} )
+bridge_submitunshieldtx "plan_hex" "txid" vout amount ( {"track_pending":bool,"refund_destination":"str","refund_fee":amount} )
+
+== Control ==
+getbackgroundjobs
+getgeneralinfo
+getmemoryinfo ( "mode" )
+getmininggovernorinfo
+getmodelbandwidthinfo
+getresourcegovernorinfo
+getresourcegovernorpolicy
+getrpcinfo
+getrpcwhitelist
+help ( "command" )
+logging ( ["include_category",...] ["exclude_category",...] )
+pausebackgroundwork ( duration )
+resetresourcegovernorpolicy
+resumebackgroundwork
+setresourcegovernormode "mode"
+setresourcegovernorpolicy "policy"
+stop
+uptime
+
+== Mining ==
+addmatmulattestationblocklist "pubkey"
+clearmintedattestation ( height end_height )
+listmatmulattestationblocklist
+getblocktemplate {"mode":"str","blockmaxsize":n,"blockmaxweight":n,"maxtemplatetxs":n,"blockreservedsigops":n,"blockreservedsize":n,"blockreservedweight":n,"capabilities":["str",...],"rules":["segwit","str",...],"longpollid":"str","minfeerate":n,"data":"hex"}
+getdifficultyhealth ( window_blocks )
+getmatmulattestations "blockhash"
+getmatmulattestedtip
+getmatmulattestors
+getmatmulchallenge
+getmatmulchallengeprofile ( target_solve_time_s validation_overhead_s propagation_overhead_s solver_parallelism solver_duty_cycle_pct )
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+getmatmultrustedstatus
+getmininginfo
+getnetworkhashps ( nblocks height )
+getprioritisedtransactions
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+prioritisetransaction "txid" ( priority_delta fee_delta )
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+submitblock "hexdata" ( "dummy" )
+submitheader "hexdata"
+submitmatmulattestations ["attestation",...]
+submitmatmulrefutation "refutation"
+Internal bug detected: Unreachable code reached (non-fatal)
+Internal bug detected: Unreachable code reached (non-fatal)
+
+== Network ==
+addminingpeermeshnode "node" ( persistent try_now v2transport )
+addnode "node" "command" ( v2transport "connection_type" )
+clearbanned
+disconnectnode ( "address" nodeid )
+getaddednodeinfo ( "node" )
+getaddrmaninfo
+getconnectioncount
+getminingpeermesh ( "node" )
+getnettotals
+getnetworkinfo
+getnodeaddresses ( count "network" )
+getpeerinfo
+listbanned
+ping
+refreshminingpeermesh ( include_defaults include_added v2transport )
+removeminingpeermeshnode "node" ( disconnect )
+setban "subnet" "command" ( bantime absolute )
+setnetworkactive state
+
+== Rawtransactions ==
+analyzepsbt "psbt"
+combinepsbt ["psbt",...]
+combinerawtransaction ["hexstring",...]
+converttopsbt "hexstring" ( permitsigdata iswitness )
+createpsbt [{"txid":"hex","vout":n,"sequence":n},...] [{"address":amount,...},{"data":"hex"},...] ( locktime replaceable )
+createrawtransaction [{"txid":"hex","vout":n,"sequence":n},...] [{"address":amount,...},{"data":"hex"},...] ( locktime replaceable )
+decodepsbt "psbt"
+decoderawtransaction "hexstring" ( iswitness )
+decodescript "hexstring"
+descriptorprocesspsbt "psbt" ["",{"desc":"str","range":n or [n,n]},...] ( options )
+finalizepsbt "psbt" ( extract )
+fundrawtransaction "hexstring" ( options iswitness )
+getrawtransaction "txid" ( verbosity "blockhash" )
+joinpsbts ["psbt",...]
+listmempooltransactions ( start_sequence verbose )
+sendrawtransaction "hexstring" ( maxfeerate maxburnamount ["reject_reason",...] )
+signrawtransactionwithkey "hexstring" ["privatekey",...] ( [{"txid":"hex","vout":n,"scriptPubKey":"hex","redeemScript":"hex","witnessScript":"hex","amount":amount},...] "sighashtype" )
+submitpackage ["rawtx",...] ( maxfeerate maxburnamount )
+testmempoolaccept ["rawtx",...] ( maxfeerate ["reject_reason",...] )
+utxoupdatepsbt "psbt" ( ["",{"desc":"str","range":n or [n,n]},...] ["",...] )
+
+== Shielded ==
+z_exportviewingkey "address" ( allow_sensitive )
+z_finalizepsbt "psbt" ( broadcast )
+z_fundpsbt amount ( "destination" fee {"max_inputs_per_chunk":n} )
+z_getbalance ( minconf )
+z_getnewaddress ( account )
+z_gettotalbalance ( minconf )
+z_importviewingkey "viewing_key" "kem_public_key" "address_or_spending_pk_hash" ( rescan start_height )
+z_listaddresses
+z_listreceivedbyaddress ( minconf include_watchonly )
+z_listunspent ( minconf maxconf include_watchonly include_sensitive )
+z_mergenotes ( max_notes fee )
+z_planshieldfunds amount ( "destination" fee {"max_inputs_per_chunk":n} )
+z_recoverstrandednote "commitment" ( "destination" fee verbose conf_target "estimate_mode" )
+z_revokeaddress "address" ( fee )
+z_rotateaddress "address" ( fee )
+z_sendmany [{"address":"str","amount":amount},...] ( fee ["output",...] conf_target "estimate_mode" "conflict_txid" )
+z_sendtoaddress "address" amount ( "comment" "comment_to" subtractfeefromamount fee verbose conf_target "estimate_mode" "conflict_txid" )
+z_shieldcoinbase ( "destination" fee limit conf_target "estimate_mode" )
+z_shieldfunds amount ( "destination" fee {"max_inputs_per_chunk":n} )
+z_sweeptotransparent "address" ( max_notes fee dry_run minconf conf_target "estimate_mode" )
+z_validateaddress "address"
+z_verifywalletintegrity
+z_viewtransaction "txid" ( include_sensitive )
+
+== Signer ==
+enumeratesigners
+
+== Stats ==
+getmempoolstats
+
+== Util ==
+createmultisig nrequired ["key",...] ( options )
+deriveaddresses "descriptor" ( range options )
+estimatesmartfee conf_target ( "estimate_mode" )
+getdescriptorinfo "descriptor" ( options )
+getindexinfo ( "index_name" )
+savefeeestimates
+signmessagewithprivkey "privkey" "message"
+validateaddress "address"
+verifymessage "address" "signature" "message"
+
+== Wallet ==
+abandontransaction "txid"
+abortrescan
+addmultisigaddress nrequired ["key",...] ( "options" )
+addpqmultisigaddress nrequired ["key",...] ( "label" sort )
+backupwallet "destination"
+backupwalletbundle "destination" ( "wallet_passphrase" include_viewing_keys )
+backupwalletbundlearchive "destination_archive" "archive_passphrase" ( "wallet_passphrase" include_viewing_keys )
+buildhtlcclaim "descriptor" {"txid":"hex","vout":n} "preimage" "destination" fee
+buildhtlcrefund "descriptor" {"txid":"hex","vout":n} "destination" locktime fee ( allow_non_htlc_tree )
+bumpfee "txid" ( options )
+Internal bug detected: Unreachable code reached (non-fatal)
+createexchangebatch [{"address":"str","amount":amount,"amount_atoms":n},...] ( {"change_address":"str","minconf":n,"fee_rate":amount,"fee_ceiling":amount,...} )
+createwallet "wallet_name" ( disable_private_keys blank "passphrase" avoid_reuse descriptors load_on_startup external_signer )
+createwalletdescriptor "type" ( {"internal":bool,"hdkey":"str",...} )
+deriveexchangeaddress index ( {"branch":n,"account":n,"algorithm":"str",...} )
+dumpmasterprivkey
+dumpprivkey "address"
+dumpwallet "filename"
+encryptwallet "passphrase"
+Internal bug detected: Unreachable code reached (non-fatal)
+exportlabels "filename"
+exportpqkey "address" ( "algorithm" )
+exportwalletbundle "bundle_file" ( "wallet_passphrase" birthday )
+finalizeexternalsign {} ( ["signature",{"vin":n,"index":n,"pubkey":"hex","signature":"hex","algorithm":"str"},...] {"sign":bool,...} )
+getaddressesbylabel "label"
+getaddressinfo "address"
+getbalance ( "dummy" minconf include_watchonly avoid_reuse )
+getbalances
+getdepositstatus "txid" ( vout )
+getexchangereadiness
+gethdkeys ( {"active_only":bool,"private":bool,...} )
+getnewaddress ( "label" "address_type" )
+getrawchangeaddress ( "address_type" )
+getreceivedbyaddress "address" ( minconf include_immature_coinbase )
+getreceivedbylabel "label" ( minconf include_immature_coinbase )
+getsigningdigests {}
+gettransaction "txid" ( include_watchonly verbose )
+getunconfirmedbalance
+getwalletinfo
+importaddress "address" ( "label" rescan p2sh )
+importdepositpool ["",{"index":n,"address":"str","pubkey":"hex","pubkey_slh":"hex","label":"str","branch":n},...] ( {"rescan":bool,...} )
+importdescriptors requests ( seeds pq_master_seeds )
+importlabels "filename"
+importmulti requests ( options )
+importprivkey "privkey" ( "label" rescan )
+importprunedfunds "rawtransaction" "txoutproof"
+importpubkey "pubkey" ( "label" rescan )
+importwallet "filename"
+importwalletbundle "bundle_file" ( rescan )
+keypoolrefill ( newsize )
+listaddressgroupings
+listdepositutxos ( {"minconf":n,"min_confirmations":n,"maxconf":n,"min_amount":amount,"include_spent":bool,"include_change":bool,...} )
+listdescriptors ( private )
+listlabels ( "purpose" )
+listlockunspent
+listreceivedbyaddress ( minconf include_empty include_watchonly "address_filter" include_immature_coinbase )
+listreceivedbylabel ( minconf include_empty include_watchonly include_immature_coinbase )
+listsinceblock ( "blockhash" target_confirmations include_watchonly include_removed include_change "label" )
+listtransactions ( "label" count skip include_watchonly )
+listunspent ( minconf maxconf ["address",...] include_unsafe query_options )
+listwalletdir
+listwallets
+loadwallet "filename" ( load_on_startup )
+lockunspent unlock ( [{"txid":"hex","vout":n},...] persistent )
+migratewallet ( "wallet_name" "passphrase" )
+newkeypool
+planconsolidation ( {"minconf":n,"min_confirmations":n,"max_inputs":n,"batch_size":n,"target_utxo_count":n,"fee_ceiling":amount,"minimum_input_value":amount,...} )
+prepareexternalsign {} ( {"sign":bool,"change_address":"str",...} )
+psbtbumpfee "txid" ( options )
+removeprunedfunds "txid"
+rescanblockchain ( start_height stop_height )
+restorewallet "wallet_name" "backup_file" ( load_on_startup )
+restorewalletbundle "wallet_name" "bundle_file" ( load_on_startup rescan "wallet_passphrase" )
+restorewalletbundlearchive "wallet_name" "archive_file" "archive_passphrase" ( load_on_startup )
+send [{"address":amount,...},{"data":"hex"},...] ( conf_target "estimate_mode" fee_rate options )
+sendall ["address",{"address":amount,...},...] ( conf_target "estimate_mode" fee_rate options )
+sendmany ( "" ) {"address":amount,...} ( minconf "comment" ["address",...] replaceable conf_target "estimate_mode" fee_rate verbose )
+sendtoaddress "address" amount ( "comment" "comment_to" subtractfeefromamount replaceable conf_target "estimate_mode" avoid_reuse fee_rate verbose )
+setfeerate amount
+sethdseed ( newkeypool "seed" )
+setlabel "address" "label"
+settxfee amount
+setwalletflag "flag" ( value )
+signmessage "address" "message"
+signrawtransactionwithwallet "hexstring" ( [{"txid":"hex","vout":n,"scriptPubKey":"hex","redeemScript":"hex","witnessScript":"hex","amount":amount},...] "sighashtype" )
+simulaterawtransaction ( ["rawtx",...] {"include_watchonly":bool,...} )
+sweepprivkeys options
+sweeptoself ( options )
+unloadwallet ( "wallet_name" load_on_startup )
+upgradewallet ( version )
+walletcreatefundedpsbt ( [{"txid":"hex","vout":n,"sequence":n,"weight":n},...] ) [{"address":amount,...},{"data":"hex"},...] ( locktime options bip32derivs )
+walletdisplayaddress "address"
+walletlock
+walletpassphrase "passphrase" timeout
+walletpassphrasechange "oldpassphrase" "newpassphrase"
+walletprocesspsbt "psbt" ( options )
+
+== Zmq ==
+getzmqnotifications

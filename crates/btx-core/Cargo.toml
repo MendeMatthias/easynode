@@ -27,6 +27,16 @@ async-trait = "0.1"
 # Verify the assumeutxo snapshot's SHA-256 before the (expensive) loadtxoutset,
 # so a corrupt/partial download fails fast with a clear message.
 sha2 = "0.10"
+# The signer role (crates/btx-core/src/signer.rs): generate one secp256k1 key,
+# encode it as the WIF the engine reads, derive the public key the operator
+# shows. Pure Rust on purpose: this crate builds on three CI runners with no C
+# toolchain assumptions, and a signing key is not the place for a build script.
+k256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa", "std"] }
+bs58 = { version = "0.5", features = ["check"] }
+# Wipe a private key read from disk once its public half is derived
+# (`btx-confirmer` without `--pubkey`). Already in the tree through k256.
+zeroize = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }
 # Cross-platform home/data dir resolution (resolves %APPDATA% on Windows).
 dirs = "5"
 libc = "0.2"

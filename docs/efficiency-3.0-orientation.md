@@ -71,6 +71,8 @@ Every easyNode, every ten minutes, on the existing status refresher:
   answered bodies this run AND are on the consent list (`nodes.json` entries
   with `seed: true`, or the shipped seed list). Never a community node's
   address: the anonymity model stays.
+  (Since EasyBTX#552, 2026-10-01: the public feed carries only `livePeerCount`;
+  the addresses are in the signed-in members tier.)
 - The feed already carries `chains` and `nodes`; the page gains a "Pools"
   line in the chain box and the app reads the same JSON.
 

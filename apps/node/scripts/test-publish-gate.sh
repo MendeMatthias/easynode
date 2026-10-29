@@ -63,6 +63,17 @@ run
 grep -q "BTX-Node_${VER}_aarch64.app.tar.gz is not listed in SHA256SUMS" "$T/out" || { echo "FAIL: unlisted asset not caught"; cat "$T/out"; exit 1; }
 echo "   pass"
 
+echo "== a .deb with no .sig: refused, like every build the updater serves =="
+# Since 0.7.0 a .deb install updates itself from node-deb.json, so the .deb
+# is served by the updater like the AppImage and must carry its signature.
+printf 'deb bytes' > "$A/BTX-Node_${VER}_amd64.deb"
+run
+grep -q "error: BTX-Node_${VER}_amd64.deb has no BTX-Node_${VER}_amd64.deb.sig" "$T/out" || { echo "FAIL: an unsigned .deb was not refused"; cat "$T/out"; exit 1; }
+printf 'sig' > "$A/BTX-Node_${VER}_amd64.deb.sig"
+run
+grep -q "amd64.deb has no" "$T/out" && { echo "FAIL: a signed .deb was refused for a missing .sig"; cat "$T/out"; exit 1; }
+echo "   pass"
+
 echo "== the box's own node on a fork: refused before any asset is read =="
 observer_row FORK
 run

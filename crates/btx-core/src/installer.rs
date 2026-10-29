@@ -123,6 +123,10 @@ retainshieldedcommitmentindex=1
 # counts, and the fork detector in the app says out loud when a longer chain
 # exists that the node cannot obtain. The warn depth stays: a deep reorg is
 # still worth a log line. docs/incident-2026-09-05-fork.md has both days.
+# Engine 0.34.12 and newer refuse parkdeepreorg=0 under their default
+# reorgpolicy=bounded, so the app also passes -reorgpolicy=legacy to them,
+# which honours this line. It is not written here: the app states it only to
+# an engine that has the option.
 parkdeepreorg=0
 maxreorgdepthwarn=3
 ";
@@ -160,7 +164,8 @@ retainshieldedcommitmentindex=1
 # Serve signed confirmations — the point of the profile.
 matmulattestationserve=1
 # Deep-reorg parking OFF, same posture and same reason as the full-node preset
-# (the 2026-09-05 split; see NODE_FASTSTART_CONF).
+# (the 2026-09-05 split; see NODE_FASTSTART_CONF), and on engine 0.34.12 and
+# newer the app adds -reorgpolicy=legacy on the command line beside it.
 parkdeepreorg=0
 maxreorgdepthwarn=3
 ";
@@ -310,7 +315,10 @@ pub fn provision_from_bundle(
     std::fs::create_dir_all(&faststart_dir)
         .map_err(|e| AppError::Process(format!("create faststart dir: {e}")))?;
     let conf_path = faststart_dir.join("faststart.conf");
-    std::fs::write(&conf_path, MINER_FASTSTART_CONF)
+    // Atomic for the same reason as the node path above: a half-written
+    // faststart.conf is worse than no faststart.conf, because btxd starts
+    // happily on an empty one.
+    crate::fsx::atomic_write(&conf_path, MINER_FASTSTART_CONF.as_bytes())
         .map_err(|e| AppError::Process(format!("write faststart.conf: {e}")))?;
 
     Ok(FaststartResult {
@@ -742,6 +750,68 @@ fn is_macho(path: &Path) -> bool {
 /// Follows the package layout as-is; symlinks are copied as their target's
 /// contents (std::fs::copy semantics), which is fine for BTX release trees
 /// (they contain none).
+/// Copy one file over another by REPLACING the directory entry, never by
+/// truncating the file that is there.
+///
+/// WHY THIS IS NOT `std::fs::copy`. `fs::copy` opens the destination with
+/// `File::create` semantics: O_TRUNC on the EXISTING inode. If a process is
+/// executing that inode — and on the engine-upgrade path one very often is,
+/// because provisioning runs at the top of `start_node_inner`, hundreds of
+/// lines before anything asks whether a node is running — then:
+///
+///   * on macOS the kernel kills the running process the next time a modified
+///     page faults, so btxd dies UNCLEANLY mid-write. That is precisely the
+///     unclean-shutdown path the whole `prune=0` design exists to survive, and
+///     on a pruned keeper the shielded rebuild that follows cannot read the
+///     blocks it needs at all;
+///   * on Linux `open(O_WRONLY)` on a running ELF returns ETXTBSY, so the copy
+///     fails, provisioning returns Err, and the app silently falls back to the
+///     previous tag — an engine downgrade nobody asked for, at the moment of a
+///     flag day.
+///
+/// A rename replaces the directory ENTRY. The running process keeps its own
+/// inode, which lives until it exits, and the next exec picks up the new file.
+/// That is the standard way to replace a binary that may be in use.
+fn replace_file(from: &Path, to: &Path) -> AppResult<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let dir = to.parent().unwrap_or_else(|| Path::new("."));
+    let name = to
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tmp".to_string());
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.{}.{n}.new", std::process::id()));
+
+    // Copy into a NEW inode beside the target, so a failure here never touches
+    // what is already installed and running.
+    std::fs::copy(from, &tmp)
+        .map_err(|e| AppError::Process(format!("copy {} -> staging: {e}", from.display())))?;
+
+    match std::fs::rename(&tmp, to) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Windows refuses to rename over a file that is open for execution.
+            // Move the old entry aside first, then put the new one in place and
+            // delete the displaced one best-effort (Windows allows deleting a
+            // running image's renamed entry; it disappears once it exits).
+            let displaced = dir.join(format!(".{name}.{}.{n}.old", std::process::id()));
+            let moved_aside = std::fs::rename(to, &displaced).is_ok();
+            let result = std::fs::rename(&tmp, to)
+                .map_err(|e| AppError::Process(format!("install {}: {e}", to.display())));
+            if result.is_err() && moved_aside {
+                // Put it back rather than leaving a hole where a binary was.
+                let _ = std::fs::rename(&displaced, to);
+            } else if moved_aside {
+                let _ = std::fs::remove_file(&displaced);
+            }
+            let _ = std::fs::remove_file(&tmp);
+            result
+        }
+    }
+}
+
 fn copy_tree(src: &Path, dst: &Path) -> AppResult<()> {
     std::fs::create_dir_all(dst)
         .map_err(|e| AppError::Process(format!("create dir {}: {e}", dst.display())))?;
@@ -753,8 +823,7 @@ fn copy_tree(src: &Path, dst: &Path) -> AppResult<()> {
         if from.is_dir() {
             copy_tree(&from, &to)?;
         } else {
-            std::fs::copy(&from, &to)
-                .map_err(|e| AppError::Process(format!("copy {}: {e}", from.display())))?;
+            replace_file(&from, &to)?;
         }
     }
     Ok(())
@@ -933,7 +1002,19 @@ pub fn provision_node_package(
     std::fs::create_dir_all(&faststart_dir)
         .map_err(|e| AppError::Process(format!("create faststart dir: {e}")))?;
     let conf_path = faststart_dir.join("faststart.conf");
-    std::fs::write(&conf_path, conf_contents)
+    // ATOMIC, like every other writer of this file. `std::fs::write` is
+    // open + O_TRUNC + write, so the truncation is committed before the bytes
+    // are: a write that fails partway leaves faststart.conf at ZERO LENGTH.
+    // The caller treats a failed provision as recoverable and falls back to the
+    // previous tag, so the app then launches btxd against an empty conf — no
+    // `prune=0`, no `retainshieldedcommitmentindex=1`, silently, with nothing on
+    // screen. This file's own header says what that costs: on the next unclean
+    // shutdown the shielded rebuild needs historical blocks a pruned node has
+    // deleted, btxd refuses to start, and the repair path wipes the chain.
+    // `fsx`'s module doc already enumerates the writers of faststart.conf and
+    // lists four; these two were the ones it missed, and they are the only ones
+    // that replace the WHOLE file.
+    crate::fsx::atomic_write(&conf_path, conf_contents.as_bytes())
         .map_err(|e| AppError::Process(format!("write faststart.conf: {e}")))?;
 
     Ok(FaststartResult {
@@ -971,6 +1052,65 @@ fn expected_btxd_version(bundled_pkg_dir: &Path, install_root: &Path) -> Option<
 
 #[cfg(test)]
 mod tests {
+
+    /// A RUNNING BINARY MUST SURVIVE ITS OWN UPGRADE.
+    ///
+    /// `copy_tree` used `std::fs::copy`, which is O_TRUNC on the EXISTING
+    /// inode. The engine upgrade runs at the top of `start_node_inner`, long
+    /// before anything asks whether a node is running, so it could truncate the
+    /// btxd it was about to replace while that btxd was executing — killed by
+    /// the kernel on macOS, ETXTBSY on Linux.
+    ///
+    /// A replace keeps the old inode intact: anything already holding it (an
+    /// open fd here, a running process in the real case) still reads the old
+    /// bytes, while the path resolves to the new ones.
+    #[test]
+    fn replace_file_swaps_the_entry_and_leaves_the_old_inode_readable() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("btxd");
+        std::fs::write(&target, b"OLD-ENGINE").unwrap();
+
+        // Hold the old inode open, the way a running process holds its image.
+        let mut held = std::fs::File::open(&target).unwrap();
+
+        let src = dir.path().join("new-btxd");
+        std::fs::write(&src, b"NEW-ENGINE-LONGER").unwrap();
+        replace_file(&src, &target).unwrap();
+
+        // The path now resolves to the new bytes...
+        assert_eq!(std::fs::read(&target).unwrap(), b"NEW-ENGINE-LONGER");
+        // ...while the inode the "running process" holds is untouched, which is
+        // the whole point. A truncating write would have left this empty.
+        let mut old = Vec::new();
+        held.seek(SeekFrom::Start(0)).unwrap();
+        held.read_to_end(&mut old).unwrap();
+        assert_eq!(
+            old, b"OLD-ENGINE",
+            "the old inode was truncated under a live reader"
+        );
+
+        // No staging litter left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with('.'))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staging files left behind: {leftovers:?}"
+        );
+
+        // And it works when the target does not exist yet (first install).
+        let fresh = dir.path().join("btx-cli");
+        let mut f = std::fs::File::create(dir.path().join("src-cli")).unwrap();
+        f.write_all(b"CLI").unwrap();
+        drop(f);
+        replace_file(&dir.path().join("src-cli"), &fresh).unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"CLI");
+    }
     use super::*;
     use crate::backend::CommandRunner;
     use std::process::{ExitStatus, Output};
@@ -1065,6 +1205,15 @@ mod tests {
         assert_eq!(
             release_tag_from_install_root(Path::new("/h/.local/btx/v0.33.2/mac")).as_deref(),
             Some("v0.33.2")
+        );
+        // A suffixed install key comes back whole. Provisioning only ever
+        // compares it against the binary when the package has no
+        // `.btxd-version` marker, and every staging script writes one, so the
+        // key's qualifier never reaches `btxd --version`.
+        assert_eq!(
+            release_tag_from_install_root(Path::new("/h/.local/btx/v0.34.6-3013c2c2/linux-x86_64"))
+                .as_deref(),
+            Some("v0.34.6-3013c2c2")
         );
         // No `btx/<tag>` layout → None, so provisioning skips the assert rather
         // than inventing an expectation it cannot justify.
@@ -1748,5 +1897,26 @@ mod keeper_profile_tests {
             NODE_KEEPER_CONF.contains("rpcbind=127.0.0.1"),
             "rpc stays local"
         );
+    }
+
+    /// Engine 0.34.12 and newer refuse `parkdeepreorg=0` under their default
+    /// bounded policy, and the launch answers with `-reorgpolicy=legacy` on the
+    /// command line, only to an engine that has the option
+    /// (`node::build_node_command`). The confs keep `parkdeepreorg=0`, which
+    /// legacy honours, and name no reorg policy: the launch states it in the
+    /// one layer that outranks every conf. (An older engine would not refuse
+    /// such a line; 0.34.9 logs "Ignoring unknown configuration value
+    /// reorgpolicy", measured 2026-09-30.)
+    #[test]
+    fn the_confs_keep_parking_off_and_leave_the_reorg_policy_to_the_launch() {
+        for conf in [NODE_FASTSTART_CONF, NODE_KEEPER_CONF] {
+            assert!(conf.lines().any(|l| l == "parkdeepreorg=0"), "{conf}");
+            assert!(
+                !conf
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("reorgpolicy")),
+                "{conf}"
+            );
+        }
     }
 }

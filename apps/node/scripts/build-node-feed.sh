@@ -15,8 +15,10 @@
 # Precisely: the omitted platform gets Err(TargetsNotFound) from the plugin
 # (get_urls runs before the version compare), NOT a quiet "no update available".
 # main.ts only surfaces check errors on a MANUAL check, so the automatic one is
-# silent and nothing is downloaded — but "Check now" will tell those users
-# "Couldn't check right now — are you online?". Harmless, and expected.
+# silent and nothing is downloaded. Since 0.6.20 "Check now" tells those
+# users the current release has no build for their platform (easynode #66).
+# Not harmless for OLDER copies there: they are offered nothing at all, not
+# their platform's last build (0.7.13 left every Mac below 0.7.12 so).
 #
 # The trap this avoids is the opposite move — keeping another platform's key
 # while pointing it at its OLD asset. The manifest has ONE top-level version, so
@@ -36,10 +38,13 @@
 #
 # Usage:
 #   build-node-feed.sh --version <ver> [--mac <app.tar.gz>] [--linux <.AppImage>]
-#                      [--win <-setup.exe>] [--notes "..."]
+#                      [--deb <.deb>] [--win <-setup.exe>] [--notes "..."]
 #
-#   # Linux-only release (mac + windows stay where they are):
-#   build-node-feed.sh --version 0.6.5 --linux dist/BTX-Node_0.6.5_amd64.AppImage
+#   # Linux-only release (mac + windows stay where they are). A Linux release
+#   # passes the .deb too: it is signed like the rest and goes into its OWN feed,
+#   # node-deb.json, beside latest-node.json, which only .deb installs read.
+#   build-node-feed.sh --version 0.7.0 \
+#     --linux dist/BTX-Node_0.7.0_amd64.AppImage --deb dist/BTX-Node_0.7.0_amd64.deb
 #
 #   # Full train:
 #   build-node-feed.sh --version 0.5.1 --mac a.app.tar.gz --linux b.AppImage --win c.exe
@@ -54,29 +59,34 @@
 #   1. npx tauri signer sign -f "$KEY" -p "" <artifact>      (Windows)
 #   2. minisign -V -P <pubkey> -x <decoded .sig> -m <artifact>   (WSL)
 #   3. gen-node-feed.py --version … --linux-sig <artifact>.sig
+# On a Linux release, steps 1 and 2 run for the .deb too, and step 3 also
+# passes --deb-sig BTX-Node_<ver>_amd64.deb.sig, which writes node-deb.json
+# beside --out. The .deb must be signed under that name, so sign it after
+# any rename.
 # Step 3 independently re-checks that the signature carries the key id baked
 # into tauri.conf.json, so a wrong key still cannot reach the feed.
 set -euo pipefail
 
-VERSION="" ; MAC_TGZ="" ; LINUX_APPIMAGE="" ; WIN_SETUP="" ; NOTES=""
+VERSION="" ; MAC_TGZ="" ; LINUX_APPIMAGE="" ; LINUX_DEB="" ; WIN_SETUP="" ; NOTES=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) VERSION="${2:?}" ; shift 2 ;;
     --mac)     MAC_TGZ="${2:?}" ; shift 2 ;;
     --linux)   LINUX_APPIMAGE="${2:?}" ; shift 2 ;;
+    --deb)     LINUX_DEB="${2:?}" ; shift 2 ;;
     --win)     WIN_SETUP="${2:?}" ; shift 2 ;;
     --notes)   NOTES="${2:?}" ; shift 2 ;;
-    -h|--help) sed -n '1,40p' "$0" ; exit 0 ;;
+    -h|--help) sed -n '1,45p' "$0" ; exit 0 ;;
     *) echo "unknown argument: $1" >&2
-       echo "usage: $0 --version <ver> [--mac <f>] [--linux <f>] [--win <f>] [--notes <s>]" >&2
+       echo "usage: $0 --version <ver> [--mac <f>] [--linux <f>] [--deb <f>] [--win <f>] [--notes <s>]" >&2
        exit 1 ;;
   esac
 done
 
 [ -n "$VERSION" ] || { echo "--version is required (e.g. --version 0.6.5)" >&2; exit 1; }
-if [ -z "$MAC_TGZ" ] && [ -z "$LINUX_APPIMAGE" ] && [ -z "$WIN_SETUP" ]; then
-  echo "need at least one of --mac / --linux / --win — a feed with no platforms" >&2
-  echo "offers nothing to anyone." >&2
+if [ -z "$MAC_TGZ" ] && [ -z "$LINUX_APPIMAGE" ] && [ -z "$LINUX_DEB" ] && [ -z "$WIN_SETUP" ]; then
+  echo "need at least one of --mac / --linux / --deb / --win: a feed with no" >&2
+  echo "platforms offers nothing to anyone." >&2
   exit 1
 fi
 NOTES="${NOTES:-BTX Node ${VERSION}. See https://easybtx.com/node}"
@@ -141,7 +151,7 @@ fi
 
 # Every artifact must exist before we sign anything, so a typo fails in a second
 # rather than after signing half the release.
-for f in "$MAC_TGZ" "$LINUX_APPIMAGE" "$WIN_SETUP"; do
+for f in "$MAC_TGZ" "$LINUX_APPIMAGE" "$LINUX_DEB" "$WIN_SETUP"; do
   [ -z "$f" ] && continue
   [ -f "$f" ] || { echo "no such file: $f" >&2; exit 1; }
 done
@@ -192,32 +202,54 @@ expect_name() {
 }
 [ -n "$MAC_TGZ" ]        && expect_name "$MAC_TGZ"        "BTX-Node_${VERSION}_aarch64.app.tar.gz"
 [ -n "$LINUX_APPIMAGE" ] && expect_name "$LINUX_APPIMAGE" "BTX-Node_${VERSION}_amd64.AppImage"
+[ -n "$LINUX_DEB" ]      && expect_name "$LINUX_DEB"      "BTX-Node_${VERSION}_amd64.deb"
 [ -n "$WIN_SETUP" ]      && expect_name "$WIN_SETUP"      "BTX-Node_${VERSION}_x64-setup.exe"
 
-# Mac .app.tar.gz.sig is produced by the build; only sign it if it's missing.
+# The mac build signs its tarball itself, but under the bundler's name,
+# "easyBTX Node.app.tar.gz", and a signature carries the name it was made under
+# in its signed comment. easyNode 0.6.31 and later refuse an update signed
+# under any name but its release name (update_binding.rs), and a .sig renamed
+# along with the tarball still carries the old one. This used to sign only when
+# no .sig was there, so the renamed one went through untouched and the release
+# failed at verify with advice to run this script. So the tarball is always
+# signed here, under the name it has now, whatever .sig sits beside it.
 if [ -n "$MAC_TGZ" ]; then
-  [ -f "${MAC_TGZ}.sig" ] || sign "$MAC_TGZ"
+  rm -f "${MAC_TGZ}.sig"
+  sign "$MAC_TGZ"
   verify "$MAC_TGZ"
 fi
 if [ -n "$LINUX_APPIMAGE" ]; then sign "$LINUX_APPIMAGE"; verify "$LINUX_APPIMAGE"; fi
+if [ -n "$LINUX_DEB" ]; then sign "$LINUX_DEB"; verify "$LINUX_DEB"; fi
 if [ -n "$WIN_SETUP" ]; then sign "$WIN_SETUP"; verify "$WIN_SETUP"; fi
 
 mkdir -p "$OUT_DIR"
 ARGS=(--version "$VERSION" --tag "$TAG")
 [ -n "$MAC_TGZ" ]        && ARGS+=(--mac-sig   "${MAC_TGZ}.sig")
 [ -n "$LINUX_APPIMAGE" ] && ARGS+=(--linux-sig "${LINUX_APPIMAGE}.sig")
+# The .deb's entry goes to node-deb.json beside --out, never into
+# latest-node.json: gen-node-feed.py refuses that, because easyNode 0.6.32
+# refuses a whole release that lists a key it does not know.
+[ -n "$LINUX_DEB" ]      && ARGS+=(--deb-sig   "${LINUX_DEB}.sig")
 [ -n "$WIN_SETUP" ]      && ARGS+=(--win-sig   "${WIN_SETUP}.sig")
 python3 "$HERE/gen-node-feed.py" "${ARGS[@]}" \
   --notes "$NOTES" --pub-date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --out "$OUT_DIR/latest-node.json"
 
 echo
-echo "feed written to $OUT_DIR/latest-node.json — every signature in it was"
-echo "verified against the app key."
+if [ -n "$MAC_TGZ" ] || [ -n "$LINUX_APPIMAGE" ] || [ -n "$WIN_SETUP" ]; then
+  echo "feed written to $OUT_DIR/latest-node.json: every signature in it was"
+  echo "verified against the app key."
+fi
+if [ -n "$LINUX_DEB" ]; then
+  echo "feed written to $OUT_DIR/node-deb.json (the .deb only, verified the same"
+  echo "way). The site PR deploys it together with latest-node.json."
+fi
 echo "Release-asset names the feed expects on $TAG:"
 [ -n "$MAC_TGZ" ]        && echo "  BTX-Node_${VERSION}_aarch64.app.tar.gz   (= $MAC_TGZ)"
 [ -n "$LINUX_APPIMAGE" ] && echo "  BTX-Node_${VERSION}_amd64.AppImage       (= $LINUX_APPIMAGE)"
+[ -n "$LINUX_DEB" ]      && echo "  BTX-Node_${VERSION}_amd64.deb            (= $LINUX_DEB)"
 [ -n "$WIN_SETUP" ]      && echo "  BTX-Node_${VERSION}_x64-setup.exe        (= $WIN_SETUP)"
 echo
-echo "Those assets MUST be attached to $TAG before the feed goes live."
+echo "Those assets, and every .sig beside them, MUST be attached to $TAG before"
+echo "the feed goes live."
 exit 0

@@ -1,12 +1,21 @@
 # easyNode
 
-> **Status, 2026-09-05.** Our nodes — the project's validator, the official
-> seeds and the explorer we linked — are on a **minority fork** since height
-> 210496, and 0.6.18 shipped that morning saying "follows the live chain". What
-> happened, what "fixed" means, and where you can help are in
-> [issue #35](https://github.com/MendeMatthias/easynode/issues/35); the raw facts
-> are in [`docs/incident-2026-09-05-fork.md`](docs/incident-2026-09-05-fork.md).
-> This note comes down when #35 closes.
+> **September 2026.** Our nodes spent twenty hours on a minority fork from
+> height 210496, and 0.6.18 shipped that morning saying "follows the live
+> chain". Both incident write-ups are kept, unedited, with the numbers and the
+> wrong turns left in:
+> [`docs/incident-2026-09-05-fork.md`](docs/incident-2026-09-05-fork.md) and
+> [`docs/incident-2026-09-06-bodyless-tower.md`](docs/incident-2026-09-06-bodyless-tower.md),
+> the day after, when every number said "split" and it was not one. What they
+> cost is in the releases since: 0.6.19 detects a chain it cannot obtain,
+> 0.6.20 lets any node witness a fork for a wallet, and 0.6.21 fixed the peering
+> underneath it — the app was naming eleven peers for the engine's eight manual
+> slots, so three were never dialled at all.
+>
+> One cause is still upstream and not ours to fix: the engine refuses a
+> live-chain node as a body source and then bans it for asking about its own
+> chain (btxchain/btx#142). Tracked in
+> [#38](https://github.com/MendeMatthias/easynode/issues/38).
 
 **Run a real BTX node from home, on the machine you already own.**
 
@@ -35,12 +44,13 @@ returns 200.
 The app updates itself from there afterwards, and will only ever install a build
 signed by the release key.
 
-> **On Linux, pick the `.AppImage` if you want automatic updates.** The updater
-> can replace an AppImage in place; it cannot replace a `.deb`, because the
-> installed files live under `/usr` and belong to root. A `.deb` install is a
-> perfectly good node — it just tells you when a new version exists and leaves
-> the install to you and `dpkg`. That is a real difference between the two
-> downloads, so it is said here rather than discovered later.
+> **On Linux, both downloads can update themselves, in different ways.** The
+> `.AppImage` replaces itself in place without asking. A `.deb` install, from
+> 0.7.0 on, installs the new `.deb` after asking for your password once,
+> because its files live under `/usr` and belong to root. On a machine with no
+> desktop to show that prompt, a `.deb` copy tries once, then shows the command
+> to install it by hand with `apt`, and it does the same for each new version.
+> A `.deb` copy older than 0.7.0 moves to 0.7.0 by hand once.
 
 > ⚠ **Do not use the "Latest" button on the releases repo.**
 > [EasyBTX-releases](https://github.com/MendeMatthias/EasyBTX-releases) hosts
@@ -243,22 +253,36 @@ npm run tauri build           # package it
 itself, so a user does not need Homebrew or a package manager, and that tree is
 about 25 MB of binaries which do not belong in a source repository. The script
 fetches them from the public upstream release, verifies the SHA-256 against the
-signed sums, and stages them into `src-tauri/resources/node-pkg/`. Without it
+release's sums, and stages them into `src-tauri/resources/node-pkg/`. Without it
 `tauri build` fails with `glob pattern resources/node-pkg/**/* path not found`,
 because `tauri.conf.json` declares that directory as a bundle resource.
 
-The staged engine is BTX v0.34.6, matching `NODE_RELEASE_TAG` in
-`src-tauri/src/commands.rs`. **Upstream has not tagged 0.34.6**: since 0.6.18 the
-pin names a commit (`NODE_RELEASE_COMMIT`, `9eb4e005` on `release/0.34.6`) and
-there is no upstream tarball for it, so the download-based staging scripts
-(`stage-node-pkg.sh`, `stage-node-pkg-linux.sh`) refuse with "this staging
-script and the engine pin disagree", which is them working. Until upstream tags
-it, the contributor path IS the source path below: build btxd at that commit and
-stage it with the `-source` script for your platform. Those two must agree: the app installs the bundled
-package into a directory named after the tag and then checks that the binary
-reports that version, so a mismatch fails first-run setup rather than quietly
-running the wrong engine. The script writes a `.btxd-version` marker recording
-what it actually staged.
+The staged engine is BTX v0.34.15: upstream's tag `v0.34.15` at commit
+`476f3f23` (tagged 2026-10-06). The app installs it under the key
+`NODE_RELEASE_TAG` = `v0.34.15` in `src-tauri/src/commands.rs`, with the commit
+beside it as `NODE_RELEASE_COMMIT`. It moved from `v0.34.12` in 0.7.8 because
+mainnet block 244,000 switched on three consensus checks 0.34.12 does not have;
+`commands.rs` has the reasoning beside the pin. No install ever used
+`v0.34.15`, so the bare tag is enough to make every install re-provision, which
+is the only moment the app does. The release engine is a source build with
+`-DWITH_MODELNET=OFF`: 0.34.7
+turned upstream's Native Model Network on by default, and it needs OpenSSL 3.5
+and starts a `btx-modeld` helper the app has no use for.
+
+The download-based staging scripts (`stage-node-pkg.sh`,
+`stage-node-pkg-linux.sh`) fetch upstream's v0.34.15 archives. That release publishes no
+`SHA256SUMS`, so the scripts pin GitHub's asset digests, which equal the hashes
+upstream lists on its PR 223: bytes rather than a signature. Upstream builds those archives with the model network ON, so
+the scripts drop its seven helpers (`btx-modeld` and friends) and btxd logs the
+helper as missing and carries on as a monetary node. Upstream's Linux binaries
+need glibc 2.38, so on Linux the contributor path that matters is the source
+path below: build btxd at that commit and stage it with the `-source` script
+for your platform. Those two must agree: the app installs the bundled package
+into a directory named after the key and then checks that the binary reports
+the version the package declares in its `.btxd-version` marker (the version
+part of the key, `v0.34.15`), so a mismatch fails first-run setup rather than
+quietly running the wrong engine. The script writes that marker from what it
+actually staged.
 
 Verified on a Mac with no Homebrew installed: v0.34.5 links no Homebrew
 libraries, so staging needs nothing beyond the standard toolchain. Earlier
@@ -288,13 +312,15 @@ version, the gates — is "Rebuilding the Linux release from nothing" in
 on an Ubuntu 22.04 box for 0.6.15 through 0.6.18.
 
 ```bash
-# 1. build btxd from a PRISTINE checkout of btxchain/btx at the pinned ref:
-#    the tag, or for an untagged pin the NODE_RELEASE_COMMIT commit
-#    (0.6.18: 9eb4e0050e08ea3ef768bac276dac9cbd2e84542). The recipe has the
-#    exact cmake flags and the CUDA requirement.
+# 1. build btxd from a PRISTINE checkout of btxchain/btx at the pinned ref,
+#    which is NODE_RELEASE_COMMIT (476f3f23e15228bb3e6119ed1e139a9b25424ce8,
+#    upstream's tag v0.34.15; `engine_pin_ref apps/node` prints it). The recipe
+#    has the exact cmake flags, -DWITH_MODELNET=OFF included, and the CUDA
+#    requirement.
 # 2. stage what you built, instead of stage-node-pkg.sh; the second argument
-#    is the version btxd will REPORT, which is the tag name:
-./scripts/stage-node-pkg-linux-source.sh ~/btx/build v0.34.6
+#    is the version btxd will REPORT: the install key without any -suffix.
+#    Omit it and the script derives the same value from the pin.
+./scripts/stage-node-pkg-linux-source.sh ~/btx/build v0.34.15
 # 3. then the usual npm ci && npm run tauri build
 ```
 
@@ -338,6 +364,12 @@ because "open source" is often read as "no control anywhere".
 - **The signing key governs updates.** Only builds signed by the release key are
   installed by the in-app updater. A fork cannot push an update to anybody
   running this app.
+
+## Community
+
+Questions, ideas, or just want to meet other people running BTX? Join the
+official BTX community group on Telegram:
+[BTX Community (Telegram)](https://t.me/BTX_COMMUNITY_ENTRY).
 
 ## Contributing
 

@@ -3,7 +3,7 @@ use crate::rpc::Rpc;
 use serde::Deserialize;
 use serde_json::json;
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 pub struct BlockchainInfo {
     pub blocks: u64,
     #[serde(default)]
@@ -47,6 +47,62 @@ pub struct BlockchainInfo {
     /// zero means "not reported" as much as it means "caught up".
     #[serde(rename = "behind_best_header", default)]
     pub behind_best_header: u64,
+    /// btxd's standing warnings, in its own words. [`crate::engine_warnings`]
+    /// turns them into sentences a person can act on.
+    ///
+    /// An ARRAY of strings on v0.34.x, or ONE string (every warning joined by a
+    /// newline, "" for none) on a node started with `-deprecatedrpc=warnings`,
+    /// which a hand-edited btx.conf can set. Both decode to the same list.
+    ///
+    /// Decoding this field can never fail the whole call: a shape nobody
+    /// anticipated decodes to an empty list. Losing the warnings is a small
+    /// loss; losing `getblockchaininfo` blinds the refresher to everything.
+    #[serde(default, deserialize_with = "warnings_in_any_shape")]
+    pub warnings: Vec<String>,
+    /// `matmul_signed_frontier`: the highest height a pinned key signed, and
+    /// whether it is on this node's chain. Present on a node that pins a key
+    /// (v0.34.15, measured on btxscan's btxd2 on 2026-10-11). The third
+    /// witness of [`BlockchainInfo::network_height`]. Like the warnings, a
+    /// shape nobody anticipated decodes to `None` and never fails the call.
+    #[serde(
+        rename = "matmul_signed_frontier",
+        default,
+        deserialize_with = "frontier_in_any_shape"
+    )]
+    pub signed_frontier: Option<AttestedTip>,
+}
+
+/// See [`BlockchainInfo::signed_frontier`].
+fn frontier_in_any_shape<'de, D>(d: D) -> Result<Option<AttestedTip>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.is_object()
+        .then(|| serde_json::from_value::<AttestedTip>(v).ok())
+        .flatten())
+}
+
+/// See [`BlockchainInfo::warnings`]. Non-string array entries and blank lines
+/// are dropped rather than rejected.
+fn warnings_in_any_shape<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    let lines: Vec<String> = match v {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|i| i.as_str().map(str::to_string))
+            .collect(),
+        serde_json::Value::String(joined) => joined.split('\n').map(str::to_string).collect(),
+        _ => Vec::new(),
+    };
+    Ok(lines
+        .into_iter()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
 }
 
 impl BlockchainInfo {
@@ -64,6 +120,19 @@ impl BlockchainInfo {
     /// that, which is the slow, honest signal.
     pub fn tip_unsafe_to_act_on(&self) -> bool {
         self.is_stale || self.behind_best_header > 0
+    }
+
+    /// How high the chain this node is on reaches: `blocks`, `headers` and
+    /// the signed frontier when it is on this chain, whichever is highest
+    /// ([`crate::network_height`]). What every "blocks behind" reader uses
+    /// since 0.7.11, because after mainnet block 244,000 `headers` alone
+    /// stays near `blocks` while a node catches up.
+    pub fn network_height(&self) -> u64 {
+        crate::network_height::network_height(
+            self.blocks,
+            self.headers,
+            self.signed_frontier.as_ref(),
+        )
     }
 }
 
@@ -188,6 +257,140 @@ impl ChainStates {
             .map(|c| c.blocks >= min_snapshot_height)
             .unwrap_or(false)
     }
+
+    /// The snapshot block's hash while the history below it is still being
+    /// checked, or `None` once the check is done or on a node that never
+    /// loaded a snapshot. The engine keeps `validated` false on the snapshot
+    /// chainstate until its background chainstate reaches the base; then it
+    /// drops the background one, and after a restart the snapshot chainstate
+    /// is an ordinary one with no snapshot hash at all.
+    pub fn unchecked_snapshot_base(&self) -> Option<&str> {
+        self.snapshot()
+            .filter(|s| !s.validated)
+            .and_then(|s| s.snapshot_blockhash.as_deref())
+    }
+}
+
+/// How far a node that started from a snapshot has got checking the history
+/// below it. The engine re-checks every block from 0 up to the snapshot's own
+/// height in a background chainstate; until it gets there, that older history
+/// rests on the snapshot. The status screen shows this as one line and a thin
+/// bar (`NodeStatusInfo.history_check`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct HistoryCheck {
+    /// The highest block the background check has reached.
+    pub checked: u64,
+    /// The snapshot's own height, where the check ends. Read from the
+    /// snapshot block's header ([`get_block_height`]), never the compiled
+    /// start point: a node on the 225,927 snapshot checks up to 225,927, not
+    /// 219,000.
+    pub base: u64,
+}
+
+/// The history check from one `getchainstates` answer and the snapshot's own
+/// height (`base_height`, read once per snapshot with [`get_block_height`]).
+///
+/// `None` when there is nothing to show: no snapshot, a finished check, no
+/// background chainstate in the answer, or a base not read yet. The line then
+/// stays hidden rather than guessing a base, because a wrong base is how a bar
+/// reaches 100% on a check that is not done.
+pub fn history_check(chainstates: &ChainStates, base_height: Option<u64>) -> Option<HistoryCheck> {
+    chainstates.unchecked_snapshot_base()?;
+    let background = chainstates.chainstates.iter().find(|c| !c.is_snapshot())?;
+    let base = base_height.filter(|b| *b > 0)?;
+    Some(HistoryCheck {
+        checked: background.blocks.min(base),
+        base,
+    })
+}
+
+/// A block's height, from its header. The history check reads the snapshot
+/// block's height this way, once per snapshot.
+pub async fn get_block_height(rpc: &dyn Rpc, hash: &str) -> AppResult<u64> {
+    let v = rpc.call("getblockheader", json!([hash, true])).await?;
+    v.get("height")
+        .and_then(|h| h.as_u64())
+        .ok_or_else(|| crate::error::AppError::Decode(format!("getblockheader: no height in {v}")))
+}
+
+/// The history check as the refresher keeps it between ticks and the status
+/// reads it (`NodeStatusInfo.history_check` and the role sentence).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HistoryProgress {
+    /// The last `getchainstates` answer carried a snapshot whose older history
+    /// is still being checked ([`ChainStates::unchecked_snapshot_base`]).
+    /// Known from the first answer, before the snapshot's own height has been
+    /// read: the role sentence needs only this.
+    pub unchecked: bool,
+    /// How far the check has got, once the snapshot's own height is known
+    /// ([`history_check`]). The line and the bar need this.
+    pub check: Option<HistoryCheck>,
+}
+
+/// What the refresher remembers about the snapshot's own height between
+/// ticks ([`refresh_history_check`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistoryBase {
+    /// The snapshot block's hash and its height, once read from its header.
+    read: Option<(String, u64)>,
+    /// The snapshot whose failed header read has been logged. The read is
+    /// tried again every tick, and a failure that keeps happening is one line
+    /// in the log per snapshot, not one every three seconds.
+    failure_logged: Option<String>,
+}
+
+impl HistoryBase {
+    /// Whether a failed read of `hash`'s header is worth a log line: true the
+    /// first time for each snapshot, false after.
+    fn first_failure(&mut self, hash: &str) -> bool {
+        if self.failure_logged.as_deref() == Some(hash) {
+            return false;
+        }
+        self.failure_logged = Some(hash.to_string());
+        true
+    }
+}
+
+/// One refresher tick of the history check, from this tick's `getchainstates`
+/// answer and the last tick's result.
+///
+/// A failed `getchainstates` keeps `previous`: one lost call is not the check
+/// finishing. Otherwise the snapshot block's height is read from its header
+/// the first time a snapshot is seen and kept in `base`, so every later tick
+/// costs no extra call, and a different snapshot is read afresh. A failed
+/// header read leaves the height unknown and the line hidden, is tried again
+/// on the next tick, and is logged once per snapshot. `unchecked` does not
+/// wait for the height.
+pub async fn refresh_history_check(
+    rpc: &dyn Rpc,
+    chainstates: &AppResult<ChainStates>,
+    base: &mut HistoryBase,
+    previous: HistoryProgress,
+) -> HistoryProgress {
+    let Ok(chainstates) = chainstates else {
+        return previous;
+    };
+    let Some(hash) = chainstates.unchecked_snapshot_base() else {
+        return HistoryProgress::default();
+    };
+    if base.read.as_ref().map(|(h, _)| h.as_str()) != Some(hash) {
+        base.read = match get_block_height(rpc, hash).await {
+            Ok(height) => Some((hash.to_string(), height)),
+            Err(e) => {
+                if base.first_failure(hash) {
+                    eprintln!(
+                        "[history-check] couldn't read the height of snapshot block {hash}: {e}. \
+                         The history line stays hidden until it can; trying again every tick."
+                    );
+                }
+                None
+            }
+        };
+    }
+    HistoryProgress {
+        unchecked: true,
+        check: history_check(chainstates, base.read.as_ref().map(|(_, height)| *height)),
+    }
 }
 
 pub async fn get_blockchain_info(rpc: &dyn Rpc) -> AppResult<BlockchainInfo> {
@@ -228,6 +431,40 @@ pub async fn get_mining_info(rpc: &dyn Rpc) -> AppResult<MiningInfo> {
 pub async fn get_chainstates(rpc: &dyn Rpc) -> AppResult<ChainStates> {
     let v = rpc.call("getchainstates", json!([])).await?;
     serde_json::from_value(v).map_err(|e| crate::error::AppError::Decode(e.to_string()))
+}
+
+/// The validated gate (docs/decisions/2026-09-29-every-node-starts-near-the-tip.md,
+/// section 3): is this node's chain one it checked itself? Open only when
+/// `answer` is a `getchainstates` answer whose `chainstates` array is not
+/// empty and every entry in it says `"validated": true`. Closed for a failed
+/// call (`None`), anything that is not such an answer, and any entry whose
+/// `validated` is false, missing or not a boolean.
+///
+/// WHY NOT THE `attested_assumeutxo` FILE. Only a signed load writes it
+/// (v0.34.9 `validation.cpp:17791` and `:17818`). Upstream's plain assumeutxo
+/// snapshot does not, although its history below the base is just as
+/// unchecked; `validated` is false for both until the background check has
+/// finished (`src/rpc/blockchain.cpp:5219`).
+///
+/// The diary, the producer and both confirmers ask this before every entry,
+/// export, send and signature. Section 8's pin rule still keys on the file.
+pub fn chainstates_validated(answer: Option<&serde_json::Value>) -> bool {
+    let Some(entries) = answer
+        .and_then(|v| v.get("chainstates"))
+        .and_then(|c| c.as_array())
+    else {
+        return false;
+    };
+    !entries.is_empty()
+        && entries
+            .iter()
+            .all(|e| e.get("validated").and_then(|v| v.as_bool()) == Some(true))
+}
+
+/// [`chainstates_validated`] on the node's answer now. A failed call is closed.
+pub async fn read_chainstates_validated(rpc: &dyn Rpc) -> bool {
+    let answer = rpc.call("getchainstates", json!([])).await.ok();
+    chainstates_validated(answer.as_ref())
 }
 
 /// Number of peer connections (`getconnectioncount` → a bare integer).
@@ -278,6 +515,21 @@ pub struct ConnectionCounts {
     /// what WILL be broadcast and this is what IS.
     #[serde(default)]
     pub subversion: String,
+    /// Our own service bits as the hex string `getnetworkinfo` reports (e.g.
+    /// "0000000088000c09"), riding on the same call for the same reason as
+    /// `subversion`: it is what the network SEES this node offer, where the
+    /// settings only say what it was asked to offer. Bit 27 is consensus, bit
+    /// 31 the attestation archive; [`crate::role`] decides from these bits,
+    /// and from `localservicesnames` only when this is absent, because a btxd
+    /// that predates a bit's name renders it `UNKNOWN[2^31]`.
+    #[serde(default)]
+    pub localservices: String,
+    #[serde(default)]
+    pub localservicesnames: Vec<String>,
+}
+
+fn minus_one() -> i64 {
+    -1
 }
 
 /// The per-peer subset a trusted mirror's health depends on (`getpeerinfo`).
@@ -324,6 +576,13 @@ pub struct PeerInfo {
     /// text chosen by a stranger.
     #[serde(default)]
     pub subver: String,
+    /// The last header this peer announced that we also have, `-1` when none.
+    /// Which peer to ask for a stuck block is chosen by this.
+    #[serde(default = "minus_one")]
+    pub synced_headers: i64,
+    /// The last block we know this peer has, `-1` when none.
+    #[serde(default = "minus_one")]
+    pub synced_blocks: i64,
     /// UNIX time this connection was established. The clock for any "we have
     /// heard nothing" judgement: silence from a peer connected two minutes ago
     /// means nothing at all, and the same silence after six hours is evidence.
@@ -368,8 +627,81 @@ pub struct ArchivePeerSummary {
     pub blocks_in_flight: usize,
 }
 
+/// What `getmatmultrustedstatus` says about this node's own MatMul role.
+///
+/// The app has never asked this question, and it is the one that decides
+/// whether the archive bit means what it appears to mean. See
+/// [`crate::frontier::archive_service`].
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct MatmulTrustedStatus {
+    /// This node holds an attestation signing key.
+    #[serde(default)]
+    pub local_signer: bool,
+    /// `-matmulattestationserve` is on.
+    #[serde(default)]
+    pub serves_attestations: bool,
+    /// `consensus` | `trusted` | other.
+    #[serde(default)]
+    pub matmul_validation_mode: String,
+    #[serde(default)]
+    pub trusted_mirror: bool,
+    /// Display order. Absent on a node with no pin and no key.
+    #[serde(default)]
+    pub replay_authority_context: Option<String>,
+    /// M of the M-of-N pin. Older engines omit this and the fields below;
+    /// they read as 0 / empty / `None` and nothing here takes a 0 for news.
+    #[serde(default)]
+    pub threshold: u64,
+    /// Compressed secp256k1 pin members, counted.
+    #[serde(default)]
+    pub trusted_signers: u64,
+    /// The LIVE secp pin, after the engine merged the command line, the conf
+    /// and `btx_rw.conf`: the keys whose signatures this node accepts.
+    #[serde(default)]
+    pub trusted_signer_pubkeys: Vec<String>,
+    /// ML-DSA-44 pin members, counted.
+    #[serde(default)]
+    pub trusted_pq_signers: u64,
+    /// The operator's attestation blocklist: keys whose signatures the
+    /// engine rejects even while they stay in the pin.
+    #[serde(default)]
+    pub blocked_pubkeys: Vec<String>,
+    /// Whether the pin members not on the blocklist still meet M.
+    #[serde(default)]
+    pub pin_quorum_reachable: Option<bool>,
+    /// The engine's in-memory store counters (`StoreStats`, engine
+    /// `trusted_exact_replay_attestation.h:367`): 0 at every engine start,
+    /// then only rising, so read them as DELTAS, never as totals. `accepted`
+    /// also counts the archive records loaded from disk at start, and
+    /// `rejected` rises for every signature from a key this node does not
+    /// pin, so a healthy node shows both large. See
+    /// [`crate::watchdog::SignatureWindow`].
+    #[serde(default)]
+    pub accepted: u64,
+    #[serde(default)]
+    pub rejected: u64,
+    #[serde(default)]
+    pub duplicates: u64,
+}
+
+/// Read this node's own MatMul role. Cheap, and answered by every engine that
+/// supports attestations; an older one that does not know the method returns an
+/// error, which callers treat as "unknown" rather than as "no".
+pub async fn get_matmul_trusted_status(rpc: &dyn Rpc) -> AppResult<MatmulTrustedStatus> {
+    let v = rpc.call("getmatmultrustedstatus", json!([])).await?;
+    serde_json::from_value(v).map_err(|e| crate::error::AppError::Decode(e.to_string()))
+}
+
 /// NODE_MATMUL_ATTESTATION_ARCHIVE — service bit 31.
 pub const NODE_MATMUL_ATTESTATION_ARCHIVE_BIT: u64 = 1 << 31;
+
+/// NODE_MATMUL_CONSENSUS — service bit 27: this node validates MatMul
+/// transcripts itself. A node in `consensus` mode WITHOUT this bit is the
+/// degraded start (no qualifying accelerator), which follows headers and
+/// stalls below the Epoch A height. Both numbers are from upstream
+/// `src/protocol.h` at 3013c2c; the check-in and [`crate::role`] read the
+/// same constant so they cannot disagree about which bit that is.
+pub const NODE_MATMUL_CONSENSUS_BIT: u64 = 1 << 27;
 
 /// Does this peer advertise the attestation-archive service? Decided from the
 /// service BITS (bit 31), not from the display names: a name-substring match
@@ -385,6 +717,24 @@ fn advertises_archive(p: &PeerInfo) -> bool {
     p.servicesnames
         .iter()
         .any(|n| n == "MATMUL_ATTESTATION_ARCHIVE")
+}
+
+/// NODE_NETWORK, service bit 0: the peer keeps and serves every block.
+pub const NODE_NETWORK_BIT: u64 = 1;
+
+/// Does this peer say it serves every block, not only its last 288? Decided
+/// from the service bits as [`advertises_archive`] is, with the exact name
+/// only for peer objects without them. The difference matters for old
+/// blocks: a peer with NETWORK_LIMITED and without this bit drops a node it
+/// does not grant `noban` when asked for a block more than 290 below its tip
+/// (engine `src/net_processing.cpp:9384-9391` at 84b998b4); one with it does
+/// not. The catch-up help (`crate::catchup_assist`) chooses by it.
+pub fn serves_full_history(p: &PeerInfo) -> bool {
+    let hex = p.services.trim_start_matches("0x");
+    if let Ok(bits) = u64::from_str_radix(hex, 16) {
+        return bits & NODE_NETWORK_BIT != 0;
+    }
+    p.servicesnames.iter().any(|n| n == "NETWORK")
 }
 
 /// The gate rule, verbatim from the incident diagnosis: archive service bit
@@ -601,6 +951,11 @@ pub struct AttestedTip {
     /// Whether the signed frontier is on our active chain.
     #[serde(default)]
     pub on_active_chain: Option<bool>,
+    /// The hash the node recorded for the frontier's height
+    /// (`signed_frontier.hash`), when it knows one. The catch-up help
+    /// (`crate::catchup_assist`) follows this header.
+    #[serde(default)]
+    pub hash: Option<String>,
 }
 
 /// Read the signed frontier. The RPC nests it under `signed_frontier`; older
@@ -619,6 +974,7 @@ pub async fn get_attested_tip(rpc: &dyn Rpc) -> AppResult<AttestedTip> {
             .get("on_active_chain")
             .and_then(|x| x.as_bool())
             .or_else(|| v.get("on_active_chain").and_then(|x| x.as_bool())),
+        hash: sf.get("hash").and_then(|x| x.as_str()).map(str::to_string),
     })
 }
 
@@ -985,14 +1341,10 @@ pub async fn restore_wallet(
         .await
 }
 
-/// `importwallet "<filename>"` — import keys from a `dumpwallet` TEXT file into
-/// the wallet this client is scoped to (call through `RpcClient::for_wallet`).
-/// Legacy path: it needs a wallet that already exists, and btxd refuses it on a
-/// descriptor wallet. The caller decides whether that refusal is worth
-/// surfacing or worth converting into plain advice.
-pub async fn import_wallet_dump(rpc: &dyn Rpc, dump_path: &str) -> AppResult<serde_json::Value> {
-    rpc.call("importwallet", json!([dump_path])).await
-}
+// No `importwallet` wrapper, on purpose: from v0.34.9, easyNode's engine from
+// 2026-09-23, it refuses every dump file.
+// `wallet_format::WalletFileKind::WalletDump` says why, and
+// `wallet_format::wallet_dump_advice()` is what the user is told instead.
 
 /// `exportwalletbundle "<bundle_file>"` — export the CURRENT descriptor
 /// wallet (call through `RpcClient::for_wallet`) as a browser-compatible
@@ -1153,7 +1505,7 @@ mod tests {
     use super::*;
     use crate::rpc::Rpc;
     use async_trait::async_trait;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -1263,6 +1615,67 @@ mod tests {
         assert!(add_node(&rpc, "1.2.3.4:19335").await.is_err());
     }
 
+    /// The v0.34.12 answer, cut to the fields the app reads plus a few it
+    /// does not, with the counters the signature check samples. The numbers
+    /// are the RTX 3060 signer's, healthy, from
+    /// docs/gpu-qualification-rtx3060.md: rejected is large on a node that
+    /// works, because every signature from a key it does not pin counts.
+    #[test]
+    fn trusted_status_reads_the_pin_and_the_signature_counters() {
+        let s: MatmulTrustedStatus = serde_json::from_value(json!({
+            "configured": true,
+            "matmul_validation_mode": "trusted",
+            "trusted_mirror": true,
+            "serves_attestations": true,
+            "local_signer": false,
+            "threshold": 1,
+            "trusted_signers": 2,
+            "trusted_signer_pubkeys": [
+                "03d90c148db37da28ce47ce15bade88a177728d663da4bc9ba765943b7d4e4f0aa",
+                "0224e80df33697385b54b3c69bae1f097f533c0c43e93c29f73ee97319d4a5e04c"
+            ],
+            "trusted_pq_signers": 0,
+            "trusted_pq_signer_pubkeys": [],
+            "blocked_pubkeys": [],
+            "unblocked_pin_members": 2,
+            "pin_quorum_reachable": true,
+            "stored_blocks": 600,
+            "blocks_with_quorum": 598,
+            "accepted": 3073,
+            "duplicates": 1532,
+            "rejected": 1735,
+            "capacity_rejections": 0,
+            "warning": ""
+        }))
+        .unwrap();
+        assert!(s.trusted_mirror);
+        assert_eq!(s.threshold, 1);
+        assert_eq!(s.trusted_signers, 2);
+        assert_eq!(s.trusted_signer_pubkeys.len(), 2);
+        assert_eq!(s.trusted_pq_signers, 0);
+        assert_eq!(s.pin_quorum_reachable, Some(true));
+        assert_eq!((s.accepted, s.rejected, s.duplicates), (3073, 1735, 1532));
+    }
+
+    /// Older engines answer with the role fields only. They must still parse,
+    /// and the counters read 0, which the signature window never takes for
+    /// evidence on its own (it reads deltas over time).
+    #[test]
+    fn trusted_status_from_an_engine_without_the_counters_still_parses() {
+        let s: MatmulTrustedStatus = serde_json::from_value(json!({
+            "local_signer": true,
+            "serves_attestations": true,
+            "matmul_validation_mode": "consensus",
+            "trusted_mirror": false
+        }))
+        .unwrap();
+        assert!(s.local_signer);
+        assert_eq!(s.threshold, 0);
+        assert!(s.trusted_signer_pubkeys.is_empty());
+        assert_eq!(s.pin_quorum_reachable, None);
+        assert_eq!((s.accepted, s.rejected, s.duplicates), (0, 0, 0));
+    }
+
     #[test]
     fn peer_info_decodes_partial_objects_from_old_nodes() {
         let peers: Vec<PeerInfo> =
@@ -1274,6 +1687,17 @@ mod tests {
             summarize_archive_peers(&peers),
             ArchivePeerSummary::default()
         );
+    }
+
+    #[test]
+    fn peer_sync_heights_decode_and_default_to_minus_one() {
+        let with: PeerInfo = serde_json::from_value(
+            json!({"id": 4, "synced_headers": 233472, "synced_blocks": 225928}),
+        )
+        .unwrap();
+        assert_eq!((with.synced_headers, with.synced_blocks), (233472, 225928));
+        let without: PeerInfo = serde_json::from_value(json!({"id": 5})).unwrap();
+        assert_eq!((without.synced_headers, without.synced_blocks), (-1, -1));
     }
 
     struct FakeRpc {
@@ -1303,6 +1727,42 @@ mod tests {
                 .cloned()
                 .unwrap_or(Value::Null))
         }
+    }
+
+    #[tokio::test]
+    async fn attested_tip_reads_the_signed_frontier_hash() {
+        let hash = "ab".repeat(32);
+        let rpc = FakeRpc::new(&[(
+            "getmatmulattestedtip",
+            json!({"configured": true, "signed_frontier": {
+                "height": 233475, "hash": hash, "on_active_chain": true,
+                "on_chain_attested_height": 225927, "blocks_behind": 7548}}),
+        )]);
+        let t = get_attested_tip(&rpc).await.unwrap();
+        assert_eq!(t.height, Some(233_475));
+        assert_eq!(t.hash.as_deref(), Some(hash.as_str()));
+        let unpinned = FakeRpc::new(&[("getmatmulattestedtip", json!({"configured": false}))]);
+        assert_eq!(
+            get_attested_tip(&unpinned).await.unwrap(),
+            AttestedTip::default()
+        );
+    }
+
+    /// Service bits as this crate's tests record them: 207.56.229.99 from the
+    /// live getpeerinfo of 2026-08-17 above (NETWORK among its bits), and
+    /// btxscan's mirror 20.86.181.203 as the snapshot_serve tests record it
+    /// (NETWORK_LIMITED, bit 10, without NETWORK).
+    #[test]
+    fn full_history_is_read_from_bit_0_with_the_name_as_fallback() {
+        let peers: Vec<PeerInfo> = serde_json::from_value(json!([
+            {"id": 1, "addr": "207.56.229.99:19335", "services": "0000000080000c09"},
+            {"id": 2, "addr": "20.86.181.203:19338", "services": "0000000088000d08"},
+            {"id": 3, "servicesnames": ["NETWORK", "WITNESS"]},
+            {"id": 4, "servicesnames": ["NETWORK_LIMITED"]}
+        ]))
+        .unwrap();
+        let full: Vec<bool> = peers.iter().map(serves_full_history).collect();
+        assert_eq!(full, [true, false, true, false]);
     }
 
     #[tokio::test]
@@ -1406,6 +1866,8 @@ mod tests {
             median_time: 0,
             is_stale: false,
             behind_best_header: 0,
+            warnings: Vec::new(),
+            signed_frontier: None,
         };
         assert!(!caught_up.tip_unsafe_to_act_on());
 
@@ -1482,6 +1944,124 @@ mod tests {
         let bi: BlockchainInfo = serde_json::from_value(v).unwrap();
         assert_eq!(bi.median_time, 0);
         assert!(!tip_is_stale(bi.median_time, 1_800_000_000));
+        assert!(bi.warnings.is_empty(), "no field, no warnings");
+    }
+
+    #[test]
+    fn the_signed_frontier_decodes_with_the_rest_and_sets_the_network_height() {
+        // btxscan's btxd2, v0.34.15, read only, 2026-10-11 21:5x UTC: the
+        // frontier rides in getblockchaininfo on a node that pins a key.
+        let at_tip = json!({
+            "blocks": 245_546, "headers": 245_546,
+            "verificationprogress": 1.0, "initialblockdownload": false,
+            "matmul_signed_frontier": {
+                "height": 245_546,
+                "hash": "64fd0b8182c7e0407f8d3881eb807d30a1f35af745980c11031e52836835027a",
+                "on_active_chain": true, "on_chain_attested_height": 245_546, "blocks_behind": 0
+            }
+        });
+        let bi: BlockchainInfo = serde_json::from_value(at_tip).unwrap();
+        assert_eq!(
+            bi.signed_frontier.as_ref().and_then(|f| f.height),
+            Some(245_546)
+        );
+        assert_eq!(bi.network_height(), 245_546);
+
+        // Catching up after 244,000: headers held near blocks, the signers ahead.
+        let behind = json!({
+            "blocks": 240_000, "headers": 244_888,
+            "verificationprogress": 0.98, "initialblockdownload": false,
+            "matmul_signed_frontier": {
+                "height": 245_260, "on_active_chain": true,
+                "on_chain_attested_height": 240_000, "blocks_behind": 5_260
+            }
+        });
+        let bi: BlockchainInfo = serde_json::from_value(behind).unwrap();
+        assert_eq!(bi.network_height(), 245_260);
+
+        // No pinned key: no field, and the best header as before.
+        let bare = json!({
+            "blocks": 240_000, "headers": 240_300,
+            "verificationprogress": 0.99, "initialblockdownload": false
+        });
+        let bi: BlockchainInfo = serde_json::from_value(bare).unwrap();
+        assert_eq!(bi.signed_frontier, None);
+        assert_eq!(bi.network_height(), 240_300);
+    }
+
+    #[test]
+    fn a_frontier_of_an_unexpected_shape_never_fails_the_call() {
+        // Losing getblockchaininfo blinds the refresher to everything; losing
+        // the frontier only costs the network height its third witness.
+        for odd in [
+            json!({"height": -1, "on_active_chain": true}),
+            json!("x"),
+            json!(7),
+            json!(null),
+        ] {
+            let v = json!({
+                "blocks": 240_000, "headers": 240_100,
+                "verificationprogress": 0.99, "initialblockdownload": false,
+                "matmul_signed_frontier": odd
+            });
+            let bi: BlockchainInfo = serde_json::from_value(v).unwrap();
+            assert_eq!(bi.signed_frontier, None);
+            assert_eq!(bi.network_height(), 240_100);
+        }
+    }
+
+    #[test]
+    fn warnings_decode_from_the_array_and_from_the_deprecated_string() {
+        let base = || {
+            json!({
+                "blocks": 230_000, "headers": 230_000,
+                "verificationprogress": 1.0, "initialblockdownload": false
+            })
+        };
+        // v0.34.x: one array entry per warning.
+        let mut v = base();
+        v["warnings"] = json!(["first warning", "second warning"]);
+        let bi: BlockchainInfo = serde_json::from_value(v).unwrap();
+        assert_eq!(bi.warnings, vec!["first warning", "second warning"]);
+
+        // -deprecatedrpc=warnings: every warning in one string, joined by a
+        // newline (node/warnings.cpp GetWarningsForRpc). The same list.
+        let mut v = base();
+        v["warnings"] = json!("first warning\nsecond warning");
+        let bi: BlockchainInfo = serde_json::from_value(v).unwrap();
+        assert_eq!(bi.warnings, vec!["first warning", "second warning"]);
+
+        // The deprecated form of "no warnings" is an empty string, not a list.
+        let mut v = base();
+        v["warnings"] = json!("");
+        let bi: BlockchainInfo = serde_json::from_value(v).unwrap();
+        assert!(bi.warnings.is_empty());
+    }
+
+    #[test]
+    fn an_unexpected_warnings_shape_never_fails_the_whole_call() {
+        // The refresher reads height, headers and the tip's age from this same
+        // answer. A warnings field it cannot read must cost the warnings only.
+        for odd in [
+            json!(null),
+            json!(7),
+            json!({"a": 1}),
+            json!([1, null, "kept"]),
+        ] {
+            let mut v = json!({
+                "blocks": 230_000, "headers": 230_000,
+                "verificationprogress": 1.0, "initialblockdownload": false
+            });
+            v["warnings"] = odd.clone();
+            let bi: BlockchainInfo = serde_json::from_value(v)
+                .unwrap_or_else(|e| panic!("warnings {odd} broke the decode: {e}"));
+            assert_eq!(bi.blocks, 230_000);
+            assert!(
+                bi.warnings.iter().all(|w| w == "kept"),
+                "{odd}: {:?}",
+                bi.warnings
+            );
+        }
     }
 
     #[tokio::test]
@@ -1631,6 +2211,364 @@ mod tests {
         // No snapshot chainstate, but it IS at tip via the normal chainstate.
         assert_eq!(cs.best_height(), 120000);
         assert!(cs.active().unwrap().validated);
+    }
+
+    // ── the validated gate (every-node-starts-near-the-tip, section 3) ──────
+
+    /// `getchainstates` as v0.34.9 writes it (`src/rpc/blockchain.cpp`,
+    /// `make_chain_data`): a background chainstate from genesis, then the
+    /// snapshot chainstate on `base`, still `validated: false`.
+    fn chainstates_on_a_snapshot(base: &str) -> Value {
+        json!({
+            "headers": 233_950,
+            "background_activation_yields": 0,
+            "chainstates": [
+                {
+                    "blocks": 131_200, "bestblockhash": "11".repeat(32),
+                    "verificationprogress": 0.56, "validated": true,
+                    "blocks_in_flight": 4
+                },
+                {
+                    "blocks": 233_949, "bestblockhash": "22".repeat(32),
+                    "verificationprogress": 0.99, "snapshot_blockhash": base,
+                    "validated": false, "blocks_in_flight": 1
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn chainstates_validated_opens_only_when_every_chainstate_is_validated() {
+        // A node that checked its whole chain: one chainstate, validated.
+        let checked = json!({"headers": 233_950, "chainstates": [
+            {"blocks": 233_949, "bestblockhash": "33".repeat(32), "validated": true}
+        ]});
+        assert!(chainstates_validated(Some(&checked)));
+        // After the background check: one chainstate left, still carrying
+        // its snapshot base, and validated.
+        let retired = json!({"headers": 233_950, "chainstates": [
+            {"blocks": 233_949, "snapshot_blockhash": "44".repeat(32), "validated": true}
+        ]});
+        assert!(chainstates_validated(Some(&retired)));
+    }
+
+    /// Upstream's plain assumeutxo snapshot (`loadtxoutset`, 219,000 on
+    /// 0.34.9, 228,000 on 0.34.12) writes no `attested_assumeutxo` file, so
+    /// the first design's file test would have let this node record and sign.
+    /// The gate never looks at the file: it takes no datadir at all.
+    #[test]
+    fn chainstates_validated_stays_closed_on_a_plain_assumeutxo_snapshot() {
+        let plain = chainstates_on_a_snapshot(
+            "dc51220bc7e5db96e29df9d817ae6179245d33eb8adcaaff765cfec83fdb87c3",
+        );
+        assert!(!chainstates_validated(Some(&plain)));
+    }
+
+    /// A signed snapshot (`loadtxoutsetattested`, 225,927) looks the same.
+    #[test]
+    fn chainstates_validated_stays_closed_on_a_signed_snapshot() {
+        let signed = chainstates_on_a_snapshot(
+            "06780445dae193010e099e6425c5430f121416b067b8d68a8a5c3b52e8a4b932",
+        );
+        assert!(!chainstates_validated(Some(&signed)));
+    }
+
+    #[test]
+    fn chainstates_validated_is_closed_when_the_answer_is_not_one() {
+        assert!(!chainstates_validated(None), "the call failed");
+        assert!(!chainstates_validated(Some(&Value::Null)));
+        assert!(!chainstates_validated(Some(&json!({"headers": 1}))));
+        assert!(!chainstates_validated(Some(&json!({"chainstates": []}))));
+        assert!(
+            !chainstates_validated(Some(&json!({"chainstates": [{}]}))),
+            "a chainstate with no tip yet writes an empty object"
+        );
+        assert!(!chainstates_validated(Some(
+            &json!({"chainstates": [{"validated": "true"}]})
+        )));
+        assert!(!chainstates_validated(Some(&json!({"chainstates": [
+            {"validated": true}, {"blocks": 5}
+        ]}))));
+    }
+
+    #[tokio::test]
+    async fn chainstates_validated_reads_the_node() {
+        let checked = json!({"chainstates": [{"blocks": 9, "validated": true}]});
+        assert!(read_chainstates_validated(&FakeRpc::new(&[("getchainstates", checked)])).await);
+        let on_snapshot = chainstates_on_a_snapshot(&"55".repeat(32));
+        assert!(
+            !read_chainstates_validated(&FakeRpc::new(&[("getchainstates", on_snapshot)])).await
+        );
+        // FakeRpc answers null for a method it does not know.
+        assert!(!read_chainstates_validated(&FakeRpc::new(&[])).await);
+    }
+
+    // ── the history check (docs/decisions/2026-09-29-quick-start-full-check-and-progress.md) ──
+
+    /// A node on a snapshot whose base is 225,927, the pinned pair's height,
+    /// with the background check at 131,200: the numbers in the decision.
+    fn signed_snapshot_being_checked() -> ChainStates {
+        serde_json::from_value(json!({
+            "headers": 233453,
+            "chainstates": [
+                { "blocks": 131200, "bestblockhash": "bg", "verificationprogress": 0.41, "validated": true },
+                {
+                    "blocks": 233400,
+                    "bestblockhash": "tip",
+                    "verificationprogress": 0.9999,
+                    "snapshot_blockhash": "b225927",
+                    "validated": false
+                }
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn history_check_is_nothing_without_a_snapshot() {
+        let only_background: ChainStates = serde_json::from_value(json!({
+            "headers": 0,
+            "chainstates": [
+                { "blocks": 0, "bestblockhash": "75a9", "verificationprogress": 7.5e-6, "validated": true }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(only_background.unchecked_snapshot_base(), None);
+        assert_eq!(history_check(&only_background, Some(225_927)), None);
+        assert_eq!(history_check(&ChainStates::default(), Some(225_927)), None);
+    }
+
+    #[tokio::test]
+    async fn history_check_reports_a_snapshot_being_checked() {
+        let rpc = FakeRpc::new(&[("getchainstates", snapshot_chainstates_json())]);
+        let cs = get_chainstates(&rpc).await.unwrap();
+        assert_eq!(
+            cs.unchecked_snapshot_base(),
+            Some("88a7b534ff66a863d45813668d9e53010a257af18b2d73154ec31a873bd36534")
+        );
+        assert_eq!(
+            history_check(&cs, Some(106_875)),
+            Some(HistoryCheck {
+                checked: 1_200,
+                base: 106_875
+            })
+        );
+        // No base read yet: say nothing rather than guess one.
+        assert_eq!(history_check(&cs, None), None);
+        assert_eq!(history_check(&cs, Some(0)), None);
+    }
+
+    #[test]
+    fn history_check_is_nothing_once_the_check_is_done() {
+        // In the same run: the engine drops the background chainstate, and
+        // the snapshot chainstate, alone, reads validated.
+        let same_run: ChainStates = serde_json::from_value(json!({
+            "headers": 233500,
+            "chainstates": [
+                {
+                    "blocks": 233500,
+                    "bestblockhash": "tip",
+                    "verificationprogress": 1.0,
+                    "snapshot_blockhash": "b225927",
+                    "validated": true
+                }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(same_run.unchecked_snapshot_base(), None);
+        assert_eq!(history_check(&same_run, Some(225_927)), None);
+        // After a restart: one ordinary chainstate, no snapshot hash.
+        let restarted: ChainStates = serde_json::from_value(json!({
+            "headers": 233500,
+            "chainstates": [
+                { "blocks": 233500, "bestblockhash": "tip", "verificationprogress": 1.0, "validated": true }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(history_check(&restarted, Some(225_927)), None);
+    }
+
+    #[test]
+    fn history_check_counts_to_the_snapshots_own_base() {
+        let cs = signed_snapshot_being_checked();
+        assert_eq!(cs.unchecked_snapshot_base(), Some("b225927"));
+        let h = history_check(&cs, Some(225_927)).expect("a check is running");
+        assert_eq!(
+            h,
+            HistoryCheck {
+                checked: 131_200,
+                base: 225_927
+            }
+        );
+        // Not the compiled start point, which would put the bar at 60% of the
+        // wrong total.
+        assert_ne!(h.base, 219_000);
+        // The count never passes the base, whatever the engine reports.
+        let mut past = cs.clone();
+        past.chainstates[0].blocks = 230_000;
+        assert_eq!(
+            history_check(&past, Some(225_927)).unwrap().checked,
+            225_927
+        );
+        // The window reads these names.
+        assert_eq!(
+            serde_json::to_value(h).unwrap(),
+            json!({ "checked": 131200, "base": 225927 })
+        );
+    }
+
+    #[tokio::test]
+    async fn block_height_is_read_from_the_header() {
+        let rpc = FakeRpc::new(&[(
+            "getblockheader",
+            json!({ "hash": "b225927", "height": 225927, "confirmations": 7500 }),
+        )]);
+        assert_eq!(get_block_height(&rpc, "b225927").await.unwrap(), 225_927);
+        let no_height = FakeRpc::new(&[("getblockheader", json!({ "hash": "b225927" }))]);
+        assert!(get_block_height(&no_height, "b225927").await.is_err());
+    }
+
+    /// One tick of the refresher, with nothing carried over from the last.
+    async fn tick(rpc: &dyn Rpc, cs: &ChainStates, base: &mut HistoryBase) -> HistoryProgress {
+        refresh_history_check(rpc, &Ok(cs.clone()), base, HistoryProgress::default()).await
+    }
+
+    #[tokio::test]
+    async fn the_snapshots_height_is_read_once_per_snapshot() {
+        let cs = signed_snapshot_being_checked();
+        let rpc = FakeRpc::new(&[("getblockheader", json!({ "height": 225927 }))]);
+        let mut base = HistoryBase::default();
+        assert_eq!(
+            tick(&rpc, &cs, &mut base).await,
+            HistoryProgress {
+                unchecked: true,
+                check: Some(HistoryCheck {
+                    checked: 131_200,
+                    base: 225_927
+                })
+            }
+        );
+        assert_eq!(base.read, Some(("b225927".to_string(), 225_927)));
+
+        // The next tick does not ask again: with the header gone, the
+        // remembered height still answers.
+        rpc.responses.lock().unwrap().remove("getblockheader");
+        assert_eq!(
+            tick(&rpc, &cs, &mut base).await.check.map(|h| h.base),
+            Some(225_927)
+        );
+
+        // A different snapshot is read afresh, never given the old height.
+        let mut other = cs.clone();
+        other.chainstates[1].snapshot_blockhash = Some("b226000".to_string());
+        assert_eq!(
+            tick(&rpc, &other, &mut base).await,
+            HistoryProgress {
+                unchecked: true,
+                check: None
+            }
+        );
+        assert_eq!(base.read, None);
+
+        // A finished check shows nothing and asks nothing.
+        let mut done = cs.clone();
+        done.chainstates.remove(0);
+        done.chainstates[0].validated = true;
+        assert_eq!(
+            tick(&rpc, &done, &mut base).await,
+            HistoryProgress::default()
+        );
+    }
+
+    /// One lost getchainstates is not the check finishing, and not a new
+    /// snapshot either: the last answer stands, the line and the role
+    /// sentence with it.
+    #[tokio::test]
+    async fn a_failed_getchainstates_keeps_the_last_answer() {
+        let rpc = FakeRpc::new(&[("getblockheader", json!({ "height": 225927 }))]);
+        let mut base = HistoryBase::default();
+        let running = tick(&rpc, &signed_snapshot_being_checked(), &mut base).await;
+        assert!(running.unchecked && running.check.is_some());
+
+        let lost: AppResult<ChainStates> = Err(crate::error::AppError::Http("timed out".into()));
+        assert_eq!(
+            refresh_history_check(&rpc, &lost, &mut base, running).await,
+            running
+        );
+        // Nothing carried over, nothing to keep.
+        assert_eq!(
+            refresh_history_check(&rpc, &lost, &mut base, HistoryProgress::default()).await,
+            HistoryProgress::default()
+        );
+        // The next answer that arrives is taken as it is, a finished check
+        // included.
+        let mut done = signed_snapshot_being_checked();
+        done.chainstates.remove(0);
+        done.chainstates[0].validated = true;
+        assert_eq!(
+            refresh_history_check(&rpc, &Ok(done), &mut base, running).await,
+            HistoryProgress::default()
+        );
+    }
+
+    /// The role sentence needs only "a snapshot's history is unchecked", which
+    /// the first getchainstates answer says. It does not wait for the
+    /// snapshot's own height, which the line needs and a failing
+    /// getblockheader can hold back for good.
+    #[tokio::test]
+    async fn an_unchecked_snapshot_is_known_before_its_height_is_read() {
+        let no_header = FakeRpc::new(&[]);
+        let mut base = HistoryBase::default();
+        let first = tick(&no_header, &signed_snapshot_being_checked(), &mut base).await;
+        assert_eq!(
+            first,
+            HistoryProgress {
+                unchecked: true,
+                check: None
+            }
+        );
+        // The read is tried again on the next tick, and the line appears then.
+        no_header
+            .responses
+            .lock()
+            .unwrap()
+            .insert("getblockheader".into(), json!({ "height": 225927 }));
+        assert_eq!(
+            tick(&no_header, &signed_snapshot_being_checked(), &mut base)
+                .await
+                .check
+                .map(|h| h.base),
+            Some(225_927)
+        );
+        // No snapshot at all: nothing unchecked.
+        let plain: ChainStates = serde_json::from_value(json!({
+            "headers": 233500,
+            "chainstates": [
+                { "blocks": 233500, "bestblockhash": "tip", "verificationprogress": 1.0, "validated": true }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            tick(&no_header, &plain, &mut base).await,
+            HistoryProgress::default()
+        );
+    }
+
+    /// A getblockheader that keeps failing is tried every tick, every three
+    /// seconds, and logged once per snapshot rather than on every try.
+    #[tokio::test]
+    async fn a_failing_header_read_is_logged_once_per_snapshot() {
+        let no_header = FakeRpc::new(&[]);
+        let mut base = HistoryBase::default();
+        let cs = signed_snapshot_being_checked();
+        tick(&no_header, &cs, &mut base).await;
+        assert_eq!(base.failure_logged.as_deref(), Some("b225927"));
+        assert!(!base.first_failure("b225927"), "the same snapshot again");
+        tick(&no_header, &cs, &mut base).await;
+        assert_eq!(base.failure_logged.as_deref(), Some("b225927"));
+        // A different snapshot is news.
+        assert!(base.first_failure("b226000"));
+        assert!(!base.first_failure("b226000"));
     }
 
     #[tokio::test]

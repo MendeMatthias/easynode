@@ -26,8 +26,11 @@ Type=simple
 # BTX_ESPLORA_ELECTRS=127.0.0.1:3081, and the freshness guardian works
 # unchanged, because it reads these same two routes.
 ExecStart=/usr/local/bin/btx-witness --datadir /var/lib/btx --rpc 127.0.0.1:19334 --listen 127.0.0.1:3081
-Restart=on-failure
-RestartSec=10
+# always, not on-failure: a witness that has exited for any reason has left
+# the wallet without its fork check, and the only right answer is to come
+# back. Five seconds keeps a btxd restart inside one polling interval.
+Restart=always
+RestartSec=5
 
 # It reads the node's cookie and answers two GETs. It needs nothing else.
 NoNewPrivileges=true

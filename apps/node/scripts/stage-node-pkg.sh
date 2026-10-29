@@ -2,8 +2,9 @@
 # Stage the bundled BTX node package for an easyBTX Node build — and make it
 # SELF-CONTAINED (no Homebrew on the user's machine).
 #
-# The app bundles the WHOLE v0.34.5 release package tree (bin/ launcher
-# wrappers + libexec/*.real Mach-O daemons + metal shader libs, ~25 MB) under
+# The app bundles the v0.34.12 release package tree (bin/ launcher wrappers +
+# libexec/*.real Mach-O daemons + metal shader libs), minus the model-plane
+# helpers and the btx-qt launcher (see below), under
 # src-tauri/resources/node-pkg/. The tree is gitignored (same rationale as the
 # miner's resources/bin + resources/node-bin: keep binaries out of the source
 # tree) and must be staged before `tauri build` / `tauri dev`.
@@ -30,16 +31,26 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="$APP_DIR/src-tauri/resources/node-pkg"
 
-VERSION="0.34.5"
+VERSION="0.34.15"
 # Refuse to stage a version the app will then refuse. See scripts/lib/engine-pin.sh.
 # shellcheck source=lib/engine-pin.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/engine-pin.sh"
 assert_matches_engine_pin "$APP_DIR" "$VERSION"
+# Download/verify/unpack for both upstream archive formats (0.34 .tar.gz and
+# 0.35 .tar.xz), plus the layout gate and exact-version check. See the file.
+# shellcheck source=lib/release-archive.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/release-archive.sh"
 
+# 0.35 renamed the archive: btx-035-macos-arm64.tar.xz, with SHA384SUMS, and
+# the rc1 Mac btxd's own code signature is INVALID (macOS kills it with
+# SIGKILL until it is re-signed). Move this URL and the digest together.
 TARBALL_URL="https://github.com/btxchain/btx/releases/download/v${VERSION}/btx-${VERSION}-arm64-apple-darwin.tar.gz"
-# From the release's signed SHA256SUMS. Upstream has re-generated release assets
-# in place before — a silent swap must FAIL here, never ship unnoticed.
-TARBALL_SHA256="67e5ed639d2fcc05f8c40d9a945e447140312b7c7505a85c41452e851e98946e"
+# Upstream has re-generated release assets in place before, and a silent swap
+# must FAIL here, never ship unnoticed. v0.34.15 publishes NO SHA256SUMS at
+# all; this is GitHub's asset digest for the file, which equals the hash
+# upstream lists on btxchain/btx PR 223. It pins the bytes, not a signature.
+# 64 hex = sha256, 96 hex = sha384 (release_archive_verify takes either).
+TARBALL_SHA256="6e1ec111fcfedb6da356e3897d3d224c07396c82b8897a83fdcfa558b781c4a8"
 
 SRC="${EASYBTX_NODE_PKG_SRC:-}"
 if [[ -z "$SRC" && -x "$HOME/btx-node-research/btx-$VERSION/bin/btxd" ]]; then
@@ -47,15 +58,17 @@ if [[ -z "$SRC" && -x "$HOME/btx-node-research/btx-$VERSION/bin/btxd" ]]; then
 fi
 if [[ -z "$SRC" ]]; then
   # No local package: fetch the pinned release, exactly like the Linux leg.
-  # `shasum -a 256`, NOT `sha256sum` — the latter is not on stock macOS.
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
   echo "==> downloading $TARBALL_URL"
-  curl -fsSL --retry 3 -o "$tmp/pkg.tgz" "$TARBALL_URL"
-  echo "$TARBALL_SHA256  $tmp/pkg.tgz" | shasum -a 256 -c -
-  tar -xzf "$tmp/pkg.tgz" -C "$tmp"
-  SRC="$tmp/btx-$VERSION"
+  curl -fsSL --retry 3 -o "$tmp/pkg.archive" "$TARBALL_URL"
+  release_archive_verify "$tmp/pkg.archive" "$TARBALL_SHA256"
+  SRC="$(release_archive_extract "$tmp/pkg.archive" "$tmp/x")"
 fi
+
+# Everything below copies libexec/*.real and re-signs only those. Refuse any
+# other layout (0.35's bin/btxd-is-the-binary) instead of staging half of it.
+require_034_layout "$SRC"
 
 if [[ ! -x "$SRC/bin/btxd" ]]; then
   echo "error: no BTX node package at $SRC (expected bin/btxd)." >&2
@@ -68,7 +81,8 @@ fi
 # install path, and node.rs derives the version-gated CLI flags from that path —
 # so staging the wrong bytes here arms `-matmulrcexecution` against a btxd that
 # rejects it fatally. Cheap to check, expensive to miss.
-if ! "$SRC/bin/btxd" --version 2>/dev/null | grep -q "v${VERSION}"; then
+# Exact, not a substring: VERSION=0.35.0 must not accept a v0.35.0rc1 binary.
+if ! btxd_reports_exact_version "$SRC/bin/btxd" "$VERSION"; then
   echo "error: $SRC/bin/btxd is not v$VERSION (reported: $("$SRC/bin/btxd" --version 2>&1 | head -1))" >&2
   exit 1
 fi
@@ -79,6 +93,25 @@ mkdir -p "$DEST"
 # doc/ are source-repo extras the app never reads.
 cp -R "$SRC/bin" "$DEST/bin"
 cp -R "$SRC/libexec" "$DEST/libexec"
+
+# ...and without the model plane. From 0.34.7 upstream's archive is built
+# WITH_MODELNET=ON and ships btx-modeld plus six sibling helpers, and an ON btxd
+# starts btx-modeld by itself (-modelnet defaults to 1), bound to 0.0.0.0:29447.
+# The release engine is built WITH_MODELNET=OFF and has none of this, and the app
+# calls none of these binaries. With btx-modeld absent, btxd logs "btx-modeld
+# not found next to btxd; monetary node continues" and runs; measured on this
+# archive's btxd, regtest, 2026-09-23. So a contributor build starts no model
+# helper and opens no model port. It is still not the release engine: this
+# btxd has the model plane compiled in (the -modelnet option, the model P2P
+# messages), where the release build has none of it.
+for helper in btx-modeld btx-modelcheck btx-open btx-capability btx-capabilityd btx-hcpd btx-hosted; do
+  rm -f "$DEST/bin/$helper" "$DEST/libexec/$helper.real"
+done
+# ...and without the GUI. From 0.34.12 the archive also carries btx-qt.app at
+# its top level plus a bin/btx-qt launcher that execs ../btx-qt.app. The .app
+# is not copied (only bin/ and libexec/ are), and the app never starts the GUI,
+# so the launcher goes too rather than pointing at nothing.
+rm -f "$DEST/bin/btx-qt"
 
 # ── Vendor non-system dylibs TRANSITIVELY (Homebrew) ────────────────────────
 # The upstream darwin build links some libs from Homebrew and a clean user Mac

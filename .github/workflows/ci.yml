@@ -52,8 +52,11 @@ jobs:
           cache: npm
           cache-dependency-path: apps/node/package-lock.json
 
-      # `npm ci` fails outright if package-lock.json and package.json disagree,
-      # so the lockfile is enforced by the command itself.
+      # `npm ci` fails outright if the DEPENDENCY graph in package-lock.json
+      # and package.json disagree. It does NOT check the root version field: a
+      # lockfile left behind on the previous release installs cleanly and says
+      # nothing, which is how 0.6.20 nearly shipped a lockfile reading 0.6.19.
+      # The release recipe lists that file; nothing here enforces it.
       - run: npm ci
 
       # `npm run build` is `tsc && vite build`: the typecheck and the bundle.
@@ -74,6 +77,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: bash apps/node/scripts/test-publish-gate.sh
+      # Upstream archive formats (0.34 .tar.gz + sha256, 0.35 .tar.xz + sha384),
+      # the layout gate and the exact-version check. Offline, ~1 second.
+      - run: bash apps/node/scripts/test-release-archive.sh
 
   # ---------------------------------------------------------------------------
   # The shared engine. No system dependencies, no staged node package, no

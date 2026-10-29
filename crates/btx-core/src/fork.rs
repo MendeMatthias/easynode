@@ -71,6 +71,55 @@ impl ChainTip {
     }
 }
 
+/// btxd's own words for "the headers ahead of me are towers nobody will serve
+/// me the bodies for".
+///
+/// WHY A LOG MARKER AND NOT A `getchaintips` STATUS. The obvious rule — only
+/// call it a fork when the rival branch is `valid-fork`, and treat
+/// `headers-only` as "waiting for bodies" — does not survive contact with the
+/// two incidents this module exists for. BOTH of them presented as
+/// `headers-only`:
+///
+///   * 2026-09-05, a real minority split: `height=211167 branchlen=671
+///     headers-only`, forking 671 blocks back at 210496.
+///   * 2026-09-06, an ordinary propagation race that cleared itself in 47
+///     minutes: `headers-only`, branchlen 23, last_common 211958.
+///
+/// `headers-only` means "I hold these headers and have never validated their
+/// bodies", which is true of a chain we are losing and equally true of a chain
+/// that is thirty seconds ahead of us. `docs/incident-2026-09-06-bodyless-tower.md`
+/// puts it plainly: the numbers cannot tell the two apart.
+///
+/// The engine can, because it knows something the tip list does not — whether
+/// any connected peer is answering its `getdata` for the next body. It says so
+/// once per 30 seconds, from `net_processing.cpp:6276`:
+///
+/// ```text
+/// Convergence note: tip-critical block 16440a39…9413 height=211959 has been
+/// requested for 2164s with no delivery -- no connected peer is serving this
+/// BODY. The node is at the served body tip (headers ahead may be bodyless
+/// competing towers), waiting on the network -- NOT an RC/verify/connect stall
+/// or node fault.
+/// ```
+///
+/// That is the discriminator, and it is the engine's own verdict rather than
+/// our inference from its outputs.
+pub const SERVED_BODY_TIP_MARKER: &str = "no connected peer is serving this BODY";
+
+/// The user-facing half of that sentence, so a test can assert the alarm does
+/// not say it without the evidence above.
+pub const SERVED_BODY_TIP_MARKER_PHRASE: &str = "no connected peer is serving";
+
+/// Whether btxd has said, in the log tail given, that it is at the served body
+/// tip and waiting on the network.
+///
+/// Substring rather than a parse on purpose: the sentence carries a hash, a
+/// height and a duration that all change every time it is written, and none of
+/// them changes the verdict.
+pub fn at_served_body_tip(log_tail: &str) -> bool {
+    log_tail.contains(SERVED_BODY_TIP_MARKER)
+}
+
 /// Blocks a headers-only branch must lead our chain by, counted from their
 /// common ancestor, before it is called a longer chain. Six is the depth at
 /// which btxd's emergency profile used to park a rewrite (the shipped conf
@@ -114,6 +163,31 @@ pub enum ForkAlarm {
         /// Seconds this has been the verdict; 0 on the tick that first saw it.
         since_secs: u64,
     },
+    /// The same shape as [`ForkAlarm::LongerBranch`] — a headers-only branch
+    /// that leads ours — but with btxd itself saying no connected peer is
+    /// serving the next body (see [`SERVED_BODY_TIP_MARKER`]).
+    ///
+    /// This is the 2026-09-06 state, and it is NOT a chain split: the node is
+    /// at the tip of what it has been served, headers have run ahead onto
+    /// towers whose bodies nobody is answering for, and the honest report is
+    /// "waiting on the network", not "you are on the wrong chain". It cleared
+    /// on its own in 47 minutes that day. It is still an alarm, because a node
+    /// that cannot obtain the next body cannot follow the chain, and the user's
+    /// view really is behind — but the sentence must not accuse a fork.
+    WaitingForBodies {
+        /// Height of the branch we hold headers for and no bodies of.
+        branch_height: u64,
+        /// Blocks on that branch since the fork point.
+        branch_len: u64,
+        /// The last block both chains share.
+        fork_height: u64,
+        /// Blocks on OUR chain since that point.
+        our_len: u64,
+        /// `branch_len - our_len`.
+        lead: u64,
+        /// Seconds this has been the verdict; 0 on the tick that first saw it.
+        since_secs: u64,
+    },
     /// Headers have outrun blocks past [`HEADERS_AHEAD_ALARM`] for at least
     /// [`HEADERS_AHEAD_ALARM_SECS`] and the gap is not closing.
     HeadersAhead {
@@ -121,6 +195,23 @@ pub enum ForkAlarm {
         blocks: u64,
         behind: u64,
         since_secs: u64,
+        /// Whether btxd itself reports that no peer is serving the next body
+        /// ([`SERVED_BODY_TIP_MARKER`]).
+        ///
+        /// Until 2026-09-16 this variant's sentence asserted "no connected
+        /// peer is serving them" unconditionally, while `headers_ahead` was
+        /// given only two heights and a clock and could not possibly know it.
+        /// Measured that day on this project's own Mac: 41 behind for 574
+        /// minutes with 16 peers, 7 of them tracked and the best at 15 blocks
+        /// ahead, while the node's own log read `select=have_data_unconnected
+        /// reason=ok` and `in_flight_global=1`. It already held blocks it had
+        /// not connected. Nobody was withholding anything: it was the cadence
+        /// burst hold (btxchain/btx#140) refusing to connect them. The
+        /// sentence sent two earlier investigations hunting peers, on
+        /// 2026-09-06 and 2026-09-13, which is expensive for a wrong guess.
+        /// The evidence is the same flag `WaitingForBodies` already keys off,
+        /// so the alarm now says which case it is instead of picking one.
+        bodies_unserved: bool,
     },
 }
 
@@ -150,16 +241,33 @@ impl ForkAlarm {
                 lead,
                 since_secs: secs,
             },
+            ForkAlarm::WaitingForBodies {
+                branch_height,
+                branch_len,
+                fork_height,
+                our_len,
+                lead,
+                ..
+            } => ForkAlarm::WaitingForBodies {
+                branch_height,
+                branch_len,
+                fork_height,
+                our_len,
+                lead,
+                since_secs: secs,
+            },
             ForkAlarm::HeadersAhead {
                 headers,
                 blocks,
                 behind,
+                bodies_unserved,
                 ..
             } => ForkAlarm::HeadersAhead {
                 headers,
                 blocks,
                 behind,
                 since_secs: secs,
+                bodies_unserved,
             },
         }
     }
@@ -178,14 +286,39 @@ impl ForkAlarm {
                  since the two split at height {fork_height}) that your node cannot obtain \
                  blocks for. Your view of the chain may be behind."
             ),
-            ForkAlarm::HeadersAhead {
-                behind, since_secs, ..
+            ForkAlarm::WaitingForBodies {
+                branch_height,
+                lead,
+                ..
             } => format!(
-                "Your node has known of {behind} block headers beyond its own blocks for {} \
-                 minutes and the gap is not closing: no connected peer is serving them. Your \
-                 view of the chain may be behind.",
-                since_secs / 60
+                "Your node holds headers for a chain {lead} blocks ahead of it (height \
+                 {branch_height}) and no connected peer is serving the block bodies for it. \
+                 btxd says it is at the tip of what it has been served and is waiting on the \
+                 network. That is usually blocks in flight rather than a split chain, and it \
+                 usually clears on its own; your view of the chain is behind until it does."
             ),
+            ForkAlarm::HeadersAhead {
+                behind,
+                since_secs,
+                bodies_unserved,
+                ..
+            } => {
+                let mins = since_secs / 60;
+                if *bodies_unserved {
+                    format!(
+                        "Your node has known of {behind} newer blocks beyond its own \
+                         for {mins} minutes and the gap is not closing: no connected peer is \
+                         serving them. Your view of the chain may be behind."
+                    )
+                } else {
+                    format!(
+                        "Your node has known of {behind} newer blocks beyond its own \
+                         for {mins} minutes and the gap is not closing. Its peers are serving \
+                         normally and btxd reports no missing body, so the hold-up is on this \
+                         machine rather than the network. Your view of the chain may be behind."
+                    )
+                }
+            }
         }
     }
 }
@@ -219,7 +352,9 @@ pub fn longer_branch(tips: &[ChainTip]) -> Option<ForkAlarm> {
             })
         })
         .max_by_key(|a| match a {
-            ForkAlarm::LongerBranch { lead, .. } => *lead,
+            ForkAlarm::LongerBranch { lead, .. } | ForkAlarm::WaitingForBodies { lead, .. } => {
+                *lead
+            }
             ForkAlarm::HeadersAhead { .. } => 0,
         })
 }
@@ -228,7 +363,12 @@ pub fn longer_branch(tips: &[ChainTip]) -> Option<ForkAlarm> {
 /// [`HEADERS_AHEAD_ALARM_SECS`], with the gap not closing. `gap` is `None`
 /// when the caller has not seen the gap cross the threshold, which is the
 /// healthy case and never alarms.
-pub fn headers_ahead(blocks: u64, headers: u64, gap: Option<GapWindow>) -> Option<ForkAlarm> {
+pub fn headers_ahead(
+    blocks: u64,
+    headers: u64,
+    gap: Option<GapWindow>,
+    bodies_unserved: bool,
+) -> Option<ForkAlarm> {
     let behind = headers.saturating_sub(blocks);
     let gap = gap?;
     if behind <= HEADERS_AHEAD_ALARM
@@ -242,22 +382,125 @@ pub fn headers_ahead(blocks: u64, headers: u64, gap: Option<GapWindow>) -> Optio
         blocks,
         behind,
         since_secs: gap.since_secs,
+        bodies_unserved,
     })
 }
 
 /// The verdict. A longer branch wins over a bare gap because it says more:
 /// where the chains split and by how much.
+/// `at_served_body_tip` is [`at_served_body_tip`] over the node's own log tail:
+/// btxd's statement that no connected peer is serving the next body. It does
+/// not change WHETHER this alarms, only WHAT the alarm is called — a branch we
+/// cannot get bodies for is worth saying either way, but calling a propagation
+/// race a fork is how the 2026-09-06 hold happened.
 pub fn fork_alarm(
     tips: &[ChainTip],
     blocks: u64,
     headers: u64,
     gap: Option<GapWindow>,
+    at_served_body_tip: bool,
 ) -> Option<ForkAlarm> {
-    longer_branch(tips).or_else(|| headers_ahead(blocks, headers, gap))
+    let branch = longer_branch(tips).map(|alarm| match alarm {
+        ForkAlarm::LongerBranch {
+            branch_height,
+            branch_len,
+            fork_height,
+            our_len,
+            lead,
+            since_secs,
+        } if at_served_body_tip => ForkAlarm::WaitingForBodies {
+            branch_height,
+            branch_len,
+            fork_height,
+            our_len,
+            lead,
+            since_secs,
+        },
+        other => other,
+    });
+    branch.or_else(|| headers_ahead(blocks, headers, gap, at_served_body_tip))
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// THE CARD MUST NOT SAY "0 minutes" ABOUT A TEN-MINUTE CONDITION.
+    ///
+    /// `headers_ahead` cannot fire before the gap has been open for
+    /// HEADERS_AHEAD_ALARM_SECS, so the alarm it returns already carries a
+    /// truthful age. The refresher used to overwrite it with time-since-first-
+    /// seen, which is ~0 on the very tick the alarm appears — the exact moment
+    /// the sentence is first shown to the user.
+    /// The 2026-09-16 screen. 41 headers beyond blocks for 574 minutes, with
+    /// 16 peers serving normally and the node holding blocks it had not
+    /// connected (`select=have_data_unconnected reason=ok`,
+    /// `in_flight_global=1`). The old sentence told the operator no peer was
+    /// serving them, which is the guess that cost two earlier investigations.
+    #[test]
+    fn headers_ahead_only_blames_peers_when_btxd_says_so() {
+        let stuck = GapWindow {
+            since_secs: 574 * 60,
+            behind_at_start: 41,
+        };
+
+        let unproven = headers_ahead(221_221, 221_262, Some(stuck), false)
+            .expect("41 behind for 574 minutes must alarm");
+        let msg = unproven.message();
+        assert!(
+            !msg.contains(SERVED_BODY_TIP_MARKER_PHRASE),
+            "must not accuse peers without evidence: {msg}"
+        );
+        assert!(msg.contains("41 newer blocks"), "{msg}");
+        assert!(msg.contains("574 minutes"), "{msg}");
+        assert!(
+            msg.contains("on this machine rather than the network"),
+            "{msg}"
+        );
+
+        let proven = headers_ahead(221_221, 221_262, Some(stuck), true)
+            .expect("same gap, with evidence, still alarms");
+        let msg = proven.message();
+        assert!(
+            msg.contains(SERVED_BODY_TIP_MARKER_PHRASE),
+            "with btxd's own marker the peer sentence is correct: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_ahead_carries_the_gap_age_it_measured() {
+        let gap = GapWindow {
+            since_secs: 20 * 60,
+            behind_at_start: 100,
+        };
+        let alarm =
+            headers_ahead(1000, 1200, Some(gap), false).expect("a stuck 200-block gap must alarm");
+        match alarm {
+            ForkAlarm::HeadersAhead { since_secs, .. } => assert_eq!(since_secs, 20 * 60),
+            other => panic!("expected HeadersAhead, got {other:?}"),
+        }
+        assert!(
+            alarm.message().contains("20 minutes"),
+            "the sentence must report the measured age: {}",
+            alarm.message()
+        );
+    }
+
+    /// The other variant genuinely has no clock of its own: a branch in
+    /// `getchaintips` carries no age, so the caller supplies one and
+    /// `with_since` is correct there.
+    #[test]
+    fn longer_branch_starts_with_no_age_and_takes_the_callers() {
+        let tips = vec![tip(210865, 0, "active"), tip(211167, 671, "headers-only")];
+        let alarm = longer_branch(&tips).expect("the 2026-09-05 shape must alarm");
+        match alarm {
+            ForkAlarm::LongerBranch { since_secs, .. } => assert_eq!(since_secs, 0),
+            other => panic!("expected LongerBranch, got {other:?}"),
+        }
+        match alarm.with_since(900) {
+            ForkAlarm::LongerBranch { since_secs, .. } => assert_eq!(since_secs, 900),
+            other => panic!("expected LongerBranch, got {other:?}"),
+        }
+    }
     use super::*;
 
     fn tip(height: u64, branchlen: u64, status: &str) -> ChainTip {
@@ -312,6 +555,7 @@ mod tests {
             blocks: 210865,
             behind: 302,
             since_secs: 900,
+            bodies_unserved: false,
         })
         .unwrap();
         assert_eq!(v["kind"], "headers_ahead");
@@ -327,7 +571,7 @@ mod tests {
             tip(191803, 112, "invalid"),
         ];
         assert_eq!(longer_branch(&tips), None);
-        assert_eq!(fork_alarm(&tips, 210865, 210865, None), None);
+        assert_eq!(fork_alarm(&tips, 210865, 210865, None, false), None);
     }
 
     #[test]
@@ -399,25 +643,26 @@ mod tests {
     #[test]
     fn headers_ahead_needs_the_gap_the_time_and_no_progress() {
         // No window yet: nothing to say.
-        assert_eq!(headers_ahead(210865, 211167, None), None);
+        assert_eq!(headers_ahead(210865, 211167, None, false), None);
         // Window too young.
         let young = GapWindow {
             since_secs: 60,
             behind_at_start: 302,
         };
-        assert_eq!(headers_ahead(210865, 211167, Some(young)), None);
+        assert_eq!(headers_ahead(210865, 211167, Some(young), false), None);
         // Old enough, gap unchanged: alarm.
         let stuck = GapWindow {
             since_secs: 700,
             behind_at_start: 302,
         };
         assert_eq!(
-            headers_ahead(210865, 211167, Some(stuck)),
+            headers_ahead(210865, 211167, Some(stuck), false),
             Some(ForkAlarm::HeadersAhead {
                 headers: 211167,
                 blocks: 210865,
                 behind: 302,
                 since_secs: 700,
+                bodies_unserved: false,
             })
         );
         // Old enough, gap GROWN: alarm.
@@ -425,15 +670,59 @@ mod tests {
             since_secs: 700,
             behind_at_start: 175,
         };
-        assert!(headers_ahead(210865, 211167, Some(grown)).is_some());
+        assert!(headers_ahead(210865, 211167, Some(grown), false).is_some());
         // Old enough but the gap is CLOSING: a node catching up. No alarm.
         let closing = GapWindow {
             since_secs: 700,
             behind_at_start: 800,
         };
-        assert_eq!(headers_ahead(210865, 211167, Some(closing)), None);
+        assert_eq!(headers_ahead(210865, 211167, Some(closing), false), None);
         // Gap back under the threshold: no alarm whatever the window says.
-        assert_eq!(headers_ahead(211150, 211167, Some(stuck)), None);
+        assert_eq!(headers_ahead(211150, 211167, Some(stuck), false), None);
+    }
+
+    /// THE 2026-09-06 HOLD, IN ONE ASSERTION.
+    ///
+    /// The tower that day was `headers-only`, branchlen 23, last_common
+    /// 211958, against an active tip of 211960 — numerically the same shape as
+    /// the 09-05 split and, on the numbers alone, a `LongerBranch`. btxd was
+    /// saying, once every 30 seconds, that no connected peer was serving the
+    /// body. With that read the verdict must be `WaitingForBodies`, and the
+    /// sentence must not accuse a fork: it cleared on its own in 47 minutes.
+    #[test]
+    fn a_tower_nobody_serves_bodies_for_is_not_called_a_fork() {
+        let tips = vec![tip(211960, 0, "active"), tip(211981, 23, "headers-only")];
+        let log = "2026-09-06T15:01:12Z Convergence note: tip-critical block 16440a39 \
+                   height=211959 has been requested for 2164s with no delivery -- no \
+                   connected peer is serving this BODY. The node is at the served body tip";
+        assert!(at_served_body_tip(log));
+
+        let alarm = fork_alarm(&tips, 211960, 211983, None, at_served_body_tip(log))
+            .expect("a branch we cannot get bodies for is still worth saying");
+        assert!(
+            matches!(alarm, ForkAlarm::WaitingForBodies { lead: 21, .. }),
+            "expected WaitingForBodies, got {alarm:?}"
+        );
+        let msg = alarm.message();
+        assert!(
+            !msg.to_lowercase().contains("longer chain exists"),
+            "must not read as a split: {msg}"
+        );
+        assert!(msg.contains("waiting on the network"), "{msg}");
+    }
+
+    /// The same tips with NO such line in the log stay a `LongerBranch`. The
+    /// engine's silence is not evidence of a propagation race, and the 09-05
+    /// split — which also presented as `headers-only` — must still be named.
+    #[test]
+    fn without_the_engines_own_read_a_longer_branch_is_still_a_longer_branch() {
+        let alarm = fork_alarm(&incident_tips(), 210865, 211167, None, false)
+            .expect("the 09-05 tips must alarm");
+        assert!(
+            matches!(alarm, ForkAlarm::LongerBranch { .. }),
+            "got {alarm:?}"
+        );
+        assert!(!at_served_body_tip("nothing of the sort in here"));
     }
 
     #[test]
@@ -442,11 +731,11 @@ mod tests {
             since_secs: 700,
             behind_at_start: 302,
         };
-        let alarm = fork_alarm(&incident_tips(), 210865, 211167, Some(stuck)).unwrap();
+        let alarm = fork_alarm(&incident_tips(), 210865, 211167, Some(stuck), false).unwrap();
         assert!(matches!(alarm, ForkAlarm::LongerBranch { .. }));
         // With no rival branch the gap speaks.
         let tips = vec![tip(210865, 0, "active"), tip(211167, 302, "headers-only")];
-        let alarm = fork_alarm(&tips, 210865, 211167, Some(stuck)).unwrap();
+        let alarm = fork_alarm(&tips, 210865, 211167, Some(stuck), false).unwrap();
         assert!(matches!(alarm, ForkAlarm::HeadersAhead { behind: 302, .. }));
         let msg = alarm.message();
         assert!(msg.contains("302"), "{msg}");

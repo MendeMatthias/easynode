@@ -23,8 +23,26 @@ export type ValidationInput = {
   rc_validates_independently: boolean;
   rc_may_fall_behind: boolean;
   rc_stalled: boolean;
+  /**
+   * btxd's standing warning that this machine cannot check the next block, as
+   * a sentence rendered in Rust (btx_core::engine_warnings) with btxd's reason.
+   * Null or absent when the engine is not saying it.
+   */
+  rc_unverifiable_message?: string | null;
   /** Following the chain via an attestation quorum instead of local replay. */
   rc_trusted_mirror: boolean;
+  /**
+   * A validating start hung in the engine's GPU check and the app moved the
+   * node to following signatures (btx_core::node::gpu_start_hung). Absent
+   * from an older backend, which reads as false.
+   */
+  gpu_start_hung?: boolean;
+  /**
+   * How the app names this machine's GPU: "graphics chip" on a Mac,
+   * "graphics card" elsewhere (btx_core::node::graphics_word). Absent from an
+   * older backend, which reads as "graphics card".
+   */
+  graphics_word?: string;
   /**
    * Archive peers passing the trusted-mirror authority gate (manual or noban),
    * or null when unknown (node stopped / didn't answer / older backend). On a
@@ -67,6 +85,17 @@ const HIDDEN: ValidationView = { state: null, note: "", cls: "" };
 // "Full" and "Basic" grade the CHECKING, not the node. Every install keeps the
 // whole chain (prune=0) and serves it to peers — there is no light mode here to
 // fall back to — so "Basic" must never read as a lesser KIND of node.
+/** The watchdog writes one sentence for the diagnostics and the screen
+ *  alike (btx_core::watchdog `StallVerdict::summary`), lower case and without
+ *  a full stop, to follow "Watchdog: " in the copied diagnostics. On the card
+ *  it is a sentence of its own. */
+function asSentence(s: string): string {
+  const t = s.trim();
+  if (!t) return t;
+  const capped = t.charAt(0).toUpperCase() + t.slice(1);
+  return /[.!?]$/.test(capped) ? capped : `${capped}.`;
+}
+
 export function validationView(status: ValidationInput): ValidationView {
   if (!status.running) return HIDDEN;
 
@@ -79,9 +108,19 @@ export function validationView(status: ValidationInput): ValidationView {
   if (status.stall) {
     return {
       state: "Needs attention",
-      note: status.stall.summary,
+      note: asSentence(status.stall.summary),
       cls: "is-stalled",
     };
+  }
+
+  // The engine's own standing warning that it cannot check the next block.
+  // It outranks everything read from the log below: btxd writes its startup
+  // verdict once, so a chip that qualified at startup and was quarantined an
+  // hour later still reads "Full" there. The sentence is the engine's case,
+  // not the generic one, which tells an Apple Silicon Mac that Apple Silicon
+  // runs it fine.
+  if (status.rc_unverifiable_message) {
+    return { state: "Stopped", note: status.rc_unverifiable_message, cls: "is-stalled" };
   }
 
   if (!status.rc_mode) {
@@ -134,24 +173,47 @@ export function validationView(status: ValidationInput): ValidationView {
     // because "we don't know" is not "it's broken".
     if (status.archive_authority === 0) {
       return {
-        state: "Mirror — waiting for a source",
+        state: "Mirror: waiting for a source",
         note:
           "Your node follows the chain using signed confirmations from other operators, " +
           "but right now it is not connected to any node allowed to hand them over. It " +
           "will keep trying the known sources on its own. If this message stays for more " +
-          "than an hour, your node may sit at a fixed block height until one comes back — " +
-          "nothing is lost, it catches up when a source appears.",
+          "than an hour, your node may sit at a fixed block height until one comes back. " +
+          "Nothing is lost. It catches up when a source appears.",
         cls: "is-stalled",
+      };
+    }
+    // A card that can check blocks but hung the engine's start-up check
+    // (0.7.1): the plain note would tell its owner the machine cannot check
+    // the proof of work at all, which is not what happened, and not say the
+    // way back.
+    if (status.gpu_start_hung) {
+      const word = status.graphics_word ?? "graphics card";
+      const short = word.replace(/^graphics /, "");
+      return {
+        state: "Mirror",
+        note:
+          `This machine's ${word} did not finish the engine's start-up check, so this ` +
+          "node follows signatures for now: it keeps up using signed confirmations from a node " +
+          `that does check the proof of work. Check blocks in Settings tries the ${short} again.`,
+        cls: "is-degraded",
       };
     }
     return {
       state: "Mirror",
+      // "Two independent operators" stopped being true at the 23 September
+      // split: one key signs the valid chain, this project's own (0.6.30).
+      // And a node that follows signatures now starts from a snapshot that key
+      // signed (btx_core::attested_snapshot), so "the balances, your node
+      // still checks" is only true once the background check reaches it. The
+      // sentence below holds for the compiled snapshot and the signed one.
       note:
         "This machine cannot check the new proof of work itself, so instead of stopping at " +
-        "block 185,000 your node follows the chain using signed confirmations from two " +
-        "independent operators who did check it. Everything else, the blocks, the " +
-        "transactions and the balances, your node still checks on its own. The trade is " +
-        "real: for that one check you are trusting those two, not verifying it yourself.",
+        "block 185,000 your node follows the chain using signed confirmations from a node " +
+        "that did check it. Today that is one signer, run by this project. Your node still " +
+        "checks the blocks and transactions on its own, and it re-checks the snapshot it " +
+        "started from in the background. The trade is real: for the proof of work you are " +
+        "trusting that signer, not verifying it yourself.",
       cls: "is-degraded",
     };
   }
@@ -173,4 +235,105 @@ export function validationView(status: ValidationInput): ValidationView {
   }
   // A mode we have no copy for. Show it plainly rather than inventing meaning.
   return { state: status.rc_mode, note: "", cls: "" };
+}
+
+/** The subset of the node status the follow-signatures decisions need. */
+export type FollowInput = {
+  rc_stalled: boolean;
+  rc_trusted_mirror: boolean;
+  rc_validates_independently: boolean;
+  /** The owner already chose to follow signatures on this machine. */
+  follow_signatures: boolean;
+  /** The app moved the node to following signatures after its graphics card
+   *  hung the engine's start-up check. Absent from an older backend. */
+  gpu_start_hung?: boolean;
+};
+
+/**
+ * The status screen's offer to follow signatures on a machine that cannot
+ * check blocks at all: its graphics chip did not pass the engine's own check,
+ * so the node sits still (rc_stalled, from the startup verdict or from the
+ * engine's standing warning). Null when the offer does not apply.
+ *
+ * The slow-machine offer (catchup-trend.ts) is the owner's decision of
+ * 2026-09-26: offered, never done for them. This is the same offer for a
+ * clearer case. A slow machine gives something up by switching; a machine
+ * that cannot check blocks gives up nothing, because it is not checking them
+ * now. It cannot sign now either, so a signer loses nothing by it.
+ */
+export function stalledFollowOffer(status: FollowInput): string | null {
+  if (!status.rc_stalled || status.rc_trusted_mirror || status.follow_signatures) return null;
+  return (
+    "This computer cannot check new blocks itself, so your node has stopped following the " +
+    "chain. It can follow signatures instead, as a Windows PC does: it then keeps up using " +
+    "signed confirmations from nodes that do check, and cannot sign. You can switch back in " +
+    "Settings."
+  );
+}
+
+/**
+ * Whether Settings shows the follow-signatures switch: wherever it is a real
+ * choice. A machine that checks blocks, one whose owner already chose, and
+ * one whose chip failed the check, which is the machine that needs the way
+ * out most. Not on a machine that follows signatures anyway.
+ */
+export function followRowVisible(status: FollowInput): boolean {
+  return (
+    status.follow_signatures ||
+    status.gpu_start_hung === true ||
+    status.rc_validates_independently ||
+    (status.rc_stalled && !status.rc_trusted_mirror)
+  );
+}
+
+/**
+ * Whether the Settings switch reads "on" (follows signatures). On for the
+ * owner's own choice, and on after the card hung the start-up check, because
+ * the node does follow signatures then: switching it off is "check blocks",
+ * which clears both and tries the card again, in one click.
+ */
+export function followToggleOn(status: FollowInput): boolean {
+  return status.follow_signatures || status.gpu_start_hung === true;
+}
+
+/**
+ * The line under the Settings switch once the restart it asked for is done.
+ * `gpuStartHung` is read from the status after that restart: "check blocks"
+ * tries the card again, and when it hangs again the node is back on
+ * signatures, which "checks blocks itself again" would deny (final review
+ * M2).
+ */
+export function followResultText(
+  on: boolean,
+  gpuStartHung: boolean,
+  graphicsWord: string = "graphics card",
+): string {
+  if (on) return "Your node restarted and follows signatures now.";
+  if (gpuStartHung) {
+    return (
+      `The ${graphicsWord} still did not finish the start-up check, so the node follows ` +
+      "signatures again."
+    );
+  }
+  return "Your node restarted and checks blocks itself again.";
+}
+
+/**
+ * The signer row's sentence on a machine moved to following signatures by a
+ * card that hung the start-up check: it cannot sign now, and the way back is
+ * the same switch (final review M4). Null where it does not apply.
+ */
+export function gpuHungSignerNote(status: {
+  gpu_start_hung?: boolean;
+  signer_applies_here: boolean | null;
+  graphics_word?: string;
+}): string | null {
+  if (!status.gpu_start_hung || status.signer_applies_here !== false) return null;
+  const word = status.graphics_word ?? "graphics card";
+  const short = word.replace(/^graphics /, "");
+  return (
+    `This machine follows signatures for now because its ${word} did not finish the engine's ` +
+    `start-up check, so it cannot sign. Check blocks in Settings tries the ${short} again, and ` +
+    "signing comes back once the node checks blocks"
+  );
 }

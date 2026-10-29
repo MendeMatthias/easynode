@@ -38,22 +38,103 @@ use tokio::process::{Child, Command};
 /// fresh node fetch the branch at all; history up to the split is the same on
 /// both chains and still comes from the archives.
 pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
+    // ORDER IS THE POINT, not a preference. `-addnode` peers are dialled in
+    // list order and the engine grants only MAX_ADDNODE_CONNECTIONS (8)
+    // manual slots at a time (net.h:112, `semAddnode`), so whatever sits at
+    // the top of this list is what a fresh or reconnecting node reaches
+    // FIRST. A live-chain body source below the eighth entry is a body source
+    // the node may not dial for minutes. Live chain first, archives after.
+    //
     // The one node found on the live chain 2026-09-05 19:49Z: /BTX:0.34.5/,
     // MATMUL_CONSENSUS, at 211197 while every other reachable node was at or
     // below 210872, and it answered `getdata` for the live branch's first
     // block (210497, 2d816071…) with the body. NETWORK_LIMITED — recent
     // blocks only — so it carries the post-split chain, not deep history.
-    "13.140.141.180:19335",
-    // Refused every dial from the validator on 2026-09-05 ("Connection
-    // refused", hundreds of debug.log lines) and did not answer the probe.
-    // Kept: it is the only full-history archive the census ever found, and a
-    // retired seed costs one failed dial.
-    "207.56.229.99:19335",
+    //
+    // ── MEASURED DEAD 2026-09-11, so it leaves the first seat ────────────────
+    // Probed from this project's Mac at 15:5xZ: three TCP attempts, twelve
+    // seconds apart, ConnectionRefused on all three. Refused, not slow, so this
+    // is not the in-flight-handshake trap the pool peer below is documented
+    // for. Corroborated twice, the way the 09-08 retirements were: btxscan's
+    // live node no longer has it in getpeerinfo, and the easybtx.com census
+    // dropped it from livePeers, the consenting seeds it measured on the
+    // heaviest chain, which that day listed 89.85.40.184 alone.
+    //
+    // It held the FIRST manual slot. Under the eight-slot cap a dead first
+    // entry is a slot every fresh or reconnecting node burns before it reaches
+    // a live one. Put it back the day it answers again, with the measurement.
+    //
+    //   "13.140.141.180:19335"  0/3 — ConnectionRefused, 2026-09-11
+    // LuckyPool. Reported to us 2026-09-07 as a live body source, and
+    // CONFIRMED here 2026-09-08 by starting a real v0.34.6 node against a
+    // scratch datadir with exactly this manual set and reading `getpeerinfo`:
+    //
+    //     /BTX:0.34.6/  synced_headers 93999  743 KB received
+    //     WITNESS, SHIELDED, NETWORK_LIMITED, CONSENSUS, ATTESTATION_ARCHIVE
+    //
+    // CONSENSUS + ATTESTATION_ARCHIVE is the scarce half: of the nine peers in
+    // that run only three advertised ATTESTATION_ARCHIVE. It is
+    // NETWORK_LIMITED, so it carries recent bodies rather than deep history —
+    // which is why it is a bootstrap seed and NOT in BTX_ARCHIVE_PEERS, whose
+    // noban grant belongs to peers that can answer a deep body request.
+    //
+    // ⚠ READ THE MEASUREMENT LATE, NOT EARLY. Two minutes into that same run
+    // this peer read `version 0, subver "", services [], synced_headers -1,
+    // 194 bytes` — indistinguishable from the dead seeds this list retires for
+    // exactly that signature — and it was struck from this list on the
+    // strength of it. It is the only peer here without P2P_V2, so it falls
+    // back to a v1 handshake and takes longer to come up than the other eight.
+    // Four minutes later it was a fully handshaked attestation archive. A seed
+    // is disqualified by a settled measurement, never by a snapshot taken
+    // while the handshake is still in flight.
+    //
+    // ── MEASURED DEAD 2026-09-12, by the standard the paragraph above sets ──
+    // Not a snapshot this time. btxscan's live v0.34.5 node was asked to
+    // `addnode 213.224.31.105:33706 onetry` and left for 300 seconds, past the
+    // four minutes the 09-08 handshake needed: no peer appeared at all, not
+    // even the half-handshaked `version 0` shape. The same onetry to
+    // 89.85.40.184 produced a full /BTX:0.34.6/ peer in 20 seconds. From the
+    // project Mac, TCP opened but no version message came back inside 30 s on
+    // 09-11 and inside 200 s on 09-12. Two clients, two days, one real node
+    // waiting longer than the documented worst case. Put it back the day a
+    // real node handshakes it again, with that reading.
+    //
+    //   "213.224.31.105:33706"  onetry 300 s, no peer — 2026-09-12
+    // ── MEASURED DEAD 2026-09-08, and that is why they are not here ──────────
+    // Probed from this project's Mac: three TCP attempts each, eight-second
+    // timeout, 0/3 answered. Corroborated by the box's own live node, which has
+    // carried all three as manual peers for days and has none of them in
+    // getpeerinfo while it holds seven other manual connections.
+    //
+    // They are commented out rather than deleted because the cap is what makes
+    // this matter. The engine dials eight manual peers; with these in the list
+    // two of those eight went to hosts that do not answer, and the peers pushed
+    // past the cap were node.btx.dev and node.btxchain.org — which that same
+    // getpeerinfo shows CONNECTED and serving at the tip. A dead seat used to
+    // cost one failed dial and then free its slot; under a hard cap it costs
+    // the slot outright. Put one back the day it answers again.
+    //
+    //   "207.56.229.99:19335"   0/3 — "the only full-history archive the census
+    //                           ever found", refusing every dial since
+    //                           2026-09-05 (docs/incident-2026-09-05-fork.md)
+    //   "114.150.94.235:19335"  0/3 — no answer to the 09-05 probe either
     // 2026-09-05 19:49Z: answered at 210872 on the minority branch. Still a
     // NETWORK archive for the shared history.
-    "37.230.134.222:19335",
-    // 2026-09-05 19:49Z: no answer to the probe.
-    "114.150.94.235:19335",
+    //
+    // ── OFF THE HEAD 2026-09-13, five hours after it was put there ──────────
+    // btxscan's live node, which carries this address as a manual peer, logged
+    // `connect() to 37.230.134.222:19335 failed after wait: Connection refused
+    // (111)` every 17 seconds from 2026-09-12 23:31Z, still refusing at 09-13
+    // 05:00Z; getaddednodeinfo connected=false; a fresh onetry produced no
+    // peer; three spaced probes from the Mac were refused. Refused, not slow.
+    //
+    // It stayed in BTX_ARCHIVE_PEERS below until 2026-10-03 (measured dead
+    // there too, see that list), because upstream's maintainer node had come
+    // back before; there it was still dialled, after the seeds that answer. What
+    // it must not be is the FIRST dial every fresh node makes. Put it back here
+    // the day a real node handshakes it again, with that reading.
+    //
+    //   "37.230.134.222:19335"  refused since 2026-09-12 23:31Z
     // 2026-09-05 19:49Z: no answer to the probe, and on the validator's
     // banlist. Both were this side's doing: at 20:23Z the same node, dialled
     // as a manual peer, was /BTX:0.34.6/ with NETWORK + MATMUL_CONSENSUS on
@@ -62,7 +143,16 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // engine's getmmattest hammer (btxchain/btx#142) for asking about
     // blocks we did not have. The one shipped seed proven on the live
     // chain with full history.
-    "89.85.40.184:19335",
+    //
+    // ── MEASURED DEAD 2026-10-01, so it leaves the list ─────────────────────
+    // Probed from this project's Mac at 17:18Z: three TCP attempts, four
+    // seconds apart, eight-second timeout, refused on all three. Corroborated
+    // by the easybtx.com census, which lists this seed as down with 0% uptime
+    // over its stored history. Its noban grant in BTX_LIVE_BODY_SOURCE_IPS
+    // stays, as the two retired above kept theirs. Put it back the day a real
+    // node handshakes it again, with that reading.
+    //
+    //   "89.85.40.184:19335"  0/3 refused — 2026-10-01
     // 139.59.106.83 REMOVED 2026-09-01. Three independent confirmations that it
     // sits on a stale branch: an operator caught it serving header 8b4842ee at
     // height 204,615 where the canonical block is e19acc35 (Byron and our own
@@ -71,7 +161,14 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // tip; its BODIES were valid, which is exactly why it looked healthy. A
     // seed that wedges fresh header presync is disqualified regardless.
     // 2026-09-05 19:49Z: answered at 210872 on the minority branch; NETWORK.
-    "194.93.48.158:19335",
+    //
+    // ── MEASURED DEAD 2026-10-01, so it leaves the list ─────────────────────
+    // The same probe from this project's Mac at 17:18Z: 0/3, refused. The
+    // easybtx.com census last reached it around 2026-09-26 (22% uptime over
+    // its stored history). Put it back the day a real node handshakes it
+    // again, with that reading.
+    //
+    //   "194.93.48.158:19335"  0/3 refused — 2026-10-01
     // Operator node, at tip, open inbound, consented to being a seed 2026-09-01
     // with the honest caveat that it is a rented box he cannot promise forever.
     // A retired seed costs one failed dial; the checkpoint gate (planned) makes
@@ -100,6 +197,24 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // AND current (docs/archival-capacity.md).
     // 2026-09-05 19:49Z: answered at 210862 (minority branch, ten behind it).
     "109.199.124.187:19335",
+    // archive.btxbyronbay.com, Jarek's FULL-HISTORY archive, offered by its
+    // operator 2026-10-11 ("serves the entire chain: every block header and
+    // every full block"). Measured from this project's Mac the same day, by
+    // name and by this IP: /BTX:0.34.15/, protocol 800002, start height
+    // 244,596 (the pool seed above read 244,597 in the same minute), services
+    // 0x2000d09 = NETWORK, WITNESS, SHIELDED, NETWORK_LIMITED, P2P_V2 and
+    // MATMUL_TRUSTED_MIRROR. Then asked for deep bodies: `getdata` for block
+    // 1,000 returned it in 0.6 s and for block 150,000 (1,048,962 bytes) in
+    // 2.3 s, each naming the right parent (894cc48f… and 06754227…).
+    //
+    // It sits here, after the live-chain seed, and NOT in BTX_ARCHIVE_PEERS:
+    // it carries no MATMUL_ATTESTATION_ARCHIVE bit and is itself a trusted
+    // mirror, so it cannot hand signatures to a mirror, which is what that
+    // list is for. What it does hold is the whole chain, which no other entry
+    // in either list does. Literal IP, like every entry here, because the
+    // catch-up help matches these against the engine's peer addresses; if the
+    // host moves, the name above is where to look first.
+    "134.199.150.193:19335",
     // 89.167.80.220 and 51.15.18.10 REMOVED 2026-09-05. Both /BTX:0.32.12/,
     // both measured parked at 185,109 on a pre-fork dead branch and answering
     // 2,000 headers of it to anyone who asks; the validator has carried both
@@ -124,18 +239,200 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
 /// numair's fleet archives. Update as the census evolves — the nodes directory
 /// on easybtx.com will carry the live archive flag (service bit 31).
 pub const BTX_ARCHIVE_PEERS: &[&str] = &[
-    "207.56.229.99:19335",
+    // 2026-09-24: btxscan.io's mirror on Azure (the node behind api.btxscan.io,
+    // v0.34.9, on the valid side of the 227313 split). FIRST, because after the
+    // split it is the one reachable peer measured holding `02d5efca`'s
+    // signatures, which is the only key signing the valid chain: probed from a
+    // Mac with pull_attest.py it returned them for the tip, for 227,400 and for
+    // 227,313 `d5f0e92f` itself, while 194.93.48.158 and 109.199.124.187
+    // returned none and 37.230.134.222 refused TCP. A mirror that pins the key
+    // but dials nobody who holds its signatures stays at 227,312 all the same.
+    // Signers already dial it (signer::BTX_MIRRORS_FED_BY_SIGNERS), once.
+    "20.86.181.203:19338",
+    // 2026-10-10: btxscan's OTHER node on the same box, port 19335, the one
+    // with the whole chain. Owner's decision the same evening, after 0.7.9
+    // shipped Jarek's archive. Measured from this project's Mac:
+    // /BTX:0.34.15/, at the tip (start height 244,623), services 0x82000d09 =
+    // NETWORK, WITNESS, SHIELDED, NETWORK_LIMITED, P2P_V2,
+    // MATMUL_TRUSTED_MIRROR and MATMUL_ATTESTATION_ARCHIVE. `getdata` for block
+    // 150,000 returned its 1,048,962 bytes in 0.9 s naming parent 06754227…,
+    // where 19338 above and 109.199.124.187 answered NOTFOUND. GETMMATTEST
+    // returned `02d5efca`'s signature, the key signing the chain, for 244,652,
+    // for 240,000 and for 227,313 `d5f0e92f` itself. So it is both halves of
+    // what this list is for: signatures for a mirror, and the old blocks the
+    // catch-up help asks for.
+    //
+    // Same machine as 19338: a second node for when one of the two stalls
+    // (as 19338 did on 2026-10-10, handshaking nobody while btxscan sat at
+    // 244,097), not a second site. The independent full-history source is
+    // Jarek's archive in BTX_BOOTSTRAP_PEERS; this one has no MATMUL bits of
+    // its own to lose a race over. 20.86.181.203 already holds the noban grant
+    // in BTX_ARCHIVE_WHITELIST_IPS, which covers both ports.
+    "20.86.181.203:19335",
+    // 207.56.229.99, 114.150.94.235 and 195.137.245.82 were measured 0/3 on
+    // 2026-09-08 and are listed with that measurement in BTX_BOOTSTRAP_PEERS
+    // above. An archive that does not answer cannot be a download source, and
+    // under the eight-slot manual cap listing it evicts one that can.
+    //
+    // node.btx.dev, node.btxchain.org and node.btx.tools LEFT this list on
+    // 2026-09-09: measured, they are discovery relays and not archives. They
+    // are in BTX_DISCOVERY_PEERS below, with the reading that moved them.
+    //
     // 2026-08-31: upstream's maintainer-grade node. Runs the unreleased 0.34.6
-    // and advertises MATMUL_ATTESTATION_ARCHIVE (observed live the same day).
-    "37.230.134.222:19335",
-    "114.150.94.235:19335",
-    "195.137.245.82:20982",
+    // and advertises MATMUL_ATTESTATION_ARCHIVE (observed live the same day),
+    // and confirmed again 2026-09-08 from a running node: NETWORK, CONSENSUS
+    // and ATTESTATION_ARCHIVE, 12.1 MB served in six minutes.
+    //
+    // ── MEASURED DEAD 2026-10-03, so it leaves the list ─────────────────────
+    // Refused since 2026-09-12 23:31Z, recorded in BTX_BOOTSTRAP_PEERS above
+    // where it left the head. Probed again from this project's Mac at 23:35Z:
+    // three TCP attempts, four seconds apart, eight-second timeout, 0/3. It
+    // goes now because btx-sentinel, the box watcher, dials every shipped seed
+    // and would otherwise alarm on it every hour. Its noban grant in
+    // BTX_ARCHIVE_WHITELIST_IPS stays, as the retired seeds kept theirs. With
+    // it gone, btxscan's mirror above is the ONLY archive this app ships,
+    // which is worth knowing before anyone reasons about how many we have.
+    // Put it back the day a real node handshakes it again, with that reading.
+    //
+    //   "37.230.134.222:19335"  0/3 refused — 2026-10-03
     // 185.204.25.227 removed 2026-08-31: refused TCP outright in every probe
     // that day and upstream's re-vetted census no longer lists it.
+];
+
+/// DISCOVERY relays: peers that introduce other peers and cannot serve a block.
+///
+/// These three sat in [`BTX_ARCHIVE_PEERS`] until 2026-09-09 and are not
+/// archives. Read from a live v0.34.6 node with the shipped manual set, after
+/// the handshakes settled:
+///
+/// ```text
+/// node.btxchain.org   /BTX:0.34.5/   25 KB   WITNESS, SHIELDED, P2P_V2, DISCOVERY
+/// node.btx.tools      /BTX:0.34.5/   18 KB   WITNESS, SHIELDED, P2P_V2, DISCOVERY
+/// node.btx.dev        /BTX:0.34.5/   18 KB   WITNESS, SHIELDED, P2P_V2, DISCOVERY
+/// ```
+///
+/// `MATMUL_DISCOVERY` and **no `NETWORK`** — the 0.34 pointer-only role
+/// (`-matmulvalidation=relay`, `init.cpp:2643`, which clears NODE_NETWORK and
+/// NODE_NETWORK_LIMITED on purpose). Beside them the real block sources moved
+/// 10 to 17 MB in the same window. They introduce peers; they do not carry
+/// chain.
+///
+/// WHY THEY ARE DIALLED AS SEED NODES, NOT MANUAL PEERS. An introducer is
+/// worth a slot on a network whose DNS seeds are unreliable: a fresh node has
+/// to reach somebody, and these answer. They used to be dialled as manual
+/// (`-addnode`) peers, last after the archives in [`manual_peers`], on the
+/// reasoning that a peer that can serve a block would always outrank one that
+/// cannot. That reasoning missed that the engine hands a MANUAL peer block
+/// requests regardless of whether it can ever answer them, and never
+/// disconnects one for slow delivery. Measured on mainnet 30 September 2026,
+/// on a fresh keeper mirror from the pinned pair: with the three relays as
+/// manual peers it gained one block in 3.5 minutes, three more still in
+/// flight at the relays when they were removed by hand; with them gone it
+/// gained 561 blocks in the following 5.5 minutes, the engine alone. They are
+/// dialled with `-seednode=<host>` instead (`build_node_command`), the
+/// engine's own introducer role: an ADDR_FETCH connection that fetches
+/// addresses and disconnects, excluded from block download by
+/// `net_processing.cpp` (`!pto->IsAddrFetchConn()`).
+///
+/// WHAT THEY LOST. The `noban` grant in [`BTX_ARCHIVE_WHITELIST_IPS`], which is
+/// documented there as belonging to peers that can answer a deep body request.
+/// It never bought them anything anyway — `IsTrustedMirrorAuthorityPeer` needs
+/// `archive && (m_noban || m_manual)` and they do not advertise the archive
+/// bit, so the grant could never fire. Dropping it costs nothing and stops the
+/// config claiming something untrue.
+pub const BTX_DISCOVERY_PEERS: &[&str] = &[
     "node.btx.dev:19335",
     "node.btxchain.org:19335",
     "node.btx.tools:19335",
 ];
+
+/// How many `-addnode` peers the engine will actually work through.
+///
+/// `MAX_ADDNODE_CONNECTIONS = 8` (`src/net.h:112`), and it is not a soft
+/// preference: `CConnman::Start` builds `semAddnode` with exactly that many
+/// grants, and `ThreadOpenAddedConnections` walks the added-node list in
+/// order taking one grant per peer it has to dial. A peer past the eighth
+/// unconnected entry is skipped (`if (!grant) continue;`) until a grant frees.
+///
+/// Two engine facts make this a correctness constant rather than trivia, both
+/// read from the shipped v0.34.6 tree:
+///
+///   * **There is no dedupe.** `init.cpp:3468` does
+///     `connOptions.m_added_nodes = args.GetArgs("-addnode")` and `net.h:1323`
+///     `push_back`s each one, so a peer named twice becomes two entries. The
+///     comment this replaced claimed "btxd dedupes addnode entries"; it does
+///     not. Only the `addnode` RPC dedupes, and that is a different path.
+///   * **Every source is merged.** `GetSettingsList` (`common/settings.cpp`)
+///     appends config-file values AFTER command-line ones for list args, so
+///     the same peer in the conf and on the CLI really is two entries.
+///
+/// Together those made the manual set on 2026-09-05 the union of the CLI's
+/// eleven distinct peers and the conf's copy of the same list. Eleven distinct
+/// peers cannot fit in eight slots, so three of them were never dialled at
+/// all, and during the cold-start window — before any connection is
+/// established, when every entry still reads `fConnected = false` — the
+/// duplicates consumed grants too. That is the shape of "the live-chain peer
+/// was never dialled for 13 minutes".
+pub const MAX_MANUAL_PEERS: usize = 8;
+
+/// The peers that can actually SERVE A BLOCK: the live-chain seeds and the
+/// archives, and deliberately not the discovery relays.
+///
+/// Exists for the watchdog's remediation, which is the one automated action
+/// this app takes on a frozen node: redial peers over RPC `addnode` so the
+/// manual exemption gets past the engine's body gate. That loop used to walk
+/// [`BTX_ARCHIVE_PEERS`], and until 2026-09-09 three of the four entries in
+/// that list were `MATMUL_DISCOVERY` relays which advertise no `NETWORK` and
+/// cannot answer a `getdata` at all. So the recovery with a production receipt
+/// behind it — an archive handshake unsticking a node in 21 seconds — was
+/// spending three of its four dials on peers structurally incapable of
+/// providing it.
+///
+/// Not capped at [`MAX_MANUAL_PEERS`]: this is an RPC redial of hosts the node
+/// mostly already has, not the start-up `-addnode` set, and a frozen node is
+/// exactly when it is worth asking everyone who might answer.
+pub fn block_source_peers() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for peer in BTX_BOOTSTRAP_PEERS.iter().chain(BTX_ARCHIVE_PEERS.iter()) {
+        if !out.contains(peer) {
+            out.push(peer);
+        }
+    }
+    out
+}
+
+/// The manual (`-addnode`) peer set for one start: deduplicated, capped at
+/// [`MAX_MANUAL_PEERS`], live chain first.
+///
+/// Order is inherited from the two lists, which is the whole design:
+/// [`BTX_BOOTSTRAP_PEERS`] leads with the peers measured on the live chain,
+/// and [`BTX_ARCHIVE_PEERS`] follows with the deep-history archives. A node
+/// that can only dial eight peers should spend those eight on the chain it
+/// must follow, then the history it can fetch later.
+///
+/// [`BTX_DISCOVERY_PEERS`] is deliberately NOT in this set. They advertise no
+/// NETWORK bit and cannot serve a block, but a MANUAL peer is asked for one
+/// anyway and the engine never disconnects it for slow delivery. Measured on
+/// mainnet 30 September 2026: dialled as manual peers, the three relays held
+/// a fresh mirror to one block in 3.5 minutes; with them gone the same node
+/// gained 561 blocks in the following 5.5 minutes. `build_node_command` dials
+/// them with `-seednode=` instead, the engine's own introducer role.
+///
+/// Truncation is silent to btxd but not to us: anything past the cap is
+/// dropped here rather than handed to an engine that would ignore it, so the
+/// set this returns is the set the node actually dials.
+pub fn manual_peers() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::with_capacity(MAX_MANUAL_PEERS);
+    for peer in BTX_BOOTSTRAP_PEERS.iter().chain(BTX_ARCHIVE_PEERS.iter()) {
+        if out.len() >= MAX_MANUAL_PEERS {
+            break;
+        }
+        if !out.contains(peer) {
+            out.push(peer);
+        }
+    }
+    out
+}
 
 /// `whitelist=in,out,noban@<ip>` targets asserted into the conf at start.
 ///
@@ -149,17 +446,61 @@ pub const BTX_ARCHIVE_PEERS: &[&str] = &[
 /// node.btx.tools=164.90.246.229). A stale IP line is harmless — it simply
 /// matches no peer.
 pub const BTX_ARCHIVE_WHITELIST_IPS: &[&str] = &[
+    // btxscan.io's mirror, the archive peer added 2026-09-24 (BTX_ARCHIVE_PEERS).
+    "20.86.181.203",
     "207.56.229.99",
+    // Left BTX_ARCHIVE_PEERS 2026-10-03, measured dead; the grant stays.
     "37.230.134.222",
     "114.150.94.235",
     "195.137.245.82",
-    "146.190.179.86",
-    "206.189.253.106",
-    "164.90.246.229",
+    // 146.190.179.86, 206.189.253.106 and 164.90.246.229 left on 2026-09-09.
+    // They are node.btx.dev, node.btxchain.org and node.btx.tools, which are
+    // discovery relays rather than archives (see BTX_DISCOVERY_PEERS), and this
+    // list's grant is documented above as belonging to peers that can answer a
+    // deep body request. They no longer reach us as manual peers either (see
+    // BTX_DISCOVERY_PEERS): they are dialled as seed nodes now, so this grant
+    // would buy them nothing even if it were restored.
 ];
 
-/// The archive noban-whitelist targets for THIS start: the pinned IPs above
-/// plus a fresh DNS resolution of every hostname in [`BTX_ARCHIVE_PEERS`].
+/// Live-chain BODY SOURCES that get the same `noban` grant as the archives.
+///
+/// WHY THESE ARE HERE AND NOT IN [`BTX_ARCHIVE_WHITELIST_IPS`]. That list is
+/// the deep-history archives, and its doc comment is explicit that the grant
+/// belongs to peers that can answer a deep body request. These three cannot,
+/// or are not known to: they are the peers measured serving the LIVE chain's
+/// recent bodies. Two different jobs, so two lists, and the comment above each
+/// stays true.
+///
+/// WHY THEY GET THE GRANT AT ALL. `noban` and `addnode` are the two halves of
+/// the same authority gate, and the engine skips a peer that has never served
+/// it a body unless the peer is manual or noban (`net_processing.cpp`,
+/// `no_body_availability`). These peers are already manual — they are at the
+/// head of [`BTX_BOOTSTRAP_PEERS`] — so the grant is belt-and-braces rather
+/// than the primary fix, and it is worth having for two reasons. It survives
+/// the manual list being trimmed at [`MAX_MANUAL_PEERS`], and it is what stops
+/// the engine's own `getmmattest` ban from taking out a live body source: on
+/// 2026-09-05 the validator banned 89.85.40.184 for exactly that
+/// (btxchain/btx#142, `docs/incident-2026-09-05-fork.md`) and then could not
+/// fetch the live branch from the one peer that had it.
+///
+/// The managed block is rewritten on every start, so an address that leaves
+/// this list loses its grant at the next launch, same as an archive.
+pub const BTX_LIVE_BODY_SOURCE_IPS: &[&str] = &[
+    // LuckyPool, measured 2026-09-08 handshaking with CONSENSUS +
+    // ATTESTATION_ARCHIVE (see BTX_BOOTSTRAP_PEERS for the full reading).
+    "213.224.31.105",
+    // The one node found on the live chain 2026-09-05 19:49Z that answered
+    // getdata for the live branch's first block with the body.
+    "13.140.141.180",
+    // Served the validator's whole 383-block reorganisation on 2026-09-05
+    // after it was dialled as a manual peer, having been banned by this side's
+    // own getmmattest hammer earlier the same day.
+    "89.85.40.184",
+];
+
+/// Every noban-whitelist target for THIS start: the pinned archive IPs, the
+/// live-chain body sources, and a fresh DNS resolution of every hostname in
+/// [`BTX_ARCHIVE_PEERS`].
 ///
 /// The pinned constants keep the mirror working when DNS is down; the live
 /// resolution keeps the whitelist tracking a ROTATED host instead of blessing
@@ -168,12 +509,20 @@ pub const BTX_ARCHIVE_WHITELIST_IPS: &[&str] = &[
 /// neither set — that pair is what makes the noban grant revocable.
 ///
 /// Blocking (getaddrinfo): call it off the async executor.
-pub fn resolve_archive_whitelist_ips() -> Vec<String> {
+pub fn resolve_managed_whitelist_ips() -> Vec<String> {
     use std::net::ToSocketAddrs;
-    let mut ips: Vec<String> = BTX_ARCHIVE_WHITELIST_IPS
+    let mut ips: Vec<String> = Vec::new();
+    for ip in BTX_ARCHIVE_WHITELIST_IPS
         .iter()
-        .map(|s| s.to_string())
-        .collect();
+        .chain(BTX_LIVE_BODY_SOURCE_IPS.iter())
+    {
+        // A peer that is both an archive and a live body source is one grant,
+        // not two: btxd reads a repeated whitelist line as a repeated grant and
+        // the block would grow a duplicate on every start.
+        if !ips.iter().any(|had| had == ip) {
+            ips.push(ip.to_string());
+        }
+    }
     for peer in BTX_ARCHIVE_PEERS {
         // Literal-IP peers are already pinned above; only hostnames resolve.
         let host = peer.rsplit_once(':').map(|(h, _)| h).unwrap_or(peer);
@@ -190,6 +539,235 @@ pub fn resolve_archive_whitelist_ips() -> Vec<String> {
         }
     }
     ips
+}
+
+// ── HEADER BOOTSTRAP ─────────────────────────────────────────────────────────
+//
+// A datadir's FIRST header sync talks only to [`block_source_peers`], each with
+// a `noban` grant that exists on that one launch's command line, and the node
+// restarts into ordinary dialling once its headers pass the snapshot anchor.
+//
+// WHY. v0.34.9 will not store a header from a chain with less work than its
+// `nMinimumChainWork` (height 186000) until a low-work PRE-sync has checked the
+// peer's chain twice, and on this chain that check is quadratic in height. For
+// every header, `headerssync.cpp` replays MatMul ASERT difficulty over a
+// synthetic index that has no skip pointers, and `pow.cpp` asks it for
+// `GetAncestor(anchor_height)` with the ASERT anchor at 50000, so every header
+// walks back one `pprev` at a time. It runs on btxd's single message-handler
+// thread. Measured 2026-09-23 on an M2 Pro, with a fresh v0.34.9 datadir
+// connected to ONE healthy peer (89.85.40.184) that had no grant: a batch of
+// 2000 headers took 0.5 s near height 70000 and 20 to 26 s near 150000-172000;
+// the pre-sync needed 10 min 57 s to reach 186000, the redownload pass then
+// started again from height 0 with the same profile, and headers passed 219000
+// after 32 minutes.
+//
+// Worse, it is not one pre-sync. Every peer that answers a `getheaders` with
+// low-work headers gets its own, and the engine probes every peer that
+// advertises a higher chain. The network's parked nodes (185109, 189611,
+// 128514, …) answer those probes, so a fresh node that dials them spends its
+// message-handler rounds on their pre-syncs and takes one batch per round from
+// the peer that could have finished in a minute. Measured the same day with
+// the app's own launch on five fresh datadirs: twice the noban peer at the head
+// of the manual list (89.85.40.184) answered first and headers reached the tip
+// about 50 s after the first one arrived. Three times a peer without the grant
+// answered a probe within seconds of it, the curated 109.199.124.187 or a
+// parked outbound peer (189611, 185109, 185042), and more followed: headers
+// passed the anchor after 18 minutes once, and were still short of it after 20
+// and 30 minutes the other two times.
+// Without the app's whitelist it is the "dial anyone" run in
+// docs/node-release-recipe.md: fifteen pre-syncs in 45 minutes, 66076 headers,
+// and ten `low-work headers sync failure`s, each `non-continuous headers`,
+// because rounds took so long that answers stopped joining the pre-sync they
+// belonged to.
+//
+// `noban` is what skips the pre-sync: "If our peer has NoBan privileges, then
+// bypass our anti-DoS logic" (net_processing.cpp, ProcessHeadersMessage) sends
+// a noban peer's headers straight into the block index. `-connect` is what
+// keeps the parked peers out: it turns off addrman dialling, and with it DNS
+// seeding and the fixed seeds, so nobody but the named peers is ever probed.
+// Neither is enough alone: a connected peer without the grant is the 32-minute
+// run above. Together, measured with this launch on three fresh datadirs:
+// headers past the anchor 58 to 71 s after the first one arrived, one of them
+// with 89.85.40.184 unreachable, and not one pre-sync.
+//
+// WHY IT ENDS AT THE ANCHOR, and why a restart ends it. The cost belongs to a
+// node whose best header is low: once the block index holds headers past the
+// minimum-work height, a peer's headers connect high and no pre-sync starts,
+// and one that does starts from a real index entry, whose skip pointers make
+// the walk short. The snapshot anchor (219000) is past that height and is what
+// the app waits for anyway. `-connect` cannot be undone at runtime, and a node
+// left on four curated peers would never learn another branch, so the app
+// restarts it into the ordinary launch. On a Mac that costs one more MatMul
+// canary, 80 to 125 s.
+//
+// Measured after each of those three: the ordinary launch on the same datadir
+// dialled three to eleven outbound peers, most of them parked, and started no
+// pre-sync at all.
+//
+// WHAT IT COSTS. For the minutes it lasts the node trusts the curated set for
+// its view of the chain. Checkpoints up to 219000 bound what that set could
+// feed it below the anchor, the snapshot it loads next is pinned by hash, and
+// the grants vanish with the command line. Above the anchor its view is theirs
+// until the restart. On 2026-09-23 that was the d5f0e92f… side of the 227313
+// split: 109.199.124.187 and 194.93.48.158 served its headers AND bodies to
+// 227420 by 22:50Z. btxscan and the signer mirror followed the heavier tower
+// from b28c3e84…, which jpp reported fails ExactReplay on CPU and GPU (the
+// case upstream's draft 0.34.10 notes call a false header; not replayed here).
+// So "heavier" is not "right": do not move this list toward whichever branch
+// has more headers. After the restart the node hears both; its own validation,
+// or on a mirror its pinned signers, decides, and since #131
+// `crate::known_invalid` refuses b28c3e84… on every node regardless.
+//
+// If every curated source is down the headers never move, and
+// [`header_bootstrap_verdict`] gives up after [`HEADER_BOOTSTRAP_STALL`] and
+// restarts the node the ordinary way, which is slower than this but no worse
+// than before it existed.
+
+/// Sticky per-datadir record that the next launch is a header-bootstrap launch.
+///
+/// A file rather than a setting because `build_node_command` decides from the
+/// datadir, as it does for [`matmul_consensus_was_refused`], and because it has
+/// to survive a quit in the middle of the bootstrap: the next start picks the
+/// bootstrap back up instead of dialling everyone with no headers.
+fn header_bootstrap_path(datadir: &Path) -> PathBuf {
+    datadir.join(".header-bootstrap")
+}
+
+/// `EASYBTX_NODE_HEADER_BOOTSTRAP=0` turns the bootstrap off: no marker is
+/// written and an existing one is ignored, so the launch is the ordinary one.
+/// Unset, or any other value, leaves it on. The rollback lever, the way
+/// `EASYBTX_NODE_TRUSTED_MIRROR` is one for the mirror split.
+pub fn header_bootstrap_disabled() -> bool {
+    std::env::var("EASYBTX_NODE_HEADER_BOOTSTRAP")
+        .is_ok_and(|raw| header_bootstrap_switch_is_off(&raw))
+}
+
+/// Pure half of [`header_bootstrap_disabled`]: the spellings of "off" that the
+/// other `EASYBTX_NODE_*` switches accept.
+pub fn header_bootstrap_switch_is_off(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    )
+}
+
+/// Is the next launch of this datadir a header-bootstrap launch?
+pub fn header_bootstrap_pending(datadir: &Path) -> bool {
+    !header_bootstrap_disabled() && header_bootstrap_path(datadir).exists()
+}
+
+/// Should a start that is about to launch btxd on this datadir begin a
+/// bootstrap? Only for a datadir that has never held a block: the same "no
+/// `blocks/` yet" test first-run setup uses for a fresh install. An existing
+/// datadir already has its headers, or is past the point where they are
+/// expensive; one that stopped half-way through a bootstrap still carries the
+/// marker, which is what resumes it.
+pub fn header_bootstrap_wanted(datadir: &Path) -> bool {
+    !header_bootstrap_disabled() && !datadir.join("blocks").exists()
+}
+
+/// Mark the datadir so launches bootstrap until [`end_header_bootstrap`].
+/// Best-effort: a datadir that cannot take the marker launches the ordinary
+/// way, which is what it did before the bootstrap existed.
+pub fn begin_header_bootstrap(datadir: &Path) {
+    let path = header_bootstrap_path(datadir);
+    if let Err(e) = std::fs::write(
+        &path,
+        "This node has not synced its block headers yet. Until it has, easyBTX\n\
+         starts btxd connected only to its curated block sources, so that no\n\
+         parked peer can hold up the header sync. It restarts btxd the ordinary\n\
+         way once the headers pass the snapshot anchor, and deletes this file.\n",
+    ) {
+        eprintln!("[node] could not write {}: {e}", path.display());
+    }
+}
+
+/// Clear the marker, so the next launch dials the ordinary way.
+pub fn end_header_bootstrap(datadir: &Path) {
+    let path = header_bootstrap_path(datadir);
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            eprintln!("[node] could not clear {}: {e}", path.display());
+        }
+    }
+}
+
+/// How long a bootstrap launch may go without its header count moving before
+/// the app gives up on the curated sources and restarts the ordinary way.
+///
+/// The bootstrap it exists for moves every few seconds: headers climb from 0 to
+/// the anchor in under a minute once one curated source answers, and a slow
+/// link still shows movement batch by batch. Five minutes of none means no
+/// curated source is serving, or none has headers past where the count is
+/// stuck, and dialling everyone is then the better bet.
+pub const HEADER_BOOTSTRAP_STALL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// What a bootstrap launch should do after one look at its header count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderBootstrapVerdict {
+    /// Headers are below the anchor and still moving: keep going.
+    Continue,
+    /// Headers reached the anchor: restart into the ordinary launch.
+    Reached,
+    /// No movement for [`HEADER_BOOTSTRAP_STALL`]: give up on the curated
+    /// sources and restart into the ordinary launch.
+    Stalled,
+}
+
+/// Pure decision for one refresher tick. `since_progress` is how long the
+/// header count has read the same, measured by the caller from the last
+/// CHANGE ([`crate::snapshot::track_header_progress`] semantics).
+pub fn header_bootstrap_verdict(
+    headers: u64,
+    anchor_height: u64,
+    since_progress: std::time::Duration,
+) -> HeaderBootstrapVerdict {
+    if crate::snapshot::snapshot_anchor_reached(headers, anchor_height) {
+        HeaderBootstrapVerdict::Reached
+    } else if since_progress >= HEADER_BOOTSTRAP_STALL {
+        HeaderBootstrapVerdict::Stalled
+    } else {
+        HeaderBootstrapVerdict::Continue
+    }
+}
+
+/// The command-line overlay of a bootstrap launch: `-connect` to every block
+/// source, a `noban` grant for each of their addresses, no DNS seeding and no
+/// listening. Everything else about the launch is the ordinary one.
+///
+/// * `-connect` turns off addrman dialling (btxd `init.cpp`: "Do not initiate
+///   other outgoing connections when connecting to trusted nodes"). The
+///   discovery relays are not part of this launch at all: they are not manual
+///   peers (see [`BTX_DISCOVERY_PEERS`]) and `-seednode` is skipped on a
+///   bootstrap launch because `-connect` makes the engine ignore it
+///   (init.cpp:3906); they would hand out no headers anyway, the three
+///   measured returning empty `headers` messages.
+/// * `-whitelist=in,out,noban@<ip>` for every block source, `in,out` for the
+///   reason [`BTX_ARCHIVE_WHITELIST_IPS`] gives: a `-connect` connection is
+///   OUTGOING. This is where the bootstrap's grant lives, and only here: the
+///   managed conf block keeps its own meaning, and the next launch, having no
+///   overlay, has no grant.
+/// * `-dnsseed=0` is what `-connect` already implies. Stated anyway, because a
+///   soft default loses to any `dnsseed=` in the datadir's `btx_rw.conf`.
+/// * `-listen=0` keeps unknown inbound peers out for the same minutes. The
+///   conf says `listen=1` explicitly, which beats the `-connect` default, so
+///   only the command line can say it.
+///
+/// Every block source is a literal IP, and
+/// `every_block_source_is_a_literal_ip` holds it there, so the grant needs no
+/// DNS and this stays pure.
+pub fn header_bootstrap_args() -> Vec<String> {
+    let sources = block_source_peers();
+    let mut args: Vec<String> = sources.iter().map(|p| format!("-connect={p}")).collect();
+    for peer in &sources {
+        let host = peer.rsplit_once(':').map(|(h, _)| h).unwrap_or(peer);
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            args.push(format!("-whitelist=in,out,noban@{host}"));
+        }
+    }
+    args.push("-dnsseed=0".to_string());
+    args.push("-listen=0".to_string());
+    args
 }
 
 /// Build the (program, args, envs) tuple for launching btxd with the chosen
@@ -220,6 +798,35 @@ fn prune_value_in_conf(conf: &Path) -> Option<String> {
     found
 }
 
+/// Has this datadir already deleted blocks?
+///
+/// The conf says what the app INTENDED. This says what the folder IS, and on
+/// any datadir that pruned before this app managed it the two disagree.
+///
+/// btxd prunes oldest-first, so a datadir that still holds `blocks/blk00000.dat`
+/// has never pruned — which makes the common case a single stat. Only when that
+/// file is absent do we look for higher-numbered ones, which is what separates
+/// "pruned" from "has not started yet".
+///
+/// Measured on this project's validator 2026-09-06: conf `prune=0`,
+/// `btx_rw.conf` `prune=4096`, `getblockchaininfo` reporting
+/// `pruned: true, pruneheight: 184942`, and `blocks/` holding blk00001,
+/// blk01003 and blk01004 with no blk00000.
+pub fn datadir_has_pruned(datadir: &Path) -> bool {
+    let blocks = datadir.join("blocks");
+    if blocks.join("blk00000.dat").exists() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(&blocks) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with("blk") && name.ends_with(".dat")
+    })
+}
+
 pub fn build_node_command(
     btxd: &Path,
     datadir: &Path,
@@ -238,19 +845,37 @@ pub fn build_node_command(
         format!("-conf={}", conf.display()),
         "-server=1".to_string(),
     ];
-    for peer in BTX_BOOTSTRAP_PEERS {
+    // The manual peer set: ONE entry per peer, at most MAX_MANUAL_PEERS, live
+    // chain first. See `manual_peers` for why each of those three properties
+    // is load-bearing and what the engine does without them.
+    //
+    // Archive peers are in that set because addnode == manual == one half of
+    // the trusted-mirror authority gate (the other half, noban, is asserted
+    // into the conf by `setup::set_managed_whitelist_block` on every start).
+    // Passing them on the CLI as well as in the conf means even a node started
+    // against a foreign conf still dials them.
+    for peer in manual_peers() {
         args.push(format!("-addnode={peer}"));
     }
-    // Archive peers ride along as -addnode too: addnode == manual == one half
-    // of the trusted-mirror authority gate (the other half, noban, is asserted
-    // into the conf by ensure_whitelist_in_conf at provisioning time). Passing
-    // them on the CLI as well means even a node started against a foreign conf
-    // still dials the archives. Duplicates with BTX_BOOTSTRAP_PEERS are fine —
-    // btxd dedupes addnode entries.
-    for peer in BTX_ARCHIVE_PEERS {
-        let arg = format!("-addnode={peer}");
-        if !args.contains(&arg) {
-            args.push(arg);
+    // A datadir's first header sync: only the block sources, each noban on
+    // this command line alone, until the app restarts it past the snapshot
+    // anchor. See HEADER BOOTSTRAP above for the measurements. `-seednode` is
+    // skipped on that launch: it is ignored by the engine whenever `-connect`
+    // is present (init.cpp:3906), which the bootstrap overlay always adds, so
+    // passing it there would be a line with no effect.
+    if header_bootstrap_pending(datadir) {
+        args.extend(header_bootstrap_args());
+    } else {
+        // The discovery relays, dialled as the engine's own introducer role
+        // rather than as manual peers: `-seednode=<host>` opens an ADDR_FETCH
+        // connection that fetches addresses and disconnects, and
+        // net_processing excludes it from block download
+        // (`!pto->IsAddrFetchConn()`). Measured on mainnet 30 September 2026
+        // (see `BTX_DISCOVERY_PEERS`): dialled as manual peers these three
+        // held a fresh mirror to one block in 3.5 minutes; 561 blocks in the
+        // following 5.5 minutes once they were gone.
+        for peer in BTX_DISCOVERY_PEERS {
+            args.push(format!("-seednode={peer}"));
         }
     }
     // BIP324 v2 transport, explicitly ON. Confirmed upstream 2026-08-31: every
@@ -275,6 +900,36 @@ pub fn build_node_command(
     // default: the most-work chain, with the fork detector (btx_core::fork)
     // saying out loud when a longer chain exists that this node cannot get.
     args.push("-parkdeepreorg=0".to_string());
+    // ...and on engine v0.34.12 and newer, legacy reorg mode beside it, so the
+    // node keeps the reorg behaviour it had on 0.34.9. 0.34.12 added
+    // `-reorgpolicy` with `bounded` as the default, and under bounded an
+    // explicit `-parkdeepreorg=0` is an init error: "-parkdeepreorg=0
+    // conflicts with -reorgpolicy=bounded. Use -reorgpolicy=legacy to follow a
+    // deeper chain without the recovery ceiling."
+    // (node/chainstatemanager_args.cpp:182-186 at v0.34.12, turned into
+    // InitError at init.cpp:2214-2216). Legacy skips the bounded decision
+    // (validation.cpp:10600) and keeps the park action `-parkdeepreorg` chooses
+    // (chainstatemanager_args.cpp:138-141), and with it at 0 the node never
+    // parks (kernel/chainstatemanager_opts.h:212-222). Bounded on a trusted
+    // mirror can also spin at 100% CPU holding cs_main when a signed competing
+    // prefix is deeper than 6 (upstream PR 211, not merged on 2026-09-30), and
+    // most easyNode nodes are trusted mirrors.
+    //
+    // The command line outranks a `reorgpolicy=` in the conf and in the
+    // datadir's btx_rw.conf, the same as every flag here (common/settings.cpp
+    // MergeSettings, v0.34.12). Measured 2026-09-30 on the v0.34.12 binary,
+    // regtest: with `reorgpolicy=bounded`, `parkdeepreorg=0` and
+    // `deepforkautoresolve=0` in the conf and `reorgpolicy=bounded` in
+    // btx_rw.conf, this launch started and logged `Command-line arg:
+    // reorgpolicy="legacy"`.
+    //
+    // Gated on the version in the install path like the flags below: v0.34.9
+    // refuses the argument outright ("Error parsing command line arguments:
+    // Invalid parameter -reorgpolicy=legacy", measured the same day), and the
+    // app launches the previous engine when provisioning a new one fails.
+    if node_has_reorg_policy(btxd) {
+        args.push("-reorgpolicy=legacy".to_string());
+    }
     // The prune posture must be EXPLICIT, for the same reason
     // -matmulvalidation is below: btxd loads the datadir's btx_rw.conf on every
     // start regardless of -conf, and a READ-WRITE setting outranks a config
@@ -297,8 +952,45 @@ pub fn build_node_command(
     // Re-asserting the CONF's OWN value rather than a hardcoded 0 is what keeps
     // the keeper profile working: the conf is the app's intent, and the command
     // line is how the intent survives contact with an old datadir.
-    if let Some(prune) = prune_value_in_conf(conf) {
-        args.push(format!("-prune={prune}"));
+    //
+    // ONE EXCEPTION, added 2026-09-06, and it is the difference between a node
+    // that runs and a node that does not. `prune=0` is not a posture a datadir
+    // can be TALKED into. btxd records that block files were pruned and refuses
+    // to start unpruned against them, with the very string this file already
+    // names PRUNED_DATADIR_REFUSED_MARKER, and it exits during init before RPC
+    // binds. Asserting `prune=0` over a datadir that HAS pruned therefore does
+    // not un-prune it; it stops the node starting, and `launch_failure_hint`
+    // answers that failure with "Remove node data" — a wipe.
+    //
+    // Reproduced against the SHIPPED 0.6.20 engine on a read-only copy of this
+    // project's validator: with `-prune=0` it exits 1 on the refusal; with the
+    // datadir's own target it reaches "init message: Done loading".
+    //
+    // The reachable population is not exotic. `installer.rs` documents that the
+    // legacy python faststart preset used `prune=4096` while this app writes
+    // `prune=0`, so every datadir that pruned under the old preset and then met
+    // the new conf is in exactly this state — and a fleet update is the event
+    // that restarts them all at once.
+    //
+    // A pruned datadir is not a broken one, which is the whole argument of this
+    // release: it holds every block HASH and can settle a fork as well as an
+    // archive can. So start it as what it is and say so on screen
+    // (`datadir_pruned` in the status) rather than refusing it.
+    //
+    // Only `prune=0` is affected. btxd accepts a change from one non-zero
+    // target to another, so the keeper profile goes on asserting its own.
+    match prune_value_in_conf(conf) {
+        Some(prune) if prune == "0" && datadir_has_pruned(datadir) => {
+            // Keep the posture the folder actually has, stated explicitly. Its
+            // own btx_rw.conf is what btxd would fall back to anyway; passing
+            // it keeps the "the command line states the intent" rule intact and
+            // puts the real value in the log instead of a silent fallback.
+            if let Some(kept) = prune_value_in_conf(&datadir.join("btx_rw.conf")) {
+                args.push(format!("-prune={kept}"));
+            }
+        }
+        Some(prune) => args.push(format!("-prune={prune}")),
+        None => {}
     }
     // btxd v0.31.0+ ships its OWN signed source-based auto-updater that, on
     // mainnet, defaults to ON: it polls btx.dev and tries to build + swap itself.
@@ -432,8 +1124,9 @@ pub fn build_node_command(
         // function against today's behaviour, and it is not a choice we get to
         // make differently, because the alternative is a node that does not run.
         // The way out is a manifest row for the user's device class, not a
-        // weaker quorum. See docs/2026-08-29-ampere-imma-layout.md for why no
-        // pre-Hopper NVIDIA card can get one today.
+        // weaker quorum. (An earlier note here said no pre-Hopper NVIDIA card
+        // could get one. The mainnet signer since September 2026 is an RTX 3060,
+        // sm_86, so that was wrong; the cohort accepts any sm_* cuda row.)
         //
         // scripts/check-engine-fleet-ready.sh fails if this gate is missing on an
         // engine that needs it.
@@ -504,8 +1197,93 @@ pub fn build_node_command(
         // anyway. Metal keeps its mirror routing untouched: the marker path
         // exists for engines that refuse a not-yet-goldened Mac at init, and
         // slow manifest-admitted Apple hosts are a mac lane decision.
-        let consensus_replaces_mirror_here =
-            !matches!(backend, Backend::Metal) && node_allows_degraded_matmul_start(btxd);
+        // ⚠ SPLIT 2026-09-15, and the 08-31 supersession above stays because
+        // it is right about a host WITH a capable card. It rested on two
+        // premises. The first holds: an RTX 3060 self-qualifies in consensus
+        // mode and validates for itself. Re-read from this box's live signer
+        // on 2026-09-15, a btxd this app launched with BTX_MATMUL_BACKEND=cpu
+        // in its environment, so the env never decided the device: its
+        // debug.log reads `provider=cuda_rc_exact_fused_extract ready=1
+        // cpu_fallbacks=0`. The second premise was "an attestation supply
+        // that measured dead", and that changed: this project's Linux
+        // validator has signed since 2026-09-01 (docs/gpu-qualification-
+        // rtx3060.md is its transcript) and LuckyPool's node carries
+        // attestations too (0.6.21 changelog, measured 2026-09-09).
+        //
+        // With a live supply, what a host WITHOUT a capable card gets from
+        // consensus mode is nothing at all. Upstream init.cpp:2662-2673
+        // (verified identical 2026-09-15 at our pin 9eb4e005, at tag v0.34.6
+        // = 3013c2c2, and on the unreleased 0.34.7 branch) grants
+        // NODE_MATMUL_ATTESTATION_ARCHIVE (bit 31) only to a node that serves
+        // attestations AND is either a trusted mirror or a local signer whose
+        // strict-device provider is ready. A GPU-less host in consensus mode
+        // is neither: it starts degraded, follows headers, stalls below the
+        // Epoch-A height, and can never advertise the archive bit, while its
+        // operator believes it helps. Meanwhile the role btxscan asked for
+        // (issue #90, closed 2026-09-14 without recording a decision) needs
+        // no GPU and no key: matmul_trusted_attestations.h:317 lets a KEYLESS
+        // node serve GETMMATTEST history with no window limit, where a signer
+        // is clamped to 16 blocks (0.6.22). On 2026-09-13 the explorer sat
+        // frozen for 21 hours for want of one historical signature that no
+        // peer it asked would serve. A keyless mirror would have answered.
+        //
+        // So a non-Metal host is split on what its backend says:
+        //
+        //   Cuda  the NVIDIA driver's CUDA library is present
+        //         (backend::node_host_backend: nvcuda.dll on Windows,
+        //         libcuda.so.1 on Linux). Stays in EXPLICIT consensus mode,
+        //         exactly as since 08-31. A capable card validates.
+        //   Cpu   no driver, so no GPU btxd could ever qualify. Launches as
+        //         the trusted mirror this block already builds for Metal's
+        //         marker path, WITH the single-key override on 0.34.5+, so it
+        //         follows the signed chain instead of stalling and is
+        //         eligible for the keyless archive role the moment serving is
+        //         on. btxd defaults -matmulattestationserve to 1 in trusted
+        //         mode; the app's switch writes the conf either way.
+        //
+        // Measured offline on 2026-09-15 against the shipped 0.34.6 engine
+        // with exactly the flags the Cpu arm produces (scratch datadir, no
+        // peers): "init message: Done loading" in 2 s; getmatmultrustedstatus
+        // matmul_validation_mode=trusted trusted_mirror=true local_signer=false
+        // serves_attestations=true threshold=1 trusted_signers=3
+        // pin_quorum_reachable=true; localservices 0x82000d09, which is bits
+        // 25 (TRUSTED_MIRROR) and 31 (ATTESTATION_ARCHIVE) set and bit 27
+        // (CONSENSUS) clear; with -matmulattestationserve=0 the same run reads
+        // 0x02000d09, bit 31 gone. So the archive bit is a switch the operator
+        // holds, on a node that can now hold it.
+        //
+        // Mode stays EXPLICIT for every non-Metal host, never the absence of
+        // a flag: the 09-01 paragraph below is why, and it applies to both
+        // arms. Metal is untouched.
+        //
+        // The cost, stated rather than buried, in the words the changelog and
+        // docs/decisions/2026-09-15-keyless-cpu-hosts-are-trusted-mirrors.md
+        // use: at threshold 1 every pinned key is a full authority alone, so
+        // one stolen signing key could make these nodes accept MatMul-invalid
+        // blocks; btxd itself warns about this at init. Mirrors also freeze
+        // when signers go quiet (2026-09-05/06 incidents) rather than
+        // validating on their own. The operator trades a node that stalls
+        // for certain and serves nobody for one that follows on signatures
+        // and can serve history, and freezes if the signers do.
+        //
+        // The gap this does not close: a host whose card carries the driver
+        // but fails the canary (Pascal, Turing, a weak Ampere) reads as Cuda,
+        // takes the consensus arm, and stalls exactly as today. The signal
+        // that would route it lands only after start: node_rc_status reads
+        // btxd's own `strict-device ... ready=0
+        // reason=no_rc_self_qualified_device_backend`. Turning that into a
+        // sticky marker and a restart as a mirror, the way
+        // record_matmul_consensus_refused does for a refused Mac, is the
+        // refinement, not this change. EASYBTX_NODE_TRUSTED_MIRROR=1 is the
+        // hand-operated version meanwhile, and =0 is the rollback: a Cpu host
+        // with it set gets explicit consensus, the 0.6.15 through 0.6.22
+        // posture.
+        let degraded_start = node_allows_degraded_matmul_start(btxd);
+        // Which arm, decided in ONE place: `launches_as_mirror` is the same
+        // rule the app's start path asks before it hands the engine a signing
+        // key, so the two can never disagree about whether this host follows
+        // signatures or makes them.
+        let mirror_here = launches_as_mirror(btxd, datadir, backend);
         // Consensus mode must be EXPLICIT, not the absence of a flag. Measured
         // 2026-09-01 on this box's real 0.6.5-era install: btxd persists its
         // runtime settings in the datadir's btx_rw.conf (the fork's read-write
@@ -519,19 +1297,96 @@ pub fn build_node_command(
         // the leftover pin degrades to telemetry a stolen key cannot abuse.
         // Every fleet install that ran the mirror era carries this leftover,
         // so this line is what makes the upgrade land for them.
-        if consensus_replaces_mirror_here {
+        //
+        // Both arms of the split state their mode. Metal alone may stay
+        // silent, and only while its marker is clear: an M5 on this engine
+        // passes no -matmulvalidation at all and self-qualifies (0.6.19).
+        let consensus_here = !matches!(backend, Backend::Metal) && degraded_start && !mirror_here;
+        if consensus_here {
             args.push("-matmulvalidation=consensus".to_string());
         }
-        if trusted_mirror_required(backend, datadir) && !consensus_replaces_mirror_here {
+        if mirror_here {
             args.push("-matmulvalidation=trusted".to_string());
+            // btxd also loads <datadir>/btx_rw.conf on every start regardless
+            // of -conf, and MERGES its list settings with the command line
+            // (common/config.cpp, common/settings.cpp GetSettingsList), so a
+            // key already pinned THERE, or in -conf, must not be pushed again
+            // here either: much of the fleet carries a leftover pin from the
+            // mirror era in btx_rw.conf, and this is also the exact arm a
+            // validating node's one-time mirror load launch goes through
+            // (mirror_load_pending above), which pushes every key. Pushing a
+            // key already pinned gets the engine's "Duplicate
+            // -matmultrustedpubkey" refusal at init (init.cpp ~1591-1597).
+            let mut already_pinned = conf_pins(conf);
+            already_pinned.extend(rw_conf_pins(&datadir.join("btx_rw.conf")));
             for pubkey in BTX_TRUSTED_ATTESTATION_PUBKEYS {
-                args.push(format!("-matmultrustedpubkey={pubkey}"));
+                if !already_pinned
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(pubkey))
+                {
+                    args.push(format!("-matmultrustedpubkey={pubkey}"));
+                }
             }
-            args.push("-matmultrustedthreshold=1".to_string());
-            if node_allows_degraded_matmul_start(btxd) {
+            args.push(format!(
+                "-matmultrustedthreshold={BTX_TRUSTED_ATTESTATION_THRESHOLD}"
+            ));
+            if degraded_start {
                 // 0.34.5 and newer refuse a mainnet mirror at M<2 without this.
                 args.push("-allowsinglekeytrustedmirror=1".to_string());
             }
+        }
+        // The signer role (btx_core::signer). The conf carries the key, put
+        // there by the app's start path only on a host that validates; this
+        // adds the other half, the LINK. A signature only helps a mirror that
+        // hears it, attestations travel to connected peers, and a node relays
+        // only the keys it pins, so a volunteer's signature reaches the
+        // explorer's mirror over a direct connection or not at all. Dialling
+        // the mirror from here means the operator forwards no port and the
+        // mirror's admin adds exactly one line: the pin. This box's validator
+        // has kept the same link by hand (addnode in its btx_rw.conf plus a
+        // shell loop) since 2026-09-02; this is that link, shipped.
+        //
+        // Never on the mirror arm: a mirror consumes attestations, and a key
+        // there signs nothing (role.rs, the 2026-09-03 case).
+        if !mirror_here && signs_here(conf) {
+            // Skip a mirror the manual set already dials: btxscan's is also an
+            // archive peer since 2026-09-24, and a second -addnode for the same
+            // peer spends a slot on nothing.
+            let manual = manual_peers();
+            for mirror in crate::signer::BTX_MIRRORS_FED_BY_SIGNERS {
+                if !manual.contains(mirror) {
+                    args.push(format!("-addnode={mirror}"));
+                }
+            }
+            // And the key's pin on itself, without which 0.34.9 refuses to
+            // start a node holding a key (`signing_key_self_pin` has the
+            // measurement). Never on the mirror arm: a mirror that pinned its
+            // own key would take its own word for the proof of work.
+            if let Some(pubkey) = signing_key_self_pin(conf, datadir) {
+                args.push(format!("-matmultrustedpubkey={pubkey}"));
+            }
+        }
+        // A validating node on a signed snapshot pins the mirrors' keys too,
+        // or the engine's start-up check of the stored manifest refuses to
+        // start it (section 8 of the confirmed-snapshot decision). In
+        // consensus mode they are telemetry: they skip no check.
+        //
+        // btxd loads the datadir's own btx_rw.conf on every start regardless
+        // of -conf, and MERGES its list settings with the command line
+        // (common/config.cpp, common/settings.cpp GetSettingsList), so a key
+        // already pinned THERE must count as already pinned here too: the
+        // mirror-era app left a single signer pin in btx_rw.conf on much of
+        // the fleet, and pushing that same key again gets the engine's
+        // "Duplicate -matmultrustedpubkey" refusal at init.
+        if !mirror_here {
+            let mut already = conf_pins(conf);
+            already.extend(rw_conf_pins(&datadir.join("btx_rw.conf")));
+            already.extend(signing_key_self_pin(conf, datadir));
+            args.extend(validating_snapshot_pin_args(
+                datadir,
+                &BTX_TRUSTED_ATTESTATION_PUBKEYS,
+                &already,
+            ));
         }
     }
     // On Metal we set ONLY `BTX_MATMUL_BACKEND` and deliberately do NOT touch the matmul
@@ -709,6 +1564,44 @@ fn node_allows_degraded_matmul_start(btxd: &Path) -> bool {
     (major, minor, patch) >= (0, 34, 5)
 }
 
+/// Whether the btxd at `path` has `-reorgpolicy`, i.e. is v0.34.12 or newer.
+/// v0.34.12 added it (init.cpp:694) with `bounded` as the default, which
+/// refuses the `-parkdeepreorg=0` every launch passes, so a launch of this
+/// engine must say `-reorgpolicy=legacy`. Older engines reject the unknown
+/// argument FATALLY, so this fails safe to `false` for any older, unknown or
+/// tag-less path, like the gates above.
+fn node_has_reorg_policy(btxd: &Path) -> bool {
+    let Some(tag) = release_tag_from_btxd_path(btxd) else {
+        return false;
+    };
+    let Some(v) = parse_tag_version(&tag) else {
+        return false;
+    };
+    let major = v.first().copied().unwrap_or(0);
+    let minor = v.get(1).copied().unwrap_or(0);
+    let patch = v.get(2).copied().unwrap_or(0);
+    (major, minor, patch) >= (0, 34, 12)
+}
+
+/// Whether an engine installed under `tag` still follows the network's
+/// consensus rules, i.e. is v0.34.14 or newer. Mainnet block 244000 switched
+/// on three checks that came with 0.34.14 (BTX_SECURITY_ACTIVATION_HEIGHT,
+/// chainparams.cpp:181 at v0.34.15): a 32-byte HTLC preimage, recovery proofs
+/// in the shielded block budget, and a Phase-1-only MatMul header that may not
+/// become the best header. An older engine can accept blocks every current
+/// node refuses and follow them onto its own chain while reporting itself
+/// healthy, so the app never launches one as a fallback. Fails closed: an
+/// unreadable tag is not trusted.
+pub fn engine_follows_network_rules(tag: &str) -> bool {
+    let Some(v) = parse_tag_version(tag) else {
+        return false;
+    };
+    let major = v.first().copied().unwrap_or(0);
+    let minor = v.get(1).copied().unwrap_or(0);
+    let patch = v.get(2).copied().unwrap_or(0);
+    (major, minor, patch) >= (0, 34, 14)
+}
+
 /// The `-matmulrcexecution` mode this host should run, or `None` to leave
 /// btxd's own default in place.
 ///
@@ -723,11 +1616,15 @@ fn node_allows_degraded_matmul_start(btxd: &Path) -> bool {
 ///   the point: the refusal is instant, costs nothing, and is legible to
 ///   `node_rc_status()`. Such a host follows the chain via the trusted quorum
 ///   (`trusted_mirror_enabled`), not by grinding the proof on the processor.
-/// * **Cuda** → `strict-device`. Only `sm_120` (Blackwell) is in the manifest.
-///   An sm_120 owner qualifies and gets full independent validation; anyone
-///   else gets the same clean refusal as Cpu. (The node app never selects Cuda
-///   today — `node_backend()` is Metal on macOS/aarch64 and Cpu everywhere
-///   else — but the shared command builder must still answer honestly.)
+/// * **Cuda** → `strict-device`. Only `sm_120` (Blackwell) is in the manifest,
+///   but on 0.34.5+ the engine also admits a card by runtime measurement (an
+///   RTX 3060, sm_86, is the mainnet signer). A card that qualifies gets full
+///   independent validation; one that does not gets the same clean refusal as
+///   Cpu. (Until 2026-09-15 the node app never selected Cuda: `node_backend()`
+///   was Metal on macOS/aarch64 and Cpu everywhere else. It now returns Cuda
+///   when the NVIDIA driver's CUDA library is present, see
+///   `backend::node_host_backend`, because the mode split in
+///   `build_node_command` needs the difference.)
 ///
 /// Override with `EASYBTX_NODE_RC_EXECUTION=strict-device|auto-fallback|
 /// cpu-diagnostic|default`. Unrecognised values are IGNORED rather than passed
@@ -758,7 +1655,50 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
         // `stalled = mode == "strict-device" && ready == Some(false)`, so while
         // we passed auto-fallback `rc_stalled` could never fire and a parked
         // node rendered as LIVE. strict-device makes the refusal clean and
-        // legible, and follows the chain via the trusted quorum below instead.
+        // legible.
+        //
+        // ⚠ CORRECTED 2026-09-07. This used to end "...and follows the chain
+        // via the trusted quorum below instead", and on a 0.34.5-or-newer
+        // engine that is no longer true for these hosts. The degraded-start
+        // block in `build_node_command` sets `consensus_replaces_mirror_here`
+        // to `!Metal && node_allows_degraded_matmul_start`, which passes
+        // `-matmulvalidation=consensus` and SKIPS the trusted quorum entirely.
+        // So a GPU-less Linux or Windows node on the shipped engine gets
+        // strict-device AND consensus AND no pins: it starts, syncs, serves
+        // history, and then stalls below the Epoch-A height with nothing to
+        // cross it. `node_rc_status` reports that stall rather than hiding it,
+        // which is why strict-device is still the right flag — the node is
+        // honest about being parked instead of burning a core producing
+        // nothing — but the fallback this comment promised is not configured.
+        //
+        // Closing it is a product decision, not a cleanup, and it has three
+        // ends, none free:
+        //
+        //   1. Land a golden manifest row for the host class so it validates in
+        //      consensus mode for real. The only one that ends with an
+        //      independent node; needs upstream.
+        //   2. Configure the trusted quorum for these hosts again — which on
+        //      0.34 also needs `-allowsinglekeytrustedmirror=1` at M=1, and
+        //      makes the app's three pinned keys this node's proof-of-work
+        //      authority. That is a trust choice the app would be imposing.
+        //   3. Accept the stall and say so plainly on screen, which is today.
+        //
+        // ⚠ CLOSED for Cpu hosts 2026-09-15, by taking end 2. A host with no
+        // CUDA driver gets the quorum again, with the override 0.34 needs,
+        // because the "today" of end 3 was a node that helps nobody while a
+        // keyless mirror can serve the explorer's history. A Cuda host whose
+        // card fails the canary stays on end 3 for now; the SPLIT paragraph
+        // in `build_node_command` and docs/decisions/2026-09-15-keyless-cpu-
+        // hosts-are-trusted-mirrors.md carry the measurements and the cost.
+        //
+        // `-matmulvalidation=relay` READS like a fourth option and is not one.
+        // Verified against the shipped v0.34.6 binary and its source: relay
+        // returns InitError unless `-disablewallet=1` (this app has a wallet),
+        // clears NODE_NETWORK and NODE_NETWORK_LIMITED so the node serves no
+        // blocks at all, forces `-blocksonly=1`, and warns that it "must not be
+        // used as getbestblockhash / getblocktemplate" — which is every status
+        // read this app makes. It is the 0.34 public DNS/introducer role, not
+        // an honest follower (init.cpp:1165, 1600, 1814, 2643).
         Backend::Cpu | Backend::Cuda => Some("strict-device"),
     }
 }
@@ -766,7 +1706,7 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
 /// Compressed secp256k1 public keys trusted to attest Profile-1 ExactReplay.
 ///
 /// Threshold is 1, so this list is a UNION and an extra key can only widen what
-/// the node accepts — it can never cause a rejection. That is why all three sit
+/// the node accepts — it can never cause a rejection. That is why all seven sit
 /// here rather than only the two upstream currently publishes.
 ///
 /// Why more than one is required at all. Measured on a parked GPU-less datadir
@@ -800,6 +1740,46 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
 ///     rotated to `0224e80d` before the 08-20 publication. It is KEPT because
 ///     historical attestations it signed still have to prove quorum after an
 ///     authority-namespace change, and at M=1 a retired key costs nothing.
+///   * `02d5efca` — this project's own signer, an RTX 3060 in consensus mode
+///     (the key `checkin.rs` uses as its real-world sample, and btxscan's pin
+///     since 2026-09-01). Added 2026-09-24 because after the 23 September split
+///     it was the ONLY key signing the valid chain: witness-1 counted it on 100
+///     of 100 blocks up to 228,157, one distinct key, and none of the three
+///     above. With 0.6.29 refusing `b28c3e84` (known_invalid.rs), a mirror
+///     pinning only those three stopped at 227,312 and could not move again.
+///     At M=1 this makes that one machine a full authority for every mirror,
+///     the trade jpp's operator standard (M=2, independent keys) is meant to
+///     retire once a second key signs the valid chain.
+///   * `026da4e3`, `03047189`, `02c9cfb7` — the zbtx operator's three keys,
+///     added in 0.7.5 by owner decision. witness-2, a mirror pinning 9 keys,
+///     counted `026da4e3` on 96-97 of the last 100 blocks on 3-4 Oct 2026,
+///     next to `02d5efca`, the only other easyNode-pinned key signing then.
+///     The other two are the same operator's keys (its other machines,
+///     grouped under one operator in `snapshot-operators.json`), pinned in
+///     the same release so a later move to them does not cost a second
+///     namespace change. The cost, per the warning below: the
+///     `AuthorityNamespace` moves once. Measured on 4 Oct 2026 on this Mac
+///     with v0.34.12, two scratch mirrors, `~/.easybtx` untouched:
+///       - A copy of this Mac's old datadir (block 185,855): 4 pins for
+///         15 min (+1,129 blocks), restart with 7 pins for 30 min (+2,079
+///         blocks). It started (the stored snapshot manifest re-verified
+///         under the larger set) and synced at a similar rate (75 and 69
+///         blocks a minute, both crawling on old-block fetches).
+///       - A fresh mirror from the signed snapshot 225,927, caught up to
+///         the tip on the 4 pins. That night `02d5efca` went quiet after
+///         238,007 and the 4-pin mirror stood still there for 10 min while
+///         the chain went on to 238,030: block 238,008 had "no in-memory
+///         quorum". Restarted with the 7 pins, it accepted its first new
+///         block 61 s after start, was at the tip (238,031) in the same
+///         minute, and followed every block for 30 min (238,044 against
+///         witness-2's 238,045). Both starts loaded 0 stored attestations
+///         with either pin set, so the namespace move cost no re-acquire
+///         time this mirror could see.
+///     At M=1 each of these keys is a full authority for every mirror, as
+///     `02d5efca` is. That is the owner's decision; the path to M=2 is in
+///     docs/earned-trust.md. Never added here: `037db271` and `03bc9ac2`
+///     (sign on mainnet, owners unrecorded) and jpp's `02e0a965` (a rented
+///     machine, for an M=2 set only).
 ///
 /// ⚠ Changing this list is not free, and the cost is not where you would look
 /// for it. btxd namespaces its durable attestation archive by
@@ -815,11 +1795,30 @@ pub fn rc_execution_mode(backend: Backend) -> Option<&'static str> {
 /// stall-recovery knobs baked at mainnet 199299), so the namespace moves for
 /// every upgrading mirror whether or not the keys move with it. Fixing the
 /// signer set in the same release costs one namespace change instead of two.
-pub const BTX_TRUSTED_ATTESTATION_PUBKEYS: [&str; 3] = [
+///
+/// Adding `02d5efca` is NOT free that way, read against the v0.34.9 tag on
+/// 2026-09-24. The namespace still hashes the signer set
+/// (`matmul_trusted_attestations.cpp:215`), and 0.34.10 / 0.34.11rc1 leave the
+/// replay context alone (SCHEMA_VERSION 4, no blockstorage or params change), so
+/// no engine bump moves it for us. `ReconcileMatMulReplayAuthorityContext`
+/// (`blockstorage.cpp:576`) keeps a block's trusted bit only where `HasQuorum`
+/// still proves it: the bounded hot store reloaded from disk still counts, the
+/// durable history behind it does not. Measure a real mirror datadir across
+/// this change before it ships.
+pub const BTX_TRUSTED_ATTESTATION_PUBKEYS: [&str; 7] = [
     "03d90c148db37da28ce47ce15bade88a177728d663da4bc9ba765943b7d4e4f0aa",
     "0224e80df33697385b54b3c69bae1f097f533c0c43e93c29f73ee97319d4a5e04c",
     "028995b25c887ee03eb53a41312d33c8eccf48f261ecf9e91fe2b1e8e50373258a",
+    "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675",
+    "026da4e3a07676cada5488123033fb1057faeb7fe6a7d50b2ae3921431e0f4bbf1",
+    "03047189023913e1922c80c895ee2a9e2eff6df05438654749e1a4f95019578a24",
+    "02c9cfb77d7e4dce0cd6b7968fee1dd53d31ef06c764185e120c825fab8c0572a0",
 ];
+
+/// The mirrors' threshold. It never rises: a mirror on a snapshot stored
+/// with fewer pinned signatures than this does not start
+/// (`pins_only_grow_and_the_threshold_stays` holds it).
+pub const BTX_TRUSTED_ATTESTATION_THRESHOLD: u32 = 1;
 
 /// Whether this host should follow the chain past the MatMul v4.7 fork via an
 /// operator-attested quorum instead of local proof replay.
@@ -829,16 +1828,39 @@ pub const BTX_TRUSTED_ATTESTATION_PUBKEYS: [&str; 3] = [
 /// silently downgraded to a mirror.
 ///
 /// Opt out with `EASYBTX_NODE_TRUSTED_MIRROR=0` to keep strict consensus and
-/// accept parking at 184,999.
+/// accept parking at 184,999. On a degraded-start engine (0.34.5+) that opt-out
+/// is stated as an explicit `-matmulvalidation=consensus`, the 0.6.15 through
+/// 0.6.22 posture for every non-Metal host, and `=1` puts a Cuda host on the
+/// mirror; `build_node_command` reads the override for both.
 pub fn trusted_mirror_enabled(backend: Backend) -> bool {
-    if let Ok(raw) = std::env::var("EASYBTX_NODE_TRUSTED_MIRROR") {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "0" | "false" | "off" | "no" => return false,
-            "1" | "true" | "on" | "yes" => return true,
-            _ => {}
-        }
+    if let Some(forced) = trusted_mirror_override() {
+        return forced;
     }
     !matches!(backend, Backend::Metal)
+}
+
+/// The operator's explicit answer to "run this node as a trusted mirror?",
+/// read from `EASYBTX_NODE_TRUSTED_MIRROR`; `None` when unset or unrecognised.
+///
+/// Since 2026-09-15 `build_node_command` reads this as well as
+/// `trusted_mirror_enabled`, because it has to outrank the backend split in
+/// both directions: `=1` puts a Cuda host whose card fails the canary on the
+/// mirror by hand, `=0` keeps a Cpu host in explicit consensus mode, which is
+/// the one-flag rollback of that decision.
+pub fn trusted_mirror_override() -> Option<bool> {
+    let raw = std::env::var("EASYBTX_NODE_TRUSTED_MIRROR").ok()?;
+    parse_trusted_mirror_override(&raw)
+}
+
+/// Pure half of `trusted_mirror_override`. Unrecognised values are ignored
+/// rather than guessed at, for the reason `rc_execution_mode` ignores them: a
+/// typo in an env var must not decide a node's consensus posture.
+pub fn parse_trusted_mirror_override(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => Some(false),
+        "1" | "true" | "on" | "yes" => Some(true),
+        _ => None,
+    }
 }
 
 /// Verbatim from btxd's init refusal, measured on an Apple M5 against the
@@ -920,13 +1942,135 @@ pub const PRUNED_DATADIR_REFUSED_MARKER: &str = "Block files have previously bee
 ///
 /// Returns `None` when nothing in the tail is recognised, so the caller can say
 /// it does not know instead of inventing a reason.
+/// btxd could not take the RPC port, which on this app means one thing in
+/// practice: something else is already running a node against this machine.
+///
+/// Found 2026-09-09 by starting 0.6.21 on a machine whose validator was
+/// already up. btxd says exactly what happened —
+///
+/// ```text
+/// Binding RPC on address 127.0.0.1 port 19334 failed (Error: Address already in use (48)).
+/// Unable to bind all endpoints for RPC server
+/// ```
+///
+/// — and the app answered "its log does not say why in a way this app
+/// recognises", with a path to a log file. That is the least useful thing it
+/// could have said about the most legible failure it can have. The datadir is
+/// shared with the miner by design and the app can be opened twice, so this is
+/// not an exotic state; it is the ordinary one for anyone who already has a
+/// node up.
+pub const RPC_BIND_FAILED_MARKER: &str = "Unable to bind all endpoints for RPC server";
+
+/// Shared by engine v0.34.12's two init refusals under its default
+/// `-reorgpolicy=bounded`: an explicit `-parkdeepreorg=0` or
+/// `-deepforkautoresolve=0` (node/chainstatemanager_args.cpp:182-190). btxd
+/// prints it on stderr and exits before RPC binds.
+///
+/// It cannot come from a conf while the launch passes `-reorgpolicy=legacy`,
+/// because the command line outranks every conf (measured, see
+/// `build_node_command`). So it means this start did not pass it: the btxd in
+/// the install folder is 0.34.12 or newer while the folder's name, which is
+/// what `node_has_reorg_policy` reads, says older.
+pub const REORG_POLICY_CONFLICT_MARKER: &str = "conflicts with -reorgpolicy";
+
+/// Engine v0.34.12's refusal when the durable MatMul attestation archive
+/// (`matmul_attestations.dat`, its `.db` LevelDB and its `.wal`) does not
+/// pass its own load, init.cpp:2888-2900:
+///
+/// ```text
+/// Failed to load the durable MatMul attestation archive: %s. The archive and
+/// WAL were preserved; repair or explicitly replace them before restarting.
+/// ```
+///
+/// `OpenPersistence` (node/matmul_trusted_attestations.cpp:2019-2068) verifies
+/// the signature of EVERY stored record on every start, and any record that
+/// fails for a reason other than an untrusted signer ends the start. It runs
+/// only when the node has a pin or a signer key, which both of this app's
+/// launch arms give it, and it runs BEFORE StartLogging (init.cpp:2924), so
+/// debug.log says nothing and the only trace is this line on stderr. It is
+/// the one piece of state that grows with runtime and is read before RPC
+/// (the pre-RPC audit of 2026-10-01), which makes it a candidate for "fine for
+/// 50 minutes, then never starts again".
+pub const ATTESTATION_ARCHIVE_REFUSED_MARKER: &str =
+    "Failed to load the durable MatMul attestation archive";
+
+/// init.cpp:2271 at v0.34.12, when another process holds `<datadir>/.lock`:
+/// `Cannot obtain a lock on directory %s. %s is probably already running.`
+/// The lock is a non-blocking fcntl F_SETLK, so btxd exits in well under a
+/// second; the kernel drops it when its owner dies, so it is never stale.
+pub const DATADIR_LOCK_REFUSED_MARKER: &str = "Cannot obtain a lock on directory";
+
+/// init.cpp:3103 at v0.34.12: `AppInitServers` failed. Its usual cause is the
+/// RPC bind, whose own line ([`RPC_BIND_FAILED_MARKER`]) is the sharper one
+/// and is checked first; this one alone is what stderr carries when the
+/// debug.log lines around it are not in the tail.
+pub const HTTP_SERVER_REFUSED_MARKER: &str = "Unable to start HTTP server";
+
+/// `BlockManager::ReadRawBlock` (node/blockstorage.cpp:1897/1905 at
+/// v0.34.12) asked for a block whose position is the default one: a block
+/// the node knows the header of and never stored.
+pub const READ_BLOCK_NO_DATA_MARKER: &str =
+    "ReadRawBlock: OpenBlockFile failed for FlatFilePos(nFile=-1";
+
+/// ImportBlocks' fatal at start (node/blockstorage.cpp:2133).
+pub const CONNECT_BEST_BLOCK_FATAL_MARKER: &str = "Failed to connect best block";
+
+/// ConnectTip's fatal (validation.cpp:9646), at start and while running.
+pub const READ_BLOCK_FATAL_MARKER: &str = "Failed to read block.";
+
+/// Whether a btxd run died on engine v0.34.12's "Failed to read block"
+/// fatal (.superpowers/sdd/progress.md, P0 root cause).
+///
+/// A trusted mirror that started from a snapshot runs two chainstates. The
+/// engine's mirror shortcut in `FindMostWorkChain` hands the background one
+/// a signed block above the snapshot; it walks up from its own low tip, hits
+/// a block it never downloaded, and the read of position nFile=-1 ends the
+/// node. The signatures that pointed there are stored
+/// (`matmul_attestations.dat*`) and loaded before the next start's first
+/// activation, so every start after it dies the same way in under a second.
+///
+/// Both halves required: the read of a block with no data, AND the fatal it
+/// caused. The read alone is logged for an RPC or peer asking for a block
+/// the node only has the header of, and the node carries on; the fatal
+/// alone, after a read with a real file number, is a damaged or pruned
+/// block file, which none of the recovery for this one would help.
+pub fn log_shows_read_block_fatal(text: &str) -> bool {
+    text.contains(READ_BLOCK_NO_DATA_MARKER)
+        && (text.contains(CONNECT_BEST_BLOCK_FATAL_MARKER)
+            || text.contains(READ_BLOCK_FATAL_MARKER))
+}
+
 pub fn launch_failure_hint(text: &str) -> Option<&'static str> {
+    if log_shows_read_block_fatal(text) {
+        return Some(
+            "the node engine stopped on a known error of its own: it tried to read a block it \
+             never downloaded. This can happen to a node that follows signatures while it \
+             still checks its older history after a snapshot start, and it then happens again \
+             at every start. easyNode tries to get it running on its own: it sets aside the \
+             node's stored signatures and, if that is not enough, its chain data, and starts \
+             again from the snapshot. If that does not work either, everything is put back. \
+             Nothing is deleted until the node is running again. Copy diagnostics in Tools \
+             gathers what helps.",
+        );
+    }
     if text.contains(PRUNED_DATADIR_REFUSED_MARKER) {
         return Some(
-            "this node folder still holds blocks from an earlier run that deleted old \
-             blocks to save space, and the node is now set to keep them all, so it \
-             refuses to start. Use Remove node data, then set the node up again from a \
-             snapshot.",
+            "this node folder deleted old blocks in an earlier run, and something asked \
+             it to keep them all, so it refused to start. Since 0.6.20 this app does not \
+             ask that of a folder like this, so check what else did: a prune=0 in the \
+             folder's own btx_rw.conf outranks the app's. Getting every block back means \
+             downloading the whole chain again either way — Remove node data and set up \
+             again from a snapshot is the faster half of that, not a different outcome.",
+        );
+    }
+    if text.contains(RPC_BIND_FAILED_MARKER) {
+        return Some(
+            "another node is already running on this computer. btxd could not take the \
+             port it talks to this app on, because something already holds it — most \
+             likely the easyBTX miner's node, a second copy of this app, or a btxd you \
+             started by hand. Only one node can use a machine's node folder at a time. \
+             Stop the other one and press Retry; nothing here is broken and nothing \
+             needs removing.",
         );
     }
     if text.contains(MATMUL_CONSENSUS_REFUSED_MARKER) {
@@ -936,7 +2080,317 @@ pub fn launch_failure_hint(text: &str) -> Option<&'static str> {
              did not start either.",
         );
     }
+    if text.contains(REORG_POLICY_CONFLICT_MARKER) {
+        return Some(
+            "the node engine refused its reorg settings because it is 0.34.12 or newer and \
+             this start did not put it in legacy reorg mode, which easyNode does only when \
+             the engine's install folder is named for 0.34.12 or newer, so the engine in that \
+             folder is newer than its name says; nothing in the node folder is damaged.",
+        );
+    }
+    if text.contains(ATTESTATION_ARCHIVE_REFUSED_MARKER) {
+        return Some(
+            "the node's saved record of block signatures did not pass its own start-up \
+             check, so the engine refused to start. Nothing in the chain is damaged. The \
+             record is the files and the folder whose names start with \
+             matmul_attestations.dat in the node folder. Open the data folder from Tools, \
+             move them to another folder, and press Retry. If this node signs blocks, ask \
+             for help first instead: the record also holds the signatures it took back. \
+             Copy diagnostics in Tools gathers what helps.",
+        );
+    }
+    if text.contains(DATADIR_LOCK_REFUSED_MARKER) {
+        return Some(
+            "another node is already using this node folder, so the engine could not \
+             lock it. That is most likely the easyBTX miner's node, a second copy of this \
+             app, or a btxd started by hand. Stop the other one and press Retry; nothing \
+             here is broken and nothing needs removing.",
+        );
+    }
+    if text.contains(HTTP_SERVER_REFUSED_MARKER) {
+        return Some(
+            "the engine could not open its local connection for this app, usually because \
+             another program already holds port 19334. Close that program and press \
+             Retry; nothing in the node folder is damaged.",
+        );
+    }
     None
+}
+
+/// The engine's own last error line in a log tail, for an exit
+/// [`launch_failure_hint`] does not recognise.
+///
+/// btxd's noui handler prints every InitError on stderr as `Error: <message>`
+/// (noui.cpp:30-46 at v0.34.12), which lands in easybtx-node.log, and it
+/// logs its own failures with "(Error: ...)" in the line. So the last line
+/// that starts with `Error:`, or carries `InitError` or `Error: `, is the
+/// engine's own account of why it stopped. Quoting it beats "not
+/// recognised": the person reading it, or the person they send it to, then
+/// has the cause in the engine's own words.
+///
+/// Trimmed, one line, at most 200 characters (cut on a character).
+///
+/// A line that STARTS with `Error:` wins over a later one that only carries
+/// an error in passing (a bind or a peer, "(Error: ...)"): the first is the
+/// engine's reason for stopping, the second is often only a symptom on the
+/// way down (Task A review M4).
+pub fn engine_error_line(text: &str) -> Option<String> {
+    let lines = || text.lines().map(str::trim);
+    lines()
+        .rfind(|l| l.starts_with("Error:"))
+        .or_else(|| lines().rfind(|l| l.contains("InitError") || l.contains("Error: ")))
+        .map(|l| cap_chars(l, LOG_QUOTE_MAX_CHARS))
+}
+
+/// How a child ended, in a few words: "it exited with code N", or on unix
+/// "it was ended by signal N".
+pub fn describe_exit(status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("it exited with code {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("it was ended by signal {signal}");
+        }
+    }
+    format!("it ended ({status})")
+}
+
+/// [`launch_failure_cause`], and when the log names nothing, how the child
+/// ended ([`describe_exit`]), which is the one fact left. `None` only when
+/// there is neither.
+pub fn launch_failure_cause_or_exit(text: &str, exit: Option<&str>) -> Option<String> {
+    launch_failure_cause(text)
+        .or_else(|| exit.map(|e| format!("the engine printed no error line, and {e}.")))
+}
+
+/// The cause to show for a launch that died: the recognised sentence when
+/// there is one, else the engine's own last error line, quoted. `None` only
+/// when the tail carries neither, so the caller can say it does not know.
+pub fn launch_failure_cause(text: &str) -> Option<String> {
+    if let Some(hint) = launch_failure_hint(text) {
+        // The archive refusal's reason (which record, why) is the engine's
+        // alone and is what a helper needs, so it stays with the sentence
+        // (Task A review M5).
+        if text.contains(ATTESTATION_ARCHIVE_REFUSED_MARKER) {
+            if let Some(line) = engine_error_line(text) {
+                return Some(format!("{hint} The engine said: \"{line}\"."));
+            }
+        }
+        return Some(hint.to_string());
+    }
+    engine_error_line(text).map(|line| format!("the engine said: \"{line}\"."))
+}
+
+/// How much of a log line the app quotes back to a person.
+const LOG_QUOTE_MAX_CHARS: usize = 200;
+
+fn cap_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// The last non-empty line of a log text, trimmed and at most 200
+/// characters. For saying what a launch that never reached RPC was last
+/// doing.
+pub fn last_log_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .map(|l| cap_chars(l, LOG_QUOTE_MAX_CHARS))
+}
+
+/// debug.log's length now, 0 when it is missing. A launch records this just
+/// before it spawns btxd so it can later read only its own lines
+/// ([`debug_log_since`]).
+pub fn debug_log_len(datadir: &Path) -> u64 {
+    std::fs::metadata(datadir.join("debug.log"))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// What debug.log gained since `offset` (from [`debug_log_len`] before the
+/// spawn), at most the last 64 KiB of it.
+///
+/// Empty is a real answer: the engine buffers every log line in memory until
+/// `init::StartLogging` (init.cpp:2924 at v0.34.12, logging.cpp:437-449), so
+/// a btxd stuck before that point has written nothing to debug.log at all.
+///
+/// A file now SHORTER than `offset` was shrunk by `ShrinkDebugFile`, which
+/// runs inside this launch's StartLogging. It keeps the old file's last 10 MB
+/// (logging.cpp:519-540 at v0.34.12) and this launch's lines follow them, so
+/// the plain tail read then can hold far more of older runs than of this
+/// one: a launch writes only a few lines before RPC. A reader that must tell
+/// them apart looks past this launch's StartLogging line ([`pre_rpc_stage`]
+/// does); a quote of the last line is safe, since that line is this
+/// launch's.
+pub fn debug_log_since(datadir: &Path, offset: u64) -> String {
+    const MAX: u64 = 64 * 1024;
+    let path = datadir.join("debug.log");
+    let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let want = if len < offset {
+        MAX
+    } else {
+        (len - offset).min(MAX)
+    };
+    if want == 0 {
+        return String::new();
+    }
+    read_tail(&path, want)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default()
+}
+
+/// The line `init::StartLogging` writes once debug.log is open
+/// (init/common.cpp:121 at v0.34.12: `Using data directory %s`). Every line
+/// the engine held in memory before it lands just ahead of it, so its
+/// presence in a launch's own part of debug.log means that launch got past
+/// StartLogging (init.cpp:2924).
+pub const START_LOGGING_MARKER: &str = "Using data directory";
+
+/// The line the engine prints at the END of its GPU readiness step,
+/// `InitializeMatMulRCReadinessPostDaemon` (init.cpp:2717-2727 at v0.34.12):
+/// `MatMul RC execution policy: %s provider=%s ready=%d ...`. It prints in
+/// every mode, a mirror's included, so a launch that got past StartLogging
+/// without it is inside that step.
+pub const RC_EXECUTION_POLICY_MARKER: &str = "MatMul RC execution policy:";
+
+/// Where a btxd that never opened its RPC was, as far as its own part of
+/// debug.log tells ([`pre_rpc_stage`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreRpcStage {
+    /// Nothing from this launch reached debug.log: it never got to
+    /// StartLogging. Arguments, the datadir lock or the attestation archive
+    /// open (init.cpp:2888-2900), not the GPU.
+    BeforeLogging,
+    /// Past StartLogging, and the GPU step's closing policy line is not
+    /// there: inside the CUDA or Metal probe, the self-qualification
+    /// episodes or the canary (init.cpp:2928, which has no timeout).
+    GpuCheck,
+    /// The GPU step finished; whatever held it came later.
+    PastGpuCheck,
+}
+
+/// Pure: read [`PreRpcStage`] from THIS launch's part of debug.log
+/// ([`debug_log_since`]).
+///
+/// Only what follows the LAST [`START_LOGGING_MARKER`] counts. A debug.log
+/// the engine shrank at this StartLogging is read as a plain tail
+/// (`debug_log_since`), which can still hold an older run's policy line
+/// above this launch's own start.
+pub fn pre_rpc_stage(launch_log: &str) -> PreRpcStage {
+    let Some(at) = launch_log.rfind(START_LOGGING_MARKER) else {
+        return PreRpcStage::BeforeLogging;
+    };
+    if launch_log[at..].contains(RC_EXECUTION_POLICY_MARKER) {
+        PreRpcStage::PastGpuCheck
+    } else {
+        PreRpcStage::GpuCheck
+    }
+}
+
+/// Did the engine run its GPU readiness step before RPC on a launch with
+/// these arguments? Pure, over the arguments the launch actually passed
+/// ([`NodeController::launch_args`]).
+///
+/// The step probes a device only in consensus mode under the strict-device
+/// policy (init.cpp:2618-2622 at v0.34.12). Both are the engine's defaults on
+/// mainnet (`-matmulvalidation` defaults to consensus, init.cpp:2596, and
+/// `-matmulrcexecution` to strict-device on a chain with an RC height), which
+/// is why a Mac that passes neither still runs it. The last value on the
+/// command line is the one the engine reads. A host with no graphics card
+/// has no GPU to hang in.
+pub fn launch_runs_gpu_check(backend: Backend, args: &[String]) -> bool {
+    if !matches!(backend, Backend::Cuda | Backend::Metal) {
+        return false;
+    }
+    let last = |flag: &str| {
+        args.iter()
+            .rev()
+            .find_map(|a| a.strip_prefix(flag).map(str::to_string))
+    };
+    let validation = last("-matmulvalidation=").unwrap_or_else(|| "consensus".to_string());
+    let execution = last("-matmulrcexecution=").unwrap_or_else(|| "strict-device".to_string());
+    validation == "consensus" && execution == "strict-device"
+}
+
+/// The evidence for "this validating start is stuck in the engine's GPU
+/// check", both halves required: the launch ran the check
+/// ([`launch_runs_gpu_check`]) and its log stops inside it
+/// ([`PreRpcStage::GpuCheck`]). A launch whose log is still empty is not
+/// enough: that is the attestation archive or earlier, and following
+/// signatures would not get past it.
+///
+/// Why this exists (2026-10-01). Zan's two NVIDIA Linux nodes, Full check on
+/// engine 0.34.12, both stopped about 50 minutes into catch-up and never
+/// started again: every start ended on "no .cookie yet". The leading
+/// reading is a card that hung on a block and now hangs the engine's start
+/// every time, in a step that has no timeout. A mirror launch does no GPU
+/// work before RPC, so the same machine can still start and follow
+/// signatures.
+pub fn stuck_in_gpu_check(gpu_check_launch: bool, launch_log: &str) -> bool {
+    gpu_check_launch && pre_rpc_stage(launch_log) == PreRpcStage::GpuCheck
+}
+
+/// Sticky per-datadir record that a validating start hung in the engine's
+/// GPU check ([`stuck_in_gpu_check`]) and the app moved the node to
+/// following signatures. The twin of the Mac's refusal marker below, for a
+/// card that does not refuse but never answers.
+///
+/// Sticky so the next start does not spend three minutes, and possibly a
+/// process the driver will not let go, finding out again. Cleared on a node
+/// engine upgrade, which may handle the card differently, and when the owner
+/// chooses to check blocks again (Settings, or Full check at setup): that is
+/// the way back, one click.
+fn gpu_start_hung_path(datadir: &Path) -> std::path::PathBuf {
+    datadir.join(".gpu-start-hung")
+}
+
+/// Has a validating start on this datadir's host hung in the GPU check?
+pub fn gpu_start_hung(datadir: &Path) -> bool {
+    gpu_start_hung_path(datadir).exists()
+}
+
+/// How the app names this host's GPU to a person: a Mac's is its "graphics
+/// chip", as the chip notice and the Block checking card say; anything else
+/// is a "graphics card" (final review M7).
+pub fn graphics_word(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Metal => "graphics chip",
+        _ => "graphics card",
+    }
+}
+
+/// Record the hang so the next launch follows signatures. Best-effort, like
+/// the refusal marker: an unwritable datadir costs one more slow start.
+pub fn record_gpu_start_hung(datadir: &Path, backend: Backend) {
+    let path = gpu_start_hung_path(datadir);
+    let word = graphics_word(backend);
+    let short = word.trim_start_matches("graphics ");
+    if let Err(e) = std::fs::write(
+        &path,
+        format!(
+            "This machine's {word} did not finish the node engine's start-up\n\
+             check: the engine waited on the {short} and never opened its connection\n\
+             for the app. So the app starts this node following signatures instead\n\
+             of checking blocks. Choosing \"check blocks\" in Settings deletes this\n\
+             file and tries the {short} again, and so does an engine update.\n"
+        ),
+    ) {
+        eprintln!("[node] could not write {}: {e}", path.display());
+    }
+}
+
+/// Drop the record, so the next launch tries the card again.
+pub fn clear_gpu_start_hung(datadir: &Path) {
+    let path = gpu_start_hung_path(datadir);
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            eprintln!("[node] could not clear {}: {e}", path.display());
+        }
+        _ => {}
+    }
 }
 
 /// Sticky per-datadir record that consensus mode was refused on this machine.
@@ -983,6 +2437,85 @@ pub fn clear_matmul_consensus_refused(datadir: &Path) {
     }
 }
 
+/// The owner's choice to follow signatures on a machine that could check
+/// blocks itself. The app offers it only when it has measured the machine
+/// adding fewer blocks an hour than the chain makes, a node that will never
+/// reach the tip (catchup-trend.ts; the owner's decision of 2026-09-26), or
+/// when the machine's graphics chip failed the engine's check and the node
+/// does not move at all (validation.ts `stalledFollowOffer`). It sets it only
+/// on the owner's click, or when the owner picks Quick start on the setup
+/// screen ([`apply_start_choice`]).
+///
+/// A file for the same reason as the refusal marker above: every path that
+/// decides the launch reads it through [`launches_as_mirror`], with nothing to
+/// thread through. Unlike that marker a node upgrade does not clear it: it
+/// records a person's choice, not a verdict a newer engine could change.
+/// Settings clears it.
+fn follow_signatures_path(datadir: &Path) -> std::path::PathBuf {
+    datadir.join(".follow-signatures")
+}
+
+/// Has the owner chosen to follow signatures on this datadir's host?
+pub fn follows_signatures_by_choice(datadir: &Path) -> bool {
+    follow_signatures_path(datadir).exists()
+}
+
+/// Record or withdraw the owner's choice. Idempotent both ways.
+pub fn set_follows_signatures_by_choice(datadir: &Path, on: bool) -> std::io::Result<()> {
+    let path = follow_signatures_path(datadir);
+    if on {
+        std::fs::write(
+            &path,
+            "The owner chose, in the app, to follow signatures instead of checking\n\
+             blocks on this machine: Quick start at setup, or the offer on the\n\
+             status screen. Settings switches it back.\n",
+        )
+    } else {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// What the owner picked on the setup screen
+/// (docs/decisions/2026-09-29-quick-start-full-check-and-progress.md). The
+/// window sends `"quick_start"` or `"full_check"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartChoice {
+    /// Follows signatures, ready in minutes.
+    QuickStart,
+    /// Validates every block, takes longer the first time.
+    FullCheck,
+}
+
+/// Record the setup choice before the node's first start, where
+/// [`launches_as_mirror`] reads it.
+///
+/// Quick start writes the follow-signatures marker on a machine that may check
+/// blocks (`Backend::may_check_blocks`), so Settings can take it back later.
+/// That includes a Mac, where Quick start is selected first: without the
+/// marker, [`launches_as_mirror`] would try the chip at the first start.
+/// Full check removes it. A machine that cannot check blocks gets no marker
+/// either way: it follows signatures anyway, and a marker there would show a
+/// Settings switch that changes nothing.
+pub fn apply_start_choice(
+    datadir: &Path,
+    choice: StartChoice,
+    may_check_blocks: bool,
+) -> std::io::Result<()> {
+    // Full check is the owner asking the card to check blocks, so it gets
+    // its next try, the way Settings' "check blocks" gives it one.
+    if choice == StartChoice::FullCheck {
+        clear_gpu_start_hung(datadir);
+    }
+    set_follows_signatures_by_choice(
+        datadir,
+        choice == StartChoice::QuickStart && may_check_blocks,
+    )
+}
+
 /// Whether THIS launch should run as a trusted mirror.
 ///
 /// `trusted_mirror_enabled` answers the static question ("is this a host class
@@ -997,6 +2530,481 @@ pub fn clear_matmul_consensus_refused(datadir: &Path) {
 /// removing the part that was false: that Apple Silicon always qualifies.
 pub fn trusted_mirror_required(backend: Backend, datadir: &Path) -> bool {
     trusted_mirror_enabled(backend) || matmul_consensus_was_refused(datadir)
+}
+
+/// Will THIS launch run as a trusted mirror (follows signatures) rather than
+/// a validator (may make them)? The one rule for one launch, used by
+/// `build_node_command` for the `-matmulvalidation` arm and by the app's
+/// start path to decide whether a signing key goes in the conf for it.
+///
+/// It includes a validating node's one-time mirror launch, which loads a
+/// signed snapshot ([`mirror_load_pending`]): that launch is a mirror, so it
+/// holds no key, although the host checks blocks itself before and after.
+/// A question about the host's lasting role (can it sign, what does the
+/// window say, should the signer be switched on for it) asks
+/// [`host_follows_signatures`] instead.
+///
+/// The operator's explicit word (`EASYBTX_NODE_TRUSTED_MIRROR`) outranks the
+/// backend split in both directions: `=1` puts a Cuda host on the mirror, `=0`
+/// keeps a Cpu host in consensus. Unset, the backend decides: a Cuda host
+/// validates, a Cpu host mirrors (2026-09-15), a refused Mac mirrors, and
+/// Metal with a clear marker validates. Only on an engine that allows a
+/// degraded start; before 0.34.5 the split does not apply. The owner's choice
+/// to follow signatures ([`follows_signatures_by_choice`]) makes any host a
+/// mirror, unless the operator's word is `=0`, and so does the record of a
+/// validating start that hung in the GPU check ([`gpu_start_hung`]).
+pub fn launches_as_mirror(btxd: &Path, datadir: &Path, backend: Backend) -> bool {
+    // A validating node's one mirror launch, to load a signed snapshot.
+    if mirror_load_marker_applies(
+        mirror_load_pending(datadir).is_some(),
+        trusted_mirror_override(),
+    ) {
+        return true;
+    }
+    host_follows_signatures(btxd, datadir, backend)
+}
+
+/// Pure half of [`launches_as_mirror`]'s first rule: a fresh mirror-load
+/// marker makes the launch a mirror, unless the operator's word
+/// ([`trusted_mirror_override`]) is "never a mirror".
+pub fn mirror_load_marker_applies(fresh_marker: bool, operator_word: Option<bool>) -> bool {
+    fresh_marker && operator_word != Some(false)
+}
+
+/// [`launches_as_mirror`] without the one-time mirror launch: does this host
+/// follow signatures, or does it check blocks itself?
+pub fn host_follows_signatures(btxd: &Path, datadir: &Path, backend: Backend) -> bool {
+    // The owner's choice, and the record of a start that hung in the GPU
+    // check, outrank the backend split, a Cuda host included, and yield only
+    // to the operator's explicit =0.
+    if follows_by_record(
+        follows_signatures_by_choice(datadir),
+        gpu_start_hung(datadir),
+        trusted_mirror_override(),
+    ) {
+        return true;
+    }
+    let degraded_start = node_allows_degraded_matmul_start(btxd);
+    let cuda_validates_here = degraded_start
+        && matches!(backend, Backend::Cuda)
+        && trusted_mirror_override() != Some(true);
+    trusted_mirror_required(backend, datadir) && !cuda_validates_here
+}
+
+/// Pure half of [`host_follows_signatures`]'s first rule: the owner's choice
+/// or the GPU-hang record ([`gpu_start_hung`]) makes the host follow
+/// signatures, unless the operator's word ([`trusted_mirror_override`]) is
+/// "never a mirror".
+pub fn follows_by_record(by_choice: bool, gpu_hung: bool, operator_word: Option<bool>) -> bool {
+    (by_choice || gpu_hung) && operator_word != Some(false)
+}
+
+/// Does the conf hand the engine a signing key? The app's start path writes
+/// `matmulattestationsignerkeyfile=` into the conf when the signer role is on
+/// for a host that validates, and removes it otherwise; the launch reads the
+/// conf rather than the setting so a hand-managed conf (this project's own
+/// validator until 0.6.26) gets the same link.
+pub fn signs_here(conf: &Path) -> bool {
+    crate::setup::conf_kv(conf, crate::signer::SIGNER_KEY_CONF_KEY)
+        .is_some_and(|v| !v.trim().is_empty())
+}
+
+/// The pin a validating signer must carry for its OWN key, or `None` when
+/// there is nothing to add.
+///
+/// WHY. v0.34.9 refuses to start a node that holds a local signing key and
+/// pins no key: "-matmulattestationblocklist leaves 0 unblocked pin
+/// member(s), below -matmultrustedthreshold=1", although the blocklist is
+/// empty. Upstream 235d39be (ML-DSA-44 pins) made that check unconditional and
+/// counts a local ML-DSA key toward it but not a local secp256k1 one; 0.34.6
+/// ran it only when pins existed. Every node this app hands a key to (a
+/// validating host since 0.6.26) is exactly that shape, so without this the
+/// 0.34.9 engine does not start on any of them. Measured 2026-09-23 on an M2
+/// Pro, mainnet parameters, no peers: 0.34.6 with the key alone and 0.34.9
+/// with the key plus this pin both reach "Done loading" and report the same
+/// getmatmultrustedstatus (consensus, local_signer, single_key_pin,
+/// collocated_signer_pin, trusted_signers 1, unblocked_pin_members 1): 0.34.6
+/// already made the local key a pin member of itself, so stating it only
+/// restores that. 0.34.9 adds one warning, "no spare unblocked MatMul pin
+/// member". The same pin on 0.34.6 is harmless, which matters when an
+/// upgrade falls back to the old engine.
+///
+/// The key is read from the file the conf line names (relative to the
+/// datadir, as the engine resolves it on mainnet). `None` when there is no
+/// line, the key cannot be read, or the conf or the datadir's `btx_rw.conf`
+/// already pins that key: the engine refuses a duplicate
+/// `-matmultrustedpubkey`, and a hand-managed conf, or a mirror-era leftover
+/// pin in `btx_rw.conf` (final review O1), may already carry it. `btxd`
+/// loads `btx_rw.conf` on every start regardless of `-conf` and merges its
+/// list settings with the command line, so a key it already pins must count
+/// here the same as a key `conf` pins.
+pub fn signing_key_self_pin(conf: &Path, datadir: &Path) -> Option<String> {
+    let named = crate::setup::conf_kv(conf, crate::signer::SIGNER_KEY_CONF_KEY)?;
+    let named = named.trim();
+    if named.is_empty() {
+        return None;
+    }
+    let key_path = if Path::new(named).is_absolute() {
+        PathBuf::from(named)
+    } else {
+        datadir.join(named)
+    };
+    let wif = std::fs::read_to_string(key_path).ok()?;
+    let pubkey = crate::signer::wif_to_pubkey_hex(&wif).ok()?;
+    let mut already_pinned = conf_pins(conf);
+    already_pinned.extend(rw_conf_pins(&datadir.join("btx_rw.conf")));
+    let already_pinned = already_pinned
+        .iter()
+        .any(|v| v.eq_ignore_ascii_case(&pubkey));
+    (!already_pinned).then_some(pubkey)
+}
+
+/// Every key `conf` already pins for mainnet (`matmultrustedpubkey=`),
+/// lowercase. The engine refuses a duplicate pin, so the command line never
+/// repeats one.
+///
+/// Parses the way the engine's own conf reader does (`common/config.cpp`
+/// `GetConfigOptions` and `common/args.cpp` `InterpretKey`, v0.34.9 at
+/// `84b998b4`): a line is cut at the first `#` and trimmed; `[name]` starts a
+/// section, and every later name is read as `name.` plus the line's; a line
+/// is split at the first `=`, both halves trimmed; the section is whatever
+/// comes before the first `.`. Mainnet reads the default section and
+/// `main`, so a pin under `[main]` or with the `main.` prefix counts, and
+/// one under `[test]`, `[regtest]` or with their prefix does not.
+/// `includeconf` is not followed: a pin listed only through an included file
+/// is not seen here. For `btx_rw.conf` ask [`rw_conf_pins`].
+pub fn conf_pins(conf: &Path) -> Vec<String> {
+    pins_read(conf, false)
+}
+
+/// [`conf_pins`] for the datadir's `btx_rw.conf`, which the engine loads on
+/// every start and reads without sections: it keeps only the name after the
+/// section (`common/config.cpp` ~111, `settings_target`), so a pin under any
+/// section, or with any section prefix, applies on mainnet there.
+pub fn rw_conf_pins(rw_conf: &Path) -> Vec<String> {
+    pins_read(rw_conf, true)
+}
+
+/// The engine's `InterpretBool` (`common/args.cpp:65-70` at `84b998b4`),
+/// backed by `LocaleIndependentAtoi<int>` (`util/strencodings.h:119-144`):
+/// an empty value reads true. Otherwise, leading whitespace and a single
+/// leading `+` are skipped (a `+` directly followed by `-` is the engine's
+/// own special case and reads 0), then the leading `-`-or-digits run is
+/// atoi'd, C-`int`-style: no digit run at all reads 0, and a number too
+/// big or small for `int` does NOT read 0, it saturates to `i32::MAX` or
+/// `i32::MIN`. Since we only need "zero or not," and a saturated value is
+/// never zero, this only has to know whether that digit run holds any
+/// digit other than `0` - never how big the number actually is, so no
+/// parse can overflow here.
+fn interpret_bool(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    let s = value.trim_start();
+    let s = match s.strip_prefix('+') {
+        Some(rest) if rest.starts_with('-') => return false,
+        Some(rest) => rest,
+        None => s,
+    };
+    let end = s
+        .char_indices()
+        .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && c == '-')))
+        .map_or(s.len(), |(i, _)| i);
+    s[..end].bytes().any(|b| b.is_ascii_digit() && b != b'0')
+}
+
+/// The two readers' one parser.
+///
+/// `sections_dropped` (`btx_rw.conf`): the engine reads it as one span,
+/// every section merged into the same list regardless of where a line
+/// sits (`common/config.cpp` ~111, `settings_target`). Otherwise (a
+/// general conf file) mainnet reads it as the engine does: `[main]`/
+/// `main.` and the default section are the engine's own two SEPARATE
+/// lists (`common/config.cpp:113`,
+/// `m_settings.ro_config[key.section][key.name].push_back(...)`, at
+/// `84b998b4`, keyed first by the section `InterpretKey` computes, so a
+/// pin under `[test]` or with the `test.` prefix is in neither list and is
+/// not read here); a `[main]`/`main.` line and a same-named default-
+/// section line do not share one list even though they end up in the same
+/// pin count.
+///
+/// Negation follows the engine's `InterpretValue` (`common/args.cpp:113-
+/// 128` at `84b998b4`, reached for every conf line through `InterpretKey`
+/// and `ReadConfigStream`, `common/config.cpp:98-106`): a
+/// `nomatmultrustedpubkey=` line, with an empty value or one that reads
+/// true per [`interpret_bool`], clears every pin read so far for its own
+/// list only (`SettingsSpan::negated`, `common/settings.cpp:281-287`).
+/// `nomatmultrustedpubkey=0` is the documented double negative and does
+/// NOT clear - though it is not harmless: that line becomes a bogus `true`
+/// entry in the pin list itself (`GetArgs`, `common/args.cpp:369-375`,
+/// `value.isTrue() ? "1" : ...`), and the engine refuses to start on it
+/// ("Invalid compressed public key in -matmultrustedpubkey: 1",
+/// `init.cpp:1577-1583`).
+///
+/// The two lists are merged `[main]`'s pins first, then the default
+/// section's (`GetSettingsList`, `common/settings.cpp:216-259`, source
+/// order in `MergeSettings`, `common/settings.cpp:24-31,42-74`), always:
+/// this function does NOT drop the default section's pins even when
+/// `[main]`'s own list ends in a negation.
+///
+/// That IS one of the engine's real rules (the "zombie" revival,
+/// `prev_negated_empty |= span.last_negated() && result.empty()`,
+/// `GetSettingsList` again), but only half of it: the engine drops the
+/// default section's pins on a `[main]`-ending negation ONLY WHEN
+/// `result` - which by then already holds whatever the command line and
+/// `btx_rw.conf` contributed, since those merge before either conf-file
+/// section - is STILL empty at that point. This function reads one conf
+/// file in isolation and has no way to know that, so it cannot apply the
+/// rule correctly; and getting it wrong the other way (dropping the
+/// default section's pins when the engine would have kept them) is worse
+/// than useless here: this app fills the command line with every shipped
+/// key it does not think is already pinned (the mirror and validating
+/// arms below, and `signing_key_self_pin`), so a key this function wrongly
+/// calls "not pinned" gets pushed on the command line, `result` is then
+/// NOT empty by the time the engine reaches the default section, the
+/// engine revives that same key from the conf file after all, and the
+/// engine refuses to start on the duplicate ("Duplicate
+/// -matmultrustedpubkey", `init.cpp:1591-1596`). Always counting the
+/// default section's pins as live avoids that: the one way this can still
+/// be wrong is the corner the engine's own rule actually drops them
+/// (`result` genuinely empty). There, the cost is never a duplicate
+/// refusal: at worst the default section's pins are missing, which the
+/// engine may itself refuse over, as it would for any choice this app
+/// could make there (a mainnet mirror with fewer than 2 signers is
+/// refused, `init.cpp:1831` at `84b998b4`; a validating node on a signed
+/// snapshot needs the default section's pins too, see the pin rule above
+/// in `build_node_command`).
+///
+/// What this function does not follow at all, for the same one-file-at-a-
+/// time reason, and the app only takes the union of [`conf_pins`] and
+/// [`rw_conf_pins`] to avoid asking the engine to pin a key twice, never
+/// which file's value "wins": `rw_conf_pins` and `conf_pins` are read
+/// independently here and do not know about each other, so a
+/// `btx_rw.conf` whose own list ends in a negation would, on the engine's
+/// side, feed into that same `result.empty()` test for the conf file's
+/// sections one level up - not modeled here either, for the same reason
+/// and with the same "at worst a missing pin" cost.
+fn pins_read(conf: &Path, sections_dropped: bool) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(conf) else {
+        return Vec::new();
+    };
+    let mut prefix = String::new();
+    // `sections_dropped`: `default_pins` is the file's one flat list.
+    // Otherwise: `main_pins` is `[main]`/`main.`'s own list and
+    // `default_pins` is the default section's, each cleared independently
+    // by its own negations; see the doc comment for why they are always
+    // both kept, never one dropped for the other.
+    let mut default_pins = Vec::new();
+    let mut main_pins = Vec::new();
+    for raw in text.lines() {
+        let l = raw.split('#').next().unwrap_or("").trim();
+        if l.len() >= 2 && l.starts_with('[') && l.ends_with(']') {
+            prefix = format!("{}.", &l[1..l.len() - 1]);
+            continue;
+        }
+        let Some((name, value)) = l.split_once('=') else {
+            continue;
+        };
+        let full = format!("{prefix}{}", name.trim());
+        let (section, key) = match full.split_once('.') {
+            Some((section, key)) => (Some(section), key),
+            None => (None, full.as_str()),
+        };
+        let value = value.trim();
+        if sections_dropped {
+            if key == "matmultrustedpubkey" && !value.is_empty() {
+                default_pins.push(value.to_ascii_lowercase());
+            } else if key == "nomatmultrustedpubkey" && interpret_bool(value) {
+                default_pins.clear();
+            }
+            continue;
+        }
+        let is_main = match section {
+            Some("main") => true,
+            None => false,
+            _ => continue, // [test]/[regtest]/etc.: mainnet does not read it.
+        };
+        let pins = if is_main {
+            &mut main_pins
+        } else {
+            &mut default_pins
+        };
+        if key == "matmultrustedpubkey" {
+            if !value.is_empty() {
+                pins.push(value.to_ascii_lowercase());
+            }
+        } else if key == "nomatmultrustedpubkey" && interpret_bool(value) {
+            pins.clear();
+        }
+    }
+    if sections_dropped {
+        return default_pins;
+    }
+    main_pins.into_iter().chain(default_pins).collect()
+}
+
+/// The engine's record that this node runs on a signed snapshot whose
+/// background check has not finished (`SNAPSHOT_ATTESTED_ASSUMEUTXO_FILENAME`,
+/// v0.34.9 `src/node/utxo_snapshot.h:254`). `network_dir` is the datadir on
+/// mainnet.
+///
+/// It does not simply vanish when the check finishes: the file stays right
+/// here, under `chainstate_snapshot/`, until the first start AFTER the
+/// background check completes (that start still re-checks the stored
+/// manifest, pins and all). On THAT start the engine renames
+/// `chainstate_snapshot/` to `chainstate/`, and this file rides along,
+/// unread, at `chainstate/attested_assumeutxo`; an invalid snapshot's folder
+/// becomes `chainstate_snapshot_INVALID` instead. Only the copy still under
+/// `chainstate_snapshot/` means "this node is on a signed snapshot"; this
+/// function is that check, nothing under `chainstate/` or
+/// `chainstate_snapshot_INVALID/` counts.
+pub fn attested_snapshot_record(network_dir: &Path) -> PathBuf {
+    network_dir
+        .join("chainstate_snapshot")
+        .join("attested_assumeutxo")
+}
+
+/// The pins a validating node must carry while it runs on a signed snapshot
+/// (the confirmed-snapshot decision, section 8): every key in `mirror_pins`
+/// not already in `already` (the conf's pins and the node's own), and the
+/// threshold the stored manifest was loaded under. Empty otherwise.
+///
+/// WHY. The engine re-checks the stored manifest at every start against the
+/// pins and threshold of that moment, and refuses to start when the check
+/// fails ("Attested snapshot manifest is present but failed verification
+/// under the current authority configuration", `validation.cpp:22330`).
+/// Measured on 2026-09-29, regtest and mainnet: a validating restart on a
+/// signed snapshot starts with the signer pinned and not without it. In
+/// consensus mode the pins are telemetry, never a reason to skip a check.
+pub fn validating_snapshot_pin_args(
+    network_dir: &Path,
+    mirror_pins: &[&str],
+    already: &[String],
+) -> Vec<String> {
+    if !attested_snapshot_record(network_dir).exists() {
+        return Vec::new();
+    }
+    let mut args: Vec<String> = mirror_pins
+        .iter()
+        .filter(|k| !already.iter().any(|a| a.eq_ignore_ascii_case(k)))
+        .map(|k| format!("-matmultrustedpubkey={k}"))
+        .collect();
+    args.push(format!(
+        "-matmultrustedthreshold={BTX_TRUSTED_ATTESTATION_THRESHOLD}"
+    ));
+    args
+}
+
+/// The one-time marker that makes the next launch of a validating node a
+/// mirror launch, so it can load a signed snapshot (section 7, step 5): the
+/// engine allows `loadtxoutsetattested` only in mirror mode. The same
+/// pattern as the header bootstrap's `.header-bootstrap`: written before the
+/// launch, read by [`launches_as_mirror`], cleared by the app after the load
+/// with a restart as a validating node.
+fn mirror_load_path(datadir: &Path) -> PathBuf {
+    datadir.join(".load-snapshot-as-mirror")
+}
+
+/// A marker older than this is left from a run that died, and is ignored:
+/// a load takes minutes, and a validating node must never stay a mirror for
+/// longer than one.
+pub const MIRROR_LOAD_MAX_AGE_SECS: u64 = 6 * 60 * 60;
+
+/// What the marker holds: the pair being loaded (its kind and base), and
+/// when it was written. `kind` is `None` on a marker written before it was
+/// kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MirrorLoad {
+    pub height: u64,
+    pub written_at: u64,
+    #[serde(default)]
+    pub kind: Option<crate::attested_snapshot::PairKind>,
+}
+
+impl MirrorLoad {
+    /// The pair this launch is for, kind and height, when the marker says.
+    /// The load takes it from disk when the website cannot be read
+    /// (`crate::attested_snapshot::prepare_start_marked`).
+    pub fn pair(&self) -> Option<(crate::attested_snapshot::PairKind, u64)> {
+        self.kind.map(|k| (k, self.height))
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// How far in the future a marker may say it was written and still count:
+/// a clock step (a clock a time sync set back), not more.
+pub const MIRROR_LOAD_CLOCK_STEP_SECS: u64 = 300;
+
+/// Pure half of [`mirror_load_pending`]: young enough, and not from the
+/// future by more than a clock step ([`MIRROR_LOAD_CLOCK_STEP_SECS`]).
+pub fn mirror_load_is_fresh(m: &MirrorLoad, now: u64) -> bool {
+    m.written_at <= now + MIRROR_LOAD_CLOCK_STEP_SECS
+        && now.saturating_sub(m.written_at) < MIRROR_LOAD_MAX_AGE_SECS
+}
+
+/// Mark the next launch of this datadir as the mirror launch that loads the
+/// pair of `kind` at `height`.
+pub fn begin_mirror_load(
+    datadir: &Path,
+    kind: crate::attested_snapshot::PairKind,
+    height: u64,
+) -> std::io::Result<()> {
+    let m = MirrorLoad {
+        height,
+        written_at: unix_now(),
+        kind: Some(kind),
+    };
+    std::fs::write(
+        mirror_load_path(datadir),
+        serde_json::to_string(&m).map_err(std::io::Error::other)?,
+    )
+}
+
+/// The pending mirror launch, if a fresh marker says so.
+pub fn mirror_load_pending(datadir: &Path) -> Option<MirrorLoad> {
+    let raw = std::fs::read_to_string(mirror_load_path(datadir)).ok()?;
+    let m: MirrorLoad = serde_json::from_str(&raw).ok()?;
+    mirror_load_is_fresh(&m, unix_now()).then_some(m)
+}
+
+/// A marker file is there, fresh or not.
+pub fn mirror_load_marker_exists(datadir: &Path) -> bool {
+    mirror_load_path(datadir).exists()
+}
+
+/// Clear the marker, so the next launch is the node's ordinary one.
+pub fn end_mirror_load(datadir: &Path) {
+    let path = mirror_load_path(datadir);
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            eprintln!("[node] could not clear {}: {e}", path.display());
+        }
+    }
+}
+
+/// Should this start launch a validating node once as a mirror, to load a
+/// signed snapshot? Only for a node that checks blocks itself, has never
+/// loaded a snapshot, holds no snapshot chainstate, is not in its header
+/// bootstrap (the load waits for the launch after it), and whose operator has
+/// not said "never a mirror" (`EASYBTX_NODE_TRUSTED_MIRROR=0`).
+pub fn mirror_load_wanted(
+    host_validates: bool,
+    header_bootstrap_pending: bool,
+    snapshot_loaded: bool,
+    has_snapshot_chainstate: bool,
+    operator_forbids_mirror: bool,
+) -> bool {
+    host_validates
+        && !header_bootstrap_pending
+        && !snapshot_loaded
+        && !has_snapshot_chainstate
+        && !operator_forbids_mirror
 }
 
 /// macOS SIGKILLs a downloaded binary with "Code Signature Invalid" at exec when
@@ -1320,6 +3328,18 @@ pub async fn stop_foreign_node(datadir: &Path, btx_cli: &Path) {
 /// a graceful stop of a HEALTHY node into a SIGKILL mid-flush, and the next
 /// start into a long "Verifying blocks…" rebuild.
 pub async fn stop_unmanaged_node(datadir: &Path, btx_cli: &Path, grace: std::time::Duration) {
+    // Out of the background policy first, as `NodeController::stop` does: a
+    // node adopted after a self-update may have been put there by the
+    // previous app, and its shutdown flush must not queue behind other
+    // programs' disk I/O. Only a pidfile pid that is alive and named btxd.
+    // macOS only: no other platform ever leaves Normal.
+    #[cfg(target_os = "macos")]
+    if let Some(pid) = verified_btxd_pidfile_pid(datadir).await {
+        let _ = crate::engine_priority::apply_engine_priority(
+            pid,
+            crate::engine_priority::EnginePriority::Normal,
+        );
+    }
     let mut stop_cmd = Command::new(btx_cli);
     stop_cmd
         .arg(format!("-datadir={}", datadir.display()))
@@ -1330,12 +3350,23 @@ pub async fn stop_unmanaged_node(datadir: &Path, btx_cli: &Path, grace: std::tim
     // The daemon writes its own pid to <datadir>/btxd.pid and removes it at
     // the very end of shutdown; once that pid is no longer alive the datadir
     // lock is free (checking the flock itself portably would need the lock).
-    let deadline = std::time::Instant::now() + grace;
+    // Past `grace`, a node that is still logging or still using CPU is still
+    // working, and is waited for (`keep_waiting_for_exit`).
+    let started = std::time::Instant::now();
+    let mut watch = ShutdownWatch::new(datadir, btxd_pidfile_pid(datadir), grace).await;
     let mut stopped = false;
-    while std::time::Instant::now() < deadline {
+    let mut notes = ExtensionNotes::default();
+    loop {
+        let progress = watch.progress().await;
+        if !keep_waiting_for_exit(started.elapsed(), progress, grace) {
+            break;
+        }
         if !btxd_pidfile_alive(datadir) {
             stopped = true;
             break;
+        }
+        if started.elapsed() >= grace {
+            notes.note(progress, started.elapsed());
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
@@ -1357,7 +3388,37 @@ pub async fn stop_unmanaged_node(datadir: &Path, btx_cli: &Path, grace: std::tim
 /// does NOT. This gates a SIGKILL, so the match must be precise. Pure →
 /// unit-testable without spawning a process.
 fn comm_looks_like_btxd(comm: &str) -> bool {
-    comm.trim().rsplit('/').next().unwrap_or("") == "btxd"
+    let base = comm.trim().rsplit('/').next().unwrap_or("");
+    // `btxd.real` is btxd. Since upstream 0.34.1 the released macOS and Linux
+    // packages ship `bin/btxd` as a `#!/bin/sh` wrapper that execs
+    // `../libexec/btxd.real`, so the RUNNING process is named `btxd.real` and
+    // the process table never shows `btxd` at all. Our own source-built
+    // packages have no wrapper, which is why this went unnoticed: it only bites
+    // a datadir whose engine came from an upstream tarball.
+    //
+    // MEASURED 2026-09-06, walking the 0.6.17 -> 0.6.19 mac upgrade on a real
+    // 0.6.17-era datadir. 0.6.17 bundles the official v0.34.5 mac binaries, so
+    // its node runs as `btxd.real`. The app updated itself, provisioned
+    // v0.34.6, and then could not recognise its OWN node:
+    //
+    //     btxd.pid names live pid 86244, but that process is
+    //     ".../v0.34.5/macos-arm64/bin/../libexec/btxd.real", not btxd - the
+    //     pid was recycled and the file is stale. Ignoring the file, and
+    //     leaving that process alone
+    //     pidfile pid 86244 is alive but not btxd (pid reused?); removing the
+    //     stale pidfile without stopping it
+    //     btxd exited within 5s of spawning, attempt 1/3 ... 2/3 ... 3/3
+    //
+    // The old engine kept the datadir lock, the new one lost the race three
+    // times, and the user was left with a dead node and an orphan still
+    // running on the OLD engine. `force_kill_foreign_btxd` refused for the same
+    // reason, so the last-resort recovery was dead too.
+    //
+    // STILL NARROW, deliberately. This function gates a SIGKILL, and it was
+    // tightened from a `contains()` check precisely because that killed
+    // `btxd-wrapper` and `stop-btxd.sh`. Two exact names, no prefix or suffix
+    // matching: `btxd.real` is upstream's own file name, not a pattern.
+    base == "btxd" || base == "btxd.real"
 }
 
 /// The command name of `pid` (basename, no extension), via the platform layer
@@ -1434,6 +3495,208 @@ async fn force_kill_foreign_btxd(datadir: &Path) {
 /// datadir does not care which process started it.
 pub const SHUTDOWN_GRACE_SECS: u64 = 90;
 
+/// Past its grace, a stopping btxd whose `debug.log` is still moving is still
+/// shutting down and is left to finish, for up to this long in all.
+///
+/// The grace alone sits at the LOW end of the flush it budgets for (90-120 s
+/// at ~185k, measured above, and the chain has grown since), so a fixed
+/// deadline killed healthy nodes mid-flush on slow machines. Raised by jpp's
+/// review of the stop paths, 2026-09-26.
+pub const SHUTDOWN_HARD_CAP_SECS: u64 = 600;
+
+/// Past its grace, a stopping btxd that is still using CPU is left to finish
+/// for up to this long in all, logging or not.
+///
+/// The log is not the only sign of work. On the 0.34.9 engine a stop cannot
+/// cancel a protected ExactReplay, a replay logs nothing while it runs (only
+/// the shielded rebuild logs progress), and a CPU replay of a ~141 TMAC episode
+/// can take hours. Cutting one off wastes the replay and leaves an unclean
+/// shutdown, and on a pruned keeper the rebuild after it cannot read the blocks
+/// it needs. So a busy node is waited for, and the window says why. jpp,
+/// 2026-09-26; the engine's own fix is 0.34.10's cancel-on-shutdown (6c1eced9),
+/// after which this cap should almost never be reached.
+pub const SHUTDOWN_BUSY_CAP_SECS: u64 = 6 * 60 * 60;
+
+/// ...and past the grace, a node that has neither logged nor used CPU for this
+/// long reads as wedged. Twice the longest silent stretch measured in a
+/// shutdown, the shielded flush's 30-60 s.
+pub const SHUTDOWN_QUIET_SECS: u64 = 120;
+
+/// A stopping node counts as busy when it used at least this share of one CPU
+/// core between two samples. A replay keeps a core or more saturated; a node
+/// waiting on anything else uses next to none.
+pub const SHUTDOWN_BUSY_CPU_PERCENT: u64 = 20;
+
+/// What a stopping btxd has shown since the stop was asked: how long ago its
+/// `debug.log` last grew, and how long ago it last used CPU in earnest. `None`
+/// for a sign it has not shown at all since then.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShutdownProgress {
+    pub since_log_moved: Option<std::time::Duration>,
+    pub since_cpu_busy: Option<std::time::Duration>,
+}
+
+impl ShutdownProgress {
+    /// Busy with CPU within the quiet window.
+    pub fn cpu_busy(&self) -> bool {
+        within_quiet_window(self.since_cpu_busy)
+    }
+}
+
+fn within_quiet_window(since: Option<std::time::Duration>) -> bool {
+    since.is_some_and(|d| d < std::time::Duration::from_secs(SHUTDOWN_QUIET_SECS))
+}
+
+/// Keep waiting for a stopping btxd to exit? Always inside `grace`. Past it,
+/// only while it has shown work SINCE THE STOP WAS ASKED, recently: using CPU,
+/// up to [`SHUTDOWN_BUSY_CAP_SECS`]; only logging, up to
+/// [`SHUTDOWN_HARD_CAP_SECS`]. A node that has shown neither gets exactly its
+/// grace, as before. Pure, so the policy is tested apart from any process.
+pub fn keep_waiting_for_exit(
+    elapsed: std::time::Duration,
+    progress: ShutdownProgress,
+    grace: std::time::Duration,
+) -> bool {
+    if elapsed < grace {
+        return true;
+    }
+    if progress.cpu_busy() {
+        return elapsed < std::time::Duration::from_secs(SHUTDOWN_BUSY_CAP_SECS);
+    }
+    within_quiet_window(progress.since_log_moved)
+        && elapsed < std::time::Duration::from_secs(SHUTDOWN_HARD_CAP_SECS)
+}
+
+/// Whether `cpu` of CPU time over `wall` of wall time is a node at work. Pure.
+pub fn cpu_was_busy(cpu: std::time::Duration, wall: std::time::Duration) -> bool {
+    !wall.is_zero()
+        && cpu.as_secs_f64() * 100.0 >= wall.as_secs_f64() * SHUTDOWN_BUSY_CPU_PERCENT as f64
+}
+
+/// How often a stop samples the node's CPU: every 5 s, or four times within a
+/// short grace so a busy node is seen before the grace runs out.
+fn cpu_sample_every(grace: std::time::Duration) -> std::time::Duration {
+    (grace / 4).clamp(
+        std::time::Duration::from_millis(250),
+        std::time::Duration::from_secs(5),
+    )
+}
+
+/// Watches a stopping btxd for signs of work, for [`keep_waiting_for_exit`]:
+/// its log, and the CPU its process uses.
+struct ShutdownWatch {
+    log: LogMotion,
+    pid: Option<u32>,
+    sample_every: std::time::Duration,
+    last_cpu: Option<(std::time::Instant, std::time::Duration)>,
+    busy_at: Option<std::time::Instant>,
+}
+
+impl ShutdownWatch {
+    /// Baselined at the moment of the stop request. Without a pid only the log
+    /// is watched, which is the policy before CPU counted.
+    async fn new(datadir: &Path, pid: Option<u32>, grace: std::time::Duration) -> Self {
+        let mut watch = Self {
+            log: LogMotion::new(datadir),
+            pid,
+            sample_every: cpu_sample_every(grace),
+            last_cpu: None,
+            busy_at: None,
+        };
+        watch.last_cpu = watch.read_cpu().await;
+        watch
+    }
+
+    async fn read_cpu(&self) -> Option<(std::time::Instant, std::time::Duration)> {
+        let cpu = crate::platform::process_cpu_time(self.pid?).await?;
+        Some((std::time::Instant::now(), cpu))
+    }
+
+    async fn progress(&mut self) -> ShutdownProgress {
+        match self.last_cpu {
+            // A failed first read is retried, so one bad sample does not turn
+            // the CPU signal off for the whole stop.
+            None if self.pid.is_some() => self.last_cpu = self.read_cpu().await,
+            Some((at, cpu)) if at.elapsed() >= self.sample_every => {
+                if let Some((now, cpu_now)) = self.read_cpu().await {
+                    if cpu_was_busy(cpu_now.saturating_sub(cpu), now - at) {
+                        self.busy_at = Some(now);
+                    }
+                    self.last_cpu = Some((now, cpu_now));
+                }
+            }
+            _ => {}
+        }
+        ShutdownProgress {
+            since_log_moved: self.log.since_moved(),
+            since_cpu_busy: self.busy_at.map(|t| t.elapsed()),
+        }
+    }
+}
+
+/// Says why a stop is still waiting past its grace, once per reason rather
+/// than on every poll.
+#[derive(Default)]
+struct ExtensionNotes {
+    log: bool,
+    cpu: bool,
+}
+
+impl ExtensionNotes {
+    fn note(&mut self, progress: ShutdownProgress, elapsed: std::time::Duration) {
+        if progress.cpu_busy() {
+            if !std::mem::replace(&mut self.cpu, true) {
+                eprintln!(
+                    "[node] btxd still shutting down after {}s and still using CPU, most likely \
+                     a block check this engine cannot cancel (it logs nothing while it runs); \
+                     waiting for it, up to {}h, rather than cutting it off",
+                    elapsed.as_secs(),
+                    SHUTDOWN_BUSY_CAP_SECS / 3600
+                );
+            }
+        } else if !std::mem::replace(&mut self.log, true) {
+            eprintln!(
+                "[node] btxd still shutting down after {}s and its log is still moving; \
+                 waiting up to {SHUTDOWN_HARD_CAP_SECS}s before forcing it",
+                elapsed.as_secs()
+            );
+        }
+    }
+}
+
+/// Tracks when `<datadir>/debug.log` last changed size after the stop was
+/// asked, for [`ShutdownWatch`].
+struct LogMotion {
+    path: PathBuf,
+    last_len: Option<u64>,
+    moved_at: Option<std::time::Instant>,
+}
+
+impl LogMotion {
+    /// Baselined at the moment of the stop request: only movement after it
+    /// counts.
+    fn new(datadir: &Path) -> Self {
+        let path = datadir.join("debug.log");
+        let last_len = std::fs::metadata(&path).ok().map(|m| m.len());
+        Self {
+            path,
+            last_len,
+            moved_at: None,
+        }
+    }
+
+    /// Time since the log last moved, or `None` if it has not moved since the
+    /// stop was asked.
+    fn since_moved(&mut self) -> Option<std::time::Duration> {
+        let len = std::fs::metadata(&self.path).ok().map(|m| m.len());
+        if len != self.last_len {
+            self.last_len = len;
+            self.moved_at = Some(std::time::Instant::now());
+        }
+        self.moved_at.map(|t| t.elapsed())
+    }
+}
+
 /// Watch a JUST-SPAWNED btxd child for `watch_for`: returns `false` if the
 /// child exited within the window, `true` if it is still alive at the end.
 ///
@@ -1464,12 +3727,32 @@ pub async fn child_survives_launch_watch(
 /// Whether the daemon-written `<datadir>/btxd.pid` (NOT our easybtx-node.pid)
 /// points at a live process. Used to wait out a foreign daemon's shutdown.
 pub fn btxd_pidfile_alive(datadir: &Path) -> bool {
-    let pid: Option<u32> = std::fs::read_to_string(datadir.join("btxd.pid"))
-        .ok()
-        .and_then(|s| s.trim().parse().ok());
     // Cross-platform liveness (kill(pid,0) on unix, OpenProcess on Windows) so the
     // foreign-daemon shutdown wait works on Windows too, not just unix.
-    pid.map(crate::platform::process_is_alive).unwrap_or(false)
+    btxd_pidfile_pid(datadir)
+        .map(crate::platform::process_is_alive)
+        .unwrap_or(false)
+}
+
+/// The pid in `<datadir>/btxd.pid`, only when that process is alive and is
+/// named btxd ([`comm_looks_like_btxd`], the guard the force-kill uses), so a
+/// stale file whose pid was reused never points at another program. For
+/// changing the scheduling policy of a node this app adopted rather than
+/// spawned (`engine_priority`).
+pub async fn verified_btxd_pidfile_pid(datadir: &Path) -> Option<u32> {
+    let pid = btxd_pidfile_pid(datadir)?;
+    if !crate::platform::process_is_alive(pid) {
+        return None;
+    }
+    let comm = pid_comm(pid).await?;
+    comm_looks_like_btxd(&comm).then_some(pid)
+}
+
+/// The pid btxd wrote to `<datadir>/btxd.pid`, if the file holds one.
+fn btxd_pidfile_pid(datadir: &Path) -> Option<u32> {
+    std::fs::read_to_string(datadir.join("btxd.pid"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
 }
 
 /// Returns the path of the btxd log file EasyBTX redirects stdout/stderr into.
@@ -1489,6 +3772,35 @@ pub fn node_log_tail(datadir: &Path, max: u64) -> String {
     read_tail(&node_log_path(datadir), max)
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default()
+}
+
+/// Tail of the engine's own `debug.log`, as text. Empty when missing.
+pub fn debug_log_tail(datadir: &Path, max: u64) -> String {
+    read_tail(&datadir.join("debug.log"), max)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default()
+}
+
+/// The hosts of every peer the app ships in its source. These are public, so
+/// diagnostics may name them; any other peer address is removed.
+pub fn published_peer_hosts() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for peer in BTX_BOOTSTRAP_PEERS
+        .iter()
+        .chain(BTX_ARCHIVE_PEERS.iter())
+        .chain(BTX_DISCOVERY_PEERS.iter())
+        .chain(crate::signer::BTX_MIRRORS_FED_BY_SIGNERS.iter())
+    {
+        let host = peer
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(peer)
+            .to_string();
+        if !out.contains(&host) {
+            out.push(host);
+        }
+    }
+    out
 }
 
 /// Pull btxd's OWN matmul-backend line out of its captured log. btxd runs an
@@ -1779,10 +4091,36 @@ struct LaunchConfig {
     btx_cli: PathBuf,
 }
 
+/// How [`NodeController::stop_without_rpc_outcome`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoRpcStop {
+    /// It exited on SIGTERM inside the grace, or was already gone.
+    OnSigterm,
+    /// It had to be killed, and the kill ended it.
+    Killed,
+    /// It outlived even the kill. A process stuck in the graphics driver in
+    /// uninterruptible sleep does that, and nothing short of a restart of
+    /// the computer frees it. It still holds the datadir lock.
+    StillRunning,
+}
+
 pub struct NodeController {
     child: Option<Child>,
     /// Last-used launch parameters, populated by `start` and reused by `restart`.
     config: Option<LaunchConfig>,
+    /// The arguments of the last `start` ([`NodeController::launch_args`]).
+    args: Vec<String>,
+    /// Consecutive [`NodeController::restart`] calls, reset by a `start` that
+    /// the caller drove itself. The crash-loop guard counts on this.
+    restarts: u32,
+    /// The scheduling policy last set on the child (`engine_priority`).
+    /// Remembered because macOS does not report another process's
+    /// background state.
+    priority: crate::engine_priority::EnginePriority,
+    /// While set, the child is held at normal priority for a step that must
+    /// not be slowed (the GPU-check extension, a snapshot load), and the
+    /// status refresher's retune leaves it alone.
+    priority_hold: bool,
 }
 
 impl NodeController {
@@ -1790,7 +4128,55 @@ impl NodeController {
         Self {
             child: None,
             config: None,
+            args: Vec::new(),
+            restarts: 0,
+            priority: crate::engine_priority::EnginePriority::Normal,
+            priority_hold: false,
         }
+    }
+
+    /// The scheduling policy last set on the child this controller spawned.
+    pub fn engine_priority(&self) -> crate::engine_priority::EnginePriority {
+        self.priority
+    }
+
+    /// Whether a hold keeps the child at normal priority right now
+    /// ([`NodeController::hold_normal_priority`]).
+    pub fn priority_held(&self) -> bool {
+        self.priority_hold
+    }
+
+    /// Put the child under `priority` and remember it. An error (no child,
+    /// or the call refused) changes nothing that is remembered.
+    pub fn set_engine_priority(
+        &mut self,
+        priority: crate::engine_priority::EnginePriority,
+    ) -> Result<(), String> {
+        let pid = self
+            .child_pid()
+            .ok_or_else(|| "no engine process to set".to_string())?;
+        crate::engine_priority::apply_engine_priority(pid, priority)?;
+        self.priority = priority;
+        Ok(())
+    }
+
+    /// Hold the child at normal priority until
+    /// [`NodeController::release_priority_hold`]: for a step whose time
+    /// budget was sized at normal priority (the GPU-check extension) or that
+    /// should not queue behind other programs' disk I/O (a snapshot load).
+    pub fn hold_normal_priority(&mut self) -> Result<(), String> {
+        self.priority_hold = true;
+        self.set_engine_priority(crate::engine_priority::EnginePriority::Normal)
+    }
+
+    /// End a hold and put the child back under the spawn policy; the status
+    /// refresher re-decides from the chain within 30 s. No-op without a hold.
+    pub fn release_priority_hold(&mut self) -> Result<(), String> {
+        if !self.priority_hold {
+            return Ok(());
+        }
+        self.priority_hold = false;
+        self.set_engine_priority(crate::engine_priority::engine_priority_at_spawn())
     }
 
     /// Stop any stale daemon that holds a pidfile in `datadir`.
@@ -1863,6 +4249,29 @@ impl NodeController {
         backend: Backend,
         btx_cli: &Path,
     ) -> AppResult<()> {
+        // Free space is checked HERE, before anything is stopped or spawned,
+        // because this is the last point at which refusing is free. See
+        // `setup::NODE_START_DISK_FLOOR` for why a node is not started onto a
+        // volume this short, and why the floor is the app's existing red line
+        // rather than a new one.
+        //
+        // An UNMEASURABLE volume never blocks, which is the same rule the
+        // profile-change preflight in `apps/node` already follows: a disk we
+        // cannot read is not evidence of a disk that is full.
+        if let Some(free) = crate::setup::free_disk_bytes(datadir) {
+            if free < crate::setup::NODE_START_DISK_FLOOR {
+                const GIB: u64 = 1024 * 1024 * 1024;
+                return Err(AppError::Disk(format!(
+                    "not starting the node: {} has {:.1} GiB free and btxd needs at least {} GiB \
+                     to write blocks and chainstate without corrupting them. Free some \
+                     space and start it again; the chain on disk is fine.",
+                    datadir.display(),
+                    free as f64 / GIB as f64,
+                    crate::setup::NODE_START_DISK_FLOOR / GIB,
+                )));
+            }
+        }
+
         // Detect + clear any orphaned daemon from a previous run.
         Self::stop_stale(datadir, btx_cli).await;
 
@@ -1927,6 +4336,28 @@ impl NodeController {
 
         // Write the child's PID so future runs can detect a stale daemon.
         if let Some(pid) = child.id() {
+            // The person using the computer goes first (`engine_priority`, and
+            // docs/mac-engine-priority.md for the measurements). Applied here,
+            // before the engine's start-up GPU check, and again on every
+            // `restart`, which comes back through this function. A failure
+            // leaves a working node at normal priority, so it is logged, not
+            // returned.
+            let priority = crate::engine_priority::engine_priority_at_spawn();
+            self.priority_hold = false;
+            self.priority = match crate::engine_priority::apply_engine_priority(pid, priority) {
+                Ok(()) => {
+                    eprintln!("[node] btxd (pid {pid}) runs at {}", priority.describe());
+                    priority
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[node] could not apply {} to btxd (pid {pid}): {e}; it runs at normal \
+                         priority",
+                        priority.describe()
+                    );
+                    crate::engine_priority::EnginePriority::Normal
+                }
+            };
             let pidfile = pidfile_path(datadir);
             if let Err(e) = std::fs::write(&pidfile, pid.to_string()) {
                 eprintln!("[node] could not write pidfile {}: {e}", pidfile.display());
@@ -1934,6 +4365,12 @@ impl NodeController {
         }
 
         self.child = Some(child);
+        self.args = args;
+        // A start the CALLER asked for clears the crash-loop counter: the
+        // operator (or a fresh launch) has intervened, so the next fault gets
+        // the full budget again. `restart` puts its own running total back
+        // afterwards, which is what keeps the loop bounded.
+        self.restarts = 0;
         // Remember the parameters so `restart` can re-spawn without the caller
         // having to thread the paths through again (used by mining recovery).
         self.config = Some(LaunchConfig {
@@ -1974,29 +4411,265 @@ impl NodeController {
         }
     }
 
+    /// How the child ended, once it has (`None` while it runs or when none
+    /// was spawned). tokio keeps the status after the child is reaped, so
+    /// this can be read after [`NodeController::child_has_exited`] said so.
+    pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.as_mut()?.try_wait().ok().flatten()
+    }
+
+    /// The pid of the child this controller spawned, while it has one.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.as_ref().and_then(|c| c.id())
+    }
+
+    /// Stop a child that has no RPC to ask: SIGTERM, wait up to `grace`, then
+    /// kill. Returns whether it exited on its own inside the grace.
+    ///
+    /// For a btxd still alive when the startup RPC wait gave up without ever
+    /// getting an answer (2026-10-01). [`NodeController::stop`] is the wrong
+    /// tool there: its `btx-cli stop` needs the RPC this process never
+    /// opened, and its 90 s grace, extended while the log moves or the CPU is
+    /// busy, exists to protect a chainstate flush that has not started yet.
+    /// Everything before `AppInitServers` (init.cpp:3100-3104 at v0.34.12) is
+    /// argument checks, the attestation archive open (LevelDB, crash-safe)
+    /// and GPU readiness; the chainstate is loaded only after the cookie. So
+    /// a short grace is enough, and a kill here cannot cost the shielded
+    /// rebuild `stop` guards against.
+    ///
+    /// btxd installs its SIGTERM handler in AppInitBasicSetup, before any of
+    /// that, so a process that is merely slow asks itself to shut down. One
+    /// wedged in the GPU driver does not act on it, which is what the kill
+    /// is for. A process stuck in uninterruptible sleep survives even the
+    /// kill; nothing in user space can change that, and the caller says what
+    /// the engine was last doing so the person can look.
+    ///
+    /// Windows has no SIGTERM; there it is a kill at once.
+    pub async fn stop_without_rpc(&mut self, grace: std::time::Duration) -> bool {
+        self.stop_without_rpc_outcome(grace).await == NoRpcStop::OnSigterm
+    }
+
+    /// [`NodeController::stop_without_rpc`], saying which way it ended. The
+    /// GPU-hang retry needs the third answer: a btxd that outlives even the
+    /// kill still holds the datadir lock, and a mirror spawned beside it
+    /// would only be refused the lock.
+    pub async fn stop_without_rpc_outcome(&mut self, grace: std::time::Duration) -> NoRpcStop {
+        let Some(mut child) = self.child.take() else {
+            return NoRpcStop::OnSigterm;
+        };
+        // Taken now: tokio forgets the pid once the child is reaped.
+        let child_pid = child.id();
+        // Only the unix arm below assigns it again.
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut exited = matches!(child.try_wait(), Ok(Some(_)));
+        #[cfg(unix)]
+        if !exited {
+            // Only the SIGTERM wait polls; on Windows it would be dead code.
+            const POLL: std::time::Duration = std::time::Duration::from_millis(200);
+            if let Some(pid) = child.id() {
+                // SAFETY: kill(2) on a pid we spawned and have not reaped
+                // (try_wait just said it is running); it only sends a signal.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+                let started = std::time::Instant::now();
+                while started.elapsed() < grace {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        exited = true;
+                        break;
+                    }
+                    tokio::time::sleep(POLL).await;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = grace;
+        let outcome = if exited {
+            NoRpcStop::OnSigterm
+        } else {
+            // Not `kill().await`: that waits for the exit without a bound, and
+            // a process in uninterruptible sleep inside a GPU driver never
+            // exits, which would hang this start forever. Dropping the handle
+            // afterwards leaves the reaping to tokio.
+            let _ = child.start_kill();
+            match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+                Ok(Ok(_)) => NoRpcStop::Killed,
+                // Not reaped five seconds after SIGKILL: look once more, in
+                // case it went in the same moment, else the kernel has not
+                // let it go.
+                Err(_) if matches!(child.try_wait(), Ok(Some(_))) => NoRpcStop::Killed,
+                Err(_) => NoRpcStop::StillRunning,
+                // The wait itself failed; ask the system instead.
+                Ok(Err(_)) => match child_pid {
+                    Some(pid) if crate::platform::process_is_alive(pid) => NoRpcStop::StillRunning,
+                    _ => NoRpcStop::Killed,
+                },
+            }
+        };
+        // The pidfile goes only when the child really exited and the file
+        // still names it. A btxd that is still there keeps it, so the next
+        // start finds the holder instead of racing it for the lock, and a
+        // file that names another process is not this controller's.
+        if outcome == NoRpcStop::StillRunning {
+            // Kept, not dropped: the caller can still see it go
+            // ([`NodeController::wait_after_kill`]). A handle let go of here
+            // would leave an exited child unreaped, and a zombie reads as
+            // alive to kill(pid, 0).
+            self.child = Some(child);
+        } else {
+            self.remove_own_pidfile(child_pid);
+        }
+        outcome
+    }
+
+    /// For a child that outlived [`NodeController::stop_without_rpc_outcome`]'s
+    /// kill: wait up to `limit` for it to go, reaping it, and remove its
+    /// pidfile once it has. True when it is gone (or there was none).
+    ///
+    /// Why (final review I1, 2026-10-01): on a wedged NVIDIA card a SIGKILLed
+    /// process can take well over five seconds to exit while the driver tears
+    /// down its context, and calling that "held until the computer restarts"
+    /// would ask for a reboot the machine did not need.
+    pub async fn wait_after_kill(&mut self, limit: std::time::Duration) -> bool {
+        let Some(child) = self.child.as_mut() else {
+            return true;
+        };
+        let pid = child.id();
+        let started = std::time::Instant::now();
+        loop {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                self.child = None;
+                self.remove_own_pidfile(pid);
+                return true;
+            }
+            if started.elapsed() >= limit {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Remove easybtx-node.pid when it still names `pid`, this controller's
+    /// child, and only then.
+    fn remove_own_pidfile(&self, pid: Option<u32>) {
+        if let (Some(cfg), Some(pid)) = (&self.config, pid) {
+            let path = pidfile_path(&cfg.datadir);
+            let ours = std::fs::read_to_string(&path).is_ok_and(|s| s.trim() == pid.to_string());
+            if ours {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    /// The arguments this controller last launched btxd with, empty before
+    /// its first `start`. The launch loop reads them to know whether this
+    /// launch ran the engine's GPU check ([`launch_runs_gpu_check`]).
+    pub fn launch_args(&self) -> &[String] {
+        &self.args
+    }
+
+    /// How many times [`NodeController::restart`] will re-spawn before it stops
+    /// and says so. A node that dies three times in a row is not a node a
+    /// fourth spawn fixes; it is a fault whose cause is still there, and the
+    /// spawn loop only hides it.
+    pub const RESTART_MAX_ATTEMPTS: u32 = 3;
+
+    /// Seconds to wait before the Nth re-spawn (N-1 × this, so 0s, 15s, 30s).
+    /// btxd needs the previous process's datadir lock released and its port
+    /// free; a re-spawn that races the old one's shutdown fails on the lock and
+    /// looks like a second crash.
+    pub const RESTART_BACKOFF_SECS: u64 = 15;
+
     /// Re-spawn btxd using the stored launch config (set by the last `start`).
     ///
-    /// Used by the mining supervisor's recovery path: after repeated RPC
-    /// failures the node is presumed wedged, so we kill the old child and
-    /// launch a fresh one. Errors if `start` was never called.
+    /// # This never kills a node that is alive
+    ///
+    /// It used to. The old body called `child.kill()` — SIGKILL, no grace —
+    /// and then re-spawned, with no limit and no check on whether anything was
+    /// actually wrong. Three separate things in this repository say why that is
+    /// the wrong shape:
+    ///
+    ///   * [`NodeController::stop`] exists precisely because SIGKILLing btxd
+    ///     during a shielded flush leaves an in-flight mutation marker and the
+    ///     next start spends 8 minutes rebuilding shielded state.
+    ///   * `watchdog.rs` never restarts anything, deliberately, and its stall
+    ///     taxonomy is built around the fact that a node replaying blocks looks
+    ///     wedged for ten minutes and must be left alone.
+    ///   * A node that is slow to answer RPC is the single most common healthy
+    ///     state this app sees (warmup, `RPC_IN_WARMUP` for minutes).
+    ///
+    /// So a restart now REQUIRES the child to have exited: `child_has_exited()`
+    /// must be `Some(true)`. A live child is refused, and the caller is told to
+    /// use `stop` — the graceful path — if it really wants the node down. An
+    /// RPC timeout alone is never enough.
+    ///
+    /// Errors if `start` was never called, if the child is still alive, or if
+    /// [`Self::RESTART_MAX_ATTEMPTS`] consecutive restarts have already been
+    /// made.
     pub async fn restart(&mut self) -> AppResult<()> {
         let cfg = self
             .config
             .clone()
             .ok_or_else(|| AppError::Process("cannot restart: node was never started".into()))?;
-        // Kill the existing child (best-effort) before re-spawning so we never
-        // leave two daemons fighting over the same wallet/datadir lock.
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill().await;
+
+        // A positive fault signal, or nothing happens. `Some(false)` is a live
+        // child; `None` is a controller that never spawned one and therefore
+        // has nothing to replace.
+        match self.child_has_exited() {
+            Some(true) => {}
+            Some(false) => {
+                return Err(AppError::Process(
+                    "not restarting: btxd is still running. A node that is slow to answer RPC \
+                     is usually warming up or replaying blocks, and killing it there costs \
+                     an 8-minute shielded rebuild. Stop it with `stop` if it really must \
+                     go down."
+                        .into(),
+                ))
+            }
+            None => {
+                return Err(AppError::Process(
+                    "cannot restart: this controller never started a node".into(),
+                ))
+            }
         }
-        self.start(
-            &cfg.btxd,
-            &cfg.datadir,
-            &cfg.conf,
-            cfg.backend,
-            &cfg.btx_cli,
-        )
-        .await
+
+        if self.restarts >= Self::RESTART_MAX_ATTEMPTS {
+            return Err(AppError::Process(format!(
+                "not restarting: btxd has already been re-spawned {} times in a row and \
+                 keeps exiting. The cause is still there; see the node log in the datadir.",
+                self.restarts
+            )));
+        }
+
+        // Back off before the second and later attempts: the exited child's
+        // datadir lock and RPC port are not necessarily free the instant it
+        // dies, and a re-spawn that races that looks like one more crash.
+        if self.restarts > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                Self::RESTART_BACKOFF_SECS * self.restarts as u64,
+            ))
+            .await;
+        }
+
+        // The child has exited and has already been reaped by `try_wait`
+        // inside `child_has_exited`; dropping the handle is all that is left.
+        self.child = None;
+        self.restarts += 1;
+
+        let attempts = self.restarts;
+        let result = self
+            .start(
+                &cfg.btxd,
+                &cfg.datadir,
+                &cfg.conf,
+                cfg.backend,
+                &cfg.btx_cli,
+            )
+            .await;
+        // `start` resets the counter (it is the caller-driven path); this is a
+        // restart, so put the running total back.
+        self.restarts = attempts;
+        result
     }
 
     /// The launch parameters captured by the last `start`, if any. Lets the
@@ -2036,8 +4709,35 @@ impl NodeController {
     /// Fix: poll `try_wait()` for up to `SHUTDOWN_GRACE_SECS` (90 s) before
     /// falling back to SIGKILL. A clean exit leaves no marker → next start
     /// loads in ~1 second instead of ~8 minutes.
+    ///
+    /// Past the grace the wait goes on while btxd still shows work: its
+    /// `debug.log` moving, up to [`SHUTDOWN_HARD_CAP_SECS`], or its CPU busy,
+    /// up to [`SHUTDOWN_BUSY_CAP_SECS`] ([`keep_waiting_for_exit`]). And a wait that
+    /// is ABANDONED, which is what the app's quit backstop does, leaves btxd to
+    /// finish on its own instead of killing it: the child is held so that
+    /// dropping this future does not fire `kill_on_drop`. A node that finishes
+    /// its flush after the app has gone is the clean outcome, and the next
+    /// start already recognises an orphan (`pre_launch_plan`), the state a
+    /// Windows self-update has always left behind.
     pub async fn stop(&mut self, btx_cli: &Path, datadir: &Path) -> AppResult<()> {
         const POLL_INTERVAL_MS: u64 = 500;
+
+        // Out of the controller BEFORE the request, so nothing that drops the
+        // controller from here on can kill a node that is shutting down.
+        let child = self.child.take().map(std::mem::ManuallyDrop::new);
+
+        // Out of the background policy first (`engine_priority`): a shutdown
+        // flushes the chainstate to disk, the background policy puts that
+        // write behind every other program's disk I/O, and a stop that runs
+        // out of grace is killed mid-flush. Best-effort, like the request.
+        if let Some(pid) = child.as_ref().and_then(|c| c.id()) {
+            let _ = crate::engine_priority::apply_engine_priority(
+                pid,
+                crate::engine_priority::EnginePriority::Normal,
+            );
+            self.priority = crate::engine_priority::EnginePriority::Normal;
+            self.priority_hold = false;
+        }
 
         // Issue the graceful stop request. btxd's stop RPC returns once it has
         // received the request, NOT when it has finished flushing.
@@ -2049,27 +4749,40 @@ impl NodeController {
         stop_cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         let _ = stop_cmd.status().await;
 
-        if let Some(mut c) = self.child.take() {
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS);
+        if let Some(mut c) = child {
+            let grace = std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS);
+            let started = std::time::Instant::now();
+            let mut watch = ShutdownWatch::new(datadir, c.id(), grace).await;
             let mut exited = false;
-            while std::time::Instant::now() < deadline {
+            let mut notes = ExtensionNotes::default();
+            loop {
+                let progress = watch.progress().await;
+                if !keep_waiting_for_exit(started.elapsed(), progress, grace) {
+                    break;
+                }
                 // try_wait returns Ok(Some(status)) once the child has exited
                 // (any exit reason). On Err we still keep polling — the next
-                // iteration may succeed, and the deadline bounds the loop.
+                // iteration may succeed, and the policy bounds the loop.
                 if matches!(c.try_wait(), Ok(Some(_))) {
                     exited = true;
                     break;
+                }
+                if started.elapsed() >= grace {
+                    notes.note(progress, started.elapsed());
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
             }
             if !exited {
                 eprintln!(
-                    "[node] btxd did not exit within {SHUTDOWN_GRACE_SECS}s of graceful stop; \
-                     sending SIGKILL (next start may rebuild shielded state)"
+                    "[node] btxd did not exit after {}s of graceful stop (no log or CPU activity, \
+                     or the cap reached); sending SIGKILL (next start may rebuild shielded state)",
+                    started.elapsed().as_secs()
                 );
                 let _ = c.kill().await;
             }
+            // Finished with it either way: the process has exited or been
+            // killed, so the handle's own kill_on_drop has nothing left to do.
+            drop(std::mem::ManuallyDrop::into_inner(c));
         }
         let _ = std::fs::remove_file(pidfile_path(datadir));
         Ok(())
@@ -2079,6 +4792,7 @@ impl NodeController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attested_snapshot::PairKind;
     use std::path::PathBuf;
 
     // ── Orphaned-holder detection (the 0.6.3 upgrade-restart guard) ─────────
@@ -2441,6 +5155,110 @@ mod tests {
         let _ = holder.kill().await;
     }
 
+    /// Past its grace, a node that is still writing its log is still
+    /// flushing, and is waited for until it exits rather than cut off at the
+    /// grace. Before 2026-09-26 this returned at the grace, with the node
+    /// still mid-flush and the force-kill next in line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_unmanaged_node_waits_out_a_flush_that_is_still_logging() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = tmp.path().join("btx-cli");
+        std::fs::write(&cli, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = tmp.path().join("debug.log");
+        std::fs::write(&log, "").unwrap();
+
+        // A "flush" that logs a line every half second for four seconds and
+        // then exits: twice the grace it is given.
+        let script = format!(
+            "for i in 1 2 3 4 5 6 7 8; do echo flushing >> '{}'; sleep 0.5; done",
+            log.display()
+        );
+        let holder = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .spawn()
+            .unwrap();
+        let pid = holder.id().unwrap();
+        std::fs::write(tmp.path().join("btxd.pid"), pid.to_string()).unwrap();
+        // Reap it the moment it exits, as its real parent would: an unreaped
+        // child stays a zombie that still reads as alive.
+        let reaper = tokio::spawn(async move {
+            let mut holder = holder;
+            holder.wait().await
+        });
+
+        let grace = std::time::Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        stop_unmanaged_node(tmp.path(), &cli, grace).await;
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= std::time::Duration::from_millis(3500),
+            "returned after {waited:?}, at the grace, while the node was still logging"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(10),
+            "returned after {waited:?}: the wait must end when the node exits"
+        );
+        assert!(
+            reaper.is_finished(),
+            "the wait must end because the node exited"
+        );
+    }
+
+    /// The case jpp named: a node busy with a block check that writes nothing
+    /// to its log. Modelled by a process that burns a core for four to five
+    /// seconds, twice its grace, and never logs. Before CPU counted, the wait ended at
+    /// the grace and the node was killed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_unmanaged_node_waits_out_a_silent_block_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = tmp.path().join("btx-cli");
+        std::fs::write(&cli, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(tmp.path().join("debug.log"), "").unwrap();
+
+        // perl, because it ships with both macOS and every Debian and Ubuntu
+        // base system, and burns the CPU in its OWN process: a shell loop
+        // would spend it in `date` children the pid does not count. `time` is
+        // whole seconds, so this runs between four and five.
+        let holder = tokio::process::Command::new("perl")
+            .arg("-e")
+            .arg("my $e = time + 5; 1 while time < $e;")
+            .spawn()
+            .expect("perl");
+        let pid = holder.id().unwrap();
+        std::fs::write(tmp.path().join("btxd.pid"), pid.to_string()).unwrap();
+        let reaper = tokio::spawn(async move {
+            let mut holder = holder;
+            holder.wait().await
+        });
+
+        let grace = std::time::Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        stop_unmanaged_node(tmp.path(), &cli, grace).await;
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= std::time::Duration::from_millis(3500),
+            "returned after {waited:?}, at the grace, while the node was busy"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(12),
+            "returned after {waited:?}: the wait must end when the node exits"
+        );
+        let status = reaper.await.unwrap().unwrap();
+        assert!(
+            status.success(),
+            "the node was killed ({status:?}) instead of left to finish"
+        );
+    }
+
     // ── Launch-watch: telling a lock-race death from a slow startup ─────────
 
     /// Drive the REAL NodeController::start against a shim script so the watch
@@ -2474,17 +5292,349 @@ mod tests {
         unreachable!("the loop above either returns a controller or panics")
     }
 
+    // ── The engine's scheduling policy (engine_priority, 0.7.2) ────────────
+
+    /// A btx-cli stand-in that records the base priority of the process in
+    /// `<datadir>/<pidfile>` at the moment the stop command runs, then
+    /// SIGTERMs it, so a test sees what the policy was WHEN the stop went out.
+    #[cfg(target_os = "macos")]
+    fn priority_recording_cli(dir: &std::path::Path, pidfile: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let cli = dir.join("btx-cli");
+        let script = format!(
+            "#!/bin/sh\npid=$(cat '{d}/{pidfile}')\nps -o pri= -p $pid | tr -d ' ' > \
+             '{d}/pri-at-stop'\nkill $pid\n",
+            d = dir.display()
+        );
+        std::fs::write(&cli, script).unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cli
+    }
+
+    /// `start` puts the real child in the background policy on a Mac, a hold
+    /// lifts it and its release puts it back, and `stop` lifts it BEFORE the
+    /// stop command goes out (read by the stand-in btx-cli at that moment).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn start_puts_the_child_in_the_background_and_stop_lifts_it_first() {
+        use crate::engine_priority::{is_background, EnginePriority};
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = priority_recording_cli(tmp.path(), "easybtx-node.pid");
+        let mut c = start_shim(tmp.path(), "sleep 60").await;
+        let pid = c.child_pid().unwrap();
+        let at_start = (is_background(pid), c.engine_priority());
+        c.hold_normal_priority().unwrap();
+        let held = (is_background(pid), c.priority_held());
+        c.release_priority_hold().unwrap();
+        let released = (is_background(pid), c.priority_held(), c.engine_priority());
+        c.stop(&cli, tmp.path()).await.unwrap();
+        let pri: i32 = std::fs::read_to_string(tmp.path().join("pri-at-stop"))
+            .expect("the stop command ran")
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(at_start, (Some(true), EnginePriority::Background));
+        assert_eq!(held, (Some(false), true));
+        assert_eq!(released, (Some(true), false, EnginePriority::Background));
+        assert!(
+            pri > 4,
+            "the stop went out with the node still in the background (pri {pri})"
+        );
+        assert_eq!(c.engine_priority(), EnginePriority::Normal);
+    }
+
+    /// The pid of a node this app adopted (a previous instance's btxd, found
+    /// through `btxd.pid`) is used only when that process is alive and named
+    /// btxd; and `stop_unmanaged_node` lifts its background policy before the
+    /// stop command goes out.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn an_adopted_node_is_found_by_name_and_lifted_before_its_stop() {
+        use crate::engine_priority::{apply_engine_priority, EnginePriority};
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = priority_recording_cli(tmp.path(), "btxd.pid");
+        assert_eq!(verified_btxd_pidfile_pid(tmp.path()).await, None, "no file");
+
+        // A process NOT named btxd behind the pidfile: a reused pid.
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(tmp.path().join("btxd.pid"), other.id().to_string()).unwrap();
+        let reused = verified_btxd_pidfile_pid(tmp.path()).await;
+        let _ = other.kill();
+        let _ = other.wait();
+        assert_eq!(reused, None, "a pid that is not btxd is never used");
+
+        // A process named btxd: /bin/sleep under that name. A symlink, not a
+        // copy: macOS kills a copied platform binary at exec.
+        let fake = tmp.path().join("bin").join("btxd");
+        std::fs::create_dir_all(fake.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("/bin/sleep", &fake).unwrap();
+        let mut node = std::process::Command::new(&fake).arg("60").spawn().unwrap();
+        let pid = node.id();
+        std::fs::write(tmp.path().join("btxd.pid"), pid.to_string()).unwrap();
+        let found = verified_btxd_pidfile_pid(tmp.path()).await;
+        apply_engine_priority(pid, EnginePriority::Background).unwrap();
+        let reaper = std::thread::spawn(move || node.wait());
+        stop_unmanaged_node(tmp.path(), &cli, std::time::Duration::from_secs(5)).await;
+        let _ = reaper.join();
+        let pri: i32 = std::fs::read_to_string(tmp.path().join("pri-at-stop"))
+            .expect("the stop command ran")
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(found, Some(pid));
+        assert!(
+            pri > 4,
+            "the stop went out with the node still in the background (pri {pri})"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn launch_watch_detects_an_immediate_child_death() {
         let tmp = tempfile::tempdir().unwrap();
         let mut controller = start_shim(tmp.path(), "exit 1").await;
+        // 10 s like the shim tests beside it: the shim starts in the macOS
+        // background band, and under a full parallel test run it was starved
+        // past a 3 s window (local CI 2 Oct, passes alone and single-threaded).
         let survived =
-            child_survives_launch_watch(&mut controller, std::time::Duration::from_secs(3)).await;
+            child_survives_launch_watch(&mut controller, std::time::Duration::from_secs(10)).await;
         assert!(
             !survived,
             "a child that exited within the window must be reported dead"
         );
+    }
+
+    /// A NODE THAT IS ALIVE IS NEVER KILLED BY `restart`.
+    ///
+    /// The old body SIGKILLed unconditionally. `stop` exists because killing
+    /// btxd mid-flush costs an 8-minute shielded rebuild, and `watchdog.rs`
+    /// never restarts anything precisely because a node replaying blocks looks
+    /// wedged for ten minutes and must be left alone. A slow RPC is not a
+    /// fault, so it must not be answered with a kill.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_refuses_a_node_that_is_still_running() {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = start_shim(d.path(), "sleep 30").await;
+
+        let err = c.restart().await.expect_err("a live child must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("still running"), "{msg}");
+        // ...and it is still running: the refusal did not kill it on the way
+        // out, which is the entire point.
+        assert_eq!(c.child_has_exited(), Some(false));
+    }
+
+    /// A controller that never started anything has nothing to re-spawn, and
+    /// says so rather than spawning a node the caller never asked for.
+    #[tokio::test]
+    async fn restart_without_a_previous_start_is_an_error() {
+        let mut c = NodeController::new();
+        let err = c.restart().await.expect_err("nothing to restart");
+        assert!(err.to_string().contains("never started"), "{err}");
+    }
+
+    /// An EXITED child is the positive fault signal, so the re-spawn happens.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dead_node_is_respawned() {
+        let d = tempfile::tempdir().unwrap();
+        // Exits immediately: the child is a confirmed fault by the time we ask.
+        let mut c = start_shim(d.path(), "exit 1").await;
+        while c.child_has_exited() != Some(true) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        c.restart().await.expect("a dead node is re-spawned");
+        assert_eq!(c.restarts, 1, "the attempt must be counted");
+    }
+
+    /// ...but not forever. The budget is asserted without serving the real
+    /// backoff: the counter is what bounds the loop, and a unit test should not
+    /// spend 45 seconds proving that `sleep` sleeps.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_node_that_keeps_dying_stops_being_respawned() {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = start_shim(d.path(), "exit 1").await;
+        while c.child_has_exited() != Some(true) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        c.restarts = NodeController::RESTART_MAX_ATTEMPTS;
+
+        let err = c
+            .restart()
+            .await
+            .expect_err("past the budget the loop must stop");
+        assert!(err.to_string().contains("keeps exiting"), "{err}");
+    }
+
+    /// A start the caller drove clears the budget: the operator has
+    /// intervened, so the next fault gets the full allowance again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_caller_driven_start_clears_the_restart_budget() {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = start_shim(d.path(), "exit 1").await;
+        c.restarts = NodeController::RESTART_MAX_ATTEMPTS;
+        let cfg = c.config.clone().unwrap();
+        c.start(
+            &cfg.btxd,
+            &cfg.datadir,
+            &cfg.conf,
+            cfg.backend,
+            &cfg.btx_cli,
+        )
+        .await
+        .expect("a caller-driven start always runs");
+        assert_eq!(c.restarts, 0);
+    }
+
+    /// The grace is a floor, not a deadline: past it a node whose log still
+    /// moves keeps its flush, a quiet one is forced, and the cap ends it all.
+    #[test]
+    fn a_stopping_node_keeps_its_flush_while_its_log_moves() {
+        let s = std::time::Duration::from_secs;
+        let grace = s(SHUTDOWN_GRACE_SECS);
+        let log = |since: Option<std::time::Duration>| ShutdownProgress {
+            since_log_moved: since,
+            since_cpu_busy: None,
+        };
+        // Inside the grace nothing else is asked, however quiet the log.
+        assert!(keep_waiting_for_exit(s(10), log(None), grace));
+        assert!(keep_waiting_for_exit(s(89), log(None), grace));
+        // A log that has not moved since the stop: exactly the grace, as before.
+        assert!(!keep_waiting_for_exit(s(90), log(None), grace));
+        // Past it: moving recently keeps waiting, quiet for the window forces.
+        assert!(keep_waiting_for_exit(s(100), log(Some(s(5))), grace));
+        assert!(keep_waiting_for_exit(
+            s(200),
+            log(Some(s(SHUTDOWN_QUIET_SECS - 1))),
+            grace
+        ));
+        assert!(!keep_waiting_for_exit(
+            s(200),
+            log(Some(s(SHUTDOWN_QUIET_SECS))),
+            grace
+        ));
+        // The cap wins over a moving log: a node that logs forever is wedged too.
+        assert!(!keep_waiting_for_exit(
+            s(SHUTDOWN_HARD_CAP_SECS),
+            log(Some(s(0))),
+            grace
+        ));
+        // The quiet window must cover the longest silent stretch measured in a
+        // shutdown (the shielded flush, up to 60 s) with room to spare.
+        assert!(SHUTDOWN_QUIET_SECS >= 2 * 60);
+        assert!(SHUTDOWN_HARD_CAP_SECS > SHUTDOWN_GRACE_SECS + SHUTDOWN_QUIET_SECS);
+    }
+
+    /// jpp, 2026-09-26: on 0.34.9 a protected ExactReplay cannot be cancelled,
+    /// logs nothing while it runs, and on CPU can take hours. A node still
+    /// using CPU is waited for, well past the log's cap, and silence alone no
+    /// longer ends the wait. Before this, the same node was forced at 90 s plus
+    /// the log's quiet window.
+    #[test]
+    fn a_stopping_node_that_is_still_using_cpu_is_not_cut_off() {
+        let s = std::time::Duration::from_secs;
+        let grace = s(SHUTDOWN_GRACE_SECS);
+        let busy = |since_cpu: u64, since_log: Option<u64>| ShutdownProgress {
+            since_log_moved: since_log.map(s),
+            since_cpu_busy: Some(s(since_cpu)),
+        };
+        // Silent and busy: waited for past the grace, and past the log's cap.
+        assert!(keep_waiting_for_exit(s(95), busy(3, None), grace));
+        assert!(keep_waiting_for_exit(
+            s(SHUTDOWN_HARD_CAP_SECS + 1),
+            busy(3, None),
+            grace
+        ));
+        assert!(keep_waiting_for_exit(s(3 * 3600), busy(3, None), grace));
+        // A busy node whose log is also stale by then is still waited for.
+        assert!(keep_waiting_for_exit(
+            s(1000),
+            busy(3, Some(SHUTDOWN_QUIET_SECS * 5)),
+            grace
+        ));
+        // CPU gone quiet for the whole window: it is not working any more.
+        assert!(!keep_waiting_for_exit(
+            s(1000),
+            busy(SHUTDOWN_QUIET_SECS, None),
+            grace
+        ));
+        // And even a busy node has a ceiling.
+        assert!(!keep_waiting_for_exit(
+            s(SHUTDOWN_BUSY_CAP_SECS),
+            busy(0, Some(0)),
+            grace
+        ));
+        // Nothing seen at all: exactly the grace, as before.
+        assert!(!keep_waiting_for_exit(
+            s(90),
+            ShutdownProgress::default(),
+            grace
+        ));
+        // The ceiling has to outlast a CPU replay of hours, and the log's cap.
+        const _: () = assert!(SHUTDOWN_BUSY_CAP_SECS >= 4 * 3600);
+        const _: () = assert!(SHUTDOWN_BUSY_CAP_SECS > SHUTDOWN_HARD_CAP_SECS);
+    }
+
+    #[test]
+    fn busy_means_a_real_share_of_a_core() {
+        let ms = std::time::Duration::from_millis;
+        // A replay saturates a core or more.
+        assert!(cpu_was_busy(ms(5000), ms(5000)));
+        assert!(cpu_was_busy(ms(9000), ms(5000)));
+        // The threshold, 20 % of one core, and just under it.
+        assert!(cpu_was_busy(ms(1000), ms(5000)));
+        assert!(!cpu_was_busy(ms(999), ms(5000)));
+        // A node waiting on anything else uses next to nothing.
+        assert!(!cpu_was_busy(ms(20), ms(5000)));
+        assert!(!cpu_was_busy(ms(0), ms(5000)));
+        assert!(!cpu_was_busy(ms(100), ms(0)));
+        // Sampled every 5 s, or four times inside a short grace.
+        assert_eq!(cpu_sample_every(ms(90_000)), ms(5000));
+        assert_eq!(cpu_sample_every(ms(2000)), ms(500));
+        assert_eq!(cpu_sample_every(ms(100)), ms(250));
+    }
+
+    /// The quit backstop abandons the stop; it must not kill the node with it.
+    /// Before 2026-09-26 the child's kill_on_drop fired when the stop future
+    /// was dropped, SIGKILLing a node mid-flush on every quit that outlasted
+    /// the backstop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_abandoned_stop_leaves_the_node_to_finish() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // A node that ignores the stop request, like one deep in a flush.
+        let mut controller = start_shim(tmp.path(), "trap '' TERM\nexec sleep 30").await;
+        let pid = controller.child.as_ref().and_then(|c| c.id()).expect("pid");
+        let cli = tmp.path().join("btx-cli");
+        std::fs::write(&cli, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let abandoned = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            controller.stop(&cli, tmp.path()),
+        )
+        .await;
+        assert!(
+            abandoned.is_err(),
+            "the stop was still waiting when abandoned"
+        );
+        drop(controller);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            crate::platform::process_is_alive(pid),
+            "an abandoned stop must leave the node running to finish its flush"
+        );
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status();
     }
 
     #[cfg(unix)]
@@ -2741,6 +5891,18 @@ consensus-validator service.";
         }
     }
 
+    /// After the 227313 split the valid chain was signed by `02d5efca` alone, so
+    /// a mirror without it stops at 227,312 for good (0.6.29 refuses the other
+    /// branch). A literal, for the same reason as the test above.
+    #[test]
+    fn the_pin_carries_the_one_key_that_signs_the_valid_side_of_the_227313_split() {
+        assert!(
+            BTX_TRUSTED_ATTESTATION_PUBKEYS
+                .contains(&"02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675"),
+            "the valid chain's signer must be pinned, or every mirror stays at 227,312"
+        );
+    }
+
     /// The refusal detector needs BOTH markers. Verbatim line, captured from a
     /// real v0.33.4.1 run on an Apple M5 (Mac17,2) on 2026-08-25 — a typed
     /// approximation here would let the shape drift away from what btxd emits.
@@ -2772,10 +5934,151 @@ consensus-validator service.";
         assert!(!log_shows_matmul_consensus_refused(""));
     }
 
+    /// Zan's Linux mirror on 2026-10-01, the restart after the first crash
+    /// (engine v0.34.12, snapshot 234614, background chainstate at 20233):
+    /// the last 80 lines of easybtx-node.log, verbatim.
+    const REAL_READ_BLOCK_FATAL: &str =
+        include_str!("../tests/fixtures/read_block_fatal/easybtx-node.log");
+
+    #[test]
+    fn the_read_block_fatal_is_recognised_from_the_real_restart() {
+        assert!(log_shows_read_block_fatal(REAL_READ_BLOCK_FATAL));
+        let hint =
+            launch_failure_hint(REAL_READ_BLOCK_FATAL).expect("the read-block fatal must be named");
+        assert!(hint.contains("signatures"), "{hint}");
+        assert!(!hint.contains('\u{2014}'), "no em-dash: {hint}");
+        assert!(!hint.to_lowercase().contains("guarantee"), "{hint}");
+        // The old chain is removed once the node runs again from the
+        // snapshot (read_block_recovery::finish): the hint must not say
+        // nothing is ever deleted (final review M3).
+        assert!(!hint.contains("Nothing is deleted."), "{hint}");
+        assert!(hint.contains("until the node is running again"), "{hint}");
+        // The cause sentence is the hint, not the engine's "Error:" line.
+        assert_eq!(
+            launch_failure_cause(REAL_READ_BLOCK_FATAL).as_deref(),
+            Some(hint)
+        );
+    }
+
+    /// The crash while running prints only ConnectTip's fatal (validation.cpp
+    /// ~9646), not ImportBlocks' "Failed to connect best block": still ours.
+    #[test]
+    fn the_read_block_fatal_while_running_is_recognised_too() {
+        let running = "2026-10-01T16:13:02Z [error] ReadRawBlock: OpenBlockFile failed for \
+                       FlatFilePos(nFile=-1, nPos=0)\n2026-10-01T16:13:02Z [error] A fatal \
+                       internal error occurred, see debug.log for details: Failed to read \
+                       block.\nError: A fatal internal error occurred, see debug.log for \
+                       details: Failed to read block.\n";
+        assert!(log_shows_read_block_fatal(running));
+    }
+
+    #[test]
+    fn other_block_read_errors_are_not_the_read_block_fatal() {
+        // A block in a real file that cannot be opened (a pruned or damaged
+        // blk file), even with the same fatal after it.
+        let pruned = "[error] ReadRawBlock: OpenBlockFile failed for FlatFilePos(nFile=12, \
+                      nPos=8)\n[error] A fatal internal error occurred, see debug.log for \
+                      details: Failed to read block.";
+        assert!(!log_shows_read_block_fatal(pruned));
+        assert!(launch_failure_hint(pruned).is_none());
+        // The read line alone, with no fatal: an RPC or a peer asked for a
+        // block this node only has the header of, and the node carried on.
+        let header_only =
+            "[error] ReadRawBlock: OpenBlockFile failed for FlatFilePos(nFile=-1, nPos=0)\n\
+             2026-10-01T17:30:00Z UpdateTip: new best=00ab height=234615";
+        assert!(!log_shows_read_block_fatal(header_only));
+        // The shielded refusal (issue #35, validation.cpp ~7457), whose own
+        // text names the nFile=-1 error it replaces.
+        let shielded = "[error] DisconnectBlock(): shielded undo for block 00ab needs a full \
+                        rebuild from ancestor blocks below the prune horizon (a reorg \
+                        disconnected a block whose shielded anchor was pruned), not the \
+                        opaque \"ReadRawBlock: FlatFilePos(nFile=-1)\" error. Refusing the \
+                        prune-unsafe rebuild; restart to recover persisted shielded state.";
+        assert!(!log_shows_read_block_fatal(shielded));
+        assert!(!log_shows_read_block_fatal(""));
+    }
+
     /// The launch hint must name the cause btxd actually printed, and must stay
     /// silent when it recognises nothing. Verbatim lines, captured from a real
     /// v0.34.5 run against ~/.easybtx on 2026-08-31, where the app had been
     /// telling the user the datadir lock never freed while nothing held it.
+    /// THE MESSAGE THE APP SHOWED FOR THE MOST LEGIBLE FAILURE IT HAS.
+    ///
+    /// Verbatim from a 0.6.21 run on 2026-09-09, started while this machine's
+    /// validator was already up. btxd names the cause in two lines; the app
+    /// said "its log does not say why in a way this app recognises" and handed
+    /// the user a path to a log file. A port already taken is not an unknown
+    /// exit, and it is the ordinary state for anyone whose miner is running.
+    #[test]
+    fn a_port_already_taken_is_named_rather_than_called_unrecognised() {
+        let log = "2026-09-09T01:25:44Z Binding RPC on address 127.0.0.1 port 19334 \
+                   failed (Error: Address already in use (48)).\n\
+                   2026-09-09T01:25:44Z Unable to bind all endpoints for RPC server\n\
+                   2026-09-09T01:25:44Z [error] Unable to start HTTP server.";
+        let hint = launch_failure_hint(log).expect("a taken port must be named");
+        assert!(hint.contains("another node is already running"), "{hint}");
+        // ...and it must NOT send the user at the repair path. The chain on
+        // disk is fine; the only thing wrong is that two nodes want one folder.
+        assert!(
+            !hint.to_lowercase().contains("remove node data"),
+            "a port collision must never read as a reason to wipe: {hint}"
+        );
+    }
+
+    /// Verbatim from the v0.34.12 binary on 2026-09-30, regtest, started with
+    /// `-parkdeepreorg=0` and no `-reorgpolicy`: it prints this on stderr
+    /// (easybtx-node.log) and exits 1 before debug.log says anything. The
+    /// second is its sibling for `-deepforkautoresolve=0`
+    /// (chainstatemanager_args.cpp:187-190).
+    /// Mainnet block 244000 switched on three consensus checks that came with
+    /// 0.34.14. An install key below that must never be launched as a
+    /// fallback, whatever its shape, and an unreadable one is not trusted.
+    #[test]
+    fn only_an_engine_with_the_244000_rules_follows_the_network() {
+        for tag in [
+            "v0.34.14",
+            "v0.34.15",
+            "v0.34.15-abcdef12",
+            "v0.35.0",
+            "v1.0.0",
+        ] {
+            assert!(engine_follows_network_rules(tag), "{tag} has the rules");
+        }
+        for tag in [
+            "v0.34.13",
+            "v0.34.12",
+            "v0.34.9",
+            "v0.34.6-3013c2c2",
+            "v0.33.3-pr105b",
+            "v0.33.2",
+            "",
+            "latest",
+        ] {
+            assert!(
+                !engine_follows_network_rules(tag),
+                "{tag} must not be launched"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reorg_policy_refusal_is_named_and_is_not_a_reason_to_wipe() {
+        for log in [
+            "Error: -parkdeepreorg=0 conflicts with -reorgpolicy=bounded. Use \
+             -reorgpolicy=legacy to follow a deeper chain without the recovery ceiling.",
+            "Error: -deepforkautoresolve=0 conflicts with -reorgpolicy=bounded. Bounded mode \
+             replaces that bypass; use -reorgpolicy=legacy to keep it.",
+        ] {
+            let hint = launch_failure_hint(log).expect("a reorg policy refusal must be named");
+            assert!(hint.contains("0.34.12"), "{hint}");
+            assert!(
+                !hint.to_lowercase().contains("remove node data"),
+                "a refused setting must never read as a reason to wipe: {hint}"
+            );
+            assert!(!hint.contains('\u{2014}'), "{hint}");
+        }
+    }
+
     #[test]
     fn a_pruned_datadir_refusal_is_named_and_an_unknown_exit_is_not_guessed_at() {
         const REAL_PRUNED_REFUSAL: &str = "2026-08-30T21:17:13Z LoadBlockIndexDB: last block \
@@ -2808,6 +6111,585 @@ consensus-validator service.";
         assert!(
             !matmul.contains("Remove node data"),
             "wrong cause: {matmul}"
+        );
+    }
+
+    /// No new launch sentence may use an em-dash, and none may send the user
+    /// at Remove node data: every cause below leaves the chain intact.
+    fn assert_calm(hint: &str) {
+        assert!(!hint.contains('\u{2014}'), "em-dash in: {hint}");
+        assert!(
+            !hint.to_lowercase().contains("remove node data"),
+            "not a reason to wipe: {hint}"
+        );
+    }
+
+    /// Engine v0.34.12, init.cpp:2896-2898, as btxd's noui handler prints an
+    /// InitError on stderr ("Error: " + message, noui.cpp:30-46). The inner
+    /// reason is one of mta.cpp's, here the record-rejected one.
+    #[test]
+    fn a_refused_attestation_archive_is_named_and_the_files_are_named() {
+        let log = "Error: Failed to load the durable MatMul attestation archive: durable \
+                   attestation database record rejected: bad signature. The archive and WAL \
+                   were preserved; repair or explicitly replace them before restarting.";
+        let hint = launch_failure_hint(log).expect("an archive refusal must be named");
+        assert!(hint.contains("matmul_attestations.dat"), "{hint}");
+        assert!(
+            hint.to_lowercase()
+                .contains("nothing in the chain is damaged"),
+            "{hint}"
+        );
+        // matmul_attestations.dat.db is a folder (LevelDB), not a file.
+        assert!(hint.contains("files and the folder"), "{hint}");
+        // On a signing node the archive also holds the votes it took back
+        // (LoadWithdrawnLocalVotes, matmul_trusted_attestations.cpp:793), so
+        // a signer is told to ask first (Task A review M5).
+        assert!(hint.contains("signs"), "{hint}");
+        assert!(hint.contains("ask for help"), "{hint}");
+        assert_calm(hint);
+
+        // The cause keeps the engine's own reason (Task A review M5).
+        let cause = launch_failure_cause(log).unwrap();
+        assert!(cause.starts_with(hint), "{cause}");
+        assert!(cause.contains("record rejected: bad signature"), "{cause}");
+        assert!(!cause.contains('\u{2014}'));
+    }
+
+    /// init.cpp:2271 at v0.34.12, with CLIENT_NAME = "BTX".
+    #[test]
+    fn a_held_datadir_lock_is_named_as_another_node() {
+        let log = "Error: Cannot obtain a lock on directory /home/zan/.easybtx. BTX is \
+                   probably already running.";
+        let hint = launch_failure_hint(log).expect("a held lock must be named");
+        assert!(hint.contains("another node"), "{hint}");
+        assert!(hint.contains("easyBTX miner"), "{hint}");
+        assert_calm(hint);
+    }
+
+    /// init.cpp:3103 at v0.34.12, alone: the bind lines that say why are in
+    /// debug.log, which this tail may not carry.
+    #[test]
+    fn an_http_server_refusal_without_the_bind_line_names_the_port() {
+        let log = "Error: Unable to start HTTP server. See debug log for details.";
+        let hint = launch_failure_hint(log).expect("an HTTP server refusal must be named");
+        assert!(hint.contains("19334"), "{hint}");
+        assert_calm(hint);
+        // With the bind line present, the sharper bind sentence still wins.
+        let both = "Unable to bind all endpoints for RPC server\n\
+                    Error: Unable to start HTTP server. See debug log for details.";
+        assert!(launch_failure_hint(both)
+            .unwrap()
+            .contains("another node is already running"));
+    }
+
+    /// Nothing recognised: quote the engine's own last error line instead of
+    /// saying only "not recognised".
+    #[test]
+    fn an_unrecognised_exit_quotes_the_engines_last_error_line() {
+        // Nothing starts with "Error:": the last line that carries one counts.
+        let log = "2026-10-01T01:00:00Z Startup time: 2026-10-01T01:00:00Z\n\
+                   2026-10-01T01:00:01Z InitError: something odd about the frobnicator\n\
+                   2026-10-01T01:00:01Z Shutdown: done\n";
+        assert_eq!(
+            engine_error_line(log).as_deref(),
+            Some("2026-10-01T01:00:01Z InitError: something odd about the frobnicator")
+        );
+        let cause = launch_failure_cause(log).expect("an error line is a cause");
+        assert_eq!(
+            cause,
+            "the engine said: \"2026-10-01T01:00:01Z InitError: something odd about the \
+             frobnicator\"."
+        );
+        // A recognised cause still gives its own sentence.
+        let known =
+            launch_failure_cause("Error: Unable to start HTTP server. See debug log for details.")
+                .unwrap();
+        assert!(known.contains("19334"), "{known}");
+        // No error line at all: nothing to say, and the caller says so.
+        assert!(engine_error_line("2026 Shutdown: done").is_none());
+        assert!(launch_failure_cause("2026 Shutdown: done").is_none());
+        assert!(launch_failure_cause("").is_none());
+    }
+
+    /// btxd's noui handler prints every InitError on stderr as "Error: ..."
+    /// (noui.cpp:30-46). That line is the engine's own reason, and it beats a
+    /// later debug.log line that only mentions an error in passing (Task A
+    /// review M4).
+    #[test]
+    fn the_engines_own_error_line_beats_one_that_only_mentions_an_error() {
+        let log = "Error: the real reason it stopped\n\
+                   2026-10-01T01:00:01Z Binding P2P on 0.0.0.0:19335 failed (Error: no)\n\
+                   2026-10-01T01:00:01Z Shutdown: done\n";
+        assert_eq!(
+            engine_error_line(log).as_deref(),
+            Some("Error: the real reason it stopped")
+        );
+    }
+
+    /// No hint and no error line: the exit status is the one fact left, so
+    /// it is said instead of nothing (Task A review M4).
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_with_no_error_line_says_how_it_ended() {
+        use std::os::unix::process::ExitStatusExt;
+        let code = std::process::ExitStatus::from_raw(3 << 8);
+        let signal = std::process::ExitStatus::from_raw(9);
+        assert_eq!(describe_exit(code), "it exited with code 3");
+        assert_eq!(describe_exit(signal), "it was ended by signal 9");
+
+        let said =
+            launch_failure_cause_or_exit("2026 Shutdown: done", Some("it exited with code 3"));
+        assert_eq!(
+            said.as_deref(),
+            Some("the engine printed no error line, and it exited with code 3.")
+        );
+        // A cause, when there is one, still wins.
+        let known = launch_failure_cause_or_exit(
+            "Error: Unable to start HTTP server. See debug log for details.",
+            Some("it exited with code 1"),
+        )
+        .unwrap();
+        assert!(known.contains("19334"), "{known}");
+        assert!(launch_failure_cause_or_exit("", None).is_none());
+    }
+
+    /// A spawned child that prints the real restart's lines and exits is
+    /// recognised from the log the controller captured, the tail the launch
+    /// loop reads.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_that_dies_on_the_read_block_fatal_is_recognised_from_its_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lines = tmp.path().join("lines.txt");
+        std::fs::write(&lines, REAL_READ_BLOCK_FATAL).unwrap();
+        let mut controller =
+            start_shim(tmp.path(), &format!("cat '{}'\nexit 1", lines.display())).await;
+        let started = std::time::Instant::now();
+        while controller.child_has_exited() != Some(true) {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let tail = node_log_tail(tmp.path(), 64 * 1024);
+        assert!(log_shows_read_block_fatal(&tail), "{tail}");
+    }
+
+    /// The controller keeps how its child ended, for that sentence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_controller_keeps_its_childs_exit_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut controller = start_shim(tmp.path(), "exit 3").await;
+        let started = std::time::Instant::now();
+        while controller.child_has_exited() != Some(true) {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let status = controller
+            .exit_status()
+            .expect("an exited child has a status");
+        assert_eq!(status.code(), Some(3));
+        assert!(NodeController::new().exit_status().is_none());
+    }
+
+    #[test]
+    fn a_quoted_error_line_is_one_short_line() {
+        let long = format!("Error: {}\r\n", "x".repeat(500));
+        let line = engine_error_line(&long).unwrap();
+        assert!(line.chars().count() <= 200, "{}", line.len());
+        assert!(!line.contains('\n') && !line.contains('\r'));
+        assert!(line.starts_with("Error: xxx"));
+        // Multi-byte text is cut on a character, not a byte.
+        let wide = format!("Error: {}", "é".repeat(300));
+        assert!(engine_error_line(&wide).unwrap().chars().count() <= 200);
+        // A line that merely mentions an error word is not an error line.
+        assert!(engine_error_line("checking for errors in blk00001.dat").is_none());
+        // btxd's own "(Error: ...)" wording inside a log line counts.
+        assert!(engine_error_line(
+            "Binding RPC on address 127.0.0.1 port 19334 failed (Error: Address already in use (98))."
+        )
+        .is_some());
+    }
+
+    // ── What a launch that never reached RPC was last doing ────────────────
+
+    #[test]
+    fn the_last_log_line_is_the_last_non_empty_one_and_is_short() {
+        assert_eq!(
+            last_log_line("a\n\n  MatMul RC production canary: begin  \n\n").as_deref(),
+            Some("MatMul RC production canary: begin")
+        );
+        assert!(last_log_line("").is_none());
+        assert!(last_log_line("\n \n\t\n").is_none());
+        let long = "y".repeat(400);
+        assert!(last_log_line(&long).unwrap().chars().count() <= 200);
+    }
+
+    /// Only THIS launch's lines: debug.log is appended across runs, so the
+    /// launch records its length before the spawn and reads from there.
+    #[test]
+    fn debug_log_since_reads_only_what_this_launch_added() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(debug_log_len(dir.path()), 0, "a missing log is empty");
+        let log = dir.path().join("debug.log");
+        std::fs::write(&log, "old run line 1\nold run line 2\n").unwrap();
+        let offset = debug_log_len(dir.path());
+        assert!(
+            debug_log_since(dir.path(), offset).is_empty(),
+            "nothing new yet"
+        );
+
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        use std::io::Write;
+        f.write_all(b"new run line\n").unwrap();
+        assert_eq!(debug_log_since(dir.path(), offset), "new run line\n");
+
+        // The engine shrinks debug.log at StartLogging (init.cpp:2924). A file
+        // now SHORTER than the offset was shrunk by this launch, so everything
+        // in it past the shrink is this launch's: read the tail.
+        std::fs::write(&log, "kept tail\nthis launch\n").unwrap();
+        assert_eq!(
+            last_log_line(&debug_log_since(dir.path(), 10_000)).as_deref(),
+            Some("this launch")
+        );
+    }
+
+    // ── A validating start stuck in the engine's GPU check (0.7.1) ─────────
+
+    /// What StartLogging writes first, then a launch's own arguments, as the
+    /// engine at v0.34.12 prints them (init/common.cpp:118-148,
+    /// common/args.cpp:1048).
+    const STARTED_LOGGING: &str = "\
+2026-10-01T08:00:00Z BTX version v0.34.12 (release build)
+2026-10-01T08:00:00Z Default data directory /home/zan/.btx
+2026-10-01T08:00:00Z Using data directory /home/zan/.easybtx/node
+2026-10-01T08:00:00Z Config file: /home/zan/.easybtx/node/faststart.conf
+2026-10-01T08:00:00Z R/W Config file: /home/zan/.easybtx/node/btx_rw.conf (not found, skipping)
+2026-10-01T08:00:00Z Command-line arg: matmulrcexecution=\"strict-device\"
+2026-10-01T08:00:00Z Command-line arg: matmulvalidation=\"consensus\"
+";
+
+    /// The line the GPU step prints last (init.cpp:2717-2727 at v0.34.12),
+    /// as docs/gpu-qualification-rtx3060.md read it from a live RTX 3060.
+    const POLICY_LINE: &str = "2026-10-01T08:01:40Z MatMul RC execution policy: strict-device \
+provider=cuda_rc_exact_fused_extract ready=1 \
+reason=generic_exactgemm_and_rc_self_qualified:canary=missing_golden \
+workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_catchup=0\n";
+
+    #[test]
+    fn the_pre_rpc_stage_is_read_from_this_launchs_log() {
+        // Nothing new in debug.log: the engine never reached StartLogging, so
+        // it is stuck in the attestation archive open or earlier, not the GPU.
+        assert_eq!(pre_rpc_stage(""), PreRpcStage::BeforeLogging);
+        assert_eq!(pre_rpc_stage("\n\n"), PreRpcStage::BeforeLogging);
+
+        // Past StartLogging, no policy line: inside the GPU step.
+        assert_eq!(pre_rpc_stage(STARTED_LOGGING), PreRpcStage::GpuCheck);
+        // The canary's own lines come before the policy line, and a hang
+        // after them is still the GPU step.
+        let canary = format!(
+            "{STARTED_LOGGING}2026-10-01T08:00:02Z MatMul RC production canary: build \
+             provenance is advisory (matches=0 dirty=0 fingerprint=a7bf4bd7). Continuing \
+             to runtime ExactGemm self-qualification and digest check; this is not a \
+             startup refusal.\n"
+        );
+        assert_eq!(pre_rpc_stage(&canary), PreRpcStage::GpuCheck);
+
+        // The policy line is there: the GPU step finished.
+        let past = format!("{STARTED_LOGGING}{POLICY_LINE}");
+        assert_eq!(pre_rpc_stage(&past), PreRpcStage::PastGpuCheck);
+
+        // A debug.log the engine shrank at this StartLogging reads as a tail
+        // that can hold an older run's policy line. Only what follows this
+        // launch's own StartLogging counts.
+        let shrunk = format!("{STARTED_LOGGING}{POLICY_LINE}{STARTED_LOGGING}");
+        assert_eq!(pre_rpc_stage(&shrunk), PreRpcStage::GpuCheck);
+    }
+
+    #[test]
+    fn only_a_validating_gpu_launch_runs_the_gpu_check() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let cuda_consensus = args(&[
+            "-datadir=/dd",
+            "-matmulrcexecution=strict-device",
+            "-matmulvalidation=consensus",
+        ]);
+        assert!(launch_runs_gpu_check(Backend::Cuda, &cuda_consensus));
+        // A Mac passes neither flag and the engine defaults to consensus and
+        // strict-device on mainnet (init.cpp:2596, --help).
+        assert!(launch_runs_gpu_check(
+            Backend::Metal,
+            &args(&["-datadir=/dd"])
+        ));
+        // A mirror launch probes nothing before RPC.
+        let mirror = args(&[
+            "-matmulrcexecution=strict-device",
+            "-matmulvalidation=trusted",
+        ]);
+        assert!(!launch_runs_gpu_check(Backend::Cuda, &mirror));
+        assert!(!launch_runs_gpu_check(Backend::Metal, &mirror));
+        // auto-fallback skips the probe (init.cpp:2619-2622).
+        let fallback = args(&[
+            "-matmulrcexecution=auto-fallback",
+            "-matmulvalidation=consensus",
+        ]);
+        assert!(!launch_runs_gpu_check(Backend::Cuda, &fallback));
+        // No graphics card, no GPU check.
+        assert!(!launch_runs_gpu_check(Backend::Cpu, &cuda_consensus));
+        // The last value on the command line is the one the engine uses.
+        let last_wins = args(&["-matmulvalidation=trusted", "-matmulvalidation=consensus"]);
+        assert!(launch_runs_gpu_check(Backend::Cuda, &last_wins));
+    }
+
+    #[test]
+    fn a_gpu_hang_needs_a_gpu_launch_and_a_log_that_stops_inside_the_check() {
+        assert!(stuck_in_gpu_check(true, STARTED_LOGGING));
+        assert!(
+            !stuck_in_gpu_check(false, STARTED_LOGGING),
+            "not a GPU launch"
+        );
+        assert!(!stuck_in_gpu_check(true, ""), "never reached StartLogging");
+        let past = format!("{STARTED_LOGGING}{POLICY_LINE}");
+        assert!(!stuck_in_gpu_check(true, &past), "the GPU step finished");
+    }
+
+    /// The record makes a Cuda host, which validates by default, follow
+    /// signatures, exactly like the owner's choice; clearing it gives the
+    /// card its next try.
+    #[test]
+    fn a_hung_gpu_start_makes_the_host_follow_signatures_until_cleared() {
+        let tmp = tempfile::tempdir().expect("temp datadir");
+        let dir = tmp.path();
+        let btxd = Path::new("/x/btx/v0.34.12/linux/btxd");
+        assert!(!gpu_start_hung(dir));
+        assert!(!host_follows_signatures(btxd, dir, Backend::Cuda));
+
+        record_gpu_start_hung(dir, Backend::Cuda);
+        assert!(gpu_start_hung(dir));
+        let text = std::fs::read_to_string(dir.join(".gpu-start-hung")).unwrap();
+        assert!(text.contains("graphics card"), "{text}");
+        assert!(!text.contains('\u{2014}'), "no em-dash: {text}");
+        for backend in [Backend::Cuda, Backend::Metal] {
+            assert!(host_follows_signatures(btxd, dir, backend), "{backend:?}");
+            assert!(launches_as_mirror(btxd, dir, backend), "{backend:?}");
+        }
+        let (_, args, _) = build_node_command(btxd, dir, &dir.join("btx.conf"), Backend::Cuda);
+        assert!(
+            args.iter().any(|a| a == "-matmulvalidation=trusted"),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|a| a == "-matmulvalidation=consensus"));
+
+        // Not the owner's choice, and not the Mac's refusal marker.
+        assert!(!follows_signatures_by_choice(dir));
+        assert!(!matmul_consensus_was_refused(dir));
+
+        clear_gpu_start_hung(dir);
+        assert!(!gpu_start_hung(dir));
+        assert!(!host_follows_signatures(btxd, dir, Backend::Cuda));
+        // Clearing a clear folder is not an error.
+        clear_gpu_start_hung(dir);
+    }
+
+    /// The record outranks the backend split and yields only to the
+    /// operator's explicit "never a mirror".
+    #[test]
+    fn the_hung_record_yields_only_to_the_operators_zero() {
+        assert!(follows_by_record(false, true, None));
+        assert!(follows_by_record(false, true, Some(true)));
+        assert!(!follows_by_record(false, true, Some(false)));
+        assert!(follows_by_record(true, false, None));
+        assert!(!follows_by_record(true, false, Some(false)));
+        assert!(!follows_by_record(false, false, None));
+        assert!(!follows_by_record(false, false, Some(true)));
+    }
+
+    /// Full check on the setup screen tries the card again, as Settings'
+    /// "check blocks" does.
+    #[test]
+    fn full_check_at_setup_clears_the_hung_record() {
+        let tmp = tempfile::tempdir().expect("temp datadir");
+        record_gpu_start_hung(tmp.path(), Backend::Cuda);
+        apply_start_choice(tmp.path(), StartChoice::FullCheck, true).unwrap();
+        assert!(!gpu_start_hung(tmp.path()));
+    }
+
+    /// A Mac's GPU is a "graphics chip" everywhere else in the app, an
+    /// NVIDIA one a "graphics card" (final review M7).
+    #[test]
+    fn the_graphics_hardware_is_named_as_the_app_names_it() {
+        assert_eq!(graphics_word(Backend::Metal), "graphics chip");
+        assert_eq!(graphics_word(Backend::Cuda), "graphics card");
+        assert_eq!(graphics_word(Backend::Cpu), "graphics card");
+        let tmp = tempfile::tempdir().expect("temp datadir");
+        record_gpu_start_hung(tmp.path(), Backend::Metal);
+        let text = std::fs::read_to_string(tmp.path().join(".gpu-start-hung")).unwrap();
+        assert!(text.contains("graphics chip"), "{text}");
+        assert!(text.contains("tries the chip again"), "{text}");
+        assert!(!text.contains("card"), "{text}");
+    }
+
+    /// The launch keeps the arguments it passed, so the app can ask whether
+    /// this launch ran the GPU check.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_started_controller_keeps_its_launch_arguments() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(NodeController::new().launch_args().is_empty());
+        let mut controller = start_shim(tmp.path(), "exec sleep 30").await;
+        let args = controller.launch_args().to_vec();
+        assert!(
+            args.iter()
+                .any(|a| a == &format!("-datadir={}", tmp.path().display())),
+            "{args:?}"
+        );
+        assert_eq!(
+            controller
+                .stop_without_rpc_outcome(std::time::Duration::from_secs(10))
+                .await,
+            NoRpcStop::OnSigterm
+        );
+    }
+
+    /// A btxd alive at the end of the RPC wait with no RPC to ask: SIGTERM
+    /// ends an ordinary process within the grace, and nothing is left behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_without_rpc_ends_a_child_that_honours_sigterm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut controller = start_shim(tmp.path(), "exec sleep 30").await;
+        let started = std::time::Instant::now();
+        let graceful = controller
+            .stop_without_rpc(std::time::Duration::from_secs(10))
+            .await;
+        assert!(graceful, "sleep dies on SIGTERM");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(controller.child_has_exited(), None, "the handle is gone");
+        assert!(!pidfile_path(tmp.path()).exists(), "the pidfile is gone");
+    }
+
+    /// A btxd wedged in the GPU driver does not act on SIGTERM. After the
+    /// grace it is killed, never left running behind an error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_without_rpc_kills_a_child_that_ignores_sigterm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut controller = start_shim(
+            tmp.path(),
+            "trap '' TERM\ntouch \"$0.ready\"\nwhile :; do sleep 1; done",
+        )
+        .await;
+        let pid = controller.child_pid().expect("a live child has a pid");
+        // The shell must reach its trap before the signal. A fixed sleep lost
+        // that race under the full suite's load; the shim says when it is.
+        let ready = tmp.path().join("btxd.ready");
+        let waited = std::time::Instant::now();
+        while !ready.exists() && waited.elapsed() < std::time::Duration::from_secs(10) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ready.exists(), "the shim never reached its trap");
+        let started = std::time::Instant::now();
+        let graceful = controller
+            .stop_without_rpc(std::time::Duration::from_secs(1))
+            .await;
+        assert!(
+            !graceful,
+            "it had to be killed; log: {}",
+            node_log_tail(tmp.path(), 4096)
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(6));
+        assert!(
+            !crate::platform::process_is_alive(pid),
+            "the wedged child must be gone"
+        );
+    }
+
+    /// After a kill the child did not survive in time, the controller can
+    /// still see it go: a btxd on a wedged NVIDIA card can take well over the
+    /// kill's 5 s while the driver tears its context down (final review I1).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_after_kill_sees_a_late_exit_and_clears_its_pidfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut controller = start_shim(tmp.path(), "sleep 0.5; exit 0").await;
+        assert!(pidfile_path(tmp.path()).exists());
+        assert!(
+            controller
+                .wait_after_kill(std::time::Duration::from_secs(10))
+                .await
+        );
+        assert!(!pidfile_path(tmp.path()).exists(), "its own pidfile goes");
+        // Nothing left to wait for.
+        assert!(
+            controller
+                .wait_after_kill(std::time::Duration::from_millis(1))
+                .await
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_after_kill_gives_up_on_a_child_that_stays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut controller = start_shim(tmp.path(), "exec sleep 30").await;
+        let started = std::time::Instant::now();
+        assert!(
+            !controller
+                .wait_after_kill(std::time::Duration::from_millis(400))
+                .await
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert!(
+            pidfile_path(tmp.path()).exists(),
+            "a holder keeps its pidfile"
+        );
+        controller
+            .stop_without_rpc(std::time::Duration::from_secs(5))
+            .await;
+    }
+
+    /// The pidfile goes only when it is this child's: one that names another
+    /// process (a newer launch, written by hand) is not ours to remove
+    /// (Task A review I2).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_without_rpc_keeps_a_pidfile_that_is_not_its_childs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut controller = start_shim(tmp.path(), "exec sleep 30").await;
+        std::fs::write(pidfile_path(tmp.path()), "999999").unwrap();
+        assert_eq!(
+            controller
+                .stop_without_rpc_outcome(std::time::Duration::from_secs(10))
+                .await,
+            NoRpcStop::OnSigterm
+        );
+        assert_eq!(
+            std::fs::read_to_string(pidfile_path(tmp.path())).unwrap(),
+            "999999"
+        );
+    }
+
+    /// The outcome says a killed child is gone, so the launch can take its
+    /// next attempt; only one that outlives the kill is `StillRunning`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_without_rpc_outcome_says_killed_for_a_child_that_ignores_sigterm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut controller = start_shim(
+            tmp.path(),
+            "trap '' TERM\ntouch \"$0.ready\"\nwhile :; do sleep 1; done",
+        )
+        .await;
+        let ready = tmp.path().join("btxd.ready");
+        let waited = std::time::Instant::now();
+        while !ready.exists() && waited.elapsed() < std::time::Duration::from_secs(10) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ready.exists(), "the shim never reached its trap");
+        assert_eq!(
+            controller
+                .stop_without_rpc_outcome(std::time::Duration::from_secs(1))
+                .await,
+            NoRpcStop::Killed
         );
     }
 
@@ -2853,6 +6735,91 @@ consensus-validator service.";
         clear_matmul_consensus_refused(&dir);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The owner's choice makes a machine that could validate follow
+    /// signatures, Metal and Cuda alike, and withdrawing it restores the
+    /// launch it had. Nothing else touches it: an engine upgrade clears the
+    /// refusal marker, never this one.
+    #[test]
+    fn the_owners_choice_to_follow_signatures_decides_the_launch() {
+        let tmp = tempfile::tempdir().expect("temp datadir");
+        let dir = tmp.path();
+        let btxd = Path::new("/x/btx/v0.34.9/mac/btxd");
+        assert!(!follows_signatures_by_choice(dir));
+        assert!(!launches_as_mirror(btxd, dir, Backend::Metal));
+
+        set_follows_signatures_by_choice(dir, true).unwrap();
+        assert!(follows_signatures_by_choice(dir));
+        for backend in [Backend::Metal, Backend::Cuda, Backend::Cpu] {
+            assert!(launches_as_mirror(btxd, dir, backend), "{backend:?}");
+        }
+        let (_, args, _) = build_node_command(btxd, dir, &dir.join("btx.conf"), Backend::Metal);
+        assert!(args.iter().any(|a| a == "-matmulvalidation=trusted"));
+        assert!(args.iter().any(|a| a == "-matmultrustedthreshold=1"));
+
+        clear_matmul_consensus_refused(dir);
+        assert!(
+            follows_signatures_by_choice(dir),
+            "an upgrade must not undo a choice"
+        );
+
+        set_follows_signatures_by_choice(dir, false).unwrap();
+        assert!(!follows_signatures_by_choice(dir));
+        assert!(!launches_as_mirror(btxd, dir, Backend::Metal));
+        // Withdrawing twice is not an error.
+        set_follows_signatures_by_choice(dir, false).unwrap();
+    }
+
+    /// The setup screen's choice decides the first start: Quick start writes
+    /// the marker, Full check removes it, and a machine that cannot check
+    /// blocks gets no marker at all, since it follows signatures anyway and a
+    /// marker would put a Settings switch on screen that changes nothing.
+    #[test]
+    fn the_setup_choice_writes_or_removes_the_marker() {
+        let tmp = tempfile::tempdir().expect("temp datadir");
+        let dir = tmp.path();
+        let btxd = Path::new("/x/btx/v0.34.9/mac/btxd");
+
+        // A Mac that keeps the preselected Quick start: Metal may check
+        // blocks, so the marker is written and the node follows signatures
+        // from its first start instead of trying the chip. An NVIDIA machine
+        // that picks Quick start is the same.
+        let mac = Backend::Metal.may_check_blocks();
+        apply_start_choice(dir, StartChoice::QuickStart, mac).unwrap();
+        assert!(follows_signatures_by_choice(dir));
+        assert!(launches_as_mirror(btxd, dir, Backend::Metal));
+        assert!(launches_as_mirror(btxd, dir, Backend::Cuda));
+
+        // A Mac that picks Full check: no marker, the chip is tried.
+        apply_start_choice(dir, StartChoice::FullCheck, mac).unwrap();
+        assert!(!follows_signatures_by_choice(dir));
+        assert!(!launches_as_mirror(btxd, dir, Backend::Metal));
+
+        // No usable GPU: Quick start writes nothing, and the node follows
+        // signatures anyway.
+        let no_gpu = Backend::Cpu.may_check_blocks();
+        apply_start_choice(dir, StartChoice::QuickStart, no_gpu).unwrap();
+        assert!(!follows_signatures_by_choice(dir));
+        assert!(launches_as_mirror(btxd, dir, Backend::Cpu));
+
+        // Full check on a fresh folder is not an error.
+        let fresh = tempfile::tempdir().expect("temp datadir");
+        apply_start_choice(fresh.path(), StartChoice::FullCheck, true).unwrap();
+        assert!(!follows_signatures_by_choice(fresh.path()));
+    }
+
+    /// The window sends the choice by name, and an older window sends none,
+    /// which is setup as it was.
+    #[test]
+    fn the_window_names_the_choice() {
+        let quick: StartChoice = serde_json::from_value(serde_json::json!("quick_start")).unwrap();
+        let full: StartChoice = serde_json::from_value(serde_json::json!("full_check")).unwrap();
+        assert_eq!(quick, StartChoice::QuickStart);
+        assert_eq!(full, StartChoice::FullCheck);
+        assert!(serde_json::from_value::<StartChoice>(serde_json::json!("fast")).is_err());
+        let none: Option<StartChoice> = serde_json::from_value(serde_json::Value::Null).unwrap();
+        assert_eq!(none, None);
     }
 
     /// A non-Metal host is a mirror on the static rule alone, with or without
@@ -3008,6 +6975,137 @@ consensus-validator service.";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Build a datadir whose `blocks/` holds exactly these blk indices.
+    fn datadir_with_blk_files(tag: &str, indices: &[u32]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("easynode-prune-{tag}-{}", std::process::id()));
+        let blocks = dir.join("blocks");
+        std::fs::create_dir_all(&blocks).unwrap();
+        for i in indices {
+            std::fs::write(blocks.join(format!("blk{i:05}.dat")), b"x").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn a_datadir_that_has_pruned_is_recognised_without_asking_the_node() {
+        // No datadir at all, and a datadir with no blocks folder: a folder that
+        // has not started has not pruned.
+        assert!(!datadir_has_pruned(Path::new("/definitely/not/here")));
+        let empty = datadir_with_blk_files("empty", &[]);
+        assert!(!datadir_has_pruned(&empty), "no block files is not pruned");
+
+        // The ordinary syncing case: the first file is still there.
+        let fresh = datadir_with_blk_files("fresh", &[0, 1, 2]);
+        assert!(
+            !datadir_has_pruned(&fresh),
+            "blk00000 present is not pruned"
+        );
+
+        // The shape measured on this project's validator on 2026-09-06.
+        let pruned = datadir_with_blk_files("pruned", &[1, 1003, 1004]);
+        assert!(
+            datadir_has_pruned(&pruned),
+            "no blk00000 but higher files is pruned"
+        );
+
+        for d in [empty, fresh, pruned] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// The bug this guards: `-prune=0` over a pruned datadir does not un-prune
+    /// it, it stops btxd starting before RPC binds, and the app then tells the
+    /// user to delete their chain. A fleet update is what restarts every
+    /// affected node at once, so this must hold before one is pushed.
+    #[test]
+    fn prune_zero_is_never_asserted_over_a_datadir_that_has_pruned() {
+        let dd = datadir_with_blk_files("guard", &[1, 1003]);
+        std::fs::write(dd.join("btx_rw.conf"), "prune=4096\n").unwrap();
+        let conf = dd.join("faststart.conf");
+        std::fs::write(&conf, "# prune=0 keeps ALL blocks\nprune=0\n").unwrap();
+
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.6/lin/btxd"),
+            &dd,
+            &conf,
+            Backend::Cuda,
+        );
+        assert!(
+            !args.iter().any(|a| a == "-prune=0"),
+            "asking a pruned folder to keep everything is how it stops starting: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "-prune=4096"),
+            "state the posture the folder actually has, rather than falling back \
+             silently to it: {args:?}"
+        );
+        let _ = std::fs::remove_dir_all(dd);
+    }
+
+    #[test]
+    fn a_pruned_datadir_with_nothing_remembered_is_left_to_the_engine() {
+        // No btx_rw.conf to read a target from. Saying nothing lets btxd use
+        // its own recorded posture, which starts; saying `-prune=0` does not.
+        let dd = datadir_with_blk_files("noremember", &[7]);
+        let conf = dd.join("c.conf");
+        std::fs::write(&conf, "prune=0\n").unwrap();
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.6/lin/btxd"),
+            &dd,
+            &conf,
+            Backend::Cuda,
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("-prune=")),
+            "no target to state means state nothing, never zero: {args:?}"
+        );
+        let _ = std::fs::remove_dir_all(dd);
+    }
+
+    #[test]
+    fn the_keeper_target_is_still_asserted_on_a_pruned_datadir() {
+        // Only prune=0 is refused. Moving one non-zero target to another is
+        // something btxd accepts, and the keeper profile depends on it.
+        let dd = datadir_with_blk_files("keeper", &[1, 1003]);
+        std::fs::write(dd.join("btx_rw.conf"), "prune=4096\n").unwrap();
+        let conf = dd.join("keeper.conf");
+        std::fs::write(&conf, "prune=10000\n").unwrap();
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.6/lin/btxd"),
+            &dd,
+            &conf,
+            Backend::Cuda,
+        );
+        assert!(
+            args.iter().any(|a| a == "-prune=10000"),
+            "the keeper profile still states its own target: {args:?}"
+        );
+        let _ = std::fs::remove_dir_all(dd);
+    }
+
+    /// The 0.6.18 fix must survive this one. On a datadir that has NOT pruned,
+    /// `prune=0` still goes on the command line, because that is what stops a
+    /// remembered `btx_rw.conf` target silently pruning a node whose app says
+    /// it keeps everything.
+    #[test]
+    fn an_unpruned_datadir_still_gets_the_confs_prune_zero() {
+        let dd = datadir_with_blk_files("unpruned", &[0, 1]);
+        std::fs::write(dd.join("btx_rw.conf"), "prune=4096\n").unwrap();
+        let conf = dd.join("faststart.conf");
+        std::fs::write(&conf, "prune=0\n").unwrap();
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.6/lin/btxd"),
+            &dd,
+            &conf,
+            Backend::Cuda,
+        );
+        assert!(
+            args.iter().any(|a| a == "-prune=0"),
+            "a folder that never pruned must still be held to the conf: {args:?}"
+        );
+        let _ = std::fs::remove_dir_all(dd);
+    }
+
     #[test]
     fn prune_is_read_from_the_setting_not_the_prose() {
         let dir = std::env::temp_dir().join(format!("easynode-prune-prose-{}", std::process::id()));
@@ -3023,51 +7121,401 @@ consensus-validator service.";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Every `-matmulvalidation=` value on the command line, in order. A
+    /// non-Metal host on a degraded-start engine must state its mode exactly
+    /// once: never zero times (the 09-01 lesson, an absent flag lets the
+    /// datadir's btx_rw.conf decide) and never twice.
+    fn validation_modes(args: &[String]) -> Vec<&str> {
+        args.iter()
+            .filter_map(|a| a.strip_prefix("-matmulvalidation="))
+            .collect()
+    }
+
+    /// Every pinned signer and threshold 1: the quorum as this file
+    /// builds it for Metal's marker path, and since 2026-09-15 for keyless
+    /// CPU hosts too.
+    fn carries_trusted_quorum(args: &[String]) -> bool {
+        BTX_TRUSTED_ATTESTATION_PUBKEYS.iter().all(|k| {
+            args.iter()
+                .any(|a| a == &format!("-matmultrustedpubkey={k}"))
+        }) && args.iter().any(|a| a == "-matmultrustedthreshold=1")
+    }
+
+    fn carries_single_key_override(args: &[String]) -> bool {
+        args.iter().any(|a| a == "-allowsinglekeytrustedmirror=1")
+    }
+
     #[test]
-    fn on_0_34_5_a_non_metal_host_leaves_the_mirror_for_consensus() {
-        // This assertion has now flipped twice, so the dates matter more than
-        // the prose. Until 2026-08-30 it demanded no mirror, because a bare
-        // 1-of-1 is refused at init. Then it demanded mirror plus override,
-        // upstream's transition escape hatch. Both predate the fact that
-        // decides it: the final v0.34.5 tag admits a capable card by runtime
-        // MEASUREMENT, not by manifest row. Measured 2026-08-31 on an RTX 3060
-        // with the exact shipped Linux package: consensus mode self-qualifies
+    fn on_a_degraded_start_engine_a_cuda_host_validates_in_explicit_consensus_mode() {
+        // This assertion has flipped three times for non-Metal hosts, so the
+        // dates matter more than the prose. Until 2026-08-30 it demanded no
+        // mirror, because a bare 1-of-1 is refused at init. Then it demanded
+        // mirror plus override, upstream's transition escape hatch. From
+        // 2026-08-31 it demanded consensus for EVERY non-Metal host, on a
+        // measurement that still stands for this one: an RTX 3060 with the
+        // exact shipped Linux package self-qualifies in consensus mode
         // (ready=1, cpu_fallbacks=0) and advertises NODE_MATMUL_CONSENSUS,
-        // while the mirror pin left the same GPU idle against an attestation
-        // supply that measured dead in mid August. A host with no capable card
-        // loses nothing here: under strict-device it refuses cleanly and
-        // stalls where rc_stalled can see it, which is also everything the
-        // dead quorum had to offer.
-        for backend in [Backend::Cpu, Backend::Cuda] {
+        // while the mirror pin left the same GPU idle behind a single key.
+        // Since 2026-09-15 that is asked of the CUDA host alone; the host with
+        // no driver has its own test below, and the matrix after that.
+        for engine in ["v0.34.5", "v0.34.6", "v0.35.0"] {
             let (_, args, _) = build_node_command(
-                Path::new("/x/btx/v0.34.5/lin/btxd"),
+                Path::new(&format!("/x/btx/{engine}/lin/btxd")),
+                Path::new("/dd"),
+                Path::new("/dd/btx.conf"),
+                Backend::Cuda,
+            );
+            assert_eq!(
+                validation_modes(&args),
+                vec!["consensus"],
+                "consensus must be EXPLICIT and stated once on {engine}: btxd \
+                 persists mirror settings in the datadir's btx_rw.conf across \
+                 engine upgrades, and only a command line value outranks them \
+                 (measured on a real 0.6.5 era install, 2026-09-01), got {args:?}"
+            );
+            assert!(
+                !args.iter().any(|a| a.starts_with("-matmultrustedpubkey=")),
+                "no signer pins in consensus mode on {engine}, got {args:?}"
+            );
+            assert!(
+                !args.iter().any(|a| a == "-matmultrustedthreshold=1"),
+                "no threshold in consensus mode on {engine}, got {args:?}"
+            );
+            assert!(
+                !carries_single_key_override(&args),
+                "the stolen-key override has no place beside consensus on {engine}, got {args:?}"
+            );
+            // strict-device stays: a card that qualifies validates, and one
+            // that does not refuses cleanly where rc_stalled can see it.
+            assert!(args.iter().any(|a| a == "-matmulrcexecution=strict-device"));
+        }
+    }
+
+    /// The signer role's link (btx_core::signer). A conf that hands the engine
+    /// a signing key makes the node dial the mirrors this project's signers
+    /// feed, on the validating arm only, and the whole manual set still fits
+    /// the engine's eight slots. Measured need, not a nicety: attestations
+    /// travel only to connected peers and are relayed only by nodes that pin
+    /// the key, so without this line a volunteer's signatures never reach
+    /// api.btxscan.io's mirror unless they forward a port and the mirror's
+    /// admin adds their address by hand.
+    #[test]
+    fn a_conf_with_a_signing_key_dials_the_mirrors_it_feeds_and_stays_in_budget() {
+        let dir = std::env::temp_dir().join(format!("easynode-signer-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let signing = dir.join("signing.conf");
+        std::fs::write(
+            &signing,
+            "server=1\nmatmulattestationsignerkeyfile=attestation-signer.key\n",
+        )
+        .unwrap();
+        let keyless = dir.join("keyless.conf");
+        std::fs::write(&keyless, "server=1\n").unwrap();
+        let blank = dir.join("blank.conf");
+        std::fs::write(&blank, "matmulattestationsignerkeyfile=\n").unwrap();
+
+        assert!(signs_here(&signing));
+        assert!(!signs_here(&keyless));
+        assert!(!signs_here(&blank), "an empty value is no key");
+        assert!(!signs_here(&dir.join("missing.conf")));
+
+        let mirror_addnodes = |args: &[String]| {
+            crate::signer::BTX_MIRRORS_FED_BY_SIGNERS
+                .iter()
+                .filter(|m| args.iter().any(|a| a == &format!("-addnode={m}")))
+                .count()
+        };
+        let btxd = Path::new("/x/btx/v0.34.6/lin/btxd");
+
+        // A validating host with a key dials every mirror, exactly once each.
+        let (_, args, _) = build_node_command(btxd, Path::new("/dd"), &signing, Backend::Cuda);
+        assert_eq!(validation_modes(&args), vec!["consensus"]);
+        assert_eq!(
+            mirror_addnodes(&args),
+            crate::signer::BTX_MIRRORS_FED_BY_SIGNERS.len(),
+            "{args:?}"
+        );
+        let addnodes = args.iter().filter(|a| a.starts_with("-addnode=")).count();
+        assert!(
+            addnodes <= MAX_MANUAL_PEERS,
+            "{addnodes} manual peers for {MAX_MANUAL_PEERS} slots: the mirror link would \
+             evict a block source or never be dialled: {args:?}"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for a in args.iter().filter(|a| a.starts_with("-addnode=")) {
+            assert!(
+                seen.insert(a.clone()),
+                "duplicate manual peer {a}: the engine does not dedupe"
+            );
+        }
+
+        // The same host without a key adds no signer link: it dials the manual
+        // set and nothing else. (Since 2026-09-24 btxscan's mirror is also an
+        // archive peer, so every host reaches it through that set; what must
+        // not appear is a mirror dialled only because of a key.)
+        let signer_only = |args: &[String]| {
+            let manual = manual_peers();
+            crate::signer::BTX_MIRRORS_FED_BY_SIGNERS
+                .iter()
+                .filter(|m| !manual.contains(m))
+                .filter(|m| args.iter().any(|a| a == &format!("-addnode={m}")))
+                .count()
+        };
+        let manual_args = |args: &[String]| {
+            args.iter()
+                .filter_map(|a| a.strip_prefix("-addnode="))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let (_, args, _) = build_node_command(btxd, Path::new("/dd"), &keyless, Backend::Cuda);
+        assert_eq!(signer_only(&args), 0, "{args:?}");
+        assert_eq!(manual_args(&args), manual_peers(), "{args:?}");
+
+        // A mirror host with the line in its conf adds no signer link either: a
+        // mirror consumes attestations, and a key there signs nothing.
+        let (_, args, _) = build_node_command(btxd, Path::new("/dd"), &signing, Backend::Cpu);
+        assert_eq!(validation_modes(&args), vec!["trusted"]);
+        assert_eq!(signer_only(&args), 0, "{args:?}");
+        assert_eq!(manual_args(&args), manual_peers(), "{args:?}");
+        assert!(launches_as_mirror(btxd, Path::new("/dd"), Backend::Cpu));
+        assert!(!launches_as_mirror(btxd, Path::new("/dd"), Backend::Cuda));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 0.34.9 refuses to start a node that holds a signing key and pins none,
+    /// and every host this app hands a key to is one (`signing_key_self_pin`
+    /// has the measurement). The validating arm must pin the key it signs
+    /// with, exactly once; the mirror arm must not pin itself; a conf that
+    /// already pins the key, a key that cannot be read, and no key at all add
+    /// nothing, because the engine also refuses a duplicate pin.
+    #[test]
+    fn a_validating_signer_pins_its_own_key_and_a_mirror_never_does() {
+        let dir = std::env::temp_dir().join(format!("easynode-self-pin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wif = crate::signer::generate_wif();
+        let pubkey = crate::signer::wif_to_pubkey_hex(&wif).unwrap();
+        std::fs::write(dir.join(crate::signer::SIGNER_KEY_FILE), format!("{wif}\n")).unwrap();
+        let signing = dir.join("signing.conf");
+        std::fs::write(
+            &signing,
+            "server=1\nmatmulattestationsignerkeyfile=attestation-signer.key\n",
+        )
+        .unwrap();
+        let pinned = dir.join("pinned.conf");
+        std::fs::write(
+            &pinned,
+            format!(
+                "server=1\nmatmulattestationsignerkeyfile=attestation-signer.key\n\
+                 matmultrustedpubkey={pubkey}\n"
+            ),
+        )
+        .unwrap();
+        let keyless = dir.join("keyless.conf");
+        std::fs::write(&keyless, "server=1\n").unwrap();
+        let unreadable = dir.join("unreadable.conf");
+        std::fs::write(
+            &unreadable,
+            "server=1\nmatmulattestationsignerkeyfile=no-such.key\n",
+        )
+        .unwrap();
+
+        let own_pin = format!("-matmultrustedpubkey={pubkey}");
+        let pins = |args: &[String]| -> Vec<String> {
+            args.iter()
+                .filter(|a| a.starts_with("-matmultrustedpubkey="))
+                .cloned()
+                .collect()
+        };
+        let btxd = Path::new("/x/btx/v0.34.9/lin/btxd");
+
+        // A validating host with a key: one pin, its own, on either GPU.
+        for backend in [Backend::Cuda, Backend::Metal] {
+            let (_, args, _) = build_node_command(btxd, &dir, &signing, backend);
+            assert_eq!(pins(&args), vec![own_pin.clone()], "{args:?}");
+        }
+        // The mirror arm, same conf: the signers it follows, never itself.
+        let (_, args, _) = build_node_command(btxd, &dir, &signing, Backend::Cpu);
+        assert_eq!(validation_modes(&args), vec!["trusted"]);
+        assert!(
+            !args.contains(&own_pin),
+            "a mirror pinned its own key: {args:?}"
+        );
+        assert_eq!(pins(&args).len(), BTX_TRUSTED_ATTESTATION_PUBKEYS.len());
+        // Nothing to add.
+        for conf in [&keyless, &unreadable, &pinned] {
+            let (_, args, _) = build_node_command(btxd, &dir, conf, Backend::Cuda);
+            assert!(pins(&args).is_empty(), "{}: {args:?}", conf.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Final review O1: `btx_rw.conf` is loaded on every start regardless of
+    /// `-conf` and merges into the same list as the command line
+    /// (`common/config.cpp`, `common/settings.cpp` `GetSettingsList`), so a
+    /// signer's own key already pinned there must count too. Without this,
+    /// a host carrying a mirror-era leftover pin of its own key in
+    /// `btx_rw.conf` gets the engine's duplicate-pin refusal at init
+    /// (init.cpp:1591-1596 at 84b998b4).
+    #[test]
+    fn a_signer_already_pinned_in_btx_rw_conf_is_not_pinned_again() {
+        let dir = std::env::temp_dir().join(format!("easynode-self-pin-rw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wif = crate::signer::generate_wif();
+        let pubkey = crate::signer::wif_to_pubkey_hex(&wif).unwrap();
+        std::fs::write(dir.join(crate::signer::SIGNER_KEY_FILE), format!("{wif}\n")).unwrap();
+        let conf = dir.join("signing.conf");
+        std::fs::write(
+            &conf,
+            "server=1\nmatmulattestationsignerkeyfile=attestation-signer.key\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("btx_rw.conf"),
+            format!("matmultrustedpubkey={pubkey}\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            signing_key_self_pin(&conf, &dir),
+            None,
+            "btx_rw.conf already pins the signer's own key"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn on_a_degraded_start_engine_a_keyless_cpu_host_is_a_trusted_mirror() {
+        // The 08-31 rule sent this host into consensus mode too, where it
+        // starts degraded, follows headers, stalls below the Epoch-A height
+        // and can never advertise the archive bit: init.cpp:2662-2673 grants
+        // it only to a trusted mirror or to a signer whose device is ready.
+        // That rule's premise was "an attestation supply that measured dead",
+        // and the supply is live again (this project's validator has signed
+        // since 2026-09-01). So a host with no CUDA driver takes the mirror
+        // this file already builds for a refused Mac, override included, and
+        // follows the signed chain. Measured offline on 2026-09-15 against
+        // the shipped 0.34.6 engine with exactly these flags: "init message:
+        // Done loading" in 2 s, getmatmultrustedstatus trusted_mirror=true
+        // local_signer=false serves_attestations=true, localservices
+        // 0x82000d09 (bits 25 and 31 set, bit 27 clear).
+        for engine in ["v0.34.5", "v0.34.6", "v0.35.0"] {
+            let (_, args, _) = build_node_command(
+                Path::new(&format!("/x/btx/{engine}/lin/btxd")),
+                Path::new("/dd"),
+                Path::new("/dd/btx.conf"),
+                Backend::Cpu,
+            );
+            assert_eq!(
+                validation_modes(&args),
+                vec!["trusted"],
+                "a keyless CPU host states trusted mode once on {engine}, got {args:?}"
+            );
+            assert!(
+                carries_trusted_quorum(&args),
+                "every pinned signer at threshold 1 on {engine}, got {args:?}"
+            );
+            assert!(
+                carries_single_key_override(&args),
+                "every 0.34 tag refuses a 1-of-1 mainnet mirror without the \
+                 override; without this line the node does not start on \
+                 {engine}, got {args:?}"
+            );
+            assert!(args.iter().any(|a| a == "-matmulrcexecution=strict-device"));
+        }
+    }
+
+    /// The whole matrix in one table, so the next flip has to rewrite a row
+    /// rather than one assertion, and a change to one host class shows up as
+    /// a diff against the others.
+    #[test]
+    fn the_launch_mode_matrix_is_metal_silent_cuda_consensus_cpu_mirror() {
+        // (backend, btxd path, stated modes, quorum pinned, override passed)
+        let cases: [(Backend, &str, &[&str], bool, bool); 9] = [
+            // Metal says nothing without its marker: btxd's default is
+            // consensus and Apple Silicon self-qualifies (an M5 on 0.34.6,
+            // 0.6.19). The marker path has its own tests above.
+            (
+                Backend::Metal,
+                "/x/btx/v0.33.4.1/mac/btxd",
+                &[],
+                false,
+                false,
+            ),
+            (Backend::Metal, "/x/btx/v0.34.6/mac/btxd", &[], false, false),
+            // Engines before the degraded start exit at init in consensus
+            // mode on an off-manifest host, so both PC classes keep the mirror
+            // there, and without the override, which is a 0.34 flag.
+            (
+                Backend::Cuda,
+                "/x/btx/v0.33.4.1/lin/btxd",
+                &["trusted"],
+                true,
+                false,
+            ),
+            (
+                Backend::Cpu,
+                "/x/btx/v0.33.4.1/lin/btxd",
+                &["trusted"],
+                true,
+                false,
+            ),
+            // The split, 2026-09-15.
+            (
+                Backend::Cuda,
+                "/x/btx/v0.34.6/lin/btxd",
+                &["consensus"],
+                false,
+                false,
+            ),
+            (
+                Backend::Cpu,
+                "/x/btx/v0.34.6/lin/btxd",
+                &["trusted"],
+                true,
+                true,
+            ),
+            // A tag-less path fails safe: no MatMul flags at all.
+            (Backend::Metal, "/data/bin/btxd", &[], false, false),
+            (Backend::Cuda, "/data/bin/btxd", &[], false, false),
+            (Backend::Cpu, "/data/bin/btxd", &[], false, false),
+        ];
+        for (backend, btxd, modes, quorum, override_) in cases {
+            let (_, args, _) = build_node_command(
+                Path::new(btxd),
                 Path::new("/dd"),
                 Path::new("/dd/btx.conf"),
                 backend,
             );
-            assert!(
-                args.iter().any(|a| a == "-matmulvalidation=consensus"),
-                "consensus must be EXPLICIT: btxd persists mirror settings in \
-                 the datadir's btx_rw.conf across engine upgrades, and only an \
-                 explicit command line value outranks them (measured on a real \
-                 0.6.5 era install, 2026-09-01), got {args:?}"
+            assert_eq!(
+                validation_modes(&args),
+                modes,
+                "{backend:?} on {btxd}: {args:?}"
             );
-            assert!(
-                !args.iter().any(|a| a == "-matmulvalidation=trusted"),
-                "never downgrade a 0.34.5 host to a mirror, got {args:?}"
+            assert_eq!(
+                carries_trusted_quorum(&args),
+                quorum,
+                "{backend:?} on {btxd}: {args:?}"
             );
-            assert!(
-                !args.iter().any(|a| a.starts_with("-matmultrustedpubkey=")),
-                "no signer pins in consensus mode, got {args:?}"
+            assert_eq!(
+                carries_single_key_override(&args),
+                override_,
+                "{backend:?} on {btxd}: {args:?}"
             );
-            assert!(
-                !args.iter().any(|a| a == "-allowsinglekeytrustedmirror=1"),
-                "the single stolen key override must leave the fleet, got {args:?}"
-            );
-            // strict-device stays: a card that qualifies validates, and a host
-            // with none refuses cleanly where rc_stalled can see it.
-            assert!(args.iter().any(|a| a == "-matmulrcexecution=strict-device"));
         }
+    }
+
+    #[test]
+    fn the_mirror_override_reads_yes_and_no_and_ignores_noise() {
+        assert_eq!(parse_trusted_mirror_override("1"), Some(true));
+        assert_eq!(parse_trusted_mirror_override(" ON "), Some(true));
+        assert_eq!(parse_trusted_mirror_override("yes"), Some(true));
+        assert_eq!(parse_trusted_mirror_override("0"), Some(false));
+        assert_eq!(parse_trusted_mirror_override("no"), Some(false));
+        assert_eq!(parse_trusted_mirror_override("Off"), Some(false));
+        // A typo must not decide a consensus posture.
+        assert_eq!(parse_trusted_mirror_override("maybe"), None);
+        assert_eq!(parse_trusted_mirror_override(""), None);
     }
 
     #[test]
@@ -3104,14 +7552,23 @@ consensus-validator service.";
         // exit at init in consensus mode on an off-manifest host.
         let dd = std::env::temp_dir().join("btx-core-mirror-gate-test");
         let _ = std::fs::create_dir_all(&dd);
-        let (_, args, _) = build_node_command(
-            Path::new("/x/btx/v0.33.4.1/lin/btxd"),
-            &dd,
-            &dd.join("btx.conf"),
-            Backend::Cpu,
-        );
-        assert!(args.iter().any(|a| a == "-matmulvalidation=trusted"));
-        assert!(args.iter().any(|a| a == "-matmultrustedthreshold=1"));
+        for backend in [Backend::Cpu, Backend::Cuda] {
+            let (_, args, _) = build_node_command(
+                Path::new("/x/btx/v0.33.4.1/lin/btxd"),
+                &dd,
+                &dd.join("btx.conf"),
+                backend,
+            );
+            assert_eq!(
+                validation_modes(&args),
+                vec!["trusted"],
+                "{backend:?}: {args:?}"
+            );
+            assert!(carries_trusted_quorum(&args), "{backend:?}: {args:?}");
+            // The override is a 0.34 flag, only passed where 0.34.5+ needs
+            // it; an older engine would reject an unknown argument fatally.
+            assert!(!carries_single_key_override(&args), "{backend:?}: {args:?}");
+        }
     }
 
     #[test]
@@ -3135,6 +7592,57 @@ consensus-validator service.";
         assert!(!node_supports_matmul_rc_flags(Path::new(
             "/x/btx/v0.33.1-hotfix/lin/btxd"
         )));
+    }
+
+    /// The install key since 2026-09-15 is `v0.34.6-3013c2c2`: upstream tagged
+    /// v0.34.6 one commit past the build every install held under the bare
+    /// `v0.34.6` key, and the app re-provisions only when the key changes, so
+    /// the key carries the commit. The qualifier starts with DIGITS, which is a
+    /// shape `-pr105b` never exercised: every gate derived from the install
+    /// directory must still read 0.34.6 from it, or the fleet update that
+    /// ships it would launch btxd without the RC flags and the degraded-start
+    /// posture, on every machine at once.
+    #[test]
+    fn the_shipped_install_key_parses_to_the_version_its_btxd_reports() {
+        assert_eq!(
+            parse_tag_version("v0.34.6-3013c2c2"),
+            Some(vec![0, 34, 6]),
+            "a hex qualifier must not leak into the version"
+        );
+        let btxd = Path::new("/x/btx/v0.34.6-3013c2c2/lin/btxd");
+        assert_eq!(
+            release_tag_from_btxd_path(btxd).as_deref(),
+            Some("v0.34.6-3013c2c2")
+        );
+        assert!(node_supports_autoupdate_flag(btxd));
+        assert!(node_supports_matmul_rc_flags(btxd));
+        assert!(node_allows_degraded_matmul_start(btxd));
+        // And the launch command that follows from those gates is the 0.34.5+
+        // one on both PC arms. A host with an NVIDIA driver validates in
+        // explicit consensus mode; a host without one is the keyless trusted
+        // mirror behind the single-key override (2026-09-15 decision). Neither
+        // is the bare 1-of-1 mirror that 0.34.5+ refuses at init.
+        let (_, cuda, _) = build_node_command(
+            btxd,
+            Path::new("/dd"),
+            Path::new("/dd/btx.conf"),
+            Backend::Cuda,
+        );
+        assert!(cuda.iter().any(|a| a == "-matmulrcexecution=strict-device"));
+        assert!(cuda.iter().any(|a| a == "-matmulvalidation=consensus"));
+        assert!(!cuda.iter().any(|a| a == "-matmultrustedthreshold=1"));
+        let (_, cpu, _) = build_node_command(
+            btxd,
+            Path::new("/dd"),
+            Path::new("/dd/btx.conf"),
+            Backend::Cpu,
+        );
+        assert!(cpu.iter().any(|a| a == "-matmulrcexecution=strict-device"));
+        assert!(cpu.iter().any(|a| a == "-matmulvalidation=trusted"));
+        assert!(cpu.iter().any(|a| a == "-allowsinglekeytrustedmirror=1"));
+        // A qualifier whose digits could be mistaken for a fourth segment is
+        // still a qualifier: `-3013c2c2` is not `.3013`.
+        assert_eq!(parse_tag_version("v0.34.6-3013c2c2").unwrap().len(), 3);
     }
 
     #[test]
@@ -3168,6 +7676,47 @@ consensus-validator service.";
             Backend::Cpu,
         );
         assert!(!args.iter().any(|a| a.starts_with("-matmulrcexecution")));
+    }
+
+    /// Both sides of the 0.34.12 line, on every backend. v0.34.12 refuses
+    /// `-parkdeepreorg=0` under its default `-reorgpolicy=bounded`, and
+    /// v0.34.9 refuses `-reorgpolicy` as an unknown argument (measured on both
+    /// binaries, regtest, 2026-09-30). So the flag goes to 0.34.12 and newer
+    /// only, and `-parkdeepreorg=0` stays on both sides.
+    #[test]
+    fn legacy_reorg_mode_goes_only_to_an_engine_that_has_it() {
+        let dd = Path::new("/dd");
+        let conf = Path::new("/dd/btx.conf");
+        for backend in [Backend::Metal, Backend::Cuda, Backend::Cpu] {
+            for tag in ["v0.34.12", "v0.34.12-5f32c4c4", "v0.34.13", "v0.35.0"] {
+                let btxd = PathBuf::from(format!("/x/btx/{tag}/plat/bin/btxd"));
+                let (_, args, _) = build_node_command(&btxd, dd, conf, backend);
+                assert!(
+                    args.iter().any(|a| a == "-reorgpolicy=legacy"),
+                    "{tag} {backend:?}: {args:?}"
+                );
+                assert!(
+                    args.iter().any(|a| a == "-parkdeepreorg=0"),
+                    "{tag} {backend:?}: {args:?}"
+                );
+            }
+            for btxd in [
+                "/x/btx/v0.34.9/plat/bin/btxd",
+                "/x/btx/v0.34.6-3013c2c2/plat/bin/btxd",
+                "/x/btx/v0.34.11/plat/bin/btxd",
+                "/data/bin/btxd",
+            ] {
+                let (_, args, _) = build_node_command(Path::new(btxd), dd, conf, backend);
+                assert!(
+                    !args.iter().any(|a| a.starts_with("-reorgpolicy")),
+                    "{btxd} {backend:?}: {args:?}"
+                );
+                assert!(
+                    args.iter().any(|a| a == "-parkdeepreorg=0"),
+                    "{btxd} {backend:?}: {args:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3223,32 +7772,451 @@ consensus-validator service.";
         );
     }
 
+    /// The manual peer set on the command line is exactly `manual_peers()`:
+    /// each peer once, at most MAX_MANUAL_PEERS of them, live chain first.
+    ///
+    /// This replaces an assertion that every entry of BTX_BOOTSTRAP_PEERS
+    /// reached the command line, which stopped being the contract when the cap
+    /// arrived. The engine grants eight manual slots (net.h:112) and works
+    /// through the list in order, so "all of them" was never something the
+    /// command line could deliver — it just meant the tail was dropped by btxd
+    /// instead of by us, silently, at the point where the live chain was what
+    /// got dropped.
     #[test]
-    fn command_includes_all_bootstrap_addnode_args() {
+    fn the_command_line_carries_one_capped_live_first_manual_set() {
         let (_, args, _) = build_node_command(
             &PathBuf::from("/data/bin/btxd"),
             &PathBuf::from("/data"),
             &PathBuf::from("/data/btx.conf"),
             Backend::Cuda,
         );
-        for peer in BTX_BOOTSTRAP_PEERS {
-            let expected = format!("-addnode={peer}");
+        let addnodes: Vec<&String> = args.iter().filter(|a| a.starts_with("-addnode=")).collect();
+
+        assert!(
+            addnodes.len() <= MAX_MANUAL_PEERS,
+            "more manual peers than the engine will dial: {addnodes:?}"
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        for arg in &addnodes {
             assert!(
-                args.contains(&expected),
-                "expected {expected} in args; got: {args:?}"
+                seen.insert((*arg).clone()),
+                "{arg} passed twice — the engine does not dedupe added nodes \
+                 (init.cpp:3468 + net.h:1323), so a repeat is a wasted slot"
             );
         }
-        // A tripwire, not a fact about the network: the count is pinned so that
-        // adding or dropping a seed cannot pass unnoticed. Every entry is
-        // something a fresh install dials on first start, so a change here
-        // deserves the moment it takes to update this number deliberately.
-        // 2026-09-05: 9 became 7 — one live-chain node in, three parked or
-        // dead-branch nodes out (see the list's comments and the incident file).
+
+        let expected: Vec<String> = manual_peers()
+            .iter()
+            .map(|p| format!("-addnode={p}"))
+            .collect();
+        let got: Vec<String> = addnodes.into_iter().cloned().collect();
+        assert_eq!(got, expected, "order is the fix; it must be preserved");
+
+        // The live-chain body sources lead, because the eight slots are spent
+        // in order and a body source below the eighth entry may not be dialled.
+        // Pinned to the head of BTX_BOOTSTRAP_PEERS rather than a literal, so
+        // retiring a seed does not silently stop this asserting anything —
+        // 2026-09-08 moved this head twice in one afternoon.
+        assert_eq!(
+            got.first().map(String::as_str),
+            Some(format!("-addnode={}", BTX_BOOTSTRAP_PEERS[0]).as_str()),
+            "the first manual peer must be the first shipped bootstrap seed"
+        );
+        // ...and that seed must be one a live node measured handshaking, which
+        // is a property of the LIST, not of this call: every entry that has
+        // failed that check is commented out above with its measurement.
+        // 2026-09-11: the head moved from 13.140.141.180 to LuckyPool's node.
+        // What justifies it: the settled 09-08 reading above, a full v0.34.6
+        // handshake as CONSENSUS + ATTESTATION_ARCHIVE with 743 KB received.
+        // What does NOT count against it: a 30 s probe from the Mac the same
+        // afternoon saw no version message, which is exactly the in-flight
+        // snapshot the list's own note says never disqualifies this peer.
+        // 2026-09-12: the head moved again, to 37.230.134.222. LuckyPool's
+        // node was dialled by btxscan's real node with `onetry` for 300 s and
+        // produced no peer, past the four minutes its own note allows. What
+        // justifies the new head: btxscan carries 37.230.134.222 as a manual
+        // peer every day, /BTX:0.34.6/, synced at the tip on 09-11 and 09-12,
+        // and it is one of the peers actually delivering attestations there.
+        // 2026-09-13: the head moved to 89.85.40.184. What justifies it: a
+        // full /BTX:0.34.6/ handshake at the tip on 09-11, 09-12 and 09-13
+        // from the Mac, a real btxd `onetry` from btxscan that connected in
+        // 20 s, and it is the one consenting seed the easybtx.com census has
+        // measured on the heaviest chain all week. 37.230.134.222 has refused
+        // every connection since 2026-09-12 23:31Z (btxd's own log).
+        // 2026-10-01: the head moved to 109.199.124.187. 89.85.40.184 and
+        // 194.93.48.158 refused three TCP dials each from the Mac at 17:18Z,
+        // and the easybtx.com census lists both as down. What justifies the
+        // new head: the same probe connected 3/3, and the census measures it
+        // at the tip on /BTX:0.34.12/ the same hour (seed d942).
+        assert!(
+            BTX_BOOTSTRAP_PEERS[0].starts_with("109.199.124.187:"),
+            "head is {} — if a seed was retired, move this with it and say \
+             what measurement justified the new head",
+            BTX_BOOTSTRAP_PEERS[0]
+        );
+    }
+
+    /// THE WATCHDOG'S ONE AUTOMATED RECOVERY MUST DIAL PEERS THAT CAN ANSWER.
+    ///
+    /// It redials this set over RPC when a node freezes. Until 2026-09-09 it
+    /// walked BTX_ARCHIVE_PEERS, three of whose four entries were
+    /// MATMUL_DISCOVERY relays: no NETWORK bit, no `getdata` answer, no way to
+    /// unstick anything. A recovery action that spends its dials on peers
+    /// structurally incapable of helping is worse than none, because it looks
+    /// like it tried.
+    #[test]
+    fn the_frozen_node_remediation_dials_only_peers_that_serve_blocks() {
+        let sources = block_source_peers();
+        assert!(!sources.is_empty());
+        for p in &sources {
+            assert!(
+                !BTX_DISCOVERY_PEERS.contains(p),
+                "{p} introduces peers and cannot serve a block; redialling it \
+                 cannot unfreeze a node"
+            );
+        }
+        // Every live-chain seed and every archive is in it: a frozen node is
+        // when to ask everyone who might answer, so this is NOT capped.
+        for p in BTX_BOOTSTRAP_PEERS.iter().chain(BTX_ARCHIVE_PEERS.iter()) {
+            assert!(sources.contains(p), "{p} missing from the redial set");
+        }
+        let unique: std::collections::HashSet<_> = sources.iter().collect();
+        assert_eq!(unique.len(), sources.len(), "duplicate dial in {sources:?}");
+    }
+
+    // ── Header bootstrap ─────────────────────────────────────────────────────
+
+    /// A fresh datadir's launch talks to the block sources alone, each with a
+    /// noban grant on the command line, and the same launch without the
+    /// marker is the ordinary one, byte for byte, apart from `-seednode`,
+    /// which the bootstrap launch drops rather than carries, since `-connect`
+    /// makes the engine ignore it.
+    ///
+    /// Measured 2026-09-23 on five fresh v0.34.9 datadirs: with one noban block
+    /// source and everyone else dialled, headers reached the tip in about 50 s
+    /// twice, and three times took 18 minutes or more, because peers without
+    /// the grant (a curated one among them) had each started a quadratic
+    /// low-work pre-sync on the message-handler thread. The overlay removes
+    /// both halves of that: nobody but the block sources is dialled, and every
+    /// one of them is noban, so none of their headers goes through it either.
+    #[test]
+    fn a_fresh_datadir_launches_on_the_block_sources_alone_until_the_marker_clears() {
+        let dir = std::env::temp_dir().join(format!(
+            "easybtx-hbootstrap-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp datadir");
+        let launch = |dir: &Path| {
+            build_node_command(
+                Path::new("/x/.local/btx/v0.34.9/macos-arm64/bin/btxd"),
+                dir,
+                &dir.join("btx.conf"),
+                Backend::Metal,
+            )
+            .1
+        };
+
+        // No marker: the ordinary launch, with none of the overlay in it.
+        assert!(
+            header_bootstrap_wanted(&dir),
+            "no blocks/ yet is a fresh datadir"
+        );
+        assert!(!header_bootstrap_pending(&dir));
+        let ordinary = launch(&dir);
+        for flag in ["-connect=", "-whitelist=", "-dnsseed=", "-listen="] {
+            assert!(
+                !ordinary.iter().any(|a| a.starts_with(flag)),
+                "{flag} on an ordinary launch: {ordinary:?}"
+            );
+        }
+
+        begin_header_bootstrap(&dir);
+        assert!(header_bootstrap_pending(&dir));
+        let bootstrap = launch(&dir);
+
+        // -connect to every block source, in the list's order, and nothing else.
+        let connects: Vec<&str> = bootstrap
+            .iter()
+            .filter_map(|a| a.strip_prefix("-connect="))
+            .collect();
+        assert_eq!(connects, block_source_peers(), "{bootstrap:?}");
+        // A noban grant for every one of them: a -connect peer WITHOUT one
+        // sends its headers through the pre-sync this exists to avoid.
+        for peer in block_source_peers() {
+            let ip = peer.rsplit_once(':').map(|(h, _)| h).unwrap_or(peer);
+            assert!(
+                bootstrap
+                    .iter()
+                    .any(|a| a == &format!("-whitelist=in,out,noban@{ip}")),
+                "{peer} is dialled without a noban grant: {bootstrap:?}"
+            );
+        }
+        // ...and for nothing else. The discovery relays serve no headers and
+        // the grant is a security grant; it goes where it is needed.
+        let grants = bootstrap
+            .iter()
+            .filter(|a| a.starts_with("-whitelist="))
+            .count();
+        assert_eq!(grants, block_source_peers().len(), "{bootstrap:?}");
+        assert!(bootstrap.iter().any(|a| a == "-dnsseed=0"));
+        assert!(bootstrap.iter().any(|a| a == "-listen=0"));
+
+        // -seednode is the one thing the bootstrap launch DROPS rather than
+        // adds: the ordinary launch dials the three discovery relays that
+        // way, and the bootstrap launch dials none of them, because -connect
+        // makes the engine ignore -seednode outright (init.cpp:3906).
+        assert!(
+            ordinary
+                .iter()
+                .filter_map(|a| a.strip_prefix("-seednode="))
+                .eq(BTX_DISCOVERY_PEERS.iter().copied()),
+            "{ordinary:?}"
+        );
+        assert!(
+            !bootstrap.iter().any(|a| a.starts_with("-seednode=")),
+            "{bootstrap:?}"
+        );
+
+        // Apart from that, the overlay only adds: everything else the
+        // ordinary launch says, the bootstrap launch says too, in the same
+        // order.
+        let overlay = header_bootstrap_args();
+        let ordinary_without_seednodes: Vec<&String> = ordinary
+            .iter()
+            .filter(|a| !a.starts_with("-seednode="))
+            .collect();
+        let without_overlay: Vec<&String> =
+            bootstrap.iter().filter(|a| !overlay.contains(*a)).collect();
+        assert_eq!(without_overlay, ordinary_without_seednodes);
+
+        // Cleared, the next launch is the ordinary one again, and the grants
+        // went with the command line they were on.
+        end_header_bootstrap(&dir);
+        assert!(!header_bootstrap_pending(&dir));
+        assert_eq!(launch(&dir), ordinary);
+        end_header_bootstrap(&dir); // idempotent
+
+        // A datadir that holds blocks is not fresh and never starts one.
+        std::fs::create_dir_all(dir.join("blocks")).expect("blocks dir");
+        assert!(!header_bootstrap_wanted(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The noban grant is written from the peer strings with no DNS, which is
+    /// what keeps `build_node_command` pure. A hostname block source would be
+    /// dialled by `-connect` WITHOUT a grant, and its headers would go through
+    /// the pre-sync. If one is ever added, resolve it the way
+    /// `resolve_managed_whitelist_ips` does before changing this test.
+    #[test]
+    fn every_block_source_is_a_literal_ip() {
+        for peer in block_source_peers() {
+            let host = peer.rsplit_once(':').map(|(h, _)| h).unwrap_or(peer);
+            assert!(
+                host.parse::<std::net::IpAddr>().is_ok(),
+                "{peer} is not a literal IP, so the bootstrap cannot grant it noban"
+            );
+        }
+    }
+
+    /// Movement keeps a bootstrap going, the anchor ends it, and five minutes
+    /// with no movement gives it up. Reaching the anchor wins over a stall: a
+    /// node whose headers passed the anchor is done, however long ago.
+    #[test]
+    fn the_header_bootstrap_ends_at_the_anchor_or_after_a_stall() {
+        use std::time::Duration;
+        let anchor = 219_000;
+        let just_under = HEADER_BOOTSTRAP_STALL - Duration::from_secs(1);
+        assert_eq!(
+            header_bootstrap_verdict(0, anchor, Duration::ZERO),
+            HeaderBootstrapVerdict::Continue
+        );
+        assert_eq!(
+            header_bootstrap_verdict(120_000, anchor, just_under),
+            HeaderBootstrapVerdict::Continue
+        );
+        assert_eq!(
+            header_bootstrap_verdict(0, anchor, HEADER_BOOTSTRAP_STALL),
+            HeaderBootstrapVerdict::Stalled
+        );
+        assert_eq!(
+            header_bootstrap_verdict(anchor - 1, anchor, HEADER_BOOTSTRAP_STALL),
+            HeaderBootstrapVerdict::Stalled
+        );
+        assert_eq!(
+            header_bootstrap_verdict(anchor, anchor, Duration::ZERO),
+            HeaderBootstrapVerdict::Reached
+        );
+        assert_eq!(
+            header_bootstrap_verdict(228_106, anchor, HEADER_BOOTSTRAP_STALL * 3),
+            HeaderBootstrapVerdict::Reached
+        );
+        // The stall window must outlast a working bootstrap by a wide margin:
+        // measured, headers go from 0 to the anchor in under a minute.
+        assert!(HEADER_BOOTSTRAP_STALL >= Duration::from_secs(120));
+    }
+
+    /// `EASYBTX_NODE_HEADER_BOOTSTRAP` turns the bootstrap off only on a
+    /// spelling of "off"; a typo leaves the fix on.
+    #[test]
+    fn the_header_bootstrap_switch_is_off_only_when_it_says_so() {
+        for off in ["0", "false", "OFF", " no ", "False"] {
+            assert!(header_bootstrap_switch_is_off(off), "{off:?}");
+        }
+        for on in ["1", "", "yes", "on", "true", "o"] {
+            assert!(!header_bootstrap_switch_is_off(on), "{on:?}");
+        }
+    }
+
+    /// `manual_peers` is where the cap and the dedupe live, so it is asserted
+    /// directly and not only through the command it feeds.
+    #[test]
+    fn manual_peers_is_deduplicated_and_capped() {
+        let peers = manual_peers();
+        assert!(peers.len() <= MAX_MANUAL_PEERS, "{peers:?}");
+        let unique: std::collections::HashSet<_> = peers.iter().collect();
+        assert_eq!(unique.len(), peers.len(), "duplicate in {peers:?}");
+        // Every entry comes from a list we ship; nothing is invented here.
+        for p in &peers {
+            assert!(
+                BTX_BOOTSTRAP_PEERS.contains(p) || BTX_ARCHIVE_PEERS.contains(p),
+                "{p} is in neither shipped list"
+            );
+        }
+        // Discovery relays are NOT manual peers. Measured on mainnet 30
+        // September 2026: dialled as manual peers, the three relays held a
+        // fresh mirror's block requests (one block in 3.5 minutes with them,
+        // 561 blocks in the following 5.5 minutes once they were removed):
+        // they advertise no NETWORK bit and cannot serve a block, but the
+        // engine hands a manual peer block requests anyway. They are dialled
+        // as seed nodes instead; see `build_node_command`.
+        for p in &peers {
+            assert!(
+                !BTX_DISCOVERY_PEERS.contains(p),
+                "{p} is a discovery relay and must not be a manual peer: {peers:?}"
+            );
+        }
+        // The archive list means what it says: everything in it must advertise
+        // the archive role. Asserted as a COUNT because the measurement that
+        // emptied it out is in the comments and a silent re-add should trip.
+        // 2026-09-24: 1 became 2. The reading for 20.86.181.203:19338, taken from
+        // a live v0.34.9 peer connection: services 0x82000d08,
+        // MATMUL_ATTESTATION_ARCHIVE among them, and it served `02d5efca`'s
+        // signatures for the tip, 227,400 and 227,313 on request.
+        // 2026-10-03: 2 became 1. 37.230.134.222 has refused since 2026-09-12
+        // 23:31Z and refused again 0/3 from the Mac at 23:35Z, and btx-sentinel
+        // would otherwise alarm on it every hour. Its noban grant stays.
+        // 2026-10-10: 1 became 2. 20.86.181.203:19335, btxscan's full node on
+        // the same box: services 0x82000d09 (NETWORK and
+        // MATMUL_ATTESTATION_ARCHIVE), served block 150,000 and `02d5efca`'s
+        // signatures for 244,652, 240,000 and 227,313.
+        assert_eq!(
+            BTX_ARCHIVE_PEERS,
+            &["20.86.181.203:19338", "20.86.181.203:19335"],
+            "btxscan's two nodes are the measured archives; adding one needs a \
+             reading, not a hostname"
+        );
+        assert!(
+            BTX_ARCHIVE_WHITELIST_IPS.contains(&"37.230.134.222"),
+            "a retired archive keeps its noban grant, as the retired seeds kept theirs"
+        );
+        // A tripwire, not a fact about the network: pinned so that adding or
+        // dropping a seed cannot pass unnoticed. 2026-09-05: 9 became 7 — one
+        // live-chain node in, three parked or dead-branch nodes out.
+        // 2026-09-07: 7 became 8 with LuckyPool's live body source at the head.
+        // 2026-09-07: 7 became 8 with LuckyPool's live body source at the head.
+        // 2026-09-08: 8 became 6 — two hosts measured 0/3 over three TCP
+        // attempts, and under the cap a dead seat is an evicted live one.
+        // LuckyPool stays: a settled reading showed it handshaked.
+        // 2026-09-11: 6 became 5 — the head, 13.140.141.180, refused three
+        // spaced TCP dials outright, and under the cap a dead FIRST seat is
+        // the one every fresh node pays for before it reaches a live peer.
+        // 2026-09-12: 5 became 4 — LuckyPool's node produced no peer for a
+        // real btxd `onetry` held 300 s, past the four minutes its own note
+        // allows, and the comparison dial to 89.85.40.184 took 20 s.
+        // 2026-09-13: 4 became 3 — 37.230.134.222 refused every connection
+        // from btxscan's real node since 09-12 23:31Z; it keeps its seat in
+        // BTX_ARCHIVE_PEERS and leaves the head.
+        // 2026-10-01: 3 became 1 — 89.85.40.184 and 194.93.48.158 refused
+        // three TCP dials each from the Mac and are down in the census.
+        // 2026-10-11: 1 became 2 — Jarek's full-history archive at
+        // 134.199.150.193, measured serving blocks 1,000 and 150,000.
         assert_eq!(
             BTX_BOOTSTRAP_PEERS.len(),
-            7,
-            "BTX_BOOTSTRAP_PEERS should have 7 entries"
+            2,
+            "BTX_BOOTSTRAP_PEERS should have 2 entries"
         );
+    }
+
+    /// Discovery relays are dialled with `-seednode=`, never `-addnode=`: they
+    /// cannot serve a block and the engine never disconnects a manual peer for
+    /// slow delivery. Measured on mainnet 30 September 2026 (see
+    /// `BTX_DISCOVERY_PEERS`): one block in 3.5 minutes with them as manual
+    /// peers, 561 blocks in the following 5.5 minutes without them.
+    ///
+    /// `-seednode` is skipped on the header-bootstrap launch: the engine
+    /// ignores it whenever `-connect` is present (init.cpp:3906), which that
+    /// launch always adds, so passing it there would be a config line with no
+    /// effect and a false impression that the relays are reachable during
+    /// bootstrap.
+    #[test]
+    fn discovery_relays_are_seednodes_not_manual_peers() {
+        let dir = std::env::temp_dir().join(format!(
+            "easybtx-seednode-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp datadir");
+        let btxd = Path::new("/x/.local/btx/v0.34.9/macos-arm64/bin/btxd");
+        let conf = dir.join("btx.conf");
+
+        // An ordinary launch: a datadir that already has blocks, so no header
+        // bootstrap is wanted or pending.
+        std::fs::create_dir_all(dir.join("blocks")).expect("blocks dir");
+        assert!(!header_bootstrap_wanted(&dir));
+        assert!(!header_bootstrap_pending(&dir));
+        let (_, ordinary, _) = build_node_command(btxd, &dir, &conf, Backend::Metal);
+
+        let seednodes: Vec<&str> = ordinary
+            .iter()
+            .filter_map(|a| a.strip_prefix("-seednode="))
+            .collect();
+        assert_eq!(
+            seednodes,
+            BTX_DISCOVERY_PEERS.to_vec(),
+            "the three relays, in order: {ordinary:?}"
+        );
+        for relay in BTX_DISCOVERY_PEERS {
+            assert!(
+                !ordinary.iter().any(|a| a == &format!("-addnode={relay}")),
+                "{relay} dialled as a manual peer on the ordinary launch: {ordinary:?}"
+            );
+        }
+
+        // The header-bootstrap launch: neither -seednode nor -addnode for a
+        // relay, because -connect makes the engine ignore -seednode outright.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp datadir");
+        begin_header_bootstrap(&dir);
+        assert!(header_bootstrap_pending(&dir));
+        let (_, bootstrap, _) = build_node_command(btxd, &dir, &conf, Backend::Metal);
+
+        assert!(
+            !bootstrap.iter().any(|a| a.starts_with("-seednode=")),
+            "-seednode on the bootstrap launch: the engine ignores it under -connect: {bootstrap:?}"
+        );
+        for relay in BTX_DISCOVERY_PEERS {
+            assert!(
+                !bootstrap.iter().any(|a| a == &format!("-addnode={relay}")),
+                "{relay} dialled as a manual peer on the bootstrap launch: {bootstrap:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The 2026-08-31 starvation fix in one assertion: v2 transport must be ON.
@@ -3270,7 +8238,7 @@ consensus-validator service.";
     /// union never duplicates an address.
     #[test]
     fn archive_whitelist_resolution_keeps_the_pins_and_dedupes() {
-        let ips = resolve_archive_whitelist_ips();
+        let ips = resolve_managed_whitelist_ips();
         for pin in BTX_ARCHIVE_WHITELIST_IPS {
             assert!(ips.iter().any(|i| i == pin), "pinned {pin} must survive");
         }
@@ -3468,7 +8436,15 @@ matmul: metal runtime_probe_ok, selecting metal\n\
             "/Users/me/.easybtx/install/btx-0.30.1/bin/btxd"
         ));
         assert!(comm_looks_like_btxd("  btxd  ")); // surrounding whitespace tolerated
-                                                   // An unrelated process that reused the pid must NOT be force-killed.
+                                                   // The upstream 0.34.1+ wrapper layout: `bin/btxd` is a sh wrapper and
+                                                   // the process that actually runs is `libexec/btxd.real`. Verbatim from
+                                                   // the process table on 2026-09-06 while the 0.6.17 -> 0.6.19 mac
+                                                   // upgrade was failing.
+        assert!(comm_looks_like_btxd("btxd.real"));
+        assert!(comm_looks_like_btxd(
+            "/Users/bonuz/.local/btx/v0.34.5/macos-arm64/bin/../libexec/btxd.real"
+        ));
+        // An unrelated process that reused the pid must NOT be force-killed.
         assert!(!comm_looks_like_btxd("Safari"));
         assert!(!comm_looks_like_btxd("/sbin/launchd"));
         assert!(!comm_looks_like_btxd(""));
@@ -3477,6 +8453,40 @@ matmul: metal runtime_probe_ok, selecting metal\n\
         assert!(!comm_looks_like_btxd("btxd-wrapper"));
         assert!(!comm_looks_like_btxd("run-btxd-tests.sh"));
         assert!(!comm_looks_like_btxd("/Users/dev/scripts/stop-btxd.sh"));
+        // Widening to `btxd.real` must not widen to anything else: this gates a
+        // SIGKILL and the two accepted names are exact, not prefixes.
+        assert!(!comm_looks_like_btxd("btxd.real.bak"));
+        assert!(!comm_looks_like_btxd("btxd.realtime"));
+        assert!(!comm_looks_like_btxd("notbtxd.real"));
+        assert!(!comm_looks_like_btxd("btxd.old"));
+    }
+
+    /// THE 2026-09-06 UPGRADE REGRESSION, as the holder table sees it.
+    ///
+    /// A live `btxd.real` from an upstream-tarball engine IS this datadir's
+    /// holder. Reading it as `Free` is what let the app delete the pidfile,
+    /// leave the old engine holding the lock, and then fail to launch the new
+    /// one three times over.
+    #[test]
+    fn the_upstream_wrapper_process_is_a_holder_not_a_recycled_pid() {
+        assert_eq!(
+            classify_datadir_holder(
+                Some(86244),
+                true,
+                Some("/Users/bonuz/.local/btx/v0.34.5/macos-arm64/bin/../libexec/btxd.real"),
+                false,
+                Some(86235),
+                true,
+            ),
+            DatadirHolder::ManagedBtxd { pid: 86244 }
+        );
+        // And once the app that spawned it is gone, the same process is an
+        // orphan we own and must stop — which is exactly the state the failing
+        // upgrade left behind, reparented to init.
+        assert_eq!(
+            classify_datadir_holder(Some(86244), true, Some("btxd.real"), false, Some(1), true),
+            DatadirHolder::OrphanedBtxd { pid: 86244 }
+        );
     }
 
     // ── node_is_ours ownership decision ─────────────────────────────────────
@@ -3506,5 +8516,1052 @@ matmul: metal runtime_probe_ok, selecting metal\n\
     fn node_not_ours_when_pidfile_unreadable() {
         // Pidfile exists but had no numeric pid → treat as foreign.
         assert!(!node_is_ours(true, None, false));
+    }
+
+    #[test]
+    fn debug_log_tail_reads_only_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("debug.log"), "old line\nnew line\n").unwrap();
+        assert_eq!(debug_log_tail(dir.path(), 9), "new line\n");
+        assert_eq!(debug_log_tail(&dir.path().join("missing"), 100), "");
+    }
+
+    #[test]
+    fn published_peers_are_the_ones_the_app_ships() {
+        let hosts = published_peer_hosts();
+        assert!(
+            hosts.contains(&"20.86.181.203".to_string()),
+            "btxscan's mirror"
+        );
+        assert!(
+            hosts.contains(&"109.199.124.187".to_string()),
+            "an archive peer"
+        );
+        assert!(hosts.contains(&"node.btx.dev".to_string()));
+        assert!(hosts.iter().all(|h| !h.contains(':')), "no ports");
+    }
+
+    // ── Confirmed snapshots: the pin rule, the mirror launch, pins only grow ──
+
+    fn signed_snapshot_datadir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("easynode-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("chainstate_snapshot")).unwrap();
+        dir
+    }
+
+    fn pin_args(args: &[String]) -> Vec<String> {
+        args.iter()
+            .filter(|a| {
+                a.starts_with("-matmultrustedpubkey=") || a.starts_with("-matmultrustedthreshold=")
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Section 8: while the engine's attested record exists, a validating
+    /// node pins every mirror key and threshold 1, in consensus mode still.
+    /// Without the record it pins nothing it did not pin before.
+    #[test]
+    fn a_validating_node_on_a_signed_snapshot_pins_the_mirrors_keys() {
+        let dir = signed_snapshot_datadir("pin-rule");
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        let btxd = Path::new("/x/btx/v0.34.9/lin/btxd");
+
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Cuda);
+        assert!(pin_args(&args).is_empty(), "no record, no pins: {args:?}");
+
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        let mut want: Vec<String> = BTX_TRUSTED_ATTESTATION_PUBKEYS
+            .iter()
+            .map(|k| format!("-matmultrustedpubkey={k}"))
+            .collect();
+        want.push("-matmultrustedthreshold=1".into());
+        for backend in [Backend::Cuda, Backend::Metal] {
+            let (_, args, _) = build_node_command(btxd, &dir, &conf, backend);
+            assert_eq!(pin_args(&args), want, "{backend:?}: {args:?}");
+            assert!(!validation_modes(&args).contains(&"trusted"), "{args:?}");
+        }
+        // The engine retires the snapshot, the record goes, and so do the pins.
+        std::fs::remove_file(attested_snapshot_record(&dir)).unwrap();
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Cuda);
+        assert!(pin_args(&args).is_empty(), "{args:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The engine refuses a duplicate pin: a key the conf pins, or the
+    /// node's own, is never passed twice.
+    #[test]
+    fn the_pin_rule_never_repeats_a_pin() {
+        let dir = signed_snapshot_datadir("pin-dupes");
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        let wif = crate::signer::generate_wif();
+        let own = crate::signer::wif_to_pubkey_hex(&wif).unwrap();
+        std::fs::write(dir.join(crate::signer::SIGNER_KEY_FILE), format!("{wif}\n")).unwrap();
+        let the_3060 = BTX_TRUSTED_ATTESTATION_PUBKEYS[3];
+        let conf = dir.join("signing.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "server=1\nmatmulattestationsignerkeyfile=attestation-signer.key\n\
+                 matmultrustedpubkey={}\n",
+                the_3060.to_ascii_uppercase()
+            ),
+        )
+        .unwrap();
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.9/lin/btxd"),
+            &dir,
+            &conf,
+            Backend::Cuda,
+        );
+        let pins: Vec<&String> = args
+            .iter()
+            .filter(|a| a.starts_with("-matmultrustedpubkey="))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        for p in &pins {
+            assert!(
+                seen.insert(p.to_ascii_lowercase()),
+                "pinned twice: {args:?}"
+            );
+        }
+        assert!(
+            pins.iter().any(|p| p.ends_with(&own)),
+            "its own key: {args:?}"
+        );
+        assert!(
+            !pins.iter().any(|p| p.ends_with(the_3060)),
+            "the conf already pins the 3060: {args:?}"
+        );
+        assert_eq!(pins.len(), 1 + BTX_TRUSTED_ATTESTATION_PUBKEYS.len() - 1);
+        // The pure rule, case-blind.
+        let got = validating_snapshot_pin_args(&dir, &[the_3060], &[the_3060.to_ascii_uppercase()]);
+        assert_eq!(got, vec!["-matmultrustedthreshold=1".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mirror_arm_is_the_same_on_a_signed_snapshot() {
+        let dir = signed_snapshot_datadir("pin-mirror");
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        let btxd = Path::new("/x/btx/v0.34.9/lin/btxd");
+        let (_, before, _) = build_node_command(btxd, &dir, &conf, Backend::Cpu);
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        let (_, after, _) = build_node_command(btxd, &dir, &conf, Backend::Cpu);
+        assert_eq!(before, after);
+        assert_eq!(validation_modes(&after), vec!["trusted"]);
+        assert_eq!(
+            after
+                .iter()
+                .filter(|a| a.starts_with("-matmultrustedthreshold="))
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mirror-era app left a single signer pin in `btx_rw.conf` on much
+    /// of the fleet (`disk::remove_node_data` keeps that file). btxd loads it
+    /// on every start regardless of `-conf` and MERGES its list settings with
+    /// the command line, so a key already there must count as "already
+    /// pinned" or the engine refuses at init with "Duplicate
+    /// -matmultrustedpubkey" (`init.cpp:1591-1597`, `common/settings.cpp
+    /// GetSettingsList`, measured at `84b998b4`).
+    #[test]
+    fn a_key_btx_rw_conf_already_pins_is_not_repeated() {
+        let dir = signed_snapshot_datadir("pin-rw-conf");
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        let leftover = BTX_TRUSTED_ATTESTATION_PUBKEYS[0];
+        std::fs::write(
+            dir.join("btx_rw.conf"),
+            format!("matmultrustedpubkey={leftover}\n"),
+        )
+        .unwrap();
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.9/lin/btxd"),
+            &dir,
+            &conf,
+            Backend::Cuda,
+        );
+        // btxd merges btx_rw.conf's list settings with the command line, so a
+        // key btx_rw.conf already pins must never also be pushed here: doing
+        // so would refuse the engine at init on "Duplicate
+        // -matmultrustedpubkey", not add a redundant pin. The command line
+        // itself never repeats a flag either way, so the check that matters
+        // is absence, not a count of 1.
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == &format!("-matmultrustedpubkey={leftover}")),
+            "leftover already pinned by btx_rw.conf, pushed again: {args:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `conf_pins` reads the way the engine's own conf parser does
+    /// (`common/config.cpp` ~42-60 at `84b998b4`): cut at `#`, split at the
+    /// first `=`, trim both halves, and accept both the bare name and the
+    /// `main.` section prefix.
+    #[test]
+    fn conf_pins_reads_the_engines_syntax_spaces_comments_and_the_main_prefix() {
+        let dir = signed_snapshot_datadir("conf-pins-syntax");
+        let key1 = BTX_TRUSTED_ATTESTATION_PUBKEYS[1];
+        let key2 = BTX_TRUSTED_ATTESTATION_PUBKEYS[2];
+        let conf = dir.join("test.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey = {} # a trailing note\nmain.matmultrustedpubkey={}\n",
+                key1.to_ascii_uppercase(),
+                key2
+            ),
+        )
+        .unwrap();
+        let pins = conf_pins(&conf);
+        assert!(pins.contains(&key1.to_string()), "{pins:?}");
+        assert!(pins.contains(&key2.to_string()), "{pins:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Final review M7: `conf_pins` reads sections the way the engine does
+    /// for mainnet (`common/config.cpp` `GetConfigOptions`, then
+    /// `InterpretKey`, at 84b998b4): the default section, `[main]`, and the
+    /// `main.` prefix count; a pin under `[test]` or with the `test.` prefix,
+    /// a commented line and a longer name ending in the option's do not. In
+    /// `btx_rw.conf` the engine drops the section (`config.cpp` ~111,
+    /// `settings_target`), so every section counts there, and a `test.`
+    /// line applies on mainnet. `conf_pins`'s two survivors come back
+    /// `[main]`'s pins first, then the default section's, the engine's own
+    /// merge order (`GetSettingsList`, `settings.cpp:216-259`), not file
+    /// order.
+    #[test]
+    fn conf_pins_counts_only_what_mainnet_reads_and_btx_rw_conf_drops_sections() {
+        let dir = signed_snapshot_datadir("conf-pins-sections");
+        let k = |n: u8| format!("02{}", format!("{n:02x}").repeat(32));
+        let conf = dir.join("sections.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\n\
+                 #matmultrustedpubkey={}\n\
+                 test.matmultrustedpubkey={}\n\
+                 extramatmultrustedpubkey={}\n\
+                 main.matmultrustedpubkey={}\n\
+                 [test]\n\
+                 matmultrustedpubkey={}\n\
+                 [regtest]\n\
+                 matmultrustedpubkey={}\n\
+                 [main]\n\
+                 matmultrustedpubkey={}\n\
+                 main.matmultrustedpubkey={}\n",
+                k(1),
+                k(2),
+                k(3),
+                k(4),
+                k(5),
+                k(6),
+                k(7),
+                k(8),
+                k(9)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            conf_pins(&conf),
+            vec![k(5), k(8), k(1)],
+            "[main]'s pins (k5, k8) come before the default section's (k1), engine order"
+        );
+        assert_eq!(
+            rw_conf_pins(&conf),
+            vec![k(1), k(3), k(5), k(6), k(7), k(8)],
+            "btx_rw.conf: the section is dropped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The engine reads `nomatmultrustedpubkey=1` (and, on the command
+    /// line only, a bare `-nomatmultrustedpubkey`) as clearing the pins
+    /// read so far at that point (`InterpretValue`, `common/args.cpp:113-
+    /// 128` at `84b998b4`, called for every conf line by
+    /// `ReadConfigStream`, `common/config.cpp:98-106`). `nomatmultrustedpubkey=0`
+    /// is the documented double negative and does NOT clear
+    /// (`InterpretValue`'s `value && !InterpretBool(*value)` arm) - though
+    /// it is not harmless: `conf_pins` runs, here as it does while building
+    /// launch arguments (~1225, ~1287), before the app ever starts the
+    /// engine on this conf, and the engine reads that same line as a bogus
+    /// `"1"` pin value (`GetArgs`, `common/args.cpp:369-375`) and refuses to
+    /// start ("Invalid compressed public key in -matmultrustedpubkey: 1",
+    /// `init.cpp:1577-1583`) once the app does launch it. A negation
+    /// under `[test]` or `test.` does not touch mainnet's list, same as a
+    /// pin there is not read; one under `[main]` or `main.` does, same as
+    /// the section tests above (also see
+    /// `pins_read_keeps_the_conf_files_two_sections_separate` for how a
+    /// `[main]`/default-section pair actually merges).
+    #[test]
+    fn a_no_line_clears_the_pins_read_so_far_in_that_file() {
+        let dir = signed_snapshot_datadir("conf-pins-negation");
+        let k = |n: u8| format!("02{}", format!("{n:02x}").repeat(32));
+        let conf = dir.join("negation.conf");
+
+        // A pin, then nomatmultrustedpubkey=1, then another pin: only the
+        // last pin survives.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\nnomatmultrustedpubkey=1\nmatmultrustedpubkey={}\n",
+                k(1),
+                k(2)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(2)]);
+
+        // nomatmultrustedpubkey=0 is the double negative: it does not
+        // clear (the engine would still refuse to start on this conf; see
+        // the doc comment above).
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\nnomatmultrustedpubkey=0\nmatmultrustedpubkey={}\n",
+                k(1),
+                k(2)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(1), k(2)]);
+
+        // A bare no-value line is also a clear, same as =1.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\nnomatmultrustedpubkey=\nmatmultrustedpubkey={}\n",
+                k(3),
+                k(4)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(4)]);
+
+        // Inside [main]: a pin, a clear, another pin, same rule.
+        std::fs::write(
+            &conf,
+            format!(
+                "[main]\nmatmultrustedpubkey={}\nnomatmultrustedpubkey=1\nmatmultrustedpubkey={}\n",
+                k(5),
+                k(6)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(6)]);
+
+        // A clear under [test] does not touch mainnet's list.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\n[test]\nnomatmultrustedpubkey=1\nmatmultrustedpubkey={}\n",
+                k(7),
+                k(8)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(7)], "the [test] clear stays there");
+
+        // btx_rw.conf drops sections, so a clear there is read wherever it sits.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\n[test]\nnomatmultrustedpubkey=1\nmatmultrustedpubkey={}\n",
+                k(9),
+                k(1)
+            ),
+        )
+        .unwrap();
+        assert_eq!(rw_conf_pins(&conf), vec![k(1)]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The engine keeps a conf file's `[main]`/`main.` pins and its default
+    /// section's pins as two separate lists (`common/config.cpp:113`,
+    /// `m_settings.ro_config[key.section][key.name].push_back(...)`, at
+    /// `84b998b4`): a negation clears only its own section's list
+    /// (`SettingsSpan::negated`, `common/settings.cpp:281-287`), and
+    /// `GetSettingsList` (`common/settings.cpp:216-259`) merges `[main]`'s
+    /// list before the default section's, so `pins_read` always returns
+    /// `[main]`'s pins first, then the default section's. See
+    /// `pins_read`'s own doc comment for why it does NOT also apply the
+    /// engine's further rule that drops the default section's pins when
+    /// `[main]`'s own list ends in a negation: that rule needs to know
+    /// whether the command line and `btx_rw.conf` already contributed
+    /// something, which this function, reading one conf file alone,
+    /// cannot.
+    #[test]
+    fn pins_read_keeps_the_conf_files_two_sections_separate() {
+        let dir = signed_snapshot_datadir("conf-pins-sections-separate");
+        let k = |n: u8| format!("02{}", format!("{n:02x}").repeat(32));
+        let conf = dir.join("sections-separate.conf");
+
+        // Scenario A: a default pin, then [main] clears and re-pins. The
+        // default pin is not cleared by [main]'s own negation: it comes
+        // back after [main]'s surviving pin, engine order.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\n[main]\nnomatmultrustedpubkey=1\nmatmultrustedpubkey={}\n",
+                k(1),
+                k(2)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            conf_pins(&conf),
+            vec![k(2), k(1)],
+            "K2 then K1, engine order"
+        );
+
+        // Scenario B: a main.-prefixed pin (still the [main] section, no
+        // header needed), then the DEFAULT section's own negation. The
+        // default section's negation cannot reach [main]'s span: it only
+        // clears its own (empty) list.
+        std::fs::write(
+            &conf,
+            format!(
+                "main.matmultrustedpubkey={}\nnomatmultrustedpubkey=1\n",
+                k(3)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(3)]);
+
+        // The main. prefix form of Scenario A, no [main] header at all:
+        // same rule, same result.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\nmain.nomatmultrustedpubkey=1\nmain.matmultrustedpubkey={}\n",
+                k(4),
+                k(5)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            conf_pins(&conf),
+            vec![k(5), k(4)],
+            "K5 then K4, engine order"
+        );
+
+        // [main]'s own list ending in a negation: the engine only drops
+        // the default section's pins here when `result` (which already
+        // holds anything from the command line and btx_rw.conf, merged
+        // before either conf-file section) is STILL empty at that point
+        // (`GetSettingsList`'s `prev_negated_empty |= span.last_negated()
+        // && result.empty()`, `settings.cpp:216-259`). This function reads
+        // one conf file in isolation and cannot know that, so it always
+        // keeps the default section's pin: K6 survives.
+        std::fs::write(
+            &conf,
+            format!(
+                "matmultrustedpubkey={}\n[main]\nmatmultrustedpubkey={}\nnomatmultrustedpubkey=1\n",
+                k(6),
+                k(7)
+            ),
+        )
+        .unwrap();
+        assert_eq!(conf_pins(&conf), vec![k(6)]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `LocaleIndependentAtoi<int>` (`util/strencodings.h:119-144` at
+    /// `84b998b4`) saturates an out-of-range number to `i32::MAX` rather
+    /// than failing, so it is never zero: `interpret_bool` must read it as
+    /// true, not fall back to 0 on the overflow the way a plain
+    /// `str::parse` would.
+    #[test]
+    fn interpret_bool_reads_an_overflowing_number_as_true_not_zero() {
+        assert!(interpret_bool("99999999999999999999"));
+        assert!(interpret_bool("1"));
+        assert!(!interpret_bool("0"));
+        assert!(!interpret_bool("00000"));
+        assert!(interpret_bool(""));
+        assert!(!interpret_bool("abc"));
+        assert!(interpret_bool("+5"));
+        assert!(!interpret_bool("+-5"), "the engine's own +- special case");
+    }
+
+    /// Final review M7, the scenario: a hand-edited conf that pins the
+    /// 3060's key only under `[test]` does not pin it on mainnet, so the
+    /// mirror arm still passes it (the stored manifest on 225,927 carries
+    /// only that signature); in `btx_rw.conf` the same line pins it.
+    #[test]
+    fn a_pin_under_another_network_is_still_passed_on_mainnet() {
+        let dir = signed_snapshot_datadir("conf-pin-under-test");
+        let the_3060 = BTX_TRUSTED_ATTESTATION_PUBKEYS[3];
+        let conf = dir.join("sections.conf");
+        std::fs::write(
+            &conf,
+            format!("server=1\n[test]\nmatmultrustedpubkey={the_3060}\n"),
+        )
+        .unwrap();
+        let btxd = Path::new("/x/btx/v0.34.9/lin/btxd");
+        let pinned = |args: &[String]| {
+            args.iter()
+                .filter(|a| **a == format!("-matmultrustedpubkey={the_3060}"))
+                .count()
+        };
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Cpu);
+        assert_eq!(validation_modes(&args), vec!["trusted"], "{args:?}");
+        assert_eq!(pinned(&args), 1, "{args:?}");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        std::fs::write(
+            dir.join("btx_rw.conf"),
+            format!("[test]\nmatmultrustedpubkey={the_3060}\n"),
+        )
+        .unwrap();
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Cpu);
+        assert_eq!(pinned(&args), 0, "btx_rw.conf already pins it: {args:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A validating node whose own key happens to be one of the mirrors'
+    /// keys (the 3060's node) must not pin it a second time.
+    ///
+    /// `signing_key_self_pin` needs a real private key on disk, and there is
+    /// no private key on hand for any of `BTX_TRUSTED_ATTESTATION_PUBKEYS`
+    /// (the 3060's is Mende's own, off this machine), so this exercises the
+    /// pure rule directly: `already` holding the node's own key is exactly
+    /// what `signing_key_self_pin` would contribute were it that key.
+    #[test]
+    fn a_signer_whose_own_key_is_a_trusted_pubkey_is_not_pinned_twice() {
+        let dir = signed_snapshot_datadir("pin-self-is-trusted");
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        let the_3060 = BTX_TRUSTED_ATTESTATION_PUBKEYS[3];
+        let got = validating_snapshot_pin_args(
+            &dir,
+            &BTX_TRUSTED_ATTESTATION_PUBKEYS,
+            &[the_3060.to_string()],
+        );
+        let pins: Vec<&String> = got
+            .iter()
+            .filter(|a| a.starts_with("-matmultrustedpubkey="))
+            .collect();
+        assert_eq!(
+            pins.len(),
+            BTX_TRUSTED_ATTESTATION_PUBKEYS.len() - 1,
+            "{got:?}"
+        );
+        assert!(!pins.iter().any(|p| p.ends_with(the_3060)), "{got:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 0.7.5: the three zbtx signer keys (owner decision, threshold 1) ──
+
+    /// The zbtx operator's three keys, in the order node.rs pins them.
+    const ZBTX_KEYS: [&str; 3] = [
+        "026da4e3a07676cada5488123033fb1057faeb7fe6a7d50b2ae3921431e0f4bbf1",
+        "03047189023913e1922c80c895ee2a9e2eff6df05438654749e1a4f95019578a24",
+        "02c9cfb77d7e4dce0cd6b7968fee1dd53d31ef06c764185e120c825fab8c0572a0",
+    ];
+
+    /// How many times each shipped key appears as a `-matmultrustedpubkey=`
+    /// argument, case-blind.
+    fn pin_count(args: &[String], key: &str) -> usize {
+        args.iter()
+            .filter(|a| {
+                a.strip_prefix("-matmultrustedpubkey=")
+                    .is_some_and(|v| v.eq_ignore_ascii_case(key))
+            })
+            .count()
+    }
+
+    /// 0.7.5 pins the zbtx operator's three keys after the four already
+    /// shipped, and nothing else. Literals, for the same reason as the
+    /// upstream-key test: the failure being guarded against is a list that
+    /// quietly differs from the decision. `037db271` and `03bc9ac2` sign on
+    /// mainnet but nobody recorded who runs them, and jpp's `02e0a965` runs
+    /// on a rented machine, so it belongs in an M=2 set only
+    /// (docs/earned-trust.md). None of them is a pin at M=1.
+    #[test]
+    fn the_pin_carries_the_three_zbtx_keys_and_none_of_the_unrecorded_ones() {
+        assert_eq!(BTX_TRUSTED_ATTESTATION_PUBKEYS.len(), 7);
+        // The four shipped before 0.7.5 keep their places: never reordered.
+        assert_eq!(
+            BTX_TRUSTED_ATTESTATION_PUBKEYS[..4],
+            [
+                "03d90c148db37da28ce47ce15bade88a177728d663da4bc9ba765943b7d4e4f0aa",
+                "0224e80df33697385b54b3c69bae1f097f533c0c43e93c29f73ee97319d4a5e04c",
+                "028995b25c887ee03eb53a41312d33c8eccf48f261ecf9e91fe2b1e8e50373258a",
+                "02d5efca78b53c89e7e1672feda8a9b70937bba40b001413495e86e05f196c4675",
+            ]
+        );
+        assert_eq!(BTX_TRUSTED_ATTESTATION_PUBKEYS[4..], ZBTX_KEYS);
+        for k in BTX_TRUSTED_ATTESTATION_PUBKEYS {
+            assert!(
+                crate::operators::parse_key(k).is_some(),
+                "a valid compressed secp256k1 point: {k}"
+            );
+            assert_eq!(k, k.to_ascii_lowercase(), "lowercase: {k}");
+        }
+        let distinct: std::collections::HashSet<String> = BTX_TRUSTED_ATTESTATION_PUBKEYS
+            .iter()
+            .map(|k| k.to_ascii_lowercase())
+            .collect();
+        assert_eq!(distinct.len(), 7, "every pin distinct");
+        for prefix in ["037db271", "03bc9ac2", "02e0a965"] {
+            assert!(
+                !BTX_TRUSTED_ATTESTATION_PUBKEYS
+                    .iter()
+                    .any(|k| k.starts_with(prefix)),
+                "{prefix} must not be pinned at M=1"
+            );
+        }
+        assert_eq!(
+            BTX_TRUSTED_ATTESTATION_THRESHOLD, 1,
+            "the threshold stays 1"
+        );
+    }
+
+    /// A mirror pushes every one of the seven keys, each exactly once, and
+    /// one threshold of 1.
+    #[test]
+    fn a_mirror_launch_pins_all_seven_keys_exactly_once() {
+        let dir = signed_snapshot_datadir("zbtx-mirror");
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        let (_, args, _) = build_node_command(
+            Path::new("/x/btx/v0.34.12/lin/btxd"),
+            &dir,
+            &conf,
+            Backend::Cpu,
+        );
+        assert_eq!(validation_modes(&args), vec!["trusted"], "{args:?}");
+        for k in BTX_TRUSTED_ATTESTATION_PUBKEYS {
+            assert_eq!(pin_count(&args, k), 1, "{k}: {args:?}");
+        }
+        assert_eq!(
+            args.iter()
+                .filter(|a| a.starts_with("-matmultrustedpubkey="))
+                .count(),
+            7,
+            "{args:?}"
+        );
+        assert_eq!(
+            args.iter()
+                .filter(|a| *a == "-matmultrustedthreshold=1")
+                .count(),
+            1,
+            "{args:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node that already pins a zbtx key by hand, in `btx_rw.conf` or in
+    /// its conf, is not given that key again on the command line: the engine
+    /// refuses "Duplicate -matmultrustedpubkey" at init. Every other key
+    /// still goes on once. Both arms: the mirror, and a validating node on a
+    /// signed snapshot.
+    #[test]
+    fn a_zbtx_key_already_pinned_by_hand_is_not_pushed_again() {
+        let dir = signed_snapshot_datadir("zbtx-dupes");
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        let conf = dir.join("hand.conf");
+        // Upper case in the conf, as a hand edit might write it.
+        std::fs::write(
+            &conf,
+            format!(
+                "server=1\nmatmultrustedpubkey={}\n",
+                ZBTX_KEYS[1].to_ascii_uppercase()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("btx_rw.conf"),
+            format!("matmultrustedpubkey={}\n", ZBTX_KEYS[0]),
+        )
+        .unwrap();
+        let btxd = Path::new("/x/btx/v0.34.12/lin/btxd");
+        for backend in [Backend::Cpu, Backend::Cuda, Backend::Metal] {
+            let (_, args, _) = build_node_command(btxd, &dir, &conf, backend);
+            assert_eq!(pin_count(&args, ZBTX_KEYS[0]), 0, "{backend:?}: {args:?}");
+            assert_eq!(pin_count(&args, ZBTX_KEYS[1]), 0, "{backend:?}: {args:?}");
+            for k in BTX_TRUSTED_ATTESTATION_PUBKEYS
+                .iter()
+                .filter(|k| !ZBTX_KEYS[..2].contains(k))
+            {
+                assert_eq!(pin_count(&args, k), 1, "{backend:?} {k}: {args:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A signer whose own key is one of the zbtx keys (the zbtx operator's
+    /// own machine running easyNode) pins that key once: the self-pin, and
+    /// the signed-snapshot pins skip it.
+    ///
+    /// There is no private key on hand for any zbtx key, so, as in
+    /// `a_signer_whose_own_key_is_a_trusted_pubkey_is_not_pinned_twice`,
+    /// this builds the validating arm's two contributions the way
+    /// `build_node_command` does: `signing_key_self_pin`'s key, then
+    /// `validating_snapshot_pin_args` with that key in `already`.
+    #[test]
+    fn a_signer_whose_own_key_is_a_zbtx_key_pins_it_once() {
+        let dir = signed_snapshot_datadir("zbtx-self");
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        for own in ZBTX_KEYS {
+            let mut args = vec![format!("-matmultrustedpubkey={own}")];
+            args.extend(validating_snapshot_pin_args(
+                &dir,
+                &BTX_TRUSTED_ATTESTATION_PUBKEYS,
+                &[own.to_string()],
+            ));
+            for k in BTX_TRUSTED_ATTESTATION_PUBKEYS {
+                assert_eq!(pin_count(&args, k), 1, "own {own}, {k}: {args:?}");
+            }
+            assert_eq!(
+                args.iter()
+                    .filter(|a| a.starts_with("-matmultrustedthreshold="))
+                    .count(),
+                1
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A keyless validating node on a signed snapshot pins all seven keys
+    /// once, in consensus mode still.
+    #[test]
+    fn a_validating_node_on_a_signed_snapshot_pins_all_seven_once() {
+        let dir = signed_snapshot_datadir("zbtx-validating");
+        std::fs::write(attested_snapshot_record(&dir), b"v2").unwrap();
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        for backend in [Backend::Cuda, Backend::Metal] {
+            let (_, args, _) =
+                build_node_command(Path::new("/x/btx/v0.34.12/lin/btxd"), &dir, &conf, backend);
+            assert!(!validation_modes(&args).contains(&"trusted"), "{args:?}");
+            for k in BTX_TRUSTED_ATTESTATION_PUBKEYS {
+                assert_eq!(pin_count(&args, k), 1, "{backend:?} {k}: {args:?}");
+            }
+            for k in ZBTX_KEYS {
+                assert_eq!(pin_count(&args, k), 1, "{backend:?} {k}: {args:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Section 7, step 5: the marker makes exactly the load launch a mirror
+    /// (the app's start path takes the signing key out of the conf for it;
+    /// `build_node_command` does not), and clearing it gives the validating
+    /// launch back.
+    #[test]
+    fn a_mirror_load_marker_makes_only_the_load_launch_a_mirror() {
+        let dir = signed_snapshot_datadir("mirror-load");
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        let btxd = Path::new("/x/btx/v0.34.9/lin/btxd");
+        assert!(!launches_as_mirror(btxd, &dir, Backend::Cuda));
+        assert_eq!(mirror_load_pending(&dir), None);
+
+        begin_mirror_load(&dir, PairKind::Confirmed, 232_000).unwrap();
+        assert_eq!(mirror_load_pending(&dir).map(|m| m.height), Some(232_000));
+        assert!(launches_as_mirror(btxd, &dir, Backend::Cuda));
+        assert!(!host_follows_signatures(btxd, &dir, Backend::Cuda));
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Cuda);
+        assert_eq!(validation_modes(&args), vec!["trusted"], "{args:?}");
+
+        end_mirror_load(&dir);
+        end_mirror_load(&dir); // idempotent
+        assert!(!mirror_load_marker_exists(&dir));
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Cuda);
+        assert_eq!(validation_modes(&args), vec!["consensus"], "{args:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Final review M4: the marker names the pair the launch is for, kind and
+    /// height, so the load can take that pair from disk when the website
+    /// cannot be read. A marker written before it said the kind still reads,
+    /// and names no pair.
+    #[test]
+    fn the_mirror_load_marker_names_its_pair() {
+        let dir = signed_snapshot_datadir("mirror-load-kind");
+        begin_mirror_load(&dir, PairKind::Confirmed, 232_000).unwrap();
+        let m = mirror_load_pending(&dir).unwrap();
+        assert_eq!(m.pair(), Some((PairKind::Confirmed, 232_000)));
+        let raw = std::fs::read_to_string(dir.join(".load-snapshot-as-mirror")).unwrap();
+        assert!(raw.contains(r#""kind":"confirmed""#), "{raw}");
+        begin_mirror_load(&dir, PairKind::Pinned, 225_927).unwrap();
+        assert_eq!(
+            mirror_load_pending(&dir).and_then(|m| m.pair()),
+            Some((PairKind::Pinned, 225_927))
+        );
+        let now = unix_now();
+        std::fs::write(
+            dir.join(".load-snapshot-as-mirror"),
+            format!(r#"{{"height":232000,"written_at":{now}}}"#),
+        )
+        .unwrap();
+        let old = mirror_load_pending(&dir).unwrap();
+        assert_eq!((old.height, old.pair()), (232_000, None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The operator's "never a mirror" (`EASYBTX_NODE_TRUSTED_MIRROR=0`)
+    /// outranks a fresh mirror-load marker: the launch is not a mirror, and
+    /// no mirror launch is wanted. The env half is read by
+    /// `trusted_mirror_override`; this is the rule it feeds.
+    #[test]
+    fn never_a_mirror_outranks_a_fresh_mirror_load_marker() {
+        let dir = signed_snapshot_datadir("mirror-load-never");
+        begin_mirror_load(&dir, PairKind::Confirmed, 232_000).unwrap();
+        let fresh = mirror_load_pending(&dir).is_some();
+        assert!(fresh);
+        let never = parse_trusted_mirror_override("0");
+        assert_eq!(never, Some(false));
+        assert!(!mirror_load_marker_applies(fresh, never));
+        assert!(mirror_load_marker_applies(fresh, None));
+        assert!(mirror_load_marker_applies(fresh, Some(true)));
+        assert!(!mirror_load_marker_applies(false, None));
+        assert!(!mirror_load_wanted(true, false, false, false, true));
+        assert!(mirror_load_wanted(true, false, false, false, false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_or_broken_mirror_load_marker_is_ignored() {
+        let now = 1_790_000_000;
+        let m = |written_at| MirrorLoad {
+            height: 232_000,
+            written_at,
+            kind: None,
+        };
+        assert!(mirror_load_is_fresh(&m(now), now));
+        assert!(mirror_load_is_fresh(
+            &m(now - MIRROR_LOAD_MAX_AGE_SECS + 1),
+            now
+        ));
+        assert!(!mirror_load_is_fresh(
+            &m(now - MIRROR_LOAD_MAX_AGE_SECS),
+            now
+        ));
+        assert!(
+            !mirror_load_is_fresh(&m(now + 3_600), now),
+            "from the future"
+        );
+        // A clock step of up to five minutes is forgiven, and no more.
+        assert_eq!(MIRROR_LOAD_CLOCK_STEP_SECS, 300);
+        assert!(mirror_load_is_fresh(&m(now + 300), now));
+        assert!(!mirror_load_is_fresh(&m(now + 301), now));
+
+        let dir = signed_snapshot_datadir("mirror-load-stale");
+        let btxd = Path::new("/x/btx/v0.34.9/lin/btxd");
+        std::fs::write(
+            dir.join(".load-snapshot-as-mirror"),
+            r#"{"height":232000,"written_at":1}"#,
+        )
+        .unwrap();
+        assert!(mirror_load_marker_exists(&dir));
+        assert_eq!(mirror_load_pending(&dir), None);
+        assert!(!launches_as_mirror(btxd, &dir, Backend::Cuda));
+        std::fs::write(dir.join(".load-snapshot-as-mirror"), "not json").unwrap();
+        assert_eq!(mirror_load_pending(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_fresh_validating_node_gets_a_mirror_launch() {
+        assert!(mirror_load_wanted(true, false, false, false, false));
+        assert!(
+            !mirror_load_wanted(false, false, false, false, false),
+            "a mirror loads in place"
+        );
+        assert!(
+            !mirror_load_wanted(true, true, false, false, false),
+            "header bootstrap first"
+        );
+        assert!(
+            !mirror_load_wanted(true, false, true, false, false),
+            "already loaded one"
+        );
+        assert!(
+            !mirror_load_wanted(true, false, false, true, false),
+            "a snapshot chainstate"
+        );
+        assert!(
+            !mirror_load_wanted(true, false, false, false, true),
+            "the operator said =0"
+        );
+    }
+
+    // ── The mirror arm does not repeat a key the engine already reads ──
+
+    /// btxd loads `<datadir>/btx_rw.conf` on every start and MERGES its list
+    /// settings with the command line (init.cpp ~1591-1597), so a leftover
+    /// pin from the mirror era there must not be pushed again on the mirror
+    /// arm either, or the engine refuses at init on "Duplicate
+    /// -matmultrustedpubkey".
+    #[test]
+    fn a_mirror_launch_does_not_repeat_a_key_btx_rw_conf_already_pins() {
+        let dir = signed_snapshot_datadir("mirror-rw-conf-pin");
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        let leftover = BTX_TRUSTED_ATTESTATION_PUBKEYS[0];
+        std::fs::write(
+            dir.join("btx_rw.conf"),
+            format!("matmultrustedpubkey={leftover}\n"),
+        )
+        .unwrap();
+        let btxd = Path::new("/x/btx/v0.34.9/lin/btxd");
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Cpu);
+        assert_eq!(validation_modes(&args), vec!["trusted"], "{args:?}");
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == &format!("-matmultrustedpubkey={leftover}")),
+            "leftover already pinned by btx_rw.conf, pushed again: {args:?}"
+        );
+        for pubkey in BTX_TRUSTED_ATTESTATION_PUBKEYS {
+            if pubkey == leftover {
+                continue;
+            }
+            assert!(
+                args.iter()
+                    .any(|a| a == &format!("-matmultrustedpubkey={pubkey}")),
+                "the other keys still belong: {args:?}"
+            );
+        }
+        assert!(args.iter().any(|a| a == "-matmultrustedthreshold=1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same as above, with the key stated in the `-conf` file itself, in the
+    /// engine's own syntax: spaces around `=` and a trailing `#` comment.
+    #[test]
+    fn a_mirror_launch_does_not_repeat_a_key_the_conf_file_pins_with_the_engines_syntax() {
+        let dir = signed_snapshot_datadir("mirror-conf-pin-syntax");
+        let leftover = BTX_TRUSTED_ATTESTATION_PUBKEYS[0];
+        let conf = dir.join("keyless.conf");
+        std::fs::write(
+            &conf,
+            format!("server=1\nmatmultrustedpubkey = {leftover} # note\n"),
+        )
+        .unwrap();
+        let btxd = Path::new("/x/btx/v0.34.9/lin/btxd");
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Cpu);
+        assert_eq!(validation_modes(&args), vec!["trusted"], "{args:?}");
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == &format!("-matmultrustedpubkey={leftover}")),
+            "{args:?}"
+        );
+        for pubkey in BTX_TRUSTED_ATTESTATION_PUBKEYS {
+            if pubkey == leftover {
+                continue;
+            }
+            assert!(
+                args.iter()
+                    .any(|a| a == &format!("-matmultrustedpubkey={pubkey}")),
+                "{args:?}"
+            );
+        }
+        assert!(args.iter().any(|a| a == "-matmultrustedthreshold=1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// This task's mirror load launch (the marker from `begin_mirror_load`)
+    /// sends a validating node through exactly this arm, so a validating
+    /// datadir carrying the fleet's leftover `btx_rw.conf` pin must not get a
+    /// duplicate either.
+    #[test]
+    fn a_mirror_load_launch_does_not_repeat_a_key_btx_rw_conf_already_pins() {
+        let dir = signed_snapshot_datadir("mirror-load-rw-conf-pin");
+        let conf = dir.join("keyless.conf");
+        std::fs::write(&conf, "server=1\n").unwrap();
+        let leftover = BTX_TRUSTED_ATTESTATION_PUBKEYS[1];
+        std::fs::write(
+            dir.join("btx_rw.conf"),
+            format!("matmultrustedpubkey={leftover}\n"),
+        )
+        .unwrap();
+        let btxd = Path::new("/x/btx/v0.34.9/mac/btxd");
+        begin_mirror_load(&dir, PairKind::Confirmed, 232_000).unwrap();
+        let (_, args, _) = build_node_command(btxd, &dir, &conf, Backend::Metal);
+        assert_eq!(validation_modes(&args), vec!["trusted"], "{args:?}");
+        let mut seen = std::collections::HashSet::new();
+        for a in args
+            .iter()
+            .filter(|a| a.starts_with("-matmultrustedpubkey="))
+        {
+            assert!(
+                seen.insert(a.to_ascii_lowercase()),
+                "pinned twice: {args:?}"
+            );
+        }
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == &format!("-matmultrustedpubkey={leftover}")),
+            "{args:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Section 12. `Err` names what broke the rule.
+    fn pins_only_grow(ever: &[&str], now: &[&str]) -> Result<(), String> {
+        let has = |list: &[&str], k: &str| list.iter().any(|x| x.eq_ignore_ascii_case(k));
+        let removed: Vec<&str> = ever.iter().copied().filter(|k| !has(now, k)).collect();
+        if !removed.is_empty() {
+            return Err(format!("removed from the pins: {}", removed.join(", ")));
+        }
+        let unrecorded: Vec<&str> = now.iter().copied().filter(|k| !has(ever, k)).collect();
+        if !unrecorded.is_empty() {
+            return Err(format!(
+                "pinned but not in pins_ever_shipped.txt: {}",
+                unrecorded.join(", ")
+            ));
+        }
+        Ok(())
+    }
+
+    fn pins_file() -> (Vec<&'static str>, u32) {
+        let text = include_str!("pins_ever_shipped.txt");
+        let mut keys = Vec::new();
+        let mut threshold = 0;
+        for line in text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            if let Some(t) = line.strip_prefix("threshold ") {
+                threshold = t.trim().parse().unwrap();
+            } else {
+                keys.push(line.split_whitespace().next().unwrap());
+            }
+        }
+        (keys, threshold)
+    }
+
+    #[test]
+    fn pins_only_grow_and_the_threshold_stays() {
+        let (ever, threshold) = pins_file();
+        assert_eq!(ever.len(), 7, "the file lost a line");
+        pins_only_grow(&ever, &BTX_TRUSTED_ATTESTATION_PUBKEYS).unwrap();
+        assert!(
+            BTX_TRUSTED_ATTESTATION_THRESHOLD <= threshold,
+            "the mirrors' threshold rose to {BTX_TRUSTED_ATTESTATION_THRESHOLD}"
+        );
+        // Sabotage: a release that drops the 3060's key.
+        let dropped: Vec<&str> = BTX_TRUSTED_ATTESTATION_PUBKEYS[..3].to_vec();
+        let err = pins_only_grow(&ever, &dropped).unwrap_err();
+        assert!(err.contains("02d5efca"), "{err}");
+        // A key added without its line in the file.
+        let mut added = BTX_TRUSTED_ATTESTATION_PUBKEYS.to_vec();
+        added.push("0343faebbc3a28f2e452132477192cb5455f0c0f2cfdab01c9217c43c2cbc3e464");
+        assert!(pins_only_grow(&ever, &added).is_err());
     }
 }

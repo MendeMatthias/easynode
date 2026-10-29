@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { validationView, type ValidationInput } from "./validation";
+import {
+  followResultText,
+  followRowVisible,
+  followToggleOn,
+  gpuHungSignerNote,
+  stalledFollowOffer,
+  validationView,
+  type FollowInput,
+  type ValidationInput,
+} from "./validation";
 
 const base: ValidationInput = {
   running: true,
@@ -12,6 +21,32 @@ const base: ValidationInput = {
 };
 
 describe("validationView", () => {
+  it("lets the engine's standing warning outrank the startup verdict", () => {
+    // The log said Full at startup; the engine has since quarantined the chip.
+    const note = "This machine's graphics chip did not pass the node engine's own check.";
+    const v = validationView({
+      ...base,
+      rc_mode: "strict-device",
+      rc_validates_independently: true,
+      rc_stalled: true,
+      rc_unverifiable_message: note,
+    });
+    expect(v.state).toBe("Stopped");
+    expect(v.note).toBe(note);
+    expect(v.cls).toBe("is-stalled");
+    // And it does not wait for a log verdict that may never be readable.
+    expect(
+      validationView({ ...base, uptime_secs: 30, rc_mode: null, rc_unverifiable_message: note })
+        .state,
+    ).toBe("Stopped");
+  });
+
+  it("keeps the generic stalled sentence when the engine gives none", () => {
+    const v = validationView({ ...base, rc_mode: "strict-device", rc_stalled: true });
+    expect(v.state).toBe("Stopped");
+    expect(v.note).toMatch(/cannot check the new proof of work/);
+  });
+
   it("explains the startup episode instead of showing a blank card", () => {
     // btxd runs one full production episode before it will judge the machine —
     // 102-218 s measured on an M2 Pro. The card used to be hidden for that whole
@@ -134,6 +169,12 @@ describe("validationView", () => {
       rc_trusted_mirror: true,
     });
     expect(v.state).toBe("Mirror");
+    // Since the 23 September split one key signs the valid chain; the copy
+    // must not promise two independent operators, or unconditional balance
+    // checks for a node that started from a snapshot.
+    expect(v.note).not.toMatch(/two independent/);
+    expect(v.note).toMatch(/one signer/);
+    expect(v.note).toMatch(/re-checks the snapshot it started from/);
     expect(v.state).not.toBe("strict-device");
     expect(v.note).toMatch(/block 185,000/);
     // It must not repeat the old promise that the node stops there.
@@ -154,7 +195,7 @@ describe("trusted mirror archive-authority escalation", () => {
       rc_trusted_mirror: true,
       archive_authority: 0,
     });
-    expect(v.state).toBe("Mirror — waiting for a source");
+    expect(v.state).toBe("Mirror: waiting for a source");
     expect(v.cls).toBe("is-stalled");
     expect(v.note).toContain("not connected to any node allowed to hand them over");
   });
@@ -197,6 +238,37 @@ describe("classified stall verdicts", () => {
     expect(v.note).toContain("signed confirmations");
   });
 
+  it("shows the signer-key verdict like every other class", () => {
+    const summary =
+      "signatures are reaching this node, but none come from a key it trusts, so it " +
+      "cannot move. Updating easyNode brings the current key list; if it is already up " +
+      "to date, the keys it trusts may have stopped signing for now";
+    const v = validationView({
+      ...base,
+      rc_mode: "strict-device",
+      rc_trusted_mirror: true,
+      stall: { class: "pins_reject_every_signature", summary },
+    });
+    expect(v.state).toBe("Needs attention");
+    expect(v.cls).toBe("is-stalled");
+    // The watchdog writes one sentence for the diagnostics and the screen
+    // alike, lower case and with no full stop; the card shows it as one.
+    expect(v.note).toBe(
+      "Signatures are reaching this node, but none come from a key it trusts, so it " +
+        "cannot move. Updating easyNode brings the current key list; if it is already up " +
+        "to date, the keys it trusts may have stopped signing for now.",
+    );
+  });
+
+  it("leaves a summary that is already a sentence as it is", () => {
+    const v = validationView({
+      ...base,
+      rc_trusted_mirror: true,
+      stall: { class: "body_missing", summary: "A block body is missing." },
+    });
+    expect(v.note).toBe("A block body is missing.");
+  });
+
   it("null stall changes nothing", () => {
     const v = validationView({
       ...base,
@@ -205,5 +277,142 @@ describe("classified stall verdicts", () => {
       stall: null,
     });
     expect(v.state).toBe("Mirror");
+  });
+});
+
+describe("the way out for a machine whose chip cannot check blocks", () => {
+  const checking: FollowInput = {
+    rc_stalled: false,
+    rc_trusted_mirror: false,
+    rc_validates_independently: true,
+    follow_signatures: false,
+  };
+  // Stalled: the chip failed the check at startup (the log says ready=0), or
+  // the engine's standing warning says so later in the run.
+  const stalled: FollowInput = { ...checking, rc_stalled: true, rc_validates_independently: false };
+
+  it("offers to follow signatures, and says what the switch costs", () => {
+    const offer = stalledFollowOffer(stalled);
+    expect(offer).toMatch(/cannot check new blocks itself/);
+    expect(offer).toMatch(/follow signatures instead/);
+    expect(offer).toMatch(/cannot sign/);
+    expect(offer).toMatch(/switch back in Settings/);
+  });
+
+  it("stays quiet where there is nothing to offer", () => {
+    // A machine that checks blocks: the slow-machine offer decides there.
+    expect(stalledFollowOffer(checking)).toBeNull();
+    // A mirror already follows signatures, and the owner who chose already did.
+    expect(stalledFollowOffer({ ...stalled, rc_trusted_mirror: true })).toBeNull();
+    expect(stalledFollowOffer({ ...stalled, follow_signatures: true })).toBeNull();
+  });
+
+  it("keeps the Settings switch on the machine that needs it most", () => {
+    // The old rule showed it only where the node checks blocks, which a
+    // stalled machine does not, so the one machine with no other way out had
+    // no switch either.
+    expect(followRowVisible(stalled)).toBe(true);
+    expect(followRowVisible(checking)).toBe(true);
+    const chosen = { ...checking, rc_validates_independently: false, follow_signatures: true };
+    expect(followRowVisible(chosen)).toBe(true);
+    // A machine that follows signatures anyway has no choice to make.
+    const mirror: FollowInput = {
+      rc_stalled: false,
+      rc_trusted_mirror: true,
+      rc_validates_independently: false,
+      follow_signatures: false,
+    };
+    expect(followRowVisible(mirror)).toBe(false);
+  });
+});
+
+describe("a machine whose graphics card hung the engine's start-up check (0.7.1)", () => {
+  const hungMirror: FollowInput = {
+    rc_stalled: false,
+    rc_trusted_mirror: true,
+    rc_validates_independently: false,
+    follow_signatures: false,
+    gpu_start_hung: true,
+  };
+
+  it("says why the node follows signatures, and the way back", () => {
+    const v = validationView({
+      ...base,
+      rc_mode: "strict-device",
+      rc_trusted_mirror: true,
+      gpu_start_hung: true,
+    });
+    expect(v.state).toBe("Mirror");
+    expect(v.note).toMatch(/graphics card did not finish the engine's start-up check/);
+    expect(v.note).toMatch(/follows signatures for now/);
+    expect(v.note).toMatch(/Check blocks in Settings tries the card again/);
+    expect(v.note.includes(String.fromCharCode(0x2014))).toBe(false); // no em-dash
+  });
+
+  it("says chip on a Mac, as the rest of the app does", () => {
+    const v = validationView({
+      ...base,
+      rc_mode: "strict-device",
+      rc_trusted_mirror: true,
+      gpu_start_hung: true,
+      graphics_word: "graphics chip",
+    });
+    expect(v.note).toMatch(/This machine's graphics chip did not finish/);
+    expect(v.note).toMatch(/tries the chip again/);
+    expect(v.note).not.toMatch(/card/);
+  });
+
+  it("keeps the plain mirror note where the card did not hang", () => {
+    const v = validationView({ ...base, rc_mode: "strict-device", rc_trusted_mirror: true });
+    expect(v.note).not.toMatch(/start-up check/);
+  });
+
+  it("still says so first when no source hands over confirmations", () => {
+    const v = validationView({
+      ...base,
+      rc_mode: "strict-device",
+      rc_trusted_mirror: true,
+      gpu_start_hung: true,
+      archive_authority: 0,
+    });
+    expect(v.state).toBe("Mirror: waiting for a source");
+  });
+
+  it("says what the switch did, including when the card hung again (final review M2)", () => {
+    expect(followResultText(true, false)).toBe("Your node restarted and follows signatures now.");
+    expect(followResultText(false, false)).toBe(
+      "Your node restarted and checks blocks itself again.",
+    );
+    const again = followResultText(false, true);
+    expect(again).toBe(
+      "The graphics card still did not finish the start-up check, so the node follows " +
+        "signatures again.",
+    );
+    expect(followResultText(false, true, "graphics chip")).toMatch(/^The graphics chip still/);
+  });
+
+  it("names the way back on the signer row (final review M4)", () => {
+    const note = gpuHungSignerNote({ gpu_start_hung: true, signer_applies_here: false });
+    expect(note).toMatch(/graphics card did not finish the engine's start-up check/);
+    expect(note).toMatch(/cannot sign/);
+    expect(note).toMatch(/Check blocks in Settings/);
+    expect(
+      gpuHungSignerNote({
+        gpu_start_hung: true,
+        signer_applies_here: false,
+        graphics_word: "graphics chip",
+      }),
+    ).toMatch(/tries the chip again/);
+    expect(gpuHungSignerNote({ gpu_start_hung: false, signer_applies_here: false })).toBeNull();
+    expect(gpuHungSignerNote({ gpu_start_hung: true, signer_applies_here: true })).toBeNull();
+  });
+
+  it("shows the Settings switch, switched on, so one click tries the card again", () => {
+    expect(followRowVisible(hungMirror)).toBe(true);
+    expect(followToggleOn(hungMirror)).toBe(true);
+    expect(followToggleOn({ ...hungMirror, gpu_start_hung: false })).toBe(false);
+    expect(
+      followToggleOn({ ...hungMirror, gpu_start_hung: false, follow_signatures: true }),
+    ).toBe(true);
   });
 });

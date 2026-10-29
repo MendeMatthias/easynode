@@ -120,3 +120,5 @@ it.
 The MIT licence covers the code. It does not grant the easyNode or easyBTX name
 or logo. Forks are welcome and should ship under a different name, so that a user
 can always tell whose build they are running.
+[FORKING.md](FORKING.md) lists the four things a fork must change so it does
+not collide with this app on a user's computer.

@@ -1,0 +1,1370 @@
+//! What the engine itself is warning about, in words a person can act on.
+//!
+//! # The problem this exists to solve
+//!
+//! btxd keeps a list of standing warnings and returns it in
+//! `getblockchaininfo.warnings`. Until 0.6.31 the app did not read it, so the
+//! engine could be saying, in so many words, that this machine can no longer
+//! verify blocks, and the status screen would carry on showing a green LIVE.
+//!
+//! v0.34.9 puts three warnings there that matter since the MatMul fork, and
+//! each is the only place its fact is reported while it is true:
+//!
+//! * `MATMUL_RC_NEXT_BLOCK_UNVERIFIABLE` (init.cpp:3961). The graphics chip is
+//!   not qualified to check the new proof of work, so the node cannot check
+//!   the next block. The app already reads btxd's startup verdict from the log,
+//!   but that line is written ONCE, at startup. A chip that qualified at
+//!   startup and was quarantined an hour later is reported here, and in
+//!   nothing the app read before.
+//!   This is also how a signer whose graphics card stops qualifying (a new
+//!   engine on an older card, btxchain/btx#205) would show up.
+//! * `MATMUL_BEHIND_SIGNED_FRONTIER` (validation.cpp:12345). The network's
+//!   signers have confirmed at least six blocks this node does not have. On a
+//!   node that has not even received the headers, every other signal in this
+//!   app reads healthy: blocks equal headers, no longer branch is known, and
+//!   the tip is not old enough to be stale yet. It is the one early sign of a
+//!   node that sits on a branch the network has left.
+//! * `MATMUL_DIVERGENT_POW_FORK` (validation.cpp:7032). The node refused a
+//!   header with the wrong difficulty. Nothing to fix: it explains why an
+//!   explorer on that refused chain shows different numbers.
+//!
+//! # What is deliberately not shown
+//!
+//! * **Cadence hold** (validation.cpp:10651). Local pacing while catching up,
+//!   in the engine's own words "not a consensus invalidity", and never cleared
+//!   while the node runs. The catch-up line already says when a gap is
+//!   closing slowly, from the gap's own trend.
+//! * **Deep reorg, followed** (validation.cpp:10635 at v0.34.12). Never
+//!   cleared while the node runs either, and on this network the reorg it
+//!   reports is usually a recovery: a node stranded on one of September's dead
+//!   branches that rejoins the main chain reorganises hundreds of blocks. It
+//!   would then carry "this may indicate a 51% attack -- raise required
+//!   confirmations and investigate" until its next restart, for the event
+//!   that fixed it, with nothing for the person to do. The same warning ends
+//!   "Parking the branch" when the engine refused to switch instead
+//!   (validation.cpp:10643): that one IS shown, as needing attention, because
+//!   the node then stays where it is until somebody acts. easyNode's launch
+//!   (`-parkdeepreorg=0`, plus `-reorgpolicy=legacy` from 0.34.12) never
+//!   parks, so it appears only when something else chose parking.
+//! * **Pre-release build**. Which engine ships is this project's choice, not
+//!   something the person running it can change.
+//! * **Unknown rules being signalled** (as opposed to activated). Miners
+//!   trying something is not a reason for anybody to act; the activated form
+//!   is, and it is shown.
+//!
+//! The heavier invalid chain (`LARGE_WORK_INVALID_CHAIN`) is shown, calmly. A
+//! node that refuses a heavier chain is usually right, and an alarm would fire
+//! exactly when it is.
+//!
+//! Anything this version does not recognise is shown in the engine's own
+//! words, calmly, rather than hidden: an engine update can add a warning, and
+//! a hidden one helps nobody.
+//!
+//! Everything here is pure, so the sentences are tested rather than trusted.
+
+use crate::node_api::BlockchainInfo;
+use serde::Serialize;
+
+/// Blocks behind the signed frontier at which btxd raises its warning.
+///
+/// Mirrors `st.blocks_behind < 6` in `NotifySignedFrontierStatus`
+/// (validation.cpp:12340 at v0.34.9). Used here to recognise the case where
+/// the node already knows it is at least that far behind.
+pub const FRONTIER_WARNING_BLOCKS: u64 = 6;
+
+/// One warning from the engine, recognised.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EngineWarning {
+    /// `MATMUL_RC_NEXT_BLOCK_UNVERIFIABLE`: no qualified device, so the node
+    /// cannot check the next block. `reason` is btxd's own token.
+    CannotVerifyBlocks { reason: Option<String> },
+    /// `MATMUL_BEHIND_SIGNED_FRONTIER`: the signers have confirmed blocks up to
+    /// `signed_height`, `blocks_behind` beyond this node.
+    BehindSigners {
+        blocks_behind: Option<u64>,
+        signed_height: Option<u64>,
+    },
+    /// `CLOCK_OUT_OF_SYNC`: this computer's clock disagrees with its peers by
+    /// more than `minutes`.
+    ClockOff { minutes: Option<u64> },
+    /// `UNKNOWN_NEW_RULES_ACTIVATED` or `SOFTWARE_EXPIRY`: the engine says it
+    /// is out of date.
+    OutOfDate,
+    /// `MATMUL_DIVERGENT_POW_FORK`: a header at `height` was refused for the
+    /// wrong difficulty.
+    RefusedWrongDifficulty { height: Option<u64> },
+    /// `LARGE_WORK_INVALID_CHAIN`: a longer chain exists that the node holds
+    /// invalid.
+    RefusingInvalidChain,
+    /// `DEEP_REORG_DETECTED` when the engine PARKED the branch: the node stays
+    /// on its chain rather than replacing its last `depth` blocks, until
+    /// somebody acts.
+    ParkedDeepReorg { depth: Option<u64> },
+    /// A warning this version does not recognise, first sentence only.
+    Other { text: String },
+}
+
+/// A warning ready for the status screen: the sentence, and whether it asks
+/// the person for attention or only explains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EngineNote {
+    pub message: String,
+    pub needs_attention: bool,
+}
+
+impl EngineWarning {
+    /// Does this ask something of the person running the node, or is it only
+    /// an explanation? Amber for the first, quiet for the second.
+    pub fn needs_attention(&self) -> bool {
+        matches!(
+            self,
+            EngineWarning::CannotVerifyBlocks { .. }
+                | EngineWarning::BehindSigners { .. }
+                | EngineWarning::ClockOff { .. }
+                | EngineWarning::OutOfDate
+                | EngineWarning::ParkedDeepReorg { .. }
+        )
+    }
+
+    /// Whether this belongs in the list of engine notes. The first two have a
+    /// home of their own on the status screen: not verifying blocks is what the
+    /// Block checking card is about, and being behind the signers is a fact
+    /// about where the node is on the chain, which the chain card says.
+    pub fn is_note(&self) -> bool {
+        !matches!(
+            self,
+            EngineWarning::CannotVerifyBlocks { .. } | EngineWarning::BehindSigners { .. }
+        )
+    }
+
+    /// One or two sentences for a person, in the app's voice: what is true,
+    /// what it means, and what to do when there is something to do.
+    pub fn message(&self) -> String {
+        match self {
+            EngineWarning::CannotVerifyBlocks { reason } => {
+                let mut m = String::from(
+                    "This machine's graphics chip did not pass the node engine's own check, so \
+                     your node cannot check the new proof of work and has stopped following new \
+                     blocks. Everything already downloaded is safe. When this follows a \
+                     graphics driver update, restarting the computer clears it. When the \
+                     check had passed earlier in this run, easyNode tries by itself after 15 \
+                     minutes: it restarts the node, or, inside WSL with that switch on in \
+                     Settings, it restarts WSL.",
+                );
+                if let Some(r) = reason {
+                    m.push_str(&format!(" The engine's reason: {}.", r.replace('_', " ")));
+                }
+                m
+            }
+            EngineWarning::BehindSigners {
+                blocks_behind,
+                signed_height,
+            } => {
+                let how_far = match (blocks_behind, signed_height) {
+                    (Some(n), Some(h)) => format!(
+                        "The network's signers have confirmed blocks up to height {}, {} beyond \
+                         this node,",
+                        group(*h),
+                        group(*n)
+                    ),
+                    (Some(n), None) => format!(
+                        "The network's signers have confirmed {} blocks beyond this node,",
+                        group(*n)
+                    ),
+                    _ => {
+                        "The network's signers have confirmed blocks beyond this node,".to_string()
+                    }
+                };
+                format!(
+                    "{how_far} and your node has not received them. Your view of the chain may \
+                     be behind."
+                )
+            }
+            EngineWarning::ClockOff { minutes } => {
+                let off = match minutes {
+                    Some(m) => format!("more than {m} minutes off"),
+                    None => "off".to_string(),
+                };
+                format!(
+                    "Your computer's clock is {off} from the rest of the network, and a wrong \
+                     clock can stop your node from following the chain. Set the date and time \
+                     to update automatically in your system settings, then restart easyNode."
+                )
+            }
+            // easyNode installs updates by itself, and a failed install has
+            // its own banner with the download address, so the sentence does
+            // not send anybody looking for a button.
+            EngineWarning::OutOfDate => "The node engine says it is out of date and may stop \
+                 agreeing with the rest of the network. easyNode installs a newer version by \
+                 itself as soon as one is out."
+                .to_string(),
+            EngineWarning::RefusedWrongDifficulty { height } => {
+                let at = match height {
+                    Some(h) => format!(" at height {}", group(*h)),
+                    None => String::new(),
+                };
+                format!(
+                    "Your node refused a block{at} that was built with the wrong difficulty. A \
+                     block explorer showing a chain whose difficulty keeps falling is showing \
+                     that refused chain, not the one your node follows."
+                )
+            }
+            EngineWarning::RefusingInvalidChain => "Your node knows of a longer chain that it \
+                 considers invalid, and it is not following it. That happens when other \
+                 computers stay on a chain that breaks the rules, as after the split at height \
+                 227,313."
+                .to_string(),
+            EngineWarning::ParkedDeepReorg { depth } => {
+                let blocks = match depth {
+                    Some(n) => format!("its last {} blocks", group(*n)),
+                    None => "some of its recent blocks".to_string(),
+                };
+                format!(
+                    "Your node found a branch that would replace {blocks} and parked it, so it \
+                     stays on the chain it has until someone decides which one is right. If the \
+                     rest of the network is on that branch, your node has stopped following it."
+                )
+            }
+            EngineWarning::Other { text } => format!("Your node's engine reports: {text}"),
+        }
+    }
+
+    pub fn note(&self) -> EngineNote {
+        EngineNote {
+            message: self.message(),
+            needs_attention: self.needs_attention(),
+        }
+    }
+}
+
+/// Recognise one warning. `None` for the kinds this app deliberately does not
+/// show; see the module docs for each one and why.
+///
+/// Matched on a phrase from the middle of each text rather than its start, so
+/// a changed "Warning:" prefix in a later engine does not turn a known warning
+/// into an unknown one.
+pub fn classify(raw: &str) -> Option<EngineWarning> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if hidden_kind(t).is_some() {
+        return None;
+    }
+    if t.contains("strict-device validation is unavailable") {
+        return Some(EngineWarning::CannotVerifyBlocks {
+            reason: token_after(t, "reason="),
+        });
+    }
+    if t.contains("blocks behind the signed MatMul frontier") {
+        return Some(EngineWarning::BehindSigners {
+            blocks_behind: number_before(t, " blocks behind the signed MatMul frontier"),
+            signed_height: number_after(t, "frontier (height "),
+        });
+    }
+    if t.contains("out of sync with the network") {
+        return Some(EngineWarning::ClockOff {
+            minutes: number_after(t, "more than "),
+        });
+    }
+    if t.contains("Unknown new rules activated")
+        || t.contains("This software expires")
+        || t.contains("This software is expired")
+    {
+        return Some(EngineWarning::OutOfDate);
+    }
+    if t.contains("for incorrect proof-of-work bits") {
+        return Some(EngineWarning::RefusedWrongDifficulty {
+            height: number_after(t, "rejected a header at height "),
+        });
+    }
+    if t.contains("Found invalid chain more than") {
+        return Some(EngineWarning::RefusingInvalidChain);
+    }
+    if t.contains(DEEP_REORG_PARKED) {
+        return Some(EngineWarning::ParkedDeepReorg {
+            depth: number_after(t, "would reorganize "),
+        });
+    }
+    Some(EngineWarning::Other {
+        text: first_sentence(t),
+    })
+}
+
+/// Everything worth showing from one `getblockchaininfo` answer, those that
+/// ask for attention first.
+///
+/// Being behind the signers is dropped while the node already knows it is
+/// behind: during the first sync, or while the network height
+/// ([`BlockchainInfo::network_height`]) stands at least the engine's own
+/// threshold above its tip. The catch-up line and the chain card already say
+/// so there, from the same number. The warning is kept for the case they
+/// cannot see: a frontier on another branch, or a node that has not even
+/// heard of the blocks.
+pub fn from_node(info: &BlockchainInfo) -> Vec<EngineWarning> {
+    let knows_it_is_behind = info.initial_block_download
+        || info.network_height().saturating_sub(info.blocks) >= FRONTIER_WARNING_BLOCKS;
+    let mut out: Vec<EngineWarning> = info
+        .warnings
+        .iter()
+        .filter_map(|w| classify(w))
+        .filter(|w| !(knows_it_is_behind && matches!(w, EngineWarning::BehindSigners { .. })))
+        .collect();
+    // Stable, so the engine's own order holds within each group.
+    out.sort_by_key(|w| !w.needs_attention());
+    out
+}
+
+/// A warning as Tools shows it: every one the engine reports, the hidden
+/// kinds included, each with the reason the home screen leaves it out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Notice {
+    pub raw: String,
+    pub message: String,
+    pub needs_attention: bool,
+    /// Why the home screen leaves it out; `None` when it is shown there.
+    pub hidden_because: Option<&'static str>,
+}
+
+/// The kinds the home screen hides on purpose: (phrase, sentence, reason).
+const HIDDEN: [(&str, &str, &str); 5] = [
+    (
+        "Cadence burst hold",
+        "The engine is pacing how fast it adds blocks while it catches up, to leave room for new ones.",
+        "Local pacing while catching up. The engine says this is not a problem with the chain.",
+    ),
+    (
+        "Deep reorg detected",
+        "Since it started, the node switched branches deeper than usual. On this network that is usually a node rejoining the main chain.",
+        "It stays until the next restart, even after what caused it is over.",
+    ),
+    (
+        "pre-release test build",
+        "The node engine is a test build.",
+        "Which engine ships is this project's choice, not something to act on.",
+    ),
+    (
+        "attempting to activate unknown new rules",
+        "Some miners are signalling rules this engine does not know yet.",
+        "Signalling is not activation. Nobody needs to act on it.",
+    ),
+    (
+        "Unrecognised block version",
+        "Some miners are signalling rules this engine does not know yet.",
+        "Signalling is not activation. Nobody needs to act on it.",
+    ),
+];
+
+/// How btxd ends a "Deep reorg detected" alarm when it PARKS the branch
+/// instead of following it (validation.cpp:10643 at v0.34.12, and :10572 at
+/// v0.34.9). It opens with the same words as the follow alarm the table above
+/// hides, and it is the opposite case: the node did not switch, and stays
+/// where it is until somebody acts. So it is never hidden.
+const DEEP_REORG_PARKED: &str = "Parking the branch";
+
+fn hidden_kind(t: &str) -> Option<(&'static str, &'static str)> {
+    if t.contains(DEEP_REORG_PARKED) {
+        return None;
+    }
+    HIDDEN
+        .iter()
+        .find(|(phrase, _, _)| t.contains(phrase))
+        .map(|(_, sentence, why)| (*sentence, *why))
+}
+
+pub fn all_notices(info: &BlockchainInfo) -> Vec<Notice> {
+    info.warnings
+        .iter()
+        .map(|w| w.trim())
+        .filter(|w| !w.is_empty())
+        .map(|w| match hidden_kind(w) {
+            Some((sentence, why)) => Notice {
+                raw: w.to_string(),
+                message: sentence.to_string(),
+                needs_attention: false,
+                hidden_because: Some(why),
+            },
+            None => {
+                let kind = classify(w).unwrap_or(EngineWarning::Other {
+                    text: first_sentence(w),
+                });
+                Notice {
+                    raw: w.to_string(),
+                    message: kind.message(),
+                    needs_attention: kind.needs_attention(),
+                    hidden_because: None,
+                }
+            }
+        })
+        .collect()
+}
+
+/// The integer that directly follows `marker`, e.g. "height " in "at height
+/// 229400 for".
+fn number_after(t: &str, marker: &str) -> Option<u64> {
+    let rest = &t[t.find(marker)? + marker.len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// The integer that directly precedes `marker`, e.g. "12" in "is 12 blocks
+/// behind".
+fn number_before(t: &str, marker: &str) -> Option<u64> {
+    let head = &t[..t.find(marker)?];
+    let digits: String = head
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    digits.parse().ok()
+}
+
+/// btxd's `key=value` token after `marker`, up to the end of its sentence.
+fn token_after(t: &str, marker: &str) -> Option<String> {
+    let rest = &t[t.find(marker)? + marker.len()..];
+    let end = rest.find(". ").unwrap_or(rest.len());
+    let token = rest[..end].trim().trim_end_matches('.');
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+/// The first sentence of an unrecognised warning, without the engine's own
+/// "Warning:" prefix, capped so one runaway string cannot take over the screen.
+fn first_sentence(t: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let mut s = t;
+    for prefix in ["Warning: ", "WARNING: ", "Warning:", "WARNING:"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.trim_start();
+            break;
+        }
+    }
+    let s = match s.find(". ") {
+        Some(i) => &s[..=i],
+        None => s,
+    };
+    if s.chars().count() <= MAX_CHARS {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(MAX_CHARS).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// 229400 → "229,400", the way the rest of the app writes heights.
+fn group(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// How long the engine's "cannot verify blocks" warning must stand, in a run
+/// whose verifier had been working, before the app restarts the engine.
+/// Fifteen minutes gives the engine's own "automatic re-test after backoff"
+/// its chance first.
+pub const VERIFIER_LOST_RESTART_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(15 * 60);
+
+/// The least time between two such restarts, so a card that keeps failing
+/// costs a restart every few hours, not a loop.
+pub const VERIFIER_RESTART_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
+
+/// Whether the app restarts the engine because its block verifier was lost
+/// mid-run ([`EngineWarning::CannotVerifyBlocks`] standing for `lost_for`).
+///
+/// Measured on the project's RTX 3060 signer (stats export, 2026-10-12
+/// 08:53 UTC): its tip stopped at block 245,498 (19:48 UTC on 10-11) with
+/// the CUDA verifier quarantined (`strict_device_provider_quarantined`,
+/// health reason `device_seeded_phase1_declined_or_wrong_size`) and
+/// `quarantine_events: 18`, `recovery_self_checks: 0`. In v0.34.15
+/// (matmul_v4_rc_gkr.cpp) each failed attempt re-quarantines and counts one
+/// event, the re-test waits 60 s doubling to a 1 h cap, and
+/// `recovery_self_checks` counts only successes: so the engine re-tested
+/// about 18 times over 13 hours and the card failed every one, inside the
+/// same process. The cause (System log, measured 2026-10-12): Windows Update
+/// installed NVIDIA driver 32.0.16.1088 at 19:49 to 19:50 UTC, live, under
+/// the running engine. The engine's warning says to restart with a provider that
+/// passes self-qualification; a restart is a new process and a new device
+/// context, which in-process re-tests are not. Measured on the 3060 on
+/// 2026-10-13 with a deliberate driver install: on a node inside WSL2 it
+/// does NOT bring the card back. The restarted engine failed startup
+/// qualification ("CUDA driver version is insufficient"), and only a WSL
+/// restart did (docs/incident-2026-10-11-3060-verifier-quarantine.md). So
+/// what the app does when this says yes depends on where it runs:
+/// [`lost_verifier_remedy`].
+///
+/// Only for a run whose verifier worked (`verified_this_run`: the node
+/// connected blocks in this run), or, before this app's first such restart,
+/// one whose engine lost a card it had in use (`engine_lost_card`,
+/// [`engine_lost_its_card`]): an app started after the loss. After that
+/// restart the engine is a new one, and its loss is this run's to see. A
+/// card refused at startup is the
+/// chip-refused path's, and restarting it would only repeat the refusal. At
+/// most once per [`VERIFIER_RESTART_MIN_GAP`] (`since_last_restart`, `None`
+/// when the app has not done this yet). Pure, so the rule is tested.
+pub fn restart_for_lost_verifier(
+    lost_for: Option<std::time::Duration>,
+    verified_this_run: bool,
+    engine_lost_card: bool,
+    since_last_restart: Option<std::time::Duration>,
+) -> bool {
+    let Some(lost_for) = lost_for else {
+        return false;
+    };
+    let worked = verified_this_run || (engine_lost_card && since_last_restart.is_none());
+    worked
+        && lost_for >= VERIFIER_LOST_RESTART_AFTER
+        && since_last_restart.is_none_or(|d| d >= VERIFIER_RESTART_MIN_GAP)
+}
+
+/// How long after the app's own WSL restart a run that never verified a
+/// block may ask for one more. A driver install can still be running when the
+/// first one fires: on 2026-10-13 the NVIDIA installer ran 46 minutes, and the
+/// 15-minute rule would have fired a third of the way in.
+pub const WSL_FOLLOW_UP_WINDOW: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The most WSL restarts the app makes for one loss of the card: the first,
+/// and one follow-up. A run that verifies blocks again starts a new count.
+pub const WSL_RESTARTS_PER_LOSS: u32 = 2;
+
+/// Whether an app inside WSL restarts WSL now, for a verifier lost for
+/// `lost_for`.
+///
+/// [`restart_for_lost_verifier`] keeps its gap in memory, and a WSL restart
+/// ends the process that holds it: the new run would see no gap at all, and
+/// a card that qualifies at startup and fails again mid-run would cost a WSL
+/// restart every ~20 minutes, each one stopping every Linux program on the PC
+/// (audit of #205, 2026-10-14). So this one reads a record kept in the
+/// settings file: `since_last`, the time since the app last restarted WSL for
+/// this, and `streak`, how many it has made since a run last verified blocks.
+///
+/// - A run that verified blocks: at most once per
+///   [`VERIFIER_RESTART_MIN_GAP`], as for the engine.
+/// - A run that never verified a block, within [`WSL_FOLLOW_UP_WINDOW`] of
+///   the app's own WSL restart: one more ([`WSL_RESTARTS_PER_LOSS`] in all).
+///   That is the run that came up without its card because the driver
+///   install was still going.
+/// - A run that never verified a block, under an engine that lost a card it
+///   had in use (`engine_lost_card`, [`engine_lost_its_card`]), before any WSL
+///   restart of ours for this loss (`streak` 0): as for a run that verified.
+///   That is an app started after the loss, which adopts the same engine: its
+///   window died with the display, the person reopened it, or the updater
+///   relaunched it. It used to wait forever, its own run never connecting a
+///   block (end-to-end run of 2026-10-14,
+///   docs/incident-2026-10-11-3060-verifier-quarantine.md). After our first
+///   restart for a loss the follow-up rule alone decides, so the cap of
+///   [`WSL_RESTARTS_PER_LOSS`] holds: a card that passes startup and fails
+///   every block costs two restarts, not one every 3 hours.
+///
+/// The spacing also counts `since_attempt`, this app's own last recovery of
+/// either kind: a WSL restart that cannot be prepared falls back to an
+/// engine restart and writes no record. Any other run that never verified is
+/// left alone: a card refused at startup is the chip-refused path's.
+pub fn restart_wsl_for_lost_verifier(
+    lost_for: Option<std::time::Duration>,
+    verified_this_run: bool,
+    engine_lost_card: bool,
+    since_last: Option<std::time::Duration>,
+    since_attempt: Option<std::time::Duration>,
+    streak: u32,
+) -> bool {
+    let Some(lost_for) = lost_for else {
+        return false;
+    };
+    if lost_for < VERIFIER_LOST_RESTART_AFTER {
+        return false;
+    }
+    let latest = match (since_last, since_attempt) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    let spaced = latest.is_none_or(|d| d >= VERIFIER_RESTART_MIN_GAP);
+    if verified_this_run {
+        return spaced;
+    }
+    let follow_up =
+        since_last.is_some_and(|d| d <= WSL_FOLLOW_UP_WINDOW) && streak < WSL_RESTARTS_PER_LOSS;
+    follow_up || (engine_lost_card && streak == 0 && spaced)
+}
+
+/// Whether the engine lost a card it had in use: its strict provider is
+/// quarantined, after at least one failure while checking a block
+/// (`backend_runtime.rc_exact_replay.provider_health` in `getmininginfo`).
+///
+/// In v0.34.15 `quarantine_events` rises only in `QuarantineProvider` and
+/// `ExtendProviderQuarantine` (src/matmul/matmul_v4_rc_gkr.cpp:84-169), called
+/// only from block validation, after a provider that passed startup
+/// qualification failed a block. A card refused at startup has its GPU
+/// routine zeroed by the production gate and is never used, so it counts
+/// none. (The exception, unverifiable catch-up replay, is off under easyNode:
+/// the engine logs `allow_unverifiable_catchup=0`.) So this is the engine's
+/// own record of "qualified and in use, then failed", and it outlives the
+/// app. Missing fields (an older engine, an answer without the runtime) read
+/// as no.
+pub fn engine_lost_its_card(mining_info: &serde_json::Value) -> bool {
+    let health = &mining_info["backend_runtime"]["rc_exact_replay"]["provider_health"];
+    health["quarantined"].as_bool() == Some(true)
+        && health["quarantine_events"].as_u64().is_some_and(|n| n >= 1)
+}
+
+/// What the app does once [`restart_for_lost_verifier`] says yes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LostVerifierRemedy {
+    /// Restart the engine: a new process re-runs the startup qualification.
+    RestartEngine,
+    /// Stop the engine, then restart WSL from the Windows side and bring
+    /// easyNode back ([`crate::wsl::restart_wsl_script`]).
+    RestartWsl,
+}
+
+/// Which remedy fits this machine.
+///
+/// - Inside WSL2: restart WSL. Measured on the 3060 on 2026-10-13: after a
+///   live driver install an engine restart failed startup qualification, and
+///   a WSL restart brought the card back in seconds. `wsl_restart_allowed` is
+///   the person's switch (on by default); restarting WSL stops every Linux
+///   program on that PC, so it must stay switchable. With it off the engine
+///   is restarted, which costs a minute and does no harm.
+/// - Native Linux and macOS: restart the engine. Whether that is enough
+///   after a driver update there is not measured. When it is not, the
+///   startup qualification fails, no further restart follows, and the
+///   message tells the person to restart the computer.
+/// - Windows natively: never reached. The Windows engine has no GPU
+///   verifier (`backend::BUNDLED_ENGINE_HAS_CUDA`).
+pub fn lost_verifier_remedy(in_wsl: bool, wsl_restart_allowed: bool) -> LostVerifierRemedy {
+    if in_wsl && wsl_restart_allowed {
+        LostVerifierRemedy::RestartWsl
+    } else {
+        LostVerifierRemedy::RestartEngine
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    /// The WSL rule with every time in minutes.
+    fn wsl(
+        lost: u64,
+        verified: bool,
+        engine: bool,
+        last: Option<u64>,
+        attempt: Option<u64>,
+        streak: u32,
+    ) -> bool {
+        let min = |m: u64| std::time::Duration::from_secs(m * 60);
+        restart_wsl_for_lost_verifier(
+            Some(min(lost)),
+            verified,
+            engine,
+            last.map(min),
+            attempt.map(min),
+            streak,
+        )
+    }
+
+    #[test]
+    fn a_wsl_restart_keeps_its_gap_across_the_restart_it_causes() {
+        // A run that verified blocks: 15 minutes lost, no earlier restart.
+        assert!(wsl(15, true, false, None, None, 0));
+        assert!(!wsl(14, true, false, None, None, 0));
+        // The record survived the restart: 20 minutes ago means no, the
+        // ~20-minute loop the audit found.
+        assert!(!wsl(15, true, false, Some(20), None, 0));
+        assert!(!wsl(15, true, false, Some(179), None, 0));
+        assert!(wsl(15, true, false, Some(180), None, 0));
+        // This app's own last attempt counts too: a WSL restart that could
+        // not be prepared fell back to an engine restart and wrote no record.
+        assert!(!wsl(15, true, false, None, Some(20), 0));
+        assert!(!wsl(15, true, false, Some(240), Some(20), 0));
+        assert!(wsl(15, true, false, None, Some(180), 0));
+    }
+
+    #[test]
+    fn a_run_that_came_up_without_its_card_gets_one_follow_up() {
+        // Right after our own restart, the driver install still running.
+        assert!(wsl(15, false, false, Some(20), None, 1));
+        // But only one: the second follow-up is refused.
+        assert!(!wsl(15, false, false, Some(20), None, 2));
+        // Not long after it, and not without one: a card refused at startup
+        // is the chip-refused path's, never a WSL restart.
+        assert!(!wsl(15, false, false, Some(61), None, 1));
+        assert!(!wsl(15, false, false, None, None, 0));
+        assert!(!wsl(14, false, false, Some(20), None, 1));
+        // An engine restart in place of a WSL restart is not one: no
+        // follow-up comes from it.
+        assert!(!wsl(15, false, false, None, Some(20), 0));
+    }
+
+    #[test]
+    fn an_app_started_after_the_loss_still_restarts_wsl() {
+        // Its own run never connected a block, but the engine it adopted
+        // lost a card it had in use: as for a run that verified.
+        assert!(wsl(15, false, true, None, None, 0));
+        assert!(!wsl(14, false, true, None, None, 0));
+        assert!(wsl(15, false, true, Some(180), None, 0));
+        // Spaced like one, by the record and by this app's own attempt.
+        assert!(!wsl(15, false, true, Some(90), None, 0));
+        assert!(!wsl(15, false, true, None, Some(15), 0));
+        // Only before our first WSL restart for this loss. After it the
+        // follow-up rule alone decides, so two stays the most: a card that
+        // passes startup and fails every block is not restarted every 3 h.
+        assert!(wsl(15, false, true, Some(20), None, 1));
+        assert!(!wsl(15, false, true, Some(20), None, 2));
+        assert!(!wsl(15, false, true, Some(180), None, 1));
+        assert!(!wsl(15, false, true, Some(180), None, 2));
+        assert!(!wsl(15, false, true, Some(600), None, 2));
+        // Without the engine's word nothing changes.
+        assert!(!wsl(15, false, false, None, None, 0));
+    }
+
+    #[test]
+    fn an_app_started_after_the_loss_restarts_the_engine_once() {
+        let lost = Some(std::time::Duration::from_secs(20 * 60));
+        let h = |x: u64| Some(std::time::Duration::from_secs(x * 3600));
+        // The engine lost a card it had in use before this app ran.
+        assert!(restart_for_lost_verifier(lost, false, true, None));
+        // Once per app: after its own restart the engine is a new one.
+        assert!(!restart_for_lost_verifier(lost, false, true, h(4)));
+        // A card refused at startup still never is.
+        assert!(!restart_for_lost_verifier(lost, false, false, None));
+    }
+
+    #[test]
+    fn the_engine_reports_a_card_it_lost_not_one_it_refused() {
+        let info = |health: serde_json::Value| serde_json::json!({"backend_runtime": {"rc_exact_replay": {"provider_health": health}}});
+        // The 3060 during the loss of 10-11 (stats export of 2026-10-12,
+        // `provider_health` verbatim).
+        let lost = serde_json::json!({
+            "quarantined": true,
+            "validator_readiness_lost": true,
+            "quarantine_events": 18,
+            "provider": "cuda_rc_exact_fused_extract",
+            "reason": "strict_device_provider_quarantined",
+            "operator_recovery": "automatic byte-exact re-test after backoff; repair/reset the accelerator if the self-check keeps failing; never invalidate or punish the announcing peer",
+            "divergent": false,
+            "quarantined_at_seconds": 625454,
+            "recovery_self_checks": 0,
+            "registered_alternate_providers": 1
+        });
+        assert!(engine_lost_its_card(&info(lost)));
+        // The same node healthy, after its WSL restart of 2026-10-14.
+        let healthy = serde_json::json!({
+            "quarantined": false,
+            "validator_readiness_lost": false,
+            "quarantine_events": 0,
+            "provider": "",
+            "reason": "",
+            "operator_recovery": "",
+            "divergent": false,
+            "quarantined_at_seconds": 0,
+            "recovery_self_checks": 0,
+            "registered_alternate_providers": 1
+        });
+        assert!(!engine_lost_its_card(&info(healthy)));
+        // Recovered in-process (the count stays), and never counted.
+        let q =
+            |q: bool, n: u64| info(serde_json::json!({"quarantined": q, "quarantine_events": n}));
+        assert!(!engine_lost_its_card(&q(false, 3)));
+        assert!(!engine_lost_its_card(&q(true, 0)));
+        // An engine that does not report it.
+        assert!(!engine_lost_its_card(&serde_json::json!({"blocks": 1})));
+        assert!(!engine_lost_its_card(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn inside_wsl_the_remedy_is_a_wsl_restart_unless_switched_off() {
+        assert_eq!(
+            lost_verifier_remedy(true, true),
+            LostVerifierRemedy::RestartWsl
+        );
+        assert_eq!(
+            lost_verifier_remedy(true, false),
+            LostVerifierRemedy::RestartEngine
+        );
+        assert_eq!(
+            lost_verifier_remedy(false, true),
+            LostVerifierRemedy::RestartEngine
+        );
+        assert_eq!(
+            lost_verifier_remedy(false, false),
+            LostVerifierRemedy::RestartEngine
+        );
+    }
+
+    // The 3060, 2026-10-11 19:49 UTC: Windows Update installed an NVIDIA
+    // driver under the running engine, which lost its GPU verifier mid-run
+    // (`device_seeded_phase1_declined_or_wrong_size`). It promised "automatic
+    // byte-exact re-test after backoff; no restart required", re-tested about
+    // hourly inside the same process and failed every time for 13 hours
+    // (`recovery_self_checks` counts only successes, so it read 0). The
+    // network's main signer sat frozen all night. A restart re-runs the
+    // startup qualification, which had passed.
+
+    #[test]
+    fn a_verifier_lost_mid_run_is_restarted_after_fifteen_minutes() {
+        let min = |m: u64| Some(std::time::Duration::from_secs(m * 60));
+        assert!(!restart_for_lost_verifier(min(14), true, false, None));
+        assert!(restart_for_lost_verifier(min(15), true, false, None));
+        assert!(restart_for_lost_verifier(min(13 * 60), true, false, None));
+    }
+
+    #[test]
+    fn a_verifier_that_never_qualified_this_run_is_left_alone() {
+        // A card refused at startup is the chip-refused path's to handle; a
+        // restart every few hours would only repeat the refusal.
+        let lost = Some(std::time::Duration::from_secs(3600));
+        assert!(!restart_for_lost_verifier(lost, false, false, None));
+    }
+
+    #[test]
+    fn nothing_lost_means_nothing_to_restart() {
+        assert!(!restart_for_lost_verifier(None, true, false, None));
+    }
+
+    #[test]
+    fn at_most_one_such_restart_every_three_hours() {
+        let lost = Some(std::time::Duration::from_secs(3600));
+        let h = |x: u64| Some(std::time::Duration::from_secs(x * 3600));
+        assert!(!restart_for_lost_verifier(lost, true, false, h(2)));
+        assert!(restart_for_lost_verifier(lost, true, false, h(3)));
+    }
+    use super::*;
+
+    // Every string below is what v0.34.9 actually puts in the array, with its
+    // format arguments filled in. The source lines are named at each one. If an
+    // engine bump changes a text, these are the tests that should break.
+
+    /// init.cpp:3961, as published at startup on a machine whose chip did not
+    /// qualify.
+    const RC_UNVERIFIABLE: &str = "CRITICAL: MatMul RC strict-device validation is \
+        unavailable. The next MatMul RC block at or after activation height 185000 cannot be \
+        independently verified by this node; MatMul consensus-validator and \
+        attestation-archive services are withheld. provider=cuda \
+        reason=strict_device_not_ready. Runtime presence is re-probed on a bounded cooldown, \
+        but presence alone is not qualification. Restart with a provider that passes the full \
+        self-qualification and production canary, or run as a trusted archive / discovery \
+        relay if this process is not a consensus validator.";
+
+    /// validation.cpp:12345, with a known frontier hash.
+    const BEHIND_FRONTIER: &str = "Warning: this node is 969 blocks behind the signed MatMul \
+        frontier (height 230663, hash 00000000000000000000000000000000000000000000000000000000000c0ffe). \
+        getmatmulattestedtip.hash only reflects HAVE_DATA on this chain; a stranded fork reports \
+        on_active_chain=true there. See getblockchaininfo.matmul_signed_frontier.";
+
+    /// validation.cpp:7032.
+    const DIVERGENT_POW: &str = "This node rejected a header at height 229400 for incorrect \
+        proof-of-work bits (bad-diffbits, hash 00ab). EncDr stall-recovery nBits start at \
+        height 228000. Explorers listing a falling-difficulty chain above that height are on \
+        a rejected fork, not this node's live chain.";
+
+    /// validation.cpp:7007.
+    const LARGE_WORK: &str = "Warning: Found invalid chain more than 6 blocks longer than our \
+        best chain. This could be due to database corruption or consensus incompatibility with \
+        peers.";
+
+    /// node/timeoffsets.cpp:56.
+    const CLOCK: &str = "Your computer's date and time appear to be more than 10 minutes out \
+        of sync with the network, this may lead to consensus failure. After you've confirmed \
+        your computer's clock, this message should no longer appear when you restart your \
+        node.";
+
+    /// validation.cpp:10651.
+    const CADENCE: &str = "Cadence burst hold: candidate height 230700 would jump the live tip \
+        (230650) faster than the 90-second block cadence (burst_max=3, allowed_height=230653). \
+        Holding ConnectTip/GETDATA until wall-clock catches up. Local policy, not a consensus \
+        invalidity.";
+
+    /// validation.cpp:10564, as it reads when a node stranded at the tip of the
+    /// 229,399 phantom branch rejoins the main chain.
+    const DEEP_REORG: &str = "Deep reorg detected: a branch would reorganize 296 blocks \
+        (profile=default; warn=6; park=0; tip=229694, fork=229398, candidate=230663). Following \
+        the most-work chain (warn-only). This may indicate a 51% attack -- raise required \
+        confirmations and investigate.";
+
+    /// validation.cpp:10635 and :10643 at v0.34.12, the same alarm when the
+    /// engine PARKS the branch instead of following it. On a legacy launch
+    /// with `-parkdeepreorg=0` it never parks; this is what a node shows when
+    /// something else chose parking. The wording is the engine's, the heights
+    /// are made up.
+    const DEEP_REORG_PARKED: &str = "Deep reorg detected: a branch would reorganize 17 blocks \
+        (profile=emergency; warn=6; park=6; tip=233453, fork=233436, candidate=233470). Parking \
+        the branch and staying on the current chain pending operator action. This may indicate \
+        a 51% attack -- raise required confirmations and investigate.";
+
+    fn info(warnings: &[&str], blocks: u64, headers: u64, ibd: bool) -> BlockchainInfo {
+        BlockchainInfo {
+            blocks,
+            headers,
+            verification_progress: 1.0,
+            initial_block_download: ibd,
+            median_time: 0,
+            is_stale: false,
+            behind_best_header: 0,
+            warnings: warnings.iter().map(|w| w.to_string()).collect(),
+            signed_frontier: None,
+        }
+    }
+
+    #[test]
+    fn a_chip_that_cannot_verify_is_recognised_with_its_reason() {
+        assert_eq!(
+            classify(RC_UNVERIFIABLE),
+            Some(EngineWarning::CannotVerifyBlocks {
+                reason: Some("strict_device_not_ready".into())
+            })
+        );
+        let m = classify(RC_UNVERIFIABLE).unwrap().message();
+        assert!(m.contains("strict device not ready"), "{m}");
+        // A driver update is the measured cause (10-11, 10-13), and an easyNode
+        // restart alone does not clear it inside WSL: the advice is the computer.
+        // Only when it follows a driver update: the same warning shows for a
+        // chip refused at startup, which a restart does not clear (audit).
+        assert!(
+            m.contains(
+                "When this follows a graphics driver update, restarting the computer clears it"
+            ),
+            "{m}"
+        );
+        assert!(!m.contains("Restarting easyNode"), "{m}");
+        assert!(m.contains("after 15 minutes"), "{m}");
+        // A WSL restart only where it can happen: inside WSL, switch on.
+        assert!(
+            m.contains("inside WSL with that switch on in Settings"),
+            "{m}"
+        );
+    }
+
+    /// The reason the engine re-publishes every half hour while a chip stays
+    /// unqualified (init.cpp, the runtime re-probe). It says a restart is what
+    /// clears it, which is why the sentence offers one.
+    #[test]
+    fn the_re_probe_reason_survives_intact() {
+        let text = RC_UNVERIFIABLE.replace(
+            "reason=strict_device_not_ready",
+            "reason=runtime_identity_present_but_full_qualification_requires_restart",
+        );
+        assert_eq!(
+            classify(&text),
+            Some(EngineWarning::CannotVerifyBlocks {
+                reason: Some(
+                    "runtime_identity_present_but_full_qualification_requires_restart".into()
+                )
+            })
+        );
+    }
+
+    #[test]
+    fn being_behind_the_signers_reads_both_numbers() {
+        let w = classify(BEHIND_FRONTIER).unwrap();
+        assert_eq!(
+            w,
+            EngineWarning::BehindSigners {
+                blocks_behind: Some(969),
+                signed_height: Some(230_663)
+            }
+        );
+        let m = w.message();
+        assert!(m.contains("230,663") && m.contains("969"), "{m}");
+        // Same wording as the chain card's own alarms, on purpose: it is the
+        // same kind of fact, and it may replace one of them on screen.
+        assert!(m.ends_with("Your view of the chain may be behind."), "{m}");
+    }
+
+    #[test]
+    fn a_frontier_without_a_known_hash_still_reads() {
+        // "%s" is empty when the frontier hash is not known.
+        let w = classify(
+            "Warning: this node is 12 blocks behind the signed MatMul frontier (height 230663). \
+             getmatmulattestedtip.hash only reflects HAVE_DATA on this chain.",
+        )
+        .unwrap();
+        assert_eq!(
+            w,
+            EngineWarning::BehindSigners {
+                blocks_behind: Some(12),
+                signed_height: Some(230_663)
+            }
+        );
+    }
+
+    #[test]
+    fn the_refused_difficulty_fork_explains_rather_than_alarms() {
+        let w = classify(DIVERGENT_POW).unwrap();
+        assert_eq!(
+            w,
+            EngineWarning::RefusedWrongDifficulty {
+                height: Some(229_400)
+            }
+        );
+        assert!(!w.needs_attention(), "the node did its job");
+        assert!(w.message().contains("229,400"));
+    }
+
+    /// Told to jpp on 2026-09-26: a node refusing the heavier invalid chain is
+    /// the normal state for a correct node, so no alarm, just a calm sentence.
+    #[test]
+    fn a_heavier_invalid_chain_is_calm() {
+        let w = classify(LARGE_WORK).unwrap();
+        assert_eq!(w, EngineWarning::RefusingInvalidChain);
+        assert!(!w.needs_attention());
+    }
+
+    #[test]
+    fn a_wrong_clock_says_what_to_do() {
+        let w = classify(CLOCK).unwrap();
+        assert_eq!(w, EngineWarning::ClockOff { minutes: Some(10) });
+        assert!(w.needs_attention());
+        let m = w.message();
+        assert!(m.contains("more than 10 minutes"), "{m}");
+        assert!(m.contains("restart easyNode"), "{m}");
+    }
+
+    #[test]
+    fn an_out_of_date_engine_is_recognised_in_all_three_wordings() {
+        for text in [
+            "WARNING: Unknown new rules activated (versionbit 5) - this software is not secure",
+            "This software expires soon, and may fall out of consensus. Before 2028-01-01, you \
+             must choose to upgrade or override this expiration.",
+            "This software is expired, and may be out of consensus. You must choose to upgrade \
+             or override this expiration.",
+        ] {
+            assert_eq!(classify(text), Some(EngineWarning::OutOfDate), "{text}");
+        }
+        assert!(EngineWarning::OutOfDate.needs_attention());
+    }
+
+    /// Each of these is explained in the module docs. The deep reorg one is the
+    /// sharpest: a node that rejoins the main chain after being stranded on a
+    /// dead branch would carry "this may indicate a 51% attack" until its next
+    /// restart, for the very event that fixed it.
+    #[test]
+    fn the_kinds_nobody_can_act_on_are_not_shown() {
+        for text in [
+            CADENCE,
+            DEEP_REORG,
+            "This is a pre-release test build - use at your own risk - do not use for mining or \
+             merchant applications",
+            "Warning: Miners are attempting to activate unknown new rules (bit 5)! You may or \
+             may not need to act to remain secure",
+            "Warning: Unrecognised block versions are being mined! Unknown rules may or may not \
+             be in effect",
+            "Warning: Unrecognised block version (0x20000000) is being mined! Unknown rules may \
+             or may not be in effect",
+            "",
+            "   ",
+        ] {
+            assert_eq!(classify(text), None, "{text}");
+        }
+    }
+
+    /// The two cases share their opening words and are opposites. Following
+    /// (and the engine's two automatic recoveries) is what fixed a stranded
+    /// node, so it stays hidden. Parking means the node stays where it is
+    /// until somebody acts, which is the one reorg alarm a person must see.
+    #[test]
+    fn a_parked_deep_reorg_asks_for_attention_and_a_followed_one_stays_hidden() {
+        for followed in [
+            DEEP_REORG,
+            &DEEP_REORG_PARKED.replace(
+                "Parking the branch and staying on the current chain pending operator action.",
+                "Activating the uniquely authenticated shallow-race recovery branch.",
+            ),
+            &DEEP_REORG_PARKED.replace(
+                "Parking the branch and staying on the current chain pending operator action.",
+                "Auto-activating the honest deep-reorg branch (deep-fork auto-resolve): observed \
+                 live as our tip climbed and sustained.",
+            ),
+        ] {
+            assert_eq!(classify(followed), None, "{followed}");
+            let n = &all_notices(&info_with(&[followed]))[0];
+            assert!(n.hidden_because.is_some() && !n.needs_attention, "{n:?}");
+        }
+
+        let w = classify(DEEP_REORG_PARKED).expect("a parked deep reorg is shown");
+        assert_eq!(w, EngineWarning::ParkedDeepReorg { depth: Some(17) });
+        assert!(w.needs_attention());
+        assert!(w.is_note());
+        assert!(w.message().contains("17 blocks"), "{}", w.message());
+        let n = &all_notices(&info_with(&[DEEP_REORG_PARKED]))[0];
+        assert_eq!(n.hidden_because, None);
+        assert!(n.needs_attention);
+        assert_eq!(n.message, w.message());
+        let node = info(&[DEEP_REORG, DEEP_REORG_PARKED], 233_453, 233_470, false);
+        assert_eq!(from_node(&node), vec![w]);
+    }
+
+    #[test]
+    fn an_unknown_warning_is_shown_in_the_engines_words_not_hidden() {
+        let w = classify(
+            "Warning: Something new happened. Here is a second sentence with details nobody needs.",
+        )
+        .unwrap();
+        assert_eq!(
+            w,
+            EngineWarning::Other {
+                text: "Something new happened.".into()
+            }
+        );
+        assert_eq!(
+            w.message(),
+            "Your node's engine reports: Something new happened."
+        );
+        assert!(!w.needs_attention());
+    }
+
+    #[test]
+    fn a_runaway_unknown_warning_is_capped() {
+        let long = "x".repeat(5_000);
+        let EngineWarning::Other { text } = classify(&long).unwrap() else {
+            panic!("an unrecognised text is Other");
+        };
+        assert!(text.chars().count() <= 241, "{}", text.len());
+        assert!(text.ends_with('…'));
+    }
+
+    /// The case the warning exists for: the node believes it is at the tip,
+    /// because it has not even received the headers the signers have signed.
+    #[test]
+    fn behind_the_signers_is_kept_when_the_node_cannot_see_it_otherwise() {
+        let stranded = info(&[BEHIND_FRONTIER], 229_694, 229_694, false);
+        assert_eq!(
+            from_node(&stranded),
+            vec![EngineWarning::BehindSigners {
+                blocks_behind: Some(969),
+                signed_height: Some(230_663)
+            }]
+        );
+    }
+
+    #[test]
+    fn behind_the_signers_is_dropped_while_the_node_knows_it_is_behind() {
+        // First sync: the syncing screen already says so.
+        let syncing = info(&[BEHIND_FRONTIER], 228_000, 230_663, true);
+        assert!(from_node(&syncing).is_empty());
+        // Headers far ahead of blocks: the catch-up line and the chain card
+        // say it, with the node's own numbers.
+        let catching_up = info(&[BEHIND_FRONTIER], 229_694, 230_663, false);
+        assert!(from_node(&catching_up).is_empty());
+        // Just under the engine's own threshold still counts as not knowing.
+        let blind = info(
+            &[BEHIND_FRONTIER],
+            229_694,
+            229_694 + FRONTIER_WARNING_BLOCKS - 1,
+            false,
+        );
+        assert_eq!(from_node(&blind).len(), 1);
+        // After mainnet 244,000 headers stay near blocks while a node catches
+        // up; the signed frontier on its own chain is what knows the gap, and
+        // the catch-up line reads it (crate::network_height).
+        let after_244000 = BlockchainInfo {
+            signed_frontier: Some(crate::node_api::AttestedTip {
+                height: Some(229_694 + 969),
+                on_active_chain: Some(true),
+                ..Default::default()
+            }),
+            ..info(&[BEHIND_FRONTIER], 229_694, 229_694, false)
+        };
+        assert!(from_node(&after_244000).is_empty());
+        // A frontier on another branch is not a gap this node can close by
+        // catching up: the warning stays.
+        let elsewhere = BlockchainInfo {
+            signed_frontier: Some(crate::node_api::AttestedTip {
+                height: Some(229_694 + 969),
+                on_active_chain: Some(false),
+                ..Default::default()
+            }),
+            ..info(&[BEHIND_FRONTIER], 229_694, 229_694, false)
+        };
+        assert_eq!(from_node(&elsewhere).len(), 1);
+    }
+
+    #[test]
+    fn attention_comes_first_and_the_engines_order_holds_otherwise() {
+        let node = info(
+            &[DIVERGENT_POW, CADENCE, LARGE_WORK, CLOCK, RC_UNVERIFIABLE],
+            230_000,
+            230_000,
+            false,
+        );
+        let kinds: Vec<_> = from_node(&node)
+            .into_iter()
+            .map(|w| (w.needs_attention(), w))
+            .collect();
+        assert_eq!(kinds.len(), 4, "cadence hold is not shown: {kinds:?}");
+        assert!(matches!(kinds[0].1, EngineWarning::ClockOff { .. }));
+        assert!(matches!(
+            kinds[1].1,
+            EngineWarning::CannotVerifyBlocks { .. }
+        ));
+        assert!(matches!(
+            kinds[2].1,
+            EngineWarning::RefusedWrongDifficulty { .. }
+        ));
+        assert_eq!(kinds[3].1, EngineWarning::RefusingInvalidChain);
+    }
+
+    #[test]
+    fn a_node_with_nothing_to_say_says_nothing() {
+        assert!(from_node(&info(&[], 230_000, 230_000, false)).is_empty());
+    }
+
+    #[test]
+    fn the_two_warnings_with_their_own_card_are_not_notes() {
+        assert!(!classify(RC_UNVERIFIABLE).unwrap().is_note());
+        assert!(!classify(BEHIND_FRONTIER).unwrap().is_note());
+        for text in [DIVERGENT_POW, LARGE_WORK, CLOCK] {
+            assert!(classify(text).unwrap().is_note(), "{text}");
+        }
+    }
+
+    #[test]
+    fn every_sentence_is_plain_and_finished() {
+        let all = [
+            EngineWarning::CannotVerifyBlocks { reason: None },
+            EngineWarning::CannotVerifyBlocks {
+                reason: Some("strict_device_not_ready".into()),
+            },
+            EngineWarning::BehindSigners {
+                blocks_behind: Some(7),
+                signed_height: Some(230_663),
+            },
+            EngineWarning::BehindSigners {
+                blocks_behind: Some(7),
+                signed_height: None,
+            },
+            EngineWarning::BehindSigners {
+                blocks_behind: None,
+                signed_height: None,
+            },
+            EngineWarning::ClockOff { minutes: Some(10) },
+            EngineWarning::ClockOff { minutes: None },
+            EngineWarning::OutOfDate,
+            EngineWarning::RefusedWrongDifficulty { height: Some(1) },
+            EngineWarning::RefusedWrongDifficulty { height: None },
+            EngineWarning::RefusingInvalidChain,
+            EngineWarning::ParkedDeepReorg { depth: Some(17) },
+            EngineWarning::ParkedDeepReorg { depth: None },
+        ];
+        for w in all {
+            let m = w.message();
+            assert!(m.ends_with('.'), "{m}");
+            assert!(!m.contains("  "), "double space: {m}");
+            for jargon in [
+                "RC",
+                "ExactReplay",
+                "strict-device",
+                "frontier",
+                "bad-diffbits",
+                "nBits",
+                "HAVE_DATA",
+                "provider=",
+            ] {
+                assert!(!m.contains(jargon), "{jargon} must not reach a person: {m}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_wire_shape_is_tagged_by_kind() {
+        let j = |w: EngineWarning| serde_json::to_value(w).unwrap();
+        assert_eq!(
+            j(EngineWarning::OutOfDate),
+            serde_json::json!({ "kind": "out_of_date" })
+        );
+        assert_eq!(
+            j(EngineWarning::BehindSigners {
+                blocks_behind: Some(7),
+                signed_height: Some(9)
+            }),
+            serde_json::json!({ "kind": "behind_signers", "blocks_behind": 7, "signed_height": 9 })
+        );
+        assert_eq!(
+            serde_json::to_value(EngineWarning::ClockOff { minutes: Some(10) }.note()).unwrap()
+                ["needs_attention"],
+            true
+        );
+    }
+
+    #[test]
+    fn heights_are_grouped_like_the_rest_of_the_app() {
+        assert_eq!(group(0), "0");
+        assert_eq!(group(999), "999");
+        assert_eq!(group(1_000), "1,000");
+        assert_eq!(group(227_313), "227,313");
+        assert_eq!(group(1_234_567), "1,234,567");
+    }
+
+    fn info_with(warnings: &[&str]) -> BlockchainInfo {
+        BlockchainInfo {
+            warnings: warnings.iter().map(|w| w.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn all_notices_keeps_the_hidden_ones_and_says_why() {
+        let n = all_notices(&info_with(&[
+            "Cadence burst hold active: pacing background validation",
+            "Warning: Deep reorg detected (depth 400)",
+            "This is a pre-release test build - use at your own risk",
+            "Warning: Unrecognised block version being mined",
+        ]));
+        assert_eq!(n.len(), 4);
+        for notice in &n {
+            assert!(notice.hidden_because.is_some(), "{notice:?}");
+            assert!(!notice.message.is_empty());
+            assert!(!notice.needs_attention);
+        }
+        assert!(n[0].message.contains("pacing"));
+        assert_eq!(
+            n[0].raw,
+            "Cadence burst hold active: pacing background validation"
+        );
+    }
+
+    #[test]
+    fn all_notices_shows_what_the_home_screen_shows_unhidden() {
+        let n = all_notices(&info_with(&[
+            "Warning: Found invalid chain more than 6 blocks longer than our best chain.",
+        ]));
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0].hidden_because, None);
+        assert!(n[0].message.contains("longer chain"));
+    }
+
+    #[test]
+    fn hiding_did_not_change_for_the_home_screen() {
+        for raw in [
+            "Cadence burst hold active",
+            "Deep reorg detected",
+            "pre-release test build",
+            "attempting to activate unknown new rules",
+            "Unrecognised block version",
+        ] {
+            assert_eq!(classify(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn notice_sentences_are_plain() {
+        for raw in [
+            "Cadence burst hold",
+            "Deep reorg detected",
+            "pre-release test build",
+            "Unrecognised block version",
+        ] {
+            let n = &all_notices(&info_with(&[raw]))[0];
+            assert!(
+                !n.message.contains('\u{2014}') && !n.hidden_because.unwrap().contains('\u{2014}')
+            );
+        }
+    }
+}

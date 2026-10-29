@@ -14,8 +14,11 @@
 #     -DBUILD_DAEMON=ON -DBUILD_CLI=ON \
 #     -DBUILD_UTIL=OFF -DBUILD_TX=OFF -DBUILD_WALLET_TOOL=OFF \
 #     -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_TESTS=OFF -DBUILD_FUZZ_BINARY=OFF \
-#     -DENABLE_WALLET=ON -DWITH_SQLITE=ON
+#     -DENABLE_WALLET=ON -DWITH_SQLITE=ON -DWITH_MODELNET=OFF
 #   cmake --build build -j"$(nproc)"
+#
+# ⚠ -DWITH_MODELNET=OFF from 0.34.7 on: upstream defaults the model network ON,
+#   and ON refuses to configure below OpenSSL 3.5, which 22.04 does not have.
 #
 # ⚠ Boost headers are needed even with BUILD_TESTS=OFF; pass
 #   -DBoost_INCLUDE_DIR=<prefix>/usr/include if they are not on a system path.
@@ -68,8 +71,10 @@ DEST="$APP_DIR/src-tauri/resources/node-pkg"
 # shellcheck source=lib/engine-pin.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/engine-pin.sh"
 if [[ -z "$EXPECT" ]]; then
-  EXPECT="$(engine_pin_tag "$APP_DIR")"
-  echo "==> no version given; using the engine pin $EXPECT"
+  # The VERSION part of the key, not the key: btxd prints `v0.34.6`, never our
+  # `-3013c2c2` qualifier, and the banner check below must match what it prints.
+  EXPECT="$(engine_pin_version "$APP_DIR")"
+  echo "==> no version given; using the engine pin $(engine_pin_tag "$APP_DIR") (btxd reports $EXPECT)"
 else
   assert_matches_engine_pin "$APP_DIR" "${EXPECT#v}"
 fi

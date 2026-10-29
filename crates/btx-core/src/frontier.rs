@@ -57,6 +57,22 @@ pub enum ArchiveService {
     /// btxd has quietly narrowed to the live window. The node looks like an
     /// archive from outside and is not behaving as one.
     DegradedToLiveWindow { blocks_behind: i64 },
+    /// Serving, at the frontier, and **holding a signing key**, which the
+    /// engine treats as a reason to answer almost nothing.
+    ///
+    /// `src/node/matmul_trusted_attestations.h:317` opens
+    /// `TrustedSignerMayServeGetMmAttest` with `if (!has_local_signer) return
+    /// true;` — a keyless node serves history with NO window limit. A node with
+    /// a key is clamped to `height + SIGNER_GETMMATTEST_SERVE_WINDOW >=
+    /// tip_height`, and that constant is 16.
+    ///
+    /// So a signer advertises bit 31 and then refuses anything older than
+    /// sixteen blocks. On 2026-09-13 the explorer needed one signature for a
+    /// block ~800 back, every peer classified it as historical and refused, and
+    /// it sat frozen for twenty-one hours. Reporting that node as
+    /// `ServingHistory` — "the only state in which a keeper is doing its job" —
+    /// is how the fleet stayed confident through it.
+    SignerLiveWindowOnly,
     /// Not configured to serve attestations. Honest and fine: a node can be
     /// useful without being an archive.
     NotServing,
@@ -85,6 +101,13 @@ impl ArchiveService {
             ArchiveService::ServingHistory => {
                 "At the frontier and serving attestation history to other nodes.".to_string()
             }
+            ArchiveService::SignerLiveWindowOnly => {
+                "Advertising the archive service, but this node holds a signing key, so the \
+                 engine answers history requests only for the last 16 blocks and refuses \
+                 everything older. The network is short of KEYLESS archives, which serve the \
+                 full range."
+                    .to_string()
+            }
             ArchiveService::DegradedToLiveWindow { blocks_behind } => format!(
                 "Behind the signed frontier by {blocks_behind} blocks, so this node has \
                  stopped serving attestation history even though it still advertises that \
@@ -109,9 +132,20 @@ impl ArchiveService {
 ///   btxd have set bit 31 at startup.
 /// * `blocks_behind` — `signed_frontier.blocks_behind`, `None` when the
 ///   frontier has not been read yet.
-pub fn archive_service(advertises_archive: bool, blocks_behind: Option<i64>) -> ArchiveService {
+pub fn archive_service(
+    advertises_archive: bool,
+    blocks_behind: Option<i64>,
+    has_local_signer: bool,
+) -> ArchiveService {
     if !advertises_archive {
         return ArchiveService::NotServing;
+    }
+    // Checked BEFORE the frontier lag, because it does not depend on it: a
+    // signer perfectly at the frontier still answers only the last 16 blocks.
+    // Ordering it after would report the healthiest possible signer as
+    // `ServingHistory`, which is the exact sentence that was wrong.
+    if has_local_signer {
+        return ArchiveService::SignerLiveWindowOnly;
     }
     match blocks_behind {
         None => ArchiveService::Unknown,
@@ -125,6 +159,55 @@ pub fn archive_service(advertises_archive: bool, blocks_behind: Option<i64>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The state this exists to stop the app reporting.
+    ///
+    /// A signer at the frontier looks perfect from every angle the app could
+    /// previously see: the archive bit is advertised, `blocks_behind` is 0. The
+    /// engine still refuses anything older than sixteen blocks, because
+    /// `TrustedSignerMayServeGetMmAttest` clamps a node that has a local
+    /// signer. Calling that `ServingHistory` is how the fleet stayed confident
+    /// while btxscan sat frozen for twenty-one hours on 2026-09-13 waiting for
+    /// a signature ~800 blocks back.
+    #[test]
+    fn a_signer_at_the_frontier_is_not_serving_history() {
+        let signing = archive_service(true, Some(0), true);
+        assert_eq!(signing, ArchiveService::SignerLiveWindowOnly);
+        assert!(
+            !signing.is_serving_history(),
+            "a node clamped to a 16-block window must never read as serving history"
+        );
+        // The keyless node in the identical chain position is the one doing the job.
+        assert_eq!(
+            archive_service(true, Some(0), false),
+            ArchiveService::ServingHistory
+        );
+    }
+
+    /// The clamp does not depend on chain position, so neither may the verdict.
+    /// Ordering the signer check after the lag check would have reported the
+    /// healthiest possible signer as the healthiest possible archive.
+    #[test]
+    fn holding_a_key_outranks_frontier_lag_in_both_directions() {
+        for behind in [None, Some(0), Some(1), Some(10_000)] {
+            assert_eq!(
+                archive_service(true, behind, true),
+                ArchiveService::SignerLiveWindowOnly,
+                "signer verdict must not depend on blocks_behind ({behind:?})"
+            );
+        }
+    }
+
+    /// Not serving still outranks everything: a node with a key that was never
+    /// asked to serve attestations is not advertising the bit and is not
+    /// promising anything.
+    #[test]
+    fn a_signer_that_does_not_serve_is_still_just_not_serving() {
+        assert_eq!(
+            archive_service(false, Some(0), true),
+            ArchiveService::NotServing
+        );
+    }
 
     #[test]
     fn the_wire_shape_is_what_the_ui_declares() {
@@ -173,7 +256,7 @@ mod tests {
         // leaving the optimisation resting on a reading of the match arms.
         for behind in [None, Some(0), Some(2), Some(9_999)] {
             assert_eq!(
-                archive_service(false, behind),
+                archive_service(false, behind, false),
                 ArchiveService::NotServing,
                 "a node that does not serve is NotServing whatever the frontier says"
             );
@@ -183,14 +266,14 @@ mod tests {
     #[test]
     fn at_the_frontier_is_the_only_state_that_serves_history() {
         assert_eq!(
-            archive_service(true, Some(0)),
+            archive_service(true, Some(0), false),
             ArchiveService::ServingHistory
         );
         assert_eq!(
-            archive_service(true, Some(1)),
+            archive_service(true, Some(1), false),
             ArchiveService::ServingHistory
         );
-        assert!(archive_service(true, Some(1)).is_serving_history());
+        assert!(archive_service(true, Some(1), false).is_serving_history());
     }
 
     #[test]
@@ -199,14 +282,14 @@ mod tests {
         // behind still serves; two does not. Getting this off by one would make
         // the app report a healthy archive that answers nothing.
         assert_eq!(
-            archive_service(true, Some(1)),
+            archive_service(true, Some(1), false),
             ArchiveService::ServingHistory
         );
         assert_eq!(
-            archive_service(true, Some(2)),
+            archive_service(true, Some(2), false),
             ArchiveService::DegradedToLiveWindow { blocks_behind: 2 }
         );
-        assert!(!archive_service(true, Some(2)).is_serving_history());
+        assert!(!archive_service(true, Some(2), false).is_serving_history());
     }
 
     #[test]
@@ -214,7 +297,7 @@ mod tests {
         // The frontier is what has been SIGNED. A node can legitimately hold a
         // tip above it, and that must not read as degraded.
         assert_eq!(
-            archive_service(true, Some(-3)),
+            archive_service(true, Some(-3), false),
             ArchiveService::ServingHistory
         );
     }
@@ -222,18 +305,21 @@ mod tests {
     #[test]
     fn a_node_that_does_not_serve_is_not_reported_as_broken() {
         assert_eq!(
-            archive_service(false, Some(999)),
+            archive_service(false, Some(999), false),
             ArchiveService::NotServing
         );
-        assert_eq!(archive_service(false, None), ArchiveService::NotServing);
-        assert!(!archive_service(false, Some(999)).needs_attention());
+        assert_eq!(
+            archive_service(false, None, false),
+            ArchiveService::NotServing
+        );
+        assert!(!archive_service(false, Some(999), false).needs_attention());
     }
 
     #[test]
     fn an_unread_frontier_is_unknown_rather_than_guessed() {
         // Reporting "fine" here would be a lie on startup, and reporting
         // "degraded" would cry wolf every launch.
-        let s = archive_service(true, None);
+        let s = archive_service(true, None, false);
         assert_eq!(s, ArchiveService::Unknown);
         assert!(!s.is_serving_history());
         assert!(!s.needs_attention(), "startup must not raise an alarm");
@@ -241,15 +327,15 @@ mod tests {
 
     #[test]
     fn only_the_misrepresenting_state_asks_for_attention() {
-        assert!(archive_service(true, Some(50)).needs_attention());
-        assert!(!archive_service(true, Some(0)).needs_attention());
-        assert!(!archive_service(false, None).needs_attention());
-        assert!(!archive_service(true, None).needs_attention());
+        assert!(archive_service(true, Some(50), false).needs_attention());
+        assert!(!archive_service(true, Some(0), false).needs_attention());
+        assert!(!archive_service(false, None, false).needs_attention());
+        assert!(!archive_service(true, None, false).needs_attention());
     }
 
     #[test]
     fn the_degraded_message_says_what_it_means_for_other_people() {
-        let m = archive_service(true, Some(7)).message();
+        let m = archive_service(true, Some(7), false).message();
         assert!(
             m.contains('7'),
             "the operator should see how far behind: {m}"
@@ -263,10 +349,10 @@ mod tests {
     #[test]
     fn every_state_has_a_plain_sentence_with_no_jargon_leaking() {
         for s in [
-            archive_service(true, Some(0)),
-            archive_service(true, Some(9)),
-            archive_service(false, None),
-            archive_service(true, None),
+            archive_service(true, Some(0), false),
+            archive_service(true, Some(9), false),
+            archive_service(false, None, false),
+            archive_service(true, None, false),
         ] {
             let m = s.message();
             assert!(!m.is_empty());
@@ -284,11 +370,11 @@ mod tests {
 
     #[test]
     fn it_serialises_with_a_state_tag_the_ui_can_switch_on() {
-        let v = serde_json::to_value(archive_service(true, Some(4))).unwrap();
+        let v = serde_json::to_value(archive_service(true, Some(4), false)).unwrap();
         assert_eq!(v["state"], "degraded_to_live_window");
         assert_eq!(v["blocks_behind"], 4);
         assert_eq!(
-            serde_json::to_value(archive_service(true, Some(0))).unwrap()["state"],
+            serde_json::to_value(archive_service(true, Some(0), false)).unwrap()["state"],
             "serving_history"
         );
     }

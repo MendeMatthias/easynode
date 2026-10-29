@@ -208,11 +208,46 @@ body {
 .fact { display: flex; justify-content: space-between; gap: var(--space-s); font-size: 13px; }
 .fact-label { color: var(--color-muted); white-space: nowrap; }
 .fact-value { text-align: right; }
+.fact-value.is-short { color: var(--color-danger); }
+.wizard-disk-short { margin: 0; font-size: 12px; line-height: 1.45; color: var(--color-danger); }
 .wizard-note {
   font-size: 12px;
   color: var(--color-muted);
   text-align: center;
 }
+/* The setup screen's one question: two choices, one line under them. */
+.start-choice {
+  border: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+.choice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-s);
+  padding: var(--space-s);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.choice.is-selected { border-color: var(--color-accent); }
+/* Dim the control, not the explanation: the reason under a greyed-out Full
+   check keeps the normal muted colour so it stays readable. */
+.choice.is-disabled,
+.choice.is-locked { cursor: default; }
+.choice.is-disabled input,
+.choice.is-disabled .choice-name,
+.choice.is-disabled .choice-desc { opacity: 0.55; }
+.choice input { margin-top: 4px; accent-color: var(--color-accent); }
+.choice-text { display: flex; flex-direction: column; gap: 2px; }
+.choice-name { font-size: 14px; font-weight: 700; }
+.choice-desc,
+.choice-reason { font-size: 12.5px; color: var(--color-muted); }
+.start-choice-note { text-align: left; margin-top: var(--space-xs); }
 
 .btn-primary {
   font-family: inherit;
@@ -390,12 +425,27 @@ body {
   font-size: 16px;
   letter-spacing: 0.06em;
 }
+.status-badge[data-mode="stalled"] { color: var(--color-amber); }
+.status-badge[data-mode="error"] { color: var(--color-danger); }
 .status-sub {
   font-size: 12.5px;
   color: var(--color-muted);
   min-height: 20px;
   text-align: center;
 }
+/* The history check under the status line: one line and a thin bar. The bar
+   is capped, not the line: at 12px the line needs about 346px, and a cap on
+   both would push "(58%)" onto a second line. */
+.history-check {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+/* pre-line: the second sentence ("Started from block ...") gets a line of
+   its own (history-check.ts). */
+.history-line { font-size: 12px; color: var(--color-muted); text-align: center; white-space: pre-line; }
+.history-track { width: 100%; max-width: 340px; height: 4px; margin-top: var(--space-xs); }
 
 /* The frequency line — the node's calm heartbeat under the orb. */
 .ambient-canvas {
@@ -525,6 +575,12 @@ body {
 
 .actions { margin-top: auto; display: flex; flex-direction: column; gap: var(--space-s); }
 .actions .btn-primary { width: 100%; }
+/* A stopped or failed node: what happened and Start node come right under
+   the headline instead of below every card (main.ts sets .is-idle). Visual
+   order only, and only these two move, so reading order stays close. */
+#screen-status.is-idle > .status-orb-wrap { order: -2; }
+#screen-status.is-idle > #status-error,
+#screen-status.is-idle > .actions { order: -1; margin-top: 0; }
 
 .error-card {
   border-color: rgba(248, 113, 113, 0.4);
@@ -537,6 +593,103 @@ body {
 
 .fork-card { border-color: rgba(251, 191, 36, 0.5); font-size: 13px; }
 .fork-card p { color: var(--color-amber); margin: 0; line-height: 1.45; }
+.follow-card button { margin-top: var(--space-s); }
+/* The stale card before the catch-up trend is measured: "Checking whether
+   your node is catching up...", said quietly, never as an alarm. */
+#fork-card.is-calm { border-color: var(--color-border); }
+#fork-card.is-calm p { color: var(--color-muted); }
+/* In the accessibility tree, off the screen: for a live region that must
+   exist before it speaks. Never display:none, which takes it out of the
+   tree. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+/* The one-time note after the engine turned this Mac's chip down. */
+.chip-card { font-size: 13px; }
+.chip-card p { margin: 0; line-height: 1.45; }
+.chip-card button { margin-top: var(--space-s); }
+/* Engine notes: amber lines ask something of the person, quiet lines only
+   explain. A card holding only quiet lines drops the amber border too, so an
+   explanation never dresses as an alarm. */
+#engine-notes { display: flex; flex-direction: column; gap: var(--space-s); }
+.engine-card.is-calm { border-color: var(--color-border); }
+.engine-card p.is-calm { color: var(--color-muted); }
+
+/* Same chain as other sources: one calm row. The word is the answer and
+   takes the text colour (spec D2); the mark and the border carry the status.
+   Green only for OK, amber for CAUTION, red for WARNING, grey for UNKNOWN,
+   so "could not compare" never looks like "agrees". */
+.agree-card { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.agree-row { display: flex; align-items: center; gap: 8px; }
+.agree-mark {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-muted);
+  flex: none;
+}
+.agree-label { color: var(--color-muted); }
+.agree-word { margin-left: auto; text-align: right; font-weight: 700; }
+.agree-scope, .agree-lines p {
+  margin: 0;
+  font-size: 12px;
+  color: var(--color-muted);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.agree-lines { display: flex; flex-direction: column; gap: 4px; }
+.agree-card.is-ok .agree-mark { background: var(--color-green); border-color: var(--color-green); }
+.agree-card.is-caution { border-color: rgba(251, 191, 36, 0.5); }
+.agree-card.is-caution .agree-mark { background: var(--color-amber); border-color: var(--color-amber); }
+.agree-card.is-caution .agree-lines p:first-child { color: var(--color-amber); }
+.agree-card.is-warning { border-color: rgba(248, 113, 113, 0.5); }
+.agree-card.is-warning .agree-mark { background: var(--color-danger); border-color: var(--color-danger); }
+.agree-card.is-warning .agree-lines p:first-child { color: var(--color-danger); }
+.agree-card.is-unknown .agree-mark { border-style: dashed; }
+
+/* Your node's role: one fact per line, each ending in a sentence on whether it
+   helps. The mark is the only judgement on the card and it is deliberately
+   quiet — filled green = helps other nodes, hollow = does not, dashed = the
+   engine did not say. No amber: none of these lines is an alarm, they are
+   answers to "is this machine useful, and how", and a node filling a modest
+   role honestly must not look like one that is failing. */
+.role-card { display: flex; flex-direction: column; gap: var(--space-s); font-size: 13px; }
+.role-head {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-muted);
+}
+.role-lines { list-style: none; display: flex; flex-direction: column; gap: 10px; }
+.role-row { display: flex; align-items: center; gap: 8px; }
+.role-mark {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-muted);
+  flex: none;
+}
+.role-line.is-helps .role-mark { background: var(--color-green); border-color: var(--color-green); }
+.role-line.is-unknown .role-mark { border-style: dashed; }
+.role-label { color: var(--color-muted); white-space: nowrap; }
+.role-value { margin-left: auto; text-align: right; font-weight: 700; }
+.role-note {
+  margin: 2px 0 0 16px;
+  font-size: 12px;
+  color: var(--color-muted);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
 
 /* ── Settings overlay ─────────────────────────────────────────────────────── */
 .overlay {
@@ -550,6 +703,11 @@ body {
   padding: var(--space-m);
 }
 .overlay[hidden] { display: none; }
+/* "Close BTX Node?" and "Quitting" open over whatever panel is up when the
+   window's close button or the tray's Quit is pressed. At the shared z-index
+   they painted behind Ask, Tools and What's next, which come later in the
+   page, and the close button seemed to do nothing. Below the toast (20). */
+#close-overlay { z-index: 15; }
 .overlay-panel {
   width: 100%;
   max-width: 460px;
@@ -572,6 +730,45 @@ body {
   gap: var(--space-m);
 }
 .setting-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+/* Settings in four groups (index.html): each a column of rows with the
+   panel's own spacing, a quiet heading, and a rule between groups. The
+   operators' group is a <details>, folded until opened. */
+.settings-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-m);
+  padding-top: var(--space-m);
+  border-top: 1px solid var(--color-border);
+}
+.settings-group-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-muted);
+  margin: 0;
+}
+.settings-group-fold > summary {
+  cursor: pointer;
+  list-style: none;
+  display: block;
+}
+.settings-group-fold > summary::-webkit-details-marker { display: none; }
+.settings-group-fold > summary::before { content: "▸ "; }
+.settings-group-fold[open] > summary::before { content: "▾ "; }
+.settings-group-hint {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+/* Inside a <details> the rows sit in its content slot, where the group's
+   flex gap does not reach them (WebKit and Chromium), so they space
+   themselves. */
+.settings-group-fold { gap: 0; }
+.settings-group-fold > :not(summary) { margin-top: var(--space-m); }
 .setting-name { font-size: 14px; font-weight: 700; }
 .setting-desc {
   font-size: 12px;
@@ -651,6 +848,9 @@ body {
 }
 .switch input:checked + .slider { background: rgba(247, 147, 26, 0.25); border-color: var(--color-accent); }
 .switch input:checked + .slider::before { transform: translateX(18px); background: var(--color-accent); }
+/* A feature this machine cannot run: the switch is greyed out and the line
+   beside it says why (feature-rows.ts). */
+.switch input:disabled + .slider { opacity: 0.4; cursor: not-allowed; }
 
 /* Toast */
 .toast {
@@ -847,6 +1047,21 @@ body.compact .stars { display: none; }
   font-size: 11px;
   word-break: break-all;
   opacity: 0.7;
+}
+
+/* The public signing key: 66 hex characters that have to be readable and
+   copyable, next to a button, on a narrow settings panel. */
+.signer-pubkey {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  word-break: break-all;
+  user-select: all;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(127, 127, 127, 0.12);
 }
 
 .ask-cite {
@@ -1113,3 +1328,61 @@ body.compact .stars { display: none; }
 .link-ext { opacity: 0.6; }
 .link-row-cite { margin-top: 2px; }
 .cite-dot-ext { background: var(--color-amber); box-shadow: 0 0 6px rgba(251, 191, 36, 0.5); }
+
+/* The one-time welcome panel. Deliberately borrows .overlay-panel,
+   .role-lines and .nickname-row so it looks like the rest of the app rather
+   than a separate screen; only the two things with no equivalent are new. */
+.welcome-lede {
+  margin: 0 0 14px;
+  color: var(--color-text-dim);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.welcome-actions { justify-content: flex-end; margin-top: 16px; }
+
+/* ── Tools overlay ─────────────────────────────────────────────────────── */
+/* .overlay-panel is flex-column with overflow-y: auto so IT scrolls; without
+   this its children default to shrinking instead, which squashes the
+   diagnostics report and the command window down to one line. Scoped to
+   Tools only, since other overlays share .overlay-panel and rely on the
+   default shrink behavior. */
+#tools-overlay .overlay-panel > * { flex-shrink: 0; }
+.tools-now { color: var(--color-muted); font-size: 12.5px; margin: 0 0 var(--space-m); }
+.tools-h { font-size: 13px; margin: var(--space-m) 0 var(--space-s); }
+.tools-actions { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-s); }
+.tools-note { color: var(--color-muted); font-size: 12px; margin: var(--space-s) 0; }
+.tools-notice { margin: var(--space-s) 0 0; }
+.tools-notice.is-attention { color: var(--color-amber); }
+.tools-raw { font-family: var(--font-mono); font-size: 11px; color: var(--color-muted); margin: 2px 0 0; overflow-wrap: anywhere; }
+.tools-pre {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 260px;
+  overflow: auto;
+  background: var(--color-raise);
+  border-radius: var(--radius);
+  padding: var(--space-s);
+  margin: var(--space-s) 0 0;
+  user-select: text;
+}
+.tools-console { margin-top: var(--space-m); }
+.tools-console-row { display: flex; gap: var(--space-s); }
+.tools-console-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 9px 12px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+.tools-console-row input::placeholder { color: var(--color-muted); opacity: 0.6; }
+.tools-entry { margin-top: var(--space-s); }
+.tools-entry-head { display: flex; justify-content: space-between; align-items: center; gap: var(--space-s); }
+.tools-entry-head code { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.tools-entry-head button { flex-shrink: 0; }
+.tools-confirm { margin-top: var(--space-s); }
