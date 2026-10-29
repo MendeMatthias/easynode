@@ -857,6 +857,10 @@ pub struct AppState {
     /// ~1.5 s on top of the refresher's — three duplicate pipelines for the
     /// same numbers. None when stopped or the node did not answer.
     pub archive_peers_cache: Arc<Mutex<Option<btx_core::node_api::ArchivePeerSummary>>>,
+    /// Whether the node is exchanging transactions (btx_core::node_api::
+    /// judge_tx_relay), judged from the SAME per-tick getpeerinfo as the
+    /// census above. None when stopped or the node did not answer.
+    pub tx_relay_cache: Arc<Mutex<Option<btx_core::node_api::TxRelayHealth>>>,
     /// Nicknames of connected peers, from the SAME per-tick getpeerinfo as the
     /// census above. Cached for the same reason: the UI polls ~1.5 s and a
     /// second full getpeerinfo for a decorative list would be indefensible.
@@ -969,6 +973,7 @@ impl AppState {
             history_check: Arc::new(Mutex::new(Default::default())),
             started_from: Arc::new(Mutex::new(None)),
             archive_peers_cache: Arc::new(Mutex::new(None)),
+            tx_relay_cache: Arc::new(Mutex::new(None)),
             peer_nicknames_cache: Arc::new(Mutex::new(Vec::new())),
             esplora: Arc::new(Mutex::new(None)),
             esplora_verdict: Arc::new(Mutex::new(None)),

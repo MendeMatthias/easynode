@@ -789,9 +789,13 @@ pub struct TxRelaySummary {
     /// Peers that told us they want transactions (`fRelay`). Silence from a
     /// peer that does not want them is not evidence of a relay problem.
     pub want_tx_from_us: usize,
-    /// Peers whose advertised minimum fee is so far above what the network
-    /// pays that they can accept nothing being sent (see `minfeefilter`).
+    /// Peers whose advertised minimum fee is a wall rather than a price (see
+    /// [`TX_WALL_BTX_PER_KVB`]): they accept nothing anyone is sending.
     pub priced_out: usize,
+    /// Peers that could actually pass transactions: they want them, and their
+    /// fee floor is a price rather than a wall. When this is zero the node
+    /// cannot hear a transaction however healthy the network is.
+    pub open_to_tx: usize,
     /// Transaction bytes in and out, across every peer.
     pub tx_bytes_in: u64,
     pub tx_bytes_out: u64,
@@ -800,13 +804,28 @@ pub struct TxRelaySummary {
     pub longest_connection_secs: i64,
 }
 
+/// A peer fee floor above this, in BTX per kvB, is a wall rather than a price.
+///
+/// The wall peers put up is 0.09170997, and it is not a fee policy: it is the
+/// feefilter a node sends while it is in initial block download (MAX_MONEY
+/// rounded down to the top fee bucket, 9,170,997 sat per kvB), so a peer
+/// showing it is still catching up, or stuck on an old chain, and asks for no
+/// transactions at all. Everyone else asks 0 or 0.00001 (1 sat per vbyte, the
+/// relay floor).
+///
+/// Measured 2026-10-29 10:46 UTC on the two btxd v0.34.15 nodes behind
+/// btxscan.io, read-only `getpeerinfo` / `getmempoolinfo` / `getnetworkinfo`:
+/// the only values any of 75 peers advertised were 0, 0.00001 and 0.09170997;
+/// 2 of 44 and 3 of 31 peers showed the wall (versions 0.31.0, 0.32.3,
+/// 0.32.12, 0.33.2 and one 0.34.10), and both nodes' `mempoolminfee` and
+/// `relayfee` were 0.00001. Same picture as 2026-09-06 (3 of 22 at
+/// 0.09170997), so this threshold still holds, with three orders of magnitude
+/// to spare on either side.
+pub const TX_WALL_BTX_PER_KVB: f64 = 0.01;
+
 /// Summarise transaction relay across the peer set. `now_unix` is passed in so
 /// the function stays pure and testable.
 pub fn summarize_tx_relay(peers: &[PeerInfo], now_unix: i64) -> TxRelaySummary {
-    // Above this the peer's own minimum fee is not a fee policy, it is a wall.
-    // The network pays 1 to 4 sat per byte; this is 1,000 sat per byte, which
-    // no honest sender on BTX has ever paid.
-    const PRICED_OUT_BTX_PER_KVB: f64 = 0.01;
     let mut s = TxRelaySummary {
         peers: peers.len(),
         ..Default::default()
@@ -825,8 +844,12 @@ pub fn summarize_tx_relay(peers: &[PeerInfo], now_unix: i64) -> TxRelaySummary {
         if p.relaytxes {
             s.want_tx_from_us += 1;
         }
-        if p.minfeefilter > PRICED_OUT_BTX_PER_KVB {
+        let walled = p.minfeefilter > TX_WALL_BTX_PER_KVB;
+        if walled {
             s.priced_out += 1;
+        }
+        if p.relaytxes && !walled {
+            s.open_to_tx += 1;
         }
         // conntime 0 means the peer object did not carry one (an older btxd):
         // unknown, so it must not be read as "connected since the epoch".
@@ -847,11 +870,12 @@ pub fn summarize_tx_relay(peers: &[PeerInfo], now_unix: i64) -> TxRelaySummary {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum TxRelayHealth {
-    /// Not enough observation yet to say anything. Carries why, in words a
-    /// person can read.
+    /// Not enough observation yet to say anything. Carries why, as a sentence
+    /// a person can read.
     Unknown { reason: String },
     /// Transactions are arriving from peers. This is the healthy answer.
     Receiving {
+        peers: usize,
         peers_sending: usize,
         tx_bytes_in: u64,
     },
@@ -862,35 +886,75 @@ pub enum TxRelayHealth {
         hours_connected: i64,
         peers_wanting_tx: usize,
         priced_out: usize,
+        /// Peers that want transactions at a fee anyone pays. Zero means the
+        /// cause is this node's peer set, not the network being quiet.
+        peers_open: usize,
     },
 }
 
+/// How long the oldest connection must have lasted before silence is evidence.
+///
+/// On 2026-09-06 this was six hours, on roughly ten transactions an hour (121
+/// user transactions in 500 blocks, measured 2026-09-04). That no longer
+/// holds. Measured 2026-10-29 10:46-10:58 UTC on the two btxd v0.34.15 nodes
+/// behind btxscan.io (read-only `getpeerinfo`, `getmempoolinfo`): both
+/// mempools were empty, and relay itself was working, 14 of 44 and 16 of 31
+/// peers having delivered transactions. But traffic is thin. By how long each
+/// peer that wants transactions at the relay floor had been connected (at
+/// 10:58):
+///
+/// | connected  | node 1: open / delivered | node 2: open / delivered |
+/// |------------|--------------------------|--------------------------|
+/// | under 6 h  | 17 / 0                   | 4 / 2                    |
+/// | 6 to 24 h  | 4 / 2                    | 7 / 5                    |
+/// | a day+     | 13 / 12                  | 9 / 9                    |
+///
+/// Seventeen open peers under six hours old had not delivered one transaction
+/// between them, on a node that relays fine, and peers 6.5 and 14.8 hours old
+/// had each delivered the same 65.6 KB, the same few transactions. A healthy
+/// node can go well past six hours without hearing one, and calling that
+/// "isolated" would blame the node for what the network did. After a day,
+/// 21 of 22 open peers across both nodes had delivered. A day is the window.
+pub const TX_RELAY_WINDOW_SECS: i64 = 24 * 3600;
+
+/// Fewer peers than this and silence proves nothing either way.
+pub const TX_RELAY_MIN_PEERS: usize = 3;
+
 /// Judge relay from a summary.
 ///
-/// The window is deliberately long. BTX carries roughly ten transactions an
-/// hour network-wide (121 user transactions in 500 blocks, measured
-/// 2026-09-04), so a quiet half hour is ordinary and proves nothing. Six hours
-/// is on the order of sixty transactions; a connected node hearing none of
-/// them is not experiencing a quiet network.
-pub fn judge_tx_relay(s: &TxRelaySummary) -> TxRelayHealth {
-    const MIN_PEERS: usize = 3;
-    const MIN_SECS: i64 = 6 * 3600;
+/// `initial_block_download` is the node's own `getblockchaininfo` flag. A node
+/// in initial block download asks its peers for no transactions at all (it
+/// sends them the same 0.09170997 wall described at [`TX_WALL_BTX_PER_KVB`]),
+/// so hearing none then is by design and says nothing about relay.
+pub fn judge_tx_relay(s: &TxRelaySummary, initial_block_download: bool) -> TxRelayHealth {
     if s.sending_us_tx > 0 {
         return TxRelayHealth::Receiving {
+            peers: s.peers,
             peers_sending: s.sending_us_tx,
             tx_bytes_in: s.tx_bytes_in,
         };
     }
-    if s.peers < MIN_PEERS {
+    if initial_block_download {
         return TxRelayHealth::Unknown {
-            reason: format!("only {} peers connected", s.peers),
+            reason: "The node is still catching up with the chain, and a node takes no \
+                     transactions until it has."
+                .to_string(),
         };
     }
-    if s.longest_connection_secs < MIN_SECS {
+    if s.peers < TX_RELAY_MIN_PEERS {
         return TxRelayHealth::Unknown {
             reason: format!(
-                "connected {} minutes; transactions are rare enough on BTX that this proves nothing yet",
-                s.longest_connection_secs / 60
+                "Only {} peers connected, too few for silence to mean anything.",
+                s.peers
+            ),
+        };
+    }
+    if s.longest_connection_secs < TX_RELAY_WINDOW_SECS {
+        return TxRelayHealth::Unknown {
+            reason: format!(
+                "Connected for {}. Transactions are rare on BTX, so hearing none yet proves \
+                 nothing. This answers after a day.",
+                connected_for(s.longest_connection_secs)
             ),
         };
     }
@@ -899,6 +963,78 @@ pub fn judge_tx_relay(s: &TxRelaySummary) -> TxRelayHealth {
         hours_connected: s.longest_connection_secs / 3600,
         peers_wanting_tx: s.want_tx_from_us,
         priced_out: s.priced_out,
+        peers_open: s.open_to_tx,
+    }
+}
+
+/// "30 minutes", "1 hour", "5 hours".
+fn connected_for(secs: i64) -> String {
+    let secs = secs.max(0);
+    let (n, unit) = if secs < 3600 {
+        (secs / 60, "minute")
+    } else {
+        (secs / 3600, "hour")
+    };
+    if n == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{n} {unit}s")
+    }
+}
+
+/// The status screen's "Transactions" line: whether this node is exchanging
+/// transactions, and when it is not, the likely reason and what to do. Same
+/// shape as the role card's other lines ([`crate::role::RoleLine`]).
+pub fn tx_relay_line(h: &TxRelayHealth) -> crate::role::RoleLine {
+    let (value, helps, note) = match h {
+        TxRelayHealth::Receiving {
+            peers,
+            peers_sending,
+            ..
+        } => (
+            "Exchanging transactions".to_string(),
+            Some(true),
+            format!(
+                "{peers_sending} of {peers} peers have sent this node transactions, so payments \
+                 reach it and it passes them on."
+            ),
+        ),
+        TxRelayHealth::Unknown { reason } => ("Not known yet".to_string(), None, reason.clone()),
+        TxRelayHealth::Isolated {
+            peers,
+            hours_connected,
+            peers_open: 0,
+            ..
+        } => (
+            "Not receiving any".to_string(),
+            Some(false),
+            format!(
+                "None of the {peers} peers takes transactions: they pass only blocks, or are \
+                 still catching up themselves. In {hours_connected} hours no transaction has \
+                 reached this node. Restart the node to find other peers."
+            ),
+        ),
+        TxRelayHealth::Isolated {
+            peers,
+            hours_connected,
+            peers_open,
+            ..
+        } => (
+            "Not receiving any".to_string(),
+            Some(false),
+            format!(
+                "{peers_open} of {peers} peers take transactions, but in {hours_connected} hours \
+                 not one has sent this node any. Either nobody is sending, or those peers do \
+                 not pass them on. Restart the node to find other peers, and if it still says \
+                 this a day later, ask in the BTX Community group."
+            ),
+        ),
+    };
+    crate::role::RoleLine {
+        label: "Transactions",
+        value,
+        helps,
+        note,
     }
 }
 
@@ -1373,13 +1509,14 @@ mod tests {
     /// (btx-esplora-1, btxd 0.34.5, 2026-09-06 01:0x UTC): 22 peers, 14 of
     /// which wanted transactions from us, three advertising a 0.09170997
     /// minimum fee, 39,370 transaction bytes sent to peers and ZERO received
-    /// from any of them.
+    /// from any of them. The oldest connection is set a day and a minute back,
+    /// just past [`TX_RELAY_WINDOW_SECS`], so the silence counts as evidence.
     fn measured_mainnet_peers(now: i64) -> Vec<PeerInfo> {
-        let six_hours_ago = now - 6 * 3600 - 60;
+        let a_day_ago = now - TX_RELAY_WINDOW_SECS - 60;
         serde_json::from_value(serde_json::json!([
             {
                 "id": 1, "addr": "62.238.22.167:19335", "inbound": false, "subver": "/BTX:0.34.5/",
-                "conntime": six_hours_ago, "relaytxes": true, "minfeefilter": 0.09170997,
+                "conntime": a_day_ago, "relaytxes": true, "minfeefilter": 0.09170997,
                 "bytesrecv_per_msg": { "inv": 2726, "block": 91000 },
                 "bytessent_per_msg": { "inv": 2726 }
             },
@@ -1416,25 +1553,37 @@ mod tests {
         );
         assert_eq!(s.taking_our_tx, 1);
         assert_eq!(s.want_tx_from_us, 3);
-        assert_eq!(s.priced_out, 2, "0.0917 BTX/kvB is 9,171 sat per byte");
-        assert_eq!(s.longest_connection_secs, 6 * 3600 + 60);
+        assert_eq!(
+            s.priced_out, 2,
+            "0.0917 BTX/kvB is the initial-download wall"
+        );
+        assert_eq!(
+            s.open_to_tx, 1,
+            "only peer 2 wants transactions at a fee anyone pays"
+        );
+        assert_eq!(s.longest_connection_secs, TX_RELAY_WINDOW_SECS + 60);
     }
 
     #[test]
     fn judge_tx_relay_reports_isolated_on_the_measured_mainnet_shape() {
         let now = 1_788_657_000;
-        let v = judge_tx_relay(&summarize_tx_relay(&measured_mainnet_peers(now), now));
+        let v = judge_tx_relay(
+            &summarize_tx_relay(&measured_mainnet_peers(now), now),
+            false,
+        );
         match v {
             TxRelayHealth::Isolated {
                 peers,
                 hours_connected,
                 peers_wanting_tx,
                 priced_out,
+                peers_open,
             } => {
                 assert_eq!(peers, 4);
-                assert_eq!(hours_connected, 6);
+                assert_eq!(hours_connected, 24);
                 assert_eq!(peers_wanting_tx, 3);
                 assert_eq!(priced_out, 2);
+                assert_eq!(peers_open, 1);
             }
             other => panic!("expected Isolated, got {other:?}"),
         }
@@ -1445,10 +1594,11 @@ mod tests {
         let now = 1_788_657_000;
         let mut peers = measured_mainnet_peers(now);
         peers[3].bytesrecv_per_msg.insert("tx".into(), 3916);
-        let v = judge_tx_relay(&summarize_tx_relay(&peers, now));
+        let v = judge_tx_relay(&summarize_tx_relay(&peers, now), false);
         assert_eq!(
             v,
             TxRelayHealth::Receiving {
+                peers: 4,
                 peers_sending: 1,
                 tx_bytes_in: 3916
             },
@@ -1459,29 +1609,65 @@ mod tests {
     #[test]
     fn judge_tx_relay_will_not_accuse_the_network_before_it_has_watched() {
         let now = 1_788_657_000;
-        // Same peers, all connected half an hour ago. BTX carries ~10
-        // transactions an hour network-wide, so this is silence that proves
+        // Same peers, all connected half an hour ago: silence that proves
         // nothing, and the check must SAY it cannot tell rather than pass.
         let mut peers = measured_mainnet_peers(now);
         for p in peers.iter_mut() {
             p.conntime = now - 1800;
         }
-        match judge_tx_relay(&summarize_tx_relay(&peers, now)) {
-            TxRelayHealth::Unknown { reason } => assert!(reason.contains("30 minutes")),
+        match judge_tx_relay(&summarize_tx_relay(&peers, now), false) {
+            TxRelayHealth::Unknown { reason } => {
+                assert!(reason.contains("30 minutes"), "{reason}")
+            }
             other => panic!("expected Unknown, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn six_quiet_hours_are_not_isolation_on_the_october_network() {
+        // 2026-10-29: on one btxscan.io node not one of the 17 open peers
+        // connected for under six hours had delivered a transaction, while
+        // relay itself was fine. September's six-hour window would have called a healthy
+        // node isolated; the window is a day now.
+        let now = 1_788_657_000;
+        let mut peers = measured_mainnet_peers(now);
+        peers[0].conntime = now - 6 * 3600 - 60;
+        match judge_tx_relay(&summarize_tx_relay(&peers, now), false) {
+            TxRelayHealth::Unknown { reason } => assert!(reason.contains("6 hours"), "{reason}"),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_node_in_initial_block_download_is_not_judged() {
+        // A node catching up asks its peers for no transactions at all, so a
+        // day of silence then is by design, not a relay failure.
+        let now = 1_788_657_000;
+        match judge_tx_relay(&summarize_tx_relay(&measured_mainnet_peers(now), now), true) {
+            TxRelayHealth::Unknown { reason } => {
+                assert!(reason.contains("catching up"), "{reason}")
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        // Transactions that did arrive are still proof, whatever the flag says.
+        let mut peers = measured_mainnet_peers(now);
+        peers[1].bytesrecv_per_msg.insert("tx".into(), 100);
+        assert!(matches!(
+            judge_tx_relay(&summarize_tx_relay(&peers, now), true),
+            TxRelayHealth::Receiving { .. }
+        ));
     }
 
     #[test]
     fn judge_tx_relay_needs_a_real_peer_set_before_it_judges() {
         let now = 1_788_657_000;
         let peers = measured_mainnet_peers(now);
-        match judge_tx_relay(&summarize_tx_relay(&peers[..2], now)) {
+        match judge_tx_relay(&summarize_tx_relay(&peers[..2], now), false) {
             TxRelayHealth::Unknown { reason } => assert!(reason.contains("2 peers")),
             other => panic!("expected Unknown, got {other:?}"),
         }
         assert!(matches!(
-            judge_tx_relay(&summarize_tx_relay(&[], now)),
+            judge_tx_relay(&summarize_tx_relay(&[], now), false),
             TxRelayHealth::Unknown { .. }
         ));
     }
@@ -1500,7 +1686,83 @@ mod tests {
         .unwrap();
         let s = summarize_tx_relay(&peers, now);
         assert_eq!(s.longest_connection_secs, 0);
-        assert!(matches!(judge_tx_relay(&s), TxRelayHealth::Unknown { .. }));
+        assert!(matches!(
+            judge_tx_relay(&s, false),
+            TxRelayHealth::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn the_transactions_line_says_what_is_happening_and_what_to_do() {
+        let receiving = tx_relay_line(&TxRelayHealth::Receiving {
+            peers: 44,
+            peers_sending: 14,
+            tx_bytes_in: 1,
+        });
+        assert_eq!(receiving.label, "Transactions");
+        assert_eq!(receiving.helps, Some(true));
+        assert!(
+            receiving.note.starts_with("14 of 44 peers"),
+            "{}",
+            receiving.note
+        );
+
+        let unknown = tx_relay_line(&TxRelayHealth::Unknown {
+            reason: "Only 2 peers connected, too few for silence to mean anything.".into(),
+        });
+        assert_eq!(
+            unknown.helps, None,
+            "a check that cannot tell must not pass"
+        );
+        assert_eq!(unknown.value, "Not known yet");
+
+        // No peer that takes transactions at all: the peer set is the cause.
+        let walled = tx_relay_line(&TxRelayHealth::Isolated {
+            peers: 8,
+            hours_connected: 30,
+            peers_wanting_tx: 2,
+            priced_out: 2,
+            peers_open: 0,
+        });
+        assert_eq!(walled.helps, Some(false));
+        assert!(
+            walled.note.starts_with("None of the 8 peers"),
+            "{}",
+            walled.note
+        );
+        assert!(walled.note.contains("Restart the node"));
+
+        // Open peers, still silence: say both possible causes, blame neither.
+        let quiet = tx_relay_line(&TxRelayHealth::Isolated {
+            peers: 8,
+            hours_connected: 30,
+            peers_wanting_tx: 6,
+            priced_out: 1,
+            peers_open: 5,
+        });
+        assert_eq!(quiet.helps, Some(false));
+        assert!(
+            quiet.note.starts_with("5 of 8 peers take transactions"),
+            "{}",
+            quiet.note
+        );
+        assert!(quiet.note.contains("30 hours"));
+        for line in [&receiving, &unknown, &walled, &quiet] {
+            assert!(
+                !line.note.contains('\u{2014}'),
+                "no em-dash in operator copy"
+            );
+        }
+    }
+
+    #[test]
+    fn the_wall_threshold_separates_the_values_peers_actually_send() {
+        // The only minfeefilter values 75 peers advertised on 2026-10-29: 0,
+        // the 1 sat/vbyte relay floor, and the initial-download wall.
+        let floor = 0.00001_f64;
+        let wall = 0.09170997_f64;
+        assert!(floor * 100.0 < TX_WALL_BTX_PER_KVB);
+        assert!(wall > TX_WALL_BTX_PER_KVB * 5.0);
     }
     use super::*;
     use crate::rpc::Rpc;

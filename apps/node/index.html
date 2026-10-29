@@ -292,7 +292,10 @@
              screen said it: a key pinned on a trusted mirror signed nothing
              for eleven days (2026-09-03), and a degraded consensus start looks
              like a full node to the person running it. Facts from the engine,
-             sentences from Rust; the script only lays them out. -->
+             sentences from Rust; the script only lays them out. The last
+             line says whether the node exchanges transactions, not just
+             blocks (btx_core::node_api::tx_relay_line), since a node can pass
+             every other check here and never receive one. -->
         <div class="card role-card" id="role-card" hidden>
           <div class="role-head">Your node's role</div>
           <ul class="role-lines" id="role-lines"></ul>

@@ -6,6 +6,36 @@ in `apps/node/package.json` / `apps/node/src-tauri/tauri.conf.json`. BTX Node
 versions independently of the easyBTX miner (that changelog lives at the repo
 root).
 
+## [Unreleased]
+
+**Your node now says whether it is exchanging transactions, not just
+blocks.** A node can be synced, well connected and serving blocks, and still
+never receive a transaction from anyone. On 6 September that was the real
+state of two public BTX nodes: 21 of 22 peers had never sent one, and valid
+transactions waited four days while blocks were mined empty. Nothing said so,
+because nothing was measuring it. "Your node's role" now ends with a
+Transactions line, read straight from the per-peer message counters the app
+already fetches each tick, so it costs nothing extra. It says "Exchanging
+transactions" when any peer has sent one, and "Not receiving any" when none has
+in a day, with the likely reason: no peer takes transactions at all (they pass
+only blocks, or are still catching up themselves), or peers take them and none
+has arrived. Either way it says to restart the node to find other peers.
+
+Until it can tell, it says "Not known yet" and why: under three peers, a node
+still catching up (which asks for no transactions by design), or connected for
+less than a day. A day, not the six hours this check was first written with:
+re-measured on 29 October on the two v0.34.15 nodes behind btxscan.io, relay
+itself was working (14 of 44 and 16 of 31 peers had sent transactions), but the
+network was quiet enough that not one of the 17 peers connected under six hours
+to one of them, all willing to take transactions, had sent any. After a day, 21
+of 22 such peers across both nodes had. Six hours would have called a healthy
+node cut off. The same reading shows what the 9,171 sat per byte "fee" a few peers
+advertise really is: it is the value a node sends while it is still in initial
+block download, and every peer showing it ran an old engine (0.31 to 0.33, one
+0.34.10). They take no transactions, and the line counts them as such.
+
+The local service report carries the same verdict as `tx_relay` (schema 3).
+
 ## [0.7.16] - 2026-10-18 · linux + windows (mac follows when built)
 
 **Jarek confirms chain snapshots, so a new node can start about a day from
