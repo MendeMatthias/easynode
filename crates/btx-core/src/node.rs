@@ -149,8 +149,9 @@ pub const BTX_BOOTSTRAP_PEERS: &[&str] = &[
     // seconds apart, eight-second timeout, refused on all three. Corroborated
     // by the easybtx.com census, which lists this seed as down with 0% uptime
     // over its stored history. Its noban grant in BTX_LIVE_BODY_SOURCE_IPS
-    // stays, as the two retired above kept theirs. Put it back the day a real
-    // node handshakes it again, with that reading.
+    // stayed until 2026-10-29 and is now revoked with the two above (see
+    // BTX_REVOKED_WHITELIST_IPS). Put it back the day a real node handshakes
+    // it again, with that reading, and the grant with it.
     //
     //   "89.85.40.184:19335"  0/3 refused — 2026-10-01
     // 139.59.106.83 REMOVED 2026-09-01. Three independent confirmations that it
@@ -315,7 +316,8 @@ pub const BTX_ARCHIVE_PEERS: &[&str] = &[
     // three TCP attempts, four seconds apart, eight-second timeout, 0/3. It
     // goes now because btx-sentinel, the box watcher, dials every shipped seed
     // and would otherwise alarm on it every hour. Its noban grant in
-    // BTX_ARCHIVE_WHITELIST_IPS stays, as the retired seeds kept theirs. With
+    // BTX_ARCHIVE_WHITELIST_IPS stayed until 2026-10-29 and is now revoked
+    // (see BTX_REVOKED_WHITELIST_IPS for why a dead host's grant goes). With
     // it gone, btxscan's mirror above is the ONLY archive this app ships,
     // which is worth knowing before anyone reasons about how many we have.
     // Put it back the day a real node handshakes it again, with that reading.
@@ -466,19 +468,30 @@ pub fn manual_peers() -> Vec<&'static str> {
 /// incoming-only, and the connection addnode creates is OUTGOING — a bare
 /// whitelist therefore does nothing for it. `noban` is what turns an ordinary
 /// consensus/archive peer into a preferred-download + attestation-authority
-/// peer on a trusted mirror. Whitelist takes IPs, not hostnames, so the DNS
-/// archives appear here by their resolved IPs (resolution 2026-08-17:
-/// node.btx.dev=146.190.179.86, node.btxchain.org=206.189.253.106,
-/// node.btx.tools=164.90.246.229). A stale IP line is harmless — it simply
-/// matches no peer.
+/// peer on a trusted mirror. Whitelist takes IPs, not hostnames.
+///
+/// ONLY LIVE, SHIPPED PEERS. Every entry here must be the host of a peer in
+/// [`block_source_peers`]; `noban_grants_only_name_shipped_block_sources`
+/// fails the build otherwise. This list used to say "a stale IP line is
+/// harmless, it simply matches no peer", and on that reasoning a retired
+/// archive kept its grant. That holds only while nobody else holds the
+/// address. Cloud and residential IPs get reassigned, and whoever gets one of
+/// these next would get ban immunity on inbound and outbound connections,
+/// preferred block download on a trusted mirror, and attestation authority the
+/// moment it advertised the archive bit, from every install, with nothing on
+/// screen. A dead host's grant buys us nothing while it is dead, so it goes
+/// when the peer goes, into [`BTX_REVOKED_WHITELIST_IPS`].
 pub const BTX_ARCHIVE_WHITELIST_IPS: &[&str] = &[
-    // btxscan.io's mirror, the archive peer added 2026-09-24 (BTX_ARCHIVE_PEERS).
+    // btxscan.io's two nodes on one box, 19338 (mirror, added 2026-09-24) and
+    // 19335 (full node, added 2026-10-10), both in BTX_ARCHIVE_PEERS. One
+    // grant covers both ports.
     "20.86.181.203",
-    "207.56.229.99",
-    // Left BTX_ARCHIVE_PEERS 2026-10-03, measured dead; the grant stays.
-    "37.230.134.222",
-    "114.150.94.235",
-    "195.137.245.82",
+    // 207.56.229.99, 114.150.94.235 and 195.137.245.82 (0/3 since 2026-09-08)
+    // and 37.230.134.222 (refused since 2026-09-12, left BTX_ARCHIVE_PEERS
+    // 2026-10-03) were here, measured dead, until 2026-10-29. Their grants are
+    // revoked; see BTX_REVOKED_WHITELIST_IPS. Put one back together with its
+    // peer entry, the day a real node handshakes it again.
+    //
     // 146.190.179.86, 206.189.253.106 and 164.90.246.229 left on 2026-09-09.
     // They are node.btx.dev, node.btxchain.org and node.btx.tools, which are
     // discovery relays rather than archives (see BTX_DISCOVERY_PEERS), and this
@@ -511,17 +524,56 @@ pub const BTX_ARCHIVE_WHITELIST_IPS: &[&str] = &[
 ///
 /// The managed block is rewritten on every start, so an address that leaves
 /// this list loses its grant at the next launch, same as an archive.
+///
+/// EMPTY SINCE 2026-10-29. All three entries had already left
+/// [`BTX_BOOTSTRAP_PEERS`] measured dead, and the same rule as
+/// [`BTX_ARCHIVE_WHITELIST_IPS`] applies: a grant lives only as long as its
+/// peer is shipped. The list stays, empty, because the job it describes is
+/// real. Adding the current head seed here is a new grant and the owner's
+/// call, not a cleanup.
 pub const BTX_LIVE_BODY_SOURCE_IPS: &[&str] = &[
-    // LuckyPool, measured 2026-09-08 handshaking with CONSENSUS +
-    // ATTESTATION_ARCHIVE (see BTX_BOOTSTRAP_PEERS for the full reading).
+    // Were here until 2026-10-29, revoked (BTX_REVOKED_WHITELIST_IPS):
+    //   "213.224.31.105"  LuckyPool, measured 2026-09-08 with CONSENSUS +
+    //                     ATTESTATION_ARCHIVE; onetry 300 s, no peer, 2026-09-12
+    //   "13.140.141.180"  answered getdata for the live branch's first block
+    //                     2026-09-05; 0/3 ConnectionRefused 2026-09-11
+    //   "89.85.40.184"    served the validator's 383-block reorganisation
+    //                     2026-09-05; 0/3 refused 2026-10-01
+];
+
+/// Every IP this app has ever granted `noban` that it no longer grants.
+///
+/// The managed conf block already drops these on the next start. This list is
+/// for the other copy: the append-only 0.6.7 candidate wrote bare
+/// `whitelist=in,out,noban@<ip>` lines OUTSIDE the block, and
+/// `setup::set_managed_whitelist_block` only claims such a line while its IP is
+/// still asserted. The moment an IP leaves the constants, its old bare line
+/// would read as the operator's own and keep the grant forever on exactly the
+/// installs that ran that build. A same-format line for an IP listed here is
+/// therefore removed, wherever it sits in the conf.
+///
+/// Reconstructed 2026-10-29 from every revision of the two grant lists above:
+/// together with 20.86.181.203 (still granted) these are all eleven public IPs
+/// they ever held. Append when a grant goes; never remove an entry unless the
+/// IP is granted again (`revoked_noban_ips_are_not_shipped_or_granted`
+/// enforces that).
+pub const BTX_REVOKED_WHITELIST_IPS: &[&str] = &[
+    // Archives, measured dead: 0/3 since 2026-09-08 (first three) and refused
+    // since 2026-09-12 (37.230.134.222). Revoked 2026-10-29.
+    "207.56.229.99",
+    "114.150.94.235",
+    "195.137.245.82",
+    "37.230.134.222",
+    // Live body sources, measured dead 2026-09-11..10-01. Revoked 2026-10-29.
     "213.224.31.105",
-    // The one node found on the live chain 2026-09-05 19:49Z that answered
-    // getdata for the live branch's first block with the body.
     "13.140.141.180",
-    // Served the validator's whole 383-block reorganisation on 2026-09-05
-    // after it was dialled as a manual peer, having been banned by this side's
-    // own getmmattest hammer earlier the same day.
     "89.85.40.184",
+    // node.btx.dev, node.btxchain.org, node.btx.tools as resolved 2026-08-17:
+    // discovery relays, grant dropped from the constants 2026-09-09. Listed so
+    // the legacy bare lines go too.
+    "146.190.179.86",
+    "206.189.253.106",
+    "164.90.246.229",
 ];
 
 /// Every noban-whitelist target for THIS start: the pinned archive IPs, the
@@ -8134,7 +8186,8 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
         // signatures for the tip, 227,400 and 227,313 on request.
         // 2026-10-03: 2 became 1. 37.230.134.222 has refused since 2026-09-12
         // 23:31Z and refused again 0/3 from the Mac at 23:35Z, and btx-sentinel
-        // would otherwise alarm on it every hour. Its noban grant stays.
+        // would otherwise alarm on it every hour. Its noban grant stayed
+        // until 2026-10-29 (see the assertion below).
         // 2026-10-10: 1 became 2. 20.86.181.203:19335, btxscan's full node on
         // the same box: services 0x82000d09 (NETWORK and
         // MATMUL_ATTESTATION_ARCHIVE), served block 150,000 and `02d5efca`'s
@@ -8145,9 +8198,14 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
             "btxscan's two nodes are the measured archives; adding one needs a \
              reading, not a hostname"
         );
+        // 2026-10-29: this used to assert the opposite, that a retired
+        // archive keeps its grant. A dead host's IP can be handed to someone
+        // else, who would then hold noban on every install; the grant goes
+        // with the peer now (BTX_ARCHIVE_WHITELIST_IPS says why).
         assert!(
-            BTX_ARCHIVE_WHITELIST_IPS.contains(&"37.230.134.222"),
-            "a retired archive keeps its noban grant, as the retired seeds kept theirs"
+            !BTX_ARCHIVE_WHITELIST_IPS.contains(&"37.230.134.222")
+                && BTX_REVOKED_WHITELIST_IPS.contains(&"37.230.134.222"),
+            "a retired archive loses its noban grant with its peer entry"
         );
         // A tripwire, not a fact about the network: pinned so that adding or
         // dropping a seed cannot pass unnoticed. 2026-09-05: 9 became 7 — one
@@ -8275,6 +8333,89 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), ips.len(), "no duplicate whitelist targets");
+    }
+
+    fn peer_host(peer: &str) -> &str {
+        peer.rsplit_once(':').map(|(h, _)| h).unwrap_or(peer)
+    }
+
+    /// A noban grant names a peer this build actually dials for blocks, or it
+    /// does not exist. Retiring a seed from the peer lists without dropping
+    /// its grant used to be the norm ("a stale IP line is harmless"); it is
+    /// not, because the IP can be handed to someone else and the grant goes
+    /// with it. This makes that drift fail the build instead of a review.
+    #[test]
+    fn noban_grants_only_name_shipped_block_sources() {
+        let hosts: Vec<&str> = block_source_peers().into_iter().map(peer_host).collect();
+        for ip in BTX_ARCHIVE_WHITELIST_IPS
+            .iter()
+            .chain(BTX_LIVE_BODY_SOURCE_IPS.iter())
+        {
+            assert!(
+                hosts.contains(ip),
+                "{ip} holds a noban grant but is not a shipped block source \
+                 ({hosts:?}); retire the grant with the peer, into \
+                 BTX_REVOKED_WHITELIST_IPS"
+            );
+        }
+        let resolved = resolve_managed_whitelist_ips();
+        for ip in BTX_REVOKED_WHITELIST_IPS {
+            assert!(
+                !resolved.iter().any(|r| r == ip),
+                "revoked {ip} is still asserted: {resolved:?}"
+            );
+        }
+    }
+
+    /// The revocation list only ever names IPs this build does not ship: an
+    /// entry that is also a live peer or a live grant would strip that peer's
+    /// legacy line while the block re-adds it, which is confusing at best,
+    /// and almost certainly means someone put a peer back without taking it
+    /// off this list.
+    #[test]
+    fn revoked_noban_ips_are_not_shipped_or_granted() {
+        let shipped: Vec<&str> = BTX_BOOTSTRAP_PEERS
+            .iter()
+            .chain(BTX_ARCHIVE_PEERS.iter())
+            .map(|p| peer_host(p))
+            .collect();
+        for ip in BTX_REVOKED_WHITELIST_IPS {
+            assert!(
+                ip.parse::<std::net::IpAddr>().is_ok(),
+                "{ip} is not an IP literal"
+            );
+            assert!(
+                !shipped.contains(ip),
+                "revoked {ip} is a shipped peer again"
+            );
+            assert!(
+                !BTX_ARCHIVE_WHITELIST_IPS.contains(ip) && !BTX_LIVE_BODY_SOURCE_IPS.contains(ip),
+                "revoked {ip} is granted again"
+            );
+        }
+        // Every IP the grant lists ever held (2026-10-29 reconstruction from
+        // git history) is either still granted or revoked: nothing fell out
+        // of both lists, which is what would leave a legacy line behind.
+        for ip in [
+            "20.86.181.203",
+            "207.56.229.99",
+            "114.150.94.235",
+            "195.137.245.82",
+            "37.230.134.222",
+            "213.224.31.105",
+            "13.140.141.180",
+            "89.85.40.184",
+            "146.190.179.86",
+            "206.189.253.106",
+            "164.90.246.229",
+        ] {
+            assert!(
+                BTX_ARCHIVE_WHITELIST_IPS.contains(&ip)
+                    || BTX_LIVE_BODY_SOURCE_IPS.contains(&ip)
+                    || BTX_REVOKED_WHITELIST_IPS.contains(&ip),
+                "{ip} was once granted noban and is now in neither list"
+            );
+        }
     }
 
     /// DRIFT GUARDS for the keeper's generated conf (keeper/install-btx-keeper.sh).

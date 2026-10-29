@@ -469,8 +469,11 @@ pub const WHITELIST_BLOCK_END: &str = "# END easybtx-managed archive whitelist";
 ///
 /// Migration/dedupe: bare `whitelist=in,out,noban@<ip>` lines OUTSIDE the
 /// block are claimed into it when their ip is one we are asserting anyway
-/// (what the append-only version wrote); every other whitelist line is the
-/// operator's and survives untouched. An unterminated block (BEGIN without
+/// (what the append-only version wrote). The same-format line for an IP in
+/// [`crate::node::BTX_REVOKED_WHITELIST_IPS`] is dropped outright: it is a
+/// grant this app wrote and has since revoked, and keeping it would undo the
+/// revocation on every install that ran the append-only build. Every other
+/// whitelist line is the operator's and survives untouched. An unterminated block (BEGIN without
 /// END — a truncated write) is treated as ours to the end of file.
 pub fn set_managed_whitelist_block(conf_path: &Path, ips: &[String]) -> AppResult<()> {
     // Hold the conf lock across the WHOLE read-modify-write: reading before
@@ -507,6 +510,9 @@ pub fn set_managed_whitelist_block(conf_path: &Path, ips: &[String]) -> AppResul
         if let Some(ip) = t.strip_prefix("whitelist=in,out,noban@") {
             if ips.iter().any(|i| i == ip) {
                 continue; // claimed into the managed block (dedupe)
+            }
+            if crate::node::BTX_REVOKED_WHITELIST_IPS.contains(&ip) {
+                continue; // a grant this app once wrote and has since revoked
             }
         }
         out.push(l.to_string());
@@ -1177,6 +1183,44 @@ mod tests {
         let f = std::fs::read_to_string(&fresh).unwrap();
         assert!(f.lines().any(|l| l == "whitelist=in,out,noban@9.9.9.9"));
         assert!(f.starts_with(WHITELIST_BLOCK_BEGIN));
+    }
+
+    /// A legacy bare line for a REVOKED grant goes, even though its IP is no
+    /// longer asserted. Without this, an install that ran the append-only
+    /// build keeps noban for a retired archive forever: the line would read as
+    /// the operator's. Operator lines in another format, or for other IPs,
+    /// still survive.
+    #[test]
+    fn managed_whitelist_block_drops_legacy_lines_for_revoked_ips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conf = tmp.path().join("faststart.conf");
+        std::fs::write(
+            &conf,
+            "server=1\n\
+             whitelist=in,out,noban@207.56.229.99\n\
+             whitelist=in,out,noban@37.230.134.222\n\
+             whitelist=in,out,noban@89.85.40.184\n\
+             whitelist=noban@37.230.134.222\n\
+             whitelist=in,out,noban@192.168.1.50\n",
+        )
+        .unwrap();
+        set_managed_whitelist_block(&conf, &ips(&["20.86.181.203"])).unwrap();
+        let s = std::fs::read_to_string(&conf).unwrap();
+        for gone in ["207.56.229.99", "89.85.40.184"] {
+            assert!(!s.contains(gone), "revoked {gone} must not survive: {s}");
+        }
+        assert!(
+            !s.contains("whitelist=in,out,noban@37.230.134.222"),
+            "revoked same-format line goes: {s}"
+        );
+        assert!(
+            s.contains("whitelist=noban@37.230.134.222"),
+            "an operator line in another format is theirs: {s}"
+        );
+        assert!(s.contains("whitelist=in,out,noban@192.168.1.50"));
+        assert!(s
+            .lines()
+            .any(|l| l == "whitelist=in,out,noban@20.86.181.203"));
     }
 
     /// THE POINT of the managed block: dropping an IP from the list revokes
