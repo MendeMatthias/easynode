@@ -136,8 +136,11 @@ shielded_check() {
     | grep -oE '[0-9a-f]{64}' | head -1 || true)"
   [ -n "$compiled" ] || die "could not read MAINNET_SHIELDED_COMMITMENT from $CONFIRMED_RS" \
     "Its shape changed. FIX THIS GUARD, do not delete it and do not skip it."
+  # v0.34.16 (074dac16) wraps the same literal in consteval_ctor(...): the
+  # spelling changed, the commitment did not. Accept exactly that wrapper and
+  # nothing looser, so any other shape still reads as "found none" and fails.
   newest="$(awk '/^class CMainParams/{m=1} m && /^};/{exit} m' "$FILE" \
-    | grep -oE 'shielded_state_commitment = uint256\{"[0-9a-f]{64}"\}' \
+    | grep -oE 'shielded_state_commitment = (consteval_ctor\()?uint256\{"[0-9a-f]{64}"\}' \
     | tail -1 | grep -oE '[0-9a-f]{64}' || true)"
   [ -n "$newest" ] || die "found no mainnet shielded_state_commitment in $CHAINPARAMS for $TAG" \
     "Either CMainParams moved or its assumeutxo entries changed shape. Read the file by hand."
