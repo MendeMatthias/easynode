@@ -248,6 +248,14 @@ jobs:
           # $ORIGIN rpath. The script's FINAL verification deliberately runs
           # under `env -u LD_LIBRARY_PATH`, so self-containment is still proved
           # without this crutch — it only has to get the walk started.
+          #
+          # That describes the artifact pinned above (v0.34.15: raw build
+          # output plus cuBLASLt). An artifact from btxd-linux.yml as it is
+          # now needs none of it: its lib/ is the complete closure, its
+          # binaries already carry their run path, and from 0.34.16 it holds
+          # the Python runtime btxd embeds (lib/python3.X). The staging script
+          # takes that lib/ whole, so what ships is what the engine build
+          # started in a clean container. The export below is then harmless.
           if [ -d btxd-dist/lib ]; then
             export LD_LIBRARY_PATH="$PWD/btxd-dist/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             echo "loader path for staging: $LD_LIBRARY_PATH"
@@ -562,7 +570,12 @@ jobs:
               echo "::error::$(basename "$f") needs GLIBC_$fv > $CEIL"
               rc=1
             fi
-          done < <(find "$pkg/bin" -maxdepth 2 -type f \( -name 'btxd' -o -name 'btx-cli' -o -name '*.so*' \))
+          done < <(find "$pkg/bin" -type f \( -name 'btxd' -o -name 'btx-cli' -o -name '*.so*' \))
+          # ^ no -maxdepth: from 0.34.16 the package also holds Python
+          # extension modules, three directories below bin/lib
+          # (bin/lib/python3.X/lib-dynload and site-packages). A walk that
+          # stopped at bin/lib would call the package checked without ever
+          # looking at them.
           # A find that matches nothing would otherwise leave rc=0 and print a
           # cheerful OK, so an empty walk has to be the failure it actually is.
           # btxd and btx-cli are always present; vendored .so files may not be.

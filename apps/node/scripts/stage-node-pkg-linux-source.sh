@@ -20,6 +20,18 @@
 # ⚠ -DWITH_MODELNET=OFF from 0.34.7 on: upstream defaults the model network ON,
 #   and ON refuses to configure below OpenSSL 3.5, which 22.04 does not have.
 #
+# ⚠ From 0.34.16 btxd embeds Python for its SwapNet worker (cmake/SwapNet.cmake)
+#   and there is no switch for it: the build needs a Python >= 3.11 WITH headers
+#   and the `cryptography` module, and 22.04's own Python is 3.10. Add
+#   -DPython3_EXECUTABLE=<that python> to the line above. btxd then links
+#   libpython3.X, also when run with -swapnet=0, so the package has to carry
+#   that library, its standard library and cryptography. This script does that:
+#   from an engine artifact it takes the runtime the engine build already
+#   bundled and tested (lib/python3.X next to btxd), from a hand build it
+#   bundles the interpreter that owns the libpython btxd resolves to.
+#   .github/workflows/btxd-linux.yml is the worked example, including the
+#   pinned interpreter and the pinned cryptography wheel.
+#
 # ⚠ Boost headers are needed even with BUILD_TESTS=OFF; pass
 #   -DBoost_INCLUDE_DIR=<prefix>/usr/include if they are not on a system path.
 #   libevent is resolved through a CMake CONFIG package first and only falls
@@ -98,82 +110,37 @@ if [[ -n "$EXPECT" ]] && ! "$SRC_BIN/btxd" --version 2>/dev/null | grep -q "$EXP
   exit 1
 fi
 
-rm -rf "$DEST"; mkdir -p "$DEST/bin" "$DEST/bin/lib"
-cp "$SRC_BIN/btxd" "$SRC_BIN/btx-cli" "$DEST/bin/"
-chmod +x "$DEST/bin/btxd" "$DEST/bin/btx-cli"
-LIBDIR="$DEST/bin/lib"
-
-# ── Vendor the non-system shared-library closure ───────────────────────────
-# Upstream's release ELFs are fully static; a local build is generally NOT —
-# it picks up whatever libevent/sqlite the build host had. A user's machine
-# may have neither, and certainly not at our build prefix's path.
+# ── Stage: binaries, shared-library closure, Python runtime, run paths ─────
+# A source build is not static: it picks up whatever libevent, sqlite and zmq
+# the build host had, cuBLASLt from the CUDA toolkit, and from 0.34.16
+# libpython. A user's machine may have none of them, so everything that is not
+# glibc or the C++ runtime travels in bin/lib/ and every ELF finds it through
+# an $ORIGIN run path.
 #
-# "System" = the glibc/gcc runtime every glibc Linux already has. Anything
-# else (libevent, libsqlite3, and whatever those pull in) travels with us.
-# Same transitive fixed-point walk as the macOS script: a vendored .so can
-# itself pull another.
-is_system_lib() {
-  case "$1" in
-    libc.so.*|libm.so.*|libdl.so.*|librt.so.*|libpthread.so.*|libresolv.so.*|\
-    libgcc_s.so.*|libstdc++.so.*|libatomic.so.*|ld-linux*.so.*|linux-vdso.so.*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# ldd lines look like `libfoo.so.1 => /path/to/libfoo.so.1 (0x…)`. Emit only
-# resolved absolute paths of non-system libraries.
-nonsystem_deps() {
-  ldd "$1" 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "=>" && $(i+1) ~ /^\//) print $1, $(i+1) }' \
-    | while read -r soname path; do is_system_lib "$soname" || echo "$path"; done
-}
-
-changed=1
-while [[ $changed -eq 1 ]]; do
-  changed=0
-  while IFS= read -r dep; do
-    [[ -z "$dep" ]] && continue
-    base="$(basename "$dep")"
-    if [[ ! -f "$LIBDIR/$base" ]]; then
-      cp -L "$dep" "$LIBDIR/$base"; chmod u+w "$LIBDIR/$base"; changed=1
-    fi
-  done < <({ for b in "$DEST"/bin/btxd "$DEST"/bin/btx-cli; do nonsystem_deps "$b"; done
-             for l in "$LIBDIR"/*.so*; do [[ -f "$l" ]] && nonsystem_deps "$l"; done; } | sort -u)
-done
-
-VENDORED="$(find "$LIBDIR" -maxdepth 1 -name '*.so*' -type f | wc -l | tr -d ' ')"
-
-# Executables live in bin/ and their libs in bin/lib/, so the binaries look at
-# $ORIGIN/lib; the vendored libs share one directory and look at $ORIGIN.
-# RUNPATH (the patchelf default) is NOT inherited by a dependency's own
-# lookups, which is exactly why the libs need their own entry.
-if [[ "$VENDORED" -gt 0 ]]; then
-  for b in "$DEST"/bin/btxd "$DEST"/bin/btx-cli; do
-    patchelf --set-rpath '$ORIGIN/lib' "$b"
-  done
-  for l in "$LIBDIR"/*.so*; do
-    [[ -f "$l" ]] && patchelf --set-rpath '$ORIGIN' "$l"
-  done
-else
-  rmdir "$LIBDIR"
+# The code is in lib/engine-runtime-linux.sh and NOT here, because the engine
+# build (.github/workflows/btxd-linux.yml) has to produce this same tree in
+# order to start it on a clean machine before it uploads it. When the source is
+# such an artifact, its lib/ is taken whole: the libraries and the Python
+# runtime staged below are then the files that build tested, not look-alikes
+# from this machine.
+# shellcheck source=lib/engine-runtime-linux.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/engine-runtime-linux.sh"
+rm -rf "$DEST"; mkdir -p "$DEST"
+engine_stage_tree "$SRC_BIN" "$DEST/bin"
+LIBDIR="$DEST/bin/lib"
+VENDORED=0
+if [[ -d "$LIBDIR" ]]; then
+  VENDORED="$(find "$LIBDIR" -maxdepth 1 -name '*.so*' -type f | wc -l | tr -d ' ')"
 fi
 
-# ── Sanity: nothing unresolved, nothing reaching outside the tree ──────────
-# Checked with an EMPTY LD_LIBRARY_PATH so a path the build host happens to
-# export cannot mask a missing dependency on a user's machine.
-for b in "$DEST"/bin/btxd "$DEST"/bin/btx-cli; do
-  if out="$(env -u LD_LIBRARY_PATH ldd "$b" 2>&1)" && echo "$out" | grep -q "not found"; then
-    echo "error: $b has unresolved libraries:" >&2
-    echo "$out" | grep "not found" >&2
-    exit 1
-  fi
-  while IFS= read -r p; do
-    case "$p" in
-      "$DEST"/*|/lib/*|/lib64/*|/usr/lib/*|/usr/lib64/*) ;;
-      *) echo "error: $b still resolves $p from outside the staged tree." >&2; exit 1 ;;
-    esac
-  done < <(env -u LD_LIBRARY_PATH ldd "$b" 2>/dev/null \
-             | awk '{ for (i = 1; i <= NF; i++) if ($i == "=>" && $(i+1) ~ /^\//) print $(i+1) }')
-done
+# ── Sanity: every ELF in the tree, not only the two binaries ───────────────
+# Nothing unresolved, nothing but glibc and the C++ runtime taken from outside
+# the tree, no run path of the build machine, and nothing that needs a glibc
+# newer than Ubuntu 22.04's 2.35. Checked without LD_LIBRARY_PATH so a path the
+# build host happens to export cannot mask a library missing on a user's
+# machine. One line per file is printed: that table is the record of what the
+# package asks of the machine it lands on.
+engine_check_tree "$DEST/bin"
 
 # Declare which btxd this package carries. The install tag and the reported
 # version legitimately differ for branch builds (BTX's 0.33.3 PR never bumped
@@ -203,6 +170,10 @@ env -u LD_LIBRARY_PATH "$DEST/bin/btxd" --version | head -1
 if [[ "$VENDORED" -gt 0 ]]; then
   echo "==> self-contained: vendored $VENDORED shared object(s), RPATH \$ORIGIN/lib"
   (cd "$LIBDIR" && ls -1 *.so* | sed 's/^/    /')
+  for py in "$LIBDIR"/python3.*; do
+    [[ -d "$py" ]] || continue
+    echo "==> embedded Python runtime: bin/lib/$(basename "$py") ($(du -sh "$py" | cut -f1), $(find "$py" -type f | wc -l | tr -d ' ') files)"
+  done
 else
   echo "==> self-contained: no non-system shared libraries to vendor"
 fi
