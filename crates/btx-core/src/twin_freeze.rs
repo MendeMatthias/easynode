@@ -1346,6 +1346,11 @@ mod tests {
     fn only_engines_before_0_35_need_it() {
         assert!(engine_needs_it("v0.34.15"));
         assert!(engine_needs_it("v0.34.15-476f3f23"));
+        // v0.34.16 (074dac16) does not fix #280, and the log lines this
+        // module reads are byte-identical there.
+        assert!(engine_needs_it("v0.34.16"));
+        assert!(engine_needs_it("v0.34.16-074dac16"));
+        assert!(engine_needs_it("v0.34.17"));
         assert!(!engine_needs_it("v0.35.0"));
         assert!(!engine_needs_it("v0.35.0rc1"));
         assert!(!engine_needs_it("v0.35.0-rc1"));

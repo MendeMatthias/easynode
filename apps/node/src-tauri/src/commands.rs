@@ -398,19 +398,119 @@ use crate::state::{
 // for 0.34.15; the archive hashes the staging scripts pin are GitHub's asset
 // digests, which equal the ones numair lists on PR 223.
 //
-// THE INSTALL KEY IS `v0.34.15`, bare, equal to what btxd reports. No release
-// ever used it, so every install re-provisions on update and fetches the
+// THE INSTALL KEY WAS `v0.34.15`, bare, equal to what btxd reports. No release
+// ever used it, so every install re-provisioned on update and fetched the
 // engine once.
-pub const NODE_RELEASE_TAG: &str = "v0.34.15";
+//
+// ── 2026-11-25: v0.34.16, THE SAME NODE ON UPSTREAM'S FINAL 0.34 TAG ────────
+//
+// Tag `v0.34.16` = `074dac167c26c1e091198f691ed5727817dba88a`, GitHub "Latest"
+// on 2026-11-25. ⚠ THE TAG MOVED, SO THE SHA IS THE PIN. Upstream first cut
+// `v0.34.16` at `d27530af` and then moved the tag to 074dac16 ("release: keep
+// the CPython termios extension out of the Linux archive"). A clone that
+// fetched the tag before the move still resolves `v0.34.16` to d27530af, so
+// nothing here, in the guards or in CI may resolve this engine by tag name.
+// Not 0.34.17: on 2026-11-25 that is a prerelease upstream has re-cut three
+// times, its sums are unsigned, trusted-mirror defects are open against it, and
+// it turns SwapNet on by default.
+//
+// This move is PARITY: the same roles and the same launch posture on the newer
+// engine, nothing switched on. What the engine adds (SwapNet, the model
+// network's swarm) stays off; turning any of it on is a later release.
+//
+// Read at the SHA against v0.34.15, 2026-11-25:
+//
+// * No consensus change. chainparams.cpp gains `vModelSeeds.clear()` and the
+//   `consteval_ctor` spelling on the assumeutxo rows' shielded commitments,
+//   and nothing else: no height, no checkpoint, no assumeutxo base. The
+//   newest bases are still 219000 and 228000, so snapshot_spec() stays on
+//   219000 for the reasons given under 0.34.12. PROTOCOL_VERSION is 800002 and
+//   MIN_PEER_PROTO_VERSION 800001, both unchanged. `6b94704b` (the 32-byte HTLC
+//   rule on all three leaves) is an ancestor.
+// * No option removed: 453 registered at v0.34.15, 460 here. Every flag this
+//   app passes and every conf key it writes is still registered. Added:
+//   -swapnet, -swapnetwallet, -swapnetowner, -offerattestedutxosnapshot,
+//   -offerattestedutxosnapshotmanifest, -lightwatchdir, and -modellandiscovery
+//   (model-network builds only).
+// * `-swapnet` defaults to 0 at this commit (swapnet/node.cpp:96, :106) and to
+//   1 on 0.34.17. crates/btx-core/src/node.rs passes `-swapnet=0` to every
+//   engine at 0.34.16 or newer, gated on the tag in the install path because
+//   0.34.15 refuses the unknown argument.
+//   `the_pinned_engine_launches_with_swapnet_off_and_no_model_flag` holds it.
+// * Two arguments became fatal: an unknown `-resourcegovernor` value
+//   (and so `-noresourcegovernor`), and `-v2pqonly` without v2 transport. The
+//   app passes neither, and passes `-v2transport=1`.
+// * `-autoupdate` still defaults to 1 on mainnet (node/autoupdate.cpp:1434;
+//   new: 0 behind `-proxy` or an `-onlynet` without ipv4 and ipv6), so the
+//   launch keeps `-autoupdate=0`. `-reorgpolicy=legacy` and `-parkdeepreorg=0`
+//   stay as they are; an unset `-reorgpolicy` is still legacy.
+// * The trusted-mirror rule is unchanged: N>=2 and M>=2 on mainnet unless
+//   `-allowsinglekeytrustedmirror=1`, which the mirror arm still passes.
+// * No datadir migration, and no RPC removed. No result field was removed from
+//   any call this app makes: rpc/net.cpp changes only addminingpeermeshnode;
+//   getblockchaininfo, getchaintips, dumptxoutset and dumptxoutsetattested are
+//   untouched; getmatmultrustedstatus is unchanged; the blocklist calls gain
+//   `blocked_pq_pubkeys` and `persisted`.
+//
+// ⚠ `signutxosnapshotmanifest` NO LONGER SIGNS BLINDLY (upstream PR 225,
+// commit af9020cd, an ancestor of this tag). It refuses a tip without the ExactReplay bit, rebuilds the
+// statement from the node's OWN ACTIVE TIP by exporting the UTXO set into
+// `<datadir>/utxo-snapshot-sign/`, and signs only when every field of the
+// manifest it was handed equals that (rpc/blockchain.cpp:4673-4800). So it
+// signs a statement only while the node's tip IS the statement's block. What
+// that means here:
+//   - The producer (btx_core::snapshot_serve) is untouched: it calls
+//     `dumptxoutsetattested` at its own tip, which did not change.
+//   - Loading is untouched: confirmed_snapshot.rs and confirmed_load.rs check
+//     manifests in Rust and load through `loadtxoutsetattested`.
+//   - The confirmer (btx_core::snapshot_confirmer, and the btx-confirmer
+//     binary) can no longer co-sign or dissent. It signs a statement 144
+//     blocks deep, and a dissent with zeroed file fields; on this engine both
+//     answer "Refusing to sign manifest: consensus fields do not match this
+//     node's active-chain statement", after the engine has written and
+//     deleted a full UTXO export for nothing. Nothing wrong gets signed; the
+//     round counts a failure and repeats ten minutes later. Snapshots are
+//     confirmed today by two PRODUCERS cutting the same height (this
+//     project's 3060 and Jarek's node; 287,000 was confirmed that way on
+//     2026-11-24), which needs no co-signature, so the confirmed start keeps
+//     working. Redesigning or retiring the confirmer is open work
+//     (NEXT-SESSION.md), and `confirmed_snapshot_regtest` and
+//     `snapshot_network_regtest` fail at their co-signing steps on this
+//     engine until it is done.
+//
+// ⚠ THE ENGINE BUILD NEEDS PYTHON NOW. SwapNet is compiled into btxd with no
+// build switch: cmake/SwapNet.cmake requires Python 3.11 or newer with its
+// development files and the `cryptography` and `sqlite3` modules at configure
+// time, and links libpython into btxd. Still built with -DWITH_MODELNET=OFF on
+// all three platforms, so `-modelnet` is still not a registered option: never
+// pass it.
+//
+// Not fixed in this tag: btxchain/btx#280 (a GPU-less mirror frozen on a
+// signed one-block twin). #285, the header-only skip, was not re-tested:
+// 46bb199c resizes the HEADER_ONLY skip sets and may narrow it. The log lines
+// btx_core::twin_freeze reads for both are byte-identical here, so the module
+// stays, and `engine_pin_still_needs_twin_freeze` keeps passing. A sync from
+// genesis still stops at 126,978 (#272 closed unmerged); nodes that start
+// from a snapshot are unaffected.
+//
+// Both guards pass on the SHA (check-engine-tag.sh, check-engine-fleet-ready.sh).
+//
+// THE INSTALL KEY IS `v0.34.16`, bare, equal to what btxd reports. No release
+// ever used it, so every install re-provisions on update and fetches the
+// engine once. If the engine ever has to move under the same reported version
+// (upstream moves the tag again and we follow), the key takes the commit's
+// short SHA as a qualifier, the `-3013c2c2` shape described above.
+pub const NODE_RELEASE_TAG: &str = "v0.34.16";
 
 /// The exact upstream commit NODE_RELEASE_TAG names: the commit upstream's
-/// annotated tag `v0.34.15` points at. Kept set although the key is itself
-/// an upstream tag, so the guards, `engine_pin_ref` and the engine build
-/// workflows check out a SHA that cannot move under us, and the CI artifacts
-/// are named for the commit (`btxd-<os>-<sha>`), which is what the installer
-/// workflows' identity checks compare. If upstream ever re-tags, this does not
-/// move by itself; re-run both guards on the new commit and choose a new key.
-pub const NODE_RELEASE_COMMIT: &str = "476f3f23e15228bb3e6119ed1e139a9b25424ce8";
+/// tag `v0.34.16` pointed at on 2026-11-25, AFTER upstream moved that tag once
+/// (from `d27530af`). Kept set although the key is itself an upstream tag, so
+/// the guards, `engine_pin_ref` and the engine build workflows check out a SHA
+/// that cannot move under us, and the CI artifacts are named for the commit
+/// (`btxd-<os>-<sha>`), which is what the installer workflows' identity checks
+/// compare. A re-tag does not move this by itself, as 0.34.16 showed; re-run
+/// both guards on the new commit and choose a new key.
+pub const NODE_RELEASE_COMMIT: &str = "074dac167c26c1e091198f691ed5727817dba88a";
 
 /// The pinned assumeutxo snapshot this app bootstraps from: height 219000,
 /// [`btx_core::snapshot::v0_34_9_spec`], pinned from upstream's manifest and
@@ -9536,6 +9636,57 @@ mod tests {
         }
     }
 
+    /// The pinned engine has SwapNet (0.34.16 and newer), so every launch must
+    /// state `-swapnet=0`: the default is 0 at 0.34.16 and 1 at 0.34.17, and a
+    /// `swapnet=1` left in a conf or in the datadir's btx_rw.conf would start
+    /// the embedded runtime under an app that has no screen or policy for it.
+    /// And no launch may name a model-network option: the release engine is
+    /// built with -DWITH_MODELNET=OFF, which leaves `-modelnet` unregistered,
+    /// and btxd exits at init on an unknown argument. The flag is gated on the
+    /// tag in the install path, so this asks the launch itself, with this
+    /// build's key in both the nominal path and the real install-dir shape.
+    #[test]
+    fn the_pinned_engine_launches_with_swapnet_off_and_no_model_flag() {
+        let mut paths = vec![super::nominal_btxd_path()];
+        if let Some(dir) = btx_core::installer::install_dir(NODE_RELEASE_TAG) {
+            paths.push(dir.join("bin").join("btxd"));
+        }
+        for btxd in &paths {
+            for backend in [
+                btx_core::backend::Backend::Metal,
+                btx_core::backend::Backend::Cuda,
+                btx_core::backend::Backend::Cpu,
+            ] {
+                let (_, args, _) = btx_core::node::build_node_command(
+                    btxd,
+                    std::path::Path::new("/dd"),
+                    std::path::Path::new("/dd/btx.conf"),
+                    backend,
+                );
+                assert_eq!(
+                    args.iter()
+                        .filter(|a| a.starts_with("-swapnet"))
+                        .collect::<Vec<_>>(),
+                    vec!["-swapnet=0"],
+                    "{NODE_RELEASE_TAG} at {} on {backend:?} must launch with exactly                      -swapnet=0: {args:?}",
+                    btxd.display()
+                );
+                assert!(
+                    !args.iter().any(|a| a.starts_with("-model")),
+                    "{NODE_RELEASE_TAG} at {} on {backend:?} names a model-network option,                      which a -DWITH_MODELNET=OFF engine refuses at init: {args:?}",
+                    btxd.display()
+                );
+                for kept in ["-autoupdate=0", "-reorgpolicy=legacy", "-parkdeepreorg=0"] {
+                    assert!(
+                        args.iter().any(|a| a == kept),
+                        "{NODE_RELEASE_TAG} at {} on {backend:?} lost {kept}: {args:?}",
+                        btxd.display()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_shipped_pin_makes_a_deliberate_keeper_decision() {
         assert!(
@@ -9576,7 +9727,7 @@ mod tests {
     /// rules: a node on a good older engine beats no node.
     #[test]
     fn a_failed_upgrade_keeps_an_engine_that_follows_the_rules() {
-        for ok in ["v0.34.14", "v0.34.15"] {
+        for ok in ["v0.34.14", "v0.34.15", "v0.34.16"] {
             assert_eq!(
                 after_failed_engine_upgrade(ok, "copy failed"),
                 Ok(()),
@@ -9619,6 +9770,12 @@ mod tests {
             // 244000 activation constants, so 219000 and 228000 stand as on
             // 0.34.12, and the pin stays on 219000 for the same reasons.
             "v0.34.15" => 219_000,
+            // Adds no base either: chainparams.cpp at 074dac16 differs from
+            // 476f3f23 only in `vModelSeeds.clear()` and the `consteval_ctor`
+            // spelling of the rows' shielded commitments. The newest base it
+            // carries is still 228000, and the pin stays on 219000 for the
+            // same reasons as on 0.34.12.
+            "v0.34.16" => 219_000,
             other => panic!(
                 "no record of the assumeutxo bases {other} carries: read `git show \
                  {other}:src/kernel/chainparams.cpp` (m_assumeutxo_data), add its row \
