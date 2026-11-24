@@ -1,11 +1,16 @@
 # BTX update protocol (all of Mende's BTX apps)
 
-v2, 2026-10-29. Aimed at **BTX 0.35.0** and reusable for every later release.
-v2 folds in an independent review (29 claims spot-checked against `origin/main`) and
-adds the signer box, the rc-phase pre-staging, a shadow canary and a stronger rollback.
-Research only: nothing was bumped, built, committed or deployed while writing this.
+v3, 2026-11-25. Written for **BTX 0.35.0**, corrected after **0.34.16** shipped first, and
+reusable for every later release.
+v3 corrects Part A (v2 said 0.34.16 would not exist; it is the shipping release), the per-app
+steps for easyNode and AInode, and adds two lessons: a final tag can be moved, and a point
+release can add a build dependency. Every 0.34.16 fact in it was read in upstream's source at
+`074dac16`, alongside easyNode's move to that engine. The 0.35 material is v2's, as read on
+2026-10-29, and is marked where it was not read again.
+v2 (2026-10-29) folded in an independent review (29 claims spot-checked against `origin/main`)
+and added the signer box, the rc-phase pre-staging, a shadow canary and a stronger rollback.
 
-- **Part A**: what's new in BTX and in 0.35, and the network state.
+- **Part A**: what's new in BTX (0.34.16 today, 0.35 later), and the network state.
 - **Part B**: the protocol. Phase 1 runs during the rc and does most of the work. Phase 2 runs
   on release day and mostly swaps a hash. Then per-app steps, checks and rollback.
 - **Part C**: the lessons it is built from.
@@ -16,18 +21,20 @@ rc, while the network is calm.
 
 ---
 
-## Part A. What's new in BTX, and what 0.35 brings
+## Part A. What's new in BTX: 0.34.16 today, 0.35 later
 
-### Where things stand (2026-10-29)
+### Where things stand (2026-11-25)
 
 | | |
 |---|---|
-| Shipping release | **v0.34.15** (2026-10-06, GitHub "Latest"). `origin/main` == `v0.34.15` == `476f3f23`. |
-| Release candidate | **v0.35.0-rc1** (2026-10-13, pre-release, `849fb2d8`, *not on main*, on `btx-035/lab`). |
-| 0.35 work | `btx-035/lab` (+42 past rc1), `btx-035/swarm` (+815), `btx-035/atlas-native` (+836), `btx-035/model-security-v2` (+811). Merge direction: atlas-native + model-security → swarm (#273, #275) → lab (#245) → 0.35 final. The last step is inferred: no v0.35.0 tag exists yet. |
-| 0.34.16 | **Will not exist** (numair, 10-25, Telegram #1924). All fixes go to 0.35. |
-| 0.35 ETA | Jpp, 10-25: "0.35 should be ready and stable in 2 weeks max", so about **Nov 8**. The website relaunch is waiting on it. |
-| Stale doc | The btx repo's CLAUDE.md says "0.34.9-dev, last tag v0.34.8". Wrong; CMake on main says 0.34.15. |
+| Shipping release | **v0.34.16** (published 2026-11-07, GitHub "Latest"). `origin/main` == `074dac167c26c1e091198f691ed5727817dba88a`. **The tag was moved**: cut at `d27530af` ("release: mark this branch 0.34.16"), later moved to `074dac16` ("release: keep the CPython termios extension out of the Linux archive", committed 2026-11-15). Pin the SHA, never the tag name. |
+| Prerelease | **v0.34.17** (2026-11-20, `3808e2a9`). Not for any app: upstream re-cut it three times, its `SHA256SUMS` is unsigned, trusted-mirror defects are open against it, and it turns SwapNet on by default. |
+| Release candidate | **v0.35.0-rc1** (2026-10-13, pre-release, `849fb2d8`) is still the only 0.35 tag. |
+| 0.35 work | As of 10-29, not read again for v3: `btx-035/lab`, `btx-035/swarm`, `btx-035/atlas-native`, `btx-035/model-security-v2`, merging toward a 0.35 final that has no tag. Parts of it shipped in 0.34.16 instead (below). |
+| 0.34.16 | v2 said "**Will not exist**" (numair, 10-25, Telegram #1924). It shipped 13 days later, with 1,419 commits since 0.34.15. An announcement is not a release plan: **read the tags.** |
+| 0.35 ETA | Jpp, 10-25: "2 weeks max", so about Nov 8. Not met; 0.34.16 and 0.34.17 came instead. No date today. |
+| Who pins what | easyNode 0.7.16 ships v0.34.15 (`476f3f23`); its move to 0.34.16 is in pull requests on 2026-11-25. AInode's app pins 0.34.16 since 0.9.0, and its public host runs 0.34.16 since 11-20, while `host/remote-setup.sh` and `host/vast/vast-host.sh` still install 0.34.15. |
+| Stale doc | The btx repo's CLAUDE.md said "0.34.9-dev, last tag v0.34.8" on 10-29. Do not take the version from prose; `CMakeLists.txt` at `074dac16` says 0.34.16. |
 
 ### Must-know before touching anything
 
@@ -37,31 +44,93 @@ rc, while the network is calm.
    An rc1 node would accept a claim that 0.34.15 rejects, which can split the chain. The rule was
    restored in `6b94704b` (10-14), and every `btx-035/*` branch has it. Checked in the code. Only
    ship 0.35 final, or a build whose history contains `6b94704b`:
-   `git merge-base --is-ancestor 6b94704b <sha>`.
+   `git merge-base --is-ancestor 6b94704b <sha>`. v0.34.16 (`074dac16`) contains it.
 2. **btxd updates itself by default on mainnet**, and has since **v0.31.0**: `-autoupdate`
-   defaults to 1 and polls `https://btx.dev/version.txt` every 30 min (`src/node/autoupdate.h`,
-   `src/init.cpp:772`).
-   - easyNode already passes `-autoupdate=0` (`crates/btx-core/src/node.rs:1002`), **but only when the
-     install key parses as `vX.Y.Z…`**. A key that doesn't parse silently drops the flag. The same
-     parse also gates `engine_follows_network_rules` and `-matmulrcexecution`.
+   defaults to 1 and polls `https://btx.dev/version.txt` every 30 min (`src/node/autoupdate.h`).
+   Still true at 0.34.16 (`node::AutoUpdateEnabled`, `src/node/autoupdate.cpp:1434`); new there:
+   the default is 0 when `-proxy` is set or `-onlynet` leaves out both ipv4 and ipv6.
+   - easyNode already passes `-autoupdate=0` (`build_node_command` in `crates/btx-core/src/node.rs`),
+     **but only when the install key parses as `vX.Y.Z…`**. A key that doesn't parse silently drops
+     the flag. The same parse also gates `engine_follows_network_rules`, `-matmulrcexecution`,
+     `-reorgpolicy=legacy` and, from 0.34.16, `-swapnet=0`.
      **Rule: the install key always starts with `v<major>.<minor>.<patch>`.**
    - **Live today: both btxscan nodes run with btxd's self-update ON.** Neither `/data/btx/bitcoin.conf` nor
      `/data/btx2/btx.conf` sets `autoupdate` (checked read-only on 2026-10-29 by the btxscan session). The
      patched switch in btx-apps PR #289 writes `autoupdate=0`, but only at the next engine switch. Until
      then, adding `autoupdate=0` to both confs and restarting is Mende's call.
-   - In 0.35 the automatic off with `-proxy`/`-onlynet` exists only on swarm/atlas/model-security, not on lab or rc1.
-3. **A sync from genesis on 0.34.15 stops at 126,978.** Block 126,979 fails
-   `shielded-unshield-velocity-exceeded`. The bug is in every 0.34.x and in rc1. The fix PR #272 is
-   still OPEN and is a consensus-replay change. Nodes that start from a snapshot or are already past
-   that height are fine. On a fixed build, run `reconsiderblock 358a3d27…`; no reindex.
-   #272 may also bump `BLOCK_VALIDATION_EPOCH`, which changes what the first start of 0.35 does.
-   Put that in the verdict table.
-4. **The checksum and archive format changes in 0.35.**
-   - SHA256SUMS is missing for v0.34.13, .14 and .15. rc1 uses **SHA384SUMS**.
-   - The archives are renamed to `btx-035-{linux-x86_64,macos-arm64,windows-x86_64}.tar.xz`. These
-     names carry no patch number, so take the version from the tag, never from the file name.
+   - The automatic off with `-proxy`/`-onlynet` is in 0.34.16. On 0.35 it was only on
+     swarm/atlas/model-security on 10-29, not on lab or rc1.
+3. **A sync from genesis still stops at 126,978, on 0.34.16 too.** Block 126,979 fails
+   `shielded-unshield-velocity-exceeded`. The bug is in every 0.34.x and in rc1. The fix PR #272 was
+   closed unmerged. Nodes that start from a snapshot or are already past that height are fine.
+   `BLOCK_VALIDATION_EPOCH` is still 1 at 0.34.16 (`src/chain.h:525`): no reindex, no datadir migration.
+4. **The checksum and archive format differ per release line. Read them from the release.**
+   - SHA256SUMS is missing for v0.34.13, .14 and .15. **0.34.16 has one again, unsigned**, and keeps
+     the 0.34 names and `.tar.gz`: `btx-0.34.16-x86_64-linux-gnu.tar.gz` and `…-cuda13.tar.gz`.
+   - **0.34.16 publishes no macOS archive** (and, as always, no Windows one). An app that staged
+     upstream's Mac tarball has nothing to download: AInode builds its Mac helper from source
+     since 0.9.0, and easyNode's Mac needs a source build for this engine too.
+   - rc1 uses **SHA384SUMS** and renames the archives to
+     `btx-035-{linux-x86_64,macos-arm64,windows-x86_64}.tar.xz`. Those names carry no patch number,
+     so take the version from the tag, never from the file name.
    - Take digests from `gh api repos/btxchain/btx/releases/tags/<tag> --jq '.assets[]|.name+" "+.digest'`.
      Strip the `sha256:` prefix where a script wants bare hex.
+5. **A final tag can move.** Upstream published v0.34.16 on 2026-11-07 at `d27530af` and later
+   moved the tag to `074dac16`. A clone that fetched it before the move still answers `d27530af`,
+   and a plain `git fetch` does not correct a tag it already holds. Ask upstream, not a clone:
+   `git ls-remote --tags https://github.com/btxchain/btx 'v0.34.16*'` (the `^{}` line is the commit).
+   Every pin, guard run and CI dispatch takes the 40-character SHA.
+6. **A point release can change how the engine is built.** 0.34.16 compiles SwapNet into btxd
+   through an embedded CPython: `cmake/SwapNet.cmake` requires Python 3.11 or newer with its
+   development files and the `cryptography` and `sqlite3` modules at configure time, links
+   libpython into btxd, and has no switch to leave it out. Ubuntu 22.04 ships Python 3.10. Every
+   builder (easyNode's three engine workflows, any local source build) needs it before it can
+   configure, which is why the diff of `CMakeLists.txt` and `cmake/` is read before a build is
+   dispatched (B1.2).
+
+### 0.34.15 → 0.34.16 (the shipping release; read at `074dac16`, 2026-11-25)
+
+- **No consensus change.** `src/kernel/chainparams.cpp` gains `vModelSeeds.clear()` and the
+  `consteval_ctor` spelling on the assumeutxo rows' shielded commitments, nothing else: no height,
+  no checkpoint, no assumeutxo base (the newest are still 219000 and 228000). `PROTOCOL_VERSION`
+  800002 and min 800001 are unchanged. `6b94704b` is an ancestor.
+- **No option removed.** 453 registered at 0.34.15, 460 at 0.34.16. Added: `-swapnet`,
+  `-swapnetwallet`, `-swapnetowner`, `-offerattestedutxosnapshot`,
+  `-offerattestedutxosnapshotmanifest`, `-lightwatchdir`, and `-modellandiscovery` (ModelNet
+  builds only). So every conf that started 0.34.15 still starts, with two exceptions that became
+  **fatal**: an unknown `-resourcegovernor` value (and so `-noresourcegovernor`), and `-v2pqonly`
+  with v2 transport off.
+- **SwapNet is built in, and off.** `-swapnet` is registered on every build (`src/init.cpp:620`,
+  `src/swapnet/node.cpp:96`) and defaults to **0** at 0.34.16 and to **1** at 0.34.17. An unknown
+  flag is fatal, so `-swapnet=0` can go only to 0.34.16 and newer; pass it there explicitly,
+  like every default that has flipped before.
+- **The model network**: with ModelNet compiled in, the swarm runs inside btxd, and there is LAN
+  discovery (`-modellandiscovery`). A btxd built with `-DWITH_MODELNET=OFF` (easyNode's) still
+  does not register `-modelnet`, so `-modelnet=0` is still fatal there.
+- **RPC: none removed, and no result field removed** from `getblockchaininfo`, `getpeerinfo`,
+  `getnetworkinfo`, `getchaintips`, `getmatmultrustedstatus`, `dumptxoutset` or
+  `dumptxoutsetattested`. Changed:
+  - **`signutxosnapshotmanifest` no longer signs what it is handed** (PR #225, `af9020cd`). It
+    refuses a tip without the ExactReplay bit, exports the UTXO set at the node's own tip into
+    `<datadir>/utxo-snapshot-sign/`, and signs only if every field of the caller's statement
+    equals that. A node can therefore sign a statement only while its tip IS the statement's block.
+    Two operators still confirm a snapshot by each cutting the same height with
+    `dumptxoutsetattested` (unchanged). Co-signing someone else's statement later, which
+    easyNode's confirmer does 144 blocks deep, is refused.
+  - `addmatmulattestationblocklist` and `listmatmulattestationblocklist` take and list ML-DSA-44
+    keys too (`blocked_pq_pubkeys`), and the add reports `persisted`.
+  - `getblockstats` counts the shielded value balance in the fee and the penalized subsidy (the
+    #281 area; not re-run on the box).
+  - `offerattestedutxosnapshot` says its offer is gone after a restart; the two new startup flags
+    are how an offer survives one.
+- **Mirrors**: the N>=2 / M>=2 rule on mainnet and `-allowsinglekeytrustedmirror` are unchanged.
+  `-reorgpolicy` unset is still legacy. **#280 is not fixed** (a GPU-less mirror frozen on a signed
+  one-block twin), and the log lines easyNode's `twin_freeze` reads are byte-identical, so that
+  module stays. #478 is fixed.
+- **Packaging**: two Linux archives and an unsigned `SHA256SUMS`; no macOS archive. The Linux
+  archive no longer carries libstdc++ and libgcc_s (AInode's staging notes), and the model helper
+  mints its ML-DSA identity in process instead of calling `openssl`.
+- **Build**: Python 3.11+ with development files, `cryptography` and `sqlite3` (must-know 6).
 
 ### 0.34.8 → 0.34.15 (already shipped; every app must have absorbed it)
 
@@ -84,7 +153,11 @@ rc, while the network is calm.
   - CUDA is `sm_120` only, and cuda12 was dropped after 0.34.10.
   - `-modelnet` defaults to 1.
 
-### What 0.35 brings
+### What 0.35 brings (as read on 2026-10-29)
+
+Not read again for v3. Some of it arrived in 0.34.16 instead: the swarm inside btxd,
+`-modellandiscovery`, and the `-offerattestedutxosnapshot[manifest]` flags. Re-read this whole
+section against the tag when a 0.35 final exists.
 
 - **Money and models in one node.** The "swarm" runs inside btxd whenever ModelNet is on
   (`-modelnet=0` turns it off). Models are shared like torrents (signed lineage, `btx://` links) and
@@ -155,6 +228,9 @@ rc, while the network is calm.
 
 - **A new rc or lab prerelease** (`gh release list -R btxchain/btx --limit 5`) starts **Phase 1**.
 - **A final tag** starts **Phase 2**.
+- **A final tag that MOVED** is a trigger too. Compare what upstream answers for the tag
+  (`git ls-remote --tags`) with the SHA every app pins; the pin census prints `MOVED TAG` when a
+  local clone disagrees with upstream. Read the diff between the two commits before following.
 - `btx-doctor.sh` (btx-apps btx-ops) warns when upstream is newer than the box.
 - Jpp or numair announce it in BTX Unicorns. Read it through ORCA, read-only, never post:
   `ssh mende@20.74.155.31 '~/.local/bin/orca-group inbox btx-unicorns -n 500 --hours 168'`.
@@ -164,12 +240,19 @@ rc, while the network is calm.
 
 ### B1. Phase 1: during the rc (days before final)
 
-1. **Pin census**: `python3 scripts/btx-pin-census.py --target <tag>` in easynode (branch
-   `claude/btx-pin-census`, `9a424c8`, until merged). It is read-only and reads every repo at `origin/main`
-   plus ainode through the GitHub API. It names every engine hash and commit against upstream's real release
-   digests and exits 1 when a code or config pin is on another release. Today `--target v0.34.15` passes
-   (118 pin lines) and `--target v0.35.0-rc1` lists the 13 pins a bump has to move. Run it at the start
-   (the to-do list) and at the end (proof nothing was missed).
+1. **Pin census**: `python3 scripts/btx-pin-census.py --target <tag>` in easynode. It is read-only
+   and reads every repo at `origin/main`, plus AInode through the GitHub API: the app's pins from
+   the public `MendeMatthias/ainode`, the host's from the private `MendeMatthias/ainode-private`
+   (until 2026-11-25 it read `host/` from `ainode`, where those files no longer are, and so
+   listed them as unreadable instead of as pins). It names every engine hash and commit against upstream's real
+   release digests, asks upstream itself which commit each tag names, and ends with a
+   `STILL TO MOVE` list; it exits 1 while a hash or commit pin is on another release. It runs
+   without `gh` (curl, and a token only for the private repo). On 2026-11-25, with easyNode's
+   `main` still on 0.34.15, `--target v0.34.16` lists 10 pins: easyNode's commit pin, two archive
+   hashes in its download staging scripts, five workflow pins, and AInode's
+   `host/remote-setup.sh` and `host/vast/vast-host.sh`. Run it at the start (the to-do list) and
+   at the end (proof nothing was missed). `--repo easynode=.@HEAD` checks a branch before it
+   merges.
 2. **Read the dangerous diff** against the last shipped tag, once, into a verdict table
    (format: `pq-wallet/docs/ROUND-0.34.15-send-in-parts-2026-10-11.md`):
    - `src/kernel/chainparams.cpp`, `src/consensus/params.h`: heights, assumeutxo rows, checkpoints, seeds.
@@ -180,10 +263,14 @@ rc, while the network is calm.
    - `src/init.cpp` and `config.cpp`: flags and defaults. **Unknown conf keys are fatal**, so check that every key
      in every conf we run still exists.
    - `src/validation.cpp`, `src/net_processing.cpp`: reorg, mirror and IBD behaviour. Check `BLOCK_VALIDATION_EPOCH`.
-   - `CMakeLists.txt`, `scripts/release/*`, the release checklist: version, archive names, layout, glibc floor, signing, CUDA.
+   - `CMakeLists.txt`, `cmake/*`, `scripts/release/*`, the release checklist: version, archive names, layout,
+     glibc floor, signing, CUDA, and **anything the build newly requires** (0.34.16: Python 3.11
+     development files plus two Python modules, with no switch).
 3. **Build the engines now** (easyNode CI): dispatch `btxd-linux.yml`, `btxd-windows.yml` and
-   `btxd-macos.yml` on the **commit SHA** of the newest 0.35 build that contains `6b94704b`.
-   Record the run ids. A rebuild on final then only happens if the final commit differs.
+   `btxd-macos.yml` on the **commit SHA** of the build to ship (for 0.35, the newest one that
+   contains `6b94704b`). Give the runners what step 2 found the build needs first. Record the
+   run ids. A rebuild on final then only happens if the final commit differs, or if the final
+   tag moves afterwards.
 4. **Patch the tooling for the new release format.** For 0.35, `btx-apps/.claude/skills/btx-ops/recovery/UPGRADE-btxscan-engine.sh`
    **cannot stage it as written**:
    - `ASSET="btx-$VER-x86_64-linux-gnu.tar.gz"` is hard-coded (:82)
@@ -213,6 +300,9 @@ rc, while the network is calm.
 
 1. **Gate.** Every one of these must pass, or nothing ships:
    - The tag is upstream's final/"Latest", and `git merge-base --is-ancestor 6b94704b <sha>` passes.
+   - The SHA we pinned and built is still the one upstream's tag names today
+     (`git ls-remote --tags https://github.com/btxchain/btx '<tag>*'`). If it moved, nothing ships
+     until the diff between the two commits is read.
    - The guards pass on the **literal tag**. Without an argument they can exit 0 on a known-bad pin.
      `check-engine-tag.sh` also refuses a tag that narrows the 32-byte HTLC rule (the rc1 bug) on
      branch `claude/btx-035-engine-guards`, `221693d`, until merged.
@@ -220,8 +310,10 @@ rc, while the network is calm.
      cd ~/repos/easynode && scripts/check-engine-tag.sh <tag> && scripts/check-engine-fleet-ready.sh <tag>
      ```
    - The recipe's two-step golden-manifest seal check (`node-release-recipe.md` :639+) passes.
-   - We downloaded every asset ourselves, and our hash matches the GitHub digest and SHA384SUMS. Upstream has
-     regenerated assets in place before (v0.32.11), so hash again on publish day.
+   - We downloaded every asset ourselves, and our hash matches the GitHub digest and the release's
+     own sums file (SHA256SUMS on 0.34.16, SHA384SUMS on 0.35, none on 0.34.13 to .15). Upstream has
+     regenerated assets in place before (v0.32.11) and moved a final tag (v0.34.16), so hash again
+     on publish day.
    - **The network is not split**: easybtx.com/api/nodes, both pools, `witness-1.easybtx.com/signers/recent`,
      api.btxscan.io and both Lars archives agree on the block hash at a settled height.
      Run `scripts/observer-ok.sh` (recipe :870). Never trust btxscan alone.
@@ -234,7 +326,7 @@ rc, while the network is calm.
 |---|---|---|---|
 | 1 | Shadow canary on the final build (short soak, ≥ 1 h) | — | Already soaked on rc in Phase 1 |
 | 2 | btxscan / esplora box: archive `btxd`, then serving `btxd2` | `btx-apps` btx-ops + `btx-esplora` | The wallet and bonuz read balances here, so keep the swap boring |
-| 3 | AI node (`btx-modeld`) | `MendeMatthias/ainode` (GitHub only) | Independent of btxd |
+| 3 | AI node (`btx-modeld`) | `MendeMatthias/ainode` (public, the app) and `ainode-private` (the host) | Independent of btxd |
 | 4 | btx-mine-hq ainode copy | `btx-mine-hq` | Same PR wave as 3 |
 | 5 | **EasyNode release** | `easynode` | **Reaches the signer box by auto-update.** Hold the signer first (B3.0) |
 | 6 | EasyBTX site: node feed and version copy | `EasyBTX` `site/` | After 5 is published |
@@ -311,20 +403,30 @@ The script steps below assume btx-apps PR #289 (merged before release day). That
 11. **Rollback**: `--rollback <unit>`. With PR #289 it restores the recorded conf too, and keeps the current one as
     `.bak-rollback-<ts>`. Then restart.
 
-#### 2. AI node (`MendeMatthias/ainode`, Azure `ainode-host-1`, UAE North, `20.196.8.98:29447`)
+#### 2. AI node (two repos; Azure `ainode-host-1`, UAE North, `20.196.8.98:29447`)
 
 It runs stock `btx-modeld` only, with no btxd. Flags: `-modelfollowpeers=0 -modelhost=1 -modelbind=0.0.0.0:29447`.
 
-1. Pins, each a version plus sha:
-   - `host/remote-setup.sh:15-17,29`
-   - `host/btx-modeld.service:2,5,22`
-   - `host/RUNBOOK.md:85-89`
-   - `host/vast/vast-host.sh`
-   - `app/scripts/stage-engine.sh:24-27`
-   - `app/scripts/stage-engine-linux.sh:34-37`
-   - `app/ENGINE-CONTRACT.md`
-2. For 0.35: check the `-model*` flags (they still exist on swarm), the new archive name and layout, and the
-   OpenSSL 3.2 and glibc needs.
+Since 2026-11-24 AInode is two repositories. **`MendeMatthias/ainode` is public and holds the
+app**; it has no `host/`. **`MendeMatthias/ainode-private` holds the model host's files.** A
+bump touches both, and a tool that reads only one sees half the pins.
+
+State on 2026-11-25: the app pins **v0.34.16** (`074dac16`) since 0.9.0, and the public host
+runs 0.34.16 since 11-20 (`host/btx-modeld.service`, `host/RUNBOOK.md`). **Still on 0.34.15**:
+`host/remote-setup.sh` and `host/vast/vast-host.sh`, which a fresh server or a Vast box would
+install from.
+
+1. Pins, each a version plus a sha or commit:
+   - public `ainode`: `app/scripts/stage-engine.sh:41-43` (`BTX_TAG`, `BTX_COMMIT`,
+     `BTX_HELPER_SHA256`), `app/scripts/stage-engine-linux.sh:43-46` (`BTX_TAG`, `BTX_SHA256`),
+     `app/scripts/stage-engine-windows.sh`, `app/scripts/build-engine-macos.sh:48-53`,
+     `app/ENGINE-CONTRACT.md`, `scripts/upstream-check.sh:11` (`PINNED_TAG`)
+   - private `ainode-private`: `host/remote-setup.sh:15-17,29`, `host/btx-modeld.service`,
+     `host/RUNBOOK.md`, `host/vast/vast-host.sh:29-31,78`
+2. For 0.34.16: there is no macOS archive, so the Mac helper is built from source at the pinned
+   commit (`build-engine-macos.sh`); the Linux archive no longer ships libstdc++ and libgcc_s; the
+   helper mints its identity in process, so no `openssl` tool is bundled. For 0.35: check the
+   `-model*` flags, the new archive name and layout, and the OpenSSL 3.2 and glibc needs.
 3. Run `host/setup-vps.sh ainode-host` from the Mac. It keeps the TLS/ML-DSA identity. **Never regenerate the
    identity**, because users pin it.
 4. Restage the app engine, then ship the app release and its updater feed (`app/scripts/release-*.sh`).
@@ -336,8 +438,8 @@ It runs stock `btx-modeld` only, with no btxd. Flags: `-modelfollowpeers=0 -mode
 
 #### 3. btx-mine-hq (Vast fleet kit and dashboard)
 
-1. Copy ainode's `vast-host.sh` into `kit/ainode/vast-host.sh:29-31` (`BTX_TAG`, `ARCHIVE`, `ARCHIVE_SHA`)
-   **in the same wave**. Update `tests/test_ainode.py`. Check `kit/ainode/prefix.sha256` (the glibc prefix)
+1. Copy `ainode-private`'s `host/vast/vast-host.sh` into `kit/ainode/vast-host.sh:29-31` (`BTX_TAG`,
+   `ARCHIVE`, `ARCHIVE_SHA`) **in the same wave**. Update `tests/test_ainode.py`. Check `kit/ainode/prefix.sha256` (the glibc prefix)
    if the glibc floor moved.
 2. Miners (`kit/btx_vast_fleet.py:30-49`) change only if MatMul or consensus changed. Keep a tested fallback pinned.
 3. Economics constants live in `kit/btx_vast_fleet.py:61` (`BLOCKS_PER_DAY`) and `btxdash/chain.py` (`subsidy()`).
@@ -349,34 +451,56 @@ It runs stock `btx-modeld` only, with no btxd. Flags: `-modelfollowpeers=0 -mode
 #### 4. EasyNode (`~/repos/easynode`, lead app)
 
 Full recipe: `docs/node-release-recipe.md`. Release state: `NEXT-SESSION.md`.
-(The recipe's step 1 still says "do not move past `1e51f0d1`". That is stale; fix it in the same PR.)
+(The recipe's step 1 said "do not move past `1e51f0d1`" until 2026-11-25; fixed with the 0.34.16 move.)
 
 1. Engines were built in Phase 1. If the final SHA differs, re-dispatch at that **commit SHA**. Paste the run ids,
    artifact names, commit and version **together** into:
-   - `node-linux-installer.yml:157-159`
-   - `node-win-installer.yml:113-116`
-   - the `btxd-windows.yml:75` default
-2. Pins in `apps/node/src-tauri/src/commands.rs`:
-   - `NODE_RELEASE_TAG` (:404). This is the install key: users re-provision only when it changes, so
-     **change it whenever the binary changes**. It must start with `vX.Y.Z` (see A.2).
-   - `NODE_RELEASE_COMMIT` (:413).
+   - `node-linux-installer.yml`: `PROVEN_BTXD_RUN_ID`, `PROVEN_BTXD_ARTIFACT`, `PROVEN_BTXD_COMMIT`
+   - `node-win-installer.yml`: `PROVEN_BTXD_RUN_ID`, `PROVEN_BTXD_ARTIFACT`, `PROVEN_BTXD_VERSION`, `PROVEN_BTXD_TAG`
+   - the `btxchain_ref` default in `btxd-windows.yml` (two places)
+
+   Before dispatching, give the builders what the diff says the build needs (0.34.16: Python 3.11
+   development files, `cryptography`, `sqlite3`). **All three platforms are source builds from
+   0.34.16**: upstream publishes no macOS archive, so `stage-node-pkg.sh` has nothing to stage for
+   the Mac and `btxd-macos.yml` plus `stage-node-pkg-mac-source.sh` is the Mac path.
+2. Pins in `apps/node/src-tauri/src/commands.rs`, named, because line numbers go stale:
+   - `NODE_RELEASE_TAG`. This is the install key: users re-provision only when it changes, so
+     **change it whenever the binary changes**. It must start with `vX.Y.Z` (see A.2). If upstream
+     moves a tag under an unchanged version and we follow, the key takes the commit's short SHA
+     (`v0.34.16-<sha8>`), or returning installs keep the old binary.
+   - `NODE_RELEASE_COMMIT`: the 40-character SHA, taken from `git ls-remote`, never from a clone's tag.
+   - Write what was read at the SHA beside the pin, as every pin there does.
 3. Snapshot:
    - Add the test row in `the_snapshot_pin_is_the_newest_base_the_pinned_engine_carries`.
    - Move `snapshot_spec()` if a new mirrored base exists.
-   - Refresh `crates/btx-core/src/attested_snapshot.rs pinned_pair()` **every release**.
+   - Refresh `crates/btx-core/src/attested_snapshot.rs pinned_pair()` **every release**. The pair
+     has to be PUBLISHED first, as the pre-release `utxo-snapshot-<height>` on
+     `MendeMatthias/EasyBTX-releases` (the 3060's keeper exports and signs it;
+     `scripts/publish-attested-snapshot.sh` publishes it). Then: the checks 0.7.11's pin lists in
+     that function's doc, the five fields, the manifest as a test fixture, and
+     `cargo test -p btx-core -- --ignored the_pinned_pair_is_still_published`. A pin on files that
+     are not published sends a node whose website pointer fails back to the engine's compiled
+     219,000.
    - Check the replay context and shielded commitment in `confirmed_snapshot.rs`.
 4. Network: `crates/btx-core/src/node.rs`:
    - `engine_follows_network_rules` (:1595): raise it on a flag day.
    - `BTX_ARCHIVE_PEERS`: add Lars's `85.215.122.100:19335` and `217.154.143.140:19335`.
    - `BTX_BOOTSTRAP_PEERS`: the official seeds are stale.
    - `engine_supports_keeper_profile` is a denylist, so there's nothing to add there.
-5. Flags: keep `-reorgpolicy=legacy`. The test `the_pinned_engine_launches_with_its_self_updater_off`
-   (branch `claude/btx-035-engine-guards`) fails the build if the install key stops yielding `-autoupdate=0`,
-   `-matmulrcexecution` or the network-rules floor. Also check `ps` on a real install once. Check that `-allowsinglekeytrustedmirror`, `strict-device` and matmul validation still exist.
+5. Flags: keep `-reorgpolicy=legacy`, `-parkdeepreorg=0` and `-autoupdate=0`, and from 0.34.16
+   `-swapnet=0` (`node_has_swapnet` in `node.rs`). The tests
+   `the_pinned_engine_launches_with_its_self_updater_off` and
+   `the_pinned_engine_launches_with_swapnet_off_and_no_model_flag` fail the build if the install
+   key stops yielding `-autoupdate=0`, `-matmulrcexecution`, the network-rules floor or
+   `-swapnet=0`, or if a launch names a `-model*` option. Check every flag the app passes and
+   every conf key it writes against the `AddArg` sites of the new tag (an unknown one is fatal),
+   and read the diff of `src/init.cpp` for arguments that BECAME fatal. Also check `ps` on a real
+   install once.
    Never pass `-modelnet=0` to this Modelnet-off build.
-6. Staging scripts in `apps/node/scripts/`: `stage-node-pkg.sh:34,40,45`, `stage-node-pkg-linux.sh:24-30`,
-   the `-source` variants and `stage-node-pkg-windows.ps1`. Update VERSION, the URL pattern (`btx-035-*.tar.xz`)
-   and the sum type. `apps/node/scripts/lib/engine-pin.sh` refuses a mismatch.
+6. Staging scripts in `apps/node/scripts/`: `stage-node-pkg.sh`, `stage-node-pkg-linux.sh`,
+   the `-source` variants and `stage-node-pkg-windows.ps1`. Update VERSION, the URL pattern and the
+   sum type from the release itself (0.34.16: the 0.34 names, `.tar.gz`, SHA256SUMS, Linux only;
+   0.35: `btx-035-*.tar.xz`, SHA384SUMS). `apps/node/scripts/lib/engine-pin.sh` refuses a mismatch.
    `lib/release-archive.sh` (branch `claude/btx-035-engine-guards`) already handles the download side for both
    formats: sha256 or sha384, `.tar.gz` or `.tar.xz`, finding the root folder, and an exact version match, so
    `0.35.0` no longer accepts a `v0.35.0rc1` binary. It **refuses the 0.35 layout** until the copy, rpath and
@@ -385,7 +509,10 @@ Full recipe: `docs/node-release-recipe.md`. Release state: `NEXT-SESSION.md`.
    - Never run `stage-node-pkg.sh` for a source build.
    - The Mac bundle embeds the official arm64 tarball, which is ad-hoc signed only in 0.35. Re-sign it as today.
 7. Tests: the real-engine `#[ignore]` suites against the new btxd, with long RPC waits (10 min).
-   Run the gates on the extracted bundles as well.
+   Run the gates on the extracted bundles as well. Against 0.34.16, `confirmed_snapshot_regtest`
+   and `snapshot_network_regtest` fail where a node co-signs a statement that is not its own tip
+   (A, 0.34.15 → 0.34.16): that is the engine change showing, not a broken build, and it stays
+   red until the confirmer is redesigned or retired (`NEXT-SESSION.md`).
 8. 0.35 specifics: check for a datadir/DB migration (if any, an engine rollback is impossible; say so in the notes),
    the new assumeutxo rows, the wallet and descriptor RPC shape, `BLOCK_VALIDATION_EPOCH`, and
    `getblockchaininfo.headers` (the "blocks behind" under-count is still open).
@@ -394,6 +521,7 @@ Full recipe: `docs/node-release-recipe.md`. Release state: `NEXT-SESSION.md`.
      `apps/node/src-tauri/src/commands.rs` (search `REMOVE WHEN 0.35 SHIPS`), and the test
      `engine_pin_still_needs_twin_freeze`, which fails on purpose once `NODE_RELEASE_TAG` reaches 0.35.
      The module already turns itself off on any 0.35 engine. Check first that #280 and #285 are in the final tag.
+     0.34.16 does not fix #280, so the module stays for it.
 9. App version in 5 places: `apps/node/package.json:5`, package-lock (×2), `tauri.conf.json:4`, `Cargo.toml:3`,
    Cargo.lock. Then changelog, build, and `gh release` on `MendeMatthias/EasyBTX-releases` as `node-vX.Y.Z`
    **with `--latest=false`**. **Hold the signer box (B3.0) before the feed goes live.**
@@ -461,8 +589,8 @@ This is not our repo. If it comes back, its pins disagree with each other. Fix t
 
 ```
 Phase 1 (rc)
-[ ] Verdict table written (diff, flags, conf keys, epoch, platform, per-app impact)
-[ ] easyNode engines built at the 0.35 SHA (contains 6b94704b), run ids recorded
+[ ] Verdict table written (diff, flags, conf keys, epoch, platform, build needs, per-app impact)
+[ ] Builders have what the new build needs; easyNode engines built at the SHA (contains 6b94704b), run ids recorded
 [ ] Staging scripts handle the new archive name / .tar.xz / SHA384 (btxscan, easynode, ainode, mine-hq)
 [ ] Shadow canary soaked >= 24 h on a real datadir clone + empty datadir + real confs
 [ ] Draft PRs open in every affected repo; PQ-wallet fixture regenerated; qid + wallet regtest green
@@ -470,6 +598,7 @@ Phase 1 (rc)
 
 Phase 2 (final)
 [ ] Gate: final/Latest, has 6b94704b, guards on literal tag, seal check, our hashes == digests, observer-ok, no split
+[ ] The tag still names the SHA we pinned and built (git ls-remote), in every repo (pin census: nothing STILL TO MOVE)
 [ ] Final-vs-rc diff reviewed; hashes swapped in drafts
 [ ] btxscan: watchers paused, confs backed up, btxd -> btxd2, doctor healthy, autoupdate=0, watchers back on
 [ ] AI node PQ1 ready + fetch-test; mine-hq copy synced
@@ -498,6 +627,8 @@ Phase 2 (final)
 |---|---|
 | Upstream tags can be bad. Ship only what upstream calls clean, and run guards on the literal tag | v0.33.4–v0.34.1 `nMatMulStallRecoveryHeight=199'299` fork; the grep guard was vacuous |
 | An rc can be consensus-different from the release before it | v0.35.0-rc1 HTLC narrowing (`68f2bf3e`, fixed in `6b94704b`) |
+| A final tag can be moved. Pin the commit SHA, and ask upstream, not a clone, what a tag names | v0.34.16: published at `d27530af`, moved to `074dac16`. The clone on the Windows box still answered the old commit on 11-25, and the pin census read its tags from that clone |
+| A point release can add a build dependency. Read `CMakeLists.txt` and `cmake/` in the diff before dispatching a build | v0.34.16: SwapNet embeds CPython; `cmake/SwapNet.cmake` needs Python 3.11 development files plus `cryptography` and `sqlite3`, with no switch, and 22.04 ships 3.10 |
 | Do the risky work on the rc; make release day a hash swap | This review (v2) |
 | An easyNode release also upgrades our own signer | NEXT-SESSION 10-13 ("the 3060 updated itself through the website") |
 | Change the install key whenever the binary changes, and keep it `vX.Y.Z…` or `-autoupdate=0` silently drops | easynode 0.6.18/0.6.23; `node.rs:995-1003` |
@@ -510,7 +641,7 @@ Phase 2 (final)
 | Refresh the attested snapshot pin every release | easynode `3e5a380`, `b01c4e5` |
 | Test against fixtures made by the real new btxd | pq-wallet `3292a7a` |
 | Set tool paths explicitly in regtest harnesses | qid `87e1b7c` (78 days untested) |
-| No SHA256SUMS since 0.34.13, and 0.35 uses SHA384 and `.tar.xz`: scripts must read the format from the release | btx-apps `e66a3fe`, EasyBTX #574, UPGRADE script :82/:119/:121 |
+| No SHA256SUMS for 0.34.13 to .15, an unsigned one again on 0.34.16, SHA384 and `.tar.xz` on 0.35, and no Mac archive since 0.34.16: scripts must read the format, and which platforms exist, from the release | btx-apps `e66a3fe`, EasyBTX #574, UPGRADE script :82/:119/:121; AInode 0.9.0's Mac source build |
 | Never hand-write updater feeds; publish node releases with `--latest=false` | EasyBTX feed traps |
 | Dispatch CI with a commit SHA and move all `PROVEN_BTXD_*` pins together | `btxd-windows.yml` default sat three engines stale |
 | The box is the truth; repo units and docs go stale | btx-esplora `4c6831e`, `49b686d` |

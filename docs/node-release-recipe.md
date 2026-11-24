@@ -154,7 +154,15 @@ with `pkexec dpkg -i`, after one password prompt. The design is
 
 ---
 
-## The engine freeze is OVER. v0.34.5 is the clean tag, and it is our pin.
+## The engine freeze is OVER. v0.34.5 was the clean tag that ended it.
+
+**The pin today is in `apps/node/src-tauri/src/commands.rs`, not on this page:**
+`NODE_RELEASE_TAG` = `v0.34.16` and `NODE_RELEASE_COMMIT` =
+`074dac167c26c1e091198f691ed5727817dba88a` since 2026-11-25 (v0.34.15 =
+`476f3f23` from 0.7.8, v0.34.12 from 0.7.0, v0.34.9 before). How a pin moves,
+across every app that pins the engine, is `docs/btx-update-protocol.md`. What
+follows is the history of how pins were chosen, kept because each entry is a
+rule somebody paid for.
 
 This section said "Engine bumps are FROZEN, 0.34.5 is not tagged" until
 2026-08-31, and for its whole life it was right. It is now history, kept short
@@ -304,6 +312,45 @@ What changed mechanically, so the next cutter is not surprised:
 * `btxd-windows.yml`'s `btxchain_ref` default now spells this commit. It sat on
   `1e51f0d1` (three engines stale) from 2026-08-12, so a blank dispatch built
   an engine that parks at 184,999.
+
+### 2026-11-25: v0.34.16, pinned by commit because the tag had moved
+
+The pin is **`v0.34.16` = `074dac167c26c1e091198f691ed5727817dba88a`**, GitHub
+"Latest". Upstream cut the tag at `d27530af` (2026-11-07) and later moved it
+to `074dac16`. A btx clone that fetched the tag before the move still answers
+`d27530af` for `v0.34.16` (the clone on the Windows box did, on 2026-11-25),
+and `git fetch` does not correct a tag it already has. So:
+
+* **Resolve this engine by SHA everywhere.** `NODE_RELEASE_COMMIT` is the
+  identity; both guards, `engine_pin_ref` and the build workflows already use
+  it. Ask upstream what the tag names, not a clone:
+  `git ls-remote --tags https://github.com/btxchain/btx 'v0.34.16*'` (the line
+  ending `^{}` is the commit). `scripts/btx-pin-census.py` prints `MOVED TAG`
+  when a local clone disagrees.
+* **The engine build needs Python now.** 0.34.16 compiles SwapNet into btxd
+  with no switch to leave it out: `cmake/SwapNet.cmake` wants Python 3.11 or
+  newer with its development files, and that Python must import
+  `cryptography` and `sqlite3` at configure time. Ubuntu 22.04's own Python is
+  3.10. The three `btxd-*.yml` workflows are where that is provided; the
+  "Rebuilding the Linux release from nothing" steps below need the same.
+* **Still `-DWITH_MODELNET=OFF`**, so `-modelnet` is not a registered option
+  and the app never passes it. SwapNet is off at run time instead: `node.rs`
+  passes `-swapnet=0` to 0.34.16 and newer (it defaults to 0 there and to 1 on
+  0.34.17).
+* **Upstream publishes no macOS archive for 0.34.16** (two Linux archives and
+  an unsigned `SHA256SUMS`, nothing else). `stage-node-pkg.sh` therefore has
+  nothing to download for the Mac at this pin: the Mac engine is a source
+  build, staged with `stage-node-pkg-mac-source.sh`.
+* **No consensus change and no new assumeutxo base**, so `snapshot_spec()`
+  stays on 219000 and the install key is the bare `v0.34.16`.
+* **`signutxosnapshotmanifest` signs only at the node's own tip** from this
+  engine on. The snapshot keeper (`dumptxoutsetattested`) and every load are
+  unaffected; the confirmer's co-signature and dissent are refused by the
+  engine. `commands.rs` has the detail beside the pin, `NEXT-SESSION.md` the
+  open work. Expect `confirmed_snapshot_regtest` and
+  `snapshot_network_regtest` to fail at their co-signing steps against a
+  0.34.16 btxd.
+* Not fixed: btxchain/btx#280, so `btx_core::twin_freeze` stays.
 
 ### The fork check: necessary, never sufficient
 
@@ -906,19 +953,21 @@ anything is signed, published or flipped live:
    `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`,
    plus `apps/node/CHANGELOG.md`.
 
-   ⚠ **The btxd pin: do not move past `1e51f0d1`.** It is no longer all three
-   platforms, as of 2026-08-28. It governs the Windows 0.6.6 and Linux 0.6.5
-   builds, which are the published ones on those platforms. Mac has moved off
-   commit pins entirely and bundles a release tag, v0.33.4.1 in 0.6.12, so this
-   note does not describe the mac path any more.
-   `f3098105` and everything after it (checked through `3455bbdc`) added
-   `RefuseUnverifiableMatMulConsensusStartup`: a consensus-mode node with no
-   qualified MatMul device **exits during init** instead of running.
-   `-matmulrcexecution=auto-fallback`, which `node.rs` passes every
-   non-Apple-Silicon host, does not avoid it — the refusal keys on the device,
-   not the mode. Measured side by side on a GPU-less machine: v0.33.2 starts,
-   `1e51f0d1` starts, `2bfd359b` refuses. Newer commits carry real fixes we want,
-   so re-check this each time, but take nothing that keeps the refusal.
+   **The btxd pin is not bumped here.** It is `NODE_RELEASE_TAG` and
+   `NODE_RELEASE_COMMIT` in `commands.rs` (v0.34.16 = `074dac16…` since
+   2026-11-25), and it moves on its own schedule, by
+   `docs/btx-update-protocol.md`, with both guards run on the commit. An app
+   release that does not move the engine leaves both constants alone, and
+   the app then does not fetch the engine again.
+
+   This step said "do not move past `1e51f0d1`" until 2026-11-25. That
+   warning was about `RefuseUnverifiableMatMulConsensusStartup`, which made a
+   consensus-mode node with no qualified MatMul device exit during init
+   (`f3098105` and after; v0.33.2 and `1e51f0d1` started, `2bfd359b` refused).
+   0.34.5 turned that refusal into a degraded start, the pin moved past it in
+   0.6.13, and `scripts/check-engine-fleet-ready.sh` is what keeps a later
+   engine from bringing it back. The rule it stood for still holds: take no
+   engine that stops a host class from starting.
 
 2. **Windows btxd first — it is the long pole.** Upstream publishes *no* Windows
    binaries in any release, so `.github/workflows/btxd-windows.yml` is the only
@@ -927,12 +976,13 @@ anything is signed, published or flipped live:
    ⚠ Dispatch it with **`btxchain_ref=<btxd commit SHA>`** — the same COMMIT SHA
    rule step 3 states for Linux, and for the same reason: artifact names cannot
    contain `/`, so a branch name fails the upload after a full build. It is
-   `3013c2c22a9a453e778d6cc426734567d819fa59` (upstream's tag v0.34.6, since
-   2026-09-15; `9eb4e005` before that), which is `NODE_RELEASE_COMMIT` in
-   `commands.rs` — read it from there rather than from this page. This line
-   said `1e51f0d1` until 2026-09-09, three engine versions stale, and
-   following it would have pinned the Windows build to an engine that parks at
-   184,999 while Mac and Linux shipped 0.34.6.
+   `NODE_RELEASE_COMMIT` in `commands.rs`: read it from there, never from this
+   page and never from a tag name. On 2026-11-25 that is
+   `074dac167c26c1e091198f691ed5727817dba88a` (upstream's v0.34.16 after
+   upstream moved that tag). This line said `1e51f0d1` until 2026-09-09 and
+   `3013c2c2…` (v0.34.6) until 2026-11-25, each several engines stale;
+   following the first would have pinned the Windows build to an engine that
+   parks at 184,999 while Mac and Linux shipped 0.34.6.
 
    This step used to read `btxchain_ref=v<node version>`, which is wrong twice
    over: the node's version (0.6.x) and btxd's ref are unrelated namespaces, and
@@ -975,6 +1025,13 @@ anything is signed, published or flipped live:
    a source-built node comes from `stage-node-pkg-mac-source.sh` instead, and
    has a different shape (`bin/` + `bin/lib/`, no `libexec/`), so the two are
    not interchangeable.
+
+   From v0.34.16 there is a second reason: upstream publishes no macOS
+   archive at all, so that script has nothing to download for the pinned
+   engine. A release that MOVES the engine therefore needs a Mac source build
+   at `NODE_RELEASE_COMMIT` first (`btxd-macos.yml`, or locally by the steps
+   above), staged with `stage-node-pkg-mac-source.sh`. The shortcut below is
+   for a release that keeps the engine.
 
    In practice the tree is usually **already staged and correct** from the
    previous release. Leave it alone and prove it byte-for-byte instead:
@@ -1222,6 +1279,14 @@ only: a checkout of this repo, a clone of btxchain/btx with tags, CUDA 13.3
 glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
 2.38 and will not run there, which is why we build at all.
 
+Two things changed since those runs. From engine v0.34.16 the configure step
+also needs Python 3.11 or newer with its development files and the
+`cryptography` and `sqlite3` modules (`cmake/SwapNet.cmake`; 22.04 ships
+Python 3.10, so it has to be added). And that WSL machine now runs the
+project's signing node in the same VM: build the engine in CI
+(`btxd-linux.yml`) rather than there, where a full build competes with the
+signer for memory.
+
 1. Engine, from a PRISTINE worktree at the pinned ref (the provenance canary
    fails on any dirty file and the node then runs while silently not
    validating). The ref is the `NODE_RELEASE_COMMIT` SHA when there is one
@@ -1232,7 +1297,11 @@ glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
    git -C <btx-clone> worktree add --detach ~/btx-ship "$(. apps/node/scripts/lib/engine-pin.sh; engine_pin_ref apps/node)"
    # 0.6.18: 9eb4e0050e08ea3ef768bac276dac9cbd2e84542
    # 0.6.23: 3013c2c22a9a453e778d6cc426734567d819fa59 (upstream tag v0.34.6)
-   # next:   84b998b4f3272775aaf8c241ac11dc683f4c4e23 (upstream tag v0.34.9)
+   # 09-23:  84b998b4f3272775aaf8c241ac11dc683f4c4e23 (upstream tag v0.34.9, #117)
+   # 0.7.0:  5f32c4c4d1cb033180bcd40a461deae2c1bc1ee1 (upstream tag v0.34.12)
+   # 0.7.8:  476f3f23e15228bb3e6119ed1e139a9b25424ce8 (upstream tag v0.34.15)
+   # next:   074dac167c26c1e091198f691ed5727817dba88a (v0.34.16; the tag moved
+   #         once, so check out the SHA, never `v0.34.16`)
    cd ~/btx-ship
    cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
      -DBUILD_DAEMON=ON -DBUILD_CLI=ON \
@@ -1264,7 +1333,8 @@ glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
    bad cache.
 
 2. Stage into the app: `apps/node/scripts/stage-node-pkg-linux-source.sh
-   ~/btx-ship/build v0.34.6`; the second argument is the version btxd REPORTS,
+   ~/btx-ship/build v0.34.6` (`v0.34.16` for the current pin); the second
+   argument is the version btxd REPORTS,
    i.e. the install key without its `-suffix`, not the key and not the commit
    (omit it and the script derives the same value from the pin). It vendors
    the whole non system library closure (including the ~490 MB cuBLASLt) with

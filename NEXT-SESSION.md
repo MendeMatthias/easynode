@@ -6,6 +6,84 @@ just the local build, except where it says otherwise.
 
 ---
 
+## Update 2026-11-25: the engine moves to BTX 0.34.16 (in pull requests, nothing released)
+
+**The plan** (owner's planning session, 2026-11-25): move the engine from
+v0.34.15 to upstream's final **v0.34.16 =
+`074dac167c26c1e091198f691ed5727817dba88a`**, pinned by SHA because upstream
+moved that tag once (from `d27530af`). Not the 0.34.17 prerelease. Step one is
+parity: the same roles and behaviour on the newer engine, the model network
+still compiled out (`-DWITH_MODELNET=OFF`), SwapNet off at run time. The
+swarm and ModelNet are a later release. Three threads work in parallel and
+each ends in an open pull request: the Linux engine build, the Windows engine
+build, and the app side. Nobody merges; the planning session integrates and
+releases.
+
+**The app side is the draft pull request from `claude/engine-0.34.16-app`.**
+It moves `NODE_RELEASE_TAG` and `NODE_RELEASE_COMMIT`, passes `-swapnet=0` to
+0.34.16 and newer, adds the tests that hold both, and brings
+`docs/btx-update-protocol.md` (v3), the recipe and
+`scripts/btx-pin-census.py` up to date. It does not bump the app version and
+touches no workflow and no staging script. `commands.rs` has everything that
+was read at the SHA beside the pin.
+
+**What is still owed before a release** (the pull request's description has
+the same list as checkboxes):
+
+1. The two engine pull requests: `PROVEN_BTXD_RUN_ID`, `PROVEN_BTXD_ARTIFACT`
+   and `PROVEN_BTXD_COMMIT` in `node-linux-installer.yml`; `PROVEN_BTXD_RUN_ID`,
+   `PROVEN_BTXD_ARTIFACT`, `PROVEN_BTXD_VERSION` and `PROVEN_BTXD_TAG` in
+   `node-win-installer.yml`; the `btxchain_ref` default in `btxd-windows.yml`
+   (two places); `VERSION` and the archive hashes in `stage-node-pkg.sh` and
+   `stage-node-pkg-linux.sh`. Until they land, the installer workflows'
+   identity checks are red on purpose: the app asks for `v0.34.16` and the
+   proven engines are 0.34.15.
+2. **The Mac.** Upstream publishes no macOS archive for 0.34.16, so
+   `stage-node-pkg.sh` cannot stage this engine. The Mac needs a source build
+   at the SHA (`btxd-macos.yml`, `stage-node-pkg-mac-source.sh`) before it can
+   ship this release; until then it stays where it is.
+3. **The engine build needs Python 3.11 or newer** with development files,
+   `cryptography` and `sqlite3` (`cmake/SwapNet.cmake`), on every builder.
+4. **The pinned start pair** (`attested_snapshot::pinned_pair()`) is still
+   245,300, about 42,000 blocks back. Refreshing it needs a newer pair
+   PUBLISHED as `utxo-snapshot-<height>` on EasyBTX-releases first; the newest
+   one there is 245,300 itself. The website's confirmed pointer serves 287,000
+   (Mende and Jarek, 2026-11-24), which is what new nodes actually start from;
+   the pinned pair is only the fallback when that pointer fails. The 3060's
+   keeper holds its last four signed pairs in `~/.easybtx/snapshots/`
+   (287,300 to 287,600 on 11-25, about 32 MB each), which is where the file
+   to publish comes from. `scripts/publish-attested-snapshot.sh` would
+   publish one, but read its step 5 first: it deletes older
+   `utxo-snapshot-<n>` pre-releases and protects only 225,927, while
+   released apps pin 239,111 and 245,300 as well.
+5. The real-engine `#[ignore]` suites against the built 0.34.16 btxd, an
+   upgrade of a real mirror-era datadir (recipe, "Rebuilding the Linux
+   release", step 5), and `ps` on one real install to see `-swapnet=0`.
+6. Then the release itself: the version in the five files, the changelog
+   heading, the site, and **hold the 3060's app auto-update before the feed
+   goes live** (`docs/btx-update-protocol.md` B3.0). The signer's engine is
+   v0.34.15 today (`/BTX:0.34.15(innovation3060)/`, tip 287,646 at 23:20 UTC
+   on 2026-11-25).
+
+**The confirmer cannot sign on 0.34.16.** Open-work item 0 below is no longer
+a warning about a pull request: btxchain/btx#225 (`af9020cd`) is in this tag.
+`signutxosnapshotmanifest` now rebuilds the statement from the node's own tip
+and signs only if every field matches, so the confirmer's co-signature 144
+blocks deep and its dissent (file fields zero) are both refused: "Refusing to
+sign manifest: consensus fields do not match this node's active-chain
+statement". Each attempt makes the engine write and delete a full UTXO export
+under `<datadir>/utxo-snapshot-sign/` first, every ten minutes per waiting
+statement. Nothing wrong is signed and nothing breaks for users: snapshots are
+confirmed by two PRODUCERS (the 3060 and Jarek, the way item 0 describes), and
+`dumptxoutsetattested` did not change. But the role is dead weight on this
+engine. On the 3060 it has never signed anything (there is no
+`snapshot-confirmer.json` in its data folder): every statement it sees
+carries its own operator's signature already. The decision owed: retire the
+confirmer and the dissent, or give them a form that works at the tip, and
+until then perhaps stop the app from asking an engine that will refuse. `confirmed_snapshot_regtest` and
+`snapshot_network_regtest` fail at their co-signing steps against 0.34.16
+until that is settled.
+
 ## Update 2026-10-18: Jarek confirms snapshots
 
 **Jarek (Byron Bay) is the second snapshot operator** (#218, owner's decision
@@ -256,9 +334,10 @@ preview:states`, then `http://localhost:1440/preview/index.html`.
     blocks; a GPU-memory hog does NOT cause the loss (WDDM pages GPU memory
     out, measured 2026-10-14).
 
-0. **Upstream btxchain/btx#225 would end co-signing as the confirmer does
-   it.** Open, not merged, "a later 0.34.16 can carry it" (its author,
-   2026-10-07). Its `af9020cd` makes `signutxosnapshotmanifest` rebuild the
+0. **Upstream btxchain/btx#225 ends co-signing as the confirmer does it,
+   and it is in v0.34.16** (see the 2026-11-25 update at the top). Written
+   on 2026-10-12, when it was open and "a later 0.34.16 can carry it" (its
+   author, 2026-10-07): its `af9020cd` makes `signutxosnapshotmanifest` rebuild the
    statement from the signing node's own active tip and refuse unless every
    field matches. The confirmer (`snapshot_confirmer.rs`) co-signs a
    statement 144 blocks deep that it checked against its diary, relying on
