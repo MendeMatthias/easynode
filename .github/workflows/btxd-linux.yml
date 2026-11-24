@@ -439,6 +439,16 @@ jobs:
           # path executes. Device execution is proven on real hardware; the
           # transcript from a machine that does it lives in
           # docs/gpu-qualification-rtx3060.md.
+          #
+          # This is the BUILD OUTPUT on the build machine, and it carries no
+          # run path: it has always found cuBLASLt through the loader cache the
+          # CUDA packages register. From 0.34.16 it also needs libpython, which
+          # is in no cache, so the loader is told here where the build's own
+          # Python is. Nothing is lent to the PACKAGE: that is started with an
+          # empty environment on a clean machine further down.
+          if [ -n "${ENGINE_PYTHON_PREFIX:-}" ]; then
+            export LD_LIBRARY_PATH="$ENGINE_PYTHON_PREFIX/lib"
+          fi
           d=$(mktemp -d)
           ./build/bin/btxd --version | head -1
           ./build/bin/btxd -regtest -datadir="$d" -fallbackfee=0.0001 -daemonwait

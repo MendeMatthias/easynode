@@ -144,6 +144,8 @@ engine_set_runpath() {
   local f=$1 want=$2 cur
   cur="$(engine_runpath "$f")"
   [[ "$cur" == "$want" ]] && return 0
+  # Said out loud: this is the one place the package's bytes are changed.
+  echo "    run path [${cur:-none}] -> [${want:-none}]  ${f##*/}"
   chmod u+w "$f"
   if [[ -z "$want" ]]; then
     patchelf --remove-rpath "$f"
@@ -196,13 +198,22 @@ engine_stage_python() {
     echo "==> Python $ver runtime: taken from the engine artifact, as its build tested it"
     return 0
   fi
-  if ! resolved="$(engine_resolve "$btxd" "$soname")"; then
+  # A btx build output carries NO run path (upstream's build sets none; run
+  # 45509202706 died on exactly that: "libpython3.14.so.1.0: cannot open shared
+  # object file" from build/bin/btxd on the machine that had just linked it).
+  # So the loader can only answer when the library is on its own search path.
+  # When it is not, ENGINE_PYTHON says which interpreter the build was given,
+  # and that interpreter's lib/ is where the library it links lives.
+  if resolved="$(engine_resolve "$btxd" "$soname")"; then
+    resolved="$(realpath "$resolved")"
+  elif [[ -n "${ENGINE_PYTHON:-}" && -f "$(dirname "$(dirname "$(readlink -f "$ENGINE_PYTHON")")")/lib/$soname" ]]; then
+    resolved="$(dirname "$(dirname "$(readlink -f "$ENGINE_PYTHON")")")/lib/$soname"
+  else
     _engine_err "btxd links $soname and the loader cannot find it on this machine."
-    _engine_err "Stage from an engine artifact (it carries lib/python$ver), or on the"
-    _engine_err "machine whose Python $ver the build used."
+    _engine_err "Stage from an engine artifact (it carries lib/python$ver), or set"
+    _engine_err "ENGINE_PYTHON to the python$ver the build was configured with."
     return 1
   fi
-  resolved="$(realpath "$resolved")"
   prefix="$(dirname "$(dirname "$resolved")")"
   python="${ENGINE_PYTHON:-$prefix/bin/python$ver}"
   if [[ ! -x "$python" ]]; then
