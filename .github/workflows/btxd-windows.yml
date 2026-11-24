@@ -431,6 +431,36 @@ jobs:
             echo "::error::failed to register the ascend stub in src/CMakeLists.txt"; exit 1; }
           echo "registered:"; grep -n 'ascend/matmul_v4' src/CMakeLists.txt
 
+      # cmake/SwapNet.cmake builds btx_swapnet_engine without core_interface,
+      # the interface target that hands every other target in the tree its
+      # platform definitions and flags. On Linux nothing notices. On Windows
+      # src/swapnet/runtime.cpp includes logging.h and with it util/fs.h, WIN32
+      # is not defined, the header takes its POSIX branch and stops at
+      #   util/fs.h:173: static assertion failed: PathToString not implemented
+      #   on this platform
+      # That was the ONLY error of the first 0.34.16 build (run 45509105010,
+      # with `make -k`). One line fixes it: link core_interface, as every
+      # sibling target does. It is appended, not edited in place, so a change to
+      # upstream's own line cannot half-apply it, and it is skipped the day
+      # upstream links core_interface itself. Worth reporting upstream: the
+      # three engine files are also the only ones compiled without the tree's
+      # hardening flags.
+      - name: Give the SwapNet engine the tree's compile definitions (upstream slip)
+        if: steps.swapnet.outputs.embedded == 'true'
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          f=cmake/SwapNet.cmake
+          if grep -qE 'btx_swapnet_engine[^)]*core_interface' "$f"; then
+            echo "upstream links core_interface into btx_swapnet_engine: nothing to do"
+            exit 0
+          fi
+          grep -q '^add_library(btx_swapnet_engine STATIC' "$f" || {
+            echo "::error::btx_swapnet_engine is no longer defined in $f; re-check this patch"; exit 1; }
+          printf '\n# Added by easyBTX CI (btxd-windows.yml): see the step that writes this.\n' >> "$f"
+          printf 'target_link_libraries(btx_swapnet_engine PRIVATE core_interface)\n' >> "$f"
+          tail -4 "$f"
+
       # WITH_MODELNET=OFF, as on Linux and macOS. 0.34.7 made the Native Model
       # Network default ON (CMakeLists.txt:172), and ON is a hard configure
       # error without OpenSSL 3.5, which the depends tree does not build for
