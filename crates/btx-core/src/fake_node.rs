@@ -42,6 +42,10 @@ pub(crate) struct NodeState {
     pub invalidate_fails: bool,
     /// Methods that fail as on a node that went away.
     pub silent: HashSet<&'static str>,
+    /// What `getnetworkinfo` answers as `version`. `None` is 3415, engine
+    /// 0.34.15, the last one whose `signutxosnapshotmanifest` signs whatever
+    /// it is handed, which is the engine this fake node plays.
+    pub engine_version: Option<u64>,
     /// What `dumptxoutsetattested` writes as (file, manifest). `None` writes
     /// `snapshot bytes <tip>` and the four bytes a manifest starts with,
     /// enough for the keeper, which never parses a manifest itself.
@@ -140,6 +144,7 @@ impl FakeNode {
                 signing_inputs: Vec::new(),
                 invalidate_fails: false,
                 silent: HashSet::new(),
+                engine_version: None,
                 dump: None,
                 offering: None,
                 peers: Vec::new(),
@@ -327,6 +332,7 @@ impl Rpc for FakeNode {
                 Ok(json!({ "withdrawn": s.offering.take().is_some() }))
             }
             "getnetworkinfo" => Ok(json!({
+                "version": s.engine_version.unwrap_or(3415),
                 "localservices": if s.offering.is_some() { "0000000188000d08" } else { "0000000088000d08" },
                 "localservicesnames": []
             })),

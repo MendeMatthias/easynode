@@ -464,19 +464,24 @@ use crate::state::{
 //   - Loading is untouched: confirmed_snapshot.rs and confirmed_load.rs check
 //     manifests in Rust and load through `loadtxoutsetattested`.
 //   - The confirmer (btx_core::snapshot_confirmer, and the btx-confirmer
-//     binary) can no longer co-sign or dissent. It signs a statement 144
-//     blocks deep, and a dissent with zeroed file fields; on this engine both
-//     answer "Refusing to sign manifest: consensus fields do not match this
-//     node's active-chain statement", after the engine has written and
-//     deleted a full UTXO export for nothing. Nothing wrong gets signed; the
-//     round counts a failure and repeats ten minutes later. Snapshots are
-//     confirmed today by two PRODUCERS cutting the same height (this
-//     project's 3060 and Jarek's node; 287,000 was confirmed that way on
-//     2026-11-24), which needs no co-signature, so the confirmed start keeps
-//     working. Redesigning or retiring the confirmer is open work
-//     (NEXT-SESSION.md), and `confirmed_snapshot_regtest` and
-//     `snapshot_network_regtest` fail at their co-signing steps on this
-//     engine until it is done.
+//     binary) can no longer co-sign or dissent, so on this engine it does
+//     not try. It signs a statement 144 blocks deep, and a dissent with
+//     zeroed file fields; this engine would answer both with "Refusing to
+//     sign manifest: consensus fields do not match this node's active-chain
+//     statement", after writing and deleting a full UTXO export, every ten
+//     minutes per waiting statement. `snapshot_confirmer::why_not_on_engine`
+//     reads the engine's version from `getnetworkinfo` and stands the
+//     confirmer down at 0.34.16 and newer, before anything is asked of the
+//     website or of the engine: Copy diagnostics says "confirmer: off, this
+//     engine signs only at its own tip, ...", and the btx-confirmer binary
+//     refuses to run. ⚠ So with this engine NO node can dissent from a wrong
+//     statement any more; confirmation rests on two PRODUCERS cutting the
+//     same height (this project's 3060 and Jarek's node; 287,000 was
+//     confirmed that way on 2026-11-24), which needs no co-signature.
+//     Giving the dissent a form that works at the tip, or retiring it, is
+//     open work (NEXT-SESSION.md). `confirmed_snapshot_regtest` and
+//     `snapshot_network_regtest` stop at their co-signing steps on this
+//     engine until then.
 //
 // ⚠ THE ENGINE BUILD NEEDS PYTHON NOW. SwapNet is compiled into btxd with no
 // build switch: cmake/SwapNet.cmake requires Python 3.11 or newer with its
@@ -8095,6 +8100,13 @@ async fn confirm_round(
         off(why.into()).await;
         return;
     }
+    // The engine's own gate, before anything else is asked of it: 0.34.16 and
+    // newer sign only at their own tip, and would export the whole UTXO set
+    // before refusing a statement 144 blocks deep or a dissent.
+    if let Some(why) = confirmer::why_not_on_engine(confirmer::engine_version(rpc).await) {
+        off(why.into()).await;
+        return;
+    }
     // why_not read both already; these cannot fail after it.
     let (Some(our_key), Some(chain)) = (
         key_hex.as_deref().and_then(btx_core::operators::parse_key),
@@ -9668,12 +9680,14 @@ mod tests {
                         .filter(|a| a.starts_with("-swapnet"))
                         .collect::<Vec<_>>(),
                     vec!["-swapnet=0"],
-                    "{NODE_RELEASE_TAG} at {} on {backend:?} must launch with exactly                      -swapnet=0: {args:?}",
+                    "{NODE_RELEASE_TAG} at {} on {backend:?} must launch with exactly \
+                     -swapnet=0: {args:?}",
                     btxd.display()
                 );
                 assert!(
                     !args.iter().any(|a| a.starts_with("-model")),
-                    "{NODE_RELEASE_TAG} at {} on {backend:?} names a model-network option,                      which a -DWITH_MODELNET=OFF engine refuses at init: {args:?}",
+                    "{NODE_RELEASE_TAG} at {} on {backend:?} names a model-network option, \
+                     which a -DWITH_MODELNET=OFF engine refuses at init: {args:?}",
                     btxd.display()
                 );
                 for kept in ["-autoupdate=0", "-reorgpolicy=legacy", "-parkdeepreorg=0"] {

@@ -9,6 +9,9 @@
 //!    signed snapshot or upstream's plain assumeutxo one, history still being
 //!    checked), the round stops there and signs nothing ([`NoRound::Unvalidated`]):
 //!    otherwise one snapshot could vouch for the next (section 3).
+//!    Then `getnetworkinfo`: on an engine that signs only at its own tip
+//!    (0.34.16 and newer, [`why_not_on_engine`]) the round stops here too,
+//!    before the website is asked and before any call that exports.
 //! 2. `GET /api/snapshots/pending`. Nothing in it is trusted: every statement
 //!    is read from its own manifest bytes, its listed hash and height must be
 //!    the bytes' own, and every signature on it must verify.
@@ -282,6 +285,10 @@ pub enum NoRound {
     Unvalidated,
     /// `pending` could not be read.
     Site(String),
+    /// The engine cannot sign what a confirmer signs ([`why_not_on_engine`]).
+    /// Nothing was asked of the website, and the engine was asked for nothing
+    /// that exports.
+    Engine(&'static str),
 }
 
 impl std::fmt::Display for NoRound {
@@ -292,6 +299,7 @@ impl std::fmt::Display for NoRound {
                 "this node is still checking older history in the background, so it signs nothing"
             ),
             NoRound::Site(e) => write!(f, "{e}"),
+            NoRound::Engine(why) => write!(f, "{why}"),
         }
     }
 }
@@ -329,6 +337,52 @@ pub fn why_not(
         return Some("its key is not on the operator list");
     }
     None
+}
+
+/// `getnetworkinfo.version` of the first engine whose
+/// `signutxosnapshotmanifest` signs only at its own tip: 0.34.16
+/// (10000 x major + 100 x minor + build; a 0.34.15 node answers 3415).
+pub const SIGNS_ONLY_AT_TIP_FROM: u64 = 3416;
+
+/// What a node on such an engine says instead of trying.
+pub const ENGINE_SIGNS_ONLY_AT_TIP: &str = "this engine signs only at its own tip, so this node \
+     cannot add its signature to another operator's statement";
+
+/// Why this node's ENGINE keeps it from confirming, or `None` when it can.
+/// The second standing gate, beside [`why_not`]; `version` is
+/// [`engine_version`].
+///
+/// From 0.34.16 (upstream PR 225, `af9020cd`) `signutxosnapshotmanifest`
+/// exports the UTXO set at the node's own tip into
+/// `<datadir>/utxo-snapshot-sign/`, compares every field of the statement it
+/// was handed with that export, and signs only on an exact match. A confirmer
+/// signs a statement 144 blocks deep, and a dissent whose file fields are
+/// zero. Neither can ever equal the tip's export, so the engine would write
+/// and delete a full export (about 32 MB on mainnet in November 2026) and
+/// then refuse, every round, for every statement waiting. So such a node does
+/// not ask: no co-signature and no dissent, and this sentence instead of a
+/// failure count. Two operators still confirm a snapshot by each producing
+/// it at the same height (`crate::snapshot_serve`).
+///
+/// An engine that does not say its version is not asked either: the cost of
+/// guessing wrong is that export.
+pub fn why_not_on_engine(version: Option<u64>) -> Option<&'static str> {
+    match version {
+        None => Some("the node did not say which engine it runs"),
+        Some(v) if v >= SIGNS_ONLY_AT_TIP_FROM => Some(ENGINE_SIGNS_ONLY_AT_TIP),
+        Some(_) => None,
+    }
+}
+
+/// The running engine's version as `getnetworkinfo` gives it, e.g. 3416 for
+/// 0.34.16. Read from the node, not from the app's install key: the
+/// `btx-confirmer` binary runs beside a btxd it did not install.
+pub async fn engine_version(rpc: &dyn Rpc) -> Option<u64> {
+    rpc.call("getnetworkinfo", json!([]))
+        .await
+        .ok()?
+        .get("version")?
+        .as_u64()
 }
 
 // ── What this node signed ───────────────────────────────────────────────────
@@ -529,6 +583,11 @@ impl Confirmer<'_> {
     pub async fn round(&self, chain: Chain) -> Result<Vec<Verdict>, NoRound> {
         if !crate::node_api::read_chainstates_validated(self.rpc).await {
             return Err(NoRound::Unvalidated);
+        }
+        // Asked here as well as by the callers, so that no caller can reach
+        // `sign_copy` on an engine that would export and refuse.
+        if let Some(why) = why_not_on_engine(engine_version(self.rpc).await) {
+            return Err(NoRound::Engine(why));
         }
         let pending = site::get_pending(self.client, self.site, chain)
             .await
@@ -1311,6 +1370,91 @@ mod tests {
         assert_eq!(n.count("signutxosnapshotmanifest"), 0);
     }
 
+    /// Both sides of the 0.34.16 line. On 0.34.15 the round runs as it
+    /// always did. On 0.34.16 and newer, and on an engine that does not say
+    /// its version, it stops before the website is asked and before the
+    /// engine is asked to sign, for a co-signature and for a dissent alike:
+    /// the engine would export its whole UTXO set and then refuse.
+    #[tokio::test]
+    async fn an_engine_that_signs_only_at_its_tip_is_never_asked_to_sign() {
+        // 0.34.15: the statement the diary agrees with is co-signed.
+        let (n, dir, env) = setup(101);
+        n.with(|s| s.engine_version = Some(3415));
+        let mut server = mockito::Server::new_async().await;
+        listing(&mut server, pending_json(&[(R_P, None)])).await;
+        server
+            .mock("POST", POST)
+            .with_body(reply(H))
+            .create_async()
+            .await;
+        let v = round(&n, dir.path(), &env, &server).await;
+        assert!(matches!(v[..], [Verdict::Signed { .. }]), "{v:?}");
+        assert_eq!(n.count("signutxosnapshotmanifest"), 1);
+
+        for version in [Some(3416), Some(3417), Some(3500), Some(10_000), None] {
+            // A statement it would co-sign (the diary says 101 coins, as the
+            // statement does), and one it would dissent from (99).
+            for coins in [101, 99] {
+                let (n, dir, env) = setup(coins);
+                n.with(|s| {
+                    s.engine_version = version;
+                    if version.is_none() {
+                        s.silent.insert("getnetworkinfo");
+                    }
+                });
+                let mut server = mockito::Server::new_async().await;
+                let get = server.mock("GET", PENDING).expect(0).create_async().await;
+                let post = no_post(&mut server).await;
+                let got = round_with(&n, dir.path(), &env, pubkey(&key(7)), &server).await;
+                let why = match version {
+                    None => "the node did not say which engine it runs",
+                    Some(_) => ENGINE_SIGNS_ONLY_AT_TIP,
+                };
+                assert_eq!(got, Err(NoRound::Engine(why)), "{version:?}");
+                get.assert_async().await;
+                post.assert_async().await;
+                assert_eq!(
+                    n.methods(),
+                    vec!["getchainstates", "getnetworkinfo"],
+                    "{version:?}: nothing that exports or signs"
+                );
+                assert!(work_is_empty(dir.path()));
+            }
+        }
+    }
+
+    #[test]
+    fn the_engine_gate_is_the_0_34_16_line() {
+        assert_eq!(why_not_on_engine(Some(3415)), None);
+        assert_eq!(why_not_on_engine(Some(3409)), None);
+        assert_eq!(
+            why_not_on_engine(Some(3416)),
+            Some(ENGINE_SIGNS_ONLY_AT_TIP)
+        );
+        assert_eq!(
+            why_not_on_engine(Some(3500)),
+            Some(ENGINE_SIGNS_ONLY_AT_TIP)
+        );
+        assert_eq!(
+            why_not_on_engine(None),
+            Some("the node did not say which engine it runs")
+        );
+        assert_eq!(SIGNS_ONLY_AT_TIP_FROM, 3416);
+        assert!(ENGINE_SIGNS_ONLY_AT_TIP.contains("signs only at its own tip"));
+        assert!(!ENGINE_SIGNS_ONLY_AT_TIP.contains("  "));
+        // Said as a stopped round, in the engine's sentence, not as a failure.
+        let mut t = Tally::default();
+        let mut seen = HashSet::new();
+        let line = t.stopped(&NoRound::Engine(ENGINE_SIGNS_ONLY_AT_TIP), &mut seen);
+        assert_eq!(
+            line,
+            Some(format!(
+                "confirmer round stopped: {ENGINE_SIGNS_ONLY_AT_TIP}"
+            ))
+        );
+        assert_eq!((t.failed, t.stopped), (0, 1));
+    }
+
     /// Check 1: under 144 deep it waits; nothing signed, nothing sent.
     #[tokio::test]
     async fn a_statement_under_144_deep_waits() {
@@ -1559,7 +1703,8 @@ mod tests {
                 statement_hash: theirs.hash().display_hex()
             }]
         );
-        assert_eq!(n.methods(), vec!["getchainstates"]);
+        // The two gates, and nothing after them.
+        assert_eq!(n.methods(), vec!["getchainstates", "getnetworkinfo"]);
     }
 
     // ── Never twice ─────────────────────────────────────────────────────────
@@ -1797,8 +1942,11 @@ mod tests {
                 "{want}: {v:?}"
             );
         }
+        // The two gates each round, and nothing after them.
         assert!(
-            n.methods().iter().all(|m| m == "getchainstates"),
+            n.methods()
+                .iter()
+                .all(|m| m == "getchainstates" || m == "getnetworkinfo"),
             "{:?}",
             n.methods()
         );

@@ -345,11 +345,13 @@ and `git fetch` does not correct a tag it already has. So:
   stays on 219000 and the install key is the bare `v0.34.16`.
 * **`signutxosnapshotmanifest` signs only at the node's own tip** from this
   engine on. The snapshot keeper (`dumptxoutsetattested`) and every load are
-  unaffected; the confirmer's co-signature and dissent are refused by the
-  engine. `commands.rs` has the detail beside the pin, `NEXT-SESSION.md` the
-  open work. Expect `confirmed_snapshot_regtest` and
-  `snapshot_network_regtest` to fail at their co-signing steps against a
-  0.34.16 btxd.
+  unaffected. The confirmer's co-signature and dissent could only be refused,
+  so on this engine the app does not ask (`snapshot_confirmer::why_not_on_engine`;
+  Copy diagnostics says "confirmer: off, this engine signs only at its own
+  tip"). No node on 0.34.16 can dissent from a wrong statement. `commands.rs`
+  has the detail beside the pin, `NEXT-SESSION.md` the open work. Expect
+  `confirmed_snapshot_regtest` and `snapshot_network_regtest` to stop at
+  their co-signing steps against a 0.34.16 btxd.
 * Not fixed: btxchain/btx#280, so `btx_core::twin_freeze` stays.
 
 ### The fork check: necessary, never sufficient

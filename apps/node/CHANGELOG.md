@@ -31,9 +31,15 @@ way that happens today still works: each operator's node cuts the snapshot
 itself at the same block, as the project's RTX 3060 and Jarek's node did for
 block 287,000 on 24 November. The other way does not work on this engine: a
 node that is asked, a day later, to add its signature to another operator's
-statement is refused by the engine, because 0.34.16 signs a statement only
-for the block its own chain ends on at that moment. Nothing wrong gets
-signed. Copy diagnostics counts those attempts under Snapshots as failed.
+statement could only be refused, because 0.34.16 signs a statement only for
+the block its own chain ends on at that moment. So on this engine easyNode no
+longer asks: it skips that step, and Copy diagnostics says under Snapshots
+"confirmer: off, this engine signs only at its own tip, so this node cannot
+add its signature to another operator's statement". It is not counted as a
+failure. The same goes for the signed objection a node could send when its
+own record disagreed with a statement: no node on this engine can send one.
+A wrong statement now stays unconfirmed simply because no second operator
+produces the same one.
 
 **Why 0.34.16 and not 0.34.17.** 0.34.17 is a pre-release that upstream has
 replaced several times. easyNode ships engines upstream calls final.

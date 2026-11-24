@@ -116,7 +116,9 @@ rc, while the network is calm.
     equals that. A node can therefore sign a statement only while its tip IS the statement's block.
     Two operators still confirm a snapshot by each cutting the same height with
     `dumptxoutsetattested` (unchanged). Co-signing someone else's statement later, which
-    easyNode's confirmer does 144 blocks deep, is refused.
+    easyNode's confirmer did 144 blocks deep, and its signed dissent, would both be refused
+    after a full UTXO export, so easyNode skips them on 0.34.16 and newer
+    (`snapshot_confirmer::why_not_on_engine`). No node on this engine can dissent.
   - `addmatmulattestationblocklist` and `listmatmulattestationblocklist` take and list ML-DSA-44
     keys too (`blocked_pq_pubkeys`), and the add reports `persisted`.
   - `getblockstats` counts the shielded value balance in the fee and the penalized subsidy (the

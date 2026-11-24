@@ -71,16 +71,20 @@ a warning about a pull request: btxchain/btx#225 (`af9020cd`) is in this tag.
 and signs only if every field matches, so the confirmer's co-signature 144
 blocks deep and its dissent (file fields zero) are both refused: "Refusing to
 sign manifest: consensus fields do not match this node's active-chain
-statement". Each attempt makes the engine write and delete a full UTXO export
-under `<datadir>/utxo-snapshot-sign/` first, every ten minutes per waiting
-statement. Nothing wrong is signed and nothing breaks for users: snapshots are
+statement". Each attempt would make the engine write and delete a full UTXO
+export under `<datadir>/utxo-snapshot-sign/` first, every ten minutes per
+waiting statement. So the app does not ask: `snapshot_confirmer::why_not_on_engine`
+reads `getnetworkinfo.version` and stands the confirmer down at 3416 (0.34.16)
+and newer, before the website or the engine is asked anything. Copy
+diagnostics shows "confirmer: off, this engine signs only at its own tip, so
+this node cannot add its signature to another operator's statement", and the
+`btx-confirmer` binary refuses to run. Nothing breaks for users: snapshots are
 confirmed by two PRODUCERS (the 3060 and Jarek, the way item 0 describes), and
-`dumptxoutsetattested` did not change. But the role is dead weight on this
-engine. On the 3060 it has never signed anything (there is no
+`dumptxoutsetattested` did not change. **But no node on this engine can
+dissent from a wrong statement any more.** On the 3060 it has never signed anything (there is no
 `snapshot-confirmer.json` in its data folder): every statement it sees
 carries its own operator's signature already. The decision owed: retire the
-confirmer and the dissent, or give them a form that works at the tip, and
-until then perhaps stop the app from asking an engine that will refuse. `confirmed_snapshot_regtest` and
+confirmer and the dissent, or give them a form that works at the tip. `confirmed_snapshot_regtest` and
 `snapshot_network_regtest` fail at their co-signing steps against 0.34.16
 until that is settled.
 
