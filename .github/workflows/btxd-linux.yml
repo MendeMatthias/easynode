@@ -493,7 +493,11 @@ jobs:
           # bumped CLIENT_VERSION_BUILD reports the older number, which is why
           # the package declares what it carries in .btxd-version instead.
           # `env -i`: the packaged binary must start with nothing lent to it.
-          env -i "$out/btxd" --version | head -1 | grep -oE 'v[0-9]+(\.[0-9]+)+' > "$out/BTXD_VERSION"
+          # Nothing but a HOME, that is. Even `--version` prepares the default
+          # data directory, and with no HOME that is `/.btx`: run 45509219697
+          # stopped here with "cannot create directories: Permission denied
+          # [/.btx/wallets]" from a package that was otherwise complete.
+          env -i HOME="$RUNNER_TEMP" "$out/btxd" --version | head -1             | grep -oE 'v[0-9]+(\.[0-9]+)+' > "$out/BTXD_VERSION"
           git rev-parse HEAD > "$out/BTXD_COMMIT"
           "$CUDA_HOME/bin/cuobjdump" --list-elf "$out/btxd" 2>/dev/null \
             | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ' > "$out/BTXD_CUDA_ARCHS"
