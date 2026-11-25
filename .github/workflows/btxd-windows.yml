@@ -66,10 +66,11 @@ name: Build Windows btxd (mingw cross, smoked on Windows)
 # 0.34 .. 0.34.4 engines; 0.34.5 and later allow a degraded start, which
 # scripts/check-engine-fleet-ready.sh verifies per pin.
 #
-# 476f3f23 is upstream's tag v0.34.15 (tagged 2026-10-06), and both engine
-# guards pass on it. Before that it was 5f32c4c4 (v0.34.12), 84b998b4
-# (v0.34.9) and 3013c2c2 (v0.34.6). A SHA rather than the tag name so the
-# artifact is named for the commit, which is what node-win-installer.yml's
+# 074dac16 is upstream's final v0.34.16 (GitHub "Latest" since 2026-11-15;
+# upstream moved the tag there from d27530af, one more reason to name the
+# commit). Before that it was 476f3f23 (v0.34.15), 5f32c4c4 (v0.34.12),
+# 84b998b4 (v0.34.9) and 3013c2c2 (v0.34.6). A SHA rather than the tag name so
+# the artifact is named for the commit, which is what node-win-installer.yml's
 # identity check needs.
 on:
   workflow_dispatch:
@@ -77,7 +78,7 @@ on:
       btxchain_ref:
         description: "btxchain/btx ref to build (default = NODE_RELEASE_COMMIT)"
         required: false
-        default: "476f3f23e15228bb3e6119ed1e139a9b25424ce8"
+        default: "074dac167c26c1e091198f691ed5727817dba88a"
   # Self-service trigger. This workflow is dispatch-only, which means a 50 minute
   # build that everything else pins against can only start from a browser, and a
   # release stalls whenever nobody is at a keyboard. Scoped to a throwaway branch
@@ -93,7 +94,7 @@ permissions:
 # fallback there. That is how a build ends up producing an artifact nobody can
 # ship. Every consumer below reads BTXCHAIN_REF instead.
 env:
-  BTXCHAIN_REF: ${{ inputs.btxchain_ref || '476f3f23e15228bb3e6119ed1e139a9b25424ce8' }}
+  BTXCHAIN_REF: ${{ inputs.btxchain_ref || '074dac167c26c1e091198f691ed5727817dba88a' }}
   # The CPython a 0.34.16+ btxd embeds. 3.14 is the line upstream's own Linux
   # archive bundles, and python.org still publishes Windows binaries for it
   # (3.12 stopped at 3.12.10, so it would ship without security fixes).
