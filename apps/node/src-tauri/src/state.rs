@@ -242,7 +242,9 @@ pub struct NodeAppSettings {
     #[serde(default)]
     pub stats_share_enabled: bool,
     /// The swarm, BTX's model network (`btx_core::swarm`): run the engine's
-    /// model network, observing only.
+    /// model network, observing only. Linux only, refused on a node that
+    /// signs, and it runs on a second engine that is downloaded when the
+    /// switch is turned on (`btx_core::swarm_engine`).
     ///
     /// OFF, for a new install and an existing one alike, and the one feature
     /// the owner's "everything on" rule of 2026-10-12 does not reach. It opens
@@ -713,6 +715,17 @@ pub struct SignerOfferStatus {
 }
 
 /// Shared, thread-safe app state managed by Tauri.
+/// Where the swarm engine's download stands, for the card.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum SwarmFetch {
+    #[default]
+    Idle,
+    /// Percent done.
+    Fetching(u8),
+    /// Not installed, and why; the node is on the default engine.
+    Failed(String),
+}
+
 pub struct AppState {
     pub rpc: Arc<Mutex<Option<RpcClient>>>,
     pub node: Arc<Mutex<Option<NodeController>>>,
@@ -831,6 +844,9 @@ pub struct AppState {
     /// that loads a signed snapshot still reads as a host that can sign.
     /// `None` before the first start of this app run.
     pub signer_applies_here: Arc<Mutex<Option<bool>>>,
+    /// The swarm engine's download (`commands::apply_swarm_switch`). A plain
+    /// mutex: the download's progress callback is not async.
+    pub swarm_fetch: Arc<std::sync::Mutex<SwarmFetch>>,
     /// What happened to the last attempt to offer this node's public signing
     /// key to the directory (`btx_core::checkin`). `None` until one has been
     /// attempted this run. Shown in Settings, because "my key is on its way to
@@ -1004,6 +1020,7 @@ impl AppState {
             recent_signers: Arc::new(Mutex::new(None)),
             signer_pubkey: Arc::new(Mutex::new(None)),
             signer_applies_here: Arc::new(Mutex::new(None)),
+            swarm_fetch: Arc::new(std::sync::Mutex::new(SwarmFetch::Idle)),
             signer_offer: Arc::new(Mutex::new(None)),
             stats_share: Arc::new(Mutex::new(None)),
             fork: Arc::new(Mutex::new(None)),

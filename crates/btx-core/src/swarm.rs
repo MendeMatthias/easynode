@@ -123,7 +123,10 @@ pub fn engine_has_model_network(btxd: &Path) -> bool {
 ///
 /// * An engine without it: nothing. It does not know the options.
 /// * An engine with it, swarm not switched on: `-modelnet=0`. No helper, no
-///   swarm thread, no guard, no listener, no LAN beacon.
+///   swarm thread, no guard, no listener, no LAN beacon (measured: no child
+///   process and no listening port; the engine still writes
+///   `<datadir>/modelnet/governor-permit.json`). Without the flag such an
+///   engine listens on 0.0.0.0:29447 and binds UDP 29448 by default.
 /// * Switched on: [`OBSERVING`].
 pub fn launch_args(btxd: &Path, datadir: &Path) -> Vec<String> {
     args_for(engine_has_model_network(btxd), wanted(datadir))
@@ -140,6 +143,11 @@ pub fn launch_args(btxd: &Path, datadir: &Path) -> Vec<String> {
 ///   that the owner did not ask for.
 /// * `-modelpreserverare=0`: it does not fetch rare models to keep them alive.
 /// * `-modelseed=off`: it does not upload a model it holds.
+///
+/// Measured on the real engine with exactly this set (two regtest nodes,
+/// 2026-11-25): `follow_configured_peers` false, `seed_mode` "off",
+/// `relay_status` "off", the helper `READY`, and a peer named with
+/// `-modelpeer` authenticated five seconds after start.
 ///
 /// NOT stated, on purpose, so the engine's own rules and the owner's conf
 /// decide:
@@ -660,6 +668,92 @@ mod tests {
             assert!(engine_has_model_network(&with), "at {at}");
         }
         assert!(!engine_has_model_network(&dir.path().join("absent")));
+    }
+
+    /// A node that answers with what the REAL engine answered
+    /// (`tests/fixtures/swarm/README.md`): the ModelNet build of 074dac16,
+    /// two nodes on regtest, started with [`OBSERVING`].
+    fn real(info: &str, models: Option<&str>) -> FakeNode {
+        let n = node();
+        let info: Value = serde_json::from_str(info).unwrap();
+        let models = models
+            .map(|m| serde_json::from_str::<Value>(m).unwrap()["models"].clone())
+            .unwrap_or_else(|| json!([]));
+        n.with(|s| {
+            s.modelnet = Some(info);
+            s.models = models;
+        });
+        n
+    }
+
+    const REAL_EMPTY: &str = include_str!("../tests/fixtures/swarm/empty.getmodelnetworkinfo.json");
+    const REAL_EMPTY_MODELS: &str = include_str!("../tests/fixtures/swarm/empty.listmodels.json");
+    const REAL_GUARD: &str = include_str!("../tests/fixtures/swarm/empty.guard-process.json");
+    const REAL_ONE_PEER: &str =
+        include_str!("../tests/fixtures/swarm/onepeer.getmodelnetworkinfo.json");
+    const REAL_ONE_PEER_MODELS: &str =
+        include_str!("../tests/fixtures/swarm/onepeer.listmodels.json");
+    const REAL_OFF: &str = include_str!("../tests/fixtures/swarm/off.getmodelnetworkinfo.json");
+
+    /// The real guard file, read at the moment btxd wrote it and after it
+    /// ran out. btxd gives it thirty seconds.
+    #[test]
+    fn the_real_guard_file_reads_as_healthy_until_it_runs_out() {
+        let v: Value = serde_json::from_str(REAL_GUARD).unwrap();
+        let written = v["observed_at_ms"].as_u64().unwrap();
+        assert_eq!(v["valid_until_ms"].as_u64().unwrap() - written, 30_000);
+        assert_eq!(guard_from(&v, written), Guard::Ready);
+        assert_eq!(guard_from(&v, written + 30_001), Guard::Stale);
+    }
+
+    #[tokio::test]
+    async fn the_real_engine_on_and_empty_reads_as_an_empty_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard: Value = serde_json::from_str(REAL_GUARD).unwrap();
+        guard_file(dir.path(), guard.clone());
+        let n = real(REAL_EMPTY, Some(REAL_EMPTY_MODELS));
+        let now = guard["observed_at_ms"].as_u64().unwrap();
+        assert_eq!(
+            read(&n, dir.path(), now).await,
+            Seen::Observing(Report {
+                models_held: 0,
+                peers_seen: 0,
+                shared_families: vec![],
+                // The test nodes ran with -modellandiscovery=0.
+                lan_discovery: false,
+                lan_error: String::new(),
+                guard: Guard::Ready,
+                observing_only: true,
+            })
+        );
+        // And what the launch asked for is what the engine says it does.
+        let info: Value = serde_json::from_str(REAL_EMPTY).unwrap();
+        assert_eq!(info["follow_configured_peers"], false);
+        assert_eq!(info["seed_mode"], "off");
+        assert_eq!(info["relay_status"], "off");
+        assert_eq!(info["helper_state"], "READY");
+    }
+
+    #[tokio::test]
+    async fn the_real_engine_with_one_peer_reads_as_one_peer_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = real(REAL_ONE_PEER, Some(REAL_ONE_PEER_MODELS));
+        let Seen::Observing(r) = read(&n, dir.path(), NOW).await else {
+            panic!("expected a report");
+        };
+        assert_eq!(r.peers_seen, 1);
+        assert_eq!(r.models_held, 0);
+        assert!(r.shared_families.is_empty(), "neither node held a model");
+        assert!(r.observing_only);
+        assert_eq!(r.guard, Guard::Unknown, "no guard file in this folder");
+    }
+
+    #[tokio::test]
+    async fn the_real_engine_with_modelnet_off_reads_as_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = real(REAL_OFF, None);
+        assert_eq!(read(&n, dir.path(), NOW).await, Seen::Off);
+        assert_eq!(n.methods(), vec!["getmodelnetworkinfo"]);
     }
 
     /// The same through the launch the app really builds, on every backend.

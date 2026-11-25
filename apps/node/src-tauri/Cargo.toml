@@ -37,3 +37,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "ti
 [dev-dependencies]
 async-trait = "0.1"
 tempfile = "3"
+# Tests only: sign a file the way `tauri signer sign` does, to check that the
+# swarm engine download is accepted under the update key and nothing else.
+minisign = "0.7"

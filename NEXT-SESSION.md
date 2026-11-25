@@ -7,38 +7,62 @@ just the local build, except where it says otherwise.
 ---
 
 
-## The swarm switch (draft PR, 2026-11-25, nothing released)
+## The swarm switch (draft PR 239, 2026-11-25, nothing released)
 
-`crates/btx-core/src/swarm.rs` is the whole rule; the app side is
-`set_swarm`, `swarm_status` and `swarm_card` in `commands.rs`, the row and
-card are `apps/node/src/swarm-card.ts`.
+Owner's rules (2026-11-25): Linux only; two engines, the second one built
+with the model network and fetched only when the swarm is switched on; off by
+default. A node that signs refuses the switch until the cost per block is
+measured.
 
-What it does:
+Where it is:
 
-- Setting `swarm_enabled`, off, never migrated (`no_migration_turns_the_swarm_on`).
-- The setting is copied to a marker file in the node folder
-  (`easynode-swarm-on`) at every start; the launch reads the marker.
-- The launch reads the ENGINE FILE for the option name `-modelnetrequired`
-  to decide whether it has the model network. Nothing for an engine without
-  it, `-modelnet=0` for one with it, and when switched on
-  `-modelnet=1 -modelhost=0 -modelrelay=0 -modelfollowpeers=0
-  -modelpreserverare=0 -modelseed=off`. Bind, LAN discovery and storage are
-  left to the engine's defaults and the owner's conf, on purpose; the
-  reasons are on `OBSERVING`.
-- Guard health is read from `<datadir>/modelnet/swarm/guard-process.json`.
-  No command returns it (checked at 074dac16).
+- `crates/btx-core/src/swarm.rs`: the launch flags, the engine probe (the
+  bytes `-modelnetrequired` in the btxd file), the reader for
+  `getmodelnetworkinfo` + `listmodels` + the guard's file.
+- `crates/btx-core/src/swarm_engine.rs`: download, sha256, signature,
+  unpack beside the final folder, hold to the pin, one rename into
+  `~/.local/btx/<tag>-modelnet/<platform>/`. Never the default engine's
+  folder.
+- `apps/node/src-tauri/src/commands.rs`: `SWARM_ENGINE` (the pin, `None`
+  today), `swarm_engine_for_launch`, `set_swarm`, `apply_swarm_switch`,
+  `swarm_status`, `swarm_card`. The start path picks the engine and writes
+  the marker `easynode-swarm-on` together.
+- `apps/node/src/swarm-card.ts`: every sentence of the row and card.
 
-Not tested, because no engine with the model network was on this box:
+To make it live, a release has to:
 
-- The engine probe against a real model-network btxd (it was run against ten
-  engines without it: 0 hits each; `-swapnet` is found the same way in the
-  0.34.16 engine, 6 hits, and not in 0.34.15).
-- A real `getmodelnetworkinfo` answer. The fake node's answers were written
-  from helper.cpp:5605, :6881 and rpc/modelnet.cpp:92, :213.
-- Whether the first listen on 29447 raises a Windows Firewall question.
-- What observing costs a signer per block.
+1. Publish the ModelNet engine as a `.tar.gz` in the layout of
+   `resources/node-pkg` (`bin/btxd`, `bin/btx-cli`, `bin/btx-modeld`,
+   `bin/btx-guardd`, `bin/lib/...`, `.btxd-version`), regular files and
+   folders only.
+2. Sign it with the app's update key (`tauri signer sign`), publish the
+   signature beside it as `<archive>.sig`.
+3. Fill in `SWARM_ENGINE`: the address, sha256, archive bytes, and the
+   unpacked bytes and file count printed by the ignored test
+   `swarm_engine::tests::the_real_engine_archive_installs_and_these_are_its_pin_numbers`
+   (`EASYNODE_TEST_SWARM_ARCHIVE=<archive>`).
 
-Open decisions for the owner are in the PR description.
+Run on the real engine on 2026-11-25 (CI run 45598950201, artifact
+15015833815, repackaged by hand; `crates/btx-core/tests/fixtures/swarm`):
+
+- The probe finds the option name twice in the ModelNet btxd, never in ten
+  engines without it.
+- The archive (489,913,031 bytes, 779 files, 828,804,903 bytes unpacked)
+  installs through `install_from_archive` in 8.5 s, real `btxd --version`
+  check included.
+- Two regtest nodes with the app's observing flags, pointed at each other
+  with `-modelpeer`: each saw the other 5 s after start. With `-modelnet=0`:
+  no child process, no listening port. Everything stopped with `btx-cli stop`.
+- A btxd given `-modelrpcsocket=<a stand-alone helper's socket>` attaches to
+  that helper (`helper_managed_by_btxd: false`), starts none of its own, and
+  `listmodels` answers from the helper's store. It still starts its own
+  guard and writes `swarm/` and `security/` in its own folder, and it leaves
+  the helper running when it stops.
+
+Not tested: the download and signature against a published archive (there is
+none), the whole switch inside a running app, a restart of the node onto the
+swarm engine on mainnet, a model held on both nodes ("models both hold"),
+LAN discovery between two computers, the cost to a signer.
 
 ## Update 2026-11-25 (later): fixes from the audit of 0.8.0, for a 0.8.1
 

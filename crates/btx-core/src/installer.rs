@@ -877,7 +877,7 @@ pub fn version_output_matches_tag(output: &str, tag: &str) -> bool {
 }
 
 /// Execute the staged btxd and confirm it reports `expected_tag`.
-fn verify_btxd_reports_tag(btxd: &Path, expected_tag: &str) -> AppResult<()> {
+pub(crate) fn verify_btxd_reports_tag(btxd: &Path, expected_tag: &str) -> AppResult<()> {
     let mut cmd = std::process::Command::new(btxd);
     cmd.arg("--version");
     #[cfg(windows)]

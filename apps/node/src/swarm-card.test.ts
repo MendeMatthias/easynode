@@ -1,12 +1,13 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { type SwarmCard, type SwarmReport, SWARM_COPY, swarmView } from "./swarm-card";
+import { type SwarmCard, type SwarmReport, SWARM_NOT_HERE, SWARM_SIGNER, swarmCopy, swarmView } from "./swarm-card";
 
 const card = (over: Partial<SwarmCard>): SwarmCard => ({
   wanted: false,
-  signs_here: false,
   state: "off",
   why: "",
+  percent: 0,
+  download_mb: 468,
   report: null,
   ...over,
 });
@@ -23,37 +24,63 @@ const report = (over: Partial<SwarmReport> = {}): SwarmReport => ({
 });
 
 describe("the Swarm row", () => {
-  it("is off and says what on would do", () => {
+  it("is off and says, before the switch, what on would do", () => {
     const v = swarmView(card({}));
     expect(v).toMatchObject({ checked: false, disabled: false, attention: false, lines: [] });
-    expect(v.desc).toBe(SWARM_COPY);
+    expect(v.desc).toBe(swarmCopy(468));
     expect(v.desc).toContain("It only observes");
     expect(v.desc).toContain("earns nothing yet");
+    // The open port, the LAN announcement, the download and the restart.
+    expect(v.desc).toContain("opens port 29447 to other computers");
+    expect(v.desc).toContain("announces your node on your local network");
+    expect(v.desc).toContain("downloads a second node engine (about 468 MB)");
+    expect(v.desc).toContain("restarts your node");
   });
 
-  it("greys the switch out on an engine with no model network, and says why", () => {
-    const v = swarmView(card({ state: "no_model_network" }));
+  it("is not offered off Linux, in one plain sentence", () => {
+    const v = swarmView(card({ state: "not_here", wanted: true }));
+    expect(v).toMatchObject({ checked: false, disabled: true, attention: false, lines: [] });
+    expect(v.desc).toBe(SWARM_NOT_HERE);
+  });
+
+  it("is refused on a node that signs, and says when that changes", () => {
+    const v = swarmView(card({ state: "signer" }));
     expect(v.disabled).toBe(true);
-    expect(v.desc).toContain("This engine has no model network");
-    expect(v.attention).toBe(false);
-    // Saved as on from another engine: it can still be switched off.
-    const kept = swarmView(card({ state: "no_model_network", wanted: true }));
-    expect(kept).toMatchObject({ checked: true, disabled: false });
-    expect(kept.desc).toContain("nothing runs");
+    expect(v.desc).toBe(SWARM_SIGNER);
+    expect(v.desc).toContain("once what it costs a signing node per block has been measured");
+    // Saved as on before the node began to sign: it can still be switched off.
+    expect(swarmView(card({ state: "signer", wanted: true }))).toMatchObject({ checked: true, disabled: false });
   });
 
-  it("tells a signer that the swarm stays off there unless switched on", () => {
-    expect(swarmView(card({ signs_here: true })).desc).toContain(
-      "This node signs blocks for mirrors, so the swarm stays off here unless you switch it on.",
-    );
-    const on = swarmView(card({ signs_here: true, wanted: true, state: "observing", report: report() }));
-    expect(on.lines.at(-1)).toContain("also signs blocks for mirrors");
+  it("greys the switch out when this version has no engine to fetch", () => {
+    const v = swarmView(card({ state: "not_available", download_mb: 0 }));
+    expect(v.disabled).toBe(true);
+    expect(v.desc).toContain("no swarm engine to fetch yet");
+  });
+
+  it("shows the download and keeps the switch still while it runs", () => {
+    const v = swarmView(card({ wanted: true, state: "fetching", percent: 37 }));
+    expect(v.disabled).toBe(true);
+    expect(v.desc).toContain("37%");
+    expect(v.desc).toContain("keeps running on its usual engine");
+  });
+
+  it("says why a download was not installed and that the node is still running", () => {
+    const why = "The swarm engine download is not signed by this app's update key (the signature does not match). Nothing was installed.";
+    const v = swarmView(card({ wanted: true, state: "fetch_failed", why }));
+    expect(v.attention).toBe(true);
+    expect(v.desc).toContain(why);
+    expect(v.desc).toContain("still running on its usual engine");
+    expect(v.desc).toContain("Switch the swarm off and on to try again");
+    expect(swarmView(card({ wanted: true, state: "engine_missing" })).desc).toContain("runs on its usual engine");
   });
 
   it("reads an empty swarm as normal, never as a fault", () => {
     const v = swarmView(card({ wanted: true, state: "observing", report: report() }));
     expect(v.attention).toBe(false);
-    expect(v.desc).toBe("On, observing only. Nothing is served, downloaded or earned yet.");
+    expect(v.desc).toBe(
+      "On, observing only. Nothing is served, downloaded or earned yet. Port 29447 is open to other computers.",
+    );
     expect(v.lines).toEqual([
       "Models held: none. That is normal: this app does not download models.",
       "Peers seen: none yet. That is normal: the model network is new and has no built-in peers.",

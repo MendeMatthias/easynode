@@ -27,11 +27,14 @@ export type SwarmReport = {
 export type SwarmCard = {
   /** The saved switch. */
   wanted: boolean;
-  /** This node signs blocks for mirrors. */
-  signs_here: boolean;
   state:
-    | "no_model_network"
+    | "not_here"
+    | "signer"
+    | "not_available"
     | "off"
+    | "fetching"
+    | "fetch_failed"
+    | "engine_missing"
     | "starts_next_start"
     | "stops_next_start"
     | "node_stopped"
@@ -40,6 +43,10 @@ export type SwarmCard = {
     | "unreadable"
     | "unreachable";
   why: string;
+  /** The download's progress while `state` is "fetching". */
+  percent: number;
+  /** The engine download's size in MB; 0 when this version has none. */
+  download_mb: number;
   report: SwarmReport | null;
 };
 
@@ -53,12 +60,22 @@ export type SwarmView = {
   attention: boolean;
 };
 
-export const SWARM_COPY =
-  "Join BTX's model network: your node finds other nodes that hold AI models and shows what it sees. It only observes. It serves nothing, downloads nothing and earns nothing yet. Off unless you switch it on. Applies on next start";
+/** What the row says while the switch is off and may be turned on. The open
+ *  port and the download are said here, before the switch, not after it. */
+export function swarmCopy(downloadMb: number): string {
+  const size = downloadMb > 0 ? `about ${downloadMb} MB` : "a few hundred MB";
+  return (
+    "Join BTX's model network: your node finds other nodes that hold AI models and shows what it sees. " +
+    "It only observes: it serves nothing, downloads no models and earns nothing yet. " +
+    `Switching it on downloads a second node engine (${size}), opens port 29447 to other computers, ` +
+    "announces your node on your local network and restarts your node. Off unless you switch it on."
+  );
+}
 
-const SIGNER_OFF =
-  " This node signs blocks for mirrors, so the swarm stays off here unless you switch it on.";
-const SIGNER_ON = "This node also signs blocks for mirrors. The swarm shares the computer with that work.";
+export const SWARM_NOT_HERE =
+  "The swarm runs on Linux only for now. On this computer there is nothing to switch on.";
+export const SWARM_SIGNER =
+  "This node signs blocks for mirrors, so the swarm stays off here for now. It will be allowed once what it costs a signing node per block has been measured.";
 
 const plural = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`;
 
@@ -99,28 +116,43 @@ function reportLines(r: SwarmReport): string[] {
 }
 
 export function swarmView(c: SwarmCard): SwarmView {
-  const signer = c.signs_here && c.wanted ? [SIGNER_ON] : [];
-  const base = { checked: c.wanted, disabled: false, lines: signer, attention: false };
+  const base = { checked: c.wanted, disabled: false, lines: [] as string[], attention: false };
+  // A switch that cannot be turned on is greyed out with the reason. It stays
+  // usable when it is saved as on, so it can always be switched off.
+  const closed = { ...base, disabled: !c.wanted };
   switch (c.state) {
-    case "no_model_network":
-      // A switch that does nothing is greyed out with the reason. It stays
-      // usable when it is saved as on, so it can be switched off again.
+    case "not_here":
+      return { ...closed, checked: false, disabled: true, desc: SWARM_NOT_HERE };
+    case "signer":
+      return { ...closed, desc: SWARM_SIGNER };
+    case "not_available":
+      return { ...closed, desc: "This version of the app has no swarm engine to fetch yet, so there is nothing to switch on." };
+    case "off":
+      return { ...base, desc: swarmCopy(c.download_mb) };
+    case "fetching":
       return {
         ...base,
-        disabled: !c.wanted,
-        lines: [],
-        desc: c.wanted
-          ? "Saved as on. This engine has no model network, so nothing runs. It starts with an engine that has one."
-          : "This engine has no model network, so there is nothing to switch on yet. The switch works with an engine that has one.",
+        disabled: true,
+        desc: `Downloading the swarm engine: ${c.percent}%. Your node keeps running on its usual engine and restarts once the download has been checked.`,
       };
-    case "off":
-      return { ...base, desc: SWARM_COPY + (c.signs_here ? SIGNER_OFF : "") };
+    case "fetch_failed":
+      return {
+        ...base,
+        attention: true,
+        desc: `The swarm engine was not installed. ${c.why} Your node is still running on its usual engine. Switch the swarm off and on to try again.`,
+      };
+    case "engine_missing":
+      return {
+        ...base,
+        attention: true,
+        desc: "On, but the swarm engine is not installed, so your node runs on its usual engine. Switch the swarm off and on to fetch it.",
+      };
     case "starts_next_start":
       return { ...base, desc: "On at the next node start. It will only observe: nothing is served, downloaded or earned." };
     case "node_stopped":
       return { ...base, desc: "On. It starts with the node, and only observes." };
     case "stops_next_start":
-      return { ...base, lines: [], desc: "Off at the next node start. Until then it is still running." };
+      return { ...base, desc: "Off at the next node start. Until then it is still running." };
     case "helper_down":
       return {
         ...base,
@@ -138,9 +170,9 @@ export function swarmView(c: SwarmCard): SwarmView {
       return {
         ...base,
         attention,
-        lines: [...reportLines(r), ...signer],
+        lines: reportLines(r),
         desc: r.observing_only
-          ? "On, observing only. Nothing is served, downloaded or earned yet."
+          ? "On, observing only. Nothing is served, downloaded or earned yet. Port 29447 is open to other computers."
           : "On. The engine reports more than observing, which this app does not describe yet. Switch it off if you did not expect that.",
       };
     }

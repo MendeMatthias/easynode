@@ -1,0 +1,205 @@
+{
+  "schema_version": 2,
+  "enabled": false,
+  "helper_ready": false,
+  "helper_managed_by_btxd": false,
+  "helper_state": "DISABLED",
+  "helper_pid": -1,
+  "helper_restart_count": 0,
+  "pq1_ready": false,
+  "error": "btx-modeld not connected",
+  "retrieval_default": "FREE_ONLY",
+  "automatic_spend_atoms": 0,
+  "public_host_reachable": false,
+  "advertised_host": false,
+  "nat_limited": true,
+  "capabilities": {
+    "schema_version": 2,
+    "protocol": 2,
+    "uri": true,
+    "importmodel": true,
+    "hostmodel": true,
+    "checkmodelsetup": true,
+    "previewmodelimport": true,
+    "getmodelsharecard": true,
+    "getmodeltransfers": true,
+    "setmodelalias": true,
+    "scanmodelwatch": true,
+    "getmodelwatchstatus": true,
+    "showmodel": true,
+    "exportmodellink": true,
+    "exportmodelpath": true,
+    "loadmodel": true,
+    "unloadmodel": true,
+    "generatemodel": true,
+    "getmodelhostprofile": true,
+    "unhostmodel": true,
+    "removemodel": true,
+    "removemodelalias": true,
+    "openmodelshare": true,
+    "seedmodel": true,
+    "listmodels": true,
+    "getmodelmanifest": true,
+    "qualifymodel": true,
+    "getmodel_free_only": true,
+    "pq1_http": true,
+    "piece_wire": "application/octet-stream",
+    "paid_retrieval": true,
+    "paid_chain_verify": false,
+    "paid_funding_rpc": true,
+    "signed_free_grant": true,
+    "release_campaign_rpc": true,
+    "buildmodelhtlcclaim": true,
+    "htlc_reuse": "0.34.6 htlc_sha256 / buildhtlcclaim / buildhtlcrefund",
+    "remote_inference": false,
+    "cuda_qualification": true,
+    "browser_bridge": false,
+    "node_model_index": true,
+    "searchmodels": true,
+    "decentralized_search": true,
+    "automatic_spend_atoms": 0,
+    "full_file_stream_v1": true,
+    "subpiece_v1": true,
+    "package_v1": true,
+    "erasure_preservation_v1": true,
+    "query_summary_v1": true,
+    "index_reconcile_v1": true,
+    "metadata_gossip_v1": true,
+    "safety_advisory_v1": true,
+    "origin_offer_v1": true,
+    "lan_discovery_v1": true,
+    "selective_files_v1": true,
+    "capabilities": [
+      {
+        "name": "FULL_FILE_STREAM_V1",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "name": "SUBPIECE_V1",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "name": "SELECTIVE_FILES_V1",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "name": "ORIGIN_OFFER_V1",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "name": "FULL_ORIGIN_INGEST_V1",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "name": "ERASURE_PRESERVATION_V1",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "name": "QUERY_SUMMARY_V1",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "name": "INDEX_RECONCILE_V1",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "name": "METADATA_GOSSIP_V1",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "name": "PACKAGE_V1",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "name": "BTXPKG_CORE_V2",
+        "min": 2,
+        "max": 2
+      },
+      {
+        "name": "AGENT_HANDOFF_V1",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "name": "BTXPKG_CORE_V3",
+        "min": 3,
+        "max": 3
+      },
+      {
+        "name": "CAPABILITY_HANDOFF_V1",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "name": "LAN_DISCOVERY_V1",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "name": "SAFETY_ADVISORY_V1",
+        "min": 1,
+        "max": 1
+      }
+    ],
+    "quic": false,
+    "utp": "NONSHIPPING",
+    "btx_torrentd_process": false,
+    "cloud_attached_storage": false,
+    "direct_cloud_seed": false,
+    "model_event_journal": true,
+    "subscription_mandate": true,
+    "demand_seed_default": true,
+    "preserve_rare": true,
+    "follow_configured_peers_default": true,
+    "unsolicited_fetch_default": false,
+    "native_lan_free_acquisition": true,
+    "acquisition_requires": "strict PQ1, matching chain, verified bytes, positive quota, follow_peers and seed=auto",
+    "extension_version": 257,
+    "features": 127,
+    "http": [
+      "POST /hello",
+      "POST /query",
+      "POST /records/get",
+      "POST /records/announce",
+      "GET /manifests/{id}",
+      "POST /availability",
+      "POST /quotes",
+      "POST /transfers/{id}/payment",
+      "GET /transfers/{id}/pieces/{file}/{piece}",
+      "GET /files/{artifact}/{file}",
+      "POST /releases/{id}/pledges",
+      "POST /releases/{id}/rounds",
+      "POST /releases/{id}/signatures",
+      "POST /ext/caps",
+      "POST /ext/resolve",
+      "POST /ext/objects/get",
+      "POST /ext/objects/announce",
+      "POST /ext/free/grant",
+      "POST /ext/receipts",
+      "POST /ext/pex",
+      "POST /ext/rendezvous",
+      "POST /ext/relay/connect",
+      "POST /ext/autonat/probe",
+      "POST /ext/autonat/report",
+      "POST /ext/relay/reserve",
+      "POST /ext/holepunch",
+      "POST /ext/providers/put",
+      "POST /ext/providers/get",
+      "POST /ext/search",
+      "POST /ext/feed"
+    ]
+  },
+  "note": "A BTX node already has compute. BTX gives it models and money. Not inference-as-a-service.",
+  "htlc": "reuses final 0.34.6 htlc_sha256 / buildhtlcclaim / buildhtlcrefund; HASH160 htlc_tx is recovery-only",
+  "helper_error": "helper unix connect failed (btx-modeld not running)"
+}

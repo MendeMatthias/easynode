@@ -8,31 +8,45 @@ root).
 
 ## [Unreleased]
 
-**Swarm (model network): a switch, off by default, and a card that shows what
-it sees.** BTX's engine can run a "model network": nodes that hold AI models
-find each other. Settings has a new switch for it, "Swarm (model network)",
-under Helping the network.
+**Swarm (model network): a switch for Linux, off by default, and a card that
+shows what it sees.** BTX's engine can run a "model network": nodes that hold
+AI models find each other. Settings has a new switch for it, "Swarm (model
+network)", under Helping the network.
 
-- **It is off, and no update switches it on.** That holds for a new install,
-  for an existing one, and for a node that signs blocks for mirrors. Off means
-  the engine's model network does not run at all: no helper program, no
-  listener, no announcement on your local network.
-- **On means observing only.** Your node listens on port 29447, looks for
-  other nodes on your local network, and shows what it finds. It serves no
-  model files, downloads none (the engine's own default would download free
-  models other nodes announce; the app switches that off by name), and earns
-  nothing yet. The card says so, and stops saying so if a later engine ever
+- **It is off, and no update switches it on.** That holds for a new install
+  and for an existing one. Off means the model network does not run at all:
+  no helper program, no listener, no announcement on your local network.
+- **Linux only for now.** On Windows and on a Mac the row says so and there
+  is nothing to switch on.
+- **Not on a node that signs blocks for mirrors, for now.** The switch is
+  refused there with the reason: it will be allowed once what the swarm costs
+  a signing node per block has been measured.
+- **It runs on a second node engine, fetched when you switch it on.** Every
+  install keeps the engine it has. Switching the swarm on downloads a second
+  one that has the model network (about 470 MB), checks it against the
+  checksum this version of the app carries and against the app's update
+  signature, installs it in a folder of its own beside the usual engine and
+  restarts your node on it. If the download fails or does not pass a check,
+  nothing is installed, your node keeps running on its usual engine and the
+  row says why. Switching the swarm off restarts your node on its usual
+  engine.
+- **On means observing only.** Your node listens on port 29447, which other
+  computers can reach, looks for other nodes on your local network, and shows
+  what it finds. It serves no model files, downloads none (the engine's own
+  default would download free models other nodes announce; the app switches
+  that off by name), and earns nothing yet. The row says all of this before
+  you switch it on, and stops saying "observing only" if a later engine ever
   reports more than that.
 - **The card** shows models held, peers seen, the models you and a peer both
   hold, whether the guard program is healthy, and whether your node is looking
   on the local network. No model and no peer is the ordinary case and is
   worded that way, not as a fault.
-- **It needs an engine that has the model network.** The engine this version
-  ships does not (it is built without it), so today the switch is greyed out
-  and says why. The app reads this from the engine itself, not from its
-  version number, and names a model-network option only to an engine that
-  knows it.
-- A change applies the next time the node starts.
+- **This version has no swarm engine to fetch yet,** so today the switch is
+  greyed out and says so. It starts working in the release that publishes
+  the engine.
+- An engine that has the model network but was installed some other way (the
+  project's own archive from upstream) is now started with the model network
+  off, where it ran by the engine's default before.
 
 ## [0.8.1] - 2026-11-25 · linux + windows (no mac build; the mac stays on the version it has)
 
