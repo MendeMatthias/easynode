@@ -109,6 +109,21 @@ for ssl in "$SRC"/lib/libssl.so* "$SRC"/lib/libcrypto.so*; do
   mkdir -p "$DEST/lib"
   cp -P "$ssl" "$DEST/lib/"
 done
+# From 0.34.16 libexec/btxd.real links libpython for the SwapNet worker, also
+# when it runs with -swapnet=0, and upstream's archive carries that runtime in
+# lib/: libpython3.X.so.1.0, the standard library in python3.X/, third-party
+# modules at the build host's site path (python3/dist-packages on a Debian
+# host) and the libraries only those modules load in python-private/. btxd
+# looks for exactly that shape beside the libpython it loaded
+# (src/swapnet/embed.cpp), so it is copied as it is. An archive without it,
+# which is 0.34.15 and everything older, copies nothing here.
+# NOT YET RUN: VERSION above is still 0.34.15, whose archive has none of this.
+# Run it once against the 0.34.16 archive when VERSION moves.
+for py in "$SRC"/lib/libpython3.*.so* "$SRC"/lib/python3* "$SRC"/lib/python-private; do
+  [ -e "$py" ] || continue
+  mkdir -p "$DEST/lib"
+  cp -RP "$py" "$DEST/lib/"
+done
 # Without the model plane, exactly as stage-node-pkg.sh does and for the same
 # reason: the archive is built WITH_MODELNET=ON, an ON btxd starts btx-modeld on
 # 0.0.0.0:29447 by itself, the release engine is built OFF, and the app calls

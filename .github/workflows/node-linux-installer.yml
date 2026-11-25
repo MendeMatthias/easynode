@@ -248,6 +248,16 @@ jobs:
           # $ORIGIN rpath. The script's FINAL verification deliberately runs
           # under `env -u LD_LIBRARY_PATH`, so self-containment is still proved
           # without this crutch — it only has to get the walk started.
+          #
+          # That describes the artifact pinned above (v0.34.15: raw build
+          # output plus cuBLASLt). An artifact from btxd-linux.yml as it is
+          # now needs none of it: its lib/ is the complete closure, its
+          # binaries already carry their run path, and from 0.34.16 it holds
+          # the Python runtime btxd embeds (lib/python3.X). The staging script
+          # takes that lib/ whole, so what ships is what the engine build
+          # started in a clean container: staging compares every staged file
+          # with the artifact's SHA256SUMS.txt and looks nothing up on this
+          # runner. The export below is then harmless.
           if [ -d btxd-dist/lib ]; then
             export LD_LIBRARY_PATH="$PWD/btxd-dist/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             echo "loader path for staging: $LD_LIBRARY_PATH"
@@ -494,6 +504,41 @@ jobs:
           env -u LD_LIBRARY_PATH "$apkgdir/bin/btxd" --version | head -1
           echo "path contract OK: runnable btxd in both bundles, no unresolved libs"
 
+      # The path-contract gate above runs `btxd --version` out of both bundles.
+      # That proves the two binaries and their libraries survived packaging. It
+      # does not touch the Python runtime the package carries from 0.34.16 on,
+      # and by now linuxdeploy has rewritten the run path of every ELF it found
+      # under usr/lib, the package's included. So start both bundled packages
+      # the way the engine build started the artifact: in a plain ubuntu:22.04
+      # container, read-only, with an empty environment and no Python there
+      # (engine_clean_start has the details). An engine without Python is
+      # started once, plain.
+      #
+      # BEFORE the bundles are collected and uploaded, on purpose: a bundle
+      # whose engine does not start must not be sitting there to download.
+      - name: Start both bundled packages on a clean Ubuntu 22.04
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          . apps/node/scripts/lib/engine-runtime-linux.sh
+          product=$(jq -r .productName apps/node/src-tauri/tauri.conf.json)
+          for tree in "/tmp/debx/usr/lib/$product/resources/node-pkg/bin" \
+                      "/tmp/appx/squashfs-root/usr/lib/$product/resources/node-pkg/bin"; do
+            [ -x "$tree/btxd" ] || { echo "::error::no bundled btxd at $tree"; exit 1; }
+            if [ -n "$(engine_python_soname "$tree/btxd")" ]; then
+              modes="swapnet0 swapnet1"
+            else
+              # Before 0.34.16 there is no -swapnet option.
+              modes="plain"
+            fi
+            for mode in $modes; do
+              echo "::group::clean start ($mode): $tree"
+              engine_clean_start "$tree" "$mode"
+              echo "::endgroup::"
+            done
+          done
+          echo "both bundled packages start on a clean Ubuntu 22.04"
+
       # The names here are the names that SHIP. tauri's productName is
       # "easyBTX Node", so the bundler emits "easyBTX Node_<ver>_amd64.AppImage",
       # with a space, and the release convention is BTX-Node_<ver>_<arch>.<ext>.
@@ -562,7 +607,12 @@ jobs:
               echo "::error::$(basename "$f") needs GLIBC_$fv > $CEIL"
               rc=1
             fi
-          done < <(find "$pkg/bin" -maxdepth 2 -type f \( -name 'btxd' -o -name 'btx-cli' -o -name '*.so*' \))
+          done < <(find "$pkg/bin" -type f \( -name 'btxd' -o -name 'btx-cli' -o -name '*.so*' \))
+          # ^ no -maxdepth: from 0.34.16 the package also holds Python
+          # extension modules, three directories below bin/lib
+          # (bin/lib/python3.X/lib-dynload and site-packages). A walk that
+          # stopped at bin/lib would call the package checked without ever
+          # looking at them.
           # A find that matches nothing would otherwise leave rc=0 and print a
           # cheerful OK, so an empty walk has to be the failure it actually is.
           # btxd and btx-cli are always present; vendored .so files may not be.

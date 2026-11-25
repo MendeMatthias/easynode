@@ -1,0 +1,39 @@
+# What btxd's embedded SwapNet worker imports beyond the standard library
+# (0.34.16 on; upstream's cmake/SwapNet.cmake checks for `cryptography` at
+# configure time). Installed into the build's Python by
+# .github/workflows/btxd-linux.yml with
+#
+#     pip install --require-hashes --only-binary :all: -r <this file>
+#
+# and from there bundled into the engine package by engine-python-bundle.py.
+# These bytes ship to users, so every file is pinned by hash and nothing is
+# built from source: a release that changes one of them has to change this
+# file.
+#
+# Hashes are the sha256 PyPI publishes for each file, read on 2026-11-25:
+#
+#   cryptography-46.0.4-cp311-abi3-manylinux_2_28_x86_64.whl
+#       46.0.4 because that is the version upstream tested the worker with:
+#       contrib/swapnet/requirements-tested-runtime.txt at 074dac16 says
+#       cryptography==46.0.4, the Windows engine ships the same, and the
+#       workflow refuses to build when upstream's file and this one disagree.
+#       The manylinux_2_28 build, not the manylinux_2_34 one pip would pick by
+#       default on this runner: same code, needs glibc 2.28 where the other
+#       needs 2.34, and the package's floor is 2.35. OpenSSL is linked into the
+#       wheel statically, so it needs no libssl from the machine and none of
+#       OpenSSL's provider directories.
+#   cffi-2.1.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+#       cryptography's bindings load its _cffi_backend extension at import.
+#       TIED TO THE PYTHON MINOR VERSION (cp314): move ENGINE_PYTHON_VERSION in
+#       the workflow to another minor and this hash must move with it.
+#   pycparser-3.12-py3-none-any.whl
+#       cffi declares it. Nothing imports it at run time, so it is installed on
+#       the build machine and is NOT bundled.
+#
+# To move one: take the new file's sha256 from https://pypi.org/pypi/<name>/<version>/json.
+cryptography==46.0.4 \
+    --hash=sha256:0a9ad24359fee86f131836a9ac3bffc9329e956624a2d379b613f8f8abaf5255
+cffi==2.1.1 \
+    --hash=sha256:b0431303acaea1089ad4b3e9ce4e6518193def1118d4073ca848635ee4ea2e96
+pycparser==3.12 \
+    --hash=sha256:a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e

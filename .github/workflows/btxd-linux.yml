@@ -25,6 +25,23 @@ name: Build Linux btxd (CUDA source build, smoked on the runner)
 # while silently refusing to validate. Nothing on screen says so. The "prove the
 # tree is pristine" step below exists to make that impossible to do by accident.
 #
+# ⚠ PYTHON, FROM 0.34.16. btxd links libpython for its in-process SwapNet
+# worker (upstream's cmake/SwapNet.cmake: Python >= 3.11 with headers and the
+# `cryptography` module, REQUIRED, no switch to turn it off). It links it even
+# when started with -swapnet=0. This runner's own Python is 3.10, and the
+# machines the binary is for may have no Python at all. So the job installs a
+# pinned CPython, builds against it, and ships that interpreter's library,
+# standard library and `cryptography` INSIDE the package, where btxd finds them
+# by itself (apps/node/scripts/lib/engine-runtime-linux.sh says how). A tree
+# that does not link Python, which is every tag up to 0.34.15, takes none of
+# those steps and is configured exactly as before.
+#
+# ⚠ THE PACKAGE IS STARTED ON A CLEAN MACHINE BEFORE IT IS UPLOADED. The
+# regtest smoke runs on this runner, which has every library the build used.
+# The last steps put the finished package into a plain ubuntu:22.04 container
+# with an empty environment and no Python, and start it there. A library the
+# package forgot fails HERE, not on a user's machine.
+#
 # ── STATUS ──────────────────────────────────────────────────────────────────
 # Releases 0.6.15 through 0.6.17 were built BY HAND on an Ubuntu 22.04 box,
 # following "Rebuilding the Linux release from nothing" in
@@ -75,6 +92,24 @@ env:
   DEFAULT_CUDA_ARCHS: "75;86;89;120"
   CUDA_VERSION: "13-3"
   CUDA_HOME: "/usr/local/cuda-13.3"
+  # The CPython btxd is built against and that ships inside the package, for an
+  # engine that embeds Python (0.34.16 on). EXACT on purpose: a range would let
+  # the interpreter a release carries move without a commit. 3.14 because that
+  # is the minor upstream's own 0.34.16 archive bundles, so the SwapNet worker
+  # runs on the Python it was released on. actions/setup-python installs the
+  # build GitHub made ON ubuntu-22.04, so it has this runner's glibc floor; the
+  # checks at the end of the job read that off the files rather than trust it.
+  # apps/node/scripts/lib/engine-python-requirements.txt pins a cffi wheel for
+  # this MINOR version; move one and the other must follow.
+  ENGINE_PYTHON_VERSION: "3.14.10"
+  # ...and pinned by BYTES, because a version is a name and setup-python fetches
+  # whatever GitHub currently publishes under it. This is the sha256 of
+  # lib/libpython3.14.so.1.0 as that build delivers it (runs 45512058871 and
+  # 45515418211 both saw it). The job stops when it differs. It moves together
+  # with the version above.
+  ENGINE_LIBPYTHON_SHA256: "83ef0c3cc369737f689854b1bb52b84e5d3d5dfdb24a070aadaccef8218d04df"
+  # Where the finished package is started before upload. See the last steps.
+  ENGINE_CLEAN_IMAGE: "ubuntu:22.04"
 
 jobs:
   build-btxd:
@@ -144,6 +179,39 @@ jobs:
           fi
           echo "tree pristine at $(git rev-parse HEAD)"
 
+      # Asked of the TREE, not of a version number: a branch build reports
+      # whatever version it likes, and the tree is what gets compiled.
+      - name: Does this engine embed Python?
+        id: py
+        run: |
+          set -euo pipefail
+          hits=$(grep -rnE 'find_package\(Python3[^)]*Development' \
+                   btx/CMakeLists.txt btx/cmake btx/src/CMakeLists.txt 2>/dev/null || true)
+          if [ -n "$hits" ]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "this tree links libpython:"
+            printf '%s\n' "$hits" | head -3
+          else
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "this tree does not link libpython; it is built as before"
+          fi
+
+      # Pulled NOW so a registry that will not answer costs one minute, not a
+      # finished CUDA build. It is a test fixture: it supplies a glibc 2.35
+      # userland and nothing from it reaches the package.
+      - name: Fetch the clean image the package is started in
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if docker pull -q "$ENGINE_CLEAN_IMAGE"; then break; fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::could not pull $ENGINE_CLEAN_IMAGE after 3 attempts"
+              exit 1
+            fi
+            sleep $((attempt * 20))
+          done
+          docker image inspect --format 'clean image: {{index .RepoDigests 0}}' "$ENGINE_CLEAN_IMAGE"
+
       - name: Install build dependencies
         run: |
           set -euo pipefail
@@ -183,6 +251,73 @@ jobs:
           done
           echo "toolchain present: nvcc + cuobjdump"
 
+      # update-environment: false ON PURPOSE. By default this action puts its
+      # Python first on PATH and exports LD_LIBRARY_PATH for the rest of the
+      # job. The first would change which Python a tree that does NOT embed one
+      # finds; the second would let btxd find libpython on this runner through
+      # the environment, hiding a package that forgot to carry it. The
+      # interpreter is handed to cmake by path instead.
+      - name: Python for the embedded SwapNet worker
+        if: steps.py.outputs.needed == 'true'
+        id: python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.ENGINE_PYTHON_VERSION }}
+          update-environment: false
+
+      - name: Pinned cryptography for that Python
+        if: steps.py.outputs.needed == 'true'
+        env:
+          PY: ${{ steps.python.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          [ -x "$PY" ] || { echo "::error::setup-python reported no interpreter ('$PY')"; exit 1; }
+          prefix=$(dirname "$(dirname "$(readlink -f "$PY")")")
+          # The interpreter binary links its own libpython and is not on any
+          # search path here (see update-environment above).
+          export LD_LIBRARY_PATH="$prefix/lib"
+          lib=$("$PY" -I -c 'import os, sysconfig; print(os.path.join(sysconfig.get_config_var("LIBDIR"), sysconfig.get_config_var("INSTSONAME")))')
+          got=$(sha256sum "$lib" | cut -d' ' -f1)
+          if [ "$got" != "$ENGINE_LIBPYTHON_SHA256" ]; then
+            echo "::error::$lib is $got, this workflow pins $ENGINE_LIBPYTHON_SHA256."
+            echo "::error::GitHub's build of Python $ENGINE_PYTHON_VERSION is not the one that was tested."
+            echo "::error::Look at what changed, then move ENGINE_LIBPYTHON_SHA256 on purpose."
+            exit 1
+          fi
+          echo "libpython is the pinned file: $got"
+          # ONE cryptography on every platform, and it is upstream's: the
+          # version upstream tested the worker with. When upstream moves it,
+          # stop and move ours (and its hash) rather than ship an untested pair.
+          tested=btx/contrib/swapnet/requirements-tested-runtime.txt
+          want=$(sed -n 's/^cryptography==//p' "$tested" 2>/dev/null || true)
+          ours=$(sed -n 's/^cryptography==\([^ ]*\).*/\1/p' easynode/apps/node/scripts/lib/engine-python-requirements.txt)
+          if [ -z "$want" ] || [ "$want" != "$ours" ]; then
+            echo "::error::upstream tests cryptography==${want:-(nothing found in $tested)}, engine-python-requirements.txt pins $ours."
+            echo "::error::Move the pin and its hash, here and in btxd-windows.yml."
+            exit 1
+          fi
+          echo "cryptography $ours is upstream's tested pin"
+          # --require-hashes + --only-binary: exactly the three files the
+          # requirements file names, nothing compiled, nothing else resolved.
+          "$PY" -I -m pip install --disable-pip-version-check --no-input \
+            --require-hashes --only-binary :all: \
+            -r easynode/apps/node/scripts/lib/engine-python-requirements.txt
+          # What upstream's configure step will ask of it, asked here first so
+          # a failure names Python and not cmake.
+          "$PY" -I -c '
+          import platform, sqlite3, ssl, sys, sysconfig
+          import cryptography
+          from cryptography.hazmat.backends.openssl import backend
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          print("python      ", platform.python_version(), "at", sys.prefix)
+          print("libpython   ", sysconfig.get_config_var("INSTSONAME"), "in", sysconfig.get_config_var("LIBDIR"))
+          print("cryptography", cryptography.__version__, "/", backend.openssl_version_text())
+          print("sqlite3     ", sqlite3.sqlite_version, "(the libsqlite3 of this machine, the one btxd links)")
+          print("ssl         ", ssl.OPENSSL_VERSION, "(the libssl of this machine, vendored into the package)")
+          '
+          echo "ENGINE_PYTHON=$PY" >> "$GITHUB_ENV"
+          echo "ENGINE_PYTHON_PREFIX=$prefix" >> "$GITHUB_ENV"
+
       - name: Configure + build
         working-directory: btx
         env:
@@ -204,6 +339,24 @@ jobs:
           # REQUIRED)). This runner has 3.0, and so do the 22.04 machines the
           # binary is built for. The app never uses the model plane. OFF also
           # removes the `-modelnet` option, so nothing may pass -modelnet=0.
+          #
+          # Python (0.34.16 on): the interpreter by PATH, never by search. Left
+          # to itself FindPython3 takes /usr/bin/python3, which is 3.10 here,
+          # and upstream's `find_package(Python3 3.11 REQUIRED ...)` then stops
+          # the configure. A tree that embeds no Python gets no extra argument
+          # at all, so its configure line is the one it always had.
+          py_args=()
+          if [ -n "${ENGINE_PYTHON:-}" ]; then
+            py_args=(
+              -DPython3_EXECUTABLE="$ENGINE_PYTHON"
+              -DPython3_ROOT_DIR="$ENGINE_PYTHON_PREFIX"
+              -DPython3_FIND_STRATEGY=LOCATION
+            )
+            # For the build's own use of that interpreter (the configure check
+            # and the step that freezes the SwapNet sources into a header).
+            export LD_LIBRARY_PATH="$ENGINE_PYTHON_PREFIX/lib"
+            echo "embedding Python: $ENGINE_PYTHON"
+          fi
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_DAEMON=ON -DBUILD_CLI=ON \
             -DBUILD_UTIL=OFF -DBUILD_TX=OFF -DBUILD_WALLET_TOOL=OFF \
@@ -213,7 +366,8 @@ jobs:
             -DWITH_MODELNET=OFF \
             -DCMAKE_IGNORE_PATH=/mnt/c \
             -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
-            -DCMAKE_CUDA_ARCHITECTURES="$archs"
+            -DCMAKE_CUDA_ARCHITECTURES="$archs" \
+            "${py_args[@]}"
           ninja -C build
 
       - name: Confirm the build info the canary reads
@@ -312,6 +466,19 @@ jobs:
           # path executes. Device execution is proven on real hardware; the
           # transcript from a machine that does it lives in
           # docs/gpu-qualification-rtx3060.md.
+          #
+          # This is the BUILD OUTPUT on the build machine. Up to 0.34.15 its
+          # run path named the CUDA toolkit directory. At 0.34.16 it is
+          # `$ORIGIN/../lib`, the layout of upstream's own archive, which here
+          # is build/lib and holds no shared library (both read off the
+          # binaries, runs 45512077986 and 45512058871). So nothing leads to
+          # the libpython it links from 0.34.16 on, and the loader is told here
+          # where the build's own Python is. Nothing is lent to the PACKAGE:
+          # that is started with an empty environment on a clean machine
+          # further down.
+          if [ -n "${ENGINE_PYTHON_PREFIX:-}" ]; then
+            export LD_LIBRARY_PATH="$ENGINE_PYTHON_PREFIX/lib"
+          fi
           d=$(mktemp -d)
           ./build/bin/btxd --version | head -1
           ./build/bin/btxd -regtest -datadir="$d" -fallbackfee=0.0001 -daemonwait
@@ -325,66 +492,108 @@ jobs:
           [ "$count" = "1" ] || { echo "::error::unexpected block count: $count"; exit 1; }
           echo "SMOKE PASSED: daemon boots, wallet works, mined 1 regtest block"
 
-      - name: Collect binaries + provenance + sha256
+      # The package is put together HERE, in its final shape, by the same code
+      # the installer's staging script runs (engine_stage_tree). The artifact
+      # is that tree: btxd and btx-cli with their run path already set, and
+      # lib/ holding every library that is not glibc or the C++ runtime, plus,
+      # for an engine that embeds Python, libpython and lib/python3.X.
+      #
+      # It used to be the raw build output plus only the libraries from outside
+      # /lib and /usr/lib (cuBLASLt, in practice), and the installer runner
+      # supplied libevent, sqlite, zmq and the rest from its own disk. That
+      # worked while both runners were the same image, and it meant nobody ever
+      # ran the bytes that shipped anywhere but on a build machine. btxd-dist/
+      # is now complete, and the next two steps check it and start it.
+      - name: Assemble the package (binaries, library closure, Python runtime)
         working-directory: btx
         run: |
           set -euo pipefail
+          # shellcheck source=/dev/null
+          . "$GITHUB_WORKSPACE/easynode/apps/node/scripts/lib/engine-runtime-linux.sh"
           out="$GITHUB_WORKSPACE/btxd-dist"
-          mkdir -p "$out"
-          cp build/bin/btxd build/bin/btx-cli "$out/"
-          # NO strip. Stripping removes the GPU kernels; the release path passes
-          # NO_STRIP=true through packaging for the same reason.
+          # NO strip, anywhere. Stripping btxd removes the GPU kernels; the
+          # release path passes NO_STRIP=true through packaging for the same
+          # reason.
+          ENGINE_SWAPNET_SRC="$PWD/contrib/swapnet/swapnet" engine_stage_tree build/bin "$out"
           file "$out/btxd"
+
           # Record what the binary REPORTS and which commit it came from, so the
           # installer workflow verifies both without trusting a filename. The
           # reported version can legitimately lag the tag: a branch that never
           # bumped CLIENT_VERSION_BUILD reports the older number, which is why
           # the package declares what it carries in .btxd-version instead.
-          "$out/btxd" --version | head -1 | grep -oE 'v[0-9]+(\.[0-9]+)+' > "$out/BTXD_VERSION"
+          # `env -i`: the packaged binary must start with nothing lent to it.
+          # Nothing but a HOME, that is. Even `--version` prepares the default
+          # data directory, and with no HOME that is `/.btx`: run 45509219697
+          # stopped here with "cannot create directories: Permission denied
+          # [/.btx/wallets]" from a package that was otherwise complete.
+          env -i HOME="$RUNNER_TEMP" "$out/btxd" --version | head -1             | grep -oE 'v[0-9]+(\.[0-9]+)+' > "$out/BTXD_VERSION"
           git rev-parse HEAD > "$out/BTXD_COMMIT"
           "$CUDA_HOME/bin/cuobjdump" --list-elf "$out/btxd" 2>/dev/null \
             | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ' > "$out/BTXD_CUDA_ARCHS"
+          # The packaged btxd had its run path rewritten. The gate above looked
+          # at build/bin/btxd; make sure the rewrite did not cost a kernel.
+          built=$("$CUDA_HOME/bin/cuobjdump" --list-elf build/bin/btxd 2>/dev/null \
+            | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ')
+          if [ "$built" != "$(cat "$out/BTXD_CUDA_ARCHS")" ]; then
+            echo "::error::device code differs after packaging: built '$built', packaged '$(cat "$out/BTXD_CUDA_ARCHS")'"
+            exit 1
+          fi
           echo "reports $(cat "$out/BTXD_VERSION") from $(cat "$out/BTXD_COMMIT")"
           echo "cuda: $(cat "$out/BTXD_CUDA_ARCHS")"
-          # Non-system shared libraries a user's distro may not have. The staging
-          # script vendors these with ORIGIN rpaths; listing them here makes a
-          # surprise dependency visible in the build log instead of at runtime.
-          ldd "$out/btxd" || true
 
-          # ...and SHIP them, which this step did not do and had to.
-          #
-          # btxd links libcublasLt.so.13 out of /usr/local/cuda-13.3, a path
-          # that exists on THIS runner because step 7 installed the toolkit and
-          # on no other runner anywhere. node-linux-installer.yml then ran the
-          # staging script on a CUDA-less machine, where the script's own first
-          # act — `btxd --version`, to check the engine is the pinned one —
-          # died with "libcublasLt.so.13: cannot open shared object file" and
-          # was reported as "btxd is not v0.34.6". The engine was v0.34.6; it
-          # could not start to say so.
-          #
-          # The staging script cannot vendor a library that is not on the disk
-          # it runs on, so the artifact has to carry it. Same classification the
-          # staging script uses: /lib, /lib64, /usr/lib and /usr/lib64 are the
-          # system, everything else travels. That deliberately includes
-          # /usr/local, which is where CUDA lives.
-          mkdir -p "$out/lib"
-          while read -r soname path; do
-            case "$path" in
-              /lib/*|/lib64/*|/usr/lib/*|/usr/lib64/*) continue ;;
-            esac
-            cp -L "$path" "$out/lib/$soname"
-            echo "artifact carries: $soname  <- $path"
-          done < <(
-            { ldd "$out/btxd"; ldd "$out/btx-cli"; } 2>/dev/null \
-              | awk '{ for (i = 1; i <= NF; i++) if ($i == "=>" && $(i+1) ~ /^\//) print $1, $(i+1) }' \
-              | sort -u
-          )
-          if [ -z "$(ls -A "$out/lib" 2>/dev/null)" ]; then
-            rmdir "$out/lib"
-            echo "artifact carries: no non-system libraries"
+          stat -c '%n  %s bytes' "$out/btxd" "$out/btx-cli" | sed "s|$out/||"
+          echo "libraries carried in lib/:"
+          find "$out/lib" -maxdepth 1 -type f -printf '  %f  %s bytes\n' | sort
+          py=$(find "$out/lib" -maxdepth 1 -type d -name 'python3.*' | head -1)
+          if [ -n "$py" ]; then
+            echo "Python runtime: $(basename "$py"), $(find "$py" -type f | wc -l) files, $(du -sb "$py" | cut -f1) bytes"
+            cat "$py/$ENGINE_PY_MANIFEST"
           fi
+          echo "package: $(find "$out" -type f | wc -l) files, $(du -sb "$out" | cut -f1) bytes"
 
-          (cd "$out" && sha256sum btxd btx-cli | tee SHA256SUMS.txt)
+      # Every ELF in the package, not just btxd: a vendored library or a Python
+      # extension module carries the floor of whatever machine built IT.
+      - name: Every ELF stays inside the package and under the glibc 2.35 floor
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          . easynode/apps/node/scripts/lib/engine-runtime-linux.sh
+          engine_check_tree btxd-dist btxd-dist/ENGINE_ELF_FLOORS.txt
+
+      # The proof that the package is complete. See engine_clean_start for what
+      # each mode asserts. `masked` is the control: the same start with the
+      # bundled standard library hidden MUST fail, or `swapnet1` passing would
+      # not show that the bundled runtime is the one in use.
+      - name: Start the package on a clean Ubuntu 22.04 (empty environment, no Python there)
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          . easynode/apps/node/scripts/lib/engine-runtime-linux.sh
+          if [ -n "$(engine_python_soname btxd-dist/btxd)" ]; then
+            modes="swapnet0 swapnet1 masked"
+          else
+            # Before 0.34.16 there is no -swapnet option; passing it is a fatal
+            # "Invalid parameter".
+            modes="plain"
+          fi
+          for mode in $modes; do
+            echo "::group::clean start: $mode"
+            engine_clean_start btxd-dist "$mode"
+            echo "::endgroup::"
+          done
+          echo "CLEAN START PASSED: $modes"
+
+      - name: sha256 of everything in the package
+        run: |
+          set -euo pipefail
+          cd btxd-dist
+          # Every file, not only the two binaries: the Python runtime is a few
+          # thousand files and any of them can be the one that changed.
+          find . -type f ! -name SHA256SUMS.txt -printf '%P\0' | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS.txt
+          grep -E '  (btxd|btx-cli)$' SHA256SUMS.txt
+          echo "$(wc -l < SHA256SUMS.txt) files listed; digest of the list: $(sha256sum < SHA256SUMS.txt | cut -d' ' -f1)"
 
       - name: Upload btxd artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
