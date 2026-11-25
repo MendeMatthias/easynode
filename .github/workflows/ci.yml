@@ -220,6 +220,11 @@ jobs:
           # nothing else.
           "$dir/btxd.exe" --version | head -1
           rm "$dir/python314.dll"
+          # For the record: another python314.dll on PATH is loaded in its
+          # place (this runner has one, and the engine then starts). The
+          # test gives its child a PATH of System32 only.
+          echo "python314.dll elsewhere on PATH:"; where python314.dll || echo "  none"
+          "$dir/btxd.exe" --version | head -1 || echo "  (with the runner's PATH the engine did not start)"
           cd crates/btx-core
           EASYNODE_TEST_BTXD_MISSING_DLL="$(cygpath -w "$dir/btxd.exe")" \
             cargo test --locked --lib engine_files::tests::a_real_windows -- --ignored --nocapture

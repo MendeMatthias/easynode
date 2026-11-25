@@ -1661,6 +1661,18 @@ mod tests {
     ///
     /// `EASYNODE_TEST_BTXD_MISSING_DLL` is a btxd.exe in a copy of the engine
     /// from which `python314.dll` was taken away.
+    ///
+    /// THE CHILD'S `PATH` IS SYSTEM32 ONLY, and that is a finding, not a
+    /// convenience. On GitHub's Windows runner this test first ran with the
+    /// runner's own `PATH` and btxd.exe exited 0: the runner has a Python
+    /// 3.14 on `PATH`, Windows looks for a DLL there after the program's own
+    /// folder and the system folders, and so the engine loaded SOMEONE
+    /// ELSE'S `python314.dll` and started. A removed engine DLL is therefore
+    /// not always a failed start: on a computer with the same Python
+    /// installed it is a silent substitution, which the loader's signature
+    /// never sees and only the file check does. With nothing on `PATH` to
+    /// substitute, the missing DLL is missing, which is what this test is
+    /// about.
     #[cfg(windows)]
     #[test]
     #[ignore]
@@ -1681,8 +1693,11 @@ mod tests {
         crate::platform::no_loader_error_dialogs();
 
         let started = std::time::Instant::now();
+        let system32 =
+            PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot")).join("System32");
         let mut child = std::process::Command::new(&btxd)
             .arg("--version")
+            .env("PATH", &system32)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
