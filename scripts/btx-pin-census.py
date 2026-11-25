@@ -61,6 +61,7 @@ UPSTREAM = "btxchain/btx"
 PIN_FILES = {
     "easynode": [
         "apps/node/src-tauri/src/commands.rs",
+        "apps/node/engine-modelnet-linux.pin",
         "apps/node/scripts/stage-node-pkg.sh",
         "apps/node/scripts/stage-node-pkg-linux.sh",
         "apps/node/scripts/stage-node-pkg-linux-source.sh",
@@ -127,7 +128,7 @@ HEX_RE = re.compile(r"(?<![0-9a-f])(?:[0-9a-f]{96}|[0-9a-f]{64}|[0-9a-f]{40})(?!
 # A line that pins an upstream COMMIT by name. A 40-hex value on such a line
 # that no upstream tag names is reported too: that is what a pin on a moved or
 # deleted tag looks like, and what a build from an untagged commit looks like.
-COMMIT_PIN_RE = re.compile(r"NODE_RELEASE_COMMIT|PROVEN_BTXD_(COMMIT|ARTIFACT)|BTXCHAIN_REF|btxchain_ref|BTX_COMMIT")
+COMMIT_PIN_RE = re.compile(r"NODE_RELEASE_COMMIT|PROVEN_BTXD_(COMMIT|ARTIFACT)|MODELNET_ENGINE_(COMMIT|ARTIFACT)|BTXCHAIN_REF|btxchain_ref|BTX_COMMIT")
 
 
 def run(cmd, **kw):

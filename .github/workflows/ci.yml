@@ -80,6 +80,12 @@ jobs:
       # Upstream archive formats (0.34 .tar.gz + sha256, 0.35 .tar.xz + sha384),
       # the layout gate and the exact-version check. Offline, ~1 second.
       - run: bash apps/node/scripts/test-release-archive.sh
+      # The ModelNet engine's own pin (apps/node/engine-modelnet-linux.pin):
+      # same commit and version as the engine the app pins, the names
+      # btxd-linux.yml mints, and never the installer's PROVEN_BTXD run. The
+      # self-test breaks a copy of the real pin ten ways. Offline, ~1 second.
+      - run: bash apps/node/scripts/check-modelnet-engine-pin.sh
+      - run: bash apps/node/scripts/check-modelnet-engine-pin.sh --self-test
 
   # ---------------------------------------------------------------------------
   # The shared engine. No system dependencies, no staged node package, no
