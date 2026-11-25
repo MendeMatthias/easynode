@@ -102,6 +102,12 @@ env:
   # apps/node/scripts/lib/engine-python-requirements.txt pins a cffi wheel for
   # this MINOR version; move one and the other must follow.
   ENGINE_PYTHON_VERSION: "3.14.10"
+  # ...and pinned by BYTES, because a version is a name and setup-python fetches
+  # whatever GitHub currently publishes under it. This is the sha256 of
+  # lib/libpython3.14.so.1.0 as that build delivers it (runs 45512058871 and
+  # 45515418211 both saw it). The job stops when it differs. It moves together
+  # with the version above.
+  ENGINE_LIBPYTHON_SHA256: "83ef0c3cc369737f689854b1bb52b84e5d3d5dfdb24a070aadaccef8218d04df"
   # Where the finished package is started before upload. See the last steps.
   ENGINE_CLEAN_IMAGE: "ubuntu:22.04"
 
@@ -270,6 +276,27 @@ jobs:
           # The interpreter binary links its own libpython and is not on any
           # search path here (see update-environment above).
           export LD_LIBRARY_PATH="$prefix/lib"
+          lib=$("$PY" -I -c 'import os, sysconfig; print(os.path.join(sysconfig.get_config_var("LIBDIR"), sysconfig.get_config_var("INSTSONAME")))')
+          got=$(sha256sum "$lib" | cut -d' ' -f1)
+          if [ "$got" != "$ENGINE_LIBPYTHON_SHA256" ]; then
+            echo "::error::$lib is $got, this workflow pins $ENGINE_LIBPYTHON_SHA256."
+            echo "::error::GitHub's build of Python $ENGINE_PYTHON_VERSION is not the one that was tested."
+            echo "::error::Look at what changed, then move ENGINE_LIBPYTHON_SHA256 on purpose."
+            exit 1
+          fi
+          echo "libpython is the pinned file: $got"
+          # ONE cryptography on every platform, and it is upstream's: the
+          # version upstream tested the worker with. When upstream moves it,
+          # stop and move ours (and its hash) rather than ship an untested pair.
+          tested=btx/contrib/swapnet/requirements-tested-runtime.txt
+          want=$(sed -n 's/^cryptography==//p' "$tested" 2>/dev/null || true)
+          ours=$(sed -n 's/^cryptography==\([^ ]*\).*/\1/p' easynode/apps/node/scripts/lib/engine-python-requirements.txt)
+          if [ -z "$want" ] || [ "$want" != "$ours" ]; then
+            echo "::error::upstream tests cryptography==${want:-(nothing found in $tested)}, engine-python-requirements.txt pins $ours."
+            echo "::error::Move the pin and its hash, here and in btxd-windows.yml."
+            exit 1
+          fi
+          echo "cryptography $ours is upstream's tested pin"
           # --require-hashes + --only-binary: exactly the three files the
           # requirements file names, nothing compiled, nothing else resolved.
           "$PY" -I -m pip install --disable-pip-version-check --no-input \

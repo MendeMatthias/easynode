@@ -256,7 +256,11 @@ def main(argv: list[str]) -> None:
         "generator": GENERATOR,
         "python": platform.python_version(),
         "soname": inst,
-        "libpython_sha256": hashlib.sha256(hostlib.read_bytes()).hexdigest(),
+        # As the interpreter's build delivered it: what the workflow pins. The
+        # shipped file gets a run path afterwards, so engine_stage_tree fills in
+        # libpython_sha256 once that is done.
+        "libpython_source_sha256": hashlib.sha256(hostlib.read_bytes()).hexdigest(),
+        "libpython_sha256": "",
         "build_prefix": sys.prefix,
         "packages": packages,
         "third_party": sorted(root.name for root in roots.values()),

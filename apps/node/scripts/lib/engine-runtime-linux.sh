@@ -82,6 +82,14 @@ engine_runpath() {
     | awk '/\((RPATH|RUNPATH)\)/ { gsub(/[][]/, "", $NF); print $NF }' | head -1
 }
 
+# Every DT_RPATH and DT_RUNPATH value, one per line. The check reads both: an
+# old-style RPATH is searched before LD_LIBRARY_PATH and would be the worse one
+# to miss.
+engine_runpath_entries() {
+  LC_ALL=C readelf -d "$1" 2>/dev/null \
+    | awk '/\((RPATH|RUNPATH)\)/ { gsub(/[][]/, "", $NF); print $NF }'
+}
+
 # The libpython btxd links, or nothing (every engine before 0.34.16).
 engine_python_soname() {
   engine_needed "$1" | { grep -E '^libpython3\.[0-9]+t?\.so\.1\.0$' || true; } | head -1
@@ -241,6 +249,37 @@ engine_stage_python() {
     "$(realpath "$swapsrc")" "$libdir" "$soname" "$resolved"
 }
 
+# ── A finished package ──────────────────────────────────────────────────────
+
+# An engine artifact from btxd-linux.yml as it is since 0.34.16 work began: its
+# SHA256SUMS.txt lists every file, lib/ included. (The older artifact lists only
+# the two binaries and carries only cuBLASLt; that one still has to be completed
+# on the staging machine.)
+engine_is_finished_package() {
+  [[ -f "$1/SHA256SUMS.txt" ]] && grep -qE '^[0-9a-f]{64}  lib/' "$1/SHA256SUMS.txt"
+}
+
+# engine_verify_sums BINDIR SUMS
+# The staged tree against the sums the engine build wrote AFTER it had checked
+# and started the package. Both directions: no file missing, none extra, none
+# changed. Anything else means what is about to ship is not what was tested.
+engine_verify_sums() {
+  local bindir=$1 sums=$2 want have
+  want="$(grep -E '^[0-9a-f]{64}  (btxd|btx-cli|lib/.+)$' "$sums" | LC_ALL=C sort -k2)"
+  if [[ -z "$want" ]]; then
+    _engine_err "$sums lists no package file"
+    return 1
+  fi
+  have="$(cd "$bindir" && find . -type f -printf '%P\0' | LC_ALL=C sort -z | xargs -0 sha256sum | LC_ALL=C sort -k2)"
+  if [[ "$want" != "$have" ]]; then
+    _engine_err "the staged tree is not the package the engine build tested."
+    _engine_err "Lines with < are in the artifact's SHA256SUMS.txt only, lines with > in the staged tree only:"
+    diff <(printf '%s\n' "$want") <(printf '%s\n' "$have") | grep -E '^[<>]' | head -20 >&2
+    return 1
+  fi
+  echo "==> $(printf '%s\n' "$have" | wc -l | tr -d ' ') staged file(s) are byte for byte the ones in the artifact's SHA256SUMS.txt"
+}
+
 # ── Staging ─────────────────────────────────────────────────────────────────
 
 # engine_stage_tree SRC BINDIR
@@ -268,6 +307,15 @@ engine_stage_tree() {
     cp -R "$src/lib/." "$libdir/" || return 1
     echo "==> took $(find "$libdir" -type f | wc -l | tr -d ' ') file(s) from $src/lib"
   fi
+  # A finished package is COPIED and COMPARED, nothing else. No library is
+  # looked up on this machine and no run path is touched: if the artifact were
+  # short of a library or had a wrong run path, completing it here would ship
+  # bytes the engine build never started, and would do it silently. The check
+  # the caller runs next (engine_check_tree) only reads.
+  if engine_is_finished_package "$src"; then
+    engine_verify_sums "$bindir" "$src/SHA256SUMS.txt" || return 1
+    return 0
+  fi
   soname="$(engine_python_soname "$bindir/btxd")"
   if [[ -n "$soname" ]]; then
     engine_stage_python "$src/btxd" "$soname" "$libdir" || return 1
@@ -278,6 +326,15 @@ engine_stage_tree() {
   while IFS= read -r f; do roots+=("$f"); done < <(engine_elfs "$libdir")
   engine_vendor_closure "$libdir" "${roots[@]}" || return 1
   engine_set_runpaths "$bindir" || return 1
+  # The manifest names the libpython that SHIPS. The bundler saw it before its
+  # run path was set, and recorded that as libpython_source_sha256.
+  if [[ -n "$soname" ]]; then
+    for f in "$libdir"/python3.*/"$ENGINE_PY_MANIFEST"; do
+      [[ -f "$f" ]] || continue
+      sed -i "s/\"libpython_sha256\": \"[^\"]*\"/\"libpython_sha256\": \"$(sha256sum "$libdir/$soname" | cut -d' ' -f1)\"/" "$f" || return 1
+      grep -q '"libpython_sha256": "[0-9a-f]\{64\}"' "$f" || { _engine_err "could not record the shipped libpython's sha256 in $f"; return 1; }
+    done
+  fi
   rmdir "$libdir" 2>/dev/null || true
 }
 
@@ -328,14 +385,27 @@ engine_check_tree() {
     rel="${f#"$bindir"/}"
     count=$((count + 1))
 
-    rp="$(engine_runpath "$f")"
-    IFS=: read -ra parts <<< "$rp"
-    for part in "${parts[@]}"; do
-      case "$part" in
-        '$ORIGIN'|'$ORIGIN/'*) ;;
-        *) _engine_err "$rel has the run path entry '$part': a path of the build machine, not of the package"; rc=1 ;;
-      esac
-    done
+    # readelf must ANSWER. Its errors are discarded everywhere else in this
+    # file, and an ELF it cannot read would otherwise look like one that needs
+    # nothing: no libraries, no symbol versions, a clean row in the table.
+    # Its exit code is not enough: on a truncated file readelf 2.38 prints
+    # errors and still exits 0 (tried). So: no "Error" on stderr, and a dynamic
+    # section, which every file in this package has.
+    if LC_ALL=C readelf -d --version-info "$f" 2>&1 >/dev/null | grep -q 'Error'        || ! LC_ALL=C readelf -d "$f" 2>/dev/null | grep -q '^Dynamic section'; then
+      _engine_err "readelf cannot read $rel, so nothing about it is known"
+      rc=1
+      continue
+    fi
+
+    while IFS= read -r rp; do
+      IFS=: read -ra parts <<< "$rp"
+      for part in "${parts[@]}"; do
+        case "$part" in
+          '$ORIGIN'|'$ORIGIN/'*) ;;
+          *) _engine_err "$rel has the run path entry '$part': a path of the build machine, not of the package"; rc=1 ;;
+        esac
+      done
+    done < <(engine_runpath_entries "$f")
 
     out="$(env -u LD_LIBRARY_PATH -u LD_PRELOAD ldd "$f" 2>&1 || true)"
     if grep -q "not found" <<< "$out"; then
@@ -439,12 +509,15 @@ if [ "$mode" = masked ]; then
   fi
   sed 's/^/  start: /' "$d/start.out"
   swaplines
-  if grep -q 'SwapNet: startup failed' "$log" 2>/dev/null; then
-    say "btxd named the reason itself: SwapNet: startup failed"
-  else
-    say "btxd did not log 'SwapNet: startup failed'; it refused to start all the same"
+  # It must refuse FOR THIS REASON. A start that fails for any other one (a
+  # port, a library, the datadir) would pass a looser control and prove nothing
+  # about the runtime.
+  if ! grep -q 'SwapNet: startup failed' "$log" 2>/dev/null; then
+    say "NEGATIVE CONTROL FAILED: btxd refused to start, but never logged 'SwapNet: startup failed'."
+    logtail
+    exit 43
   fi
-  say "CLEAN START OK (masked): without the standard library btxd -swapnet=1 refuses to start"
+  say "CLEAN START OK (masked): without the standard library btxd -swapnet=1 refuses to start, and says why"
   exit 0
 fi
 
@@ -476,12 +549,19 @@ case "$mode" in
       swaplines
       exit 48
     fi
+    # The answer itself, not the absence of an error: exit 0, and the two
+    # fields that only the in-process Python worker of this protocol sets.
     out=$(cli getswapnetworkinfo 2>&1) && rc=0 || rc=$?
-    say "getswapnetworkinfo (exit $rc), answered by the Python worker:"
+    say "getswapnetworkinfo (exit $rc):"
     printf '%s\n' "$out" | head -n 12 | sed 's/^/  /'
+    [ "$rc" = 0 ] || { say "getswapnetworkinfo failed with -swapnet=1"; exit 49; }
     case "$out" in
-      *'disabled or not initialized'*|*'runtime is not available'*)
-        say "the SwapNet runtime is not answering"; exit 49 ;;
+      *'"in_process": true'*) ;;
+      *) say "getswapnetworkinfo does not report \"in_process\": true"; exit 49 ;;
+    esac
+    case "$out" in
+      *'"protocol": 2,'*) ;;
+      *) say "getswapnetworkinfo does not report \"protocol\": 2"; exit 49 ;;
     esac
     ;;
   swapnet0)
@@ -512,9 +592,11 @@ CLEAN_START
 #             although Python is never started, and the SwapNet RPCs must refuse.
 #   swapnet1  the same with -swapnet=1. btxd must log that the embedded runtime
 #             started, which takes the standard library, sqlite3 and
-#             cryptography, all from the package.
+#             cryptography, all from the package, and getswapnetworkinfo must
+#             exit 0 and report "in_process": true and "protocol": 2.
 #   masked    swapnet1 with bin/lib/python3.X hidden behind an empty directory.
-#             btxd must REFUSE to start. This is the proof that swapnet1 passing
+#             btxd must REFUSE to start and log "SwapNet: startup failed". This
+#             is the proof that swapnet1 passing
 #             means the bundled runtime was used: if a start without it also
 #             succeeded, the test would be measuring nothing.
 engine_clean_start() {

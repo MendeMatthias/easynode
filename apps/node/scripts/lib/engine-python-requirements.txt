@@ -12,7 +12,11 @@
 #
 # Hashes are the sha256 PyPI publishes for each file, read on 2026-11-25:
 #
-#   cryptography-50.0.2-cp311-abi3-manylinux_2_28_x86_64.whl
+#   cryptography-46.0.4-cp311-abi3-manylinux_2_28_x86_64.whl
+#       46.0.4 because that is the version upstream tested the worker with:
+#       contrib/swapnet/requirements-tested-runtime.txt at 074dac16 says
+#       cryptography==46.0.4, the Windows engine ships the same, and the
+#       workflow refuses to build when upstream's file and this one disagree.
 #       The manylinux_2_28 build, not the manylinux_2_34 one pip would pick by
 #       default on this runner: same code, needs glibc 2.28 where the other
 #       needs 2.34, and the package's floor is 2.35. OpenSSL is linked into the
@@ -27,8 +31,8 @@
 #       the build machine and is NOT bundled.
 #
 # To move one: take the new file's sha256 from https://pypi.org/pypi/<name>/<version>/json.
-cryptography==50.0.2 \
-    --hash=sha256:4061c0079120205fb760c58acab6443e217307dcf05e3702cf970e0689972856
+cryptography==46.0.4 \
+    --hash=sha256:0a9ad24359fee86f131836a9ac3bffc9329e956624a2d379b613f8f8abaf5255
 cffi==2.1.1 \
     --hash=sha256:b0431303acaea1089ad4b3e9ce4e6518193def1118d4073ca848635ee4ea2e96
 pycparser==3.12 \
