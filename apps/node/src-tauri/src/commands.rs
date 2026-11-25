@@ -1471,15 +1471,25 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     // only for btxd and btx-cli, and the engine is 776 files on Linux and 191
     // on Windows since it carries a Python runtime. One of them gone (antivirus
     // software taking python314.dll is the usual way) and btxd ends before it
-    // prints a line. So the files are compared with the list written when the
-    // engine was installed: one `stat` each, about a millisecond for the lot
-    // on the project's own Linux install, nothing read and nothing hashed.
-    // What is missing or the wrong size is copied again from the app's own
-    // package, and setup.log says which files. Not after an upgrade in this
-    // same start (that install was checked a moment ago), and only for the
-    // engine this app carries, because that is the one it has a copy of.
-    if tag == NODE_RELEASE_TAG && !upgraded_this_start && settings.btx_release_tag.is_some() {
-        heal_installed_engine(app, &datadir).await;
+    // prints a line. So the files are compared with the engine's own list:
+    // one `stat` each, about a millisecond for the lot on the project's own
+    // Linux install, nothing read and nothing hashed.
+    //
+    // What may be COPIED is narrow, and `btx_core::engine_files` holds the
+    // rules: a file that is missing or not the size the list says, only when
+    // the app's package is the same build, and only when no node is running
+    // from the folder. A relaunch after a self-update adopts the btxd that is
+    // already running, so whether one runs is asked first: with a holder, or
+    // with RPC answering, the check reports and copies nothing.
+    if engine_check_wanted(
+        &tag,
+        upgraded_this_start,
+        settings.btx_release_tag.is_some(),
+    ) {
+        let holder_free = btx_core::node::datadir_holder(&datadir).await == DatadirHolder::Free;
+        let rpc_answering = rpc_already_answering(&datadir).await.is_some();
+        let mode = engine_check_mode(holder_free, rpc_answering, cfg!(target_os = "macos"));
+        heal_installed_engine(app, &datadir, mode).await;
     }
 
     let paths: FaststartResult = returning_launch_paths(&datadir, &tag)
@@ -1958,6 +1968,15 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     *state.rpc.lock().await = Some(rpc.clone());
     *state.started_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
     abort_mirror_load.armed = false;
+    // The engine in that folder started and answers: a copy made after a
+    // loader failure worked, or none was needed. Either way the record that
+    // holds a second copy back is done with.
+    if plan != PreLaunchPlan::Attach {
+        let pinned_root = install_dir(NODE_RELEASE_TAG);
+        btx_core::engine_files::clear_copied_again(
+            &engine_repair_target(&paths.btxd, pinned_root.as_deref()).0,
+        );
+    }
     // A retry inside the spawn (a start stuck in the GPU check, a Mac's chip
     // refused) moved the host to following signatures and decided the signer
     // again; everything below reads that, not the value from before the
@@ -2160,22 +2179,88 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     Ok(())
 }
 
+/// Does this start check the installed engine's files? Only the engine this
+/// app carries (the saved tag is the pinned one), because that is the one it
+/// has a copy of; not right after this same start installed it; and not on a
+/// computer where setup never ran, where "not installed yet" is the answer.
+fn engine_check_wanted(tag: &str, upgraded_this_start: bool, has_saved_tag: bool) -> bool {
+    tag == NODE_RELEASE_TAG && !upgraded_this_start && has_saved_tag
+}
+
+/// May the start-time check copy files, or only report?
+///
+/// It copies only when nothing can be running from the engine's folder:
+/// nothing holds the node folder (`datadir_holder`: no live process behind
+/// `btxd.pid`, of any kind, identified or not) AND nothing answers RPC there
+/// (a btxd started by hand leaves no pidfile of ours). A relaunch after a
+/// self-update finds its own btxd still running and adopts it, which is the
+/// case this exists for: files are never swapped under a running engine.
+///
+/// On macOS it reports only. A copy there signs the file again, and a
+/// cut-off Mach-O is not seen by a size check at all; neither has been run
+/// on a Mac, so the Mac session decides when this is switched on.
+fn engine_check_mode(
+    holder_free: bool,
+    rpc_answering: bool,
+    macos: bool,
+) -> btx_core::engine_files::Mode {
+    use btx_core::engine_files::{Mode, NotCopied};
+    if !holder_free || rpc_answering {
+        Mode::ReportOnly(NotCopied::NodeRunning)
+    } else if macos {
+        Mode::ReportOnly(NotCopied::MacOs)
+    } else {
+        Mode::Repair
+    }
+}
+
 /// What the start-time check of the engine's files leaves in setup.log and
 /// the app's own log. Nothing when all is in place, which is every start but
 /// a handful.
-fn engine_check_note(outcome: &Result<btx_core::engine_files::Repair, String>) -> Option<String> {
-    use btx_core::engine_files::Repair;
+fn engine_check_note(outcome: &Result<btx_core::engine_files::Check, String>) -> Option<String> {
+    use btx_core::engine_files::{name_some, Check, NotCopied};
     match outcome {
-        Ok(Repair::NotNeeded) => None,
-        Ok(Repair::Adopted) => Some(
-            "the node engine's files were compared with the app's own copy and all are in \
-             place; their list is kept in the engine's folder from now on"
+        Ok(Check::Complete) => None,
+        Ok(Check::Adopted {
+            other_build: false, ..
+        }) => Some(
+            "the node engine's files are all in place; their list is kept in the engine's \
+             folder from now on"
                 .to_string(),
         ),
-        Ok(Repair::Repaired(damage)) => Some(format!(
+        Ok(Check::Adopted {
+            other_build: true,
+            not_installed,
+        }) => Some(format!(
+            "the installed node engine is another build of {NODE_RELEASE_TAG} than the one this \
+             app carries (file sizes differ), so it is left exactly as it is and its list was \
+             written from the folder{}",
+            if not_installed.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; this app's build has {} the installed one does not",
+                    name_some(not_installed)
+                )
+            }
+        )),
+        Ok(Check::Repaired(damage)) => Some(format!(
             "node engine files were missing or damaged and were copied again from the app's \
              own copy: {}",
             damage.describe()
+        )),
+        Ok(Check::Found { damage, why }) => Some(format!(
+            "node engine files are missing or damaged: {}. Nothing was copied, because {}",
+            damage.describe(),
+            match why {
+                NotCopied::NodeRunning =>
+                    "a node is running from that folder; they are put back at the next start \
+                     with no node running",
+                NotCopied::OtherBuild =>
+                    "this app carries another build of the engine than the one installed, and \
+                     mixing two builds file by file is worse than either",
+                NotCopied::MacOs => "on a Mac the check only reports",
+            }
         )),
         Err(e) => Some(format!(
             "the node engine's files could not be checked or put back: {e}"
@@ -2183,11 +2268,15 @@ fn engine_check_note(outcome: &Result<btx_core::engine_files::Repair, String>) -
     }
 }
 
-/// The start-time check and repair of the installed engine
-/// (`btx_core::engine_files`). Never ends the start: when a file cannot be
-/// put back, the launch that follows fails on it and
-/// [`answer_engine_loader_failure`] says which one.
-async fn heal_installed_engine(app: &AppHandle, datadir: &Path) {
+/// The start-time check of the installed engine
+/// (`btx_core::engine_files::check_and_repair`). Never ends the start: when
+/// a file is missing and was not put back, the launch that follows fails on
+/// it and [`answer_engine_loader_failure`] says which one.
+async fn heal_installed_engine(
+    app: &AppHandle,
+    datadir: &Path,
+    mode: btx_core::engine_files::Mode,
+) {
     let resource_dir = app.path().resource_dir().ok();
     let Some(pkg) = resolve_bundled_node_pkg(
         resource_dir.as_deref(),
@@ -2200,7 +2289,7 @@ async fn heal_installed_engine(app: &AppHandle, datadir: &Path) {
     };
     let dd = datadir.to_path_buf();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        btx_core::engine_files::check_and_repair(&pkg, &install_root, &dd)
+        btx_core::engine_files::check_and_repair(&pkg, &install_root, &dd, mode)
             .map_err(|e| e.to_string())
     })
     .await
@@ -2230,16 +2319,15 @@ fn engine_repair_target(btxd: &Path, pinned_root: Option<&Path>) -> (PathBuf, bo
     }
 }
 
-/// A start ended on the loader's signature: copy the engine again from the
-/// app's own package, once (`btx_core::engine_files::answer_loader_failure`,
-/// which holds the rules and their tests). `Ok` is the line for the log
-/// before the next attempt, `Err` what the person reads.
+/// A start ended on the loader's signature
+/// (`btx_core::engine_files::answer_loader_failure`, which holds the rules
+/// and their tests). `Ok` is the line for the log before the next attempt,
+/// `Err` what the person reads.
 async fn answer_engine_loader_failure(
     app: &AppHandle,
     datadir: &Path,
     btxd: &Path,
     loader: btx_core::engine_files::LoaderFailure,
-    already_answered: bool,
 ) -> Result<String, String> {
     let pinned_root = install_dir(NODE_RELEASE_TAG);
     let (install_root, ours) = engine_repair_target(btxd, pinned_root.as_deref());
@@ -2254,13 +2342,17 @@ async fn answer_engine_loader_failure(
     };
     let dd = datadir.to_path_buf();
     let fallback = install_root.clone();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     tauri::async_runtime::spawn_blocking(move || {
         btx_core::engine_files::answer_loader_failure(
             pkg.as_deref(),
             &install_root,
             &dd,
             &loader,
-            already_answered,
+            now_secs,
         )
     })
     .await
@@ -2278,24 +2370,89 @@ async fn answer_engine_loader_failure(
 
 #[cfg(test)]
 mod engine_file_tests {
-    use super::{engine_check_note, engine_repair_target};
-    use btx_core::engine_files::{Damage, Repair};
+    use super::{
+        engine_check_mode, engine_check_note, engine_check_wanted, engine_repair_target,
+        NODE_RELEASE_TAG,
+    };
+    use btx_core::engine_files::{Check, Damage, Mode, NotCopied};
     use std::path::Path;
 
+    /// Files are copied only with nothing holding the node folder and
+    /// nothing answering RPC. Every other combination reports.
     #[test]
-    fn the_start_time_check_is_silent_unless_it_did_something() {
-        assert_eq!(engine_check_note(&Ok(Repair::NotNeeded)), None);
-        let adopted = engine_check_note(&Ok(Repair::Adopted)).unwrap();
-        assert!(adopted.contains("all are in place"), "{adopted}");
-        let repaired = engine_check_note(&Ok(Repair::Repaired(Damage {
+    fn the_check_copies_only_when_no_node_can_be_running() {
+        let running = Mode::ReportOnly(NotCopied::NodeRunning);
+        assert_eq!(engine_check_mode(true, false, false), Mode::Repair);
+        // The relaunch after a self-update: the app's own btxd holds the
+        // folder and answers.
+        assert_eq!(engine_check_mode(false, true, false), running);
+        // A holder that is not answering yet (still warming up, or one that
+        // could not be identified).
+        assert_eq!(engine_check_mode(false, false, false), running);
+        // A btxd started by hand: no pidfile of ours, but it answers.
+        assert_eq!(engine_check_mode(true, true, false), running);
+        // A Mac reports only, and a running node is still the reason given
+        // when there is one.
+        assert_eq!(
+            engine_check_mode(true, false, true),
+            Mode::ReportOnly(NotCopied::MacOs)
+        );
+        assert_eq!(engine_check_mode(false, true, true), running);
+    }
+
+    #[test]
+    fn the_check_is_for_the_pinned_engine_on_a_computer_that_was_set_up() {
+        assert!(engine_check_wanted(NODE_RELEASE_TAG, false, true));
+        // An older engine a failed update left the node on: no copy of it.
+        assert!(!engine_check_wanted("v0.34.15", false, true));
+        // Installed a moment ago by this same start.
+        assert!(!engine_check_wanted(NODE_RELEASE_TAG, true, true));
+        // Setup never ran.
+        assert!(!engine_check_wanted(NODE_RELEASE_TAG, false, false));
+    }
+
+    #[test]
+    fn the_check_is_silent_when_all_is_in_place_and_says_why_it_copied_nothing() {
+        assert_eq!(engine_check_note(&Ok(Check::Complete)), None);
+        let adopted = engine_check_note(&Ok(Check::Adopted {
+            other_build: false,
+            not_installed: vec![],
+        }))
+        .unwrap();
+        assert!(adopted.contains("all in place"), "{adopted}");
+
+        let other = engine_check_note(&Ok(Check::Adopted {
+            other_build: true,
+            not_installed: vec!["bin/new-tool".into()],
+        }))
+        .unwrap();
+        assert!(other.contains("another build"), "{other}");
+        assert!(other.contains("left exactly as it is"), "{other}");
+        assert!(other.contains("1 file (bin/new-tool)"), "{other}");
+
+        let damage = Damage {
             missing: vec!["bin/python314.dll".into()],
             wrong_size: vec![],
-        })))
-        .unwrap();
+        };
+        let repaired = engine_check_note(&Ok(Check::Repaired(damage.clone()))).unwrap();
         assert!(
             repaired.ends_with("copied again from the app's own copy: 1 file (bin/python314.dll)"),
             "{repaired}"
         );
+        for (why, word) in [
+            (NotCopied::NodeRunning, "a node is running from that folder"),
+            (NotCopied::OtherBuild, "another build of the engine"),
+            (NotCopied::MacOs, "on a Mac"),
+        ] {
+            let found = engine_check_note(&Ok(Check::Found {
+                damage: damage.clone(),
+                why,
+            }))
+            .unwrap();
+            assert!(found.contains("1 file (bin/python314.dll)"), "{found}");
+            assert!(found.contains("Nothing was copied"), "{found}");
+            assert!(found.contains(word), "{found}");
+        }
         let failed = engine_check_note(&Err("disk error: no room".into())).unwrap();
         assert!(failed.ends_with("could not be checked or put back: disk error: no room"));
     }
@@ -2322,14 +2479,30 @@ mod engine_file_tests {
         );
     }
 
-    /// The launch loop answers the loader's signature before it counts the
-    /// exit as an ordinary one, checks for a Stop first, and copies at most
-    /// once per start.
+    /// Wiring only; the decisions are tested above and in
+    /// `btx_core::engine_files`. The start asks who holds the node folder
+    /// before the check may copy, and the launch loop honours a Stop before
+    /// it answers a loader failure.
     #[test]
-    fn the_launch_loop_answers_a_loader_failure_once() {
+    fn the_holder_is_asked_before_the_check_and_a_stop_before_the_copy() {
         let src = include_str!("commands.rs");
         // Put together here so that this test's own text is not what the
-        // other tests in this file find when they look for the function.
+        // other tests in this file find when they look for the functions.
+        let start = src
+            .split(concat!("\nasync fn start_node", "_once("))
+            .nth(1)
+            .expect("start_node_once is in this file");
+        let holder = start
+            .find("btx_core::node::datadir_holder(&datadir).await == DatadirHolder::Free")
+            .expect("the holder is asked");
+        let heal = start
+            .find("heal_installed_engine(app, &datadir, mode).await;")
+            .expect("the check");
+        let resolve = start
+            .find("returning_launch_paths(&datadir, &tag)")
+            .expect("the launch paths");
+        assert!(holder < heal && heal < resolve);
+
         let spawn_fn = src
             .split(concat!("\nasync fn spawn_node_with", "_lock_retry("))
             .nth(1)
@@ -2350,31 +2523,7 @@ mod engine_file_tests {
             .find("answer_engine_loader_failure(")
             .expect("the copy");
         assert!(stop_check < copy);
-        assert!(block.contains("engine_copied_again,\n"));
-        assert!(block.contains("engine_copied_again = true;\n                    continue;"));
         assert!(block.contains("after_failed_launch(datadir, said)"));
-    }
-
-    /// The start-time check runs before the launch paths are resolved (a
-    /// removed btxd is put back before anything asks for it), only for the
-    /// pinned engine, and never on a computer where setup has not run.
-    #[test]
-    fn the_start_checks_the_engines_files_before_it_resolves_them() {
-        let src = include_str!("commands.rs");
-        let start = src
-            .split(concat!("\nasync fn start_node", "_once("))
-            .nth(1)
-            .expect("start_node_once is in this file");
-        let heal = start
-            .find("heal_installed_engine(app, &datadir).await;")
-            .expect("the check");
-        let resolve = start
-            .find("returning_launch_paths(&datadir, &tag)")
-            .expect("the launch paths");
-        assert!(heal < resolve);
-        assert!(start[..heal].contains(
-            "if tag == NODE_RELEASE_TAG && !upgraded_this_start && settings.btx_release_tag.is_some() {"
-        ));
     }
 }
 
@@ -2394,9 +2543,6 @@ async fn spawn_node_with_lock_retry(
 ) -> Result<RpcClient, String> {
     // How the last attempt's btxd ended, when it exited.
     let mut last_exit: Option<String> = None;
-    // Has this start copied the engine again after the loader's signature?
-    // Once only; see `answer_engine_loader_failure`.
-    let mut engine_copied_again = false;
     // A Stop moves this; see `stopped_since`.
     let start_gen = state.refresher_gen.load(Ordering::SeqCst);
     for attempt in 1..=LAUNCH_ATTEMPTS {
@@ -2832,27 +2978,23 @@ async fn spawn_node_with_lock_retry(
         // loader's line in the log, or one of the exit codes that mean it
         // (Windows names no file, only 0xC0000135). Starting again unchanged
         // ends the same way three times, and "it exited with code
-        // -1073741515" names neither the cause nor the fix. The engine is
-        // copied again from the app's own package, once per start, and the
-        // next attempt launches it. A second time in the same start stops
-        // with the file's name: something is removing it again.
+        // -1073741515" names neither the cause nor the fix.
+        //
+        // `engine_files::answer_loader_failure` decides, and its tests cover
+        // each case: a file of the engine's own gets one copy from the app's
+        // package and the next attempt launches it; a file that is not the
+        // engine's (every engine file in place) gets a sentence and no copy;
+        // and a copy already made, in this start or an earlier one, is not
+        // made again until a start has worked or a day has passed. That
+        // record is a file in the engine's folder, not a variable here.
         if let Some(loader) = btx_core::engine_files::loader_failure(&tail, exit_code) {
             if stopped_since(start_gen, state.refresher_gen.load(Ordering::SeqCst)) {
                 return Err("the node was stopped while it was starting".to_string());
             }
-            match answer_engine_loader_failure(
-                app,
-                datadir,
-                &paths.btxd,
-                loader,
-                engine_copied_again,
-            )
-            .await
-            {
+            match answer_engine_loader_failure(app, datadir, &paths.btxd, loader).await {
                 Ok(line) => {
                     eprintln!("[node-app] {line} (attempt {attempt}/{LAUNCH_ATTEMPTS})");
                     setup_log(datadir, &line);
-                    engine_copied_again = true;
                     continue;
                 }
                 Err(said) => {

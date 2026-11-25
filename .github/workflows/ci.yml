@@ -139,3 +139,50 @@ jobs:
             > resources/node-pkg/CI-PLACEHOLDER
       - run: cargo check --locked --all-targets
       - run: cargo test --locked
+
+  # ---------------------------------------------------------------------------
+  # Windows. Until 0.8.1 no pull request compiled a line of the Windows code:
+  # the jobs above are Ubuntu and macOS, and node-win-installer.yml runs only
+  # when someone dispatches it. `platform/windows.rs`, every `#[cfg(windows)]`
+  # branch and the path handling (backslashes, `.exe`, rename-over-open-file)
+  # were first compiled at release time.
+  #
+  # Both crates, the same two commands as on the other systems. No engine is
+  # staged, so the tests that need a real btxd.exe stay ignored here, among
+  # them `a_real_windows_engine_with_a_dll_removed_exits_instead_of_waiting`:
+  # that one is run by hand against the engine the installer workflow pins.
+  # ---------------------------------------------------------------------------
+  windows:
+    name: windows (btx-core and tauri shell, check and test)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Show toolchain
+        run: rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            crates/btx-core
+            apps/node/src-tauri
+      - name: btx-core (check)
+        working-directory: crates/btx-core
+        run: cargo check --locked --all-targets
+      - name: btx-core (test)
+        working-directory: crates/btx-core
+        run: cargo test --locked
+      - name: Satisfy the bundle-resource glob (debug builds only)
+        working-directory: apps/node/src-tauri
+        run: |
+          mkdir -p resources/node-pkg
+          echo "CI placeholder. Not a node package. See the app job's comment." \
+            > resources/node-pkg/CI-PLACEHOLDER
+      - name: tauri shell (check)
+        working-directory: apps/node/src-tauri
+        run: cargo check --locked --all-targets
+      - name: tauri shell (test)
+        working-directory: apps/node/src-tauri
+        run: cargo test --locked

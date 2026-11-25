@@ -909,30 +909,38 @@ fn verify_btxd_reports_tag(btxd: &Path, expected_tag: &str) -> AppResult<()> {
     )))
 }
 
-/// Mark what must run as executable and sign what macOS wants signed.
+/// Make one installed file runnable when it is one that runs: mark it
+/// executable and, on macOS, sign it.
 ///
-/// `bin/` holds the launcher wrappers, `libexec/` the real daemons; both need
-/// +x. Only genuine Mach-Os get re-signed (the kernel only SIGKILLs Mach-Os;
-/// signing a script is an error, not a no-op).
+/// `bin/` holds the launcher wrappers, `libexec/` the real daemons; the
+/// files directly in them need +x. Only genuine Mach-Os get re-signed (the
+/// kernel only SIGKILLs Mach-Os; signing a script is an error, not a no-op).
+/// A file anywhere else (a library, a shader) is data and is left alone.
+pub(crate) fn finish_engine_file(install_root: &Path, path: &Path, datadir: &Path) {
+    let runs = ["bin", "libexec"]
+        .iter()
+        .any(|sub| path.parent() == Some(install_root.join(sub).as_path()));
+    if !runs || !path.is_file() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+    }
+    if is_macho(path) {
+        crate::node::ensure_adhoc_signed(path, datadir);
+    }
+}
+
+/// [`finish_engine_file`] for every file of a freshly copied engine.
 pub(crate) fn finish_engine_tree(install_root: &Path, datadir: &Path) {
     for sub in ["bin", "libexec"] {
-        let dir = install_root.join(sub);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Ok(entries) = std::fs::read_dir(install_root.join(sub)) else {
             continue;
         };
         for entry in entries.flatten() {
-            let p = entry.path();
-            if !p.is_file() {
-                continue; // e.g. libexec/metal/ shader dir — data, not executables
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
-            }
-            if is_macho(&p) {
-                crate::node::ensure_adhoc_signed(&p, datadir);
-            }
+            finish_engine_file(install_root, &entry.path(), datadir);
         }
     }
 }
@@ -940,19 +948,20 @@ pub(crate) fn finish_engine_tree(install_root: &Path, datadir: &Path) {
 /// Copy the whole package into `install_root`, make it runnable, ask the
 /// copied btxd which version it is, and only then write the file list.
 ///
-/// The order is the point. The list is removed first and written last, so a
-/// copy that stops half-way (the disk filled, the computer lost power) leaves
-/// a folder that does not count as an install, and the next call copies
-/// again. Free space is checked before the first byte: a copy that would not
-/// fit is refused with the numbers instead of leaving half an engine behind.
+/// The order is the point. Free space is checked before anything in the
+/// folder changes: a copy that would not fit is refused with the numbers and
+/// leaves a good install, list included, exactly as it was. Then the list is
+/// removed, and written again last, so a copy that stops half-way (the
+/// computer lost power) leaves a folder that does not count as an install,
+/// and the next call copies again.
 fn copy_and_verify_engine_tree(
     bundled_pkg_dir: &Path,
     install_root: &Path,
     datadir: &Path,
     listing: &[crate::engine_files::FileEntry],
 ) -> AppResult<()> {
-    crate::engine_files::forget_manifest(install_root);
     crate::engine_files::ensure_space_for(install_root, listing)?;
+    crate::engine_files::forget_manifest(install_root);
     copy_tree(bundled_pkg_dir, install_root)?;
     finish_engine_tree(install_root, datadir);
     if let Some(expected) = expected_btxd_version(bundled_pkg_dir, install_root) {
@@ -961,7 +970,7 @@ fn copy_and_verify_engine_tree(
             .join(crate::platform::exe_name("btxd"));
         verify_btxd_reports_tag(&btxd_path, &expected)?;
     }
-    crate::engine_files::write_manifest(install_root, listing)
+    crate::engine_files::write_manifest(install_root, true, listing)
 }
 
 /// Copy the whole engine again over an install of it, whatever its file list
@@ -999,9 +1008,10 @@ pub fn provision_node_package(
     // another app is running never moves the saved tag (`start_node_once`,
     // "Attach-mode never flips"), so every start of the app copied the whole
     // engine again. So did every start that provisioned and then failed to
-    // launch. A folder with a file list that names this package's files at
-    // this package's sizes, all of them in place, is a finished install of
-    // this package (`engine_files::installed_matches`), and is left alone.
+    // launch. A folder whose file list was written by an install and names
+    // this package's files at this package's sizes, all of them in place, is
+    // a finished install of this package (`engine_files::installed_matches`),
+    // and is left alone.
     // The conf below is still written: that is what the callers come for.
     let listing = crate::engine_files::list_tree(bundled_pkg_dir)?;
     let already_installed = crate::engine_files::installed_matches(install_root, &listing);
@@ -1888,6 +1898,33 @@ mod tests {
         // failure after this point cannot leave a stale one behind.
         crate::engine_files::forget_manifest(&install);
         assert!(!crate::engine_files::installed_matches(&install, &listing));
+    }
+
+    /// Only what runs is made runnable: the files directly in bin/ and
+    /// libexec/, not a library or a shader beside them.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_files_that_run_are_marked_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("install");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o111;
+        for rel in [
+            "bin/btxd",
+            "bin/lib/libx.so",
+            "libexec/metal/k.metallib",
+            "top",
+        ] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+            finish_engine_file(&root, &p, tmp.path());
+        }
+        assert_eq!(mode(&root.join("bin/btxd")), 0o111);
+        assert_eq!(mode(&root.join("bin/lib/libx.so")), 0);
+        assert_eq!(mode(&root.join("libexec/metal/k.metallib")), 0);
+        assert_eq!(mode(&root.join("top")), 0);
     }
 
     #[test]
