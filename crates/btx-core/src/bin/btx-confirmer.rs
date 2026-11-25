@@ -312,6 +312,11 @@ async fn main() {
             )),
             Err(e) => refuse(e),
         };
+    // The engine's own gate: 0.34.16 and newer sign only at their own tip, so
+    // this tool has nothing it could sign there.
+    if let Some(why) = confirmer::why_not_on_engine(confirmer::engine_version(&client).await) {
+        refuse(format!("this node does not confirm: {why}"));
+    }
     let site = Site::from_env().unwrap_or_else(|e| refuse(e));
     let http = snapshot_site::client().unwrap_or_else(|e| refuse(e));
     if let Err(e) = std::fs::create_dir_all(&args.state) {
@@ -379,8 +384,16 @@ async fn main() {
             let status = node_api::get_matmul_trusted_status(&client).await.ok();
             let why = match &status {
                 None => Some("the node did not answer getmatmultrustedstatus".to_string()),
-                Some(s) => confirmer::why_not(s, key_hex.as_deref(), &genesis, env.as_deref())
-                    .map(str::to_string),
+                Some(s) => {
+                    match confirmer::why_not(s, key_hex.as_deref(), &genesis, env.as_deref()) {
+                        Some(why) => Some(why.to_string()),
+                        // A btxd replaced by a newer one under this tool.
+                        None => {
+                            confirmer::why_not_on_engine(confirmer::engine_version(&client).await)
+                                .map(str::to_string)
+                        }
+                    }
+                }
             };
             if let Some(why) = why {
                 if off.as_deref() != Some(why.as_str()) {

@@ -1080,6 +1080,31 @@ pub fn build_node_command(
     if node_supports_autoupdate_flag(btxd) {
         args.push("-autoupdate=0".to_string());
     }
+    // SwapNet OFF, stated on every launch of an engine that has it. v0.34.16
+    // builds SwapNet into btxd (an embedded CPython runtime, cmake/SwapNet.cmake,
+    // with no build switch: "Disabling the feature at runtime is -swapnet=0") and
+    // registers `-swapnet` on every build, model network or not (init.cpp:620,
+    // swapnet/node.cpp:96). At that tag it defaults to 0 (node.cpp:106), so this
+    // flag changes nothing there. It is here for the engine after it: 0.34.17
+    // flips the default to 1 (swapnet/node.cpp:179, :190 at v0.34.17), and a
+    // `swapnet=1` in a conf or in the datadir's btx_rw.conf would turn it on
+    // under this app on any engine, where the command line outranks both. This
+    // app is a monetary node; it has no SwapNet policy, wallet binding or
+    // screen, so the runtime stays stopped until a release decides otherwise.
+    //
+    // Gated on the version in the install path, like -autoupdate above and
+    // through the same parse: v0.34.15 and older do not register the option and
+    // refuse an unknown argument at init, and the app launches the previous
+    // engine when provisioning a new one fails.
+    //
+    // NOT passed, on any engine: `-modelnet`. The release engine is built with
+    // -DWITH_MODELNET=OFF, which leaves `-modelnet` unregistered (init.cpp:652,
+    // inside `#ifdef ENABLE_MODELNET`), so `-modelnet=0` is a fatal unknown
+    // argument there. `the_pinned_engine_launches_with_swapnet_off_and_no_model_flag`
+    // in the app holds both halves.
+    if node_has_swapnet(btxd) {
+        args.push("-swapnet=0".to_string());
+    }
     // ── MatMul v4.7 / RC ExactReplay (BTX v0.33.2, mainnet block 185,000) ──────
     // The fork replaces the proof of work with an "RC episode" that block
     // VALIDATION must recompute. btxd's own default for `-matmulrcexecution`
@@ -1659,6 +1684,25 @@ fn node_has_reorg_policy(btxd: &Path) -> bool {
     let minor = v.get(1).copied().unwrap_or(0);
     let patch = v.get(2).copied().unwrap_or(0);
     (major, minor, patch) >= (0, 34, 12)
+}
+
+/// Whether the btxd at `path` has `-swapnet`, i.e. is v0.34.16 or newer.
+/// v0.34.16 added it (swapnet/node.cpp:96, registered from init.cpp:620 on
+/// every build) with a default of 0; 0.34.17 defaults it to 1. Older engines
+/// reject the unknown argument FATALLY, so this fails safe to `false` for any
+/// older, unknown or tag-less path, like the gates above, and reads the
+/// version through the same `parse_tag_version` they do.
+fn node_has_swapnet(btxd: &Path) -> bool {
+    let Some(tag) = release_tag_from_btxd_path(btxd) else {
+        return false;
+    };
+    let Some(v) = parse_tag_version(&tag) else {
+        return false;
+    };
+    let major = v.first().copied().unwrap_or(0);
+    let minor = v.get(1).copied().unwrap_or(0);
+    let patch = v.get(2).copied().unwrap_or(0);
+    (major, minor, patch) >= (0, 34, 16)
 }
 
 /// Whether an engine installed under `tag` still follows the network's
@@ -7791,6 +7835,70 @@ workspace_required=5164972400 workspace_capacity=9663283200 allow_unverifiable_c
                 );
                 assert!(
                     args.iter().any(|a| a == "-parkdeepreorg=0"),
+                    "{btxd} {backend:?}: {args:?}"
+                );
+            }
+        }
+    }
+
+    /// Both sides of the 0.34.16 line, on every backend. v0.34.16 registers
+    /// `-swapnet` (default 0) and 0.34.17 turns it on by default; v0.34.15 and
+    /// older refuse it as an unknown argument. So `-swapnet=0` goes to 0.34.16
+    /// and newer only, exactly once, and no launch on either side ever names a
+    /// model-network option: the release engine is built without the model
+    /// network and refuses `-modelnet` the same way.
+    #[test]
+    fn swapnet_is_switched_off_only_on_an_engine_that_has_it() {
+        let dd = Path::new("/dd");
+        let conf = Path::new("/dd/btx.conf");
+        for backend in [Backend::Metal, Backend::Cuda, Backend::Cpu] {
+            for tag in [
+                "v0.34.16",
+                "v0.34.16-074dac16",
+                "v0.34.17",
+                "v0.34.100",
+                "v0.35.0",
+                "v1.0.0",
+            ] {
+                let btxd = PathBuf::from(format!("/x/btx/{tag}/plat/bin/btxd"));
+                assert!(node_has_swapnet(&btxd), "{tag}");
+                let (_, args, _) = build_node_command(&btxd, dd, conf, backend);
+                assert_eq!(
+                    args.iter().filter(|a| a.starts_with("-swapnet")).count(),
+                    1,
+                    "{tag} {backend:?}: {args:?}"
+                );
+                assert!(
+                    args.iter().any(|a| a == "-swapnet=0"),
+                    "{tag} {backend:?}: {args:?}"
+                );
+                assert!(
+                    args.iter().any(|a| a == "-autoupdate=0"),
+                    "{tag} {backend:?}: {args:?}"
+                );
+                assert!(
+                    !args.iter().any(|a| a.starts_with("-model")),
+                    "{tag} {backend:?}: {args:?}"
+                );
+            }
+            for btxd in [
+                "/x/btx/v0.34.15/plat/bin/btxd",
+                "/x/btx/v0.34.15-476f3f23/plat/bin/btxd",
+                "/x/btx/v0.34.14/plat/bin/btxd",
+                "/x/btx/v0.34.9/plat/bin/btxd",
+                "/x/btx/v0.34.6-3013c2c2/plat/bin/btxd",
+                "/x/btx/v0.33.16/plat/bin/btxd",
+                "/x/btx/custom/plat/bin/btxd",
+                "/data/bin/btxd",
+            ] {
+                assert!(!node_has_swapnet(Path::new(btxd)), "{btxd}");
+                let (_, args, _) = build_node_command(Path::new(btxd), dd, conf, backend);
+                assert!(
+                    !args.iter().any(|a| a.starts_with("-swapnet")),
+                    "{btxd} {backend:?}: {args:?}"
+                );
+                assert!(
+                    !args.iter().any(|a| a.starts_with("-model")),
                     "{btxd} {backend:?}: {args:?}"
                 );
             }

@@ -8,6 +8,50 @@ root).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-25 · linux + windows (no mac build; the mac stays on the version it has)
+
+**The node engine moves to BTX 0.34.16, upstream's newest final release.
+Nothing about how your node runs changes.** 0.34.16 changes none of the
+network's rules: the same blocks are valid, no new rule starts at any height,
+and your data folder is used as it is. Your node keeps the role it has. It
+still checks blocks itself where its graphics card can, and follows signatures
+where it cannot. It still follows the chain with the most work, and a new node
+still starts from the same places. On the first start after the update the
+app fetches the new engine once, as it did for 0.34.15.
+
+**What the new engine adds stays switched off.** 0.34.16 comes with SwapNet
+built in, upstream's network for swaps between nodes. It is off unless a node
+asks for it, and easyNode now also switches it off itself on every start. The
+next engine turns it on by default, and this way it cannot start under
+easyNode until a release decides that it should. The model network is still
+not part of the engine easyNode ships. And the engine's own updater stays
+off, as always: easyNode updates the engine.
+
+**If you confirm snapshots: the engine now signs only at its own tip.** A
+snapshot counts as confirmed when two operators sign the same statement. The
+way that happens today still works: each operator's node cuts the snapshot
+itself at the same block, as the project's RTX 3060 and Jarek's node did for
+block 287,000 on 24 November. The other way does not work on this engine: a
+node that is asked, a day later, to add its signature to another operator's
+statement could only be refused, because 0.34.16 signs a statement only for
+the block its own chain ends on at that moment. So on this engine easyNode no
+longer asks: it skips that step, and Copy diagnostics says under Snapshots
+"confirmer: off, this engine signs only at its own tip, so this node cannot
+add its signature to another operator's statement". It is not counted as a
+failure. The same goes for the signed objection a node could send when its
+own record disagreed with a statement: no node on this engine can send one.
+A wrong statement now stays unconfirmed simply because no second operator
+produces the same one.
+
+**Why 0.34.16 and not 0.34.17.** 0.34.17 is a pre-release that upstream has
+replaced several times. easyNode ships engines upstream calls final.
+
+**This release is for Linux and Windows. The Mac stays on the version it
+has.** Upstream published no Mac build of 0.34.16, so the Mac's engine has to
+be built from source first, and a Mac release follows when that is done. A
+Mac node loses nothing while it waits: 0.34.15 and 0.34.16 follow the same
+rules and the same chain.
+
 **You can count your node in the network's totals.** easybtx.com can now say
 how much the easyNode network uploads to other nodes, over the last day, the
 last week and since counting began, but only from nodes that report it. A new

@@ -6,6 +6,90 @@ just the local build, except where it says otherwise.
 
 ---
 
+## Update 2026-11-25: easyNode 0.8.0 carries BTX 0.34.16 (Linux and Windows)
+
+**The plan** (owner's planning session, 2026-11-25): move the engine from
+v0.34.15 to upstream's final **v0.34.16 =
+`074dac167c26c1e091198f691ed5727817dba88a`**, pinned by SHA because upstream
+moved that tag once (from `d27530af`). Not the 0.34.17 prerelease. Step one is
+parity: the same roles and behaviour on the newer engine, the model network
+still compiled out (`-DWITH_MODELNET=OFF`), SwapNet off at run time. The
+swarm and ModelNet are a later release. Three threads worked in parallel: the
+Linux engine build (#235, merged), the Windows engine build (#234, merged)
+and the app side (#233). The planning session merges and publishes: Linux
+first, the 3060 signer is updated from it, Windows follows.
+
+**#233 is the release pull request for 0.8.0.** It moves `NODE_RELEASE_TAG`
+and `NODE_RELEASE_COMMIT`, passes `-swapnet=0` to 0.34.16 and newer, stands
+the snapshot confirmer down on this engine, pins the Linux installer to the
+proven engine build (run 45523343898, artifact 14981349727), moves the two
+contributor staging scripts, and sets the app version to 0.8.0 in the six
+places the recipe names. The Windows installer pins came with #234 (run
+45516298111). `commands.rs` has everything that was read at the SHA beside
+the pin. When this was written nothing was published: no release, no feed,
+no site change.
+
+**What is still open after 0.8.0:**
+
+1. **The Mac.** Upstream publishes no macOS archive for 0.34.16, so
+   `stage-node-pkg.sh` refuses for this engine and says so. The Mac needs a
+   source build at the SHA (`btxd-macos.yml`, `stage-node-pkg-mac-source.sh`)
+   before it can ship this release; until then it stays on the version it has.
+2. **SwapNet cannot be switched on inside an AppImage as the app starts btxd
+   today.** Inside an AppImage btxd inherits `LD_LIBRARY_PATH`, `PYTHONHOME`
+   and `PYTHONPATH` from AppRun, and so loads the AppImage's own libpython,
+   which has no standard library beside it. Measured on the 3060 by the
+   planning session on 2026-11-25, under that environment: the bundled engine
+   starts and qualifies its GPU with `-swapnet=0`, and refuses to start with
+   `-swapnet=1`. 0.8.0 always passes `-swapnet=0`, so it is not affected. But
+   before any release switches SwapNet on, the child's environment has to be
+   cleaned where btxd is spawned (`build_node_command` in
+   `crates/btx-core/src/node.rs`, which today never clears it, on purpose, so
+   power users can override), and the engine tested with `-swapnet=1` from
+   inside the real AppImage.
+3. **The pinned start pair** (`attested_snapshot::pinned_pair()`) stays on
+   245,300 in 0.8.0, about 42,000 blocks back. The refresh waits for a
+   two-operator pair PUBLISHED as `utxo-snapshot-<height>` on
+   EasyBTX-releases; the newest one there is 245,300 itself. The website's
+   confirmed pointer serves 287,000 (Mende and Jarek, 2026-11-24), which is
+   what new nodes actually start from; the pinned pair is only the fallback
+   when that pointer fails. `scripts/publish-attested-snapshot.sh` would
+   publish one, but read its step 5 first: it deletes older
+   `utxo-snapshot-<n>` pre-releases and protects only 225,927, while
+   released apps pin 239,111 and 245,300 as well. #233's description has the
+   steps and the checks for the refresh.
+4. The real-engine `#[ignore]` suites against the built 0.34.16 btxd, an
+   upgrade of a real mirror-era datadir (recipe, "Rebuilding the Linux
+   release", step 5), and `ps` on one real install to see `-swapnet=0`.
+5. The release steps themselves are the recipe's: the site, the feed, and
+   **hold the 3060's app auto-update before the feed goes live**
+   (`docs/btx-update-protocol.md` B3.0). The signer's engine was v0.34.15
+   when this was written (`/BTX:0.34.15(innovation3060)/`, tip 287,646 at
+   23:20 UTC on 2026-11-25).
+
+**The confirmer cannot sign on 0.34.16.** Open-work item 0 below is no longer
+a warning about a pull request: btxchain/btx#225 (`af9020cd`) is in this tag.
+`signutxosnapshotmanifest` now rebuilds the statement from the node's own tip
+and signs only if every field matches, so the confirmer's co-signature 144
+blocks deep and its dissent (file fields zero) are both refused: "Refusing to
+sign manifest: consensus fields do not match this node's active-chain
+statement". Each attempt would make the engine write and delete a full UTXO
+export under `<datadir>/utxo-snapshot-sign/` first, every ten minutes per
+waiting statement. So the app does not ask: `snapshot_confirmer::why_not_on_engine`
+reads `getnetworkinfo.version` and stands the confirmer down at 3416 (0.34.16)
+and newer, before the website or the engine is asked anything. Copy
+diagnostics shows "confirmer: off, this engine signs only at its own tip, so
+this node cannot add its signature to another operator's statement", and the
+`btx-confirmer` binary refuses to run. Nothing breaks for users: snapshots are
+confirmed by two PRODUCERS (the 3060 and Jarek, the way item 0 describes), and
+`dumptxoutsetattested` did not change. **But no node on this engine can
+dissent from a wrong statement any more.** On the 3060 it has never signed anything (there is no
+`snapshot-confirmer.json` in its data folder): every statement it sees
+carries its own operator's signature already. The decision owed: retire the
+confirmer and the dissent, or give them a form that works at the tip. `confirmed_snapshot_regtest` and
+`snapshot_network_regtest` fail at their co-signing steps against 0.34.16
+until that is settled.
+
 ## Update 2026-10-18: Jarek confirms snapshots
 
 **Jarek (Byron Bay) is the second snapshot operator** (#218, owner's decision
@@ -256,9 +340,10 @@ preview:states`, then `http://localhost:1440/preview/index.html`.
     blocks; a GPU-memory hog does NOT cause the loss (WDDM pages GPU memory
     out, measured 2026-10-14).
 
-0. **Upstream btxchain/btx#225 would end co-signing as the confirmer does
-   it.** Open, not merged, "a later 0.34.16 can carry it" (its author,
-   2026-10-07). Its `af9020cd` makes `signutxosnapshotmanifest` rebuild the
+0. **Upstream btxchain/btx#225 ends co-signing as the confirmer does it,
+   and it is in v0.34.16** (see the 2026-11-25 update at the top). Written
+   on 2026-10-12, when it was open and "a later 0.34.16 can carry it" (its
+   author, 2026-10-07): its `af9020cd` makes `signutxosnapshotmanifest` rebuild the
    statement from the signing node's own active tip and refuse unless every
    field matches. The confirmer (`snapshot_confirmer.rs`) co-signs a
    statement 144 blocks deep that it checked against its diary, relying on

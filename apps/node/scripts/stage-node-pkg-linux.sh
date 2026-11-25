@@ -21,13 +21,14 @@
 # Usage:  apps/node/scripts/stage-node-pkg-linux.sh
 set -euo pipefail
 
-VERSION="0.34.15"
+VERSION="0.34.16"
 TARBALL_URL="https://github.com/btxchain/btx/releases/download/v${VERSION}/btx-${VERSION}-x86_64-linux-gnu.tar.gz"
 # Upstream has re-generated release assets in place before, and a silent swap
-# must FAIL here, never ship unnoticed. v0.34.15 publishes NO SHA256SUMS at
-# all; this is GitHub's asset digest for the file, which equals the hash
-# upstream lists on btxchain/btx PR 223. It pins the bytes, not a signature.
-TARBALL_SHA256="9dbaef6ffab696535794bfb7ea3b6318fa391578599970ec75a33ff1872e7dec"
+# must FAIL here, never ship unnoticed. v0.34.16 publishes a SHA256SUMS file
+# again (unsigned); this is its line for this archive, it equals GitHub's
+# asset digest, and a download on 2026-11-25 hashed to it. It pins the bytes,
+# not a signature.
+TARBALL_SHA256="9bbfff065299b3d6e863ecdeb0e54917788c1c0395cfa1d2b61bc40bf364932b"
 # NOTE: upstream publishes no `aarch64-linux-gnu` asset, so there is no ARM-Linux
 # node to stage. This script is x86_64-only by construction and always was; the
 # gap is called out here so nobody spends an afternoon looking for the tarball.
@@ -117,8 +118,12 @@ done
 # looks for exactly that shape beside the libpython it loaded
 # (src/swapnet/embed.cpp), so it is copied as it is. An archive without it,
 # which is 0.34.15 and everything older, copies nothing here.
-# NOT YET RUN: VERSION above is still 0.34.15, whose archive has none of this.
-# Run it once against the 0.34.16 archive when VERSION moves.
+# CHECKED 2026-11-25 against the listing of the 0.34.16 archive, not by a
+# run: its lib/ holds libpython3.14.so.1.0, python3.14/, python3/dist-packages/
+# (cryptography, cffi, bcrypt) and python-private/, which are the names the
+# loop below copies. The copy itself has not been run to the end: this script
+# asks the archive's btxd for its version first, that binary needs glibc 2.38,
+# and the machine the listing was read on is Ubuntu 22.04.
 for py in "$SRC"/lib/libpython3.*.so* "$SRC"/lib/python3* "$SRC"/lib/python-private; do
   [ -e "$py" ] || continue
   mkdir -p "$DEST/lib"
