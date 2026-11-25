@@ -29,35 +29,65 @@ Where it is:
   the marker `easynode-swarm-on` together.
 - `apps/node/src/swarm-card.ts`: every sentence of the row and card.
 
-When the swarm engine is broken (added 2026-11-25, same PR):
+When the swarm engine is broken, and the other rules (2026-11-25, same PR):
 
-- A launch of the swarm engine that fails holds the engine back and the same
-  start begins again on the default engine, once. The decision is at the one
-  call in `start_node_once` that runs an engine
-  (`falls_back_from_swarm_engine`); `start_node_held` takes the word
-  `SWARM_ENGINE_FELL_BACK` once. Not for a Stop or Quit, a read-block
-  recovery step, or a btxd the graphics driver holds.
+- Signer rule: `swarm_signs_in` is the one test, asked by the launch, the
+  switch and the card. It is the app's signer switch on a host that checks
+  blocks, OR `signing_key_the_app_does_not_manage` (a key in `btx_rw.conf`,
+  or in faststart.conf under the other option names).
+- A launch of the swarm engine that does not come up holds the engine back
+  and the same start begins again on the default engine, once. It is decided
+  from the kind of failure, which the launch writes down where the failure
+  is made (`EngineFailure`: could not be run, exited before answering, never
+  answered, a file not loaded), never from the sentence. A Quit, a Stop, the
+  set-aside, a full disk, the graphics check, warming through the whole wait
+  and the read-block recovery write nothing down. `StartPasses` counts the
+  passes; if the default engine then fails too, the hold is withdrawn
+  (`withdraw_swarm_hold`), because what stops both is not the swarm engine's.
 - The hold is the file `easynode-swarm-engine-held-back` in the node folder
   (`btx_core::swarm::hold_engine_back`, `engine_held_back`,
   `clear_engine_hold`): `app <version>`, then the reason. While it is there
-  `swarm_engine_for_launch` answers the default engine, so starts, the
-  refresher's restarts and a new run of the app cannot go back and forth.
-  Only `set_swarm` (on or off) and a fresh install clear it. Card state
-  `engine_start_failed`.
+  `swarm_engine_for_launch` answers the default engine. Only `set_swarm` (on
+  or off) and a fresh install clear it. Card state `engine_start_failed`.
 - A swarm engine that ends badly while running (signal, exit code other than
-  0) is held back by the status refresher and the node starts again on the
-  default engine (`swarm_engine_crash_falls_back`). A clean exit is left
-  alone.
+  0): one such end within an hour of its start is written to
+  `easynode-swarm-engine-bad-end` and the node is left exactly as the
+  default engine's is ("stopped responding", Start launches the swarm engine
+  again). A second within 24 hours holds the engine back and the node starts
+  again on the default engine (`swarm_crash_step`,
+  `btx_core::swarm::judge_bad_end`). A run that lasted an hour or more is
+  not counted. Nothing here starts the swarm engine again by itself.
 - A damaged install (the list an install wrote is there, files are missing or
   the wrong size, or `bin/btxd` is gone) is `swarm_engine::damage`. The start
   writes which files to setup.log and runs the default engine; card state
   `engine_damaged`; off and on fetches again and `install_from_archive`
   replaces the folder.
+- An install records its archive's sha256 in `.easynode-engine-archive` in
+  the engine folder, and `swarm_engine::installed(pin, root)` wants it to be
+  the pin's. A release that publishes another archive under the same tag is
+  therefore fetched; the card reads `engine_missing` until then.
+- The switch claims the download before its task is spawned
+  (`claim_swarm_switch`); a request while one runs is refused. It restarts a
+  running node only to change its engine (`swarm_switch_needs_restart`).
+
+Open, on purpose:
+
+- After an update that moves `NODE_RELEASE_TAG`, a switched-on swarm reads
+  `engine_missing` ("the swarm engine for this version of the app is not
+  installed", off and on fetches it). Nothing fetches it by itself: that is
+  half a gigabyte nobody asked for at that moment, again at every start if
+  it fails. The owner decides.
+- Old `<tag>-modelnet` folders in `~/.local/btx/` are not removed (about
+  830 MB each). The default engine's old folders are not removed either.
+- Neither engine is started again by the app after one outside kill; the
+  swarm engine is treated as the default engine is.
 - Not covered: a swarm engine that stays up and misbehaves (helper down, not
-  syncing); a folder whose file list was deleted reads as never installed.
-  Not tested: any of this with a real engine or inside a running app. The
-  pure rules, the hold file, the damage reading and the replacement are
-  tested; the two places they are called from are held by source checks only.
+  syncing); one that ends badly only after an hour or more, every time; a
+  folder whose file list was deleted reads as never installed.
+- Not tested: any of this with a real engine or inside a running app. The
+  rules, the pass loop, the crash steps, the files and the replacement are
+  run by tests; that the start path and the refresher call them at the right
+  place is held by source checks.
 
 To make it live, a release has to:
 

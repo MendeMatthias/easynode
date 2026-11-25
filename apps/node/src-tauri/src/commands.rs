@@ -1328,30 +1328,89 @@ const MAX_LADDER_RESTARTS: u32 = 2;
 pub(crate) async fn start_node_held(app: &AppHandle, state: &AppState) -> Result<(), String> {
     let datadir = node_datadir();
     crate::read_block_recovery::before_start(&datadir).await?;
-    let mut restarts = 0;
-    let mut fell_back = false;
+    let mut passes = StartPasses::default();
     loop {
-        match start_node_once(app, state).await {
-            Err(e) if e == crate::read_block_recovery::STEP_TAKEN => {
-                restarts += 1;
-                if restarts > MAX_LADDER_RESTARTS {
-                    return Err(
-                        "the node kept stopping on a known engine error; see setup.log in the \
-                         node folder."
-                            .to_string(),
-                    );
-                }
-            }
-            // The swarm engine was launched and failed. It is held back by
-            // now (`hold_swarm_engine_back`), so the next pass picks the
-            // default engine and cannot end here again; `fell_back` is the
-            // second fence, so this is one more pass and never a loop.
-            Err(e) if e == SWARM_ENGINE_FELL_BACK && !fell_back => fell_back = true,
-            Ok(()) => {
+        match passes.after(start_node_once(app, state).await) {
+            AfterPass::Again => {}
+            AfterPass::Started => {
                 crate::read_block_recovery::after_start(app, state);
                 return Ok(());
             }
-            Err(e) => return Err(e),
+            AfterPass::Failed {
+                error,
+                withdraw_hold,
+            } => {
+                if withdraw_hold {
+                    withdraw_swarm_hold(&datadir, &error);
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// What [`start_node_held`] does after one pass of the start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AfterPass {
+    /// Begin again from the top.
+    Again,
+    Started,
+    /// The start ends with `error`. `withdraw_hold`: this start set the swarm
+    /// engine aside and the default engine then did not start either, so the
+    /// failure was not the swarm engine's and the hold made for it goes.
+    Failed {
+        error: String,
+        withdraw_hold: bool,
+    },
+}
+
+/// The passes of one start, counted. Two things begin a start again from the
+/// top: a rung of the read-block recovery (`crate::read_block_recovery`,
+/// at most [`MAX_LADDER_RESTARTS`]), and a swarm engine that was launched and
+/// did not come up ([`SWARM_ENGINE_FELL_BACK`], once: by then the engine is
+/// held back, so the next pass is the default engine's, and a second such
+/// answer ends the start instead of going round).
+#[derive(Debug, Default)]
+struct StartPasses {
+    ladder_restarts: u32,
+    fell_back: bool,
+}
+
+impl StartPasses {
+    fn after(&mut self, result: Result<(), String>) -> AfterPass {
+        let error = match result {
+            Ok(()) => return AfterPass::Started,
+            Err(e) => e,
+        };
+        if error == crate::read_block_recovery::STEP_TAKEN {
+            self.ladder_restarts += 1;
+            if self.ladder_restarts <= MAX_LADDER_RESTARTS {
+                return AfterPass::Again;
+            }
+            return AfterPass::Failed {
+                error: "the node kept stopping on a known engine error; see setup.log in the \
+                        node folder."
+                    .to_string(),
+                withdraw_hold: self.fell_back,
+            };
+        }
+        if error == SWARM_ENGINE_FELL_BACK {
+            if !self.fell_back {
+                self.fell_back = true;
+                return AfterPass::Again;
+            }
+            // Not reachable while the hold works; said as a sentence, and
+            // the hold stays, because the swarm engine is what failed twice.
+            return AfterPass::Failed {
+                error: "the swarm engine did not start and the node could not be started on \
+                        its usual engine either; see setup.log in the node folder."
+                    .to_string(),
+                withdraw_hold: false,
+            };
+        }
+        AfterPass::Failed {
+            error,
+            withdraw_hold: self.fell_back,
         }
     }
 }
@@ -1825,11 +1884,12 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     // written to setup.log here so neither happens silently: an install that
     // was finished once and now has files missing or cut off, and a swarm
     // engine held back because it failed (`hold_swarm_engine_back`).
+    //
+    // "Signs" is asked of the node folder too (`swarm_signs_in`): a signing
+    // key the operator put in a conf signs whatever the app's own switch says.
     let swarm_held = swarm_hold(&datadir);
-    if cfg!(target_os = "linux")
-        && settings.swarm_enabled
-        && !(settings.signer_enabled && signer_applies_here)
-    {
+    let swarm_signs = swarm_signs_in(&datadir, settings.signer_enabled, signer_applies_here);
+    if cfg!(target_os = "linux") && settings.swarm_enabled && !swarm_signs {
         if let Some((root, damage)) = swarm_engine_damage() {
             setup_log(&datadir, &swarm_damage_line(&root, &damage));
         } else if let Some(why) = &swarm_held {
@@ -1845,7 +1905,7 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     let swarm_root = swarm_engine_for_launch(
         cfg!(target_os = "linux"),
         settings.swarm_enabled,
-        settings.signer_enabled && signer_applies_here,
+        swarm_signs,
         swarm_held.is_some(),
         swarm_engine_installed(),
     );
@@ -2035,7 +2095,10 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
             // A node we spawn is ours by construction.
             *state.attached_to.lock().await = None;
             let launched = &abort_mirror_load.launched;
-            let spawned = spawn_node_with_lock_retry(app, state, &datadir, &paths, launched).await;
+            // Filled in by the launch when what failed was the engine itself.
+            let why = std::sync::Mutex::new(None);
+            let spawned =
+                spawn_node_with_lock_retry(app, state, &datadir, &paths, launched, &why).await;
             match spawned {
                 Ok(client) => client,
                 // The owner's rule: a node comes back by itself, and never
@@ -2043,21 +2106,37 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
                 // the one call that runs an engine, so it is the one place
                 // that knows the swarm engine was run and did not come up:
                 // attaching to a node already serving runs nothing, and what
-                // fails before this line fails on either engine. The swarm
-                // engine is held back in a file, and the start begins again
-                // from the top on the default engine, once
-                // (`start_node_held`). If that start fails too, its error is
-                // the one shown, as before.
+                // fails before this line fails on either engine.
+                //
+                // Decided from the KIND of failure the launch wrote down
+                // (`EngineFailure`), never from its sentence: the engine's
+                // file could not be run, it exited before it answered, it
+                // never answered, or the system could not load one of its
+                // files. A Quit, a Stop, a snapshot that could not be moved
+                // aside, a full disk, the graphics check and the read-block
+                // recovery write nothing down, and the swarm engine stays
+                // as it is for them.
+                //
+                // The swarm engine is then held back in a file and the start
+                // begins again from the top on the default engine, once
+                // (`StartPasses`). If that start fails too, its error is the
+                // one shown and the hold is withdrawn: what stops both
+                // engines is not the swarm engine's fault.
                 //
                 // NOT covered here: a swarm engine that starts, answers and
                 // then stays up while misbehaving (a helper that is down, a
                 // node that stops syncing). The card reports the helper; the
                 // node is not moved off the engine for it. One that ends
                 // badly while running is the status refresher's
-                // (`swarm_engine_crash_falls_back`).
+                // (`swarm_crash_step`).
                 Err(e) => {
-                    let gpu_holds = GPU_HELD_PID.load(Ordering::SeqCst) != 0;
-                    if falls_back_from_swarm_engine(swarm_root.is_some(), &e, gpu_holds) {
+                    let failure = why.lock().map(|w| *w).unwrap_or(None);
+                    if falls_back_from_swarm_engine(
+                        swarm_root.is_some(),
+                        failure,
+                        state.quitting.load(Ordering::SeqCst),
+                        GPU_HELD_PID.load(Ordering::SeqCst) != 0,
+                    ) {
                         hold_swarm_engine_back(&datadir, &e);
                         return Err(SWARM_ENGINE_FELL_BACK.to_string());
                     }
@@ -2643,6 +2722,7 @@ async fn spawn_node_with_lock_retry(
     datadir: &Path,
     paths: &FaststartResult,
     launched: &std::sync::atomic::AtomicBool,
+    engine_failure: &std::sync::Mutex<Option<EngineFailure>>,
 ) -> Result<RpcClient, String> {
     // How the last attempt's btxd ended, when it exited.
     let mut last_exit: Option<String> = None;
@@ -2732,7 +2812,15 @@ async fn spawn_node_with_lock_retry(
                 &paths.btx_cli,
             )
             .await
-            .map_err(|e| format!("couldn't start the node: {e}"))?;
+            .map_err(|e| {
+                // The engine's file could not be run at all. A disk too full
+                // to start a node on is refused before anything is run, and
+                // is not that.
+                if !matches!(e, AppError::Disk(_)) {
+                    note_engine_failure(engine_failure, EngineFailure::CouldNotRun);
+                }
+                format!("couldn't start the node: {e}")
+            })?;
         // The arguments this attempt ran with, for the read-block recovery:
         // whether it ran as a trusted mirror is read from what ran.
         let launch_args = controller.launch_args().to_vec();
@@ -2993,9 +3081,21 @@ async fn spawn_node_with_lock_retry(
                     }
                     let doing = btx_core::node::last_log_line(&since);
                     let said = rpc_timeout_error(&last, doing.as_deref(), stopped, datadir);
-                    return Err(
-                        crate::read_block_recovery::after_failed_launch(datadir, said).await,
-                    );
+                    let made = said.clone();
+                    let ended =
+                        crate::read_block_recovery::after_failed_launch(datadir, said).await;
+                    // An engine that answered "warming up" through the whole
+                    // wait is working, slowly, on this chain data; one that
+                    // never opened its RPC did not come up.
+                    if !graceful {
+                        engine_did_not_come_up(
+                            engine_failure,
+                            EngineFailure::NeverAnswered,
+                            &made,
+                            &ended,
+                        );
+                    }
+                    return Err(ended);
                 }
                 // `after_rpc_wait` maps each outcome to exactly one of these,
                 // so what is left is an exit: fall through to the exit path.
@@ -3103,9 +3203,16 @@ async fn spawn_node_with_lock_retry(
                 Err(said) => {
                     eprintln!("[node-app] {said}");
                     setup_log(datadir, &said);
-                    return Err(
-                        crate::read_block_recovery::after_failed_launch(datadir, said).await,
+                    let made = said.clone();
+                    let ended =
+                        crate::read_block_recovery::after_failed_launch(datadir, said).await;
+                    engine_did_not_come_up(
+                        engine_failure,
+                        EngineFailure::FileNotLoaded,
+                        &made,
+                        &ended,
                     );
+                    return Err(ended);
                 }
             }
         }
@@ -3141,7 +3248,15 @@ async fn spawn_node_with_lock_retry(
          See easybtx-node.log in {} for details.",
         datadir.display()
     );
-    Err(crate::read_block_recovery::after_failed_launch(datadir, said).await)
+    let made = said.clone();
+    let ended = crate::read_block_recovery::after_failed_launch(datadir, said).await;
+    engine_did_not_come_up(
+        engine_failure,
+        EngineFailure::ExitedBeforeAnswering,
+        &made,
+        &ended,
+    );
+    Err(ended)
 }
 
 /// While the (long) startup RPC wait runs, surface warmup as a CALM phase:
@@ -3302,6 +3417,9 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
         // clock to within milliseconds).
         let run_started = std::time::Instant::now();
         let mut consecutive_failures: u32 = 0;
+        // A bad end of this run's swarm engine is judged once, not at every
+        // tick that finds the node silent (`swarm_crash_step`).
+        let mut swarm_bad_end_judged = false;
         // The last peer count actually measured this run, so a lost getpeerinfo
         // holds the number instead of claiming zero. Starts at 0, which is the
         // truth before the first successful read.
@@ -4704,37 +4822,57 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         return;
                     }
                     // A swarm engine that started, answered and then ended
-                    // badly (a signal, an exit code other than 0). Without
-                    // this the node would stay down behind "stopped
-                    // responding", and every Start would launch the same
-                    // engine again. It is held back and the node starts
-                    // again by itself on its usual engine, once: the hold
-                    // makes the next launch the default engine's, whose
-                    // marker is off, so this arm cannot be taken twice. A
-                    // clean exit is not this (someone stopped the node), nor
-                    // is a node that is merely silent.
-                    let crashed = slot_child_crashed(&node_slot);
-                    if swarm_engine_crash_falls_back(
-                        btx_core::swarm::wanted(&node_datadir()),
-                        crashed.is_some(),
+                    // badly (a signal, an exit code other than 0). One such
+                    // end is not evidence against the engine: a process
+                    // killed for memory, by hand, by a driver swap or with
+                    // its virtual machine dies the same way on the default
+                    // engine. So the first one is written down and the node
+                    // is left to what follows, exactly as the default
+                    // engine's is, and the next start is the swarm engine's
+                    // again. A second early bad end inside a day is the
+                    // engine's: it is held back and the node starts again by
+                    // itself on its usual engine. That start's marker is
+                    // off, so this arm cannot be taken again, and nothing
+                    // here starts the swarm engine again by itself. A clean
+                    // exit is not this (someone stopped the node), nor is a
+                    // node that is merely silent.
+                    let ended_badly = slot_child_crashed(&node_slot);
+                    let dd = node_datadir();
+                    let step = swarm_crash_step(&SwarmCrash {
+                        swarm_engine_run: btx_core::swarm::wanted(&dd),
+                        ended_badly: ended_badly.is_some(),
                         ours,
                         stopped,
-                    ) {
-                        hold_swarm_engine_back(
-                            &node_datadir(),
-                            &format!(
-                                "it stopped while the node was running: {}",
-                                crashed.unwrap_or_default()
-                            ),
-                        );
-                        let p = NodePhase::Warming {
-                            message: SWARM_ENGINE_CRASH_RESTART.into(),
-                        };
-                        *phase_slot.lock().await = p.clone();
-                        crate::tray::reflect_phase(&app, &p);
-                        stop_node_inner(&state).await;
-                        let _ = start_node_projected(&app, &state).await;
-                        return;
+                        judged: swarm_bad_end_judged,
+                        ran_secs: run_started.elapsed().as_secs(),
+                        earlier_bad_end: btx_core::swarm::last_bad_end(&dd),
+                        now: unix_now_secs(),
+                    });
+                    let how = ended_badly.unwrap_or_default();
+                    match step {
+                        SwarmCrashStep::Nothing => {}
+                        SwarmCrashStep::NoteIt => {
+                            swarm_bad_end_judged = true;
+                            note_swarm_bad_end(&dd, &how);
+                        }
+                        SwarmCrashStep::HoldAndStartAgain => {
+                            hold_swarm_engine_back(
+                                &dd,
+                                &format!(
+                                    "it stopped twice within a day, each time soon after it \
+                                     started; the last time {how}"
+                                ),
+                            );
+                            let _ = btx_core::swarm::clear_bad_end(&dd);
+                            let p = NodePhase::Warming {
+                                message: SWARM_ENGINE_CRASH_RESTART.into(),
+                            };
+                            *phase_slot.lock().await = p.clone();
+                            crate::tray::reflect_phase(&app, &p);
+                            stop_node_inner(&state).await;
+                            let _ = start_node_projected(&app, &state).await;
+                            return;
+                        }
                     }
                     consecutive_failures += 1;
                     // ~1 min of continuous silence → tell the user instead of
@@ -7911,10 +8049,6 @@ const SWARM_ENGINE_FELL_BACK: &str =
 const SWARM_ENGINE_CRASH_RESTART: &str =
     "The swarm engine stopped. Starting your node again on its usual engine…";
 
-/// What a start says when a Stop or Quit ended it. Not a failure of any
-/// engine.
-const STOPPED_WHILE_STARTING: &str = "the node was stopped while it was starting";
-
 /// Set when the swarm engine was held back in this run of the app. The file
 /// in the node folder is the record that lasts; this covers a folder that
 /// could not take the file, so that one run of the app still cannot go back
@@ -7922,29 +8056,157 @@ const STOPPED_WHILE_STARTING: &str = "the node was stopped while it was starting
 static SWARM_ENGINE_HELD_THIS_RUN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Does a launch that ended in `error` send the node back to the default
-/// engine? Only when the swarm engine was the one launched, and the error is
-/// the launch's own: not a Stop or Quit, not the read-block recovery taking a
-/// step (that is the chain data, and its start begins again by itself), and
-/// not a btxd the graphics driver will not let go of (nothing can start
-/// beside it, on either engine).
-fn falls_back_from_swarm_engine(swarm_engine_launched: bool, error: &str, gpu_holds: bool) -> bool {
-    swarm_engine_launched
-        && !gpu_holds
-        && error != STOPPED_WHILE_STARTING
-        && error != crate::read_block_recovery::STEP_TAKEN
+/// How a launch failed, when what failed was the engine itself: it was run
+/// (or could not be run at all) and did not come up. The launch writes one
+/// of these down at the place the failure is made
+/// (`spawn_node_with_lock_retry`'s `engine_failure`); every other way a
+/// start ends writes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineFailure {
+    /// The engine's file could not be run.
+    CouldNotRun,
+    /// Every attempt exited before it answered.
+    ExitedBeforeAnswering,
+    /// It ran through the whole wait without opening its RPC.
+    NeverAnswered,
+    /// The operating system could not load a file the engine needs.
+    FileNotLoaded,
 }
 
-/// Does a node that went silent start again on the default engine? Only when
-/// the run was the swarm engine's (its launch marker is on exactly then), the
-/// engine this app spawned ended badly, and nobody stopped it.
-fn swarm_engine_crash_falls_back(
-    swarm_engine_run: bool,
-    ended_badly: bool,
-    ours: bool,
-    stopped: bool,
+fn note_engine_failure(slot: &std::sync::Mutex<Option<EngineFailure>>, kind: EngineFailure) {
+    if let Ok(mut s) = slot.lock() {
+        *s = Some(kind);
+    }
+}
+
+/// Write `kind` down for a launch that ended in its own sentence `made`.
+/// `ended` is what the read-block recovery made of it
+/// (`after_failed_launch`): when that is another sentence, the start that
+/// failed was the recovery's start from a snapshot and it was rolled back,
+/// which is the chain data's story and not the engine's, and nothing is
+/// written.
+fn engine_did_not_come_up(
+    slot: &std::sync::Mutex<Option<EngineFailure>>,
+    kind: EngineFailure,
+    made: &str,
+    ended: &str,
+) {
+    if made == ended {
+        note_engine_failure(slot, kind);
+    }
+}
+
+/// Does a failed launch send the node back to the default engine? Only when
+/// the swarm engine was the one launched and the launch wrote down that the
+/// engine itself did not come up. Never while the app is quitting (the start
+/// that would follow must not run), and never beside a btxd the graphics
+/// driver will not let go of (nothing can start beside it, on either
+/// engine).
+fn falls_back_from_swarm_engine(
+    swarm_engine_launched: bool,
+    failure: Option<EngineFailure>,
+    quitting: bool,
+    gpu_holds: bool,
 ) -> bool {
-    swarm_engine_run && ended_badly && ours && !stopped
+    swarm_engine_launched && failure.is_some() && !quitting && !gpu_holds
+}
+
+/// What the status refresher knows when a node goes silent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SwarmCrash {
+    /// The run is the swarm engine's: its launch marker is on exactly then.
+    swarm_engine_run: bool,
+    /// The engine this app spawned ended by a signal or a code other than 0.
+    ended_badly: bool,
+    /// This app's own node, not one it attached to.
+    ours: bool,
+    /// A Stop, a restart or a Quit is under way.
+    stopped: bool,
+    /// This run's bad end was judged at an earlier tick.
+    judged: bool,
+    /// How long the run lasted.
+    ran_secs: u64,
+    /// The last counted bad end on record, as a time.
+    earlier_bad_end: Option<u64>,
+    now: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwarmCrashStep {
+    /// Not a bad end of a swarm-engine run, or one already judged, or a run
+    /// that lasted: the node is treated as the default engine's is.
+    Nothing,
+    /// The first early bad end inside the window: write it down, and
+    /// otherwise as `Nothing`.
+    NoteIt,
+    /// The second: hold the swarm engine back and start the node again on
+    /// its usual engine.
+    HoldAndStartAgain,
+}
+
+fn swarm_crash_step(c: &SwarmCrash) -> SwarmCrashStep {
+    use btx_core::swarm::BadEnd;
+    if !(c.swarm_engine_run && c.ended_badly && c.ours) || c.stopped || c.judged {
+        return SwarmCrashStep::Nothing;
+    }
+    match btx_core::swarm::judge_bad_end(c.ran_secs, c.earlier_bad_end, c.now) {
+        BadEnd::NotCounted => SwarmCrashStep::Nothing,
+        BadEnd::First => SwarmCrashStep::NoteIt,
+        BadEnd::Repeat => SwarmCrashStep::HoldAndStartAgain,
+    }
+}
+
+/// Write down the first early bad end of a swarm-engine run, with a line in
+/// setup.log that says what a second one does.
+fn note_swarm_bad_end(datadir: &Path, how: &str) {
+    let kept = btx_core::swarm::note_bad_end(datadir, unix_now_secs());
+    let mut msg = format!(
+        "the swarm engine stopped soon after it started ({how}). One such stop is not held \
+         against it; a second within a day sets it aside and the node goes back to its usual \
+         engine"
+    );
+    if let Err(e) = kept {
+        msg.push_str(&format!(". This could not be written down ({e})"));
+    }
+    eprintln!("[node-app] {msg}");
+    setup_log(datadir, &msg);
+}
+
+/// Does this node sign blocks, for the swarm's rule? Two ways: the app's own
+/// signer switch on a host that checks blocks itself, and a signing key the
+/// app does not manage (`signing_key_the_app_does_not_manage`: one the
+/// operator put in `btx_rw.conf`, or in faststart.conf under another option
+/// name), which signs whatever the switch says. Read from the node folder
+/// every time it is asked.
+fn swarm_signs_in(datadir: &Path, signer_enabled: bool, applies_here: bool) -> bool {
+    (signer_enabled && applies_here) || signing_key_the_app_does_not_manage(datadir)
+}
+
+/// Take the switch for one request: `false` while a download runs, which
+/// refuses the request. One lock, so two requests cannot both pass; and a
+/// request that will download says so here, before its task is spawned, so a
+/// quick on, off, on cannot start two downloads into the same files.
+fn claim_swarm_switch(slot: &std::sync::Mutex<SwarmFetch>, will_fetch: bool) -> bool {
+    let Ok(mut fetch) = slot.lock() else {
+        return false;
+    };
+    if matches!(*fetch, SwarmFetch::Fetching(_)) {
+        return false;
+    }
+    *fetch = if will_fetch {
+        SwarmFetch::Fetching(0)
+    } else {
+        SwarmFetch::Idle
+    };
+    true
+}
+
+/// Does the switch restart a running node? Only when it changes the engine:
+/// on with the node on its usual engine, off with the node on the swarm
+/// engine (`running_on_swarm_engine` is the launch marker). Off on a node
+/// that already runs its usual engine changes nothing that is running.
+fn swarm_switch_needs_restart(on: bool, running_on_swarm_engine: bool) -> bool {
+    on != running_on_swarm_engine
 }
 
 /// Why the swarm engine is held back in this node folder, or `None`. The
@@ -7979,15 +8241,37 @@ fn hold_swarm_engine_back(datadir: &Path, why: &str) {
 }
 
 /// The owner asks for the swarm engine again: the switch in Settings, or a
-/// fresh install of the engine. Nothing else clears the hold.
+/// fresh install of the engine. Nothing else clears the hold, except a
+/// start that finds the failure was not the swarm engine's
+/// (`withdraw_swarm_hold`). The note of one bad end goes with it: the count
+/// starts again.
 fn clear_swarm_hold(datadir: &Path) {
     SWARM_ENGINE_HELD_THIS_RUN.store(false, Ordering::SeqCst);
+    let _ = btx_core::swarm::clear_bad_end(datadir);
     if let Err(e) = btx_core::swarm::clear_engine_hold(datadir) {
         setup_log(
             datadir,
             &format!("the record that holds the swarm engine back could not be removed: {e}"),
         );
     }
+}
+
+/// Take back the hold this start made. The swarm engine did not come up,
+/// was held back, and the default engine then did not start either: whatever
+/// stops both is not the swarm engine's fault, and the owner should not have
+/// to switch the swarm off and on for it. The next start tries the swarm
+/// engine again, and falls back again if it must.
+fn withdraw_swarm_hold(datadir: &Path, error: &str) {
+    SWARM_ENGINE_HELD_THIS_RUN.store(false, Ordering::SeqCst);
+    let msg = match btx_core::swarm::clear_engine_hold(datadir) {
+        Ok(()) => format!(
+            "the node did not start on its usual engine either ({error}), so the swarm engine \
+             is not held back for this; the next start tries it again"
+        ),
+        Err(e) => format!("the record that holds the swarm engine back could not be removed: {e}"),
+    };
+    eprintln!("[node-app] {msg}");
+    setup_log(datadir, &msg);
 }
 
 /// The swarm engine's folder and what is wrong in it, when an install that
@@ -8011,11 +8295,13 @@ fn swarm_damage_line(root: &Path, damage: &btx_core::engine_files::Damage) -> St
     )
 }
 
-/// The swarm engine's folder, if a finished install is in it.
+/// The swarm engine's folder, if a finished install of this build's archive
+/// is in it. An install made from another archive under the same tag is not
+/// one (`btx_core::swarm_engine::installed`).
 fn swarm_engine_installed() -> Option<PathBuf> {
     let pin = swarm_engine_pin()?;
     let root = btx_core::swarm_engine::root(&pin)?;
-    btx_core::swarm_engine::installed(&root).then_some(root)
+    btx_core::swarm_engine::installed(&pin, &root).then_some(root)
 }
 
 /// Why a node that signs may not switch the swarm on.
@@ -8113,12 +8399,13 @@ fn swarm_card(f: &SwarmFacts, seen: Option<btx_core::swarm::Seen>) -> SwarmCard 
     }
 }
 
-/// Whether this node signs for mirrors, as far as is known now: the switch is
-/// on and the host is one that checks blocks itself. Before the first start
-/// of this run the host's role is not decided yet, and a node with the
-/// signing switch on counts as a signer until it is.
-async fn swarm_signs_here(state: &AppState, settings: &NodeAppSettings) -> bool {
-    settings.signer_enabled && *state.signer_applies_here.lock().await != Some(false)
+/// Whether this node signs for mirrors, as far as is known now
+/// (`swarm_signs_in`). Before the first start of this run the host's role is
+/// not decided yet, and a node with the signing switch on counts as a signer
+/// until it is.
+async fn swarm_signs_here(state: &AppState, settings: &NodeAppSettings, datadir: &Path) -> bool {
+    let applies_here = *state.signer_applies_here.lock().await != Some(false);
+    swarm_signs_in(datadir, settings.signer_enabled, applies_here)
 }
 
 fn swarm_fetch_now(state: &AppState) -> SwarmFetch {
@@ -8147,7 +8434,7 @@ pub async fn swarm_status(state: State<'_, AppState>) -> Result<SwarmCard, Strin
     let facts = SwarmFacts {
         linux: cfg!(target_os = "linux"),
         wanted: settings.swarm_enabled,
-        signs_here: swarm_signs_here(&state, &settings).await,
+        signs_here: swarm_signs_here(&state, &settings, &datadir).await,
         fetchable: pin.is_some(),
         engine_installed: swarm_engine_installed().is_some(),
         engine_damaged: swarm_engine_damage().map(|(_, damage)| damage.describe()),
@@ -8213,13 +8500,16 @@ pub async fn set_swarm(
     if on {
         if let Some(refusal) = swarm_on_refusal(
             cfg!(target_os = "linux"),
-            swarm_signs_here(&state, &settings).await,
+            swarm_signs_here(&state, &settings, &datadir).await,
             swarm_engine_pin().is_some() || installed,
         ) {
             return Err(refusal);
         }
     }
-    if matches!(swarm_fetch_now(&state), SwarmFetch::Fetching(_)) {
+    // Claimed here, before the task below is spawned: a second request while
+    // a download runs is refused, and a request that will download is the
+    // download from this line on.
+    if !claim_swarm_switch(&state.swarm_fetch, on && !installed) {
         return Err(
             "The swarm engine is downloading. Change the switch when it has finished.".to_string(),
         );
@@ -8229,23 +8519,33 @@ pub async fn set_swarm(
     // failed be tried again. Off clears the hold too, so "off and on" is the
     // whole of what the card asks for.
     clear_swarm_hold(&datadir);
-    set_swarm_fetch(&state, SwarmFetch::Idle);
     let message = swarm_switch_message(
         on,
         installed,
         swarm_engine_pin()
             .map(|p| p.archive_bytes.div_ceil(1024 * 1024))
             .unwrap_or(0),
+        state.rpc.lock().await.is_some() && btx_core::swarm::wanted(&datadir),
     );
     tauri::async_runtime::spawn(apply_swarm_switch(app, on));
     Ok(message)
 }
 
 /// What the person reads the moment they flip the switch.
-fn swarm_switch_message(on: bool, installed: bool, download_mb: u64) -> String {
+fn swarm_switch_message(
+    on: bool,
+    installed: bool,
+    download_mb: u64,
+    running_on_swarm_engine: bool,
+) -> String {
     if !on {
-        return "Off. Your node restarts on its usual engine. Nothing the swarm wrote is deleted."
-            .to_string();
+        return if running_on_swarm_engine {
+            "Off. Your node restarts on its usual engine. Nothing the swarm wrote is deleted."
+        } else {
+            "Off. Your node is on its usual engine already, so nothing restarts. Nothing the \
+             swarm wrote is deleted."
+        }
+        .to_string();
     }
     let what = "It only observes: your node serves no models, downloads none and earns nothing \
                 yet. It listens on port 29447 and looks for peers on your local network.";
@@ -8263,7 +8563,8 @@ fn swarm_switch_message(on: bool, installed: bool, download_mb: u64) -> String {
 ///
 /// A failed or unverified download leaves the node as it is, on the default
 /// engine, and the card says why. The node is restarted only when one is
-/// running under this app, and a restart that is refused (a start in flight,
+/// running under this app on the other engine than the switch asks for
+/// (`swarm_switch_needs_restart`), and a restart that is refused (a start in flight,
 /// a node this app does not own) is left for the next start: the launch
 /// decides the engine from the setting every time.
 async fn apply_swarm_switch(app: AppHandle, on: bool) {
@@ -8272,6 +8573,7 @@ async fn apply_swarm_switch(app: AppHandle, on: bool) {
     let datadir = node_datadir();
     if on && swarm_engine_installed().is_none() {
         let Some(pin) = swarm_engine_pin() else {
+            set_swarm_fetch(&state, SwarmFetch::Idle);
             return;
         };
         let Some(root) = btx_core::swarm_engine::root(&pin) else {
@@ -8320,8 +8622,18 @@ async fn apply_swarm_switch(app: AppHandle, on: bool) {
             }
         }
     }
+    // The switch claimed the download before this task began
+    // (`claim_swarm_switch`). With nothing to download after all, the claim
+    // ends here; a failed download has already said so.
+    if matches!(swarm_fetch_now(&state), SwarmFetch::Fetching(_)) {
+        set_swarm_fetch(&state, SwarmFetch::Idle);
+    }
     if state.rpc.lock().await.is_none() {
         return; // no node running under this app; the next start follows the setting
+    }
+    // A node already on the engine the switch asks for is left running.
+    if !swarm_switch_needs_restart(on, btx_core::swarm::wanted(&datadir)) {
+        return;
     }
     if let Err(why) = crate::tools::restart_node_for_setting(&app, &state).await {
         setup_log(
@@ -10760,7 +11072,22 @@ mod tests {
     fn the_pinned_engine_launches_with_swapnet_off_and_the_swarm_off() {
         let mut paths = vec![super::nominal_btxd_path()];
         if let Some(dir) = btx_core::installer::install_dir(NODE_RELEASE_TAG) {
-            paths.push(dir.join("bin").join("btxd"));
+            let installed = dir.join("bin").join("btxd");
+            // Asked of the installed engine outright, and not through the
+            // launch that uses the same probe: the engine in this folder is
+            // the release engine, built without the model network, and the
+            // probe must say so. A probe that hit here would pass
+            // `-modelnet=0` to an engine that refuses the argument at init,
+            // on every node.
+            if installed.is_file() {
+                assert!(
+                    !btx_core::swarm::engine_has_model_network(&installed),
+                    "the probe reads {} as an engine with the model network; the \
+                     {NODE_RELEASE_TAG} folder holds the release engine, which has none",
+                    installed.display()
+                );
+            }
+            paths.push(installed);
         }
         for btxd in &paths {
             for backend in [
@@ -10783,22 +11110,16 @@ mod tests {
                      -swapnet=0: {args:?}",
                     btxd.display()
                 );
-                // The swarm is off on this launch (`/dd` carries no marker):
-                // nothing for an engine built without the model network, which
-                // refuses the option at init, and exactly `-modelnet=0` for
-                // one that has it. Asked of the installed engine itself.
-                let expected: Vec<&str> = if btx_core::swarm::engine_has_model_network(btxd) {
-                    vec!["-modelnet=0"]
-                } else {
-                    vec![]
-                };
+                // No model-network argument at all, stated and not derived:
+                // the release engine does not register them and exits at
+                // init on one it does not know.
                 assert_eq!(
                     args.iter()
                         .filter(|a| a.starts_with("-model"))
                         .collect::<Vec<_>>(),
-                    expected,
-                    "{NODE_RELEASE_TAG} at {} on {backend:?} must keep the swarm off and \
-                     name no other model-network option: {args:?}",
+                    Vec::<&String>::new(),
+                    "{NODE_RELEASE_TAG} at {} on {backend:?} must name no model-network \
+                     option: {args:?}",
                     btxd.display()
                 );
                 for kept in ["-autoupdate=0", "-reorgpolicy=legacy", "-parkdeepreorg=0"] {
@@ -13870,11 +14191,12 @@ mod twin_freeze_removal {
 #[cfg(test)]
 mod swarm_tests {
     use super::{
-        clear_swarm_hold, falls_back_from_swarm_engine, hold_swarm_engine_back, swarm_card,
-        swarm_damage_line, swarm_engine_crash_falls_back, swarm_engine_for_launch,
-        swarm_engine_pin, swarm_hold, swarm_on_refusal, swarm_switch_message, update_public_key,
-        update_signature_ok, SwarmFacts, NODE_RELEASE_TAG, STOPPED_WHILE_STARTING,
-        SWARM_ENGINE_FELL_BACK, SWARM_ENGINE_KEY_SUFFIX, SWARM_SIGNER_REFUSAL,
+        claim_swarm_switch, clear_swarm_hold, engine_did_not_come_up, falls_back_from_swarm_engine,
+        hold_swarm_engine_back, swarm_card, swarm_crash_step, swarm_damage_line,
+        swarm_engine_for_launch, swarm_engine_pin, swarm_hold, swarm_on_refusal, swarm_signs_in,
+        swarm_switch_message, swarm_switch_needs_restart, update_public_key, update_signature_ok,
+        AfterPass, EngineFailure, StartPasses, SwarmCrash, SwarmCrashStep, SwarmFacts,
+        NODE_RELEASE_TAG, SWARM_ENGINE_FELL_BACK, SWARM_ENGINE_KEY_SUFFIX, SWARM_SIGNER_REFUSAL,
     };
     use crate::state::SwarmFetch;
     use btx_core::swarm::{Guard, Report, Seen};
@@ -13936,45 +14258,116 @@ mod swarm_tests {
         }
     }
 
-    /// Only a launch of the swarm engine that failed by itself falls back.
+    /// Only a launch of the swarm engine that wrote down that the engine
+    /// itself did not come up falls back. The sentence is never read.
     #[test]
-    fn a_failed_swarm_engine_launch_falls_back_and_nothing_else_does() {
-        let failed = "the node kept exiting right after launch: Error: x. See easybtx-node.log.";
-        assert!(falls_back_from_swarm_engine(true, failed, false));
-        assert!(falls_back_from_swarm_engine(
-            true,
-            "btxd did not open its RPC in 180s",
-            false
-        ));
-        // The default engine was the one launched: its error stands.
-        assert!(!falls_back_from_swarm_engine(false, failed, false));
-        // A Stop or Quit during the start is nobody's failure.
-        assert!(!falls_back_from_swarm_engine(
-            true,
-            STOPPED_WHILE_STARTING,
-            false
-        ));
-        // The read-block recovery took a step: the chain data, not the engine.
-        assert!(!falls_back_from_swarm_engine(
-            true,
-            crate::read_block_recovery::STEP_TAKEN,
-            false
-        ));
-        // A btxd the graphics driver holds: nothing can start beside it.
-        assert!(!falls_back_from_swarm_engine(true, failed, true));
-        // The word the start loop reads is not one a launch can fail with.
-        assert_ne!(SWARM_ENGINE_FELL_BACK, STOPPED_WHILE_STARTING);
-        assert_ne!(
-            SWARM_ENGINE_FELL_BACK,
-            crate::read_block_recovery::STEP_TAKEN
+    fn a_swarm_engine_that_did_not_come_up_falls_back_and_nothing_else_does() {
+        for kind in [
+            EngineFailure::CouldNotRun,
+            EngineFailure::ExitedBeforeAnswering,
+            EngineFailure::NeverAnswered,
+            EngineFailure::FileNotLoaded,
+        ] {
+            assert!(falls_back_from_swarm_engine(true, Some(kind), false, false));
+            // The default engine was the one launched: its error stands.
+            assert!(!falls_back_from_swarm_engine(
+                false,
+                Some(kind),
+                false,
+                false
+            ));
+            // The app is quitting: no second start.
+            assert!(!falls_back_from_swarm_engine(true, Some(kind), true, false));
+            // A btxd the graphics driver holds: nothing can start beside it.
+            assert!(!falls_back_from_swarm_engine(true, Some(kind), false, true));
+        }
+        // Nothing written down: a Quit, a Stop, a snapshot that could not be
+        // set aside, a full disk, the graphics check, a recovery step or
+        // roll-back. None of them is the engine's.
+        assert!(!falls_back_from_swarm_engine(true, None, false, false));
+    }
+
+    /// The kind is written down only while the launch's own sentence is the
+    /// one that ends the start; a roll-back by the read-block recovery puts
+    /// another sentence there, and then nothing is written.
+    #[test]
+    fn a_rolled_back_recovery_start_is_not_written_down_as_the_engines() {
+        let slot = std::sync::Mutex::new(None);
+        engine_did_not_come_up(
+            &slot,
+            EngineFailure::ExitedBeforeAnswering,
+            "the node kept exiting right after launch: x",
+            "Everything was put back. It said: the node kept exiting right after launch: x",
+        );
+        assert_eq!(*slot.lock().unwrap(), None);
+        engine_did_not_come_up(
+            &slot,
+            EngineFailure::ExitedBeforeAnswering,
+            "the node kept exiting right after launch: x",
+            "the node kept exiting right after launch: x",
+        );
+        assert_eq!(
+            *slot.lock().unwrap(),
+            Some(EngineFailure::ExitedBeforeAnswering)
         );
     }
 
-    /// The fallback sits at the one call that runs an engine, holds the
-    /// engine back before the start begins again, and the start loop takes
-    /// that word once.
+    /// Every `Err` the launch can return, and whether it writes a kind down.
+    /// This is the list the fallback is decided from; a new way to fail has
+    /// to be put on it.
     #[test]
-    fn the_fallback_is_at_the_launch_and_begins_the_start_again_once() {
+    fn each_way_the_launch_fails_is_classed_at_the_place_it_is_made() {
+        let src = include_str!("commands.rs");
+        let production = src.split("\nmod swarm_tests {").next().unwrap();
+        let spawn_fn = production
+            .split(concat!("\nasync fn spawn_node_with", "_lock_retry("))
+            .nth(1)
+            .and_then(|s| s.split("\nfn spawn_warmup_watcher(").next())
+            .unwrap();
+        // The engine's: four places, one kind each.
+        for (kind, times) in [
+            ("EngineFailure::CouldNotRun", 1),
+            ("EngineFailure::NeverAnswered", 1),
+            ("EngineFailure::FileNotLoaded", 1),
+            ("EngineFailure::ExitedBeforeAnswering", 1),
+        ] {
+            assert_eq!(spawn_fn.matches(kind).count(), times, "{kind}");
+        }
+        assert_eq!(spawn_fn.matches("engine_did_not_come_up(").count(), 3);
+        assert_eq!(spawn_fn.matches("note_engine_failure(").count(), 1);
+        // A full disk is not "could not be run", and warming through the
+        // whole wait is not "never answered".
+        let could_not = spawn_fn.find("EngineFailure::CouldNotRun").unwrap();
+        assert!(spawn_fn[..could_not].ends_with(
+            "if !matches!(e, AppError::Disk(_)) {\n                    note_engine_failure(engine_failure, "
+        ));
+        let never = spawn_fn.find("EngineFailure::NeverAnswered").unwrap();
+        assert!(spawn_fn[..never]
+            .contains("if !graceful {\n                        engine_did_not_come_up("));
+        // Not the engine's: every other `Err` this function makes. Counted,
+        // so that one added later is looked at.
+        for (text, times) in [
+            ("\"the app is quitting, so the node is not starting\"", 1),
+            ("honour_pending_set_aside(datadir)?", 1),
+            ("\"the node was stopped while it was starting\"", 7),
+            ("return Err(gpu_hung_on_last_attempt(gpu_word));", 1),
+            ("return Err(gpu_holds_node_error(gpu_word));", 1),
+            ("return Err(said);", 1), // the read-block recovery's answer
+        ] {
+            assert_eq!(spawn_fn.matches(text).count(), times, "{text}");
+        }
+        // Together: 11 returns that write nothing and 3 ends in `ended`
+        // (two returns and the function's last line), one `?` on the
+        // set-aside and one on the spawn.
+        assert_eq!(spawn_fn.matches("return Err(").count(), 13);
+        assert_eq!(spawn_fn.matches("Err(ended)").count(), 3);
+        assert_eq!(spawn_fn.matches("?;").count(), 2);
+    }
+
+    /// The fallback sits at the one call that runs an engine and holds the
+    /// engine back before the start begins again.
+    #[test]
+    fn the_fallback_is_at_the_launch() {
         let src = include_str!("commands.rs");
         let production = src.split("\nmod swarm_tests {").next().unwrap();
         let once = production
@@ -13990,26 +14383,299 @@ mod swarm_tests {
             .unwrap();
         assert!(launch < decided && decided < held && held < again);
         assert!(once[decided..held].contains("swarm_root.is_some()"));
-        // The rule is asked in one place.
+        assert!(once[decided..held].contains("state.quitting.load(Ordering::SeqCst)"));
         assert_eq!(
             production.matches("falls_back_from_swarm_engine(").count(),
             2,
             "its definition and the launch"
         );
-        // And the engine decision reads the hold.
+        // The engine decision reads the hold and the folder's signing keys.
         assert!(once.contains("swarm_held.is_some(),"));
-
+        assert!(
+            once.contains("swarm_signs_in(&datadir, settings.signer_enabled, signer_applies_here)")
+        );
+        // And the start loop is the counted one.
         let loop_fn = production
             .split("pub(crate) async fn start_node_held(")
             .nth(1)
             .and_then(|s| s.split("\n}\n").next())
             .unwrap();
-        assert!(loop_fn
-            .contains("Err(e) if e == SWARM_ENGINE_FELL_BACK && !fell_back => fell_back = true,"));
-        // The stop sentence the rule compares with is the one starts return.
-        assert!(production.contains(&format!(
-            "return Err(\"{STOPPED_WHILE_STARTING}\".to_string())"
-        )));
+        assert!(loop_fn.contains("passes.after(start_node_once(app, state).await)"));
+        assert!(loop_fn.contains("withdraw_swarm_hold(&datadir, &error);"));
+    }
+
+    /// One start, run pass by pass the way `start_node_held` runs it, with
+    /// the real launch rule and the real hold file deciding each pass's
+    /// engine. `outcome(engine_is_swarm)` is what a launch on that engine
+    /// does. Returns the engine of each pass and how the start ended.
+    fn run_start(
+        dir: &std::path::Path,
+        mut outcome: impl FnMut(bool) -> Result<(), (Option<EngineFailure>, String)>,
+    ) -> (Vec<&'static str>, AfterPass) {
+        let root = Some(PathBuf::from("/h/.local/btx/x-modelnet/linux-x86_64"));
+        let mut passes = StartPasses::default();
+        let mut engines = Vec::new();
+        loop {
+            let held = btx_core::swarm::engine_held_back(dir).is_some();
+            let swarm = swarm_engine_for_launch(true, true, false, held, root.clone()).is_some();
+            engines.push(if swarm { "swarm" } else { "default" });
+            let result = match outcome(swarm) {
+                Ok(()) => Ok(()),
+                Err((failure, error)) => {
+                    if falls_back_from_swarm_engine(swarm, failure, false, false) {
+                        btx_core::swarm::hold_engine_back(dir, "0.8.1", &error).unwrap();
+                        Err(SWARM_ENGINE_FELL_BACK.to_string())
+                    } else {
+                        Err(error)
+                    }
+                }
+            };
+            match passes.after(result) {
+                AfterPass::Again => assert!(engines.len() < 10, "a start that goes round"),
+                AfterPass::Failed {
+                    error,
+                    withdraw_hold,
+                } => {
+                    if withdraw_hold {
+                        btx_core::swarm::clear_engine_hold(dir).unwrap();
+                    }
+                    return (
+                        engines,
+                        AfterPass::Failed {
+                            error,
+                            withdraw_hold,
+                        },
+                    );
+                }
+                done => return (engines, done),
+            }
+        }
+    }
+
+    fn exited() -> (Option<EngineFailure>, String) {
+        (
+            Some(EngineFailure::ExitedBeforeAnswering),
+            "the node kept exiting right after launch: x".to_string(),
+        )
+    }
+
+    #[test]
+    fn a_start_on_a_broken_swarm_engine_ends_on_the_default_engine_and_stays_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let swarm_is_broken = |swarm: bool| if swarm { Err(exited()) } else { Ok(()) };
+        // This start: the swarm engine, then the default engine, started.
+        assert_eq!(
+            run_start(dir.path(), swarm_is_broken),
+            (vec!["swarm", "default"], AfterPass::Started)
+        );
+        let held = btx_core::swarm::engine_held_back(dir.path()).unwrap();
+        assert_eq!(held.why, "the node kept exiting right after launch: x");
+        // Every later start, a new run of the app included (the file is all
+        // that is read): the default engine, one pass. No going back and forth.
+        for _ in 0..3 {
+            assert_eq!(
+                run_start(dir.path(), swarm_is_broken),
+                (vec!["default"], AfterPass::Started)
+            );
+        }
+        // The owner asks again: the swarm engine is tried once more.
+        clear_swarm_hold(dir.path());
+        assert_eq!(
+            run_start(dir.path(), |_| Ok(())),
+            (vec!["swarm"], AfterPass::Started)
+        );
+        assert_eq!(btx_core::swarm::engine_held_back(dir.path()), None);
+    }
+
+    #[test]
+    fn what_stops_both_engines_is_not_held_against_the_swarm_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        // Both exit: the default engine's error is the one shown, and the
+        // hold made for the swarm engine is taken back.
+        let (engines, ended) = run_start(dir.path(), |swarm| {
+            if swarm {
+                Err(exited())
+            } else {
+                Err((
+                    Some(EngineFailure::ExitedBeforeAnswering),
+                    "the node kept exiting right after launch: the datadir is pruned".into(),
+                ))
+            }
+        });
+        assert_eq!(engines, vec!["swarm", "default"]);
+        assert_eq!(
+            ended,
+            AfterPass::Failed {
+                error: "the node kept exiting right after launch: the datadir is pruned".into(),
+                withdraw_hold: true,
+            }
+        );
+        assert_eq!(btx_core::swarm::engine_held_back(dir.path()), None);
+        // So the next start tries the swarm engine again, and never more
+        // than two passes.
+        assert_eq!(
+            run_start(dir.path(), |_| Ok(())),
+            (vec!["swarm"], AfterPass::Started)
+        );
+    }
+
+    #[test]
+    fn a_failure_that_is_not_the_engines_ends_the_start_on_the_engine_it_ran() {
+        for error in [
+            "the app is quitting, so the node is not starting",
+            "the node was stopped while it was starting",
+            "easyNode could not move a snapshot it did not accept out of the way",
+            "this machine's graphics card did not finish the node engine's start-up check",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (engines, ended) = run_start(dir.path(), |_| Err((None, error.to_string())));
+            assert_eq!(engines, vec!["swarm"], "{error}");
+            assert_eq!(
+                ended,
+                AfterPass::Failed {
+                    error: error.to_string(),
+                    withdraw_hold: false,
+                }
+            );
+            assert_eq!(btx_core::swarm::engine_held_back(dir.path()), None);
+        }
+    }
+
+    #[test]
+    fn the_start_loop_counts_recovery_steps_and_takes_the_fallback_once() {
+        let step = || Err(crate::read_block_recovery::STEP_TAKEN.to_string());
+        let fell = || Err(SWARM_ENGINE_FELL_BACK.to_string());
+        // Two rungs, then started.
+        let mut p = StartPasses::default();
+        assert_eq!(p.after(step()), AfterPass::Again);
+        assert_eq!(p.after(step()), AfterPass::Again);
+        assert_eq!(p.after(Ok(())), AfterPass::Started);
+        // A third rung ends the start.
+        let mut p = StartPasses::default();
+        assert_eq!(p.after(step()), AfterPass::Again);
+        assert_eq!(p.after(step()), AfterPass::Again);
+        let AfterPass::Failed {
+            error,
+            withdraw_hold,
+        } = p.after(step())
+        else {
+            panic!("a third step goes on");
+        };
+        assert!(error.contains("kept stopping on a known engine error"));
+        assert!(!withdraw_hold);
+        // The fallback and the rungs are counted apart: a step on the swarm
+        // engine, the fallback, a step on the default engine, started.
+        let mut p = StartPasses::default();
+        assert_eq!(p.after(step()), AfterPass::Again);
+        assert_eq!(p.after(fell()), AfterPass::Again);
+        assert_eq!(p.after(step()), AfterPass::Again);
+        assert_eq!(p.after(Ok(())), AfterPass::Started);
+        // A second fallback in one start cannot go round: it ends the start
+        // in a sentence, and the hold stays.
+        let mut p = StartPasses::default();
+        assert_eq!(p.after(fell()), AfterPass::Again);
+        let AfterPass::Failed {
+            error,
+            withdraw_hold,
+        } = p.after(fell())
+        else {
+            panic!("a second fallback goes on");
+        };
+        assert_ne!(error, SWARM_ENGINE_FELL_BACK);
+        assert!(error.contains("swarm engine did not start"));
+        assert!(!error.contains("  "), "{error:?}");
+        assert!(!withdraw_hold);
+        // The word is not one a launch can fail with.
+        assert_ne!(
+            SWARM_ENGINE_FELL_BACK,
+            crate::read_block_recovery::STEP_TAKEN
+        );
+    }
+
+    /// The signer rule reads the node folder: a key the operator put in a
+    /// conf signs with the app's own switch off, and every gate refuses.
+    #[test]
+    fn a_signing_key_the_app_does_not_manage_keeps_the_swarm_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = || Some(PathBuf::from("/h/.local/btx/x-modelnet/linux-x86_64"));
+        // The app's switch, on a host that checks blocks.
+        assert!(swarm_signs_in(dir.path(), true, true));
+        assert!(!swarm_signs_in(dir.path(), true, false));
+        assert!(!swarm_signs_in(dir.path(), false, true));
+        assert_eq!(
+            swarm_engine_for_launch(
+                true,
+                true,
+                swarm_signs_in(dir.path(), false, true),
+                false,
+                root()
+            ),
+            root()
+        );
+        let conf = dir.path().join("faststart").join("faststart.conf");
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        for (file, text) in [
+            (
+                dir.path().join("btx_rw.conf"),
+                "matmulattestationsignerkeyfile=operator.key\n",
+            ),
+            (
+                dir.path().join("btx_rw.conf"),
+                "main.matmulattestationsignerkey = L1abc\n",
+            ),
+            (conf.clone(), "matmulattestationsignerpqfile=pq.key\n"),
+            (conf.clone(), "matmulattestationsignerkey=L1abc\n"),
+        ] {
+            std::fs::write(&file, text).unwrap();
+            // The signer switch is off, on a host that checks blocks and on
+            // one whose role is not decided yet: it signs all the same.
+            for applies_here in [true, false] {
+                let signs = swarm_signs_in(dir.path(), false, applies_here);
+                assert!(signs, "{text}");
+                // The launch: the default engine.
+                assert_eq!(
+                    swarm_engine_for_launch(true, true, signs, false, root()),
+                    None,
+                    "{text}"
+                );
+                // The switch: refused, with the signer's reason.
+                assert_eq!(
+                    swarm_on_refusal(true, signs, true).as_deref(),
+                    Some(SWARM_SIGNER_REFUSAL),
+                    "{text}"
+                );
+                // The card: the signer's state.
+                let mut f = facts();
+                f.signs_here = signs;
+                assert_eq!(swarm_card(&f, None).state, "signer", "{text}");
+            }
+            std::fs::remove_file(&file).unwrap();
+            assert!(!swarm_signs_in(dir.path(), false, true));
+        }
+        // The app's own key line, which the start path manages, is the
+        // switch's business and not this rule's.
+        std::fs::write(
+            &conf,
+            "matmulattestationsignerkeyfile=attestation-signer.key\n",
+        )
+        .unwrap();
+        assert!(!swarm_signs_in(dir.path(), false, true));
+
+        // The three gates ask this one function.
+        let src = include_str!("commands.rs");
+        let production = src.split("\nmod swarm_tests {").next().unwrap();
+        assert_eq!(
+            production.matches("swarm_signs_in(").count(),
+            3,
+            "its definition, the launch, and swarm_signs_here"
+        );
+        assert_eq!(
+            production
+                .matches("swarm_signs_here(&state, &settings, &datadir).await")
+                .count(),
+            2,
+            "the card and the switch"
+        );
     }
 
     /// The hold is a file in the node folder, logged, read back with its
@@ -14084,29 +14750,198 @@ mod swarm_tests {
         assert!(installed < cleared && cleared < failed);
     }
 
-    /// A swarm engine that ended badly while running starts the node again
-    /// on the default engine; a clean exit, a stop and another app's node
-    /// do not.
+    fn crash(dir: &std::path::Path, ran_secs: u64, now: u64) -> SwarmCrash {
+        SwarmCrash {
+            swarm_engine_run: true,
+            ended_badly: true,
+            ours: true,
+            stopped: false,
+            judged: false,
+            ran_secs,
+            earlier_bad_end: btx_core::swarm::last_bad_end(dir),
+            now,
+        }
+    }
+
+    /// One bad end of a swarm-engine run is written down and the node is
+    /// left as the default engine's would be; the second inside a day holds
+    /// the engine back and starts the node on the default engine. Run tick
+    /// by tick, with the real record.
     #[test]
-    fn a_swarm_engine_that_ends_badly_while_running_falls_back() {
-        assert!(swarm_engine_crash_falls_back(true, true, true, false));
-        assert!(!swarm_engine_crash_falls_back(false, true, true, false)); // the default engine
-        assert!(!swarm_engine_crash_falls_back(true, false, true, false)); // running, or exit 0
-        assert!(!swarm_engine_crash_falls_back(true, true, false, false)); // not this app's node
-        assert!(!swarm_engine_crash_falls_back(true, true, true, true)); // Stop or Quit
+    fn one_bad_end_is_left_alone_and_the_second_inside_a_day_holds_the_swarm_engine_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = 1_800_000_000;
+        // Run 1 dies two minutes in. First tick: write it down.
+        let first = crash(dir.path(), 120, t0);
+        assert_eq!(swarm_crash_step(&first), SwarmCrashStep::NoteIt);
+        btx_core::swarm::note_bad_end(dir.path(), t0).unwrap();
+        // The next ticks of the same silence do nothing more: no hold from
+        // one death counted twice.
+        let next_tick = SwarmCrash {
+            judged: true,
+            ..crash(dir.path(), 123, t0 + 3)
+        };
+        assert_eq!(swarm_crash_step(&next_tick), SwarmCrashStep::Nothing);
+        assert_eq!(btx_core::swarm::engine_held_back(dir.path()), None);
+        // The next start is the swarm engine's again (nothing is held).
+        let root = Some(PathBuf::from("/h/.local/btx/x-modelnet/linux-x86_64"));
+        assert_eq!(
+            swarm_engine_for_launch(true, true, false, false, root.clone()),
+            root
+        );
+        // Run 2 dies ten minutes later, five minutes in: the engine's.
+        let second = crash(dir.path(), 300, t0 + 600);
+        assert_eq!(swarm_crash_step(&second), SwarmCrashStep::HoldAndStartAgain);
+        // Held: the start that follows is the default engine's, whose marker
+        // is off, so the arm is not taken again however that run ends.
+        let after_hold = SwarmCrash {
+            swarm_engine_run: false,
+            ..crash(dir.path(), 60, t0 + 700)
+        };
+        assert_eq!(swarm_crash_step(&after_hold), SwarmCrashStep::Nothing);
+    }
+
+    #[test]
+    fn a_bad_end_is_counted_only_when_it_is_evidence_against_the_swarm_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = 1_800_000_000;
+        btx_core::swarm::note_bad_end(dir.path(), t0).unwrap();
+        let second = crash(dir.path(), 300, t0 + 600);
+        assert_eq!(swarm_crash_step(&second), SwarmCrashStep::HoldAndStartAgain);
+        for (name, c) in [
+            (
+                "the default engine",
+                SwarmCrash {
+                    swarm_engine_run: false,
+                    ..second.clone()
+                },
+            ),
+            (
+                "still running, or a clean exit",
+                SwarmCrash {
+                    ended_badly: false,
+                    ..second.clone()
+                },
+            ),
+            (
+                "another app's node",
+                SwarmCrash {
+                    ours: false,
+                    ..second.clone()
+                },
+            ),
+            (
+                "a Stop or Quit",
+                SwarmCrash {
+                    stopped: true,
+                    ..second.clone()
+                },
+            ),
+            (
+                "a run that lasted",
+                SwarmCrash {
+                    ran_secs: btx_core::swarm::BAD_END_EARLY_SECS,
+                    ..second.clone()
+                },
+            ),
+        ] {
+            assert_eq!(swarm_crash_step(&c), SwarmCrashStep::Nothing, "{name}");
+        }
+        // The earlier one is more than a day old: a first again.
+        let later = crash(
+            dir.path(),
+            300,
+            t0 + btx_core::swarm::BAD_END_WINDOW_SECS + 1,
+        );
+        assert_eq!(swarm_crash_step(&later), SwarmCrashStep::NoteIt);
+        // The owner's switch starts the count again.
+        clear_swarm_hold(dir.path());
+        assert_eq!(btx_core::swarm::last_bad_end(dir.path()), None);
+    }
+
+    /// Where the refresher asks: after the read-block arm, before the
+    /// "stopped responding" error, and only the hold starts the node.
+    #[test]
+    fn the_refresher_asks_the_crash_rule_before_it_says_stopped_responding() {
         let src = include_str!("commands.rs");
         let refresher = src
             .split("\nfn spawn_status_refresher(")
             .nth(1)
             .and_then(|s| s.split("\n}\n").next())
             .unwrap();
-        let asked = refresher.find("swarm_engine_crash_falls_back(").unwrap();
+        let asked = refresher.find("swarm_crash_step(&SwarmCrash {").unwrap();
+        let noted = refresher.find("note_swarm_bad_end(&dd, &how);").unwrap();
         let held = refresher.find("hold_swarm_engine_back(").unwrap();
         let started = refresher[held..]
             .find("start_node_projected(&app, &state)")
             .unwrap();
         let error = refresher.find("The node stopped responding.").unwrap();
-        assert!(asked < held && held + started < error);
+        assert!(asked < noted && noted < held && held + started < error);
+        assert!(refresher[asked..noted].contains("judged: swarm_bad_end_judged,"));
+        assert!(refresher[noted - 80..noted].contains("swarm_bad_end_judged = true;"));
+        // The first bad end starts nothing.
+        assert!(!refresher[noted..held].contains("start_node_projected("));
+    }
+
+    /// A request while a download runs is refused, and a request that will
+    /// download is the download from the moment it is accepted.
+    #[test]
+    fn the_switch_is_claimed_before_its_work_begins() {
+        let slot = std::sync::Mutex::new(SwarmFetch::Idle);
+        // On, nothing installed: accepted, and downloading at once.
+        assert!(claim_swarm_switch(&slot, true));
+        assert_eq!(*slot.lock().unwrap(), SwarmFetch::Fetching(0));
+        // Off and on again while it runs: both refused, nothing changed.
+        assert!(!claim_swarm_switch(&slot, false));
+        assert!(!claim_swarm_switch(&slot, true));
+        assert_eq!(*slot.lock().unwrap(), SwarmFetch::Fetching(0));
+        *slot.lock().unwrap() = SwarmFetch::Fetching(40);
+        assert!(!claim_swarm_switch(&slot, true));
+        assert_eq!(*slot.lock().unwrap(), SwarmFetch::Fetching(40));
+        // After a failure the switch is free, and a request without a
+        // download clears the failure.
+        *slot.lock().unwrap() = SwarmFetch::Failed("no".into());
+        assert!(claim_swarm_switch(&slot, false));
+        assert_eq!(*slot.lock().unwrap(), SwarmFetch::Idle);
+        // In set_swarm the claim comes before the setting is saved and
+        // before the task is spawned.
+        let src = include_str!("commands.rs");
+        let switch = src
+            .split("\npub async fn set_swarm(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let claim = switch
+            .find("claim_swarm_switch(&state.swarm_fetch, on && !installed)")
+            .unwrap();
+        let saved = switch.find("s.swarm_enabled = on").unwrap();
+        let spawned = switch.find("apply_swarm_switch(app, on)").unwrap();
+        assert!(claim < saved && saved < spawned);
+    }
+
+    /// The switch restarts a running node only when it changes the engine.
+    #[test]
+    fn the_switch_restarts_the_node_only_to_change_its_engine() {
+        assert!(swarm_switch_needs_restart(true, false)); // on, from the usual engine
+        assert!(swarm_switch_needs_restart(false, true)); // off, from the swarm engine
+        assert!(!swarm_switch_needs_restart(false, false)); // off, already on the usual one
+        assert!(!swarm_switch_needs_restart(true, true)); // on, already on the swarm engine
+        let src = include_str!("commands.rs");
+        let apply = src
+            .split("\nasync fn apply_swarm_switch(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let rule = apply
+            .find("swarm_switch_needs_restart(on, btx_core::swarm::wanted(&datadir))")
+            .unwrap();
+        let restart = apply.find("restart_node_for_setting(").unwrap();
+        assert!(rule < restart);
+        let already = swarm_switch_message(false, true, 470, false);
+        assert!(
+            already.contains("nothing restarts") && !already.contains("  "),
+            "{already:?}"
+        );
     }
 
     #[test]
@@ -14348,10 +15183,10 @@ mod swarm_tests {
 
     #[test]
     fn the_switch_says_what_on_means_and_what_happens_next() {
-        let fetch = swarm_switch_message(true, false, 470);
+        let fetch = swarm_switch_message(true, false, 470, false);
         assert!(fetch.contains("about 470 MB"));
         assert!(fetch.contains("keeps running"));
-        let on = swarm_switch_message(true, true, 470);
+        let on = swarm_switch_message(true, true, 470, false);
         assert!(on.contains("restarts on the swarm engine") && !on.contains("Downloading"));
         for m in [&fetch, &on] {
             assert!(m.contains("only observes") && m.contains("earns nothing yet"));
@@ -14361,7 +15196,9 @@ mod swarm_tests {
                 "no runs of spaces from wrapped lines: {m:?}"
             );
         }
-        assert!(swarm_switch_message(false, true, 470).contains("usual engine"));
+        assert!(
+            swarm_switch_message(false, true, 470, true).contains("restarts on its usual engine")
+        );
     }
 
     /// The swarm engine has a folder of its own, and this build's pin, once a

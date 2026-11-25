@@ -59,11 +59,26 @@ pub fn btx_cli_in(root: &Path) -> PathBuf {
     root.join("bin").join(crate::platform::exe_name("btx-cli"))
 }
 
-/// Whether a finished install is in `root`: the list an install wrote is
-/// there and every file on it is there at its size. One `stat` per file.
-pub fn installed(root: &Path) -> bool {
+/// Whether a finished install of THIS pin's archive is in `root`: the list
+/// an install wrote is there, every file on it is there at its size, and the
+/// folder was made from the archive the pin names. One `stat` per file.
+///
+/// The last part is what makes a release that publishes another archive
+/// under the same engine tag fetch it: the folder key is the tag, so without
+/// it the older archive's install would pass for the new one for ever.
+pub fn installed(pin: &EnginePin, root: &Path) -> bool {
     matches!(engine_files::read_manifest(root), Some(list) if list.from_package)
+        && from_this_archive(pin, root)
         && damage(root).is_none()
+}
+
+/// Whether the install in `root` was made from the archive `pin` names. The
+/// install writes the archive's sha256 beside the file list; a folder
+/// without that record was not made by this code and does not count.
+pub fn from_this_archive(pin: &EnginePin, root: &Path) -> bool {
+    std::fs::read_to_string(root.join(engine_files::SOURCE_ARCHIVE_NAME))
+        .map(|recorded| recorded.trim().eq_ignore_ascii_case(pin.sha256.trim()))
+        .unwrap_or(false)
 }
 
 /// What is wrong with an install that was once finished in `root`, or `None`.
@@ -330,6 +345,13 @@ async fn unpack_and_check(pin: &EnginePin, archive: &Path, staging: &Path) -> Re
         .await
         .map_err(|e| format!("checking the swarm engine's version stopped: {e}"))?
         .map_err(|e| format!("The swarm engine did not pass its version check: {e}"))?;
+    // Which archive this folder is, for `installed`. Written before the file
+    // list, so a folder that has the list has this too.
+    std::fs::write(
+        staging.join(engine_files::SOURCE_ARCHIVE_NAME),
+        format!("{}\n", pin.sha256.trim()),
+    )
+    .map_err(|e| format!("write the swarm engine's archive record: {e}"))?;
     engine_files::write_manifest(staging, true, &listing).map_err(|e| e.to_string())
 }
 
@@ -576,7 +598,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(installed(&root));
+        assert!(installed(&pin, &root));
         assert!(crate::swarm::engine_has_model_network(&btxd_in(&root)));
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(btxd_in(&root))
@@ -671,7 +693,7 @@ mod tests {
                 .expect_err(name);
             assert!(err.contains(says), "{name}: {err}");
             assert!(!root.exists(), "{name}");
-            assert!(!installed(&root), "{name}");
+            assert!(!installed(&pin, &root), "{name}");
             assert_eq!(
                 leftovers(root.parent().unwrap()),
                 Vec::<String>::new(),
@@ -738,7 +760,7 @@ mod tests {
         install_from_archive(&pin, &root, &a, "good signature", &yes)
             .await
             .unwrap();
-        assert!(installed(&root));
+        assert!(installed(&pin, &root));
 
         let bad = engine("v0.34.17", true);
         std::fs::write(&a, &bad).unwrap();
@@ -749,12 +771,12 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(installed(&root), "the engine that was there still is");
+        assert!(installed(&pin, &root), "the engine that was there still is");
         assert_eq!(leftovers(root.parent().unwrap()), vec!["plat"]);
 
         // A file gone from an installed engine: no longer a finished install.
         std::fs::remove_file(root.join("bin/btx-modeld")).unwrap();
-        assert!(!installed(&root));
+        assert!(!installed(&pin, &root));
     }
 
     /// A damaged install is told from one never made, names what is wrong,
@@ -772,12 +794,12 @@ mod tests {
         assert_eq!(damage(&root), None);
         std::fs::create_dir_all(&root).unwrap();
         assert_eq!(damage(&root), None);
-        assert!(!installed(&root));
+        assert!(!installed(&pin, &root));
 
         install_from_archive(&pin, &root, &a, "good signature", &yes)
             .await
             .unwrap();
-        assert!(installed(&root));
+        assert!(installed(&pin, &root));
         assert_eq!(damage(&root), None);
 
         // One file gone, one cut off.
@@ -793,7 +815,7 @@ mod tests {
             found.describe(),
             "2 files (bin/btx-modeld, bin/lib/python3.14/os.py)"
         );
-        assert!(!installed(&root));
+        assert!(!installed(&pin, &root));
 
         // The engine itself gone: named once.
         std::fs::remove_file(root.join("bin/btxd")).unwrap();
@@ -808,7 +830,7 @@ mod tests {
         install_from_archive(&pin, &root, &a, "good signature", &yes)
             .await
             .unwrap();
-        assert!(installed(&root));
+        assert!(installed(&pin, &root));
         assert_eq!(damage(&root), None);
         assert!(root.join("bin/btx-modeld").is_file());
         assert_eq!(
@@ -821,7 +843,63 @@ mod tests {
         // installed, not as damaged.
         engine_files::forget_manifest(&root);
         assert_eq!(damage(&root), None);
-        assert!(!installed(&root));
+        assert!(!installed(&pin, &root));
+    }
+
+    /// The same tag, another archive: the install made from the first one is
+    /// not this pin's, is fetched again, and then is.
+    #[tokio::test]
+    async fn an_install_from_another_archive_is_not_this_pins() {
+        let first = engine("v0.34.16", true);
+        // A rebuild under the same tag: one file differs, same layout.
+        let second = tar_gz(&[
+            Item::File("./bin/btxd", btxd_script("v0.34.16", true), 0o755),
+            Item::File("bin/btx-cli", b"#!/bin/sh\n".to_vec(), 0o755),
+            Item::File("bin/btx-modeld", b"HELPER".to_vec(), 0o755),
+            Item::File("bin/lib/python3.14/os.py", b"import sys\n".to_vec(), 0o644),
+            Item::File(".btxd-version", b"v0.34.16\n".to_vec(), 0o644),
+            Item::File("BTXD_MODELNET", b"ON\n".to_vec(), 0o644),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.tar.gz");
+        std::fs::write(&a, &first).unwrap();
+        let pin = pin_for(&first, "");
+        let repin = pin_for(&second, "");
+        assert_eq!(pin.key, repin.key, "the same folder");
+        assert_ne!(pin.sha256, repin.sha256);
+        let root = dir.path().join("btx").join(&pin.key).join("plat");
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+
+        install_from_archive(&pin, &root, &a, "good signature", &yes)
+            .await
+            .unwrap();
+        assert!(installed(&pin, &root));
+        assert!(from_this_archive(&pin, &root));
+        // Whole, and not damaged: only not the archive the new pin names.
+        assert!(!installed(&repin, &root));
+        assert_eq!(damage(&root), None);
+        // The record is not one of the engine's files.
+        let list = engine_files::read_manifest(&root).unwrap();
+        assert!(list
+            .entries
+            .iter()
+            .all(|e| e.rel != engine_files::SOURCE_ARCHIVE_NAME));
+        assert_eq!(list.entries.len() as u64, pin.files);
+
+        std::fs::write(&a, &second).unwrap();
+        install_from_archive(&repin, &root, &a, "good signature", &yes)
+            .await
+            .unwrap();
+        assert!(installed(&repin, &root));
+        assert!(!installed(&pin, &root));
+        assert_eq!(
+            std::fs::read(root.join("bin/btx-modeld")).unwrap(),
+            b"HELPER"
+        );
+
+        // A folder without the record was not made by this code.
+        std::fs::remove_file(root.join(engine_files::SOURCE_ARCHIVE_NAME)).unwrap();
+        assert!(!installed(&repin, &root));
     }
 
     /// Run by hand against the real engine: `EASYNODE_TEST_SWARM_ARCHIVE` is
@@ -845,7 +923,7 @@ mod tests {
             .await
             .unwrap();
         println!("installed in {:?}", started.elapsed());
-        assert!(installed(&root));
+        assert!(installed(&pin, &root));
         assert!(crate::swarm::engine_has_model_network(&btxd_in(&root)));
         assert!(root.join("bin").join("btx-modeld").is_file());
         assert!(root.join("bin").join("btx-guardd").is_file());

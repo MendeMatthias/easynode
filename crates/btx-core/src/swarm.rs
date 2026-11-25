@@ -429,10 +429,150 @@ pub fn clear_engine_hold(datadir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// The file in the node folder that says "a run of the swarm engine ended
+/// badly soon after it started, at this time". One bad end proves nothing
+/// about the engine: a process killed for memory, by hand, by a driver swap
+/// or with its virtual machine dies the same way on the default engine. A
+/// second one inside [`BAD_END_WINDOW_SECS`] is what holds the engine back.
+const BAD_END_MARKER: &str = "easynode-swarm-engine-bad-end";
+
+/// A run that lasted at least this long before it ended badly is not counted:
+/// an engine that ran for hours was working, and what ended it is more
+/// likely outside it.
+pub const BAD_END_EARLY_SECS: u64 = 60 * 60;
+
+/// How long one counted bad end is remembered.
+pub const BAD_END_WINDOW_SECS: u64 = 24 * 60 * 60;
+
+/// What a bad end of a swarm-engine run means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadEnd {
+    /// The run was a long one: nothing is counted.
+    NotCounted,
+    /// The first early bad end inside the window: it is written down, and
+    /// the node is treated as the default engine's would be.
+    First,
+    /// A second one inside the window: the engine is held back.
+    Repeat,
+}
+
+/// `ran_secs` is how long the run lasted, `earlier` the time of the last
+/// counted bad end if one is on record, `now` the time.
+pub fn judge_bad_end(ran_secs: u64, earlier: Option<u64>, now: u64) -> BadEnd {
+    if ran_secs >= BAD_END_EARLY_SECS {
+        return BadEnd::NotCounted;
+    }
+    match earlier {
+        // A time in the future is a clock that moved, not a recent bad end.
+        Some(at) if at <= now && now - at <= BAD_END_WINDOW_SECS => BadEnd::Repeat,
+        _ => BadEnd::First,
+    }
+}
+
+/// The time of the last counted bad end, or `None`.
+pub fn last_bad_end(datadir: &Path) -> Option<u64> {
+    std::fs::read_to_string(datadir.join(BAD_END_MARKER))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+pub fn note_bad_end(datadir: &Path, now: u64) -> std::io::Result<()> {
+    std::fs::write(datadir.join(BAD_END_MARKER), format!("{now}\n"))
+}
+
+pub fn clear_bad_end(datadir: &Path) -> std::io::Result<()> {
+    let path = datadir.join(BAD_END_MARKER);
+    if path.exists() {
+        std::fs::remove_file(&path)
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fake_node::FakeNode;
+
+    /// One bad end is written down, a second inside a day holds, and a long
+    /// run or an old record is not evidence.
+    #[test]
+    fn one_bad_end_is_noted_and_a_second_inside_the_window_holds() {
+        let now = 1_800_000_000;
+        assert_eq!(judge_bad_end(40, None, now), BadEnd::First);
+        assert_eq!(judge_bad_end(40, Some(now - 600), now), BadEnd::Repeat);
+        assert_eq!(
+            judge_bad_end(40, Some(now - BAD_END_WINDOW_SECS), now),
+            BadEnd::Repeat
+        );
+        // The earlier one is older than the window: this is a first again.
+        assert_eq!(
+            judge_bad_end(40, Some(now - BAD_END_WINDOW_SECS - 1), now),
+            BadEnd::First
+        );
+        // A clock that moved back.
+        assert_eq!(judge_bad_end(40, Some(now + 5), now), BadEnd::First);
+        // A run that lasted: not counted, whatever is on record.
+        for earlier in [None, Some(now - 600)] {
+            assert_eq!(
+                judge_bad_end(BAD_END_EARLY_SECS, earlier, now),
+                BadEnd::NotCounted
+            );
+        }
+        assert_eq!(
+            judge_bad_end(BAD_END_EARLY_SECS - 1, Some(now - 600), now),
+            BadEnd::Repeat
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(last_bad_end(dir.path()), None);
+        clear_bad_end(dir.path()).unwrap();
+        note_bad_end(dir.path(), now).unwrap();
+        assert_eq!(last_bad_end(dir.path()), Some(now));
+        // Its own file: neither the switch's marker nor the hold.
+        assert!(!wanted(dir.path()));
+        assert_eq!(engine_held_back(dir.path()), None);
+        clear_bad_end(dir.path()).unwrap();
+        assert_eq!(last_bad_end(dir.path()), None);
+        // A record that does not read is no record.
+        std::fs::write(dir.path().join(BAD_END_MARKER), "soon").unwrap();
+        assert_eq!(last_bad_end(dir.path()), None);
+    }
+
+    /// The probe hits on the one option name, with its dash, and on nothing
+    /// that merely looks like it. A hit on an engine built without the model
+    /// network would pass it an argument it refuses at init.
+    #[test]
+    fn text_that_only_looks_like_the_option_is_not_the_model_network() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, text) in [
+            ("off", "-modelnet=0"),
+            ("on", "-modelnet=1 -modelnet"),
+            ("negated", "nomodelnet -nomodelnet"),
+            ("no dash", "modelnetrequired"),
+            ("other dash", "--modelnet-required _modelnetrequired"),
+            ("upper", "-MODELNETREQUIRED -ModelNetRequired"),
+            ("split", "-modelnet required -modelnet\0required"),
+            ("cut", "-modelnetrequire"),
+            (
+                "others",
+                "-modelhost=0 -modelrelay=0 -modelseed=off -swapnet=0",
+            ),
+            (
+                "help",
+                "Model network options: modelnet, modelnetrequired (see -help)",
+            ),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            assert!(!engine_has_model_network(&path), "{name}: {text}");
+        }
+        let with = dir.path().join("with");
+        std::fs::write(&with, "x-modelnetrequired=<n>").unwrap();
+        assert!(engine_has_model_network(&with));
+    }
 
     /// The hold is a file in the node folder: it is there for the next start
     /// and for the next run of the app, until it is cleared.

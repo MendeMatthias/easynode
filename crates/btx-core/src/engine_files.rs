@@ -60,6 +60,10 @@ const SOURCE_FOLDER: &str = "from folder";
 /// "The engine was copied again in answer to a loader failure", with the
 /// time, in the install folder. See [`answer_loader_failure`].
 pub const COPIED_AGAIN_NAME: &str = ".easynode-engine-copied-again";
+/// "This folder was installed from the archive with this sha256", in the
+/// install folder of an engine that is fetched (`swarm_engine`). Not a file
+/// of the engine, so not on the file list.
+pub const SOURCE_ARCHIVE_NAME: &str = ".easynode-engine-archive";
 /// How long that record holds a second copy back.
 pub const COPIED_AGAIN_HOLD_SECS: u64 = 24 * 60 * 60;
 
@@ -128,6 +132,7 @@ pub fn name_some(files: &[String]) -> String {
 fn is_bookkeeping(name: &str) -> bool {
     name == MANIFEST_NAME
         || name == COPIED_AGAIN_NAME
+        || name == SOURCE_ARCHIVE_NAME
         || (name.starts_with('.') && (name.ends_with(".new") || name.ends_with(".old")))
 }
 

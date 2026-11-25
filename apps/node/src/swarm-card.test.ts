@@ -72,7 +72,12 @@ describe("the Swarm row", () => {
     expect(v.desc).toContain(why);
     expect(v.desc).toContain("still running on its usual engine");
     expect(v.desc).toContain("Switch the swarm off and on to try again");
-    expect(swarmView(card({ wanted: true, state: "engine_missing" })).desc).toContain("runs on its usual engine");
+    // Also what an update to a newer engine leaves: on, and this version's swarm engine not fetched yet.
+    const missing = swarmView(card({ wanted: true, state: "engine_missing" }));
+    expect(missing.attention).toBe(true);
+    expect(missing.desc).toBe(
+      "On, but the swarm engine for this version of the app is not installed, so your node runs on its usual engine. Switch the swarm off and on to fetch it.",
+    );
   });
 
   it("says a swarm engine that failed, why, and that the node runs on its usual engine", () => {

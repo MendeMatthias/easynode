@@ -147,7 +147,7 @@ export function swarmView(c: SwarmCard): SwarmView {
       return {
         ...base,
         attention: true,
-        desc: "On, but the swarm engine is not installed, so your node runs on its usual engine. Switch the swarm off and on to fetch it.",
+        desc: "On, but the swarm engine for this version of the app is not installed, so your node runs on its usual engine. Switch the swarm off and on to fetch it.",
       };
     case "engine_damaged":
       // `why` is the count and the first names: "2 files (bin/a, bin/b)".

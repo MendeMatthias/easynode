@@ -20,7 +20,8 @@ network)", under Helping the network.
   is nothing to switch on.
 - **Not on a node that signs blocks for mirrors, for now.** The switch is
   refused there with the reason: it will be allowed once what the swarm costs
-  a signing node per block has been measured.
+  a signing node per block has been measured. A node whose signing key was
+  put into its configuration by hand counts as one that signs.
 - **It runs on a second node engine, fetched when you switch it on.** Every
   install keeps the engine it has. Switching the swarm on downloads a second
   one that has the model network (about 470 MB), checks it against the
@@ -31,10 +32,12 @@ network)", under Helping the network.
   row says why. Switching the swarm off restarts your node on its usual
   engine.
 - **If the swarm engine fails, your node goes back to its usual engine by
-  itself.** A swarm engine that does not start, or that stops with an error
-  while it runs, is set aside: your node starts again on its usual engine and
-  stays on it, also after the app is closed and opened again. The row says
-  why. Switching the swarm off and on tries the swarm engine again.
+  itself.** A swarm engine that does not come up is set aside in the same
+  start: your node starts on its usual engine and stays on it, also after the
+  app is closed and opened again. The same happens to a swarm engine that
+  stops with an error twice within a day, each time within an hour of
+  starting; one such stop alone is not held against it. The row says why.
+  Switching the swarm off and on tries the swarm engine again.
 - **A damaged swarm engine is said, not hidden.** If files of the swarm
   engine are missing or cut off, the row says how many and names the first
   ones, your node runs on its usual engine, and switching the swarm off and
