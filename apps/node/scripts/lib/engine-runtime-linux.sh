@@ -198,12 +198,16 @@ engine_stage_python() {
     echo "==> Python $ver runtime: taken from the engine artifact, as its build tested it"
     return 0
   fi
-  # A btx build output carries NO run path (upstream's build sets none; run
-  # 45509202706 died on exactly that: "libpython3.14.so.1.0: cannot open shared
-  # object file" from build/bin/btxd on the machine that had just linked it).
-  # So the loader can only answer when the library is on its own search path.
-  # When it is not, ENGINE_PYTHON says which interpreter the build was given,
-  # and that interpreter's lib/ is where the library it links lives.
+  # A 0.34.16 build output cannot find its own libpython. Its run path is
+  # `$ORIGIN/../lib`, the layout of upstream's archive, and next to build/bin
+  # that is a directory of static libraries (read off the binary in run
+  # 45512058871; up to 0.34.15 the run path named the CUDA toolkit directory
+  # instead). Run 45509202706 died on exactly that: "libpython3.14.so.1.0:
+  # cannot open shared object file" from build/bin/btxd, on the machine that
+  # had just linked it. So the loader can only answer here when the library is
+  # on its search path for another reason. When it is not, ENGINE_PYTHON says
+  # which interpreter the build was given, and that interpreter's lib/ is
+  # where the library it links lives.
   if resolved="$(engine_resolve "$btxd" "$soname")"; then
     resolved="$(realpath "$resolved")"
   elif [[ -n "${ENGINE_PYTHON:-}" && -f "$(dirname "$(dirname "$(readlink -f "$ENGINE_PYTHON")")")/lib/$soname" ]]; then
