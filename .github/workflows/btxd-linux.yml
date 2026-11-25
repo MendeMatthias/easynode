@@ -716,6 +716,18 @@ jobs:
             stat -c '%n  %s bytes' "$out/$b" | sed "s|$out/||"
           done
           echo "btxd $(readelf -n "$out/btxd" | sed -n 's/^ *Build ID: /BuildID /p')"
+          if [ "$ENGINE_MODELNET" = on ]; then
+            # Built and NOT shipped, on purpose. The package is btxd, btx-cli,
+            # btx-modeld, btx-guardd and what they load. btx-swarm, btx-swarmd
+            # and btx-paynetd start upstream's Python mesh with THIS runner's
+            # Python path compiled in; the other helpers are not started by
+            # btxd.
+            echo "built and left out of the package:"
+            for b in build/bin/*; do
+              n=$(basename "$b")
+              [ -f "$out/$n" ] || echo "  $n"
+            done
+          fi
           echo "libraries carried in lib/:"
           find "$out/lib" -maxdepth 1 -type f -printf '  %f  %s bytes\n' | sort
           py=$(find "$out/lib" -maxdepth 1 -type d -name 'python3.*' | head -1)
@@ -770,6 +782,52 @@ jobs:
             | xargs -0 sha256sum > SHA256SUMS.txt
           grep -E '  btx[a-z-]*$' SHA256SUMS.txt
           echo "$(wc -l < SHA256SUMS.txt) files listed; digest of the list: $(sha256sum < SHA256SUMS.txt | cut -d' ' -f1)"
+
+      # The ModelNet engine is never inside an installer: an installed app
+      # fetches it when its user switches the swarm on. This is the file it
+      # fetches, with its sha256, its file list in the app's own format and a
+      # description (engine_release_archive says what each one holds). The
+      # archive is unpacked again and THAT copy is started, so the bytes a user
+      # downloads are bytes that ran. Nothing is published here: a release is
+      # made by hand from this artifact, and signed, on the maintainer's
+      # machine.
+      - name: The archive an installed app fetches (ModelNet engine only)
+        if: steps.pin.outputs.modelnet == 'on'
+        env:
+          ENGINE_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          . easynode/apps/node/scripts/lib/engine-runtime-linux.sh
+          ENGINE_SOURCE_DATE_EPOCH="$(git -C btx log -1 --format=%ct)"
+          export ENGINE_SOURCE_DATE_EPOCH
+          engine_release_archive btxd-dist engine-release
+          ls -l engine-release
+          cat engine-release/*.json
+          cat engine-release/*.sha256
+          head -n 6 engine-release/*.files
+          # The same package a second time must give the same archive.
+          engine_release_archive btxd-dist "$RUNNER_TEMP/engine-release-again" >/dev/null
+          cmp engine-release/*.tar.gz "$RUNNER_TEMP"/engine-release-again/*.tar.gz
+          echo "archiving the same package twice gives the same bytes"
+          # How the app tells a ModelNet engine from the default one: it looks
+          # for this option name in btxd (btx_core::swarm). It must be there.
+          n=$(grep -c -a -- '-modelnetrequired' "$ENGINE_ARCHIVE_UNPACKED/bin/btxd" || true)
+          echo "'-modelnetrequired' occurs in $n line(s) of the archived btxd"
+          [ "$n" -ge 1 ] || { echo "::error::the app would not recognise this btxd as a ModelNet engine"; exit 1; }
+          echo "::group::clean start from the unpacked archive: modelnet1"
+          engine_clean_start "$ENGINE_ARCHIVE_UNPACKED/bin" modelnet1
+          echo "::endgroup::"
+
+      - name: Upload the fetchable ModelNet engine
+        if: steps.pin.outputs.modelnet == 'on'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: engine-modelnet-linux-release-${{ steps.pin.outputs.slug }}
+          path: engine-release/*
+          if-no-files-found: error
+          # Already gzip; zipping it again only costs time.
+          compression-level: 0
 
       - name: Upload btxd artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
