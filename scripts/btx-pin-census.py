@@ -26,6 +26,12 @@ What it does, all READ-ONLY:
   5. With --target <tag>: marks each pin as on that tag or not, ends with the
      list of what still has to move, and exits 1 if any hash or commit pin is
      elsewhere. Without --target it only reports.
+  6. With --target it FAILS CLOSED on what it could not read. A pin file that
+     did not read (a private repo without a token, a file that moved) and a
+     repo that is not cloned are named in the closing list and make the exit
+     code 1, like a drifted pin: "nothing listed" must never mean "nothing
+     looked at". --allow-missing accepts repos that are not cloned on this
+     machine (they stay named); nothing accepts an unreadable pin file.
 
 Usage:
   scripts/btx-pin-census.py                    # report
@@ -33,6 +39,10 @@ Usage:
   scripts/btx-pin-census.py --fetch            # git fetch each repo first
   scripts/btx-pin-census.py --target v0.34.16 --repo easynode=.@HEAD
                                                # this checkout's branch, not origin/main
+  scripts/btx-pin-census.py --target v0.34.16 --allow-missing
+                                               # on a machine without every clone
+Exit codes with --target: 0 every pin is on the tag and everything was read;
+1 a pin is elsewhere, or something was not read. The last line says which.
 It never writes to any repo; --fetch only updates remote-tracking refs.
 
 GitHub access: `gh api` when gh is installed. Otherwise curl, with a token
@@ -302,7 +312,29 @@ def norm(v):
     return v.lstrip("v").replace("-rc", "rc")
 
 
+def verdict(target, drift, unreadable, not_cloned, allow_missing):
+    # (exit code, last line) of a --target run. Fails closed: a pin file that
+    # was not read counts like a pin that did not move, and so does a repo
+    # that is not cloned unless --allow-missing was passed.
+    reasons = []
+    if drift:
+        reasons.append(f"{drift} pin(s) not on {target}")
+    if unreadable:
+        reasons.append(f"{unreadable} pin file(s) not read")
+    if not_cloned and not allow_missing:
+        reasons.append(f"{not_cloned} repo(s) not cloned (pass --allow-missing to accept)")
+    if reasons:
+        return 1, f"FAIL (exit 1): {'; '.join(reasons)}."
+    skipped = f" {not_cloned} repo(s) not cloned here were NOT checked." if not_cloned else ""
+    return 0, f"OK (exit 0): everything read is on {target}.{skipped}"
+
+
 def main():
+    # A Windows console is cp1252 by default and prints "…" as a replacement
+    # character, or dies on it when the output is piped.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--target", help="tag every engine pin should be on, e.g. v0.34.16")
     ap.add_argument("--fetch", action="store_true", help="git fetch each repo first")
@@ -310,6 +342,9 @@ def main():
     ap.add_argument("--repo", action="append", default=[], metavar="NAME=PATH[@REF]",
                     help="read this repo from PATH (and REF) instead of $BTX_REPOS/NAME at "
                          "origin/main, e.g. easynode=.@HEAD for the branch checked out here")
+    ap.add_argument("--allow-missing", action="store_true",
+                    help="with --target: do not fail for a repo that is not cloned here "
+                         "(it is still named as not checked)")
     args = ap.parse_args()
     override = dict(r.split("=", 1) for r in args.repo if "=" in r)
 
@@ -366,10 +401,13 @@ def main():
         if vmark:
             print(f"     {vmark}")
 
+    not_cloned = []                # repos with no local clone: nothing in them was checked
+    unreadable = []                # pin files that did not read
     for repo, files in PIN_FILES.items():
         loc, err = local_files(repo, args.fetch, override)
         print(f"== {repo}" + (f"  (skipped: {err})" if err else f"  @ {loc[1]}"))
         if err:
+            not_cloned.append(f"{repo}: {err}")
             continue
         path, ref = loc
         seen = set()
@@ -377,6 +415,7 @@ def main():
             text = show(path, ref, f)
             if text is None:
                 print(f"  {f}: (not on {ref})")
+                unreadable.append(f"{repo}:{f} (not on {ref})")
                 continue
             for ln, line, vers, hexes, unnamed, code in scan_text(text, True, known, prose=f.endswith('.md')):
                 seen.add((f, ln))
@@ -391,7 +430,6 @@ def main():
                        history=bool(COMMENT_RE.match(text)))
         print()
 
-    unreadable = []
     for repo, files in GH_REPOS.items():
         print(f"== {repo}  @ GitHub default branch")
         for f in files:
@@ -409,8 +447,8 @@ def main():
         print()
         return
     print(f"{drift} hash or commit pin(s) not on {args.target}." if drift
-          else f"every hash and commit pin is on {args.target}.")
-    if todo or judge or unreadable:
+          else f"every hash and commit pin that was read is on {args.target}.")
+    if todo or judge or unreadable or not_cloned:
         print(f"\nSTILL TO MOVE to {args.target}")
     for repo in list(PIN_FILES) + list(GH_REPOS):
         if repo not in todo and repo not in judge:
@@ -421,14 +459,20 @@ def main():
         for line in judge.get(repo, []):
             print(f"    version  {line}")
     if unreadable:
-        print("  NOT READ, so not checked (a private repo needs a token; a 404 means the file moved):")
+        print("  NOT READ, so not checked (a private repo needs a token; otherwise the file moved):")
         for f in unreadable:
             print(f"    {f}")
+    if not_cloned:
+        print("  NOT CLONED here, so not checked at all:")
+        for r in not_cloned:
+            print(f"    {r}")
     print("\n`pin` lines are hashes and commits on another release: they are counted, and each one")
     print("has to move. `version` lines are version tokens on code lines of the pin files, for a")
     print("human to judge: a floor like MIN_ENGINE or an example in a test names other versions on")
     print("purpose. Comments and docs are history and are not listed.")
-    sys.exit(1 if drift else 0)
+    code, line = verdict(args.target, drift, len(unreadable), len(not_cloned), args.allow_missing)
+    print("\n" + line)
+    sys.exit(code)
 
 
 if __name__ == "__main__":
