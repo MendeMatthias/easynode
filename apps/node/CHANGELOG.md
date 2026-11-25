@@ -8,6 +8,51 @@ root).
 
 ## [Unreleased]
 
+**A node engine with a file missing is put back, and says which file.** Since
+0.8.0 the engine carries a Python runtime: 776 files on Linux and 191 on
+Windows, where it used to be a handful. If one of them goes missing (antivirus
+software removing `python314.dll` is the usual way), the node could not start,
+every start failed the same way, and all the app said was "the engine printed
+no error line, and it exited with code -1073741515". Four things change:
+
+- When the node is started, the app checks that each engine file is there
+  and has the size it should. That is one look at each file, about a
+  millisecond in all on the project's own Linux node; no file is read. A
+  file that is missing or cut off is copied again from the app's own copy of
+  the engine, and `setup.log` says which. It copies only when no node is
+  running from that folder, and only when the app carries the same build of
+  the engine as the one installed: an engine that is merely another build is
+  left exactly as it is. A file that was already cut off when this version
+  first looked can pass as another build; that case is caught by the next
+  point. On a Mac the check reports and copies nothing yet.
+- If the engine still ends because the system could not load one of its own
+  files, the app copies the engine again once and starts once more. If a
+  start ends the same way after that, it says so, with the file's name where
+  the system gives one and the folder to allow in antivirus software, and
+  does not copy again for a day, or until a start has worked or the app has
+  been updated. Your chain data is not affected by any of this.
+- If the file that could not be loaded is not one of the engine's, nothing
+  is copied. On Linux and macOS the system names the file and the app
+  repeats the name. Windows never names it, so there the app first makes
+  sure the engine's own files are all in place (against its own copy of the
+  engine, for an install this version did not make itself) and only then
+  says that the missing file is one of Windows' own.
+- On Windows a missing engine file can no longer leave the node waiting
+  behind a "the code execution cannot proceed" box that nobody is there to
+  close.
+
+**Installing the engine checks the disk first, and is not repeated.** The app
+now refuses to copy the engine when the disk does not have room for it, with
+the numbers, before it writes anything. And an engine that is already
+installed is no longer copied again: when another app (the easyBTX miner)
+was running the node during an engine update, every start of easyNode copied
+the whole engine again, about 700 MB on Linux since 0.8.0.
+
+**The command window says what `signutxosnapshotmanifest` costs.** It was
+never runnable there and still is not. Its refusal now says why it matters on
+this engine: the command writes out every unspent coin before it signs or
+refuses anything.
+
 ## [0.8.0] - 2026-11-25 · linux + windows (no mac build; the mac stays on the version it has)
 
 **The node engine moves to BTX 0.34.16, upstream's newest final release.
@@ -17,7 +62,12 @@ and your data folder is used as it is. Your node keeps the role it has. It
 still checks blocks itself where its graphics card can, and follows signatures
 where it cannot. It still follows the chain with the most work, and a new node
 still starts from the same places. On the first start after the update the
-app fetches the new engine once, as it did for 0.34.15.
+app copies the new engine out of its own files once, as it did for 0.34.15.
+Nothing is downloaded for it.
+
+**The app is larger.** The engine now carries a Python runtime, which SwapNet
+needs: 776 files on Linux and 191 on Windows. The Linux AppImage is about
+519 MB and the Windows installer about 38 MB.
 
 **What the new engine adds stays switched off.** 0.34.16 comes with SwapNet
 built in, upstream's network for swaps between nodes. It is off unless a node
@@ -41,7 +91,9 @@ add its signature to another operator's statement". It is not counted as a
 failure. The same goes for the signed objection a node could send when its
 own record disagreed with a statement: no node on this engine can send one.
 A wrong statement now stays unconfirmed simply because no second operator
-produces the same one.
+produces the same one. The standalone `btx-confirmer` tool does the same:
+started against a node on this engine it says "this node does not confirm"
+with the reason, and exits.
 
 **Why 0.34.16 and not 0.34.17.** 0.34.17 is a pre-release that upstream has
 replaced several times. easyNode ships engines upstream calls final.

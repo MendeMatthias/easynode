@@ -6,6 +6,77 @@ just the local build, except where it says otherwise.
 
 ---
 
+## Update 2026-11-25 (later): fixes from the audit of 0.8.0, for a 0.8.1
+
+Not released. One pull request (#236) from `claude/0.8.0-audit-fixes`, no
+version bump. What it does is in the changelog under Unreleased; the rules
+are in the module doc of `crates/btx-core/src/engine_files.rs`.
+
+**The rule that matters most, from the review of the first version:** two
+builds of one engine tag are not the same files. linuxdeploy rewrites the
+run path of every ELF it bundles, an engine artifact can be pinned again
+under the same tag, and the easyBTX miner installs its own build into the
+same `~/.local/btx/<tag>/`. So the start-time check never treats a size
+difference against the app's package as damage. It copies a file back only
+when the file is missing or not the size the folder's own list says, the
+package's copy has exactly the listed size, and nothing is running from the
+folder (no holder of the node folder, no RPC answering). Everything else is
+written to `setup.log` and left alone. A whole engine is replaced only by an
+install on a tag change and by the answer to a loader failure.
+
+**Whether a new AppImage's engine equals an installed 0.8.0 one is not
+known and no longer matters.** The 3060's installed engine equals the 0.8.0
+package it was copied from (776 files, all sizes), which says nothing about
+the next build. If the next build differs in size anywhere, an install with
+no list is adopted as "another build": its list is written from the folder
+and nothing is copied.
+
+**Open, for the owner: old engine folders are never removed.** Every engine
+the app ever installed stays under `~/.local/btx/<tag>/`. On the project's
+3060 that was ten folders and 4.4 GB on 2026-11-25 (0.33.3 to 0.34.16; each
+0.34 one is about 580 to 710 MB). Proposed rule, not implemented: when an
+engine update has finished and the new engine is running (the place the
+saved tag moves in `start_node_once`), keep the folder of the pinned tag and
+the folder of the tag the node ran before, and remove the rest. Why it is
+not in the pull request: the folder is shared with the easyBTX miner, so a
+folder easyNode does not use may be the one the miner runs. A safe version
+needs a record of which folders easyNode itself installed (it has none for
+past installs), or a check that no running process was started from the
+folder.
+
+**Open, for the Mac session:** on macOS the start-time check reports and
+copies nothing (`NotCopied::MacOs`). A copy there signs the file again, and
+a cut-off Mach-O is not seen by a size check. Run it on a Mac, then decide.
+The `dyld` line is matched on its documented shape, not on real output. The
+whole-engine copy after a loader failure is the same code as an install and
+is not gated.
+
+**What was run against the real 0.34.16 engine, 2026-11-25:**
+
+- Linux: with `libpython3.14.so.1.0` removed the engine exits 127 with the
+  loader's line; the app's code names the file, puts it back and the engine
+  runs again (`engine_files::tests::a_real_engine_with_a_library_removed_is_put_back`).
+  Removing the `encodings` folder of the Python library does not stop
+  `btxd --version`, so only the start-time check finds that kind of damage.
+- Windows: with `python314.dll` removed and the error mode set, btxd.exe
+  exits with -1073741515 in under a second and prints nothing. With error
+  mode 0, which is what an app started from the desktop has, it had not
+  exited after six seconds: the system's message box. The app's own call was
+  run too (`a_real_windows_engine_with_a_dll_removed_exits_instead_of_waiting`).
+- What the Windows engine loads from outside its own folder, read from the
+  import tables of btxd.exe, btx-cli.exe and python314.dll: only Windows
+  system libraries (kernel32, advapi32, ws2_32, iphlpapi, shell32, msvcrt,
+  bcrypt, version, and the Universal C Runtime's `api-ms-win-crt-*`). The
+  Visual C++ runtime, the GCC runtime and Python are in the package. That is
+  what the "a file of Windows itself" sentence rests on.
+
+**Not tested:** the check and the launch-loop answer inside a running app,
+on any system. Their rules are tested in btx-core, the app's decisions
+(`engine_check_mode`, `engine_check_wanted`) as functions, the wiring by
+reading the source.
+
+---
+
 ## Update 2026-11-25: easyNode 0.8.0 carries BTX 0.34.16 (Linux and Windows)
 
 **The plan** (owner's planning session, 2026-11-25): move the engine from
