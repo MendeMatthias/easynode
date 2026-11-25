@@ -53,9 +53,10 @@ network)", under Helping the network.
   hold, whether the guard program is healthy, and whether your node is looking
   on the local network. No model and no peer is the ordinary case and is
   worded that way, not as a fault.
-- **This version has no swarm engine to fetch yet,** so today the switch is
-  greyed out and says so. It starts working in the release that publishes
-  the engine.
+- **The swarm engine** is the published release `engine-modelnet-v0.34.16`
+  on easyBTX's release page (about 467 MiB to download, 790 MiB installed).
+  The app carries its checksum and checks its signature with the same key
+  that signs app updates.
 - An engine that has the model network but was installed some other way (the
   project's own archive from upstream) is now started with the model network
   off, where it ran by the engine's default before.

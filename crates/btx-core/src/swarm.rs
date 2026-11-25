@@ -1010,6 +1010,21 @@ mod tests {
         assert_eq!(n.methods(), vec!["getmodelnetworkinfo"]);
     }
 
+    /// Prints, one per line, the model-network arguments the app's launch
+    /// gives the btxd in `EASYNODE_TEST_BTXD` for the node folder in
+    /// `EASYNODE_TEST_DATADIR`, as `build_node_command` adds them. For a run
+    /// by hand of the switch's two engines on regtest.
+    #[test]
+    #[ignore = "prints arguments for a run by hand"]
+    fn print_the_model_arguments_for_a_launch() {
+        let btxd = PathBuf::from(std::env::var_os("EASYNODE_TEST_BTXD").unwrap());
+        let dd = PathBuf::from(std::env::var_os("EASYNODE_TEST_DATADIR").unwrap());
+        for a in launch_args(&btxd, &dd) {
+            println!("ARG {a}");
+        }
+        println!("PROBE {}", engine_has_model_network(&btxd));
+    }
+
     /// The same through the launch the app really builds, on every backend.
     #[test]
     fn the_node_launch_carries_the_swarm_flags_and_no_others() {

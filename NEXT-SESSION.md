@@ -23,8 +23,7 @@ Where it is:
   unpack beside the final folder, hold to the pin, one rename into
   `~/.local/btx/<tag>-modelnet/<platform>/`. Never the default engine's
   folder.
-- `apps/node/src-tauri/src/commands.rs`: `SWARM_ENGINE` (the pin, `None`
-  today), `swarm_engine_for_launch`, `set_swarm`, `apply_swarm_switch`,
+- `apps/node/src-tauri/src/commands.rs`: `SWARM_ENGINE_PIN` (compiled in from `apps/node/engine-modelnet-linux.pin`, PR 240's file) and `SWARM_ENGINE_RELEASE` (the published release's address), `swarm_engine_for_launch`, `set_swarm`, `apply_swarm_switch`,
   `swarm_status`, `swarm_card`. The start path picks the engine and writes
   the marker `easynode-swarm-on` together.
 - `apps/node/src/swarm-card.ts`: every sentence of the row and card.
@@ -97,10 +96,12 @@ To make it live, a release has to:
    folders only.
 2. Sign it with the app's update key (`tauri signer sign`), publish the
    signature beside it as `<archive>.sig`.
-3. Fill in `SWARM_ENGINE`: the address, sha256, archive bytes, and the
-   unpacked bytes and file count printed by the ignored test
-   `swarm_engine::tests::the_real_engine_archive_installs_and_these_are_its_pin_numbers`
-   (`EASYNODE_TEST_SWARM_ARCHIVE=<archive>`).
+3. The pin is now read from `apps/node/engine-modelnet-linux.pin` (PR 240
+   owns it; this branch carries an identical copy) and the release address
+   is `SWARM_ENGINE_RELEASE` in `commands.rs`. A new engine build means a
+   new release tag, a new pin, and that constant changed with it; a
+   published archive is never replaced. Done for v0.34.16 on 2026-11-25:
+   release `engine-modelnet-v0.34.16`, id 458120480.
 
 Run on the real engine on 2026-11-25 (CI run 45598950201, artifact
 15015833815, repackaged by hand; `crates/btx-core/tests/fixtures/swarm`):
@@ -591,3 +592,15 @@ preview:states`, then `http://localhost:1440/preview/index.html`.
   publish scripts need `OBSERVER_OVERRIDE=1` after proving "no split, live
   chain" from easybtx.com/api/nodes, both pools, witness-1 and api.btxscan.io.
 - Never re-cut a published version.
+
+Run end to end on 2026-11-25 against the published release (isolated HOME,
+regtest): the app's download from the public address, sha256 and the real
+update key's signature, install, in 124 s; a doctored signature and a
+doctored archive (with a pin made to match it) served locally were both
+refused by the signature check, nothing installed. One node folder started
+on the default engine (no model arguments, `getmodelnetworkinfo` unknown, no
+child, no port), on the downloaded swarm engine with the switch on (the
+observing set, helper READY, follow/seed/relay off), and on the default
+engine again; the swarm engine with the switch off got `-modelnet=0` and ran
+silent. What was NOT run: the app itself switching, restarting and falling
+back (the start path and the refresher), and mainnet.

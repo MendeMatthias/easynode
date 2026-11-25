@@ -40,3 +40,7 @@ tempfile = "3"
 # Tests only: sign a file the way `tauri signer sign` does, to check that the
 # swarm engine download is accepted under the update key and nothing else.
 minisign = "0.7"
+# Tests only: serve the real swarm engine archive with a doctored signature,
+# and hash a doctored copy (swarm_pin_tests). Both already in btx-core's tests.
+mockito = "1"
+sha2 = "0.10"

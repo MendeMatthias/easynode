@@ -7938,13 +7938,21 @@ pub async fn set_signer_publish(state: State<'_, AppState>, on: bool) -> Result<
 /// built WITH the model network, for Linux, installed beside the default
 /// engine and only when the owner switches the swarm on.
 ///
-/// `None` until a release publishes one. A release fills in the address of
-/// the archive (its signature is at that address plus `.sig`, made with the
-/// app's update key), its sha256 and its sizes; the numbers come from
-/// `the_real_engine_archive_installs_and_these_are_its_pin_numbers` in
-/// btx-core, run against the archive that is published. With `None` the
-/// switch says that this version has no swarm engine to fetch.
-const SWARM_ENGINE: Option<SwarmEngineSource> = None;
+/// The numbers are read from `apps/node/engine-modelnet-linux.pin`, the ONE
+/// place they are written (the Linux engine workflow fills it in from a run's
+/// `<archive>.json`, and `scripts/check-modelnet-engine-pin.sh` ties its
+/// commit and version to this app's own engine). The file is compiled in, so
+/// a pin that does not read, or names another engine version than
+/// `NODE_RELEASE_TAG`, leaves this build with nothing to fetch, and the
+/// switch says so.
+const SWARM_ENGINE_PIN: &str = include_str!("../../engine-modelnet-linux.pin");
+
+/// Where the published archive lives. A published archive is never replaced:
+/// a rebuild is a new release tag here and a new pin, so this and the pin
+/// move together. Its signature is at the same address plus `.sig`, made with
+/// the app's update key.
+const SWARM_ENGINE_RELEASE: &str =
+    "https://github.com/MendeMatthias/EasyBTX-releases/releases/download/engine-modelnet-v0.34.16";
 
 /// The folder key of the swarm engine: `~/.local/btx/<this>/<platform>/`,
 /// beside the default engine's `NODE_RELEASE_TAG` folder and never the same.
@@ -7952,24 +7960,50 @@ const SWARM_ENGINE_KEY_SUFFIX: &str = "-modelnet";
 
 use crate::state::SwarmFetch;
 
-struct SwarmEngineSource {
-    url: &'static str,
-    sha256: &'static str,
-    archive_bytes: u64,
-    unpacked_bytes: u64,
-    files: u64,
+/// One `KEY="value"` line of the pin file. The file is read as data, never
+/// run, the same rule its own guard script follows.
+fn pin_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines().find_map(|line| {
+        let line = line.trim();
+        let rest = line.strip_prefix(key)?.strip_prefix('=')?;
+        rest.strip_prefix('"')?.strip_suffix('"')
+    })
+}
+
+/// The pin, read from the pin file's text, or `None` if any value is missing
+/// or does not read, or if it is for another engine version than `version`.
+fn swarm_engine_pin_from(
+    text: &str,
+    release: &str,
+    version: &str,
+) -> Option<btx_core::swarm_engine::EnginePin> {
+    let num = |key: &str| pin_value(text, key)?.parse::<u64>().ok();
+    let pinned_version = pin_value(text, "MODELNET_ENGINE_VERSION")?;
+    if pinned_version != version {
+        return None;
+    }
+    let archive = pin_value(text, "MODELNET_ENGINE_ARCHIVE")?;
+    let sha256 = pin_value(text, "MODELNET_ENGINE_ARCHIVE_SHA256")?;
+    let safe_name = !archive.is_empty()
+        && archive
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    if !safe_name || sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(btx_core::swarm_engine::EnginePin {
+        key: format!("{version}{SWARM_ENGINE_KEY_SUFFIX}"),
+        version: version.to_string(),
+        url: format!("{}/{archive}", release.trim_end_matches('/')),
+        sha256: sha256.to_ascii_lowercase(),
+        archive_bytes: num("MODELNET_ENGINE_ARCHIVE_SIZE").filter(|n| *n > 0)?,
+        unpacked_bytes: num("MODELNET_ENGINE_UNPACKED_SIZE").filter(|n| *n > 0)?,
+        files: num("MODELNET_ENGINE_FILE_COUNT").filter(|n| *n > 0)?,
+    })
 }
 
 fn swarm_engine_pin() -> Option<btx_core::swarm_engine::EnginePin> {
-    SWARM_ENGINE.map(|s| btx_core::swarm_engine::EnginePin {
-        key: format!("{NODE_RELEASE_TAG}{SWARM_ENGINE_KEY_SUFFIX}"),
-        version: NODE_RELEASE_TAG.to_string(),
-        url: s.url.to_string(),
-        sha256: s.sha256.to_string(),
-        archive_bytes: s.archive_bytes,
-        unpacked_bytes: s.unpacked_bytes,
-        files: s.files,
-    })
+    swarm_engine_pin_from(SWARM_ENGINE_PIN, SWARM_ENGINE_RELEASE, NODE_RELEASE_TAG)
 }
 
 /// The app's update key, as the updater plugin is configured with it: the
@@ -14202,6 +14236,12 @@ mod swarm_tests {
     use btx_core::swarm::{Guard, Report, Seen};
     use std::path::PathBuf;
 
+    /// The tests that touch this run's hold flag (`SWARM_ENGINE_HELD_THIS_RUN`, one
+    /// per process) take this first: run in parallel, one cleared the flag
+    /// while another was asserting it, and the hold test failed about half the
+    /// time (measured 2026-11-25 at 55d9819).
+    static HOLD_FLAG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn report() -> Report {
         Report {
             models_held: 0,
@@ -14461,6 +14501,7 @@ mod swarm_tests {
 
     #[test]
     fn a_start_on_a_broken_swarm_engine_ends_on_the_default_engine_and_stays_there() {
+        let _flag = HOLD_FLAG.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let swarm_is_broken = |swarm: bool| if swarm { Err(exited()) } else { Ok(()) };
         // This start: the swarm engine, then the default engine, started.
@@ -14683,6 +14724,7 @@ mod swarm_tests {
     /// touches this run's flag.
     #[test]
     fn a_failed_swarm_engine_is_held_back_in_the_node_folder_until_the_owner_asks_again() {
+        let _flag = HOLD_FLAG.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(swarm_hold(dir.path()), None);
         hold_swarm_engine_back(dir.path(), "it exited with code 1");
@@ -14803,6 +14845,7 @@ mod swarm_tests {
 
     #[test]
     fn a_bad_end_is_counted_only_when_it_is_evidence_against_the_swarm_engine() {
+        let _flag = HOLD_FLAG.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let t0 = 1_800_000_000;
         btx_core::swarm::note_bad_end(dir.path(), t0).unwrap();
@@ -15276,5 +15319,206 @@ mod swarm_tests {
         assert!(production.contains("NodeAppSettings::update(&datadir, |s| s.swarm_enabled = on);"));
         // The marker says "on" exactly when the swarm engine is the one launched.
         assert!(production.contains("btx_core::swarm::set_wanted(&datadir, swarm_root.is_some())"));
+    }
+}
+
+#[cfg(test)]
+mod swarm_pin_tests {
+    use super::{
+        swarm_engine_pin, swarm_engine_pin_from, update_public_key, update_signature_ok,
+        NODE_RELEASE_TAG, SWARM_ENGINE_PIN, SWARM_ENGINE_RELEASE,
+    };
+
+    /// The published archive, as the planning session published it on
+    /// 2026-11-25 (release `engine-modelnet-v0.34.16`, id 458120480). If the
+    /// pin file moves, this moves with it, on purpose: a second place that has
+    /// to be changed by hand is what makes a pin change a decision.
+    #[test]
+    fn this_build_fetches_the_published_swarm_engine() {
+        let pin = swarm_engine_pin().expect("the pin file reads");
+        assert_eq!(pin.version, NODE_RELEASE_TAG);
+        assert_eq!(pin.key, format!("{NODE_RELEASE_TAG}-modelnet"));
+        assert_eq!(
+            pin.url,
+            "https://github.com/MendeMatthias/EasyBTX-releases/releases/download/\
+             engine-modelnet-v0.34.16/easynode-engine-linux-x86_64-modelnet-v0.34.16-074dac16.tar.gz"
+        );
+        assert_eq!(
+            pin.sha256,
+            "4eeec1b9caa9d4c45b632154ec6cbda62b18349a9a13981bd95472afdaee3be2"
+        );
+        assert_eq!(pin.archive_bytes, 489_914_145);
+        assert_eq!(pin.unpacked_bytes, 828_804_903);
+        assert_eq!(pin.files, 779);
+        // The release names the version the pin is for.
+        assert!(SWARM_ENGINE_RELEASE.ends_with(&format!("engine-modelnet-{NODE_RELEASE_TAG}")));
+    }
+
+    #[test]
+    fn a_pin_that_does_not_read_or_is_for_another_version_fetches_nothing() {
+        let good = SWARM_ENGINE_PIN;
+        assert!(swarm_engine_pin_from(good, SWARM_ENGINE_RELEASE, NODE_RELEASE_TAG).is_some());
+        assert!(swarm_engine_pin_from(good, SWARM_ENGINE_RELEASE, "v0.34.17").is_none());
+        for key in [
+            "MODELNET_ENGINE_VERSION",
+            "MODELNET_ENGINE_ARCHIVE",
+            "MODELNET_ENGINE_ARCHIVE_SHA256",
+            "MODELNET_ENGINE_ARCHIVE_SIZE",
+            "MODELNET_ENGINE_UNPACKED_SIZE",
+            "MODELNET_ENGINE_FILE_COUNT",
+        ] {
+            let without: String = good
+                .lines()
+                .filter(|l| !l.trim_start().starts_with(&format!("{key}=")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                swarm_engine_pin_from(&without, SWARM_ENGINE_RELEASE, NODE_RELEASE_TAG).is_none(),
+                "{key}"
+            );
+        }
+        let bad = [
+            (
+                "MODELNET_ENGINE_ARCHIVE_SHA256=\"4eeec1b9",
+                "MODELNET_ENGINE_ARCHIVE_SHA256=\"zzzzc1b9",
+            ),
+            (
+                "MODELNET_ENGINE_ARCHIVE=\"easynode",
+                "MODELNET_ENGINE_ARCHIVE=\"../easynode",
+            ),
+            (
+                "MODELNET_ENGINE_ARCHIVE_SIZE=\"489914145\"",
+                "MODELNET_ENGINE_ARCHIVE_SIZE=\"0\"",
+            ),
+            (
+                "MODELNET_ENGINE_FILE_COUNT=\"779\"",
+                "MODELNET_ENGINE_FILE_COUNT=\"many\"",
+            ),
+        ];
+        for (from, to) in bad {
+            assert!(good.contains(from), "{from}");
+            let changed = good.replace(from, to);
+            assert!(
+                swarm_engine_pin_from(&changed, SWARM_ENGINE_RELEASE, NODE_RELEASE_TAG).is_none(),
+                "{to}"
+            );
+        }
+        // A comment that mentions a key is not the key.
+        assert!(good.lines().any(|l| l.starts_with('#')));
+    }
+
+    fn real_archive() -> Option<std::path::PathBuf> {
+        std::env::var_os("EASYNODE_TEST_SWARM_ARCHIVE").map(Into::into)
+    }
+
+    /// End to end against the internet: the app's own download from the
+    /// published address, the sha256 and the signature checked with the key
+    /// compiled into this app, the install. Into a scratch folder.
+    #[tokio::test]
+    #[ignore = "downloads about 490 MB from the published release"]
+    async fn the_published_swarm_engine_downloads_verifies_and_installs() {
+        let pin = swarm_engine_pin().unwrap();
+        let key = update_public_key().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("btx").join(&pin.key).join("linux-x86_64");
+        let started = std::time::Instant::now();
+        let check = move |file: &std::path::Path, sig: &str| update_signature_ok(&key, file, sig);
+        btx_core::swarm_engine::fetch_and_install(&pin, &root, &check, &|_| {})
+            .await
+            .unwrap();
+        println!(
+            "downloaded, verified and installed in {:?}",
+            started.elapsed()
+        );
+        assert!(btx_core::swarm_engine::installed(&pin, &root));
+        let btxd = btx_core::swarm_engine::btxd_in(&root);
+        assert!(btx_core::swarm::engine_has_model_network(&btxd));
+        if let Some(keep) = std::env::var_os("EASYNODE_TEST_SWARM_KEEP") {
+            let keep = std::path::PathBuf::from(keep);
+            let _ = std::fs::remove_dir_all(&keep);
+            std::fs::create_dir_all(keep.parent().unwrap()).unwrap();
+            std::fs::rename(&root, &keep).unwrap();
+            println!("kept the install in {}", keep.display());
+        }
+    }
+
+    /// The same path against a local server that serves the REAL archive with
+    /// a doctored signature, and a doctored archive with a pin made to match
+    /// it and the REAL signature. Both must install nothing.
+    #[tokio::test]
+    #[ignore = "needs the real archive and its signature: EASYNODE_TEST_SWARM_ARCHIVE"]
+    async fn a_doctored_signature_or_archive_is_refused_with_the_real_key() {
+        use sha2::{Digest, Sha256};
+        let Some(archive) = real_archive() else {
+            return;
+        };
+        let bytes = std::fs::read(&archive).unwrap();
+        let sig = std::fs::read_to_string(format!("{}.sig", archive.display())).unwrap();
+        let key = update_public_key().unwrap();
+        let real_pin = swarm_engine_pin().unwrap();
+
+        // The real signature is good for the real bytes: the control.
+        update_signature_ok(&key, &archive, &sig).expect("the published signature is good");
+
+        // 1. The real archive, a signature with one character changed.
+        let mut doctored_sig = sig.trim().to_string();
+        let i = doctored_sig.len() / 2;
+        let c = doctored_sig.as_bytes()[i];
+        doctored_sig.replace_range(i..i + 1, if c == b'A' { "B" } else { "A" });
+        // 2. One byte of the archive changed, and a pin that names it.
+        let mut doctored = bytes.clone();
+        let at = doctored.len() / 2;
+        doctored[at] ^= 0x01;
+        let doctored_sha: String = Sha256::digest(&doctored)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        for (name, body, signature, sha) in [
+            (
+                "doctored signature",
+                &bytes,
+                doctored_sig.clone(),
+                real_pin.sha256.clone(),
+            ),
+            (
+                "doctored archive with its own pin",
+                &doctored,
+                sig.clone(),
+                doctored_sha,
+            ),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            server
+                .mock("GET", "/e.tar.gz")
+                .with_body(body.clone())
+                .create_async()
+                .await;
+            server
+                .mock("GET", "/e.tar.gz.sig")
+                .with_body(signature)
+                .create_async()
+                .await;
+            let mut pin = real_pin.clone();
+            pin.url = format!("{}/e.tar.gz", server.url());
+            pin.sha256 = sha;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("btx").join(&pin.key).join("linux-x86_64");
+            let key = key.clone();
+            let check = move |file: &std::path::Path, s: &str| update_signature_ok(&key, file, s);
+            let err = btx_core::swarm_engine::fetch_and_install(&pin, &root, &check, &|_| {})
+                .await
+                .expect_err(name);
+            println!("{name}: {err}");
+            assert!(
+                err.contains("not signed by this app's update key"),
+                "{name}: {err}"
+            );
+            assert!(!root.exists(), "{name}");
+            let left: Vec<_> = std::fs::read_dir(root.parent().unwrap())
+                .map(|d| d.flatten().map(|e| e.file_name()).collect())
+                .unwrap_or_default();
+            assert!(left.is_empty(), "{name}: {left:?}");
+        }
     }
 }
