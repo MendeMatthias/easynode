@@ -154,9 +154,29 @@ env:
   # v0.34.15`, SMOKE PASSED, and the artifact carries libcublasLt.so.13.
   # Artifact 394270094 bytes. The install key is plain `v0.34.15`, equal to
   # what the binary reports.
-  PROVEN_BTXD_RUN_ID: "38062016894"
-  PROVEN_BTXD_ARTIFACT: "btxd-linux-476f3f23e15228bb3e6119ed1e139a9b25424ce8"
-  PROVEN_BTXD_COMMIT: "476f3f23e15228bb3e6119ed1e139a9b25424ce8"
+  #
+  # MOVED 2026-11-25 to v0.34.16 = 074dac16, by SHA: upstream moved the tag
+  # v0.34.16 once (from d27530af), so the ref is the commit and never the tag
+  # name (commands.rs has what was read at it). Built with -DWITH_MODELNET=OFF
+  # as before. From this engine on btxd embeds Python for its SwapNet worker,
+  # so the artifact also carries lib/libpython3.14.so.1.0 and lib/python3.14
+  # (CPython 3.14.10 pinned by hash, cryptography 46.0.4, which is the version
+  # upstream tested; btxd-linux.yml has how). Run 45523343898, dispatched on
+  # claude/engine-0.34.16-linux at 765da4a1 for that commit: completed
+  # success, log proved `tree pristine at 074dac16...`, `native model network
+  # ... OFF`, BUILD_GIT_DIRTY 0, architectures present sm_120 sm_75 sm_86
+  # sm_89 in btxd and libbtx_matmul_backend.a, `BTX daemon version v0.34.16`,
+  # SMOKE PASSED, and the artifact carries libcublasLt.so.13 and a Python
+  # runtime of 746 files. Artifact 14981349727, 453712761 bytes. It is the run
+  # AFTER that branch's review fixes: 45515418211 is the run before them and
+  # must not be pinned. The planning session also ran these bytes on the
+  # project's RTX 3060 the same day (every sum in the artifact OK, GPU
+  # qualification ready on sm_86, and as a 0.34.16 mirror on a copy of the
+  # live datadir it followed the 0.34.15 signer block for block). The install
+  # key is plain `v0.34.16`, equal to what the binary reports.
+  PROVEN_BTXD_RUN_ID: "45523343898"
+  PROVEN_BTXD_ARTIFACT: "btxd-linux-074dac167c26c1e091198f691ed5727817dba88a"
+  PROVEN_BTXD_COMMIT: "074dac167c26c1e091198f691ed5727817dba88a"
 
 jobs:
   build-node-linux:

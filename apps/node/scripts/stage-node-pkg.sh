@@ -31,7 +31,7 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="$APP_DIR/src-tauri/resources/node-pkg"
 
-VERSION="0.34.15"
+VERSION="0.34.16"
 # Refuse to stage a version the app will then refuse. See scripts/lib/engine-pin.sh.
 # shellcheck source=lib/engine-pin.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/engine-pin.sh"
@@ -44,17 +44,48 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/release-archive.sh"
 # 0.35 renamed the archive: btx-035-macos-arm64.tar.xz, with SHA384SUMS, and
 # the rc1 Mac btxd's own code signature is INVALID (macOS kills it with
 # SIGKILL until it is re-signed). Move this URL and the digest together.
-TARBALL_URL="https://github.com/btxchain/btx/releases/download/v${VERSION}/btx-${VERSION}-arm64-apple-darwin.tar.gz"
-# Upstream has re-generated release assets in place before, and a silent swap
-# must FAIL here, never ship unnoticed. v0.34.15 publishes NO SHA256SUMS at
-# all; this is GitHub's asset digest for the file, which equals the hash
-# upstream lists on btxchain/btx PR 223. It pins the bytes, not a signature.
+#
+# ⚠ v0.34.16 HAS NO macOS ARCHIVE. Upstream's release carries two Linux
+# archives and SHA256SUMS, nothing for arm64-apple-darwin (GitHub's asset
+# list, read 2026-11-25). The last macOS archive is v0.34.15's, and it must
+# not be staged for an app that pins v0.34.16: the app would refuse it at
+# first run, and node.rs passes this engine a flag (-swapnet=0) that 0.34.15
+# exits on. So both values are EMPTY for this engine and the download branch
+# below refuses in plain words. The Mac engine for v0.34.16 is a source build
+# (.github/workflows/btxd-macos.yml, stage-node-pkg-mac-source.sh).
+#
+# When upstream publishes a macOS archive again, set both together:
+#   TARBALL_URL="https://github.com/btxchain/btx/releases/download/v${VERSION}/btx-${VERSION}-arm64-apple-darwin.tar.gz"
+# and its sha256, compared with GitHub's asset digest. Upstream has
+# re-generated release assets in place before, and a silent swap must FAIL
+# here, never ship unnoticed. It pins the bytes, not a signature.
 # 64 hex = sha256, 96 hex = sha384 (release_archive_verify takes either).
-TARBALL_SHA256="6e1ec111fcfedb6da356e3897d3d224c07396c82b8897a83fdcfa558b781c4a8"
+TARBALL_URL=""
+TARBALL_SHA256=""
 
 SRC="${EASYBTX_NODE_PKG_SRC:-}"
 if [[ -z "$SRC" && -x "$HOME/btx-node-research/btx-$VERSION/bin/btxd" ]]; then
   SRC="$HOME/btx-node-research/btx-$VERSION"
+fi
+if [[ -z "$SRC" && -z "$TARBALL_URL" ]]; then
+  cat >&2 <<EOF
+error: there is no upstream macOS package of BTX v$VERSION to stage.
+
+  Upstream published v$VERSION for Linux only. This script stages upstream's
+  macOS release archive, and for this engine there is none. It does not fall
+  back to an older archive: the app pins v$VERSION and would refuse it.
+
+  On the Mac, the engine for v$VERSION is a source build:
+    - build btxd at the pinned commit (.github/workflows/btxd-macos.yml, or
+      docs/node-release-recipe.md, "Building the Mac engine on a Mac with no
+      Homebrew"), then
+    - stage it with apps/node/scripts/stage-node-pkg-mac-source.sh.
+
+  If you do hold an extracted v$VERSION package in upstream's release layout
+  (bin/ wrappers and libexec/*.real), name it and run this again:
+    EASYBTX_NODE_PKG_SRC=<that directory> apps/node/scripts/stage-node-pkg.sh
+EOF
+  exit 1
 fi
 if [[ -z "$SRC" ]]; then
   # No local package: fetch the pinned release, exactly like the Linux leg.

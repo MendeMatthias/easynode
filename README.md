@@ -274,9 +274,12 @@ engine build also needs Python 3.11 or newer with its development files and
 the `cryptography` and `sqlite3` modules, because SwapNet is compiled in.
 
 The download-based staging scripts (`stage-node-pkg.sh`,
-`stage-node-pkg-linux.sh`) fetch upstream's v0.34.15 archives. That release publishes no
-`SHA256SUMS`, so the scripts pin GitHub's asset digests, which equal the hashes
-upstream lists on its PR 223: bytes rather than a signature. Upstream builds those archives with the model network ON, so
+`stage-node-pkg-linux.sh`) stage upstream's release archive for the pinned
+engine. For v0.34.16 upstream published Linux archives only: the Linux script
+pins the archive's sha256 (its line in upstream's unsigned `SHA256SUMS`, equal
+to GitHub's asset digest: bytes rather than a signature), and the Mac script
+refuses and says that the Mac engine for this version is a source build.
+Upstream builds its archives with the model network ON, so
 the scripts drop its seven helpers (`btx-modeld` and friends) and btxd logs the
 helper as missing and carries on as a monetary node. Upstream's Linux binaries
 need glibc 2.38, so on Linux the contributor path that matters is the source
@@ -284,7 +287,7 @@ path below: build btxd at that commit and stage it with the `-source` script
 for your platform. Those two must agree: the app installs the bundled package
 into a directory named after the key and then checks that the binary reports
 the version the package declares in its `.btxd-version` marker (the version
-part of the key, `v0.34.15`), so a mismatch fails first-run setup rather than
+part of the key, `v0.34.16`), so a mismatch fails first-run setup rather than
 quietly running the wrong engine. The script writes that marker from what it
 actually staged.
 
