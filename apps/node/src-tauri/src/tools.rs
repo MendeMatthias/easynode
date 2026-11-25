@@ -370,6 +370,23 @@ pub async fn tools_restart_node(app: AppHandle, state: State<'_, AppState>) -> R
     restart_node_projected(&app, &state).await
 }
 
+/// The same restart for a setting that needs one (the swarm switch), with the
+/// same three refusals: a restart already running, a start in flight, a node
+/// this app does not own.
+pub(crate) async fn restart_node_for_setting(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+) -> Result<(), String> {
+    let Some(_restarting) = Claim::take(&RESTARTING) else {
+        return Err(ALREADY_RESTARTING.into());
+    };
+    if let Some(sentence) = restart_busy(false, state.start_in_flight.load(Ordering::SeqCst)) {
+        return Err(sentence.into());
+    }
+    destructive_allowed(node_ownership(state, &node_datadir()).await)?;
+    restart_node_projected(app, state).await
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FetchOutcome {
     pub message: String,

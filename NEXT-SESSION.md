@@ -6,6 +6,125 @@ just the local build, except where it says otherwise.
 
 ---
 
+
+## The swarm switch (draft PR 239, 2026-11-25, nothing released)
+
+Owner's rules (2026-11-25): Linux only; two engines, the second one built
+with the model network and fetched only when the swarm is switched on; off by
+default. A node that signs refuses the switch until the cost per block is
+measured.
+
+Where it is:
+
+- `crates/btx-core/src/swarm.rs`: the launch flags, the engine probe (the
+  bytes `-modelnetrequired` in the btxd file), the reader for
+  `getmodelnetworkinfo` + `listmodels` + the guard's file.
+- `crates/btx-core/src/swarm_engine.rs`: download, sha256, signature,
+  unpack beside the final folder, hold to the pin, one rename into
+  `~/.local/btx/<tag>-modelnet/<platform>/`. Never the default engine's
+  folder.
+- `apps/node/src-tauri/src/commands.rs`: `SWARM_ENGINE_PIN` (compiled in from `apps/node/engine-modelnet-linux.pin`, written by the Linux engine workflow since PR 240) and `SWARM_ENGINE_RELEASE` (the published release's address), `swarm_engine_for_launch`, `set_swarm`, `apply_swarm_switch`,
+  `swarm_status`, `swarm_card`. The start path picks the engine and writes
+  the marker `easynode-swarm-on` together.
+- `apps/node/src/swarm-card.ts`: every sentence of the row and card.
+
+When the swarm engine is broken, and the other rules (2026-11-25, same PR):
+
+- Signer rule: `swarm_signs_in` is the one test, asked by the launch, the
+  switch and the card. It is the app's signer switch on a host that checks
+  blocks, OR `signing_key_the_app_does_not_manage` (a key in `btx_rw.conf`,
+  or in faststart.conf under the other option names).
+- A launch of the swarm engine that does not come up holds the engine back
+  and the same start begins again on the default engine, once. It is decided
+  from the kind of failure, which the launch writes down where the failure
+  is made (`EngineFailure`: could not be run, exited before answering, never
+  answered, a file not loaded), never from the sentence. A Quit, a Stop, the
+  set-aside, a full disk, the graphics check, warming through the whole wait
+  and the read-block recovery write nothing down. `StartPasses` counts the
+  passes; if the default engine then fails too, the hold is withdrawn
+  (`withdraw_swarm_hold`), because what stops both is not the swarm engine's.
+- The hold is the file `easynode-swarm-engine-held-back` in the node folder
+  (`btx_core::swarm::hold_engine_back`, `engine_held_back`,
+  `clear_engine_hold`): `app <version>`, then the reason. While it is there
+  `swarm_engine_for_launch` answers the default engine. Only `set_swarm` (on
+  or off) and a fresh install clear it. Card state `engine_start_failed`.
+- A swarm engine that ends badly while running (signal, exit code other than
+  0): one such end within an hour of its start is written to
+  `easynode-swarm-engine-bad-end` and the node is left exactly as the
+  default engine's is ("stopped responding", Start launches the swarm engine
+  again). A second within 24 hours holds the engine back and the node starts
+  again on the default engine (`swarm_crash_step`,
+  `btx_core::swarm::judge_bad_end`). A run that lasted an hour or more is
+  not counted. Nothing here starts the swarm engine again by itself.
+- A damaged install (the list an install wrote is there, files are missing or
+  the wrong size, or `bin/btxd` is gone) is `swarm_engine::damage`. The start
+  writes which files to setup.log and runs the default engine; card state
+  `engine_damaged`; off and on fetches again and `install_from_archive`
+  replaces the folder.
+- An install records its archive's sha256 in `.easynode-engine-archive` in
+  the engine folder, and `swarm_engine::installed(pin, root)` wants it to be
+  the pin's. A release that publishes another archive under the same tag is
+  therefore fetched; the card reads `engine_missing` until then.
+- The switch claims the download before its task is spawned
+  (`claim_swarm_switch`); a request while one runs is refused. It restarts a
+  running node only to change its engine (`swarm_switch_needs_restart`).
+
+Open, on purpose:
+
+- After an update that moves `NODE_RELEASE_TAG`, a switched-on swarm reads
+  `engine_missing` ("the swarm engine for this version of the app is not
+  installed", off and on fetches it). Nothing fetches it by itself: that is
+  half a gigabyte nobody asked for at that moment, again at every start if
+  it fails. The owner decides.
+- Old `<tag>-modelnet` folders in `~/.local/btx/` are not removed (about
+  830 MB each). The default engine's old folders are not removed either.
+- Neither engine is started again by the app after one outside kill; the
+  swarm engine is treated as the default engine is.
+- Not covered: a swarm engine that stays up and misbehaves (helper down, not
+  syncing); one that ends badly only after an hour or more, every time; a
+  folder whose file list was deleted reads as never installed.
+- Not tested: any of this with a real engine or inside a running app. The
+  rules, the pass loop, the crash steps, the files and the replacement are
+  run by tests; that the start path and the refresher call them at the right
+  place is held by source checks.
+
+To make it live, a release has to:
+
+1. Publish the ModelNet engine as a `.tar.gz` in the layout of
+   `resources/node-pkg` (`bin/btxd`, `bin/btx-cli`, `bin/btx-modeld`,
+   `bin/btx-guardd`, `bin/lib/...`, `.btxd-version`), regular files and
+   folders only.
+2. Sign it with the app's update key (`tauri signer sign`), publish the
+   signature beside it as `<archive>.sig`.
+3. The pin is now read from `apps/node/engine-modelnet-linux.pin` (PR 240
+   came with it; this branch does not carry its own copy) and the release address
+   is `SWARM_ENGINE_RELEASE` in `commands.rs`. A new engine build means a
+   new release tag, a new pin, and that constant changed with it; a
+   published archive is never replaced. Done for v0.34.16 on 2026-11-25:
+   release `engine-modelnet-v0.34.16`, id 458120480.
+
+Run on the real engine on 2026-11-25 (CI run 45598950201, artifact
+15015833815, repackaged by hand; `crates/btx-core/tests/fixtures/swarm`):
+
+- The probe finds the option name twice in the ModelNet btxd, never in ten
+  engines without it.
+- The archive (489,913,031 bytes, 779 files, 828,804,903 bytes unpacked)
+  installs through `install_from_archive` in 8.5 s, real `btxd --version`
+  check included.
+- Two regtest nodes with the app's observing flags, pointed at each other
+  with `-modelpeer`: each saw the other 5 s after start. With `-modelnet=0`:
+  no child process, no listening port. Everything stopped with `btx-cli stop`.
+- A btxd given `-modelrpcsocket=<a stand-alone helper's socket>` attaches to
+  that helper (`helper_managed_by_btxd: false`), starts none of its own, and
+  `listmodels` answers from the helper's store. It still starts its own
+  guard and writes `swarm/` and `security/` in its own folder, and it leaves
+  the helper running when it stops.
+
+Not tested: the download and signature against a published archive (there is
+none), the whole switch inside a running app, a restart of the node onto the
+swarm engine on mainnet, a model held on both nodes ("models both hold"),
+LAN discovery between two computers, the cost to a signer.
+
 ## Update 2026-11-25 (later): fixes from the audit of 0.8.0, for a 0.8.1
 
 Not released. One pull request (#236) from `claude/0.8.0-audit-fixes`, no
@@ -473,3 +592,15 @@ preview:states`, then `http://localhost:1440/preview/index.html`.
   publish scripts need `OBSERVER_OVERRIDE=1` after proving "no split, live
   chain" from easybtx.com/api/nodes, both pools, witness-1 and api.btxscan.io.
 - Never re-cut a published version.
+
+Run end to end on 2026-11-25 against the published release (isolated HOME,
+regtest): the app's download from the public address, sha256 and the real
+update key's signature, install, in 124 s; a doctored signature and a
+doctored archive (with a pin made to match it) served locally were both
+refused by the signature check, nothing installed. One node folder started
+on the default engine (no model arguments, `getmodelnetworkinfo` unknown, no
+child, no port), on the downloaded swarm engine with the switch on (the
+observing set, helper READY, follow/seed/relay off), and on the default
+engine again; the swarm engine with the switch off got `-modelnet=0` and ran
+silent. What was NOT run: the app itself switching, restarting and falling
+back (the start path and the refresher), and mainnet.

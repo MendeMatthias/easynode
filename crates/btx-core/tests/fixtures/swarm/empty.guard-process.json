@@ -1,0 +1,1 @@
+{"schema":"BTX/GuardProcess/1","enabled":true,"ready":true,"state":"READY","pid":3948987,"restart_count":0,"error":"","transport":"PRIVATE_INHERITED_STDIO","automatic_spend_atoms":"0","execution_authorized":false,"observed_at_ms":1795608050246,"valid_until_ms":1795608080246,"heartbeat_sequence":1}

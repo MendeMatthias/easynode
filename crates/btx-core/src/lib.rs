@@ -70,6 +70,8 @@ pub mod state_flush;
 pub mod statement_check;
 pub mod stuck_blocks;
 pub mod supply;
+pub mod swarm;
+pub mod swarm_engine;
 pub mod twin_freeze;
 pub mod wallet_format;
 pub mod watchdog;

@@ -8,6 +8,59 @@ root).
 
 ## [Unreleased]
 
+**Swarm (model network): a switch for Linux, off by default, and a card that
+shows what it sees.** BTX's engine can run a "model network": nodes that hold
+AI models find each other. Settings has a new switch for it, "Swarm (model
+network)", under Helping the network.
+
+- **It is off, and no update switches it on.** That holds for a new install
+  and for an existing one. Off means the model network does not run at all:
+  no helper program, no listener, no announcement on your local network.
+- **Linux only for now.** On Windows and on a Mac the row says so and there
+  is nothing to switch on.
+- **Not on a node that signs blocks for mirrors, for now.** The switch is
+  refused there with the reason: it will be allowed once what the swarm costs
+  a signing node per block has been measured. A node whose signing key was
+  put into its configuration by hand counts as one that signs.
+- **It runs on a second node engine, fetched when you switch it on.** Every
+  install keeps the engine it has. Switching the swarm on downloads a second
+  one that has the model network (about 470 MB), checks it against the
+  checksum this version of the app carries and against the app's update
+  signature, installs it in a folder of its own beside the usual engine and
+  restarts your node on it. If the download fails or does not pass a check,
+  nothing is installed, your node keeps running on its usual engine and the
+  row says why. Switching the swarm off restarts your node on its usual
+  engine.
+- **If the swarm engine fails, your node goes back to its usual engine by
+  itself.** A swarm engine that does not come up is set aside in the same
+  start: your node starts on its usual engine and stays on it, also after the
+  app is closed and opened again. The same happens to a swarm engine that
+  stops with an error twice within a day, each time within an hour of
+  starting; one such stop alone is not held against it. The row says why.
+  Switching the swarm off and on tries the swarm engine again.
+- **A damaged swarm engine is said, not hidden.** If files of the swarm
+  engine are missing or cut off, the row says how many and names the first
+  ones, your node runs on its usual engine, and switching the swarm off and
+  on fetches the engine again.
+- **On means observing only.** Your node listens on port 29447, which other
+  computers can reach, looks for other nodes on your local network, and shows
+  what it finds. It serves no model files, downloads none (the engine's own
+  default would download free models other nodes announce; the app switches
+  that off by name), and earns nothing yet. The row says all of this before
+  you switch it on, and stops saying "observing only" if a later engine ever
+  reports more than that.
+- **The card** shows models held, peers seen, the models you and a peer both
+  hold, whether the guard program is healthy, and whether your node is looking
+  on the local network. No model and no peer is the ordinary case and is
+  worded that way, not as a fault.
+- **The swarm engine** is the published release `engine-modelnet-v0.34.16`
+  on easyBTX's release page (about 467 MiB to download, 790 MiB installed).
+  The app carries its checksum and checks its signature with the same key
+  that signs app updates.
+- An engine that has the model network but was installed some other way (the
+  project's own archive from upstream) is now started with the model network
+  off, where it ran by the engine's default before.
+
 ## [0.8.1] - 2026-11-25 · linux + windows (no mac build; the mac stays on the version it has)
 
 **A node engine with a file missing is put back, and says which file.** Since

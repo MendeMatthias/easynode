@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "coverage": "incomplete",
+  "local_count": 0,
+  "models": [
+  ],
+  "next_actions": [
+    "getmodeltransfers",
+    "searchmodels {\"scope\":\"LOCAL\"}",
+    "automatic_spend_atoms stays 0"
+  ],
+  "automatic_spend_atoms": 0
+}
