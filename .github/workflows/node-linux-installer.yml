@@ -588,3 +588,38 @@ jobs:
           fi
           [ "$rc" -eq 0 ] || exit 1
           echo "bundled btxd + vendored libs GLIBC floor OK ($seen file(s), <= $CEIL)"
+
+      # The path-contract gate above runs `btxd --version` out of both bundles.
+      # That proves the two binaries and their libraries survived packaging. It
+      # does not touch the Python runtime the package carries from 0.34.16 on,
+      # and by now linuxdeploy has rewritten the run path of every ELF it found
+      # under usr/lib, the package's included. So start both bundled packages
+      # the way the engine build started the artifact: in a plain ubuntu:22.04
+      # container, read-only, with an empty environment and no Python there
+      # (engine_clean_start has the details). An engine without Python is
+      # started once, plain.
+      #
+      # After the upload for the same reason as the glibc gate: a registry that
+      # will not serve the image must not cost the bundles.
+      - name: Start both bundled packages on a clean Ubuntu 22.04
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          . apps/node/scripts/lib/engine-runtime-linux.sh
+          product=$(jq -r .productName apps/node/src-tauri/tauri.conf.json)
+          for tree in "/tmp/debx/usr/lib/$product/resources/node-pkg/bin" \
+                      "/tmp/appx/squashfs-root/usr/lib/$product/resources/node-pkg/bin"; do
+            [ -x "$tree/btxd" ] || { echo "::error::no bundled btxd at $tree"; exit 1; }
+            if [ -n "$(engine_python_soname "$tree/btxd")" ]; then
+              modes="swapnet0 swapnet1"
+            else
+              # Before 0.34.16 there is no -swapnet option.
+              modes="plain"
+            fi
+            for mode in $modes; do
+              echo "::group::clean start ($mode): $tree"
+              engine_clean_start "$tree" "$mode"
+              echo "::endgroup::"
+            done
+          done
+          echo "both bundled packages start on a clean Ubuntu 22.04"
