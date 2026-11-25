@@ -23,7 +23,7 @@ Where it is:
   unpack beside the final folder, hold to the pin, one rename into
   `~/.local/btx/<tag>-modelnet/<platform>/`. Never the default engine's
   folder.
-- `apps/node/src-tauri/src/commands.rs`: `SWARM_ENGINE_PIN` (compiled in from `apps/node/engine-modelnet-linux.pin`, PR 240's file) and `SWARM_ENGINE_RELEASE` (the published release's address), `swarm_engine_for_launch`, `set_swarm`, `apply_swarm_switch`,
+- `apps/node/src-tauri/src/commands.rs`: `SWARM_ENGINE_PIN` (compiled in from `apps/node/engine-modelnet-linux.pin`, written by the Linux engine workflow since PR 240) and `SWARM_ENGINE_RELEASE` (the published release's address), `swarm_engine_for_launch`, `set_swarm`, `apply_swarm_switch`,
   `swarm_status`, `swarm_card`. The start path picks the engine and writes
   the marker `easynode-swarm-on` together.
 - `apps/node/src/swarm-card.ts`: every sentence of the row and card.
@@ -97,7 +97,7 @@ To make it live, a release has to:
 2. Sign it with the app's update key (`tauri signer sign`), publish the
    signature beside it as `<archive>.sig`.
 3. The pin is now read from `apps/node/engine-modelnet-linux.pin` (PR 240
-   owns it; this branch carries an identical copy) and the release address
+   came with it; this branch does not carry its own copy) and the release address
    is `SWARM_ENGINE_RELEASE` in `commands.rs`. A new engine build means a
    new release tag, a new pin, and that constant changed with it; a
    published archive is never replaced. Done for v0.34.16 on 2026-11-25:
