@@ -1097,14 +1097,19 @@ pub fn build_node_command(
     // refuse an unknown argument at init, and the app launches the previous
     // engine when provisioning a new one fails.
     //
-    // NOT passed, on any engine: `-modelnet`. The release engine is built with
-    // -DWITH_MODELNET=OFF, which leaves `-modelnet` unregistered (init.cpp:652,
-    // inside `#ifdef ENABLE_MODELNET`), so `-modelnet=0` is a fatal unknown
-    // argument there. `the_pinned_engine_launches_with_swapnet_off_and_no_model_flag`
-    // in the app holds both halves.
     if node_has_swapnet(btxd) {
         args.push("-swapnet=0".to_string());
     }
+    // The model network ("the swarm"), which has no version to gate on: an
+    // engine built with -DWITH_MODELNET=OFF leaves `-modelnet` unregistered
+    // (init.cpp:652, inside `#ifdef ENABLE_MODELNET`) and refuses it as an
+    // unknown argument, and an engine of the same version built with it on
+    // defaults it to 1. So `crate::swarm` reads the engine itself: nothing for
+    // an engine without it, `-modelnet=0` for one that has it, and the
+    // observing-only set when the owner switched the swarm on.
+    // `the_pinned_engine_launches_with_swapnet_off_and_the_swarm_off` in the
+    // app holds this for the release engine.
+    args.extend(crate::swarm::launch_args(btxd, datadir));
     // ── MatMul v4.7 / RC ExactReplay (BTX v0.33.2, mainnet block 185,000) ──────
     // The fork replaces the proof of work with an "RC episode" that block
     // VALIDATION must recompute. btxd's own default for `-matmulrcexecution`

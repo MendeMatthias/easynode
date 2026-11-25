@@ -494,13 +494,14 @@ Full recipe: `docs/node-release-recipe.md`. Release state: `NEXT-SESSION.md`.
 5. Flags: keep `-reorgpolicy=legacy`, `-parkdeepreorg=0` and `-autoupdate=0`, and from 0.34.16
    `-swapnet=0` (`node_has_swapnet` in `node.rs`). The tests
    `the_pinned_engine_launches_with_its_self_updater_off` and
-   `the_pinned_engine_launches_with_swapnet_off_and_no_model_flag` fail the build if the install
+   `the_pinned_engine_launches_with_swapnet_off_and_the_swarm_off` fail the build if the install
    key stops yielding `-autoupdate=0`, `-matmulrcexecution`, the network-rules floor or
-   `-swapnet=0`, or if a launch names a `-model*` option. Check every flag the app passes and
+   `-swapnet=0`, or if a launch names a `-model*` option other than the swarm's own (`btx_core::swarm`). Check every flag the app passes and
    every conf key it writes against the `AddArg` sites of the new tag (an unknown one is fatal),
    and read the diff of `src/init.cpp` for arguments that BECAME fatal. Also check `ps` on a real
    install once.
-   Never pass `-modelnet=0` to this Modelnet-off build.
+   Never pass `-modelnet=0` to this Modelnet-off build. The app does not: `btx_core::swarm` reads
+   the engine binary and names a model-network option only to an engine that registers it.
 6. Staging scripts in `apps/node/scripts/`: `stage-node-pkg.sh`, `stage-node-pkg-linux.sh`,
    the `-source` variants and `stage-node-pkg-windows.ps1`. Update VERSION, the URL pattern and the
    sum type from the release itself (0.34.16: the 0.34 names, `.tar.gz`, SHA256SUMS, Linux only;

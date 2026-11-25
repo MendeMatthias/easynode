@@ -440,7 +440,7 @@ use crate::state::{
 //   1 on 0.34.17. crates/btx-core/src/node.rs passes `-swapnet=0` to every
 //   engine at 0.34.16 or newer, gated on the tag in the install path because
 //   0.34.15 refuses the unknown argument.
-//   `the_pinned_engine_launches_with_swapnet_off_and_no_model_flag` holds it.
+//   `the_pinned_engine_launches_with_swapnet_off_and_the_swarm_off` holds it.
 // * Two arguments became fatal: an unknown `-resourcegovernor` value
 //   (and so `-noresourcegovernor`), and `-v2pqonly` without v2 transport. The
 //   app passes neither, and passes `-v2transport=1`.
@@ -1793,6 +1793,25 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
         setup_log(
             &datadir,
             "fresh datadir: the first header sync uses the curated block sources only",
+        );
+    }
+
+    // The swarm's marker follows the setting on every start, for the same
+    // reason as the one above: the spawn below reads it
+    // (`btx_core::swarm::launch_args`). The setting is the truth; a marker
+    // left by hand or by another version lasts until here.
+    if let Err(e) = btx_core::swarm::set_wanted(&datadir, settings.swarm_enabled) {
+        setup_log(
+            &datadir,
+            &format!(
+                "the swarm setting is {} and its marker could not be {}: {e}",
+                if settings.swarm_enabled { "on" } else { "off" },
+                if settings.swarm_enabled {
+                    "written, so the swarm stays off on this start"
+                } else {
+                    "removed, so the swarm may still start"
+                },
+            ),
         );
     }
 
@@ -7661,6 +7680,158 @@ pub async fn set_signer_publish(state: State<'_, AppState>, on: bool) -> Result<
     )
 }
 
+/// What the Swarm card shows (`btx_core::swarm`). `state` is one word the
+/// window turns into a sentence (`src/swarm-card.ts`); `report` is there only
+/// while the swarm is reporting.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SwarmCard {
+    /// The saved switch.
+    pub wanted: bool,
+    /// This node signs for mirrors, so the card says the swarm stays off
+    /// there unless switched on.
+    pub signs_here: bool,
+    pub state: &'static str,
+    pub why: String,
+    pub report: Option<btx_core::swarm::Report>,
+}
+
+/// The card, from the switch and what the node said. `seen` is `None` while
+/// no node runs; then, and only then, `engine_has_it` (read from the installed
+/// engine's file) decides between "no model network" and "off".
+///
+/// The switch applies at a node start, so the switch and the running node can
+/// disagree for a while, and the card says which way.
+fn swarm_card(
+    wanted: bool,
+    signs_here: bool,
+    engine_has_it: bool,
+    seen: Option<btx_core::swarm::Seen>,
+) -> SwarmCard {
+    use btx_core::swarm::Seen;
+    let (state, why, report) = match seen {
+        None if !engine_has_it => ("no_model_network", String::new(), None),
+        None if wanted => ("node_stopped", String::new(), None),
+        None => ("off", String::new(), None),
+        Some(Seen::NoModelNetwork) => ("no_model_network", String::new(), None),
+        Some(Seen::Off) if wanted => ("starts_next_start", String::new(), None),
+        Some(Seen::Off) => ("off", String::new(), None),
+        Some(Seen::HelperDown { .. } | Seen::Observing(_) | Seen::Unreadable { .. }) if !wanted => {
+            ("stops_next_start", String::new(), None)
+        }
+        Some(Seen::HelperDown { why }) => ("helper_down", why, None),
+        Some(Seen::Observing(report)) => ("observing", String::new(), Some(report)),
+        Some(Seen::Unreadable { why }) => ("unreadable", why, None),
+        Some(Seen::Unreachable { why }) if wanted => ("unreachable", why, None),
+        Some(Seen::Unreachable { .. }) => ("off", String::new(), None),
+    };
+    SwarmCard {
+        wanted,
+        signs_here,
+        state,
+        why,
+        report,
+    }
+}
+
+/// Whether the engine this app would launch has the model network, for the
+/// card while no node runs. Reads the engine file once per engine key: it is
+/// some 75 MB, and a key names one build until the app restarts.
+fn installed_engine_has_model_network(datadir: &Path, settings: &NodeAppSettings) -> bool {
+    static PROBED: std::sync::Mutex<Option<(String, bool)>> = std::sync::Mutex::new(None);
+    let tag = settings
+        .btx_release_tag
+        .clone()
+        .unwrap_or_else(|| NODE_RELEASE_TAG.to_string());
+    if let Ok(probed) = PROBED.lock() {
+        if let Some((key, has)) = probed.as_ref() {
+            if *key == tag {
+                return *has;
+            }
+        }
+    }
+    let Some(paths) = returning_launch_paths(datadir, &tag) else {
+        return false; // nothing installed yet; not remembered
+    };
+    let has = btx_core::swarm::engine_has_model_network(&paths.btxd);
+    if let Ok(mut probed) = PROBED.lock() {
+        *probed = Some((tag, has));
+    }
+    has
+}
+
+/// The Swarm card. Two read-only questions to a running node
+/// (`getmodelnetworkinfo`, and `listmodels` only while the swarm reports) and
+/// one small file; nothing is asked of a node that is not running.
+#[tauri::command]
+pub async fn swarm_status(state: State<'_, AppState>) -> Result<SwarmCard, String> {
+    let datadir = node_datadir();
+    let settings = NodeAppSettings::load(&datadir);
+    let signs_here =
+        settings.signer_enabled && *state.signer_applies_here.lock().await == Some(true);
+    // A clone, so the shared handle is not held across the round-trip.
+    let rpc = state.rpc.lock().await.clone();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let (seen, engine_has_it) = match rpc {
+        Some(rpc) => (
+            Some(btx_core::swarm::read(&rpc, &datadir, now_ms).await),
+            false,
+        ),
+        None => (
+            None,
+            installed_engine_has_model_network(&datadir, &settings),
+        ),
+    };
+    Ok(swarm_card(
+        settings.swarm_enabled,
+        signs_here,
+        engine_has_it,
+        seen,
+    ))
+}
+
+/// Settings: the swarm (`swarm_enabled`). The ONE place the setting is turned
+/// on. Saves the choice and brings the launch marker in line now, so any
+/// start from here on follows it; the engine reads the flags at its start, so
+/// a change applies on the next one, which the message says.
+#[tauri::command]
+pub async fn set_swarm(state: State<'_, AppState>, on: bool) -> Result<String, String> {
+    let datadir = node_datadir();
+    NodeAppSettings::update(&datadir, |s| s.swarm_enabled = on);
+    if datadir.is_dir() {
+        btx_core::swarm::set_wanted(&datadir, on).map_err(|e| {
+            format!(
+                "Saved, but the node folder would not take the change ({e}). It is applied \
+                 again at the next node start."
+            )
+        })?;
+    }
+    let settings = NodeAppSettings::load(&datadir);
+    let signs_here =
+        settings.signer_enabled && *state.signer_applies_here.lock().await == Some(true);
+    Ok(swarm_switch_message(on, signs_here))
+}
+
+/// What the person reads the moment they flip the switch.
+fn swarm_switch_message(on: bool, signs_here: bool) -> String {
+    if !on {
+        return "Off at the next node start. Nothing the swarm wrote is deleted.".to_string();
+    }
+    let mut msg = "On at the next node start. It only observes: your node serves no models, \
+                   downloads none and earns nothing yet. It listens on port 29447 and looks for \
+                   peers on your local network."
+        .to_string();
+    if signs_here {
+        msg.push_str(
+            " This node signs blocks for mirrors; the swarm will share the computer with that \
+             work.",
+        );
+    }
+    msg
+}
+
 /// Settings: be counted in the network's stats (`stats_share_enabled`).
 ///
 /// Turning it off stops these check-ins at the next cycle. What was already
@@ -10083,7 +10254,7 @@ mod tests {
     /// tag in the install path, so this asks the launch itself, with this
     /// build's key in both the nominal path and the real install-dir shape.
     #[test]
-    fn the_pinned_engine_launches_with_swapnet_off_and_no_model_flag() {
+    fn the_pinned_engine_launches_with_swapnet_off_and_the_swarm_off() {
         let mut paths = vec![super::nominal_btxd_path()];
         if let Some(dir) = btx_core::installer::install_dir(NODE_RELEASE_TAG) {
             paths.push(dir.join("bin").join("btxd"));
@@ -10109,10 +10280,22 @@ mod tests {
                      -swapnet=0: {args:?}",
                     btxd.display()
                 );
-                assert!(
-                    !args.iter().any(|a| a.starts_with("-model")),
-                    "{NODE_RELEASE_TAG} at {} on {backend:?} names a model-network option, \
-                     which a -DWITH_MODELNET=OFF engine refuses at init: {args:?}",
+                // The swarm is off on this launch (`/dd` carries no marker):
+                // nothing for an engine built without the model network, which
+                // refuses the option at init, and exactly `-modelnet=0` for
+                // one that has it. Asked of the installed engine itself.
+                let expected: Vec<&str> = if btx_core::swarm::engine_has_model_network(btxd) {
+                    vec!["-modelnet=0"]
+                } else {
+                    vec![]
+                };
+                assert_eq!(
+                    args.iter()
+                        .filter(|a| a.starts_with("-model"))
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "{NODE_RELEASE_TAG} at {} on {backend:?} must keep the swarm off and \
+                     name no other model-network option: {args:?}",
                     btxd.display()
                 );
                 for kept in ["-autoupdate=0", "-reorgpolicy=legacy", "-parkdeepreorg=0"] {
@@ -13177,6 +13360,127 @@ mod twin_freeze_removal {
             btx_core::twin_freeze::engine_needs_it(super::NODE_RELEASE_TAG),
             "{} is pinned: remove btx_core::twin_freeze and its wiring",
             super::NODE_RELEASE_TAG
+        );
+    }
+}
+
+#[cfg(test)]
+mod swarm_tests {
+    use super::{swarm_card, swarm_switch_message};
+    use btx_core::swarm::{Guard, Report, Seen};
+
+    fn report() -> Report {
+        Report {
+            models_held: 0,
+            peers_seen: 0,
+            shared_families: vec![],
+            lan_discovery: true,
+            lan_error: String::new(),
+            guard: Guard::Ready,
+            observing_only: true,
+        }
+    }
+
+    /// Every pairing of the switch with what the node said, and the one word
+    /// the window gets for it.
+    #[test]
+    fn the_card_states_follow_the_switch_and_the_node() {
+        let down = || Seen::HelperDown { why: "gone".into() };
+        let odd = || Seen::Unreadable { why: "v2".into() };
+        let quiet = || Seen::Unreachable {
+            why: "timeout".into(),
+        };
+        for (wanted, engine_has_it, seen, state) in [
+            // No node running: the installed engine's file decides.
+            (false, false, None, "no_model_network"),
+            (true, false, None, "no_model_network"),
+            (false, true, None, "off"),
+            (true, true, None, "node_stopped"),
+            // A running node answers for itself.
+            (false, true, Some(Seen::NoModelNetwork), "no_model_network"),
+            (true, true, Some(Seen::NoModelNetwork), "no_model_network"),
+            (false, false, Some(Seen::Off), "off"),
+            (true, false, Some(Seen::Off), "starts_next_start"),
+            (true, false, Some(Seen::Observing(report())), "observing"),
+            (
+                false,
+                false,
+                Some(Seen::Observing(report())),
+                "stops_next_start",
+            ),
+            (true, false, Some(down()), "helper_down"),
+            (false, false, Some(down()), "stops_next_start"),
+            (true, false, Some(odd()), "unreadable"),
+            (false, false, Some(odd()), "stops_next_start"),
+            (true, false, Some(quiet()), "unreachable"),
+            (false, false, Some(quiet()), "off"),
+        ] {
+            let card = swarm_card(wanted, false, engine_has_it, seen.clone());
+            assert_eq!(card.state, state, "wanted={wanted} seen={seen:?}");
+            assert_eq!(card.wanted, wanted);
+            assert_eq!(
+                card.report.is_some(),
+                state == "observing",
+                "a report only while observing: {seen:?}"
+            );
+        }
+        let card = swarm_card(true, true, false, Some(down()));
+        assert!(card.signs_here);
+        assert_eq!(card.why, "gone");
+    }
+
+    /// The shape the window reads (`src/swarm-card.ts`).
+    #[test]
+    fn the_card_serializes_in_the_shape_the_window_reads() {
+        let mut r = report();
+        r.guard = Guard::NotReady {
+            why: "BACKOFF".into(),
+        };
+        let v =
+            serde_json::to_value(swarm_card(true, true, false, Some(Seen::Observing(r)))).unwrap();
+        assert_eq!(v["wanted"], true);
+        assert_eq!(v["signs_here"], true);
+        assert_eq!(v["state"], "observing");
+        assert_eq!(v["report"]["models_held"], 0);
+        assert_eq!(v["report"]["observing_only"], true);
+        assert_eq!(v["report"]["guard"]["state"], "not_ready");
+        assert_eq!(v["report"]["guard"]["why"], "BACKOFF");
+        let v = serde_json::to_value(swarm_card(false, false, true, None)).unwrap();
+        assert!(v["report"].is_null());
+        assert_eq!(
+            serde_json::to_value(Guard::Ready).unwrap()["state"],
+            "ready"
+        );
+    }
+
+    #[test]
+    fn the_switch_says_what_on_means_and_tells_a_signer() {
+        let on = swarm_switch_message(true, false);
+        assert!(on.contains("only observes") && on.contains("earns nothing yet"));
+        assert!(on.contains("29447"), "the listener is not a surprise: {on}");
+        assert!(!on.contains("signs"));
+        assert!(swarm_switch_message(true, true).contains("signs blocks for mirrors"));
+        assert!(swarm_switch_message(false, true).starts_with("Off at the next node start"));
+        assert!(
+            !on.contains("  "),
+            "no runs of spaces from wrapped lines: {on:?}"
+        );
+    }
+
+    /// The setting is turned on in exactly one place, the Settings switch, and
+    /// the start path only copies it to the launch marker.
+    #[test]
+    fn only_the_switch_turns_the_swarm_on() {
+        let src = include_str!("commands.rs");
+        let production = src.split("\nmod swarm_tests {").next().unwrap();
+        assert_eq!(
+            production.matches("s.swarm_enabled = ").count(),
+            1,
+            "one assignment, in set_swarm"
+        );
+        assert!(production.contains("NodeAppSettings::update(&datadir, |s| s.swarm_enabled = on);"));
+        assert!(
+            production.contains("btx_core::swarm::set_wanted(&datadir, settings.swarm_enabled)")
         );
     }
 }

@@ -241,6 +241,22 @@ pub struct NodeAppSettings {
     /// already sends these numbers with it, so it is counted either way.
     #[serde(default)]
     pub stats_share_enabled: bool,
+    /// The swarm, BTX's model network (`btx_core::swarm`): run the engine's
+    /// model network, observing only.
+    ///
+    /// OFF, for a new install and an existing one alike, and the one feature
+    /// the owner's "everything on" rule of 2026-10-12 does not reach. It opens
+    /// a listener on port 29447 and announces the node on the local network,
+    /// it starts two more programs beside the node, and it does not help the
+    /// chain; that is a thing a person switches on, not a thing an update
+    /// does to them. NO MIGRATION MAY TURN IT ON: the only assignment of
+    /// `true` is the Settings switch (`commands::set_swarm`), and
+    /// `no_migration_turns_the_swarm_on` runs every migration over files
+    /// that never had the key and holds that it stays `false`. A node that
+    /// signs for mirrors is covered by the same rule: it stays off there
+    /// unless its owner switches it on.
+    #[serde(default)]
+    pub swarm_enabled: bool,
     /// Write a local `service-report.json` next to the datadir every few
     /// minutes: uptime, heights, peers, bytes served, archive-peer summary,
     /// stall verdict. LOCAL FILE ONLY — nothing phones home; this is the
@@ -399,6 +415,8 @@ impl Default for NodeAppSettings {
             signer_publish_enabled: true,
             // Off, new installs included. See the field.
             stats_share_enabled: false,
+            // Off, new installs included, and never migrated. See the field.
+            swarm_enabled: false,
             service_report_enabled: true,
             node_profile: default_profile(),
             // No nickname. Anything else would publish an identifier the user
@@ -1298,6 +1316,45 @@ mod tests {
         assert!(!NodeAppSettings::migrate_features_on(dir.path()));
         let s = NodeAppSettings::load(dir.path());
         assert!(!s.wallet_enabled && s.welcome_shown);
+    }
+
+    /// The swarm is off for a new install, off for a file from before the
+    /// field, and still off after every migration has run over files that
+    /// never had the key: the ones that turn "never chose" into "on" for the
+    /// other features.
+    #[test]
+    fn no_migration_turns_the_swarm_on() {
+        assert!(!NodeAppSettings::default().swarm_enabled);
+        for old in [
+            r#"{"setup_complete":true}"#,
+            r#"{"setup_complete":true,"welcome_shown":true,"contribution_migrated":true,
+               "signer_migrated":true,"wallet_enabled":false,"txindex_enabled":false,
+               "esplora_enabled":false,"snapshot_serve_enabled":false}"#,
+            r#"{"setup_complete":true,"signer_enabled":true,"attestation_serve_enabled":true}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(SETTINGS_FILE_NAME), old).unwrap();
+            assert!(!NodeAppSettings::load(dir.path()).swarm_enabled, "{old}");
+            NodeAppSettings::migrate_contributions(dir.path());
+            NodeAppSettings::migrate_signer(dir.path(), true);
+            NodeAppSettings::migrate_features_on(dir.path());
+            assert!(!NodeAppSettings::load(dir.path()).swarm_enabled, "{old}");
+        }
+        // A choice survives them too.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE_NAME),
+            r#"{"setup_complete":true,"swarm_enabled":true}"#,
+        )
+        .unwrap();
+        NodeAppSettings::migrate_contributions(dir.path());
+        NodeAppSettings::migrate_signer(dir.path(), true);
+        NodeAppSettings::migrate_features_on(dir.path());
+        assert!(NodeAppSettings::load(dir.path()).swarm_enabled);
+        // And nothing in this file sets it: the switch is in commands.rs.
+        let src = include_str!("state.rs");
+        let assignment = concat!("swarm_enabled", " = true");
+        assert!(!src.contains(assignment));
     }
 
     #[test]

@@ -55,6 +55,12 @@ pub(crate) struct NodeState {
     /// What `getpeerinfo` answers. Empty by default, so the keeper's bounce
     /// of the mirror links does not wait for sockets that are not there.
     pub peers: Vec<Value>,
+    /// What `getmodelnetworkinfo` answers. `None` is an engine built without
+    /// the model network: it does not know the command (JSON-RPC -32601),
+    /// nor `listmodels`.
+    pub modelnet: Option<Value>,
+    /// What `listmodels` answers as `models`, on an engine that has them.
+    pub models: Value,
 }
 
 impl NodeState {
@@ -148,6 +154,8 @@ impl FakeNode {
                 dump: None,
                 offering: None,
                 peers: Vec::new(),
+                modelnet: None,
+                models: json!([]),
             }),
             calls: Mutex::new(Vec::new()),
         }
@@ -338,6 +346,14 @@ impl Rpc for FakeNode {
             })),
             "getpeerinfo" => Ok(Value::Array(s.peers.clone())),
             "disconnectnode" | "addnode" => Ok(Value::Null),
+            "getmodelnetworkinfo" => s
+                .modelnet
+                .clone()
+                .ok_or_else(|| rpc_err(-32601, "Method not found")),
+            "listmodels" => match s.modelnet {
+                Some(_) => Ok(json!({ "models": s.models.clone() })),
+                None => Err(rpc_err(-32601, "Method not found")),
+            },
             other => panic!("the fake node was asked {other}, which it does not script"),
         }
     }

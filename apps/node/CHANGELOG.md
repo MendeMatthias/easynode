@@ -8,6 +8,32 @@ root).
 
 ## [Unreleased]
 
+**Swarm (model network): a switch, off by default, and a card that shows what
+it sees.** BTX's engine can run a "model network": nodes that hold AI models
+find each other. Settings has a new switch for it, "Swarm (model network)",
+under Helping the network.
+
+- **It is off, and no update switches it on.** That holds for a new install,
+  for an existing one, and for a node that signs blocks for mirrors. Off means
+  the engine's model network does not run at all: no helper program, no
+  listener, no announcement on your local network.
+- **On means observing only.** Your node listens on port 29447, looks for
+  other nodes on your local network, and shows what it finds. It serves no
+  model files, downloads none (the engine's own default would download free
+  models other nodes announce; the app switches that off by name), and earns
+  nothing yet. The card says so, and stops saying so if a later engine ever
+  reports more than that.
+- **The card** shows models held, peers seen, the models you and a peer both
+  hold, whether the guard program is healthy, and whether your node is looking
+  on the local network. No model and no peer is the ordinary case and is
+  worded that way, not as a fault.
+- **It needs an engine that has the model network.** The engine this version
+  ships does not (it is built without it), so today the switch is greyed out
+  and says why. The app reads this from the engine itself, not from its
+  version number, and names a model-network option only to an engine that
+  knows it.
+- A change applies the next time the node starts.
+
 ## [0.8.1] - 2026-11-25 · linux + windows (no mac build; the mac stays on the version it has)
 
 **A node engine with a file missing is put back, and says which file.** Since

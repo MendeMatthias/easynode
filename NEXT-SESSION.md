@@ -6,6 +6,40 @@ just the local build, except where it says otherwise.
 
 ---
 
+
+## The swarm switch (draft PR, 2026-11-25, nothing released)
+
+`crates/btx-core/src/swarm.rs` is the whole rule; the app side is
+`set_swarm`, `swarm_status` and `swarm_card` in `commands.rs`, the row and
+card are `apps/node/src/swarm-card.ts`.
+
+What it does:
+
+- Setting `swarm_enabled`, off, never migrated (`no_migration_turns_the_swarm_on`).
+- The setting is copied to a marker file in the node folder
+  (`easynode-swarm-on`) at every start; the launch reads the marker.
+- The launch reads the ENGINE FILE for the option name `-modelnetrequired`
+  to decide whether it has the model network. Nothing for an engine without
+  it, `-modelnet=0` for one with it, and when switched on
+  `-modelnet=1 -modelhost=0 -modelrelay=0 -modelfollowpeers=0
+  -modelpreserverare=0 -modelseed=off`. Bind, LAN discovery and storage are
+  left to the engine's defaults and the owner's conf, on purpose; the
+  reasons are on `OBSERVING`.
+- Guard health is read from `<datadir>/modelnet/swarm/guard-process.json`.
+  No command returns it (checked at 074dac16).
+
+Not tested, because no engine with the model network was on this box:
+
+- The engine probe against a real model-network btxd (it was run against ten
+  engines without it: 0 hits each; `-swapnet` is found the same way in the
+  0.34.16 engine, 6 hits, and not in 0.34.15).
+- A real `getmodelnetworkinfo` answer. The fake node's answers were written
+  from helper.cpp:5605, :6881 and rpc/modelnet.cpp:92, :213.
+- Whether the first listen on 29447 raises a Windows Firewall question.
+- What observing costs a signer per block.
+
+Open decisions for the owner are in the PR description.
+
 ## Update 2026-11-25 (later): fixes from the audit of 0.8.0, for a 0.8.1
 
 Not released. One pull request (#236) from `claude/0.8.0-audit-fixes`, no

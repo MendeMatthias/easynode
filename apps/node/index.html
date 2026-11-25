@@ -570,6 +570,23 @@
               <span class="slider"></span>
             </label>
           </div>
+
+          <!-- The swarm, BTX's model network (btx_core::swarm). Off unless
+               switched on here, on every install, and observing only. The
+               card under the row is what the engine itself reports; an empty
+               one is the ordinary case and is worded as such. -->
+          <div class="setting-row">
+            <div class="setting-text">
+              <span class="setting-name">Swarm (model network)</span>
+              <span class="setting-desc" id="swarm-desc">Join BTX's model network: your node finds other nodes that hold AI models and shows what it sees. It only observes. It serves nothing, downloads nothing and earns nothing yet. Off unless you switch it on. Applies on next start</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="swarm-toggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <ul class="swarm-card" id="swarm-card" hidden></ul>
+          <p class="setting-result" id="swarm-result" hidden></p>
           </section>
 
           <details class="settings-group settings-group-fold">

@@ -57,6 +57,7 @@ import {
 } from "./update-check";
 import { contributionView } from "./contribution";
 import { explorerRow } from "./feature-rows";
+import { type SwarmCard, swarmView } from "./swarm-card";
 import { type VisualMode, announceChange, headline, waitingLine } from "./headline";
 import { initOverlayKeys } from "./overlay-keys";
 import { mountPowerCore } from "./power-core";
@@ -1143,6 +1144,8 @@ function renderStatus(status: NodeStatusInfo) {
   reflectWitnessRow(status);
   reflectSnapshotServeRow(status);
   reflectFollowRow(status);
+  // Asked only while Settings is on screen, and at most every 15 seconds.
+  if ($("swarm-toggle").getClientRects().length > 0) void refreshSwarm();
 
   // Record the gap on every poll while the node runs, so the wording below
   // can tell a closing gap from a pinned one, and a syncing node that adds
@@ -1445,6 +1448,7 @@ $("settings-btn").addEventListener("click", async () => {
     reflectWitnessRow(lastStatus);
     reflectSnapshotServeRow(lastStatus);
   }
+  void refreshSwarm(true);
   // The preflight is a question about the machine, so it is asked when the
   // panel opens rather than on the status poll: it reads the conf, the node
   // and the disk, and none of that changes second to second.
@@ -2241,6 +2245,58 @@ $<HTMLInputElement>("serve-toggle").addEventListener("change", (e) => {
       ),
     )
     .catch((err) => showToast(String(err)));
+});
+
+// The Swarm row and card (swarm-card.ts). Its own command and its own, slower
+// clock: the answer comes from two questions to the node, and nothing in it
+// changes by the second.
+let swarmAsked = 0;
+async function refreshSwarm(force = false): Promise<void> {
+  const now = Date.now();
+  if (!force && now - swarmAsked < 15_000) return;
+  swarmAsked = now;
+  try {
+    reflectSwarm(await invoke<SwarmCard>("swarm_status"));
+  } catch {
+    // The row keeps what it last showed; the next ask replaces it.
+  }
+}
+
+function reflectSwarm(card: SwarmCard): void {
+  const view = swarmView(card);
+  const t = $<HTMLInputElement>("swarm-toggle");
+  if (document.activeElement !== t) t.checked = view.checked;
+  t.disabled = view.disabled;
+  const desc = $("swarm-desc");
+  desc.textContent = view.desc;
+  desc.classList.toggle("needs-attention", view.attention);
+  const list = $("swarm-card");
+  list.replaceChildren(
+    ...view.lines.map((line) => {
+      const li = document.createElement("li");
+      li.textContent = line;
+      return li;
+    }),
+  );
+  list.hidden = view.lines.length === 0;
+}
+
+$<HTMLInputElement>("swarm-toggle").addEventListener("change", async (e) => {
+  const box = e.target as HTMLInputElement;
+  const on = box.checked;
+  const result = $("swarm-result");
+  box.disabled = true;
+  try {
+    result.textContent = await invoke<string>("set_swarm", { on });
+    result.classList.remove("is-error");
+  } catch (err) {
+    box.checked = !on;
+    result.classList.add("is-error");
+    result.textContent = String(err);
+  }
+  result.hidden = false;
+  box.disabled = false;
+  void refreshSwarm(true);
 });
 
 $<HTMLInputElement>("wallet-toggle").addEventListener("change", (e) => {
