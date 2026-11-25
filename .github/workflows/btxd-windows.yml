@@ -37,7 +37,11 @@ name: Build Windows btxd (mingw cross, smoked on Windows)
 #     find_package(Python3 ... Development), because FindPython3 cannot serve a
 #     cross build (see the fetch step).
 #
-# Every download is pinned by SHA-256. A ref without cmake/SwapNet.cmake
+# Every Python download (the embeddable zip, the NuGet package, the three
+# wheels) is pinned by SHA-256. Not pinned: the apt packages, which include
+# the host's python3-cryptography (configure check only, never shipped) and
+# the mingw toolchain whose runtime DLLs (libgomp, libgcc_s_seh,
+# libwinpthread) are shipped, as before. A ref without cmake/SwapNet.cmake
 # (0.34.15 and older) skips all of it and builds exactly as before.
 #
 # Security: the only input is a git ref consumed by actions/checkout's ref:

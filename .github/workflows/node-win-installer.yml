@@ -274,7 +274,8 @@ jobs:
       # Check the INSTALLER, not only the tree it was built from. The setup.exe
       # is what a user runs, and between the staged tree and the user's disk sit
       # Tauri's resource glob and NSIS. From BTX 0.34.16 the node package is a
-      # tree of about 330 files (btxd embeds CPython), and a file lost on that
+      # tree of 191 files, 192 with the .btxd-version marker the staging script
+      # writes (btxd embeds CPython), and a file lost on that
       # path is not a cosmetic problem: without python314.dll btxd.exe does not
       # start at all. So: install silently on this runner, compare the installed
       # node package with the staged one file by file, and run the installed
