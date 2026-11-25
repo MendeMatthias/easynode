@@ -143,10 +143,24 @@ pub(crate) const REFUSALS: &[(&[&str], &str)] = &[
     (
         &[
             "loadtxoutset", "loadtxoutsetattested", "dumptxoutset", "dumptxoutsetattested",
-            "signutxosnapshotmanifest", "offerattestedutxosnapshot",
+            "offerattestedutxosnapshot",
             "withdrawattestedutxosnapshot", "fetchattestedutxosnapshot",
         ],
         "Snapshots go through Fast-forward and Serve a chain snapshot, which check them first.",
+    ),
+    // Its own sentence since engine 0.34.16 (upstream PR 225). The command
+    // used to check a statement and sign it. It now rebuilds the statement
+    // from the node's own chain first, which means writing out the whole set
+    // of unspent coins, and only then signs or refuses, and it refuses
+    // anything that is not the block the chain ends on at that moment. Typed
+    // here with an older statement it would cost minutes of disk work to be
+    // told no. It was never runnable from this window and stays that way;
+    // the sentence now says what it costs and where signing happens.
+    (
+        &["signutxosnapshotmanifest"],
+        "Snapshots are signed by Serve a chain snapshot, at the block it cuts them. On this \
+         engine the command first writes out every unspent coin, which takes minutes, and then \
+         signs only for the block the chain ends on right now.",
     ),
     (
         &["addmatmulattestationblocklist", "clearmintedattestation", "submitmatmulattestations", "submitmatmulrefutation"],
@@ -506,6 +520,26 @@ mod tests {
             decide("addnode [2001:db8::1]:19335 onetry"),
             Decision::Confirm { .. }
         ));
+    }
+
+    /// On engine 0.34.16 this command exports the whole set of unspent coins
+    /// before it signs or refuses. This window must never run it, whatever
+    /// its arguments, and must say what it costs.
+    #[test]
+    fn the_statement_signing_command_is_refused_and_says_what_it_costs() {
+        for line in [
+            "signutxosnapshotmanifest",
+            "signutxosnapshotmanifest /tmp/statement.json",
+            "SignUtxoSnapshotManifest a",
+        ] {
+            let Decision::Refuse(why) = decide(line) else {
+                panic!("{line:?} was not refused");
+            };
+            assert!(why.contains("writes out every unspent coin"), "{why}");
+            assert!(why.contains("Serve a chain snapshot"), "{why}");
+        }
+        assert_eq!(class_of("signutxosnapshotmanifest"), None);
+        assert!(!help_text().contains("signutxosnapshotmanifest"));
     }
 
     #[test]

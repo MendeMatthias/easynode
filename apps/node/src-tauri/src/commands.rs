@@ -74,7 +74,11 @@ use crate::state::{
 ///
 /// Returning users are carried across by the upgrade path in `start_node_inner`,
 /// which re-provisions from the bundle whenever this constant moves — the chain
-/// in `~/.easybtx` is untouched, so this costs a ~25 MB swap, not a resync.
+/// in `~/.easybtx` is untouched, so this costs one copy of the engine out of
+/// the app's own files, not a resync. Nothing is downloaded. The copy was about
+/// 25 MB up to 0.34.15 on a Mac; since 0.34.16 the engine carries a Python
+/// runtime and the copy is about 700 MB on Linux (776 files) and 191 files on
+/// Windows.
 // v0.33.4.1: the OFFICIAL upstream release tag (2026-08-24), self-built on this
 // Mac at the tag commit `0d3e384f` from a CLEAN tree.
 //
@@ -1432,9 +1436,14 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
                         // The persisted tag flips only after the new-tag node
                         // actually RUNS (end of this function). If this start
                         // dies half-way (quit mid-stop, lost lock race), the
-                        // next start re-enters this branch — re-provisioning
-                        // is an idempotent ~25 MB copy — instead of treating
+                        // next start re-enters this branch instead of treating
                         // a leftover old-binaries node as already upgraded.
+                        // Re-entering is cheap: `provision_node_package`
+                        // leaves a finished install of this package alone
+                        // and only writes the conf. Until 0.8.1 it copied
+                        // the whole engine again each time, 700 MB on Linux
+                        // since 0.34.16, on every app start for as long as
+                        // another app's node kept the tag from moving.
                         // (The 2026-08-12 0.6.1→0.6.2 failure mode; see
                         // `pre_launch_plan`.)
                         upgraded_this_start = true;
@@ -1456,6 +1465,21 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
                 }
             }
         }
+    }
+
+    // Is the installed engine all there? `returning_launch_paths` below asks
+    // only for btxd and btx-cli, and the engine is 776 files on Linux and 191
+    // on Windows since it carries a Python runtime. One of them gone (antivirus
+    // software taking python314.dll is the usual way) and btxd ends before it
+    // prints a line. So the files are compared with the list written when the
+    // engine was installed: one `stat` each, about a millisecond for the lot
+    // on the project's own Linux install, nothing read and nothing hashed.
+    // What is missing or the wrong size is copied again from the app's own
+    // package, and setup.log says which files. Not after an upgrade in this
+    // same start (that install was checked a moment ago), and only for the
+    // engine this app carries, because that is the one it has a copy of.
+    if tag == NODE_RELEASE_TAG && !upgraded_this_start && settings.btx_release_tag.is_some() {
+        heal_installed_engine(app, &datadir).await;
     }
 
     let paths: FaststartResult = returning_launch_paths(&datadir, &tag)
@@ -2136,6 +2160,224 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     Ok(())
 }
 
+/// What the start-time check of the engine's files leaves in setup.log and
+/// the app's own log. Nothing when all is in place, which is every start but
+/// a handful.
+fn engine_check_note(outcome: &Result<btx_core::engine_files::Repair, String>) -> Option<String> {
+    use btx_core::engine_files::Repair;
+    match outcome {
+        Ok(Repair::NotNeeded) => None,
+        Ok(Repair::Adopted) => Some(
+            "the node engine's files were compared with the app's own copy and all are in \
+             place; their list is kept in the engine's folder from now on"
+                .to_string(),
+        ),
+        Ok(Repair::Repaired(damage)) => Some(format!(
+            "node engine files were missing or damaged and were copied again from the app's \
+             own copy: {}",
+            damage.describe()
+        )),
+        Err(e) => Some(format!(
+            "the node engine's files could not be checked or put back: {e}"
+        )),
+    }
+}
+
+/// The start-time check and repair of the installed engine
+/// (`btx_core::engine_files`). Never ends the start: when a file cannot be
+/// put back, the launch that follows fails on it and
+/// [`answer_engine_loader_failure`] says which one.
+async fn heal_installed_engine(app: &AppHandle, datadir: &Path) {
+    let resource_dir = app.path().resource_dir().ok();
+    let Some(pkg) = resolve_bundled_node_pkg(
+        resource_dir.as_deref(),
+        &[Path::new(env!("CARGO_MANIFEST_DIR"))],
+    ) else {
+        return;
+    };
+    let Some(install_root) = install_dir(NODE_RELEASE_TAG) else {
+        return;
+    };
+    let dd = datadir.to_path_buf();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        btx_core::engine_files::check_and_repair(&pkg, &install_root, &dd)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("the check stopped unexpectedly ({e})")));
+    if let Some(note) = engine_check_note(&outcome) {
+        eprintln!("[node-app] {note}");
+        setup_log(datadir, &note);
+    }
+}
+
+/// Which folder a loader failure of `btxd` is about, and whether the app's
+/// own package is a copy of that engine. The package holds the pinned engine
+/// and no other, so it may be copied only over the pinned engine's folder:
+/// an older engine a failed update left the node on is named in the message
+/// and left as it is.
+fn engine_repair_target(btxd: &Path, pinned_root: Option<&Path>) -> (PathBuf, bool) {
+    match pinned_root {
+        Some(root) if btxd.starts_with(root) => (root.to_path_buf(), true),
+        _ => (
+            // `<folder>/bin/btxd`.
+            btxd.parent()
+                .and_then(Path::parent)
+                .unwrap_or(btxd)
+                .to_path_buf(),
+            false,
+        ),
+    }
+}
+
+/// A start ended on the loader's signature: copy the engine again from the
+/// app's own package, once (`btx_core::engine_files::answer_loader_failure`,
+/// which holds the rules and their tests). `Ok` is the line for the log
+/// before the next attempt, `Err` what the person reads.
+async fn answer_engine_loader_failure(
+    app: &AppHandle,
+    datadir: &Path,
+    btxd: &Path,
+    loader: btx_core::engine_files::LoaderFailure,
+    already_answered: bool,
+) -> Result<String, String> {
+    let pinned_root = install_dir(NODE_RELEASE_TAG);
+    let (install_root, ours) = engine_repair_target(btxd, pinned_root.as_deref());
+    let pkg = if ours {
+        let resource_dir = app.path().resource_dir().ok();
+        resolve_bundled_node_pkg(
+            resource_dir.as_deref(),
+            &[Path::new(env!("CARGO_MANIFEST_DIR"))],
+        )
+    } else {
+        None
+    };
+    let dd = datadir.to_path_buf();
+    let fallback = install_root.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        btx_core::engine_files::answer_loader_failure(
+            pkg.as_deref(),
+            &install_root,
+            &dd,
+            &loader,
+            already_answered,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| {
+        Err(btx_core::engine_files::missing_file_message(
+            btx_core::engine_files::MissingFileCase::RepairFailed(&format!(
+                "the copy stopped unexpectedly ({e})."
+            )),
+            None,
+            &[],
+            &fallback,
+        ))
+    })
+}
+
+#[cfg(test)]
+mod engine_file_tests {
+    use super::{engine_check_note, engine_repair_target};
+    use btx_core::engine_files::{Damage, Repair};
+    use std::path::Path;
+
+    #[test]
+    fn the_start_time_check_is_silent_unless_it_did_something() {
+        assert_eq!(engine_check_note(&Ok(Repair::NotNeeded)), None);
+        let adopted = engine_check_note(&Ok(Repair::Adopted)).unwrap();
+        assert!(adopted.contains("all are in place"), "{adopted}");
+        let repaired = engine_check_note(&Ok(Repair::Repaired(Damage {
+            missing: vec!["bin/python314.dll".into()],
+            wrong_size: vec![],
+        })))
+        .unwrap();
+        assert!(
+            repaired.ends_with("copied again from the app's own copy: 1 file (bin/python314.dll)"),
+            "{repaired}"
+        );
+        let failed = engine_check_note(&Err("disk error: no room".into())).unwrap();
+        assert!(failed.ends_with("could not be checked or put back: disk error: no room"));
+    }
+
+    /// The package is the pinned engine's. It must never be copied over the
+    /// folder of another engine.
+    #[test]
+    fn only_the_pinned_engines_folder_is_one_the_package_may_be_copied_over() {
+        let pinned = Path::new("/h/.local/btx/v0.34.16/linux-x86_64");
+        assert_eq!(
+            engine_repair_target(&pinned.join("bin").join("btxd"), Some(pinned)),
+            (pinned.to_path_buf(), true)
+        );
+        // The engine a failed update left the node on.
+        let old = Path::new("/h/.local/btx/v0.34.15/linux-x86_64");
+        assert_eq!(
+            engine_repair_target(&old.join("bin").join("btxd"), Some(pinned)),
+            (old.to_path_buf(), false)
+        );
+        // No home folder to resolve the pin against.
+        assert_eq!(
+            engine_repair_target(&old.join("bin").join("btxd"), None),
+            (old.to_path_buf(), false)
+        );
+    }
+
+    /// The launch loop answers the loader's signature before it counts the
+    /// exit as an ordinary one, checks for a Stop first, and copies at most
+    /// once per start.
+    #[test]
+    fn the_launch_loop_answers_a_loader_failure_once() {
+        let src = include_str!("commands.rs");
+        // Put together here so that this test's own text is not what the
+        // other tests in this file find when they look for the function.
+        let spawn_fn = src
+            .split(concat!("\nasync fn spawn_node_with", "_lock_retry("))
+            .nth(1)
+            .and_then(|s| s.split("\nfn spawn_warmup_watcher(").next())
+            .expect("the launch loop is in this file");
+        let answer = spawn_fn
+            .find("btx_core::engine_files::loader_failure(&tail, exit_code)")
+            .expect("the loop reads the loader's signature");
+        let ordinary = spawn_fn
+            .find("let when = exit_when(exited_after_watch, exited_warming);")
+            .expect("the ordinary exit line");
+        assert!(answer < ordinary);
+        let block = &spawn_fn[answer..ordinary];
+        let stop_check = block
+            .find("stopped_since(start_gen")
+            .expect("a Stop is honoured");
+        let copy = block
+            .find("answer_engine_loader_failure(")
+            .expect("the copy");
+        assert!(stop_check < copy);
+        assert!(block.contains("engine_copied_again,\n"));
+        assert!(block.contains("engine_copied_again = true;\n                    continue;"));
+        assert!(block.contains("after_failed_launch(datadir, said)"));
+    }
+
+    /// The start-time check runs before the launch paths are resolved (a
+    /// removed btxd is put back before anything asks for it), only for the
+    /// pinned engine, and never on a computer where setup has not run.
+    #[test]
+    fn the_start_checks_the_engines_files_before_it_resolves_them() {
+        let src = include_str!("commands.rs");
+        let start = src
+            .split(concat!("\nasync fn start_node", "_once("))
+            .nth(1)
+            .expect("start_node_once is in this file");
+        let heal = start
+            .find("heal_installed_engine(app, &datadir).await;")
+            .expect("the check");
+        let resolve = start
+            .find("returning_launch_paths(&datadir, &tag)")
+            .expect("the launch paths");
+        assert!(heal < resolve);
+        assert!(start[..heal].contains(
+            "if tag == NODE_RELEASE_TAG && !upgraded_this_start && settings.btx_release_tag.is_some() {"
+        ));
+    }
+}
+
 /// Spawn btxd with the datadir-lock discipline the 2026-08-12 self-update
 /// failure demanded: make sure any unmanaged holder has actually RELEASED the
 /// lock (graceful stop + bounded wait, force-kill only as a last resort),
@@ -2152,6 +2394,9 @@ async fn spawn_node_with_lock_retry(
 ) -> Result<RpcClient, String> {
     // How the last attempt's btxd ended, when it exited.
     let mut last_exit: Option<String> = None;
+    // Has this start copied the engine again after the loader's signature?
+    // Once only; see `answer_engine_loader_failure`.
+    let mut engine_copied_again = false;
     // A Stop moves this; see `stopped_since`.
     let start_gen = state.refresher_gen.load(Ordering::SeqCst);
     for attempt in 1..=LAUNCH_ATTEMPTS {
@@ -2514,14 +2759,14 @@ async fn spawn_node_with_lock_retry(
         }
         // How it ended, kept for the cause sentence when its log names
         // nothing (Task A review M4).
-        let exit = state
+        let exit_status = state
             .node
             .lock()
             .await
             .take()
-            .and_then(|mut c| c.exit_status())
-            .map(btx_core::node::describe_exit);
-        last_exit = exit;
+            .and_then(|mut c| c.exit_status());
+        let exit_code = exit_status.and_then(|s| s.code());
+        last_exit = exit_status.map(btx_core::node::describe_exit);
 
         // Did the engine refuse to be an independent MatMul consensus
         // validator on this machine? That is not a lock race and retrying it
@@ -2581,6 +2826,43 @@ async fn spawn_node_with_lock_retry(
             )
             .await;
             return Err(said);
+        }
+
+        // The operating system could not load a file the engine needs: the
+        // loader's line in the log, or one of the exit codes that mean it
+        // (Windows names no file, only 0xC0000135). Starting again unchanged
+        // ends the same way three times, and "it exited with code
+        // -1073741515" names neither the cause nor the fix. The engine is
+        // copied again from the app's own package, once per start, and the
+        // next attempt launches it. A second time in the same start stops
+        // with the file's name: something is removing it again.
+        if let Some(loader) = btx_core::engine_files::loader_failure(&tail, exit_code) {
+            if stopped_since(start_gen, state.refresher_gen.load(Ordering::SeqCst)) {
+                return Err("the node was stopped while it was starting".to_string());
+            }
+            match answer_engine_loader_failure(
+                app,
+                datadir,
+                &paths.btxd,
+                loader,
+                engine_copied_again,
+            )
+            .await
+            {
+                Ok(line) => {
+                    eprintln!("[node-app] {line} (attempt {attempt}/{LAUNCH_ATTEMPTS})");
+                    setup_log(datadir, &line);
+                    engine_copied_again = true;
+                    continue;
+                }
+                Err(said) => {
+                    eprintln!("[node-app] {said}");
+                    setup_log(datadir, &said);
+                    return Err(
+                        crate::read_block_recovery::after_failed_launch(datadir, said).await,
+                    );
+                }
+            }
         }
 
         let when = exit_when(exited_after_watch, exited_warming);
@@ -11019,12 +11301,14 @@ mod signed_start_tests {
             spawn_fn[handed..generic].contains("return Err("),
             "a step or a roll-back ends this start"
         );
-        // Both other ways a launch fails go through the step-2 check.
+        // The three other ways a launch fails go through the step-2 check:
+        // no RPC in time, an engine file that cannot be loaded, and the
+        // attempts running out.
         assert_eq!(
             spawn_fn
                 .matches("crate::read_block_recovery::after_failed_launch(")
                 .count(),
-            2
+            3
         );
     }
 

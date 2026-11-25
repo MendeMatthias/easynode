@@ -46,6 +46,24 @@ pub fn free_disk_mb(path: &Path) -> u64 {
     free_disk_bytes(path) / (1024 * 1024)
 }
 
+/// Keep Windows from putting up a "the code execution cannot proceed because
+/// python314.dll was not found" box for a child this process starts.
+///
+/// The box belongs to the child, is shown on the desktop, and the child does
+/// not exit until someone presses OK: a node that starts at boot with nobody
+/// at the screen would sit there, neither running nor failed. With
+/// `SEM_FAILCRITICALERRORS` in the error mode, the child ends at once with
+/// `STATUS_DLL_NOT_FOUND` instead, which is what the app reads
+/// (`engine_files::loader_failure`). A child inherits its parent's error
+/// mode, and Rust's `Command` has no hook that runs in the child on Windows,
+/// so the mode is set on this process: once, the first time a child that
+/// could show the box is about to be started. It changes nothing else the
+/// app does. Nothing to do on macOS and Linux, where the loader writes a
+/// line to stderr and exits.
+pub fn no_loader_error_dialogs() {
+    imp::no_loader_error_dialogs()
+}
+
 /// Resolve an executable file name for this platform: appends `.exe` on
 /// Windows, identity on macOS/Linux.
 pub fn exe_name(stem: &str) -> String {

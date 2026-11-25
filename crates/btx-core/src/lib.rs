@@ -29,6 +29,7 @@ pub mod datadir;
 pub mod diagnostics;
 pub mod diary;
 pub mod disk;
+pub mod engine_files;
 pub mod engine_priority;
 pub mod engine_warnings;
 pub mod error;

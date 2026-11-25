@@ -731,7 +731,7 @@ pub fn resolve_bundled_node_pkg(
 /// package: the v0.32.12 `bin/` wrappers are scripts (codesign would just
 /// error) while `libexec/*.real` are the actual Mach-O daemons macOS SIGKILLs
 /// without a locally-acceptable signature. Best-effort: unreadable → false.
-fn is_macho(path: &Path) -> bool {
+pub(crate) fn is_macho(path: &Path) -> bool {
     use std::io::Read;
     let Ok(mut f) = std::fs::File::open(path) else {
         return false;
@@ -772,7 +772,7 @@ fn is_macho(path: &Path) -> bool {
 /// A rename replaces the directory ENTRY. The running process keeps its own
 /// inode, which lives until it exits, and the next exec picks up the new file.
 /// That is the standard way to replace a binary that may be in use.
-fn replace_file(from: &Path, to: &Path) -> AppResult<()> {
+pub(crate) fn replace_file(from: &Path, to: &Path) -> AppResult<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -885,6 +885,7 @@ fn verify_btxd_reports_tag(btxd: &Path, expected_tag: &str) -> AppResult<()> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
+    crate::platform::no_loader_error_dialogs();
     let out = cmd.output().map_err(|e| {
         AppError::Process(format!(
             "staged btxd at {} could not be executed: {e}",
@@ -908,25 +909,12 @@ fn verify_btxd_reports_tag(btxd: &Path, expected_tag: &str) -> AppResult<()> {
     )))
 }
 
-pub fn provision_node_package(
-    bundled_pkg_dir: &Path,
-    install_root: &Path,
-    datadir: &Path,
-    conf_contents: &str,
-) -> AppResult<FaststartResult> {
-    let btxd_name = crate::platform::exe_name("btxd");
-    if !bundled_pkg_dir.join("bin").join(&btxd_name).exists() {
-        return Err(AppError::Config(format!(
-            "bundled node package missing bin/{btxd_name} (looked in {})",
-            bundled_pkg_dir.display()
-        )));
-    }
-
-    copy_tree(bundled_pkg_dir, install_root)?;
-
-    // Exec bits + ad-hoc signature. bin/ holds the launcher wrappers, libexec/
-    // the real daemons; both need +x. Only genuine Mach-Os get re-signed (the
-    // kernel only SIGKILLs Mach-Os; signing a script is an error, not a no-op).
+/// Mark what must run as executable and sign what macOS wants signed.
+///
+/// `bin/` holds the launcher wrappers, `libexec/` the real daemons; both need
+/// +x. Only genuine Mach-Os get re-signed (the kernel only SIGKILLs Mach-Os;
+/// signing a script is an error, not a no-op).
+pub(crate) fn finish_engine_tree(install_root: &Path, datadir: &Path) {
     for sub in ["bin", "libexec"] {
         let dir = install_root.join(sub);
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -947,6 +935,76 @@ pub fn provision_node_package(
             }
         }
     }
+}
+
+/// Copy the whole package into `install_root`, make it runnable, ask the
+/// copied btxd which version it is, and only then write the file list.
+///
+/// The order is the point. The list is removed first and written last, so a
+/// copy that stops half-way (the disk filled, the computer lost power) leaves
+/// a folder that does not count as an install, and the next call copies
+/// again. Free space is checked before the first byte: a copy that would not
+/// fit is refused with the numbers instead of leaving half an engine behind.
+fn copy_and_verify_engine_tree(
+    bundled_pkg_dir: &Path,
+    install_root: &Path,
+    datadir: &Path,
+    listing: &[crate::engine_files::FileEntry],
+) -> AppResult<()> {
+    crate::engine_files::forget_manifest(install_root);
+    crate::engine_files::ensure_space_for(install_root, listing)?;
+    copy_tree(bundled_pkg_dir, install_root)?;
+    finish_engine_tree(install_root, datadir);
+    if let Some(expected) = expected_btxd_version(bundled_pkg_dir, install_root) {
+        let btxd_path = install_root
+            .join("bin")
+            .join(crate::platform::exe_name("btxd"));
+        verify_btxd_reports_tag(&btxd_path, &expected)?;
+    }
+    crate::engine_files::write_manifest(install_root, listing)
+}
+
+/// Copy the whole engine again over an install of it, whatever its file list
+/// says, and leave `faststart.conf` alone. The answer to a start that ended
+/// on the loader's signature while every file is there at the right size
+/// (`engine_files::answer_loader_failure`).
+pub fn reinstall_engine_tree(
+    bundled_pkg_dir: &Path,
+    install_root: &Path,
+    datadir: &Path,
+) -> AppResult<()> {
+    let listing = crate::engine_files::list_tree(bundled_pkg_dir)?;
+    copy_and_verify_engine_tree(bundled_pkg_dir, install_root, datadir, &listing)
+}
+
+pub fn provision_node_package(
+    bundled_pkg_dir: &Path,
+    install_root: &Path,
+    datadir: &Path,
+    conf_contents: &str,
+) -> AppResult<FaststartResult> {
+    let btxd_name = crate::platform::exe_name("btxd");
+    if !bundled_pkg_dir.join("bin").join(&btxd_name).exists() {
+        return Err(AppError::Config(format!(
+            "bundled node package missing bin/{btxd_name} (looked in {})",
+            bundled_pkg_dir.display()
+        )));
+    }
+
+    // What the package holds, and whether exactly that is installed already.
+    //
+    // The copy used to run on every call. That was a 25 MB copy when it was
+    // written and is 700 MB since the engine carries a Python runtime, and
+    // one path calls this on every app start: an engine update whose node
+    // another app is running never moves the saved tag (`start_node_once`,
+    // "Attach-mode never flips"), so every start of the app copied the whole
+    // engine again. So did every start that provisioned and then failed to
+    // launch. A folder with a file list that names this package's files at
+    // this package's sizes, all of them in place, is a finished install of
+    // this package (`engine_files::installed_matches`), and is left alone.
+    // The conf below is still written: that is what the callers come for.
+    let listing = crate::engine_files::list_tree(bundled_pkg_dir)?;
+    let already_installed = crate::engine_files::installed_matches(install_root, &listing);
 
     // The installed tree must actually BE the release its directory claims.
     //
@@ -990,10 +1048,8 @@ pub fn provision_node_package(
     //
     // Packages without the marker keep the old behaviour: verify against the
     // install-root tag.
-    let expected = expected_btxd_version(bundled_pkg_dir, install_root);
-    if let Some(expected) = expected {
-        let btxd_path = install_root.join("bin").join(&btxd_name);
-        verify_btxd_reports_tag(&btxd_path, &expected)?;
+    if !already_installed {
+        copy_and_verify_engine_tree(bundled_pkg_dir, install_root, datadir, &listing)?;
     }
 
     // Write the node faststart.conf (bootstrap peers appended by the caller via
@@ -1770,6 +1826,68 @@ mod tests {
             "node preset must not carry mining keys"
         );
         assert!(res.mining_results_dir.is_none());
+    }
+
+    /// A second provision of the same package copies nothing. Until 0.8.1 it
+    /// copied the whole engine again, on every app start for as long as
+    /// another app's node kept the saved tag from moving.
+    #[test]
+    fn a_finished_install_of_the_same_package_is_not_copied_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("pkg");
+        let install = tmp.path().join("install");
+        let datadir = tmp.path().join("datadir");
+        fake_node_pkg(&pkg);
+        let res = provision_node_package(&pkg, &install, &datadir, NODE_FASTSTART_CONF).unwrap();
+        assert!(install.join(crate::engine_files::MANIFEST_NAME).exists());
+
+        // Mark the installed btxd. A copy would replace it with the
+        // package's, which has the same size and other bytes.
+        let marked = b"#!/bin/sh\nexec MARK\n";
+        assert_eq!(
+            marked.len(),
+            std::fs::metadata(&res.btxd).unwrap().len() as usize
+        );
+        std::fs::write(&res.btxd, marked).unwrap();
+        // The conf is still written: that is what the caller comes for.
+        std::fs::write(&res.faststart_conf, "gone=1\n").unwrap();
+
+        provision_node_package(&pkg, &install, &datadir, NODE_FASTSTART_CONF).unwrap();
+        assert_eq!(std::fs::read(&res.btxd).unwrap(), marked, "copied again");
+        assert!(std::fs::read_to_string(&res.faststart_conf)
+            .unwrap()
+            .contains("prune=0"));
+
+        // Another package (a file more) is installed over it in full.
+        std::fs::write(pkg.join("bin").join("new-tool"), b"tool").unwrap();
+        provision_node_package(&pkg, &install, &datadir, NODE_FASTSTART_CONF).unwrap();
+        assert_ne!(std::fs::read(&res.btxd).unwrap(), marked);
+        assert!(install.join("bin").join("new-tool").exists());
+    }
+
+    /// A copy that stopped half-way leaves no file list, so the folder is
+    /// not taken for an install and the next provision copies in full.
+    #[test]
+    fn a_half_copied_engine_is_not_taken_for_an_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("pkg");
+        let install = tmp.path().join("install");
+        let datadir = tmp.path().join("datadir");
+        fake_node_pkg(&pkg);
+        // What a cut-off copy leaves: some files, in full, and no list.
+        copy_tree(&pkg.join("bin"), &install.join("bin")).unwrap();
+        assert!(!install.join(crate::engine_files::MANIFEST_NAME).exists());
+        let listing = crate::engine_files::list_tree(&pkg).unwrap();
+        assert!(!crate::engine_files::installed_matches(&install, &listing));
+
+        provision_node_package(&pkg, &install, &datadir, NODE_FASTSTART_CONF).unwrap();
+        assert!(install.join("libexec").join("btxd.real").exists());
+        assert!(crate::engine_files::installed_matches(&install, &listing));
+
+        // And a copy that is about to start takes the list away first, so a
+        // failure after this point cannot leave a stale one behind.
+        crate::engine_files::forget_manifest(&install);
+        assert!(!crate::engine_files::installed_matches(&install, &listing));
     }
 
     #[test]

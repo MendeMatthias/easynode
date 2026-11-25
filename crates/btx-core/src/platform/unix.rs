@@ -315,3 +315,5 @@ mod tests {
         }
     }
 }
+
+pub fn no_loader_error_dialogs() {}

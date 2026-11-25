@@ -6,6 +6,35 @@ just the local build, except where it says otherwise.
 
 ---
 
+## Update 2026-11-25 (later): fixes from the audit of 0.8.0, for a 0.8.1
+
+Not released. One pull request from `claude/0.8.0-audit-fixes`, no version
+bump. What it does is in the changelog under Unreleased and in
+`crates/btx-core/src/engine_files.rs`.
+
+**Open, for the owner: old engine folders are never removed.** Every engine
+the app ever installed stays under `~/.local/btx/<tag>/`. On the project's
+3060 that was ten folders and 4.4 GB on 2026-11-25 (0.33.3 to 0.34.16; each
+0.34 one is about 580 to 710 MB). Proposed rule, not implemented: when an
+engine update has finished and the new engine is running (the place the
+saved tag moves in `start_node_once`), keep the folder of the pinned tag and
+the folder of the tag the node ran before, and remove the rest. Why it is
+not in the pull request: `~/.local/btx` is shared with the easyBTX miner,
+which installs its own engine there under the same layout, so a folder
+easyNode does not use may be the one the miner runs. A safe version needs
+one of two things first: a record of which folders easyNode itself
+installed (it has none for past installs), or a check that no running
+process was started from the folder.
+
+**Not tested on a real machine:** Windows (the error-mode call, the exit
+code read from a real btxd.exe with a DLL removed) and macOS (the `dyld`
+line). Linux was: the real 0.34.16 engine with `libpython3.14.so.1.0`
+removed exits 127 with the loader's line, the app's code names the file,
+puts it back and the engine runs again
+(`engine_files::tests::a_real_engine_with_a_library_removed_is_put_back`).
+
+---
+
 ## Update 2026-11-25: easyNode 0.8.0 carries BTX 0.34.16 (Linux and Windows)
 
 **The plan** (owner's planning session, 2026-11-25): move the engine from

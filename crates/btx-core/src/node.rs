@@ -2268,7 +2268,12 @@ pub fn engine_error_line(text: &str) -> Option<String> {
 /// "it was ended by signal N".
 pub fn describe_exit(status: std::process::ExitStatus) -> String {
     if let Some(code) = status.code() {
-        return format!("it exited with code {code}");
+        // A code that says a file could not be loaded says so in words too:
+        // "-1073741515" alone tells nobody anything.
+        return match crate::engine_files::exit_code_meaning(code) {
+            Some(meaning) => format!("it exited with code {code} ({meaning})"),
+            None => format!("it exited with code {code}"),
+        };
     }
     #[cfg(unix)]
     {
@@ -2302,6 +2307,13 @@ pub fn launch_failure_cause(text: &str) -> Option<String> {
             }
         }
         return Some(hint.to_string());
+    }
+    // The system loader's line is not the engine's: it has no "Error:" in
+    // it, so `engine_error_line` passes over it, and it is the whole cause.
+    if let Some(file) = crate::engine_files::loader_named_file(text) {
+        return Some(format!(
+            "a file the node engine needs could not be loaded: {file}."
+        ));
     }
     engine_error_line(text).map(|line| format!("the engine said: \"{line}\"."))
 }
@@ -4454,6 +4466,10 @@ impl NodeController {
         // will send SIGKILL to btxd automatically — no orphaned daemon.
         cmd.kill_on_drop(true);
 
+        // A btxd that cannot load one of its files must exit, not wait behind
+        // a Windows message box nobody is there to close.
+        crate::platform::no_loader_error_dialogs();
+
         let child = cmd.spawn().map_err(|e| AppError::Process(e.to_string()))?;
 
         // Write the child's PID so future runs can detect a stale daemon.
@@ -6345,6 +6361,38 @@ consensus-validator service.";
         assert_eq!(
             engine_error_line(log).as_deref(),
             Some("Error: the real reason it stopped")
+        );
+    }
+
+    /// The system loader's line has no "Error:" in it, so it used to be
+    /// passed over and the start said only how the child ended. It is the
+    /// whole cause, and it names the file.
+    #[test]
+    fn the_loaders_line_is_the_cause_and_names_the_file() {
+        let log = "/home/u/.local/btx/v0.34.16/linux-x86_64/bin/btxd: error while loading \
+                   shared libraries: libpython3.14.so.1.0: cannot open shared object file: No \
+                   such file or directory\n";
+        assert!(engine_error_line(log).is_none());
+        assert_eq!(
+            launch_failure_cause_or_exit(log, Some("it exited with code 127")).as_deref(),
+            Some("a file the node engine needs could not be loaded: libpython3.14.so.1.0.")
+        );
+    }
+
+    /// Windows prints nothing and names nothing; the code is all there is,
+    /// so it is said in words beside the number.
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_code_that_means_a_file_could_not_be_loaded_says_so() {
+        use std::os::unix::process::ExitStatusExt;
+        let could_not_load = std::process::ExitStatus::from_raw(127 << 8);
+        assert_eq!(
+            describe_exit(could_not_load),
+            "it exited with code 127 (the system could not load the engine or a file it needs)"
+        );
+        assert_eq!(
+            crate::engine_files::exit_code_meaning(-1_073_741_515),
+            Some("Windows could not find a file the engine needs")
         );
     }
 

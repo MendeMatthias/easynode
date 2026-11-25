@@ -280,3 +280,23 @@ pub fn force_kill(pid: u32) {
         CloseHandle(handle);
     }
 }
+
+pub fn no_loader_error_dialogs() {
+    // Declared here rather than through windows-sys: one function and one
+    // constant, both stable since Windows NT, and no new crate feature.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetErrorMode(mode: u32) -> u32;
+    }
+    const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: SetErrorMode takes a bit mask and returns the previous one;
+        // it has no pointer arguments and cannot fail. The previous mode is
+        // kept and the one bit added, so nothing a host set is lost.
+        unsafe {
+            let previous = SetErrorMode(SEM_FAILCRITICALERRORS);
+            SetErrorMode(previous | SEM_FAILCRITICALERRORS);
+        }
+    });
+}
