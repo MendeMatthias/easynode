@@ -448,7 +448,29 @@ pub fn check_and_repair(
                 install_root.display()
             )));
         }
-        if !against_package.wrong_size.is_empty() {
+        // A file that is EMPTY where the package's is not is a cut-off
+        // file, on any build: no build ships a zero-length library. It must
+        // not pass as "another build", or its size 0 would be written into
+        // the list and the file called healthy from then on.
+        let (empty, other_size): (Vec<String>, Vec<String>) =
+            against_package.wrong_size.into_iter().partition(|rel| {
+                std::fs::metadata(join_rel(install_root, rel)).is_ok_and(|m| m.len() == 0)
+            });
+        if !other_size.is_empty() {
+            if !empty.is_empty() {
+                // Another build with a cut-off file in it. The package's
+                // copy does not belong in that build, so nothing is copied,
+                // and no list is written that would vouch for the folder: a
+                // loader failure then compares it with the package and
+                // copies the whole engine (`answer_loader_failure`).
+                return found(
+                    Damage {
+                        missing: Vec::new(),
+                        wrong_size: empty,
+                    },
+                    NotCopied::OtherBuild,
+                );
+            }
             // Another build. Its list is what the folder holds.
             write_manifest(install_root, false, &list_tree(install_root)?)?;
             return Ok(Check::Adopted {
@@ -456,26 +478,31 @@ pub fn check_and_repair(
                 not_installed: against_package.missing,
             });
         }
-        if against_package.missing.is_empty() {
+        let damage = Damage {
+            missing: against_package.missing,
+            wrong_size: empty,
+        };
+        if damage.is_empty() {
             write_manifest(install_root, false, &list_tree(install_root)?)?;
             return Ok(Check::Adopted {
                 other_build: false,
                 not_installed: Vec::new(),
             });
         }
-        // The same build with files gone: every file that is there has the
-        // package's size, so the package's copies of the others belong.
+        // The same build with files gone or empty: every other file has the
+        // package's size, so the package's copies of these belong.
         if let Mode::ReportOnly(why) = mode {
-            return found(against_package, why);
+            return found(damage, why);
         }
+        let files = damage.files();
         let wanted: Vec<FileEntry> = package_listing
             .iter()
-            .filter(|e| against_package.missing.contains(&e.rel))
+            .filter(|e| files.contains(&e.rel))
             .cloned()
             .collect();
         copy_files(package, install_root, datadir, &wanted)?;
         write_manifest(install_root, false, &list_tree(install_root)?)?;
-        return Ok(Check::Repaired(against_package));
+        return Ok(Check::Repaired(damage));
     };
 
     let damage = damage_against(install_root, &manifest.entries);
@@ -594,26 +621,32 @@ pub fn package_has_file_named(listing: &[FileEntry], file_name: &str) -> bool {
         .any(|e| e.rel.rsplit('/').next() == Some(file_name))
 }
 
-fn copied_again_at(install_root: &Path) -> Option<u64> {
-    std::fs::read_to_string(install_root.join(COPIED_AGAIN_NAME))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+/// When the record was written, and by which version of the app.
+fn copied_again_record(install_root: &Path) -> Option<(u64, String)> {
+    let text = std::fs::read_to_string(install_root.join(COPIED_AGAIN_NAME)).ok()?;
+    let (at, version) = text.trim().split_once('\t')?;
+    Some((at.parse().ok()?, version.to_string()))
 }
 
-/// Was the engine in this folder copied again, in answer to a loader
-/// failure, within the last [`COPIED_AGAIN_HOLD_SECS`], with no start that
-/// worked since? A record from the future (a clock set back) holds too.
-pub fn copied_again_recently(install_root: &Path, now_secs: u64) -> bool {
-    copied_again_at(install_root)
-        .is_some_and(|at| now_secs.saturating_sub(at) < COPIED_AGAIN_HOLD_SECS)
+/// Was the engine in this folder copied again by THIS version of the app,
+/// in answer to a loader failure, within the last
+/// [`COPIED_AGAIN_HOLD_SECS`], with no start that worked since?
+///
+/// A record another version of the app wrote does not hold: an update may
+/// carry the fix, or another build of the engine. A record stamped in the
+/// future does not hold either: the clock was wrong when it was written or
+/// is wrong now, and a record that can never expire would be worse than one
+/// copy too many.
+pub fn copied_again_recently(install_root: &Path, now_secs: u64, app_version: &str) -> bool {
+    copied_again_record(install_root).is_some_and(|(at, version)| {
+        version == app_version && at <= now_secs && now_secs - at < COPIED_AGAIN_HOLD_SECS
+    })
 }
 
-fn note_copied_again(install_root: &Path, now_secs: u64) {
+fn note_copied_again(install_root: &Path, now_secs: u64, app_version: &str) {
     let _ = crate::fsx::atomic_write(
         &install_root.join(COPIED_AGAIN_NAME),
-        now_secs.to_string().as_bytes(),
+        format!("{now_secs}\t{app_version}").as_bytes(),
     );
 }
 
@@ -707,26 +740,39 @@ pub fn missing_file_message(
 ///   * `package`: the app's own copy, and only when it holds that same
 ///     engine tag (the caller compares the tags). `None` otherwise.
 ///   * `now_secs`: the time, in seconds since 1970.
+///   * `app_version`: this app's version, for the copy record.
 ///
 /// IS IT OURS? The engine is copied only when the failure is about one of
 /// its own files:
 ///
 ///   * the loader named a file, and the package holds a file of that name;
 ///   * or the loader named nothing (Windows never does; a bare exit 127 does
-///     not either) and the check finds a file missing or the wrong size.
+///     not either) and an engine file is missing or the wrong size.
 ///
-/// A named file the package does not hold, or no name and every engine file
-/// in place, is the system's: a Windows or driver library. Nothing is
-/// copied, because a copy cannot help and a version check of the copied
-/// btxd would fail on the same file.
+/// "Missing or the wrong size" is asked of the folder's list, and of the
+/// PACKAGE as well whenever the list was not written by an install of this
+/// app. A list written from the folder (an install from before 0.8.1) only
+/// records what was there on the day: a file that was already cut off then
+/// is in it at its cut-off size. With such a list, or none, a folder that
+/// differs from the package is not known to be whole, and the engine has
+/// just failed to load, so the benefit of the doubt ends here. This is the
+/// one place a healthy other build can be replaced by this app's build: it
+/// takes a loader failure that names nothing, costs one recorded copy, and
+/// the result is a whole engine of one build with its version checked.
 ///
-/// ONCE. A copy is recorded in the folder ([`COPIED_AGAIN_NAME`]) and the
-/// record is removed when the engine starts. While it stands, for a day, a
-/// further loader failure is answered with a sentence and no copy: a file
-/// that is gone again after being put back is being removed by something,
-/// and copying 700 MB at every press of Start would hide that.
+/// A named file the package does not hold, or no name and nothing differing,
+/// is the system's: a Windows or driver library. Nothing is copied, because
+/// a copy cannot help.
 ///
-/// WHAT IS COPIED. The files the check finds missing or wrong, when the
+/// ONCE. A copy that succeeded is recorded in the folder
+/// ([`COPIED_AGAIN_NAME`]) and the record is removed when the engine
+/// starts. While it stands (see [`copied_again_recently`]) a further loader
+/// failure is answered with a sentence and no copy: a file that is gone
+/// again after being put back is being removed by something, and copying
+/// 700 MB at every press of Start would hide that. A copy that FAILED
+/// leaves no record, so the sentence never claims a copy that was not made.
+///
+/// WHAT IS COPIED. The files the list finds missing or wrong, when the
 /// package is the same build ([`check_and_repair`]). Otherwise the whole
 /// engine, which also asks the copied btxd for its version.
 pub fn answer_loader_failure(
@@ -735,6 +781,7 @@ pub fn answer_loader_failure(
     datadir: &Path,
     loader: &LoaderFailure,
     now_secs: u64,
+    app_version: &str,
 ) -> Result<String, String> {
     let named = loader.file.as_deref();
     let damaged = damage_now(install_root, package)
@@ -744,19 +791,20 @@ pub fn answer_loader_failure(
     let Some(package) = package else {
         return Err(say(MissingFileCase::OtherEngine));
     };
+    let package_listing = list_tree(package).unwrap_or_default();
+    let vouched_for = read_manifest(install_root).is_some_and(|m| m.from_package);
+    let differs_from_package =
+        !vouched_for && !damage_against(install_root, &package_listing).is_empty();
     let ours = match named {
-        Some(name) => list_tree(package)
-            .map(|listing| package_has_file_named(&listing, name))
-            .unwrap_or(false),
-        None => !damaged.is_empty(),
+        Some(name) => package_has_file_named(&package_listing, name),
+        None => !damaged.is_empty() || differs_from_package,
     };
     if !ours {
         return Err(say(MissingFileCase::NotOurs));
     }
-    if copied_again_recently(install_root, now_secs) {
+    if copied_again_recently(install_root, now_secs, app_version) {
         return Err(say(MissingFileCase::StillFailing));
     }
-    note_copied_again(install_root, now_secs);
     // The small copy first, where it applies: the same build, files gone.
     // Not on macOS, where it has not been run (see `NotCopied::MacOs`).
     let small = !damaged.is_empty() && !cfg!(target_os = "macos");
@@ -768,7 +816,10 @@ pub fn answer_loader_failure(
         _ => crate::installer::reinstall_engine_tree(package, install_root, datadir),
     };
     match copied {
-        Ok(()) => Ok(say(MissingFileCase::Repairing)),
+        Ok(()) => {
+            note_copied_again(install_root, now_secs, app_version);
+            Ok(say(MissingFileCase::Repairing))
+        }
         Err(e) => Err(say(MissingFileCase::RepairFailed(&e.to_string()))),
     }
 }
@@ -778,6 +829,18 @@ mod tests {
     use super::*;
 
     const NOW: u64 = 1_800_000_000;
+    const APP: &str = "0.8.1";
+
+    /// [`answer_loader_failure`] as this version of the app asks it.
+    fn answer(
+        package: Option<&Path>,
+        install_root: &Path,
+        datadir: &Path,
+        loader: &LoaderFailure,
+        now_secs: u64,
+    ) -> Result<String, String> {
+        answer_loader_failure(package, install_root, datadir, loader, now_secs, APP)
+    }
 
     fn write(root: &Path, rel: &str, bytes: &[u8]) {
         let p = join_rel(root, rel);
@@ -1168,8 +1231,7 @@ mod tests {
         // Wrong bytes at the right size would show a whole-engine copy.
         std::fs::write(join_rel(&install, "bin/btxd"), b"ENGINX").unwrap();
         let unnamed = LoaderFailure { file: None };
-        let said =
-            answer_loader_failure(Some(&pkg), &install, dd.path(), &unnamed, NOW).unwrap_err();
+        let said = answer(Some(&pkg), &install, dd.path(), &unnamed, NOW).unwrap_err();
         assert!(said.contains("all in place"), "{said}");
         assert!(!said.contains("stage"), "{said}");
         assert_eq!(read(&install, "bin/btxd"), b"ENGINX", "copied");
@@ -1180,8 +1242,7 @@ mod tests {
         let system = LoaderFailure {
             file: Some("libcuda.so.1".into()),
         };
-        let said =
-            answer_loader_failure(Some(&pkg), &install, dd.path(), &system, NOW).unwrap_err();
+        let said = answer(Some(&pkg), &install, dd.path(), &system, NOW).unwrap_err();
         assert!(said.contains("needs: libcuda.so.1."), "{said}");
         assert!(said.contains("not to easyNode"), "{said}");
         assert_eq!(read(&install, "bin/btxd"), b"ENGINX", "copied");
@@ -1199,29 +1260,28 @@ mod tests {
         // 1. A file is gone and Windows names nothing: the check names it,
         //    and only it is copied.
         std::fs::remove_file(join_rel(&install, gone)).unwrap();
-        let line = answer_loader_failure(Some(&pkg), &install, dd.path(), &unnamed, NOW).unwrap();
+        let line = answer(Some(&pkg), &install, dd.path(), &unnamed, NOW).unwrap();
         assert!(line.contains(&format!("1 file ({gone})")), "{line}");
         assert_eq!(read(&install, gone), b"PYTHON-RUNTIME");
-        assert!(copied_again_recently(&install, NOW));
+        assert!(copied_again_recently(&install, NOW, APP));
 
         // 2. It is gone again at the next start, the same day, in another
         //    run of the app (nothing here is in memory): no copy.
         std::fs::remove_file(join_rel(&install, gone)).unwrap();
-        let said = answer_loader_failure(Some(&pkg), &install, dd.path(), &unnamed, NOW + 3600)
-            .unwrap_err();
+        let said = answer(Some(&pkg), &install, dd.path(), &unnamed, NOW + 3600).unwrap_err();
         assert!(said.contains("does not copy it again for a day"), "{said}");
         assert!(said.contains(gone), "{said}");
         assert!(!join_rel(&install, gone).exists());
 
         // 3. A day later it is tried again.
         let later = NOW + COPIED_AGAIN_HOLD_SECS;
-        answer_loader_failure(Some(&pkg), &install, dd.path(), &unnamed, later).unwrap();
+        answer(Some(&pkg), &install, dd.path(), &unnamed, later).unwrap();
         assert!(join_rel(&install, gone).exists());
 
         // 4. Or at once after a start that worked.
         std::fs::remove_file(join_rel(&install, gone)).unwrap();
         clear_copied_again(&install);
-        answer_loader_failure(Some(&pkg), &install, dd.path(), &unnamed, later + 60).unwrap();
+        answer(Some(&pkg), &install, dd.path(), &unnamed, later + 60).unwrap();
         assert!(join_rel(&install, gone).exists());
 
         // 5. The loader names an engine file that is there at the right
@@ -1231,16 +1291,185 @@ mod tests {
         let named = LoaderFailure {
             file: Some("libpython3.14.so.1.0".into()),
         };
-        answer_loader_failure(Some(&pkg), &install, dd.path(), &named, later).unwrap();
+        answer(Some(&pkg), &install, dd.path(), &named, later).unwrap();
         assert_eq!(read(&install, "bin/btxd"), b"ENGINE");
         assert!(read_manifest(&install).unwrap().from_package);
 
         // 6. An engine this app carries no copy of: said, with what its own
         //    list shows is gone.
         std::fs::remove_file(join_rel(&install, "bin/btx-cli")).unwrap();
-        let said = answer_loader_failure(None, &install, dd.path(), &unnamed, later).unwrap_err();
+        let said = answer(None, &install, dd.path(), &unnamed, later).unwrap_err();
         assert!(said.contains("does not carry a copy"), "{said}");
         assert!(said.contains("bin/btx-cli"), "{said}");
+    }
+
+    /// The second review's case. A 0.8.0 install (no list) had a cut-off file
+    /// on the day the new app first looked. A cut-off file with bytes left
+    /// in it cannot be told from another build by its size, so the folder
+    /// was adopted and its list holds the cut-off size. The list alone would
+    /// then call the engine whole for ever, and on Windows, where the loader
+    /// names nothing, the app would say "all in place, run sfc". A list
+    /// written from the folder does not get that much trust: on a loader
+    /// failure the folder is compared with the package.
+    #[test]
+    fn a_cut_off_file_adopted_into_the_list_is_still_answered() {
+        // Windows-shaped: no name.
+        let (_tmp, pkg, install) = package_and_install();
+        let dd = tempfile::tempdir().unwrap();
+        std::fs::write(join_rel(&install, "bin/lib/libpython3.14.so.1.0"), b"PYTH").unwrap();
+        assert!(matches!(
+            check(&pkg, &install, Mode::Repair),
+            Check::Adopted {
+                other_build: true,
+                ..
+            }
+        ));
+        assert_eq!(check(&pkg, &install, Mode::Repair), Check::Complete);
+        let unnamed = LoaderFailure { file: None };
+        let line = answer(Some(&pkg), &install, dd.path(), &unnamed, NOW).unwrap();
+        assert!(line.contains("starting once more"), "{line}");
+        assert_eq!(
+            read(&install, "bin/lib/libpython3.14.so.1.0"),
+            b"PYTHON-RUNTIME"
+        );
+        // The whole engine, so the list is now an install's, and recorded.
+        assert!(read_manifest(&install).unwrap().from_package);
+        assert!(copied_again_recently(&install, NOW, APP));
+        // After that copy the list is vouched for: a further failure that
+        // names nothing, with all in place, is the system's.
+        clear_copied_again(&install);
+        let said = answer(Some(&pkg), &install, dd.path(), &unnamed, NOW).unwrap_err();
+        assert!(said.contains("all in place"), "{said}");
+
+        // The same with no list at all (the check never ran, or only
+        // reported): compared with the package, not passed as whole.
+        let (_tmp, pkg, install) = package_and_install();
+        std::fs::write(join_rel(&install, "bin/btx-cli"), b"CL").unwrap();
+        answer(Some(&pkg), &install, dd.path(), &unnamed, NOW).unwrap();
+        assert_eq!(read(&install, "bin/btx-cli"), b"CLI");
+
+        // Linux-shaped: the loader names the cut-off file.
+        let (_tmp, pkg, install) = package_and_install();
+        std::fs::write(join_rel(&install, "bin/lib/libpython3.14.so.1.0"), b"PYTH").unwrap();
+        check(&pkg, &install, Mode::Repair);
+        let named = LoaderFailure {
+            file: Some("libpython3.14.so.1.0".into()),
+        };
+        answer(Some(&pkg), &install, dd.path(), &named, NOW).unwrap();
+        assert_eq!(
+            read(&install, "bin/lib/libpython3.14.so.1.0"),
+            b"PYTHON-RUNTIME"
+        );
+
+        // And a healthy install whose list an install of this app wrote is
+        // never second-guessed against a package of another build.
+        let (_tmp, pkg, install) = package_and_install();
+        write_manifest(&install, true, &list_tree(&pkg).unwrap()).unwrap();
+        write(&pkg, "bin/btxd", b"ENGINE-OTHER-BUILD");
+        let said = answer(Some(&pkg), &install, dd.path(), &unnamed, NOW).unwrap_err();
+        assert!(said.contains("all in place"), "{said}");
+        assert_eq!(read(&install, "bin/btxd"), b"ENGINE");
+    }
+
+    /// An EMPTY file where the package's is not is a cut-off file on any
+    /// build. It is never written into a list as healthy.
+    #[test]
+    fn an_empty_file_is_damage_and_never_another_build() {
+        // The same build otherwise: put back, or reported under a node.
+        let (_tmp, pkg, install) = package_and_install();
+        std::fs::write(join_rel(&install, "bin/btx-cli"), b"").unwrap();
+        let Check::Found { damage, why } = check(&pkg, &install, NODE_RUNNING) else {
+            panic!("an empty file passed, or was copied under a running node");
+        };
+        assert_eq!(damage.wrong_size, ["bin/btx-cli"]);
+        assert_eq!(why, NotCopied::NodeRunning);
+        assert!(read_manifest(&install).is_none());
+        assert_eq!(check(&pkg, &install, Mode::Repair), Check::Repaired(damage));
+        assert_eq!(read(&install, "bin/btx-cli"), b"CLI");
+
+        // Another build with an empty file in it: nothing is copied, and no
+        // list is written that would vouch for it.
+        let (_tmp, pkg, install) = package_and_install();
+        write(&pkg, "bin/btxd", b"ENGINE-OTHER-BUILD");
+        std::fs::write(join_rel(&install, "bin/btx-cli"), b"").unwrap();
+        for _ in 0..2 {
+            let Check::Found { damage, why } = check(&pkg, &install, Mode::Repair) else {
+                panic!("an empty file was adopted");
+            };
+            assert_eq!(damage.wrong_size, ["bin/btx-cli"]);
+            assert_eq!(why, NotCopied::OtherBuild);
+            assert!(read_manifest(&install).is_none());
+            assert_eq!(read(&install, "bin/btx-cli"), b"");
+        }
+        // The loader's failure then gets the whole engine.
+        let dd = tempfile::tempdir().unwrap();
+        answer(
+            Some(&pkg),
+            &install,
+            dd.path(),
+            &LoaderFailure { file: None },
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(read(&install, "bin/btx-cli"), b"CLI");
+        assert_eq!(read(&install, "bin/btxd"), b"ENGINE-OTHER-BUILD");
+
+        // A file that is empty in the package too is simply an empty file.
+        let (_tmp, pkg, install) = package_and_install();
+        write(&pkg, "bin/lib/python3.14/empty.py", b"");
+        write(&install, "bin/lib/python3.14/empty.py", b"");
+        assert!(matches!(
+            check(&pkg, &install, Mode::Repair),
+            Check::Adopted {
+                other_build: false,
+                ..
+            }
+        ));
+    }
+
+    /// The record says "the app copied the engine again", so it is written
+    /// only when it did; it is this version's; and it cannot hold for ever.
+    #[test]
+    fn the_copy_record_is_written_after_a_copy_that_worked_and_can_expire() {
+        let (_tmp, pkg, install) = package_and_install();
+        let dd = tempfile::tempdir().unwrap();
+        let unnamed = LoaderFailure { file: None };
+        check(&pkg, &install, Mode::Repair);
+        // A copy that cannot be made: a file sits where a folder has to be.
+        let enc = "bin/lib/python3.14/encodings";
+        std::fs::remove_dir_all(join_rel(&install, enc)).unwrap();
+        std::fs::write(join_rel(&install, enc), b"in the way").unwrap();
+        let said = answer(Some(&pkg), &install, dd.path(), &unnamed, NOW).unwrap_err();
+        assert!(said.contains("did not work"), "{said}");
+        assert!(!install.join(COPIED_AGAIN_NAME).exists());
+        // So the next failure is not told that a copy was made: it tries.
+        let again = answer(Some(&pkg), &install, dd.path(), &unnamed, NOW + 60).unwrap_err();
+        assert!(again.contains("did not work"), "{again}");
+        assert!(!again.contains("does not copy it again"), "{again}");
+
+        // With the way clear the copy works and is recorded.
+        std::fs::remove_file(join_rel(&install, enc)).unwrap();
+        answer(Some(&pkg), &install, dd.path(), &unnamed, NOW + 120).unwrap();
+        let at = NOW + 120;
+        assert!(copied_again_recently(&install, at, APP));
+        assert!(copied_again_recently(
+            &install,
+            at + COPIED_AGAIN_HOLD_SECS - 1,
+            APP
+        ));
+        assert!(!copied_again_recently(
+            &install,
+            at + COPIED_AGAIN_HOLD_SECS,
+            APP
+        ));
+        // Another version of the app is not held by it.
+        assert!(!copied_again_recently(&install, at, "0.8.2"));
+        // A record from the future (the clock was set ahead, then back)
+        // does not hold.
+        assert!(!copied_again_recently(&install, at - 1, APP));
+        // Nor does a record that does not read as one.
+        std::fs::write(install.join(COPIED_AGAIN_NAME), b"1800000000").unwrap();
+        assert!(!copied_again_recently(&install, 1_800_000_001, APP));
     }
 
     /// Files are gone and the package is another build: file by file would
@@ -1254,7 +1483,7 @@ mod tests {
         write(&pkg, "bin/btx-cli", b"CLI-OTHER");
         std::fs::remove_file(join_rel(&install, "bin/btx-cli")).unwrap();
         let unnamed = LoaderFailure { file: None };
-        answer_loader_failure(Some(&pkg), &install, dd.path(), &unnamed, NOW).unwrap();
+        answer(Some(&pkg), &install, dd.path(), &unnamed, NOW).unwrap();
         assert_eq!(read(&install, "bin/btxd"), b"ENGINE-OTHER-BUILD");
         assert_eq!(read(&install, "bin/btx-cli"), b"CLI-OTHER");
         assert!(installed_matches(&install, &list_tree(&pkg).unwrap()));
@@ -1279,7 +1508,7 @@ mod tests {
         let loader = LoaderFailure {
             file: Some("libpython3.14.so.1.0".into()),
         };
-        answer_loader_failure(Some(&pkg), &install, dd.path(), &loader, NOW).unwrap();
+        answer(Some(&pkg), &install, dd.path(), &loader, NOW).unwrap();
         assert_eq!(
             std::fs::read_to_string(join_rel(&install, "bin/btxd")).unwrap(),
             script("v0.34.16")
@@ -1289,8 +1518,7 @@ mod tests {
         // refused and the sentence carries the reason.
         clear_copied_again(&install);
         std::fs::write(&btxd, script("v0.34.15")).unwrap();
-        let said =
-            answer_loader_failure(Some(&pkg), &install, dd.path(), &loader, NOW).unwrap_err();
+        let said = answer(Some(&pkg), &install, dd.path(), &loader, NOW).unwrap_err();
         assert!(said.contains("did not work"), "{said}");
         assert!(said.contains("v0.34.16"), "{said}");
     }
@@ -1414,7 +1642,7 @@ mod tests {
         assert_eq!(loader.file.as_deref(), Some("libpython3.14.so.1.0"));
         assert_eq!(code, Some(EXIT_COULD_NOT_LOAD));
 
-        let line = answer_loader_failure(Some(&pkg), &install, &home, &loader, NOW).unwrap();
+        let line = answer(Some(&pkg), &install, &home, &loader, NOW).unwrap();
         println!("{line}");
         let (code, said) = run();
         assert_eq!(code, Some(0), "{said}");

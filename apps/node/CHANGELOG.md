@@ -13,7 +13,7 @@ root).
 Windows, where it used to be a handful. If one of them goes missing (antivirus
 software removing `python314.dll` is the usual way), the node could not start,
 every start failed the same way, and all the app said was "the engine printed
-no error line, and it exited with code -1073741515". Three things change:
+no error line, and it exited with code -1073741515". Four things change:
 
 - When the node is started, the app checks that each engine file is there
   and has the size it should. That is one look at each file, about a
@@ -22,18 +22,21 @@ no error line, and it exited with code -1073741515". Three things change:
   the engine, and `setup.log` says which. It copies only when no node is
   running from that folder, and only when the app carries the same build of
   the engine as the one installed: an engine that is merely another build is
-  left exactly as it is. On a Mac the check reports and copies nothing yet.
+  left exactly as it is. A file that was already cut off when this version
+  first looked can pass as another build; that case is caught by the next
+  point. On a Mac the check reports and copies nothing yet.
 - If the engine still ends because the system could not load one of its own
   files, the app copies the engine again once and starts once more. If a
   start ends the same way after that, it says so, with the file's name where
   the system gives one and the folder to allow in antivirus software, and
-  does not copy again for a day or until a start has worked. Your chain data
-  is not affected by any of this.
+  does not copy again for a day, or until a start has worked or the app has
+  been updated. Your chain data is not affected by any of this.
 - If the file that could not be loaded is not one of the engine's, nothing
   is copied. On Linux and macOS the system names the file and the app
-  repeats the name. Windows never names it, so there the app says that the
-  engine's own files are all in place and the missing file is one of
-  Windows' own.
+  repeats the name. Windows never names it, so there the app first makes
+  sure the engine's own files are all in place (against its own copy of the
+  engine, for an install this version did not make itself) and only then
+  says that the missing file is one of Windows' own.
 - On Windows a missing engine file can no longer leave the node waiting
   behind a "the code execution cannot proceed" box that nobody is there to
   close.

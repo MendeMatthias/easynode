@@ -2353,6 +2353,7 @@ async fn answer_engine_loader_failure(
             &dd,
             &loader,
             now_secs,
+            env!("CARGO_PKG_VERSION"),
         )
     })
     .await

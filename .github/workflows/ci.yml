@@ -147,15 +147,27 @@ jobs:
   # branch and the path handling (backslashes, `.exe`, rename-over-open-file)
   # were first compiled at release time.
   #
-  # Both crates, the same two commands as on the other systems. No engine is
-  # staged, so the tests that need a real btxd.exe stay ignored here, among
-  # them `a_real_windows_engine_with_a_dll_removed_exits_instead_of_waiting`:
-  # that one is run by hand against the engine the installer workflow pins.
+  # Both crates, the same two commands as on the other systems.
+  #
+  # One test needs a real btxd.exe and is `#[ignore]` for that reason:
+  # `a_real_windows_engine_with_a_dll_removed_exits_instead_of_waiting`, the
+  # only test of the error-mode call and of the exit code Windows really
+  # gives. The last step runs it against the engine build that
+  # node-win-installer.yml pins (the run id and artifact name are read from
+  # that file, so they move with the pin), with python314.dll taken away.
+  # An artifact expires after 90 days, and a pull request from a fork may
+  # not read another run's artifacts: when it cannot be fetched the step
+  # says so with a warning and the job stays green, because an expired
+  # artifact says nothing about the pull request. The step's log line
+  # "ran against the pinned engine" is the proof that it ran.
   # ---------------------------------------------------------------------------
   windows:
     name: windows (btx-core and tauri shell, check and test)
     runs-on: windows-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
     defaults:
       run:
         shell: bash
@@ -186,3 +198,29 @@ jobs:
       - name: tauri shell (test)
         working-directory: apps/node/src-tauri
         run: cargo test --locked
+      - name: The real engine with a DLL removed (when the pinned build can be fetched)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          wf=.github/workflows/node-win-installer.yml
+          rid="$(sed -n 's/^  PROVEN_BTXD_RUN_ID: "\([0-9]*\)"$/\1/p' "$wf")"
+          art="$(sed -n 's/^  PROVEN_BTXD_ARTIFACT: "\([A-Za-z0-9._-]*\)"$/\1/p' "$wf")"
+          if [ -z "$rid" ] || [ -z "$art" ]; then
+            echo "::error::could not read the pinned engine run and artifact from $wf"
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/pinned-engine"
+          if ! gh run download "$rid" -R "$GITHUB_REPOSITORY" -n "$art" -D "$dir"; then
+            echo "::warning::the pinned engine artifact $art (run $rid) could not be fetched; the real-engine test did not run"
+            exit 0
+          fi
+          test -f "$dir/btxd.exe"
+          # Whole first: the test below must fail on the missing DLL and on
+          # nothing else.
+          "$dir/btxd.exe" --version | head -1
+          rm "$dir/python314.dll"
+          cd crates/btx-core
+          EASYNODE_TEST_BTXD_MISSING_DLL="$(cygpath -w "$dir/btxd.exe")" \
+            cargo test --locked --lib engine_files::tests::a_real_windows -- --ignored --nocapture
+          echo "ran against the pinned engine: $art (run $rid)"
