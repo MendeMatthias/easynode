@@ -8,6 +8,8 @@ root).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-25 · linux + windows (no mac build; the mac stays on the version it has)
+
 **The node engine moves to BTX 0.34.16, upstream's newest final release.
 Nothing about how your node runs changes.** 0.34.16 changes none of the
 network's rules: the same blocks are valid, no new rule starts at any height,
@@ -43,6 +45,12 @@ produces the same one.
 
 **Why 0.34.16 and not 0.34.17.** 0.34.17 is a pre-release that upstream has
 replaced several times. easyNode ships engines upstream calls final.
+
+**This release is for Linux and Windows. The Mac stays on the version it
+has.** Upstream published no Mac build of 0.34.16, so the Mac's engine has to
+be built from source first, and a Mac release follows when that is done. A
+Mac node loses nothing while it waits: 0.34.15 and 0.34.16 follow the same
+rules and the same chain.
 
 **You can count your node in the network's totals.** easybtx.com can now say
 how much the easyNode network uploads to other nodes, over the last day, the

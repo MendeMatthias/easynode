@@ -33,7 +33,7 @@ rc, while the network is calm.
 | 0.35 work | As of 10-29, not read again for v3: `btx-035/lab`, `btx-035/swarm`, `btx-035/atlas-native`, `btx-035/model-security-v2`, merging toward a 0.35 final that has no tag. Parts of it shipped in 0.34.16 instead (below). |
 | 0.34.16 | v2 said "**Will not exist**" (numair, 10-25, Telegram #1924). It shipped 13 days later, with 1,419 commits since 0.34.15. An announcement is not a release plan: **read the tags.** |
 | 0.35 ETA | Jpp, 10-25: "2 weeks max", so about Nov 8. Not met; 0.34.16 and 0.34.17 came instead. No date today. |
-| Who pins what | easyNode 0.7.16 ships v0.34.15 (`476f3f23`); its move to 0.34.16 is in pull requests on 2026-11-25. AInode's app pins 0.34.16 since 0.9.0, and its public host runs 0.34.16 since 11-20, while `host/remote-setup.sh` and `host/vast/vast-host.sh` still install 0.34.15. |
+| Who pins what | easyNode 0.7.16 ships v0.34.15 (`476f3f23`); 0.8.0 (Linux and Windows, 2026-11-25) moves to v0.34.16 (`074dac16`), and the Mac stays on 0.34.15 until its engine is built from source. AInode's app pins 0.34.16 since 0.9.0, and its public host runs 0.34.16 since 11-20, while `host/remote-setup.sh` and `host/vast/vast-host.sh` still install 0.34.15. |
 | Stale doc | The btx repo's CLAUDE.md said "0.34.9-dev, last tag v0.34.8" on 10-29. Do not take the version from prose; `CMakeLists.txt` at `074dac16` says 0.34.16. |
 
 ### Must-know before touching anything

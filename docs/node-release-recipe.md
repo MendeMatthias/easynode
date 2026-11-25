@@ -1281,10 +1281,9 @@ only: a checkout of this repo, a clone of btxchain/btx with tags, CUDA 13.3
 glibc the fleet runs (22.04, glibc 2.35); the official Linux binaries need
 2.38 and will not run there, which is why we build at all.
 
-Two things changed since those runs. From engine v0.34.16 the configure step
-also needs Python 3.11 or newer with its development files and the
-`cryptography` and `sqlite3` modules (`cmake/SwapNet.cmake`; 22.04 ships
-Python 3.10, so it has to be added). And that WSL machine now runs the
+Two things changed since those runs. From engine v0.34.16 btxd embeds Python:
+step 1 has what the build needs for that, and step 4 what the package must
+then carry. And that WSL machine now runs the
 project's signing node in the same VM: build the engine in CI
 (`btxd-linux.yml`) rather than there, where a full build competes with the
 signer for memory.
@@ -1302,7 +1301,7 @@ signer for memory.
    # 09-23:  84b998b4f3272775aaf8c241ac11dc683f4c4e23 (upstream tag v0.34.9, #117)
    # 0.7.0:  5f32c4c4d1cb033180bcd40a461deae2c1bc1ee1 (upstream tag v0.34.12)
    # 0.7.8:  476f3f23e15228bb3e6119ed1e139a9b25424ce8 (upstream tag v0.34.15)
-   # next:   074dac167c26c1e091198f691ed5727817dba88a (v0.34.16; the tag moved
+   # 0.8.0:  074dac167c26c1e091198f691ed5727817dba88a (v0.34.16; the tag moved
    #         once, so check out the SHA, never `v0.34.16`)
    cd ~/btx-ship
    cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -1323,6 +1322,33 @@ signer for memory.
    `BUILD_GIT_SOURCE_TREE_FINGERPRINT` equals the tag's seal in
    `build/src/bitcoin-build-info.h` before going further (0.6.18's engine:
    `BUILD_GIT_COMMIT "9eb4e0050e08"`, fingerprint `a7bf4bd74375b269…`).
+
+   **From v0.34.16 the engine embeds Python**, for its SwapNet worker, and
+   there is no switch to leave it out: `cmake/SwapNet.cmake` requires Python
+   3.11 or newer with its development files and the `cryptography` and
+   `sqlite3` modules. btxd links libpython also when it is started with
+   `-swapnet=0`, which is how easyNode starts it. 22.04's own Python is 3.10,
+   and FindPython3 left to itself takes `/usr/bin/python3` and stops the
+   configure. `btxd-linux.yml` is the worked example; by hand it is four
+   things:
+
+   * The interpreter the release was built on: CPython 3.14.10
+     (`ENGINE_PYTHON_VERSION` in `btxd-linux.yml`, which also pins that
+     build's `libpython3.14.so.1.0` by sha256). It has to be a build with a
+     shared libpython and headers under one prefix, because that prefix is
+     what gets bundled.
+   * The pinned modules, installed into it by hash and never compiled:
+     `<python> -I -m pip install --require-hashes --only-binary :all: -r apps/node/scripts/lib/engine-python-requirements.txt`.
+     That is cryptography 46.0.4, the version upstream tested the worker with
+     (`contrib/swapnet/requirements-tested-runtime.txt` at the pin), and what
+     it needs.
+   * Three more arguments on the cmake line above:
+     `-DPython3_EXECUTABLE=<python> -DPython3_ROOT_DIR=<its prefix> -DPython3_FIND_STRATEGY=LOCATION`.
+   * `export LD_LIBRARY_PATH=<its prefix>/lib` for the configure, for ninja,
+     and for any run of `build/bin/btxd` before it is staged. The build
+     output's run path is `$ORIGIN/../lib`, which in a build directory holds
+     no libpython. The staged package gets no such help and must not need it
+     (step 4).
 
    Two traps hit on 2026-09-05 that the staging script's header already warns
    about and that still cost two failed configures: `cmake` on the WSL box is
@@ -1353,7 +1379,11 @@ signer for memory.
    tree, cuobjdump lists every pinned architecture (sm_75/86/89/120, plus
    upstream's own sm_100; the vendored cuBLASLt contributes more, nine in all
    on 0.6.18), and both engine guards exit
-   0 with their OK text actually read.
+   0 with their OK text actually read. From v0.34.16 also: the package holds
+   `bin/lib/libpython3.14.so.1.0` and `bin/lib/python3.14` with `cryptography`
+   in it (746 files in the 0.8.0 engine), and btxd starts from the extracted
+   bundle with an EMPTY environment (`env -i`), so nothing on the build
+   machine lends it a Python.
 
 5. The test that catches what clean rooms cannot: upgrade a REAL datadir
    from the mirror era. The engine persists settings in the datadir's
