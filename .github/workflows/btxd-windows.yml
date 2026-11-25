@@ -439,12 +439,14 @@ jobs:
       #   util/fs.h:173: static assertion failed: PathToString not implemented
       #   on this platform
       # That was the ONLY error of the first 0.34.16 build (run 45509105010,
-      # with `make -k`). One line fixes it: link core_interface, as every
-      # sibling target does. It is appended, not edited in place, so a change to
-      # upstream's own line cannot half-apply it, and it is skipped the day
-      # upstream links core_interface itself. Worth reporting upstream: the
-      # three engine files are also the only ones compiled without the tree's
-      # hardening flags.
+      # with `make -k`). One line fixes it: give the engine core_interface's
+      # compile requirements, which every sibling target gets by linking it.
+      # $<COMPILE_ONLY:...> (CMake 3.27) because the engine needs the
+      # definitions and flags, not another entry on btxd's link line. The line
+      # is appended, not edited in place, so a change to upstream's own line
+      # cannot half-apply it, and it is skipped the day upstream links
+      # core_interface itself. Worth reporting upstream: the three engine files
+      # are also the only ones compiled without the tree's hardening flags.
       - name: Give the SwapNet engine the tree's compile definitions (upstream slip)
         if: steps.swapnet.outputs.embedded == 'true'
         working-directory: btx
@@ -458,7 +460,7 @@ jobs:
           grep -q '^add_library(btx_swapnet_engine STATIC' "$f" || {
             echo "::error::btx_swapnet_engine is no longer defined in $f; re-check this patch"; exit 1; }
           printf '\n# Added by easyBTX CI (btxd-windows.yml): see the step that writes this.\n' >> "$f"
-          printf 'target_link_libraries(btx_swapnet_engine PRIVATE core_interface)\n' >> "$f"
+          printf 'target_link_libraries(btx_swapnet_engine PRIVATE $<COMPILE_ONLY:core_interface>)\n' >> "$f"
           tail -4 "$f"
 
       # WITH_MODELNET=OFF, as on Linux and macOS. 0.34.7 made the Native Model
@@ -466,6 +468,21 @@ jobs:
       # error without OpenSSL 3.5, which the depends tree does not build for
       # mingw. The app never uses the model plane, and OFF also removes the
       # `-modelnet` option, so nothing may pass -modelnet=0 to this btxd.
+      #
+      # APPEND_LDFLAGS=-lws2_32 -liphlpapi, for trees whose archive group covers
+      # MinGW. 0.34.16 widened target_link_btx_linux_archive_group from
+      # `UNIX AND NOT APPLE` to `(UNIX AND NOT APPLE) OR MINGW`, so btxd.exe is
+      # now linked as --start-group <btx archives> --end-group followed by the
+      # outside libraries. libminiupnpc.a is one of those and needs inet_pton,
+      # but nothing names ws2_32 after it, and GNU ld reads archives once, left
+      # to right:
+      #   libminiupnpc.a(minissdpc.c.obj): undefined reference to `__imp_inet_pton'
+      # (run 45512052613, the only error left once everything compiled).
+      # Upstream's own MinGW builds have the model network ON, and
+      # bitcoin_modelnet puts ws2_32 at the end of the line, which is why this
+      # only shows with WITH_MODELNET=OFF. APPEND_LDFLAGS is the tree's own knob
+      # for "at the very end of the link line". 0.34.15 linked without the
+      # group, so it does not get the flag.
       #
       # `-- -k` keeps make going past the first failing file. A bring-up on a
       # new upstream tag used to cost one 50 minute run per error (the 0.33.2
@@ -487,14 +504,30 @@ jobs:
               -DEASYBTX_WINPY_IMPLIB="$w/libpython$xy.dll.a"
             )
           fi
+          link_args=()
+          if grep -q 'if((UNIX AND NOT APPLE) OR MINGW)' src/CMakeLists.txt; then
+            link_args=(-DAPPEND_LDFLAGS="-lws2_32 -liphlpapi")
+          fi
           cmake -B build-win --toolchain depends/x86_64-w64-mingw32/toolchain.cmake \
             -DBUILD_DAEMON=ON -DBUILD_CLI=ON -DBUILD_UTIL=OFF -DBUILD_TX=OFF \
             -DBUILD_WALLET_TOOL=OFF -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_TESTS=OFF \
             -DENABLE_WALLET=ON -DWITH_SQLITE=ON -DWARN_INCOMPATIBLE_BDB=OFF \
             -DWITH_MODELNET=OFF \
             -DAPPEND_CPPFLAGS="-DNO_STRICT -I$(pwd)/win-compat" \
-            "${python_args[@]}"
+            "${python_args[@]}" "${link_args[@]}"
           cmake --build build-win -j"$(nproc)" -- -k
+
+      # The order of btxd.exe's link line, also after a failed build. A wrong
+      # order is the usual way a mingw link of this tree breaks (GNU ld reads
+      # each archive once), and the make output does not show the command.
+      - name: Show the btxd link order
+        if: always()
+        working-directory: btx
+        run: |
+          f=build-win/src/CMakeFiles/btxd.dir/link.txt
+          if [ ! -f "$f" ]; then echo "no $f (configure did not get that far)"; exit 0; fi
+          tr ' ' '\n' < "$f" | grep -nE '(^-l|\.a$|-Wl,--(start|end)-group)' \
+            | sed -E 's#[^:]*/##' || true
 
       - name: Collect binaries + sha256
         working-directory: btx
