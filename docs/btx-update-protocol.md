@@ -248,7 +248,9 @@ section against the tag when a 0.35 final exists.
    (until 2026-11-25 it read `host/` from `ainode`, where those files no longer are, and so
    listed them as unreadable instead of as pins). It names every engine hash and commit against upstream's real
    release digests, asks upstream itself which commit each tag names, and ends with a
-   `STILL TO MOVE` list; it exits 1 while a hash or commit pin is on another release. It runs
+   `STILL TO MOVE` list; it exits 1 while a hash or commit pin is on another release, and also
+   when a pin file did not read or a repo is not cloned (`--allow-missing` accepts the latter on a
+   machine without every clone), so a clean result never means "not looked at". It runs
    without `gh` (curl, and a token only for the private repo). On 2026-11-25, with easyNode's
    `main` still on 0.34.15, `--target v0.34.16` lists 10 pins: easyNode's commit pin, two archive
    hashes in its download staging scripts, five workflow pins, and AInode's
