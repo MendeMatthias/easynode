@@ -35,6 +35,8 @@ export type SwarmCard = {
     | "fetching"
     | "fetch_failed"
     | "engine_missing"
+    | "engine_damaged"
+    | "engine_start_failed"
     | "starts_next_start"
     | "stops_next_start"
     | "node_stopped"
@@ -147,6 +149,22 @@ export function swarmView(c: SwarmCard): SwarmView {
         attention: true,
         desc: "On, but the swarm engine is not installed, so your node runs on its usual engine. Switch the swarm off and on to fetch it.",
       };
+    case "engine_damaged":
+      // `why` is the count and the first names: "2 files (bin/a, bin/b)".
+      return {
+        ...base,
+        attention: true,
+        desc: `The swarm engine on this computer was found damaged: ${c.why || "some of its files are"} missing or the wrong size. Your node is running on its usual engine. Switch the swarm off and on to fetch the swarm engine again.`,
+      };
+    case "engine_start_failed": {
+      // The reason is the start's own error, which may end in a full stop.
+      const why = c.why.trim().replace(/[.\s]+$/, "");
+      return {
+        ...base,
+        attention: true,
+        desc: `The swarm engine failed${why ? ` (${why})` : ""}. Your node is running on its usual engine. Switch the swarm off and on to try again.`,
+      };
+    }
     case "starts_next_start":
       return { ...base, desc: "On at the next node start. It will only observe: nothing is served, downloaded or earned." };
     case "node_stopped":

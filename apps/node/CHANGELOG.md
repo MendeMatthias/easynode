@@ -30,6 +30,15 @@ network)", under Helping the network.
   nothing is installed, your node keeps running on its usual engine and the
   row says why. Switching the swarm off restarts your node on its usual
   engine.
+- **If the swarm engine fails, your node goes back to its usual engine by
+  itself.** A swarm engine that does not start, or that stops with an error
+  while it runs, is set aside: your node starts again on its usual engine and
+  stays on it, also after the app is closed and opened again. The row says
+  why. Switching the swarm off and on tries the swarm engine again.
+- **A damaged swarm engine is said, not hidden.** If files of the swarm
+  engine are missing or cut off, the row says how many and names the first
+  ones, your node runs on its usual engine, and switching the swarm off and
+  on fetches the engine again.
 - **On means observing only.** Your node listens on port 29447, which other
   computers can reach, looks for other nodes on your local network, and shows
   what it finds. It serves no model files, downloads none (the engine's own

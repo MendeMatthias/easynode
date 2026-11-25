@@ -75,6 +75,41 @@ describe("the Swarm row", () => {
     expect(swarmView(card({ wanted: true, state: "engine_missing" })).desc).toContain("runs on its usual engine");
   });
 
+  it("says a swarm engine that failed, why, and that the node runs on its usual engine", () => {
+    const why = "the node kept exiting right after launch: Error: x. See easybtx-node.log in /home/a/.easybtx for details.";
+    const v = swarmView(card({ wanted: true, state: "engine_start_failed", why }));
+    expect(v).toMatchObject({ checked: true, disabled: false, attention: true, lines: [] });
+    expect(v.desc).toBe(
+      "The swarm engine failed (the node kept exiting right after launch: Error: x. See easybtx-node.log in /home/a/.easybtx for details). " +
+        "Your node is running on its usual engine. Switch the swarm off and on to try again.",
+    );
+    // No reason on record: no empty brackets.
+    expect(swarmView(card({ wanted: true, state: "engine_start_failed" })).desc).toBe(
+      "The swarm engine failed. Your node is running on its usual engine. Switch the swarm off and on to try again.",
+    );
+  });
+
+  it("says a damaged swarm engine, which files, and how to fetch it again", () => {
+    const v = swarmView(card({ wanted: true, state: "engine_damaged", why: "2 files (bin/btx-modeld, bin/btxd)" }));
+    expect(v).toMatchObject({ checked: true, disabled: false, attention: true, lines: [] });
+    expect(v.desc).toBe(
+      "The swarm engine on this computer was found damaged: 2 files (bin/btx-modeld, bin/btxd) missing or the wrong size. " +
+        "Your node is running on its usual engine. Switch the swarm off and on to fetch the swarm engine again.",
+    );
+    expect(swarmView(card({ wanted: true, state: "engine_damaged" })).desc).toContain(
+      "found damaged: some of its files are missing or the wrong size.",
+    );
+    // Not the sentence for an engine that was never installed.
+    expect(v.desc).not.toBe(swarmView(card({ wanted: true, state: "engine_missing" })).desc);
+  });
+
+  it("uses no long dashes and no runs of spaces in the two new sentences", () => {
+    for (const state of ["engine_damaged", "engine_start_failed"] as const) {
+      const d = swarmView(card({ wanted: true, state, why: "1 file (bin/btxd)" })).desc;
+      expect(d).not.toMatch(/\u2014|\u2013| {2}/);
+    }
+  });
+
   it("reads an empty swarm as normal, never as a fault", () => {
     const v = swarmView(card({ wanted: true, state: "observing", report: report() }));
     expect(v.attention).toBe(false);

@@ -826,6 +826,16 @@ fn slot_child_gone(slot: &tokio::sync::Mutex<Option<NodeController>>) -> bool {
     }
 }
 
+/// How the spawned engine ended, when it ended badly: by a signal, or with a
+/// code other than 0. `None` while it runs, after a clean exit (a stop asked
+/// for from outside the app, `btx-cli stop`, ends with 0), and while the slot
+/// is held.
+fn slot_child_crashed(slot: &tokio::sync::Mutex<Option<NodeController>>) -> Option<String> {
+    let mut guard = slot.try_lock().ok()?;
+    let status = guard.as_mut()?.exit_status()?;
+    (!status.success()).then(|| btx_core::node::describe_exit(status))
+}
+
 /// Hold the spawned engine at normal priority for a step that must not be
 /// slowed by the background policy (`NodeController::hold_normal_priority`),
 /// with one log line. No child, no hold.
@@ -1319,6 +1329,7 @@ pub(crate) async fn start_node_held(app: &AppHandle, state: &AppState) -> Result
     let datadir = node_datadir();
     crate::read_block_recovery::before_start(&datadir).await?;
     let mut restarts = 0;
+    let mut fell_back = false;
     loop {
         match start_node_once(app, state).await {
             Err(e) if e == crate::read_block_recovery::STEP_TAKEN => {
@@ -1331,6 +1342,11 @@ pub(crate) async fn start_node_held(app: &AppHandle, state: &AppState) -> Result
                     );
                 }
             }
+            // The swarm engine was launched and failed. It is held back by
+            // now (`hold_swarm_engine_back`), so the next pass picks the
+            // default engine and cannot end here again; `fell_back` is the
+            // second fence, so this is one more pass and never a loop.
+            Err(e) if e == SWARM_ENGINE_FELL_BACK && !fell_back => fell_back = true,
             Ok(()) => {
                 crate::read_block_recovery::after_start(app, state);
                 return Ok(());
@@ -1804,10 +1820,33 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     // download leaves the node. The marker says "on" exactly when the swarm
     // engine is the one launched, so the two cannot disagree: the spawn below
     // reads it (`btx_core::swarm::launch_args`).
+    //
+    // Two things keep a switched-on swarm on the default engine, and both are
+    // written to setup.log here so neither happens silently: an install that
+    // was finished once and now has files missing or cut off, and a swarm
+    // engine held back because it failed (`hold_swarm_engine_back`).
+    let swarm_held = swarm_hold(&datadir);
+    if cfg!(target_os = "linux")
+        && settings.swarm_enabled
+        && !(settings.signer_enabled && signer_applies_here)
+    {
+        if let Some((root, damage)) = swarm_engine_damage() {
+            setup_log(&datadir, &swarm_damage_line(&root, &damage));
+        } else if let Some(why) = &swarm_held {
+            setup_log(
+                &datadir,
+                &format!(
+                    "the swarm engine is held back after it failed ({why}); starting on the \
+                     usual engine. Switching the swarm off and on in Settings tries it again"
+                ),
+            );
+        }
+    }
     let swarm_root = swarm_engine_for_launch(
         cfg!(target_os = "linux"),
         settings.swarm_enabled,
         settings.signer_enabled && signer_applies_here,
+        swarm_held.is_some(),
         swarm_engine_installed(),
     );
     if let Err(e) = btx_core::swarm::set_wanted(&datadir, swarm_root.is_some()) {
@@ -1995,8 +2034,36 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
             }
             // A node we spawn is ours by construction.
             *state.attached_to.lock().await = None;
-            spawn_node_with_lock_retry(app, state, &datadir, &paths, &abort_mirror_load.launched)
-                .await?
+            let launched = &abort_mirror_load.launched;
+            let spawned = spawn_node_with_lock_retry(app, state, &datadir, &paths, launched).await;
+            match spawned {
+                Ok(client) => client,
+                // The owner's rule: a node comes back by itself, and never
+                // stays down because the optional engine is broken. This is
+                // the one call that runs an engine, so it is the one place
+                // that knows the swarm engine was run and did not come up:
+                // attaching to a node already serving runs nothing, and what
+                // fails before this line fails on either engine. The swarm
+                // engine is held back in a file, and the start begins again
+                // from the top on the default engine, once
+                // (`start_node_held`). If that start fails too, its error is
+                // the one shown, as before.
+                //
+                // NOT covered here: a swarm engine that starts, answers and
+                // then stays up while misbehaving (a helper that is down, a
+                // node that stops syncing). The card reports the helper; the
+                // node is not moved off the engine for it. One that ends
+                // badly while running is the status refresher's
+                // (`swarm_engine_crash_falls_back`).
+                Err(e) => {
+                    let gpu_holds = GPU_HELD_PID.load(Ordering::SeqCst) != 0;
+                    if falls_back_from_swarm_engine(swarm_root.is_some(), &e, gpu_holds) {
+                        hold_swarm_engine_back(&datadir, &e);
+                        return Err(SWARM_ENGINE_FELL_BACK.to_string());
+                    }
+                    return Err(e);
+                }
+            }
         }
     };
 
@@ -4632,6 +4699,39 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         crate::tray::reflect_phase(&app, &p);
                         // The child is gone; this clears the slot and the
                         // run's state the way Stop does, then the start.
+                        stop_node_inner(&state).await;
+                        let _ = start_node_projected(&app, &state).await;
+                        return;
+                    }
+                    // A swarm engine that started, answered and then ended
+                    // badly (a signal, an exit code other than 0). Without
+                    // this the node would stay down behind "stopped
+                    // responding", and every Start would launch the same
+                    // engine again. It is held back and the node starts
+                    // again by itself on its usual engine, once: the hold
+                    // makes the next launch the default engine's, whose
+                    // marker is off, so this arm cannot be taken twice. A
+                    // clean exit is not this (someone stopped the node), nor
+                    // is a node that is merely silent.
+                    let crashed = slot_child_crashed(&node_slot);
+                    if swarm_engine_crash_falls_back(
+                        btx_core::swarm::wanted(&node_datadir()),
+                        crashed.is_some(),
+                        ours,
+                        stopped,
+                    ) {
+                        hold_swarm_engine_back(
+                            &node_datadir(),
+                            &format!(
+                                "it stopped while the node was running: {}",
+                                crashed.unwrap_or_default()
+                            ),
+                        );
+                        let p = NodePhase::Warming {
+                            message: SWARM_ENGINE_CRASH_RESTART.into(),
+                        };
+                        *phase_slot.lock().await = p.clone();
+                        crate::tray::reflect_phase(&app, &p);
                         stop_node_inner(&state).await;
                         let _ = start_node_projected(&app, &state).await;
                         return;
@@ -7780,22 +7880,135 @@ fn update_signature_ok(public_key: &str, file: &Path, signature: &str) -> Result
 }
 
 /// The engine folder a launch uses for the swarm, or `None` for the default
-/// engine. The swarm engine runs only when all four hold: this is Linux, the
-/// owner switched the swarm on, the node does not sign for mirrors, and a
-/// finished install of the swarm engine is on disk. Anything else launches
-/// the default engine, which is how a failed or missing download, a signer
+/// engine. The swarm engine runs only when all five hold: this is Linux, the
+/// owner switched the swarm on, the node does not sign for mirrors, the swarm
+/// engine is not held back after a failure, and a finished install of it is
+/// on disk. Anything else launches the default engine, which is how a failed
+/// or missing download, a damaged install, an engine that failed, a signer
 /// and another platform all end up: on the engine every install has.
 fn swarm_engine_for_launch(
     linux: bool,
     wanted: bool,
     signs_here: bool,
+    held_back: bool,
     installed_root: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    if linux && wanted && !signs_here {
+    if linux && wanted && !signs_here && !held_back {
         installed_root
     } else {
         None
     }
+}
+
+/// What `start_node_once` returns when the swarm engine was launched and
+/// failed, after holding it back: `start_node_held` reads it as "begin again
+/// from the top", which is then a start on the default engine. Never shown.
+const SWARM_ENGINE_FELL_BACK: &str =
+    "the swarm engine did not start; starting again on the usual engine";
+
+/// What the window shows while the node starts again after a swarm engine
+/// that ended badly while running.
+const SWARM_ENGINE_CRASH_RESTART: &str =
+    "The swarm engine stopped. Starting your node again on its usual engine…";
+
+/// What a start says when a Stop or Quit ended it. Not a failure of any
+/// engine.
+const STOPPED_WHILE_STARTING: &str = "the node was stopped while it was starting";
+
+/// Set when the swarm engine was held back in this run of the app. The file
+/// in the node folder is the record that lasts; this covers a folder that
+/// could not take the file, so that one run of the app still cannot go back
+/// and forth between the two engines.
+static SWARM_ENGINE_HELD_THIS_RUN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Does a launch that ended in `error` send the node back to the default
+/// engine? Only when the swarm engine was the one launched, and the error is
+/// the launch's own: not a Stop or Quit, not the read-block recovery taking a
+/// step (that is the chain data, and its start begins again by itself), and
+/// not a btxd the graphics driver will not let go of (nothing can start
+/// beside it, on either engine).
+fn falls_back_from_swarm_engine(swarm_engine_launched: bool, error: &str, gpu_holds: bool) -> bool {
+    swarm_engine_launched
+        && !gpu_holds
+        && error != STOPPED_WHILE_STARTING
+        && error != crate::read_block_recovery::STEP_TAKEN
+}
+
+/// Does a node that went silent start again on the default engine? Only when
+/// the run was the swarm engine's (its launch marker is on exactly then), the
+/// engine this app spawned ended badly, and nobody stopped it.
+fn swarm_engine_crash_falls_back(
+    swarm_engine_run: bool,
+    ended_badly: bool,
+    ours: bool,
+    stopped: bool,
+) -> bool {
+    swarm_engine_run && ended_badly && ours && !stopped
+}
+
+/// Why the swarm engine is held back in this node folder, or `None`. The
+/// reason is empty when only this run's flag says so.
+fn swarm_hold(datadir: &Path) -> Option<String> {
+    match btx_core::swarm::engine_held_back(datadir) {
+        Some(held) => Some(held.why),
+        None => SWARM_ENGINE_HELD_THIS_RUN
+            .load(Ordering::SeqCst)
+            .then(String::new),
+    }
+}
+
+/// Hold the swarm engine back after it failed, and say so in setup.log.
+/// From here every start, by the owner, by the app or after a restart of the
+/// app, is the default engine's, until the owner asks again
+/// (`clear_swarm_hold`).
+fn hold_swarm_engine_back(datadir: &Path, why: &str) {
+    SWARM_ENGINE_HELD_THIS_RUN.store(true, Ordering::SeqCst);
+    let kept = btx_core::swarm::hold_engine_back(datadir, env!("CARGO_PKG_VERSION"), why);
+    let mut msg = format!(
+        "the swarm engine failed ({why}); this node now starts on its usual engine and stays on \
+         it until the swarm is switched off and on in Settings"
+    );
+    if let Err(e) = kept {
+        msg.push_str(&format!(
+            ". The record of this could not be written ({e}), so it holds until the app is closed"
+        ));
+    }
+    eprintln!("[node-app] {msg}");
+    setup_log(datadir, &msg);
+}
+
+/// The owner asks for the swarm engine again: the switch in Settings, or a
+/// fresh install of the engine. Nothing else clears the hold.
+fn clear_swarm_hold(datadir: &Path) {
+    SWARM_ENGINE_HELD_THIS_RUN.store(false, Ordering::SeqCst);
+    if let Err(e) = btx_core::swarm::clear_engine_hold(datadir) {
+        setup_log(
+            datadir,
+            &format!("the record that holds the swarm engine back could not be removed: {e}"),
+        );
+    }
+}
+
+/// The swarm engine's folder and what is wrong in it, when an install that
+/// was finished once now has files missing or cut off. `None` for a whole
+/// install and for one never made.
+fn swarm_engine_damage() -> Option<(PathBuf, btx_core::engine_files::Damage)> {
+    let pin = swarm_engine_pin()?;
+    let root = btx_core::swarm_engine::root(&pin)?;
+    let damage = btx_core::swarm_engine::damage(&root)?;
+    Some((root, damage))
+}
+
+/// The setup.log line for a start that found the swarm engine damaged.
+fn swarm_damage_line(root: &Path, damage: &btx_core::engine_files::Damage) -> String {
+    format!(
+        "the swarm is switched on, and the swarm engine in {} is damaged: {} missing or the wrong \
+         size. Starting on the usual engine. Switching the swarm off and on in Settings fetches \
+         the swarm engine again",
+        root.display(),
+        btx_core::engine_files::name_some(&damage.files())
+    )
 }
 
 /// The swarm engine's folder, if a finished install is in it.
@@ -7835,6 +8048,11 @@ struct SwarmFacts {
     /// This build names a swarm engine to fetch.
     fetchable: bool,
     engine_installed: bool,
+    /// An install that was finished once and is not whole now: which files,
+    /// in `Damage::describe`'s words.
+    engine_damaged: Option<String>,
+    /// The swarm engine failed and is held back: why (may be empty).
+    held_back: Option<String>,
     fetch: SwarmFetch,
     download_mb: u64,
 }
@@ -7842,8 +8060,10 @@ struct SwarmFacts {
 /// The card. `seen` is `None` while no node runs.
 ///
 /// Order is the order of what a person can do about it: not on this platform,
-/// not on a signer, a download running or failed, then the switch against
-/// what the node says. The switch restarts the node by itself, but a restart
+/// not on a signer, a download running or failed, an engine found damaged, an
+/// engine that failed and is held back, then the switch against what the node
+/// says. Damaged comes before held back because it is what is on the disk
+/// now, and fetching again is what answers both. The switch restarts the node by itself, but a restart
 /// can be refused (another start in flight, a node this app does not own), so
 /// the switch and the running node can disagree and the card says which way.
 fn swarm_card(f: &SwarmFacts, seen: Option<btx_core::swarm::Seen>) -> SwarmCard {
@@ -7867,6 +8087,10 @@ fn swarm_card(f: &SwarmFacts, seen: Option<btx_core::swarm::Seen>) -> SwarmCard 
         }
     } else if let SwarmFetch::Failed(why) = &f.fetch {
         ("fetch_failed", why.clone(), None)
+    } else if let (false, Some(what)) = (f.engine_installed, &f.engine_damaged) {
+        ("engine_damaged", what.clone(), None)
+    } else if let Some(why) = &f.held_back {
+        ("engine_start_failed", why.clone(), None)
     } else if !f.engine_installed {
         ("engine_missing", none(), None)
     } else {
@@ -7926,6 +8150,8 @@ pub async fn swarm_status(state: State<'_, AppState>) -> Result<SwarmCard, Strin
         signs_here: swarm_signs_here(&state, &settings).await,
         fetchable: pin.is_some(),
         engine_installed: swarm_engine_installed().is_some(),
+        engine_damaged: swarm_engine_damage().map(|(_, damage)| damage.describe()),
+        held_back: swarm_hold(&datadir),
         fetch: swarm_fetch_now(&state),
         download_mb: pin
             .map(|p| p.archive_bytes.div_ceil(1024 * 1024))
@@ -7970,7 +8196,9 @@ fn swarm_on_refusal(linux: bool, signs_here: bool, fetchable_or_installed: bool)
 /// On: refused on anything but Linux, on a node that signs, and in a build
 /// with no swarm engine to fetch. Otherwise the choice is saved and the rest
 /// runs in the background (`apply_swarm_switch`): fetch and check the swarm
-/// engine if it is not installed, then restart the node on it. Off: saved,
+/// engine if it is not installed (a damaged install is not one, so it is
+/// fetched again and replaced), then restart the node on it. Either way the
+/// switch clears a hold on a swarm engine that failed. Off: saved,
 /// and the node restarts on its usual engine. The node keeps running on the
 /// engine it has until a restart succeeds.
 #[tauri::command]
@@ -7997,6 +8225,10 @@ pub async fn set_swarm(
         );
     }
     NodeAppSettings::update(&datadir, |s| s.swarm_enabled = on);
+    // The owner's own switch is the one thing that lets a swarm engine that
+    // failed be tried again. Off clears the hold too, so "off and on" is the
+    // whole of what the card asks for.
+    clear_swarm_hold(&datadir);
     set_swarm_fetch(&state, SwarmFetch::Idle);
     let message = swarm_switch_message(
         on,
@@ -8071,6 +8303,8 @@ async fn apply_swarm_switch(app: AppHandle, on: bool) {
         match result {
             Ok(()) => {
                 set_swarm_fetch(&state, SwarmFetch::Idle);
+                // A fresh, checked install is a new engine to try.
+                clear_swarm_hold(&datadir);
                 setup_log(
                     &datadir,
                     &format!("the swarm engine is installed in {}", root.display()),
@@ -13636,9 +13870,11 @@ mod twin_freeze_removal {
 #[cfg(test)]
 mod swarm_tests {
     use super::{
-        swarm_card, swarm_engine_for_launch, swarm_engine_pin, swarm_on_refusal,
-        swarm_switch_message, update_public_key, update_signature_ok, SwarmFacts, NODE_RELEASE_TAG,
-        SWARM_ENGINE_KEY_SUFFIX, SWARM_SIGNER_REFUSAL,
+        clear_swarm_hold, falls_back_from_swarm_engine, hold_swarm_engine_back, swarm_card,
+        swarm_damage_line, swarm_engine_crash_falls_back, swarm_engine_for_launch,
+        swarm_engine_pin, swarm_hold, swarm_on_refusal, swarm_switch_message, update_public_key,
+        update_signature_ok, SwarmFacts, NODE_RELEASE_TAG, STOPPED_WHILE_STARTING,
+        SWARM_ENGINE_FELL_BACK, SWARM_ENGINE_KEY_SUFFIX, SWARM_SIGNER_REFUSAL,
     };
     use crate::state::SwarmFetch;
     use btx_core::swarm::{Guard, Report, Seen};
@@ -13665,6 +13901,8 @@ mod swarm_tests {
             signs_here: false,
             fetchable: true,
             engine_installed: true,
+            engine_damaged: None,
+            held_back: None,
             fetch: SwarmFetch::Idle,
             download_mb: 470,
         }
@@ -13679,19 +13917,294 @@ mod swarm_tests {
                 "/h/.local/btx/v0.34.16-modelnet/linux-x86_64",
             ))
         };
-        assert_eq!(swarm_engine_for_launch(true, true, false, root()), root());
-        for (linux, wanted, signs, installed) in [
-            (false, true, false, root()), // Windows, macOS
-            (true, false, false, root()), // switched off: back to the default engine
-            (true, true, true, root()),   // a signer
-            (true, true, false, None),    // download failed, unverified or never made
+        assert_eq!(
+            swarm_engine_for_launch(true, true, false, false, root()),
+            root()
+        );
+        for (linux, wanted, signs, held, installed) in [
+            (false, true, false, false, root()), // Windows, macOS
+            (true, false, false, false, root()), // switched off: back to the default engine
+            (true, true, true, false, root()),   // a signer
+            (true, true, false, true, root()),   // it failed and is held back
+            (true, true, false, false, None),    // download failed, damaged or never made
         ] {
             assert_eq!(
-                swarm_engine_for_launch(linux, wanted, signs, installed.clone()),
+                swarm_engine_for_launch(linux, wanted, signs, held, installed.clone()),
                 None,
-                "linux={linux} wanted={wanted} signs={signs} installed={installed:?}"
+                "linux={linux} wanted={wanted} signs={signs} held={held} installed={installed:?}"
             );
         }
+    }
+
+    /// Only a launch of the swarm engine that failed by itself falls back.
+    #[test]
+    fn a_failed_swarm_engine_launch_falls_back_and_nothing_else_does() {
+        let failed = "the node kept exiting right after launch: Error: x. See easybtx-node.log.";
+        assert!(falls_back_from_swarm_engine(true, failed, false));
+        assert!(falls_back_from_swarm_engine(
+            true,
+            "btxd did not open its RPC in 180s",
+            false
+        ));
+        // The default engine was the one launched: its error stands.
+        assert!(!falls_back_from_swarm_engine(false, failed, false));
+        // A Stop or Quit during the start is nobody's failure.
+        assert!(!falls_back_from_swarm_engine(
+            true,
+            STOPPED_WHILE_STARTING,
+            false
+        ));
+        // The read-block recovery took a step: the chain data, not the engine.
+        assert!(!falls_back_from_swarm_engine(
+            true,
+            crate::read_block_recovery::STEP_TAKEN,
+            false
+        ));
+        // A btxd the graphics driver holds: nothing can start beside it.
+        assert!(!falls_back_from_swarm_engine(true, failed, true));
+        // The word the start loop reads is not one a launch can fail with.
+        assert_ne!(SWARM_ENGINE_FELL_BACK, STOPPED_WHILE_STARTING);
+        assert_ne!(
+            SWARM_ENGINE_FELL_BACK,
+            crate::read_block_recovery::STEP_TAKEN
+        );
+    }
+
+    /// The fallback sits at the one call that runs an engine, holds the
+    /// engine back before the start begins again, and the start loop takes
+    /// that word once.
+    #[test]
+    fn the_fallback_is_at_the_launch_and_begins_the_start_again_once() {
+        let src = include_str!("commands.rs");
+        let production = src.split("\nmod swarm_tests {").next().unwrap();
+        let once = production
+            .split("\nasync fn start_node_once(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let launch = once.find("spawn_node_with_lock_retry(app, state").unwrap();
+        let decided = once.find("falls_back_from_swarm_engine(").unwrap();
+        let held = once.find("hold_swarm_engine_back(&datadir, &e);").unwrap();
+        let again = once
+            .find("return Err(SWARM_ENGINE_FELL_BACK.to_string());")
+            .unwrap();
+        assert!(launch < decided && decided < held && held < again);
+        assert!(once[decided..held].contains("swarm_root.is_some()"));
+        // The rule is asked in one place.
+        assert_eq!(
+            production.matches("falls_back_from_swarm_engine(").count(),
+            2,
+            "its definition and the launch"
+        );
+        // And the engine decision reads the hold.
+        assert!(once.contains("swarm_held.is_some(),"));
+
+        let loop_fn = production
+            .split("pub(crate) async fn start_node_held(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(loop_fn
+            .contains("Err(e) if e == SWARM_ENGINE_FELL_BACK && !fell_back => fell_back = true,"));
+        // The stop sentence the rule compares with is the one starts return.
+        assert!(production.contains(&format!(
+            "return Err(\"{STOPPED_WHILE_STARTING}\".to_string())"
+        )));
+    }
+
+    /// The hold is a file in the node folder, logged, read back with its
+    /// reason, and cleared only by `clear_swarm_hold`. The one test that
+    /// touches this run's flag.
+    #[test]
+    fn a_failed_swarm_engine_is_held_back_in_the_node_folder_until_the_owner_asks_again() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(swarm_hold(dir.path()), None);
+        hold_swarm_engine_back(dir.path(), "it exited with code 1");
+        assert_eq!(
+            swarm_hold(dir.path()).as_deref(),
+            Some("it exited with code 1")
+        );
+        let held = btx_core::swarm::engine_held_back(dir.path()).unwrap();
+        assert_eq!(held.app_version, env!("CARGO_PKG_VERSION"));
+        let log = std::fs::read_to_string(dir.path().join("setup.log")).unwrap();
+        assert!(log.contains("the swarm engine failed (it exited with code 1)"));
+        assert!(log.contains("starts on its usual engine"));
+        assert!(!log.contains("  "), "{log:?}");
+        // While held, the launch is the default engine's.
+        let root = Some(PathBuf::from("/h/.local/btx/x-modelnet/linux-x86_64"));
+        assert_eq!(
+            swarm_engine_for_launch(
+                true,
+                true,
+                false,
+                swarm_hold(dir.path()).is_some(),
+                root.clone()
+            ),
+            None
+        );
+        // A folder that lost the file is still held for this run of the app.
+        btx_core::swarm::clear_engine_hold(dir.path()).unwrap();
+        assert_eq!(swarm_hold(dir.path()).as_deref(), Some(""));
+        clear_swarm_hold(dir.path());
+        assert_eq!(swarm_hold(dir.path()), None);
+        assert_eq!(
+            swarm_engine_for_launch(
+                true,
+                true,
+                false,
+                swarm_hold(dir.path()).is_some(),
+                root.clone()
+            ),
+            root
+        );
+    }
+
+    /// The owner's switch and a fresh install are the only callers that
+    /// clear the hold.
+    #[test]
+    fn only_the_switch_and_a_fresh_install_clear_the_hold() {
+        let src = include_str!("commands.rs");
+        let production = src.split("\nmod swarm_tests {").next().unwrap();
+        assert_eq!(production.matches("clear_swarm_hold(&datadir);").count(), 2);
+        assert_eq!(production.matches("clear_swarm_hold(").count(), 3);
+        let switch = production
+            .split("\npub async fn set_swarm(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(switch.contains("clear_swarm_hold(&datadir);"));
+        let apply = production
+            .split("\nasync fn apply_swarm_switch(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let installed = apply.find("Ok(()) => {").unwrap();
+        let cleared = apply.find("clear_swarm_hold(&datadir);").unwrap();
+        let failed = apply.find("Err(why) => {").unwrap();
+        assert!(installed < cleared && cleared < failed);
+    }
+
+    /// A swarm engine that ended badly while running starts the node again
+    /// on the default engine; a clean exit, a stop and another app's node
+    /// do not.
+    #[test]
+    fn a_swarm_engine_that_ends_badly_while_running_falls_back() {
+        assert!(swarm_engine_crash_falls_back(true, true, true, false));
+        assert!(!swarm_engine_crash_falls_back(false, true, true, false)); // the default engine
+        assert!(!swarm_engine_crash_falls_back(true, false, true, false)); // running, or exit 0
+        assert!(!swarm_engine_crash_falls_back(true, true, false, false)); // not this app's node
+        assert!(!swarm_engine_crash_falls_back(true, true, true, true)); // Stop or Quit
+        let src = include_str!("commands.rs");
+        let refresher = src
+            .split("\nfn spawn_status_refresher(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let asked = refresher.find("swarm_engine_crash_falls_back(").unwrap();
+        let held = refresher.find("hold_swarm_engine_back(").unwrap();
+        let started = refresher[held..]
+            .find("start_node_projected(&app, &state)")
+            .unwrap();
+        let error = refresher.find("The node stopped responding.").unwrap();
+        assert!(asked < held && held + started < error);
+    }
+
+    #[test]
+    fn the_cards_say_a_damaged_engine_and_an_engine_that_failed() {
+        let with = |change: &dyn Fn(&mut SwarmFacts)| {
+            let mut f = facts();
+            change(&mut f);
+            f
+        };
+        let damaged = |f: &mut SwarmFacts| {
+            f.engine_installed = false;
+            f.engine_damaged = Some("2 files (bin/btx-modeld, bin/btxd)".into());
+        };
+        // Damaged: its own state, with the files, whatever the node says.
+        for seen in [None, Some(Seen::NoModelNetwork)] {
+            let card = swarm_card(&with(&damaged), seen);
+            assert_eq!(
+                (card.state, card.why.as_str()),
+                ("engine_damaged", "2 files (bin/btx-modeld, bin/btxd)")
+            );
+        }
+        // Held back: the node runs the default engine, which has no model
+        // network, and the card must not read that as "on at the next start".
+        let held = |f: &mut SwarmFacts| f.held_back = Some("it exited with code 1".into());
+        for seen in [None, Some(Seen::NoModelNetwork), Some(Seen::Off)] {
+            let card = swarm_card(&with(&held), seen);
+            assert_eq!(
+                (card.state, card.why.as_str()),
+                ("engine_start_failed", "it exited with code 1")
+            );
+            assert!(card.wanted);
+        }
+        // Held back with no reason on record still says so.
+        let card = swarm_card(&with(&|f| f.held_back = Some(String::new())), None);
+        assert_eq!((card.state, card.why.as_str()), ("engine_start_failed", ""));
+        // Both: what is on the disk now comes first.
+        let both = swarm_card(
+            &with(&|f| {
+                damaged(f);
+                held(f);
+            }),
+            None,
+        );
+        assert_eq!(both.state, "engine_damaged");
+        // Held back and the folder gone altogether: still the failure.
+        let gone = swarm_card(
+            &with(&|f| {
+                held(f);
+                f.engine_installed = false;
+            }),
+            None,
+        );
+        assert_eq!(gone.state, "engine_start_failed");
+        // What outranks them: the platform, a signer, a download, the switch off.
+        for (change, state) in [
+            (
+                &(|f: &mut SwarmFacts| f.linux = false) as &dyn Fn(&mut SwarmFacts),
+                "not_here",
+            ),
+            (&|f: &mut SwarmFacts| f.signs_here = true, "signer"),
+            (
+                &|f: &mut SwarmFacts| f.fetch = SwarmFetch::Fetching(5),
+                "fetching",
+            ),
+            (
+                &|f: &mut SwarmFacts| f.fetch = SwarmFetch::Failed("no".into()),
+                "fetch_failed",
+            ),
+            (&|f: &mut SwarmFacts| f.wanted = false, "off"),
+        ] {
+            let card = swarm_card(
+                &with(&|f| {
+                    damaged(f);
+                    held(f);
+                    change(f);
+                }),
+                None,
+            );
+            assert_eq!(card.state, state);
+        }
+    }
+
+    #[test]
+    fn the_log_line_for_a_damaged_engine_names_the_files_and_the_way_back() {
+        let damage = btx_core::engine_files::Damage {
+            missing: vec!["bin/btx-modeld".into()],
+            wrong_size: vec!["bin/btxd".into(), "bin/lib/os.py".into()],
+        };
+        let line = swarm_damage_line(
+            std::path::Path::new("/h/.local/btx/v0.34.16-modelnet/linux-x86_64"),
+            &damage,
+        );
+        assert!(line.contains("/h/.local/btx/v0.34.16-modelnet/linux-x86_64 is damaged"));
+        assert!(line
+            .contains("3 files (bin/btx-modeld, bin/btxd and 1 more) missing or the wrong size"));
+        assert!(line.contains("Starting on the usual engine"));
+        assert!(line.contains("off and on in Settings fetches the swarm engine again"));
+        assert!(!line.contains("  "), "{line:?}");
     }
 
     #[test]

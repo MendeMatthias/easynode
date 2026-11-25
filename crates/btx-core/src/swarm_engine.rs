@@ -62,13 +62,28 @@ pub fn btx_cli_in(root: &Path) -> PathBuf {
 /// Whether a finished install is in `root`: the list an install wrote is
 /// there and every file on it is there at its size. One `stat` per file.
 pub fn installed(root: &Path) -> bool {
-    match engine_files::read_manifest(root) {
-        Some(list) if list.from_package => {
-            let damage = engine_files::damage_against(root, &list.entries);
-            damage.missing.is_empty() && damage.wrong_size.is_empty() && btxd_in(root).is_file()
+    matches!(engine_files::read_manifest(root), Some(list) if list.from_package)
+        && damage(root).is_none()
+}
+
+/// What is wrong with an install that was once finished in `root`, or `None`.
+///
+/// This is what tells "installed and now damaged" from "never installed":
+/// only a folder that carries the list an install wrote can be damaged. Files
+/// on that list that are gone or not their size are named, and so is a
+/// missing `bin/btxd` even if the list does not name it. A folder without
+/// the list (never installed, or the list itself deleted) is `None`, and so
+/// is a whole install. One `stat` per file.
+pub fn damage(root: &Path) -> Option<engine_files::Damage> {
+    let list = engine_files::read_manifest(root).filter(|l| l.from_package)?;
+    let mut damage = engine_files::damage_against(root, &list.entries);
+    if !btxd_in(root).is_file() {
+        let rel = format!("bin/{}", crate::platform::exe_name("btxd"));
+        if !damage.missing.contains(&rel) && !damage.wrong_size.contains(&rel) {
+            damage.missing.push(rel);
         }
-        _ => false,
     }
+    (!damage.is_empty()).then_some(damage)
 }
 
 fn sibling(root: &Path, suffix: &str) -> PathBuf {
@@ -739,6 +754,73 @@ mod tests {
 
         // A file gone from an installed engine: no longer a finished install.
         std::fs::remove_file(root.join("bin/btx-modeld")).unwrap();
+        assert!(!installed(&root));
+    }
+
+    /// A damaged install is told from one never made, names what is wrong,
+    /// and fetching again puts a whole engine in its place.
+    #[tokio::test]
+    async fn a_damaged_install_is_named_and_replaced_by_a_good_one() {
+        let archive = engine("v0.34.16", true);
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.tar.gz");
+        std::fs::write(&a, &archive).unwrap();
+        let pin = pin_for(&archive, "");
+        let root = dir.path().join("btx").join(&pin.key).join("plat");
+
+        // Never installed: no folder, and an empty folder, are not damage.
+        assert_eq!(damage(&root), None);
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(damage(&root), None);
+        assert!(!installed(&root));
+
+        install_from_archive(&pin, &root, &a, "good signature", &yes)
+            .await
+            .unwrap();
+        assert!(installed(&root));
+        assert_eq!(damage(&root), None);
+
+        // One file gone, one cut off.
+        std::fs::remove_file(root.join("bin/btx-modeld")).unwrap();
+        std::fs::write(root.join("bin/lib/python3.14/os.py"), b"imp").unwrap();
+        let found = damage(&root).expect("damaged");
+        assert_eq!(found.missing, vec!["bin/btx-modeld".to_string()]);
+        assert_eq!(
+            found.wrong_size,
+            vec!["bin/lib/python3.14/os.py".to_string()]
+        );
+        assert_eq!(
+            found.describe(),
+            "2 files (bin/btx-modeld, bin/lib/python3.14/os.py)"
+        );
+        assert!(!installed(&root));
+
+        // The engine itself gone: named once.
+        std::fs::remove_file(root.join("bin/btxd")).unwrap();
+        let found = damage(&root).expect("damaged");
+        assert_eq!(
+            found.missing.iter().filter(|f| *f == "bin/btxd").count(),
+            1,
+            "{found:?}"
+        );
+
+        // Fetching again replaces the damaged folder with a whole engine.
+        install_from_archive(&pin, &root, &a, "good signature", &yes)
+            .await
+            .unwrap();
+        assert!(installed(&root));
+        assert_eq!(damage(&root), None);
+        assert!(root.join("bin/btx-modeld").is_file());
+        assert_eq!(
+            std::fs::read(root.join("bin/lib/python3.14/os.py")).unwrap(),
+            b"import sys\n"
+        );
+        assert_eq!(leftovers(root.parent().unwrap()), vec!["plat"]);
+
+        // Without the list an install wrote, the folder reads as never
+        // installed, not as damaged.
+        engine_files::forget_manifest(&root);
+        assert_eq!(damage(&root), None);
         assert!(!installed(&root));
     }
 

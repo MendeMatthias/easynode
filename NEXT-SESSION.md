@@ -29,6 +29,36 @@ Where it is:
   the marker `easynode-swarm-on` together.
 - `apps/node/src/swarm-card.ts`: every sentence of the row and card.
 
+When the swarm engine is broken (added 2026-11-25, same PR):
+
+- A launch of the swarm engine that fails holds the engine back and the same
+  start begins again on the default engine, once. The decision is at the one
+  call in `start_node_once` that runs an engine
+  (`falls_back_from_swarm_engine`); `start_node_held` takes the word
+  `SWARM_ENGINE_FELL_BACK` once. Not for a Stop or Quit, a read-block
+  recovery step, or a btxd the graphics driver holds.
+- The hold is the file `easynode-swarm-engine-held-back` in the node folder
+  (`btx_core::swarm::hold_engine_back`, `engine_held_back`,
+  `clear_engine_hold`): `app <version>`, then the reason. While it is there
+  `swarm_engine_for_launch` answers the default engine, so starts, the
+  refresher's restarts and a new run of the app cannot go back and forth.
+  Only `set_swarm` (on or off) and a fresh install clear it. Card state
+  `engine_start_failed`.
+- A swarm engine that ends badly while running (signal, exit code other than
+  0) is held back by the status refresher and the node starts again on the
+  default engine (`swarm_engine_crash_falls_back`). A clean exit is left
+  alone.
+- A damaged install (the list an install wrote is there, files are missing or
+  the wrong size, or `bin/btxd` is gone) is `swarm_engine::damage`. The start
+  writes which files to setup.log and runs the default engine; card state
+  `engine_damaged`; off and on fetches again and `install_from_archive`
+  replaces the folder.
+- Not covered: a swarm engine that stays up and misbehaves (helper down, not
+  syncing); a folder whose file list was deleted reads as never installed.
+  Not tested: any of this with a real engine or inside a running app. The
+  pure rules, the hold file, the damage reading and the replacement are
+  tested; the two places they are called from are held by source checks only.
+
 To make it live, a release has to:
 
 1. Publish the ModelNet engine as a `.tar.gz` in the layout of

@@ -366,10 +366,124 @@ fn holds(model: &Value) -> bool {
         && model["incomplete"].as_bool() != Some(true)
 }
 
+/// The file in the node folder that says "the swarm engine failed here, and
+/// this node runs on its usual engine until its owner asks for the swarm
+/// engine again". A file and not a variable, so it holds across a restart of
+/// the app: without it every start would try the engine that just failed,
+/// fall back, and try it again at the next one.
+const HELD_BACK_MARKER: &str = "easynode-swarm-engine-held-back";
+
+/// The longest reason kept. A launch error quotes the engine's own log line.
+const HELD_BACK_WHY_MAX: usize = 600;
+
+/// Why the swarm engine is held back, and which version of the app held it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldBack {
+    pub app_version: String,
+    pub why: String,
+}
+
+fn held_back_path(datadir: &Path) -> PathBuf {
+    datadir.join(HELD_BACK_MARKER)
+}
+
+/// Record that the swarm engine failed, with the reason on one line. Two
+/// lines: `app <version>`, then the reason.
+pub fn hold_engine_back(datadir: &Path, app_version: &str, why: &str) -> std::io::Result<()> {
+    let one_line = why.split_whitespace().collect::<Vec<_>>().join(" ");
+    let why: String = one_line.chars().take(HELD_BACK_WHY_MAX).collect();
+    std::fs::write(
+        held_back_path(datadir),
+        format!("app {}\n{why}\n", app_version.trim()),
+    )
+}
+
+/// Whether the swarm engine is held back in this node folder, and why. The
+/// file being there is the fact: one that does not read still holds, with no
+/// reason, because the safe side is the engine every install has.
+pub fn engine_held_back(datadir: &Path) -> Option<HeldBack> {
+    let path = held_back_path(datadir);
+    if !path.exists() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut lines = text.lines();
+    let app_version = lines
+        .next()
+        .and_then(|l| l.strip_prefix("app "))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let why = lines.next().unwrap_or_default().trim().to_string();
+    Some(HeldBack { app_version, why })
+}
+
+/// Let the swarm engine be tried again. Only the owner does this: the switch
+/// in Settings, and a fresh install of the swarm engine.
+pub fn clear_engine_hold(datadir: &Path) -> std::io::Result<()> {
+    let path = held_back_path(datadir);
+    if path.exists() {
+        std::fs::remove_file(&path)
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fake_node::FakeNode;
+
+    /// The hold is a file in the node folder: it is there for the next start
+    /// and for the next run of the app, until it is cleared.
+    #[test]
+    fn a_held_back_engine_stays_held_until_it_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(engine_held_back(dir.path()), None);
+        // Nothing to clear is not an error.
+        clear_engine_hold(dir.path()).unwrap();
+
+        hold_engine_back(
+            dir.path(),
+            " 0.8.1 ",
+            "the node kept exiting right after launch:\n  Error: no such option.  See the log.",
+        )
+        .unwrap();
+        let held = HeldBack {
+            app_version: "0.8.1".into(),
+            why: "the node kept exiting right after launch: Error: no such option. See the log."
+                .into(),
+        };
+        // Read twice: reading does not use it up.
+        assert_eq!(engine_held_back(dir.path()), Some(held.clone()));
+        assert_eq!(engine_held_back(dir.path()), Some(held));
+        // It is its own file, not the switch's marker.
+        assert!(!wanted(dir.path()));
+        set_wanted(dir.path(), true).unwrap();
+        set_wanted(dir.path(), false).unwrap();
+        assert!(engine_held_back(dir.path()).is_some());
+
+        clear_engine_hold(dir.path()).unwrap();
+        assert_eq!(engine_held_back(dir.path()), None);
+    }
+
+    #[test]
+    fn a_hold_that_does_not_read_still_holds_and_a_long_reason_is_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let nothing = Some(HeldBack {
+            app_version: String::new(),
+            why: String::new(),
+        });
+        std::fs::write(held_back_path(dir.path()), b"").unwrap();
+        assert_eq!(engine_held_back(dir.path()), nothing);
+        std::fs::write(held_back_path(dir.path()), [0xff, 0xfe, 0x00]).unwrap();
+        assert_eq!(engine_held_back(dir.path()), nothing);
+
+        hold_engine_back(dir.path(), "0.8.1", &"x".repeat(5000)).unwrap();
+        let held = engine_held_back(dir.path()).unwrap();
+        assert_eq!(held.why.chars().count(), HELD_BACK_WHY_MAX);
+        assert_eq!(held.app_version, "0.8.1");
+    }
 
     const NOW: u64 = 1_800_000_000_000;
 
