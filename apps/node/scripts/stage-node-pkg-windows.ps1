@@ -1,16 +1,29 @@
 # Stage the bundled BTX node binaries for an easyBTX Node WINDOWS build.
 #
-# Takes the output of the btxd-windows.yml CI build and stages the flat package
+# Takes the output of the btxd-windows.yml CI build and stages the package
 # layout resolve_bundled_node_pkg() probes:
 #   src-tauri\resources\node-pkg\bin\{btxd.exe, btx-cli.exe, *.dll}
+# and, for BTX 0.34.16 and later, the CPython runtime btxd embeds for SwapNet:
+#   ...\bin\{pythonXY.dll, python3.dll, vcruntime140*.dll, pythonXY._pth}
+#   ...\bin\python\   (standard library zip, extension modules, site-packages)
+# btxd.exe imports pythonXY.dll, so without that runtime it does not start at
+# all, not even for --version and not with -swapnet=0. The whole artifact is
+# therefore copied as a tree. provision_node_package copies the tree on to the
+# install directory, and Tauri bundles resources/node-pkg/**/*.
 #
 # NOT a static triplet. btxd-windows.yml cross-compiles with mingw-w64, and the
 # result imports at least libgomp-1.dll. 0.6.6 shipped without it: btxd.exe died
 # with 0xC0000135 (STATUS_DLL_NOT_FOUND) on every machine that was not the build
 # runner, the app's `--version` probe hung instead of failing, and the app fell
-# back to the OLD node while reporting the new app version. Any DLL beside
+# back to the OLD node while reporting the new app version. Everything beside
 # btxd.exe in $SourceDir is therefore vendored, and the run check below is the
 # gate that proves the staged tree works with nothing but system DLLs on PATH.
+#
+# With -VerifyShaFile the STAGED tree is compared with the artifact's
+# SHA256SUMS.txt in both directions: every staged file must be listed with the
+# right hash, and every listed file must have been staged. btxd-windows.yml runs
+# its Windows smoke on a tree staged by this script from the same sums, so a
+# tree that passes here is, byte for byte, the one that was smoked.
 #
 # Usage: .\stage-node-pkg-windows.ps1 -SourceDir <dir> [-VerifyShaFile <SHA256SUMS.txt>]
 #                                     [-ExpectedVersion v0.33.2]
@@ -37,28 +50,76 @@ foreach ($name in "btxd.exe", "btx-cli.exe") {
     }
 }
 
+# Lines are "<sha256-lower>  <path relative to the artifact root>" (the
+# artifact's SHA256SUMS.txt, forward slashes). A line that cannot be read is an
+# error, not something to skip: a skipped line is an unverified file.
+$sums = @{}
 if ($VerifyShaFile) {
-    # Lines are "<sha256-lower>  <name>" (the artifact's SHA256SUMS.txt).
     foreach ($line in Get-Content $VerifyShaFile) {
-        if ($line -notmatch '^([0-9a-f]{64})\s+(\S+)$') { continue }
-        $want = $Matches[1]; $name = $Matches[2]
-        $got = (Get-FileHash (Join-Path $SourceDir $name) -Algorithm SHA256).Hash.ToLower()
-        if ($got -ne $want) { throw "sha256 mismatch for ${name}: got $got, want $want" }
-        Write-Host "verified ${name}: $got"
+        if (-not $line.Trim()) { continue }
+        if ($line -notmatch '^([0-9a-f]{64})\s+\*?(.+)$') {
+            throw "unreadable line in ${VerifyShaFile}: '$line'"
+        }
+        $sums[$Matches[2].Trim()] = $Matches[1]
+    }
+    foreach ($name in "btxd.exe", "btx-cli.exe") {
+        if (-not $sums.ContainsKey($name)) { throw "$VerifyShaFile does not list $name" }
     }
 }
 
 if (Test-Path $Dest) { Remove-Item -Recurse -Force $Dest }
-New-Item -ItemType Directory -Force (Join-Path $Dest "bin") | Out-Null
-Copy-Item (Join-Path $SourceDir "btxd.exe") (Join-Path $Dest "bin")
-Copy-Item (Join-Path $SourceDir "btx-cli.exe") (Join-Path $Dest "bin")
+$DestBin = (New-Item -ItemType Directory -Force (Join-Path $Dest "bin")).FullName
 
-# Vendor every DLL the build shipped next to the binaries. mingw links libgomp
-# dynamically, so the package is only self-contained if these travel with it.
-$dlls = @(Get-ChildItem -Path $SourceDir -Filter *.dll -File -ErrorAction SilentlyContinue)
-foreach ($d in $dlls) {
-    Copy-Item $d.FullName (Join-Path $Dest "bin")
-    Write-Host "vendored $($d.Name)"
+# Vendor everything the build shipped next to the binaries, as a tree. mingw
+# links libgomp dynamically and 0.34.16 imports pythonXY.dll, so the package is
+# only self-contained if all of it travels. The sums file itself stays behind.
+$top = @(Get-ChildItem -LiteralPath $SourceDir -Force | Where-Object { $_.Name -ne "SHA256SUMS.txt" })
+foreach ($item in $top) {
+    Copy-Item -LiteralPath $item.FullName -Destination $DestBin -Recurse -Force
+    if ($item.PSIsContainer) { Write-Host "vendored $($item.Name)\ (directory)" }
+    elseif ($item.Extension -ne ".exe") { Write-Host "vendored $($item.Name)" }
+}
+
+if ($VerifyShaFile) {
+    $staged = @(Get-ChildItem -LiteralPath $DestBin -Recurse -File -Force)
+    $seen = @{}
+    foreach ($f in $staged) {
+        $rel = $f.FullName.Substring($DestBin.Length + 1).Replace('\', '/')
+        if (-not $sums.ContainsKey($rel)) { throw "staged file is not listed in ${VerifyShaFile}: $rel" }
+        $got = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLower()
+        if ($got -ne $sums[$rel]) { throw "sha256 mismatch for ${rel}: got $got, want $($sums[$rel])" }
+        $seen[$rel] = $true
+    }
+    foreach ($rel in $sums.Keys) {
+        if (-not $seen.ContainsKey($rel)) { throw "listed in $VerifyShaFile but not staged: $rel" }
+    }
+    foreach ($name in "btxd.exe", "btx-cli.exe") { Write-Host "verified ${name}: $($sums[$name])" }
+    Write-Host "verified all $($staged.Count) staged files against $VerifyShaFile"
+}
+
+# The embedded CPython, when the package has one. CPython reads pythonXY._pth
+# beside pythonXY.dll and uses exactly the paths it lists, so each of them must
+# exist in the staged tree. This is a structural check for a package staged
+# WITHOUT a sums file; with one, the comparison above already covers it.
+$pyDll = @(Get-ChildItem -LiteralPath $DestBin -Filter "python3*.dll" -File |
+    Where-Object { $_.BaseName -match '^python3\d+$' })
+if ($pyDll.Count -gt 1) { throw "more than one pythonXY.dll in the package: $($pyDll.Name -join ', ')" }
+if ($pyDll.Count -eq 1) {
+    $pth = Join-Path $DestBin ($pyDll[0].BaseName + "._pth")
+    if (-not (Test-Path -LiteralPath $pth)) {
+        throw "$($pyDll[0].Name) is staged without $(Split-Path -Leaf $pth): CPython would search the machine for a standard library"
+    }
+    foreach ($line in Get-Content -LiteralPath $pth) {
+        $entry = $line.Trim()
+        if (-not $entry -or $entry.StartsWith("#") -or $entry.StartsWith("import ")) { continue }
+        if (-not (Test-Path -LiteralPath (Join-Path $DestBin $entry))) {
+            throw "$(Split-Path -Leaf $pth) names '$entry', which is not in the staged tree"
+        }
+    }
+    foreach ($need in "python3.dll", "vcruntime140.dll") {
+        if (-not (Test-Path -LiteralPath (Join-Path $DestBin $need))) { throw "the embedded CPython needs $need beside btxd.exe" }
+    }
+    Write-Host "embedded CPython: $($pyDll[0].Name), every path in $(Split-Path -Leaf $pth) is staged"
 }
 
 # Run the staged btxd with a SYSTEM-ONLY PATH.
@@ -72,15 +133,19 @@ $savedPath = $env:PATH
 $verLine = ""
 try {
     $env:PATH = "$env:SystemRoot\system32;$env:SystemRoot"
-    $verLine = (& $probe --version 2>&1 | Select-Object -First 1)
+    # Collect all of the output first: piping into Select-Object -First 1
+    # ends the pipeline after one line and can leave $LASTEXITCODE at -1.
+    $verOut = @(& $probe --version 2>&1)
     $probeExit = $LASTEXITCODE
+    $verLine = "$($verOut | Select-Object -First 1)"
 } finally {
     $env:PATH = $savedPath
 }
 if ($probeExit -ne 0) {
     throw ("staged btxd.exe failed to run with a system-only PATH (exit $probeExit): '$verLine'. " +
            "Exit -1073741515 = 0xC0000135 STATUS_DLL_NOT_FOUND means a dependency DLL is missing " +
-           "from $SourceDir. Vendor it beside btxd.exe, or link it statically in btxd-windows.yml.")
+           "from $SourceDir (a mingw runtime DLL, or from BTX 0.34.16 pythonXY.dll and vcruntime140.dll). " +
+           "Vendor it beside btxd.exe, or link it statically in btxd-windows.yml.")
 }
 Write-Host $verLine
 if ($ExpectedVersion -and ($verLine -notmatch [regex]::Escape($ExpectedVersion))) {

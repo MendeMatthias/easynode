@@ -1,7 +1,10 @@
 name: Build Windows BTX Node installer (NSIS)
 
-# Bundles the CI-built btxd.exe/btx-cli.exe (btxd-windows.yml, creators'
-# wrapper, static) into the BTX Node app and produces the NSIS setup.exe.
+# Bundles the CI-built btxd.exe/btx-cli.exe (btxd-windows.yml, mingw cross
+# build) into the BTX Node app and produces the NSIS setup.exe. From BTX 0.34.16
+# the package is a tree: btxd embeds CPython, and its runtime travels beside
+# btxd.exe (bin\python314.dll, bin\python\...). The staging script copies and
+# verifies the whole tree; Tauri bundles resources/node-pkg/**/*.
 # UNSIGNED (SmartScreen will warn) + updater artifacts disabled — keyless CI;
 # a real release signs and flips createUpdaterArtifacts.
 #
@@ -110,10 +113,25 @@ env:
   # v0.34.15`, SMOKE PASSED), artifact btxd-windows-476f3f23... (19644349
   # bytes). All four pins move together. VERSION and TAG are equal: the binary
   # reports v0.34.15 and the install key is plain v0.34.15.
-  PROVEN_BTXD_RUN_ID: "38062021519"
-  PROVEN_BTXD_ARTIFACT: "btxd-windows-476f3f23e15228bb3e6119ed1e139a9b25424ce8"
-  PROVEN_BTXD_VERSION: "v0.34.15"
-  PROVEN_BTXD_TAG: "v0.34.15"
+  #
+  # MOVED 2026-11-25 to upstream's final v0.34.16 = 074dac16 (the commit, not
+  # the tag name: upstream moved that tag once). Run 45516298111, dispatched on
+  # claude/engine-0.34.16-windows with btxchain_ref=074dac16...: both jobs
+  # green. This is the first Windows btxd that embeds CPython (SwapNet has no
+  # build switch), so the artifact btxd-windows-074dac16... is a tree now:
+  # 191 files, 93344444 bytes unpacked, 43481306 bytes as the artifact zip
+  # (0.34.15: 19644349). The smoke ran on the tree as staged by
+  # stage-node-pkg-windows.ps1, with PATH reduced to System32 and Windows:
+  # `BTX daemon version v0.34.16`, mined one regtest block with -swapnet=0,
+  # stopped cleanly, then started twice with -swapnet=1 (no Python on PATH;
+  # a foreign Python on PATH) and showed python314.dll loaded from the package.
+  # All four pins move together. VERSION and TAG are equal: the binary reports
+  # v0.34.16 and the install key is plain v0.34.16. TAG has to equal
+  # NODE_RELEASE_TAG in commands.rs, which the guard below enforces.
+  PROVEN_BTXD_RUN_ID: "45516298111"
+  PROVEN_BTXD_ARTIFACT: "btxd-windows-074dac167c26c1e091198f691ed5727817dba88a"
+  PROVEN_BTXD_VERSION: "v0.34.16"
+  PROVEN_BTXD_TAG: "v0.34.16"
 
 permissions:
   contents: read
@@ -252,6 +270,70 @@ jobs:
           [System.IO.File]::WriteAllText((Join-Path $out "SHA256SUMS"), "$hash  $name`n")
           Write-Host "installer: $name ($([math]::Round($setup.Length/1MB,1)) MB)"
           Write-Host "sha256: $hash"
+
+      # Check the INSTALLER, not only the tree it was built from. The setup.exe
+      # is what a user runs, and between the staged tree and the user's disk sit
+      # Tauri's resource glob and NSIS. From BTX 0.34.16 the node package is a
+      # tree of 191 files, 192 with the .btxd-version marker the staging script
+      # writes (btxd embeds CPython), and a file lost on that
+      # path is not a cosmetic problem: without python314.dll btxd.exe does not
+      # start at all. So: install silently on this runner, compare the installed
+      # node package with the staged one file by file, and run the installed
+      # btxd with nothing but System32 on PATH.
+      - name: Install the setup.exe and check the bundled node package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $setup = Get-ChildItem installer-dist -Filter "*-setup.exe" | Select-Object -First 1
+          if (-not $setup) { throw "no setup.exe in installer-dist" }
+          $staged = (Resolve-Path "apps\node\src-tauri\resources\node-pkg").Path
+          Write-Host "installing $($setup.Name) silently (/S)"
+          $p = Start-Process -FilePath $setup.FullName -ArgumentList "/S" -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "the silent install exited with code $($p.ExitCode)" }
+
+          # Per-user installs land under %LOCALAPPDATA%; look there first.
+          $hits = @()
+          foreach ($root in $env:LOCALAPPDATA, $env:ProgramFiles) {
+            $hits = @(Get-ChildItem -LiteralPath $root -Recurse -Filter btxd.exe -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match 'node-pkg\\bin\\btxd\.exe$' })
+            if ($hits.Count -gt 0) { break }
+          }
+          if ($hits.Count -ne 1) {
+            throw "expected exactly one installed node-pkg\bin\btxd.exe, found $($hits.Count): $($hits.FullName -join '; ')"
+          }
+          $installed = Split-Path -Parent (Split-Path -Parent $hits[0].FullName)
+          Write-Host "installed node package: $installed"
+
+          $files = @(Get-ChildItem -LiteralPath $staged -Recurse -File -Force)
+          $bytes = 0
+          foreach ($f in $files) {
+            $rel = $f.FullName.Substring($staged.Length + 1)
+            $there = Join-Path $installed $rel
+            if (-not (Test-Path -LiteralPath $there)) { throw "the installer did not install $rel" }
+            $a = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash
+            $b = (Get-FileHash -LiteralPath $there -Algorithm SHA256).Hash
+            if ($a -ne $b) { throw "installed $rel differs from the staged file" }
+            $bytes += $f.Length
+          }
+          $extra = @(Get-ChildItem -LiteralPath $installed -Recurse -File -Force).Count - $files.Count
+          if ($extra -ne 0) { throw "the installed node package has $extra file(s) more than the staged one" }
+          Write-Host "all $($files.Count) staged files ($bytes bytes) are installed, byte for byte"
+
+          $btxd = Join-Path $installed "bin\btxd.exe"
+          $savedPath = $env:PATH
+          try {
+            $env:PATH = "$env:SystemRoot\system32;$env:SystemRoot"
+            $out = @(& $btxd --version 2>&1)
+            $code = $LASTEXITCODE
+          } finally {
+            $env:PATH = $savedPath
+          }
+          if ($code -ne 0) { throw "the installed btxd.exe exited with $code on --version" }
+          $line = "$($out | Select-Object -First 1)"
+          Write-Host "installed btxd: $line"
+          if ($line -notmatch [regex]::Escape($env:PROVEN_BTXD_VERSION)) {
+            throw "the installed btxd.exe is not $($env:PROVEN_BTXD_VERSION): '$line'"
+          }
 
       - name: Upload installer
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

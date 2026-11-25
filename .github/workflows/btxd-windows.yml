@@ -19,6 +19,31 @@ name: Build Windows btxd (mingw cross, smoked on Windows)
 # Upstream's release tooling already enumerates windows-x86_64; when official
 # Windows assets appear, this build becomes a pinned download.
 #
+# From BTX 0.34.16 btxd EMBEDS CPYTHON. SwapNet (cmake/SwapNet.cmake) has no
+# off switch at build time: btxd links libpython and imports pythonXY.dll at
+# load, even when it runs with -swapnet=0. Upstream supplies no Python for a
+# Windows build (its own script installs one on the build machine with winget
+# and ships nothing), so this workflow brings one:
+#
+#   - link target: python.org's official CPython for Windows. The headers come
+#     from the `python` NuGet package, the import library is made from the
+#     official pythonXY.dll with gendef + dlltool. A mingw binary can use that
+#     MSVC-built DLL because only the C API crosses the boundary, with no
+#     FILE*, no file descriptor and no malloc/free pair shared between the two
+#     C runtimes (src/swapnet/embed.cpp);
+#   - runtime: python.org's embeddable package plus the pinned `cryptography`
+#     wheels, shipped beside btxd.exe (see the collect step for the layout);
+#   - CMake: a dependency provider answers SwapNet's
+#     find_package(Python3 ... Development), because FindPython3 cannot serve a
+#     cross build (see the fetch step).
+#
+# Every Python download (the embeddable zip, the NuGet package, the three
+# wheels) is pinned by SHA-256. Not pinned: the apt packages, which include
+# the host's python3-cryptography (configure check only, never shipped) and
+# the mingw toolchain whose runtime DLLs (libgomp, libgcc_s_seh,
+# libwinpthread) are shipped, as before. A ref without cmake/SwapNet.cmake
+# (0.34.15 and older) skips all of it and builds exactly as before.
+#
 # Security: the only input is a git ref consumed by actions/checkout's ref:
 # parameter (not interpolated into any run: line).
 
@@ -45,10 +70,11 @@ name: Build Windows btxd (mingw cross, smoked on Windows)
 # 0.34 .. 0.34.4 engines; 0.34.5 and later allow a degraded start, which
 # scripts/check-engine-fleet-ready.sh verifies per pin.
 #
-# 476f3f23 is upstream's tag v0.34.15 (tagged 2026-10-06), and both engine
-# guards pass on it. Before that it was 5f32c4c4 (v0.34.12), 84b998b4
-# (v0.34.9) and 3013c2c2 (v0.34.6). A SHA rather than the tag name so the
-# artifact is named for the commit, which is what node-win-installer.yml's
+# 074dac16 is upstream's final v0.34.16 (GitHub "Latest" since 2026-11-15;
+# upstream moved the tag there from d27530af, one more reason to name the
+# commit). Before that it was 476f3f23 (v0.34.15), 5f32c4c4 (v0.34.12),
+# 84b998b4 (v0.34.9) and 3013c2c2 (v0.34.6). A SHA rather than the tag name so
+# the artifact is named for the commit, which is what node-win-installer.yml's
 # identity check needs.
 on:
   workflow_dispatch:
@@ -56,7 +82,7 @@ on:
       btxchain_ref:
         description: "btxchain/btx ref to build (default = NODE_RELEASE_COMMIT)"
         required: false
-        default: "476f3f23e15228bb3e6119ed1e139a9b25424ce8"
+        default: "074dac167c26c1e091198f691ed5727817dba88a"
   # Self-service trigger. This workflow is dispatch-only, which means a 50 minute
   # build that everything else pins against can only start from a browser, and a
   # release stalls whenever nobody is at a keyboard. Scoped to a throwaway branch
@@ -72,7 +98,17 @@ permissions:
 # fallback there. That is how a build ends up producing an artifact nobody can
 # ship. Every consumer below reads BTXCHAIN_REF instead.
 env:
-  BTXCHAIN_REF: ${{ inputs.btxchain_ref || '476f3f23e15228bb3e6119ed1e139a9b25424ce8' }}
+  BTXCHAIN_REF: ${{ inputs.btxchain_ref || '074dac167c26c1e091198f691ed5727817dba88a' }}
+  # The CPython a 0.34.16+ btxd embeds. 3.14 is the line upstream's own Linux
+  # archive bundles, and python.org still publishes Windows binaries for it
+  # (3.12 stopped at 3.12.10, so it would ship without security fixes).
+  # The embeddable zip's hash is the one python.org publishes
+  # (python.org/api/v2/downloads/release_file); the NuGet hash was measured on
+  # first use in run 45507573539, where its python314.dll was byte-identical
+  # to the embeddable package's. Move all three together.
+  WINPY_VERSION: "3.14.10"
+  WINPY_EMBED_SHA256: "90905e64a840557d8c1bc4f5b74db3d7ee85e3ffb217611cac1c7813acea4159"
+  WINPY_NUGET_SHA256: "f54ba67c9951c3d773ea47d2bb095150c037c399f0423a968bcda22809241784"
 
 jobs:
   build-btxd:
@@ -85,6 +121,9 @@ jobs:
       # failed the upload AFTER the full cross-compile. btxd-linux.yml has
       # guarded this since its first run; this workflow did not.
       slug: ${{ steps.slug.outputs.slug }}
+      # "true" when this ref embeds CPython (0.34.16+). The smoke job uses it to
+      # decide whether -swapnet exists: 0.34.15 rejects the flag as unknown.
+      swapnet: ${{ steps.swapnet.outputs.embedded }}
     steps:
       - name: Slug the ref for artifact names
         id: slug
@@ -99,10 +138,27 @@ jobs:
           ref: ${{ env.BTXCHAIN_REF }}
           path: btx
 
+      - name: Does this ref embed CPython (SwapNet)?
+        id: swapnet
+        run: |
+          set -euo pipefail
+          if [ -f btx/cmake/SwapNet.cmake ]; then
+            echo "embedded=true" >> "$GITHUB_OUTPUT"
+            echo "cmake/SwapNet.cmake present: this btxd embeds CPython"
+          else
+            echo "embedded=false" >> "$GITHUB_OUTPUT"
+            echo "no cmake/SwapNet.cmake: no Python in this build"
+          fi
+
+      # mingw-w64-tools is gendef (the import library for pythonXY.dll).
+      # python3-cryptography is for the HOST interpreter: SwapNet's configure
+      # check imports cryptography with the interpreter that later freezes the
+      # swapnet sources into a header. It never reaches the Windows package.
       - name: Install mingw-w64 toolchain (posix threads)
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-mingw-w64-x86-64-posix cmake make curl git
+          sudo apt-get install -y g++-mingw-w64-x86-64-posix cmake make curl git \
+            mingw-w64-tools unzip python3-cryptography python3-pip
           # Bitcoin's build docs require the POSIX-threads mingw variant.
           sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix || true
           sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix || true
@@ -142,6 +198,96 @@ jobs:
             btx/depends/x86_64-w64-mingw32
           key: ${{ steps.depends_cache.outputs.cache-primary-key }}
 
+      # The Windows CPython for SwapNet (0.34.16+), all of it pinned by hash.
+      #
+      # Why a dependency provider and not -DPython3_LIBRARY hints: FindPython3
+      # is built for native builds. In this cross build it (1) refuses
+      # Development files whose minor version differs from the HOST interpreter
+      # ("Could NOT find Python3 (missing: Development ...)", 3.14 files with
+      # Ubuntu's 3.12), and (2) when the versions do match it copies the host
+      # interpreter's link flags onto the Windows link, which then dies with
+      # "cannot find -ldl". Both measured in run 45506860646. So the provider
+      # takes the interpreter from FindPython3 and hands SwapNet.cmake a
+      # Python3::Python target made from our own files. The btx tree is not
+      # edited for this. (CMAKE_PROJECT_TOP_LEVEL_INCLUDES needs CMake 3.24.)
+      - name: Fetch the Windows CPython that SwapNet embeds
+        if: steps.swapnet.outputs.embedded == 'true'
+        run: |
+          set -euo pipefail
+          major=$(echo "$WINPY_VERSION" | cut -d. -f1); minor=$(echo "$WINPY_VERSION" | cut -d. -f2)
+          xy="${major}${minor}"
+          w="$GITHUB_WORKSPACE/winpy"
+          mkdir -p "$w" && cd "$w"
+
+          curl -fsSL --retry 3 -o embed.zip \
+            "https://www.python.org/ftp/python/$WINPY_VERSION/python-$WINPY_VERSION-embed-amd64.zip"
+          curl -fsSL --retry 3 -o python.nupkg \
+            "https://www.nuget.org/api/v2/package/python/$WINPY_VERSION"
+          echo "$WINPY_EMBED_SHA256  embed.zip" | sha256sum -c -
+          echo "$WINPY_NUGET_SHA256  python.nupkg" | sha256sum -c -
+          mkdir embed nuget
+          unzip -q embed.zip -d embed
+          unzip -q python.nupkg -d nuget
+          test -f nuget/tools/include/Python.h
+          grep -q "define PY_VERSION  *\"$WINPY_VERSION\"" nuget/tools/include/patchlevel.h || {
+            echo "::error::the NuGet headers are not CPython $WINPY_VERSION"; exit 1; }
+          # The headers must describe the DLL we ship.
+          cmp "nuget/tools/python$xy.dll" "embed/python$xy.dll" || {
+            echo "::error::the NuGet python$xy.dll and the embeddable one differ"; exit 1; }
+
+          # Import library straight from the official DLL.
+          gendef "embed/python$xy.dll"
+          x86_64-w64-mingw32-dlltool -d "python$xy.def" -D "python$xy.dll" -l "libpython$xy.dll.a"
+          echo "python$xy.dll: $(grep -c . "python$xy.def") exports"
+
+          # Runtime wheels. cryptography is upstream's own tested pin
+          # (contrib/swapnet/requirements-tested-runtime.txt); cffi and
+          # pycparser are what it imports. Hashes are PyPI's for the win_amd64
+          # (cffi: cp314) files; --require-hashes refuses anything else.
+          want=$(sed -n 's/^cryptography==//p' "$GITHUB_WORKSPACE/btx/contrib/swapnet/requirements-tested-runtime.txt")
+          if [ "$want" != "46.0.4" ]; then
+            echo "::error::upstream now tests cryptography==$want, this workflow pins 46.0.4. Move the pin and its hash."
+            exit 1
+          fi
+          {
+            echo "cryptography==46.0.4 --hash=sha256:6225d3ebe26a55dbc8ead5ad1265c0403552a63336499564675b29eb3184c09b"
+            echo "cffi==2.1.1 --hash=sha256:3222ba5d678f80a030e6afbcc33dc1ae5cb45facabb61cee2c7016b8432fde48"
+            echo "pycparser==3.12 --hash=sha256:a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e"
+          } > requirements-win.txt
+          /usr/bin/python3 -m pip download --no-deps --only-binary=:all: --require-hashes \
+            --platform win_amd64 --python-version "$major.$minor" --implementation cp \
+            -d wheels -r requirements-win.txt
+          sha256sum wheels/*
+
+          # The provider. Lines are written one by one, like the stubs below.
+          p=python3-provider.cmake
+          : > "$p"
+          echo '# Answers find_package(Python3 ... Development) for the mingw cross build.' >> "$p"
+          echo '# Interpreter: the host one, from FindPython3. Library: the official' >> "$p"
+          echo '# Windows CPython this workflow downloaded. Written by btxd-windows.yml.' >> "$p"
+          echo 'macro(easybtx_provide_dependency method package_name)' >> "$p"
+          echo '  if("${package_name}" STREQUAL "Python3")' >> "$p"
+          echo '    set(_easybtx_args "${ARGN}")' >> "$p"
+          echo '    if("Development" IN_LIST _easybtx_args)' >> "$p"
+          echo '      list(REMOVE_ITEM _easybtx_args Development)' >> "$p"
+          echo '      find_package(Python3 ${_easybtx_args} BYPASS_PROVIDER)' >> "$p"
+          echo '      if(Python3_Interpreter_FOUND AND NOT TARGET Python3::Python)' >> "$p"
+          echo '        add_library(Python3::Python UNKNOWN IMPORTED GLOBAL)' >> "$p"
+          echo '        set_target_properties(Python3::Python PROPERTIES' >> "$p"
+          echo '          IMPORTED_LOCATION "${EASYBTX_WINPY_IMPLIB}"' >> "$p"
+          echo '          INTERFACE_INCLUDE_DIRECTORIES "${EASYBTX_WINPY_INCLUDE}"' >> "$p"
+          echo '          # The official pyconfig.h defines MS_WIN64 only under _MSC_VER.' >> "$p"
+          echo '          # Without it Py_ssize_t is 32 bits and every object is misread.' >> "$p"
+          echo '          INTERFACE_COMPILE_DEFINITIONS "MS_WIN64")' >> "$p"
+          echo '      endif()' >> "$p"
+          echo '      set(Python3_Development_FOUND "${Python3_Interpreter_FOUND}")' >> "$p"
+          echo '    endif()' >> "$p"
+          echo '    unset(_easybtx_args)' >> "$p"
+          echo '  endif()' >> "$p"
+          echo 'endmacro()' >> "$p"
+          echo 'cmake_language(SET_DEPENDENCY_PROVIDER easybtx_provide_dependency SUPPORTED_METHODS FIND_PACKAGE)' >> "$p"
+          cat "$p"
+
       # mingw's windef.h defines STRICT=1 by default (unless NO_STRICT), and
       # the tree's ReorgProtectionProfile enum has a STRICT enumerator — the
       # macro rewrites it into "expected identifier before numeric constant"
@@ -170,6 +316,8 @@ jobs:
       # slip on their side and worth reporting. The guard below fails the build if
       # a bare `bool near` survives, so a future upstream fix cannot leave this
       # patch quietly half-applied.
+      #
+      # Still needed at 0.34.16 (074dac16, net_processing.cpp:9846 and :9855).
       - name: Patch mingw `near` macro collision (upstream portability slip)
         working-directory: btx
         run: |
@@ -202,10 +350,20 @@ jobs:
       # yet. Pre-existing Bitcoin Core users of this header (ioprio, lockedpool,
       # subprocess, leveldb's env_posix) never reach the include on Windows,
       # since v0.33.1 built here fine, so nothing else can pick this up.
+      #
+      # 0.34.16 ships the same stand-in itself (src/compat/mingw/sys/resource.h,
+      # put on the include path for every Windows target by CMakeLists.txt), so
+      # the shim is only written for refs that lack it, 0.34.15 among them. The
+      # -I for win-compat stays on the command line either way: an include
+      # directory that does not exist is ignored.
       - name: Shim POSIX <sys/resource.h> for mingw
         working-directory: btx
         run: |
           set -euo pipefail
+          if [ -f src/compat/mingw/sys/resource.h ]; then
+            echo "upstream ships src/compat/mingw/sys/resource.h: no shim needed"
+            exit 0
+          fi
           mkdir -p win-compat/sys
           h=win-compat/sys/resource.h
           : > "$h"
@@ -240,10 +398,19 @@ jobs:
       # (ELF builds get away with it because the address-taken reference in an
       # unreachable branch folds away; PE/COFF emits a .refptr indirection that
       # keeps the reference alive, so mingw is where it surfaces.)
+      #
+      # Still missing at 0.34.16 (074dac16): src/ascend/ has the LT stub and the
+      # RC host file, and accel_v4.cpp:200/219/239 still take the three
+      # addresses. The guard skips this step the day upstream defines them, so
+      # the fix cannot turn into a duplicate-symbol link error.
       - name: Add the missing Ascend fail-closed digest stub
         working-directory: btx
         run: |
           set -euo pipefail
+          if grep -rqE 'bool[[:space:]]+ComputeDigestAccel[[:space:]]*\(' src/ascend/; then
+            echo "upstream now defines matmul_v4::ascend::ComputeDigestAccel: no stub needed"
+            exit 0
+          fi
           s=src/ascend/matmul_v4_accel_stub_btx.cpp
           : > "$s"
           echo '// Fail-closed Ascend digest stub (added by easyBTX CI: upstream ships' >> "$s"
@@ -269,24 +436,108 @@ jobs:
             echo "::error::failed to register the ascend stub in src/CMakeLists.txt"; exit 1; }
           echo "registered:"; grep -n 'ascend/matmul_v4' src/CMakeLists.txt
 
+      # cmake/SwapNet.cmake builds btx_swapnet_engine without core_interface,
+      # the interface target that hands every other target in the tree its
+      # platform definitions and flags. On Linux nothing notices. On Windows
+      # src/swapnet/runtime.cpp includes logging.h and with it util/fs.h, WIN32
+      # is not defined, the header takes its POSIX branch and stops at
+      #   util/fs.h:173: static assertion failed: PathToString not implemented
+      #   on this platform
+      # That was the ONLY error of the first 0.34.16 build (run 45509105010,
+      # with `make -k`). One line fixes it: give the engine core_interface's
+      # compile requirements, which every sibling target gets by linking it.
+      # $<COMPILE_ONLY:...> (CMake 3.27) because the engine needs the
+      # definitions and flags, not another entry on btxd's link line. The line
+      # is appended, not edited in place, so a change to upstream's own line
+      # cannot half-apply it, and it is skipped the day upstream links
+      # core_interface itself. Worth reporting upstream: the three engine files
+      # are also the only ones compiled without the tree's hardening flags.
+      - name: Give the SwapNet engine the tree's compile definitions (upstream slip)
+        if: steps.swapnet.outputs.embedded == 'true'
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          f=cmake/SwapNet.cmake
+          if grep -qE 'btx_swapnet_engine[^)]*core_interface' "$f"; then
+            echo "upstream links core_interface into btx_swapnet_engine: nothing to do"
+            exit 0
+          fi
+          grep -q '^add_library(btx_swapnet_engine STATIC' "$f" || {
+            echo "::error::btx_swapnet_engine is no longer defined in $f; re-check this patch"; exit 1; }
+          printf '\n# Added by easyBTX CI (btxd-windows.yml): see the step that writes this.\n' >> "$f"
+          printf 'target_link_libraries(btx_swapnet_engine PRIVATE $<COMPILE_ONLY:core_interface>)\n' >> "$f"
+          tail -4 "$f"
+
       # WITH_MODELNET=OFF, as on Linux and macOS. 0.34.7 made the Native Model
       # Network default ON (CMakeLists.txt:172), and ON is a hard configure
       # error without OpenSSL 3.5, which the depends tree does not build for
       # mingw. The app never uses the model plane, and OFF also removes the
       # `-modelnet` option, so nothing may pass -modelnet=0 to this btxd.
+      #
+      # APPEND_LDFLAGS=-lws2_32 -liphlpapi, for trees whose archive group covers
+      # MinGW. 0.34.16 widened target_link_btx_linux_archive_group from
+      # `UNIX AND NOT APPLE` to `(UNIX AND NOT APPLE) OR MINGW`, so btxd.exe is
+      # now linked as --start-group <btx archives> --end-group followed by the
+      # outside libraries. libminiupnpc.a is one of those and needs inet_pton,
+      # but nothing names ws2_32 after it, and GNU ld reads archives once, left
+      # to right:
+      #   libminiupnpc.a(minissdpc.c.obj): undefined reference to `__imp_inet_pton'
+      # (run 45512052613, the only error left once everything compiled).
+      # Upstream's own MinGW builds have the model network ON, and
+      # bitcoin_modelnet puts ws2_32 at the end of the line, which is why this
+      # only shows with WITH_MODELNET=OFF. APPEND_LDFLAGS is the tree's own knob
+      # for "at the very end of the link line". 0.34.15 linked without the
+      # group, so it does not get the flag.
+      #
+      # `-- -k` keeps make going past the first failing file. A bring-up on a
+      # new upstream tag used to cost one 50 minute run per error (the 0.33.2
+      # rounds above); this way one run lists them all.
       - name: Configure + build (depends toolchain, NO_STRICT)
         working-directory: btx
+        env:
+          SWAPNET: ${{ steps.swapnet.outputs.embedded }}
         run: |
+          set -euo pipefail
+          python_args=()
+          if [ "$SWAPNET" = "true" ]; then
+            xy="$(echo "$WINPY_VERSION" | cut -d. -f1)$(echo "$WINPY_VERSION" | cut -d. -f2)"
+            w="$GITHUB_WORKSPACE/winpy"
+            python_args=(
+              -DPython3_EXECUTABLE=/usr/bin/python3
+              -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="$w/python3-provider.cmake"
+              -DEASYBTX_WINPY_INCLUDE="$w/nuget/tools/include"
+              -DEASYBTX_WINPY_IMPLIB="$w/libpython$xy.dll.a"
+            )
+          fi
+          link_args=()
+          if grep -q 'if((UNIX AND NOT APPLE) OR MINGW)' src/CMakeLists.txt; then
+            link_args=(-DAPPEND_LDFLAGS="-lws2_32 -liphlpapi")
+          fi
           cmake -B build-win --toolchain depends/x86_64-w64-mingw32/toolchain.cmake \
             -DBUILD_DAEMON=ON -DBUILD_CLI=ON -DBUILD_UTIL=OFF -DBUILD_TX=OFF \
             -DBUILD_WALLET_TOOL=OFF -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_TESTS=OFF \
             -DENABLE_WALLET=ON -DWITH_SQLITE=ON -DWARN_INCOMPATIBLE_BDB=OFF \
             -DWITH_MODELNET=OFF \
-            -DAPPEND_CPPFLAGS="-DNO_STRICT -I$(pwd)/win-compat"
-          cmake --build build-win -j"$(nproc)"
+            -DAPPEND_CPPFLAGS="-DNO_STRICT -I$(pwd)/win-compat" \
+            "${python_args[@]}" "${link_args[@]}"
+          cmake --build build-win -j"$(nproc)" -- -k
+
+      # The order of btxd.exe's link line, also after a failed build. A wrong
+      # order is the usual way a mingw link of this tree breaks (GNU ld reads
+      # each archive once), and the make output does not show the command.
+      - name: Show the btxd link order
+        if: always()
+        working-directory: btx
+        run: |
+          f=build-win/src/CMakeFiles/btxd.dir/link.txt
+          if [ ! -f "$f" ]; then echo "no $f (configure did not get that far)"; exit 0; fi
+          tr ' ' '\n' < "$f" | grep -nE '(^-l|\.a$|-Wl,--(start|end)-group)' \
+            | sed -E 's#[^:]*/##' || true
 
       - name: Collect binaries + sha256
         working-directory: btx
+        env:
+          SWAPNET: ${{ steps.swapnet.outputs.embedded }}
         run: |
           set -euo pipefail
           btxd=$(find build-win -name btxd.exe | head -1)
@@ -350,9 +601,62 @@ jobs:
             queue="$next"
           done
 
+          # The CPython runtime (0.34.16+).
+          #
+          # Layout, relative to btxd.exe:
+          #   pythonXY.dll python3.dll vcruntime140*.dll   beside btxd.exe: the
+          #       loader resolves btxd.exe's import of pythonXY.dll in the
+          #       application directory first, before System32 and PATH, so a
+          #       Python the user installed can never be picked up instead.
+          #       python3.dll is what cryptography's abi3 module imports.
+          #   pythonXY._pth            CPython reads the ._pth beside its DLL and
+          #       then uses exactly these three paths: no registry, no
+          #       PYTHONHOME, no PYTHONPATH, no user site-packages.
+          #   python/pythonXY.zip      the standard library, precompiled
+          #   python/*.pyd + their DLLs  extension modules (sqlite3, ssl, ...)
+          #   python/site-packages/    cryptography, cffi, pycparser
+          # python.exe and pythonw.exe are left out: btxd is the only host.
+          if [ "$SWAPNET" = "true" ]; then
+            xy="$(echo "$WINPY_VERSION" | cut -d. -f1)$(echo "$WINPY_VERSION" | cut -d. -f2)"
+            e="$GITHUB_WORKSPACE/winpy/embed"
+            "$OBJDUMP" -p "$out/btxd.exe" | grep -q "DLL Name: python$xy.dll" || {
+              echo "::error::btxd.exe does not import python$xy.dll; the runtime would not match"; exit 1; }
+            appdir="python$xy.dll python3.dll vcruntime140.dll vcruntime140_1.dll"
+            for f in $appdir; do
+              [ -f "$e/$f" ] || { echo "::error::the embeddable package has no $f"; exit 1; }
+              cp "$e/$f" "$out/"
+            done
+            mkdir -p "$out/python/site-packages"
+            for f in "$e"/*; do
+              b=$(basename "$f")
+              case " python.exe pythonw.exe python.cat python$xy._pth $appdir " in *" $b "*) continue ;; esac
+              cp -r "$f" "$out/python/"
+            done
+            for whl in "$GITHUB_WORKSPACE"/winpy/wheels/*.whl; do
+              unzip -q -o "$whl" -d "$out/python/site-packages"
+            done
+            printf 'python\\python%s.zip\npython\npython\\site-packages\n' "$xy" > "$out/python$xy._pth"
+            echo "python$xy._pth:"; cat "$out/python$xy._pth"
+            {
+              echo "CPython $WINPY_VERSION for Windows x86-64, from python.org, unmodified."
+              echo "embeddable package sha256 $WINPY_EMBED_SHA256"
+              echo "python.exe, pythonw.exe and python.cat are left out; pythonXY._pth is rewritten."
+              echo "site-packages, from PyPI wheels:"
+              (cd "$GITHUB_WORKSPACE/winpy/wheels" && sha256sum *.whl | sed 's/^/  /')
+              echo "Licences: python/LICENSE.txt and the *.dist-info directories."
+            } > "$out/python/RUNTIME.txt"
+            du -sh "$out/python" "$out/python/site-packages"
+          fi
+
           file "$out/btxd.exe"
           ls -la "$out"
-          (cd "$out" && sha256sum btxd.exe btx-cli.exe $(ls *.dll 2>/dev/null) | tee SHA256SUMS.txt)
+          # Every file of the package, by relative path. The staging script
+          # verifies the staged tree against this list and refuses a file that
+          # is not on it.
+          (cd "$out" && find . -type f ! -name SHA256SUMS.txt -printf '%P\n' | LC_ALL=C sort \
+            | xargs -d '\n' sha256sum > SHA256SUMS.txt)
+          grep -E '  (btxd\.exe|btx-cli\.exe|[^/]*\.dll)$' "$out/SHA256SUMS.txt"
+          echo "package: $(wc -l < "$out/SHA256SUMS.txt") files, $(du -sb "$out" | cut -f1) bytes"
 
       - name: Upload btxd artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -365,48 +669,218 @@ jobs:
     name: regtest smoke on real Windows
     needs: build-btxd
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    env:
+      SWAPNET: ${{ needs.build-btxd.outputs.swapnet }}
     steps:
-      - name: Download the cross-built binaries
+      - name: Download the cross-built package
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: btxd-windows-${{ needs.build-btxd.outputs.slug }}
           path: btxd-dist
 
-      # The creators' wrapper smoke, ported 1:1 (Invoke-SmokeTest in
-      # contrib/devtools/build-btx-windows.ps1): boot the daemon on regtest,
-      # wait for RPC, create a wallet, mine one block, assert the count.
-      - name: Regtest smoke (boot → wallet → mine 1 block)
+      # Smoke what ships. The staging script is the one step between this
+      # artifact and the tree inside the installer (node-win-installer.yml), so
+      # the smoke runs on its output: the same layout, verified file by file
+      # against SHA256SUMS.txt. A package the script cannot stage fails here,
+      # 50 minutes earlier than in the installer build.
+      - name: Checkout the staging script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: easynode
+          sparse-checkout: |
+            apps/node/scripts
+
+      - name: Stage the package the way the installer build does
         shell: pwsh
         run: |
-          $daemon = Resolve-Path "btxd-dist\btxd.exe"
-          $cli = Resolve-Path "btxd-dist\btx-cli.exe"
-          & $daemon --version | Select-Object -First 1
-          $smokeDir = Join-Path $env:TEMP "btx-smoke"
-          New-Item -ItemType Directory -Path $smokeDir -Force | Out-Null
-          $node = Start-Process -FilePath $daemon -ArgumentList @(
-            "-regtest", "-datadir=$smokeDir", "-fallbackfee=0.0001"
-          ) -PassThru -WindowStyle Hidden
-          try {
-            $ready = $false
-            for ($i = 0; $i -lt 90; $i++) {
-              & $cli "-regtest" "-datadir=$smokeDir" getblockcount *> $null
-              if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+          .\easynode\apps\node\scripts\stage-node-pkg-windows.ps1 `
+            -SourceDir btxd-dist -VerifyShaFile btxd-dist\SHA256SUMS.txt
+
+      # Case 1 is the creators' wrapper smoke, ported 1:1 (Invoke-SmokeTest in
+      # contrib/devtools/build-btx-windows.ps1): boot the daemon on regtest,
+      # wait for RPC, create a wallet, mine one block, assert the count. It now
+      # also asserts a CLEAN stop (exit code 0 and "Shutdown: done"), and it
+      # runs with a PATH of System32 and Windows only: no Python, no mingw.
+      # GitHub's Windows image has both on PATH, which is how the missing
+      # libgomp-1.dll of 0.6.6 stayed invisible until it reached a user.
+      #
+      # Cases 2 and 3 exist for a 0.34.16+ btxd, which embeds CPython:
+      #   2  -swapnet=1 from an install path with a space and an umlaut, with
+      #      the same Python-free PATH. Proves the embedded runtime starts on a
+      #      machine that has no Python at all, and that the path of a real
+      #      user profile (a first and last name, non-ASCII letters) does not
+      #      break it.
+      #   3  -swapnet=1 with the runner's own PATH (which has another Python
+      #      and other mingw DLLs first) and PYTHONHOME/PYTHONPATH pointing
+      #      nowhere. Proves a Python the user installed cannot displace or
+      #      break the one in the package.
+      # Both read the answer three ways: the SwapNet RPC replies in-process,
+      # debug.log has the runtime's start line, and the module list of the
+      # running btxd shows pythonXY.dll, _sqlite3.pyd and cryptography's
+      # _rust.pyd loaded from inside the package and nowhere else.
+      - name: Regtest smoke (boot, wallet, mine 1 block, clean stop; embedded CPython)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pkg = (Resolve-Path "easynode\apps\node\src-tauri\resources\node-pkg").Path
+          $bin = Join-Path $pkg "bin"
+          $embedded = ($env:SWAPNET -eq "true")
+          $runnerPath = $env:PATH
+          $systemPath = "$env:SystemRoot\system32;$env:SystemRoot"
+
+          function Show-Log([string]$datadir) {
+            $log = Join-Path $datadir "regtest\debug.log"
+            if (Test-Path $log) { Write-Host "---- last lines of $log"; Get-Content $log -Tail 60 }
+          }
+
+          function Start-Node([string]$binDir, [string]$datadir, [string[]]$extra) {
+            New-Item -ItemType Directory -Path $datadir -Force | Out-Null
+            # Start-Process joins the list with spaces and quotes nothing, so
+            # the one argument that can hold a space is quoted here.
+            $argv = @("-regtest", "-datadir=`"$datadir`"", "-fallbackfee=0.0001") + $extra
+            $p = Start-Process -FilePath (Join-Path $binDir "btxd.exe") -ArgumentList $argv -PassThru -WindowStyle Hidden
+            $null = $p.Handle  # without this, ExitCode is empty once the process is gone
+            return $p
+          }
+
+          function Wait-Rpc($node, [string]$binDir, [string]$datadir) {
+            $cli = Join-Path $binDir "btx-cli.exe"
+            for ($i = 0; $i -lt 180; $i++) {
+              if ($node.HasExited) {
+                Show-Log $datadir
+                throw "btxd exited during startup with code $($node.ExitCode)"
+              }
+              & $cli "-regtest" "-datadir=$datadir" getblockcount *> $null
+              if ($LASTEXITCODE -eq 0) { return }
               Start-Sleep -Seconds 1
             }
-            if (-not $ready) { throw "regtest node did not become RPC-ready" }
-            & $cli "-regtest" "-datadir=$smokeDir" createwallet smoke | Out-Null
+            Show-Log $datadir
+            throw "regtest node did not become RPC-ready in 180 s"
+          }
+
+          function Stop-Node($node, [string]$binDir, [string]$datadir) {
+            & (Join-Path $binDir "btx-cli.exe") "-regtest" "-datadir=$datadir" stop | Out-Null
+            if (-not $node.WaitForExit(120000)) {
+              Stop-Process -Id $node.Id -Force -ErrorAction SilentlyContinue
+              Show-Log $datadir
+              throw "btxd was still running 120 s after 'stop'"
+            }
+            if ($node.ExitCode -ne 0) {
+              Show-Log $datadir
+              throw "btxd exited with code $($node.ExitCode) after 'stop'"
+            }
+            $log = Get-Content (Join-Path $datadir "regtest\debug.log") -Raw
+            if ($log -notmatch "Shutdown: done") { throw "debug.log has no 'Shutdown: done'" }
+            Write-Host "clean stop: exit code 0, 'Shutdown: done' logged"
+          }
+
+          function Assert-EmbeddedRuntime($node, [string]$binDir, [string]$datadir) {
+            $cli = Join-Path $binDir "btx-cli.exe"
+            $raw = & $cli "-regtest" "-datadir=$datadir" getswapnetworkinfo
+            if ($LASTEXITCODE -ne 0) { Show-Log $datadir; throw "getswapnetworkinfo failed" }
+            $flat = ($raw | Out-String | ConvertFrom-Json | ConvertTo-Json -Depth 20 -Compress)
+            Write-Host "getswapnetworkinfo: $flat"
+            if ($flat -notmatch '"in_process":true') { throw "SwapNet does not report in_process=true" }
+            if ($flat -notmatch '"protocol":2') { throw "SwapNet does not report protocol 2" }
+
+            $log = Get-Content (Join-Path $datadir "regtest\debug.log") -Raw
+            if ($log -notmatch "SwapNet: embedded runtime started") {
+              Show-Log $datadir
+              throw "debug.log has no 'SwapNet: embedded runtime started'"
+            }
+
+            $names = '^(python3\d*\.dll|vcruntime140.*\.dll|.*\.pyd|libcrypto.*\.dll|libssl.*\.dll|libffi.*\.dll|sqlite3\.dll)$'
+            $mods = @((Get-Process -Id $node.Id).Modules | Where-Object { $_.ModuleName -match $names })
+            foreach ($m in $mods) {
+              Write-Host "  loaded $($m.FileName)"
+              if (-not $m.FileName.StartsWith($binDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "btxd loaded $($m.ModuleName) from outside the package: $($m.FileName)"
+              }
+            }
+            foreach ($need in '^python3\d+\.dll$', '^_sqlite3\.pyd$', '^_rust\.pyd$') {
+              if (-not ($mods | Where-Object { $_.ModuleName -match $need })) {
+                throw "btxd has no module matching $need loaded: the embedded runtime did not start fully"
+              }
+            }
+            Write-Host "embedded CPython is running inside btxd, loaded from $binDir only"
+          }
+
+          function Invoke-Case([string]$title, [scriptblock]$body) {
+            Write-Host ""
+            Write-Host "================ $title"
+            $script:node = $null
+            try { & $body }
+            catch {
+              if ($script:node -and -not $script:node.HasExited) {
+                Stop-Process -Id $script:node.Id -Force -ErrorAction SilentlyContinue
+              }
+              throw
+            }
+          }
+
+          # ---- Case 1: the wrapper smoke, Python-free PATH.
+          Invoke-Case "1: boot, wallet, mine 1 block, clean stop (PATH = System32 and Windows only)" {
+            $env:PATH = $systemPath
+            Remove-Item Env:PYTHONHOME, Env:PYTHONPATH -ErrorAction SilentlyContinue
+            $cli = Join-Path $bin "btx-cli.exe"
+            $banner = & (Join-Path $bin "btxd.exe") --version
+            if ($LASTEXITCODE -ne 0) { throw "btxd.exe --version exited with $LASTEXITCODE" }
+            Write-Host ($banner | Select-Object -First 1)
+            $dd = Join-Path $env:RUNNER_TEMP "btx-smoke-1"
+            # 0.34.15 does not know -swapnet and refuses an unknown argument.
+            $extra = @(); if ($embedded) { $extra = @("-swapnet=0") }
+            $script:node = Start-Node $bin $dd $extra
+            Wait-Rpc $script:node $bin $dd
+            & $cli "-regtest" "-datadir=$dd" createwallet smoke | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "createwallet failed" }
-            $addr = (& $cli "-regtest" "-datadir=$smokeDir" "-rpcwallet=smoke" getnewaddress).Trim()
+            $addr = (& $cli "-regtest" "-datadir=$dd" "-rpcwallet=smoke" getnewaddress).Trim()
             if (-not $addr) { throw "getnewaddress returned nothing" }
             Write-Host "mining one regtest block to $addr"
-            & $cli "-regtest" "-datadir=$smokeDir" "-rpcwallet=smoke" generatetoaddress 1 $addr | Out-Null
+            & $cli "-regtest" "-datadir=$dd" "-rpcwallet=smoke" generatetoaddress 1 $addr | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "generatetoaddress failed" }
-            $count = (& $cli "-regtest" "-datadir=$smokeDir" getblockcount).Trim()
+            $count = (& $cli "-regtest" "-datadir=$dd" getblockcount).Trim()
             if ($count -ne "1") { throw "unexpected block count after mining: $count" }
-            Write-Host "SMOKE PASSED: daemon boots, wallet works, mined 1 regtest block on Windows"
-          } finally {
-            & $cli "-regtest" "-datadir=$smokeDir" stop *> $null
-            Start-Sleep -Seconds 3
-            if (-not $node.HasExited) { Stop-Process -Id $node.Id -Force -ErrorAction SilentlyContinue }
+            if ($embedded) {
+              $reply = (& $cli "-regtest" "-datadir=$dd" getswapnetworkinfo 2>&1 | Out-String)
+              if ($LASTEXITCODE -eq 0) { throw "SwapNet answered although the node runs with -swapnet=0" }
+              Write-Host "with -swapnet=0 the SwapNet RPC declines, as it should: $($reply.Trim())"
+            }
+            Stop-Node $script:node $bin $dd
           }
+
+          if (-not $embedded) {
+            Write-Host ""
+            Write-Host "SMOKE PASSED: daemon boots, wallet works, mined 1 regtest block, stopped cleanly (this ref embeds no CPython)"
+            exit 0
+          }
+
+          # ---- Case 2: -swapnet=1, awkward install path, Python-free PATH.
+          Invoke-Case "2: -swapnet=1 from a path with a space and an umlaut (PATH = System32 and Windows only)" {
+            $env:PATH = $systemPath
+            Remove-Item Env:PYTHONHOME, Env:PYTHONPATH -ErrorAction SilentlyContinue
+            $odd = Join-Path $env:RUNNER_TEMP ("BTX Node J" + [char]0xF6 + "rg")
+            Copy-Item -Recurse $pkg $odd
+            $bin2 = Join-Path $odd "bin"
+            $dd = Join-Path $odd "data"
+            $script:node = Start-Node $bin2 $dd @("-swapnet=1")
+            Wait-Rpc $script:node $bin2 $dd
+            Assert-EmbeddedRuntime $script:node $bin2 $dd
+            Stop-Node $script:node $bin2 $dd
+          }
+
+          # ---- Case 3: -swapnet=1 with another Python in the way.
+          Invoke-Case "3: -swapnet=1 with the runner's PATH and a bogus PYTHONHOME/PYTHONPATH" {
+            $env:PATH = $runnerPath
+            $env:PYTHONHOME = "C:\does-not-exist"
+            $env:PYTHONPATH = "C:\does-not-exist"
+            Write-Host "python on PATH: $((Get-Command python -ErrorAction SilentlyContinue).Source)"
+            $dd = Join-Path $env:RUNNER_TEMP "btx-smoke-3"
+            $script:node = Start-Node $bin $dd @("-swapnet=1")
+            Wait-Rpc $script:node $bin $dd
+            Assert-EmbeddedRuntime $script:node $bin $dd
+            Stop-Node $script:node $bin $dd
+          }
+
+          Write-Host ""
+          Write-Host "SMOKE PASSED: daemon boots, wallet works, mined 1 regtest block, stopped cleanly; embedded CPython starts with no Python on PATH and with a foreign one"
