@@ -8,6 +8,8 @@ root).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-25 · linux + windows (no mac build; the mac stays on the version it has)
+
 **A node engine with a file missing is put back, and says which file.** Since
 0.8.0 the engine carries a Python runtime: 776 files on Linux and 191 on
 Windows, where it used to be a handful. If one of them goes missing (antivirus
