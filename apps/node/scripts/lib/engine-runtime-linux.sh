@@ -398,10 +398,14 @@ engine_stage_tree() {
 # app downloads it when its user switches the swarm on. So it needs a form that
 # can be fetched as one file and checked without trusting the place it came
 # from. engine_release_archive makes four files in OUTDIR, all named after the
-# BTX commit the engine was built from:
+# BTX version and commit the engine was built from
+# (easynode-engine-linux-x86_64-modelnet-v0.34.16-074dac16):
 #
-#   <name>.tar.gz          bin/btxd, bin/btx-cli, bin/btx-modeld, bin/btx-guardd,
-#                          bin/lib/...  (the layout of an install folder)
+#   <name>.tar.gz          the tree that goes under <install>/linux-x86_64/,
+#                          the layout a staged node-pkg has: bin/btxd,
+#                          bin/btx-cli, bin/btx-modeld, bin/btx-guardd,
+#                          bin/lib/..., .btxd-version, and BTXD_MODELNET.
+#                          Regular files and directories only.
 #   <name>.tar.gz.sha256   `sha256sum` format
 #   <name>.files           every file of it, `<size>TAB<path>`, under the two
 #                          header lines the app's own list has
@@ -410,21 +414,21 @@ engine_stage_tree() {
 #   <name>.json            what it is: commit, version, btxd BuildID and sha256,
 #                          the archive's and the list's sha256 and sizes
 #
-# The archive is reproducible from one package: sorted names, no owner, one
-# timestamp (ENGINE_SOURCE_DATE_EPOCH, the commit's time). It is NOT
-# reproducible across two builds: two runs at one commit give btxd the same
-# BuildID and different bytes. So a pin names one run's archive by sha256.
-ENGINE_ARCHIVE_PREFIX="easynode-engine-modelnet-linux-x86_64"
+# The archive is reproducible from one package: sorted names, owner 0, every
+# timestamp 0, gzip without a name or time. It is NOT reproducible across two
+# builds: two runs at one commit give btxd the same BuildID and different
+# bytes. So a pin names one run's archive by sha256.
+ENGINE_ARCHIVE_PREFIX="easynode-engine-linux-x86_64-modelnet"
 ENGINE_FILES_HEADER="easynode-engine-files 2"
 
 # engine_release_archive BINDIR OUTDIR
 # BINDIR is a finished, checked package with BTXD_COMMIT, BTXD_VERSION and
 # SHA256SUMS.txt in it (the engine build's btxd-dist).
 engine_release_archive() {
-  local bindir out=$2 commit version name stage back f n epoch build_id
+  local bindir out=$2 commit version name stage back f n build_id tab
   local tgz files json
   bindir="$(realpath "$1")"
-  for f in BTXD_COMMIT BTXD_VERSION SHA256SUMS.txt btxd btx-cli; do
+  for f in BTXD_COMMIT BTXD_VERSION BTXD_MODELNET SHA256SUMS.txt btxd btx-cli; do
     [[ -f "$bindir/$f" ]] || { _engine_err "$bindir/$f not found"; return 1; }
   done
   for f in $ENGINE_OPTIONAL_BINARIES; do
@@ -434,27 +438,32 @@ engine_release_archive() {
   version="$(tr -d '[:space:]' < "$bindir/BTXD_VERSION")"
   [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { _engine_err "BTXD_COMMIT is not a commit: '$commit'"; return 1; }
   [[ "$version" =~ ^v[0-9]+(\.[0-9]+)+$ ]] || { _engine_err "BTXD_VERSION is not a version: '$version'"; return 1; }
-  epoch="${ENGINE_SOURCE_DATE_EPOCH:-0}"
-  [[ "$epoch" =~ ^[0-9]+$ ]] || { _engine_err "ENGINE_SOURCE_DATE_EPOCH is not a number: '$epoch'"; return 1; }
-  name="$ENGINE_ARCHIVE_PREFIX-${commit:0:12}"
+  name="$ENGINE_ARCHIVE_PREFIX-$version-${commit:0:8}"
+  tab="$(printf '\t')"
   mkdir -p "$out" || return 1
   out="$(realpath "$out")"
   tgz="$out/$name.tar.gz"; files="$out/$name.files"; json="$out/$name.json"
 
-  # Only the package: the executables and lib/. The build's own records
-  # (BTXD_*, SHA256SUMS.txt, the ELF report) stay in the Actions artifact.
+  # Only the package: the executables and lib/ under bin/, the version marker
+  # every staged package has (.btxd-version, what provisioning compares the
+  # binary's own answer with) and the marker that says which engine this is.
+  # The build's other records (SHA256SUMS.txt, the ELF report) stay in the
+  # Actions artifact.
   stage="$(mktemp -d)"; back="$(mktemp -d)"
   mkdir -p "$stage/bin" || return 1
   while IFS= read -r f; do
     cp -p "$bindir/$f" "$stage/bin/$f" || return 1
   done < <(engine_package_binaries "$bindir")
   cp -pR "$bindir/lib" "$stage/bin/lib" || return 1
+  printf '%s\n' "$version" > "$stage/.btxd-version" || return 1
+  cp "$bindir/BTXD_MODELNET" "$stage/BTXD_MODELNET" || return 1
+  chmod 644 "$stage/.btxd-version" "$stage/BTXD_MODELNET"
   # The app's list is path and size of regular files. Anything else (a link, a
   # socket) it could neither list nor check, so it may not be in the archive.
-  n="$(find "$stage/bin" ! -type f ! -type d | wc -l | tr -d ' ')"
+  n="$(find "$stage" ! -type f ! -type d | wc -l | tr -d ' ')"
   if [[ "$n" != 0 ]]; then
     _engine_err "the package holds $n entr(ies) that are neither file nor directory:"
-    find "$stage/bin" ! -type f ! -type d | head -5 >&2
+    find "$stage" ! -type f ! -type d | head -5 >&2
     return 1
   fi
   # .pyc is Python's own cache; the app leaves it out of its list and the
@@ -463,18 +472,18 @@ engine_release_archive() {
   [[ "$n" == 0 ]] || { _engine_err "the package holds $n .pyc file(s); the app's file list has no place for them"; return 1; }
 
   { printf '%s\nfrom package\n' "$ENGINE_FILES_HEADER"
-    (cd "$stage" && find bin -type f -printf '%s\t%p\n' | LC_ALL=C sort -t "$(printf '\t')" -k2)
+    (cd "$stage" && find . -type f -printf '%s\t%P\n' | LC_ALL=C sort -t "$tab" -k2)
   } > "$files" || return 1
 
   (cd "$stage" && LC_ALL=C tar --sort=name --owner=0 --group=0 --numeric-owner \
-      --mtime="@$epoch" --format=gnu -cf - bin) | gzip -n -6 > "$tgz" || return 1
+      --mtime=@0 --format=gnu -cf - .btxd-version BTXD_MODELNET bin) | gzip -n -6 > "$tgz" || return 1
   (cd "$out" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256") || return 1
 
   # Read it back: what a user's app will unpack, against the list and against
   # the sums of the package that was checked and started.
   tar -xzf "$tgz" -C "$back" || return 1
   if ! diff <(tail -n +3 "$files") \
-            <(cd "$back" && find bin -type f -printf '%s\t%p\n' | LC_ALL=C sort -t "$(printf '\t')" -k2) >/dev/null; then
+            <(cd "$back" && find . -type f -printf '%s\t%P\n' | LC_ALL=C sort -t "$tab" -k2) >/dev/null; then
     _engine_err "the unpacked archive is not what $name.files lists"
     return 1
   fi

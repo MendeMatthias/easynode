@@ -799,8 +799,6 @@ jobs:
           set -euo pipefail
           # shellcheck source=/dev/null
           . easynode/apps/node/scripts/lib/engine-runtime-linux.sh
-          ENGINE_SOURCE_DATE_EPOCH="$(git -C btx log -1 --format=%ct)"
-          export ENGINE_SOURCE_DATE_EPOCH
           engine_release_archive btxd-dist engine-release
           ls -l engine-release
           cat engine-release/*.json
