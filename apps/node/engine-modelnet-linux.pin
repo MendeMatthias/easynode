@@ -1,0 +1,32 @@
+# The ModelNet engine for Linux: which build an installed app may fetch.
+#
+# This is NOT the engine an installer carries. That one is pinned in
+# .github/workflows/node-linux-installer.yml (PROVEN_BTXD_RUN_ID and friends)
+# and is built with the Native Model Network off. The engine named here is the
+# second one: the same BTX commit built with the model network on, with
+# btx-modeld and btx-guardd beside btxd. An installed Linux app downloads it
+# only when its user switches the swarm on, and checks the download against
+# the numbers below.
+#
+# Every value comes from ONE run of btxd-linux.yml with `modelnet: on`: read
+# them from that run's <archive>.json (artifact engine-modelnet-linux-release-<commit>).
+# They move TOGETHER. Two runs at one commit give different bytes, so a new run
+# means a new archive sha256, and an archive that was ever published is never
+# replaced under the same release tag.
+#
+# apps/node/scripts/check-modelnet-engine-pin.sh (in CI) refuses a pin whose
+# commit or version is not the app's own engine pin, and one that points at the
+# installer's run. This file is read as data, `KEY="value"`, never sourced.
+
+MODELNET_ENGINE_RUN_ID="45608534969"
+MODELNET_ENGINE_ARTIFACT="btxd-linux-modelnet-074dac167c26c1e091198f691ed5727817dba88a"
+MODELNET_ENGINE_COMMIT="074dac167c26c1e091198f691ed5727817dba88a"
+MODELNET_ENGINE_VERSION="v0.34.16"
+MODELNET_ENGINE_BTXD_BUILD_ID="1b5e452247beb88116c986b8a732f50cd2cade30"
+MODELNET_ENGINE_BTXD_SHA256="c8283047055473f0893509ee5ab5b137cd134b7eb3e495464b2163847d1bc90e"
+MODELNET_ENGINE_ARCHIVE="easynode-engine-linux-x86_64-modelnet-v0.34.16-074dac16.tar.gz"
+MODELNET_ENGINE_ARCHIVE_SIZE="489914145"
+MODELNET_ENGINE_ARCHIVE_SHA256="4eeec1b9caa9d4c45b632154ec6cbda62b18349a9a13981bd95472afdaee3be2"
+MODELNET_ENGINE_UNPACKED_SIZE="828804903"
+MODELNET_ENGINE_FILE_COUNT="779"
+MODELNET_ENGINE_FILES_SHA256="919628e2dfa11674a5a81fd68ed06d9e67f2b8e4e0b9be3e09bfbb7df539a525"

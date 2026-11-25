@@ -16,6 +16,7 @@
 # THE LAYOUT (unchanged for the binaries, new for Python):
 #
 #   bin/btxd, bin/btx-cli              RUNPATH $ORIGIN/lib
+#   bin/btx-modeld, bin/btx-guardd     RUNPATH $ORIGIN/lib   ModelNet build only
 #   bin/lib/*.so*                      RUNPATH $ORIGIN      every non-glibc library
 #   bin/lib/libpython3.X.so.1.0        RUNPATH $ORIGIN      0.34.16 on
 #   bin/lib/python3.X/                 standard library, lib-dynload, site-packages
@@ -36,6 +37,8 @@
 #   engine-runtime-linux.sh stage <dir with btxd + btx-cli> <dest bin dir>
 #   engine-runtime-linux.sh check <bin dir> [report file]
 #   engine-runtime-linux.sh clean-start <bin dir> <plain|swapnet0|swapnet1|masked>
+#   (a ModelNet package also takes modelnet0, modelnet1, modelnet1swapnet1 and
+#   modelnetdefault; engine_clean_start says what each one asserts)
 
 # The oldest machines the engine must run on: Ubuntu 22.04. glibc 2.35, and the
 # libstdc++ of GCC 12 that 22.04 ships (GLIBCXX_3.4.30, CXXABI_1.3.13). glibc
@@ -52,6 +55,26 @@ ENGINE_CLEAN_IMAGE="${ENGINE_CLEAN_IMAGE:-ubuntu:22.04}"
 ENGINE_PY_MANIFEST="EASYNODE-RUNTIME.json"
 
 _engine_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The executables a package MAY carry beside btxd and btx-cli. Only an engine
+# built with the Native Model Network has them (btxd-linux.yml, modelnet: on).
+# They sit BESIDE btxd on purpose: btxd's guard supervisor starts the btx-guardd
+# next to its own executable and never one from PATH.
+ENGINE_OPTIONAL_BINARIES="btx-modeld btx-guardd"
+
+# engine_package_binaries DIR
+# The executables of the package in DIR, one name per line: btxd, btx-cli, and
+# whichever optional ones are there.
+engine_package_binaries() {
+  local n
+  printf 'btxd
+btx-cli
+'
+  for n in $ENGINE_OPTIONAL_BINARIES; do
+    if [[ -f "$1/$n" ]]; then printf '%s
+' "$n"; fi
+  done
+}
 
 _engine_err() { printf 'error: %s\n' "$*" >&2; }
 
@@ -170,9 +193,19 @@ engine_set_runpath() {
 # from the package gets NO run path, so no build-machine path ships.
 engine_set_runpaths() {
   local bindir=$1 libdir="$1/lib" f dep rel nonsys
-  for f in "$bindir/btxd" "$bindir/btx-cli"; do
-    engine_set_runpath "$f" '$ORIGIN/lib' || return 1
-  done
+  while IFS= read -r f; do
+    # An executable that needs nothing from bin/lib gets no run path at all
+    # (btx-guardd, which links only glibc and the C++ runtime).
+    nonsys=0
+    while IFS= read -r dep; do
+      if ! engine_is_system_lib "$dep"; then nonsys=1; fi
+    done < <(engine_needed "$bindir/$f")
+    if [[ $nonsys -eq 1 || "$f" == btxd || "$f" == btx-cli ]]; then
+      engine_set_runpath "$bindir/$f" '$ORIGIN/lib' || return 1
+    else
+      engine_set_runpath "$bindir/$f" '' || return 1
+    fi
+  done < <(engine_package_binaries "$bindir")
   [[ -d "$libdir" ]] || return 0
   while IFS= read -r f; do
     if [[ "$(dirname "$f")" == "$libdir" ]]; then
@@ -265,7 +298,7 @@ engine_is_finished_package() {
 # changed. Anything else means what is about to ship is not what was tested.
 engine_verify_sums() {
   local bindir=$1 sums=$2 want have
-  want="$(grep -E '^[0-9a-f]{64}  (btxd|btx-cli|lib/.+)$' "$sums" | LC_ALL=C sort -k2)"
+  want="$(grep -E "^[0-9a-f]{64}  (btxd|btx-cli|${ENGINE_OPTIONAL_BINARIES// /|}|lib/.+)\$" "$sums" | LC_ALL=C sort -k2)"
   if [[ -z "$want" ]]; then
     _engine_err "$sums lists no package file"
     return 1
@@ -286,19 +319,39 @@ engine_verify_sums() {
 # SRC holds btxd and btx-cli: a btx build's bin/, or a downloaded engine
 # artifact (which also has lib/, the closure its build already tested).
 # BINDIR is replaced.
+#
+# The optional executables (ENGINE_OPTIONAL_BINARIES) are carried in two cases
+# only: SRC is a finished package whose SHA256SUMS.txt lists them, or the
+# caller asks for them by name in ENGINE_EXTRA_BINARIES (the ModelNet engine
+# build). A build's bin/ that merely happens to contain one does not get it
+# shipped by accident.
 engine_stage_tree() {
   local src=$1 bindir=$2 libdir="$2/lib" f soname
-  local -a roots
+  local -a roots extras=()
+  if engine_is_finished_package "$src"; then
+    for f in $ENGINE_OPTIONAL_BINARIES; do
+      if grep -qE "^[0-9a-f]{64}  $f\$" "$src/SHA256SUMS.txt"; then extras+=("$f"); fi
+    done
+  else
+    for f in ${ENGINE_EXTRA_BINARIES:-}; do
+      case " $ENGINE_OPTIONAL_BINARIES " in
+        *" $f "*) extras+=("$f") ;;
+        *) _engine_err "ENGINE_EXTRA_BINARIES names '$f', which is not one of: $ENGINE_OPTIONAL_BINARIES"; return 1 ;;
+      esac
+    done
+  fi
   for f in patchelf readelf ldd realpath; do
     command -v "$f" >/dev/null || { _engine_err "$f is required (apt install patchelf binutils)."; return 1; }
   done
-  for f in btxd btx-cli; do
+  for f in btxd btx-cli "${extras[@]}"; do
     [[ -f "$src/$f" ]] || { _engine_err "$src/$f not found"; return 1; }
   done
   rm -rf "$bindir"
   mkdir -p "$libdir" || return 1
-  cp "$src/btxd" "$src/btx-cli" "$bindir/" || return 1
-  chmod 755 "$bindir/btxd" "$bindir/btx-cli"
+  for f in btxd btx-cli "${extras[@]}"; do
+    cp "$src/$f" "$bindir/$f" || return 1
+    chmod 755 "$bindir/$f"
+  done
   # An engine artifact: take its lib/ whole, BEFORE asking the loader for
   # anything. Otherwise a library this machine happens to have (the installer
   # runner has most of them) could be picked up in place of the copy the engine
@@ -323,6 +376,7 @@ engine_stage_tree() {
   # The two binaries are resolved at their SOURCE path, where their run path
   # still means something; the copies have not been given theirs yet.
   roots=("$src/btxd" "$src/btx-cli")
+  for f in "${extras[@]}"; do roots+=("$src/$f"); done
   while IFS= read -r f; do roots+=("$f"); done < <(engine_elfs "$libdir")
   engine_vendor_closure "$libdir" "${roots[@]}" || return 1
   engine_set_runpaths "$bindir" || return 1
@@ -336,6 +390,134 @@ engine_stage_tree() {
     done
   fi
   rmdir "$libdir" 2>/dev/null || true
+}
+
+# ── The archive an installed app fetches ────────────────────────────────────
+
+# The ModelNet engine is a SECOND engine: no installer carries it, an installed
+# app downloads it when its user switches the swarm on. So it needs a form that
+# can be fetched as one file and checked without trusting the place it came
+# from. engine_release_archive makes four files in OUTDIR, all named after the
+# BTX version and commit the engine was built from
+# (easynode-engine-linux-x86_64-modelnet-v0.34.16-074dac16):
+#
+#   <name>.tar.gz          the tree that goes under <install>/linux-x86_64/,
+#                          the layout a staged node-pkg has: bin/btxd,
+#                          bin/btx-cli, bin/btx-modeld, bin/btx-guardd,
+#                          bin/lib/..., .btxd-version, and BTXD_MODELNET.
+#                          Regular files and directories only.
+#   <name>.tar.gz.sha256   `sha256sum` format
+#   <name>.files           every file of it, `<size>TAB<path>`, under the two
+#                          header lines the app's own list has
+#                          (crates/btx-core/src/engine_files.rs, MANIFEST_NAME):
+#                          the app can write it into the install folder as it is
+#   <name>.json            what it is: commit, version, btxd BuildID and sha256,
+#                          the archive's and the list's sha256 and sizes
+#
+# The archive is reproducible from one package: sorted names, owner 0, every
+# timestamp 0, gzip without a name or time. It is NOT reproducible across two
+# builds: two runs at one commit give btxd the same BuildID and different
+# bytes. So a pin names one run's archive by sha256.
+ENGINE_ARCHIVE_PREFIX="easynode-engine-linux-x86_64-modelnet"
+ENGINE_FILES_HEADER="easynode-engine-files 2"
+
+# engine_release_archive BINDIR OUTDIR
+# BINDIR is a finished, checked package with BTXD_COMMIT, BTXD_VERSION and
+# SHA256SUMS.txt in it (the engine build's btxd-dist).
+engine_release_archive() {
+  local bindir out=$2 commit version name stage back f n build_id tab
+  local tgz files json
+  bindir="$(realpath "$1")"
+  for f in BTXD_COMMIT BTXD_VERSION BTXD_MODELNET SHA256SUMS.txt btxd btx-cli; do
+    [[ -f "$bindir/$f" ]] || { _engine_err "$bindir/$f not found"; return 1; }
+  done
+  for f in $ENGINE_OPTIONAL_BINARIES; do
+    [[ -f "$bindir/$f" ]] || { _engine_err "$bindir/$f not found: this is not a ModelNet package"; return 1; }
+  done
+  commit="$(tr -d '[:space:]' < "$bindir/BTXD_COMMIT")"
+  version="$(tr -d '[:space:]' < "$bindir/BTXD_VERSION")"
+  [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { _engine_err "BTXD_COMMIT is not a commit: '$commit'"; return 1; }
+  [[ "$version" =~ ^v[0-9]+(\.[0-9]+)+$ ]] || { _engine_err "BTXD_VERSION is not a version: '$version'"; return 1; }
+  name="$ENGINE_ARCHIVE_PREFIX-$version-${commit:0:8}"
+  tab="$(printf '\t')"
+  mkdir -p "$out" || return 1
+  out="$(realpath "$out")"
+  tgz="$out/$name.tar.gz"; files="$out/$name.files"; json="$out/$name.json"
+
+  # Only the package: the executables and lib/ under bin/, the version marker
+  # every staged package has (.btxd-version, what provisioning compares the
+  # binary's own answer with) and the marker that says which engine this is.
+  # The build's other records (SHA256SUMS.txt, the ELF report) stay in the
+  # Actions artifact.
+  stage="$(mktemp -d)"; back="$(mktemp -d)"
+  mkdir -p "$stage/bin" || return 1
+  while IFS= read -r f; do
+    cp -p "$bindir/$f" "$stage/bin/$f" || return 1
+  done < <(engine_package_binaries "$bindir")
+  cp -pR "$bindir/lib" "$stage/bin/lib" || return 1
+  printf '%s\n' "$version" > "$stage/.btxd-version" || return 1
+  cp "$bindir/BTXD_MODELNET" "$stage/BTXD_MODELNET" || return 1
+  chmod 644 "$stage/.btxd-version" "$stage/BTXD_MODELNET"
+  # The app's list is path and size of regular files. Anything else (a link, a
+  # socket) it could neither list nor check, so it may not be in the archive.
+  n="$(find "$stage" ! -type f ! -type d | wc -l | tr -d ' ')"
+  if [[ "$n" != 0 ]]; then
+    _engine_err "the package holds $n entr(ies) that are neither file nor directory:"
+    find "$stage" ! -type f ! -type d | head -5 >&2
+    return 1
+  fi
+  # .pyc is Python's own cache; the app leaves it out of its list and the
+  # package ships none.
+  n="$(find "$stage/bin" -type f -name '*.pyc' | wc -l | tr -d ' ')"
+  [[ "$n" == 0 ]] || { _engine_err "the package holds $n .pyc file(s); the app's file list has no place for them"; return 1; }
+
+  { printf '%s\nfrom package\n' "$ENGINE_FILES_HEADER"
+    (cd "$stage" && find . -type f -printf '%s\t%P\n' | LC_ALL=C sort -t "$tab" -k2)
+  } > "$files" || return 1
+
+  (cd "$stage" && LC_ALL=C tar --sort=name --owner=0 --group=0 --numeric-owner \
+      --mtime=@0 --format=gnu -cf - .btxd-version BTXD_MODELNET bin) | gzip -n -6 > "$tgz" || return 1
+  (cd "$out" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256") || return 1
+
+  # Read it back: what a user's app will unpack, against the list and against
+  # the sums of the package that was checked and started.
+  tar -xzf "$tgz" -C "$back" || return 1
+  if ! diff <(tail -n +3 "$files") \
+            <(cd "$back" && find . -type f -printf '%s\t%P\n' | LC_ALL=C sort -t "$tab" -k2) >/dev/null; then
+    _engine_err "the unpacked archive is not what $name.files lists"
+    return 1
+  fi
+  engine_verify_sums "$back/bin" "$bindir/SHA256SUMS.txt" || return 1
+  for f in btxd btx-cli $ENGINE_OPTIONAL_BINARIES; do
+    [[ -x "$back/bin/$f" ]] || { _engine_err "bin/$f is not executable after unpacking"; return 1; }
+  done
+
+  build_id="$(LC_ALL=C readelf -n "$bindir/btxd" 2>/dev/null | sed -n 's/^ *Build ID: //p' | head -1)"
+  [[ "$build_id" =~ ^[0-9a-f]{40}$ ]] || { _engine_err "btxd has no BuildID"; return 1; }
+  {
+    printf '{\n'
+    printf '  "schema": "easynode-engine-archive 1",\n'
+    printf '  "kind": "modelnet",\n'
+    printf '  "platform": "linux-x86_64",\n'
+    printf '  "btx_commit": "%s",\n' "$commit"
+    printf '  "btx_version": "%s",\n' "$version"
+    printf '  "btxd_build_id": "%s",\n' "$build_id"
+    printf '  "btxd_sha256": "%s",\n' "$(sha256sum "$bindir/btxd" | cut -d' ' -f1)"
+    printf '  "archive": "%s",\n' "$name.tar.gz"
+    printf '  "archive_size": %s,\n' "$(stat -c %s "$tgz")"
+    printf '  "archive_sha256": "%s",\n' "$(sha256sum "$tgz" | cut -d' ' -f1)"
+    printf '  "files": "%s",\n' "$name.files"
+    printf '  "files_sha256": "%s",\n' "$(sha256sum "$files" | cut -d' ' -f1)"
+    printf '  "file_count": %s,\n' "$(tail -n +3 "$files" | wc -l | tr -d ' ')"
+    printf '  "unpacked_size": %s,\n' "$(tail -n +3 "$files" | awk -F'\t' '{ s += $1 } END { printf "%d", s }')"
+    printf '  "executables": ["bin/btxd", "bin/btx-cli", "bin/btx-modeld", "bin/btx-guardd"],\n'
+    printf '  "run_id": "%s"\n' "${ENGINE_RUN_ID:-}"
+    printf '}\n'
+  } > "$json" || return 1
+  rm -rf "$stage"
+  # Left for the caller: the unpacked copy, to be STARTED before upload.
+  ENGINE_ARCHIVE_UNPACKED="$back"
+  echo "==> $name.tar.gz: $(stat -c %s "$tgz") bytes, $(tail -n +3 "$files" | wc -l | tr -d ' ') files, read back and compared"
 }
 
 # ── Checks ──────────────────────────────────────────────────────────────────
@@ -373,7 +555,8 @@ engine_check_tree() {
   local rc=0 count=0 gmax=0 xmax=0 amax=0
   local -a files parts
   bindir="$(realpath "$1")"; libdir="$bindir/lib"
-  files=("$bindir/btxd" "$bindir/btx-cli")
+  files=()
+  while IFS= read -r f; do files+=("$bindir/$f"); done < <(engine_package_binaries "$bindir")
   if [[ -d "$libdir" ]]; then
     while IFS= read -r f; do files+=("$f"); done < <(engine_elfs "$libdir")
   fi
@@ -470,6 +653,34 @@ mkdir -p "$d" "$HOME"
 say() { printf '%s\n' "$*"; }
 cli() { "$e/btx-cli" -regtest -datadir="$d" "$@"; }
 swaplines() { grep 'SwapNet' "$log" 2>/dev/null | sed 's/^/  debug.log: /' || true; }
+modellines() { grep -iE 'model (helper|network|storage|LAN)|swarm guard|-modelbind' "$log" 2>/dev/null | sed 's/^/  debug.log: /' || true; }
+# "pid ppid executable" for every process this user can see. The image has no
+# ps; /proc is all there is.
+procs() {
+  for p in /proc/[0-9]*; do
+    x=$(readlink "$p/exe" 2>/dev/null) || continue
+    st=$(cat "$p/stat" 2>/dev/null) || continue
+    st=${st##*) }
+    # shellcheck disable=SC2086
+    set -- $st
+    printf '%s %s %s\n' "${p#/proc/}" "$2" "$x"
+  done
+}
+# "proto address-in-hex port" for every LISTENING TCP socket and every bound
+# UDP socket in this network namespace. Nothing else runs in the container, so
+# every line is btxd's or one of its children's.
+socks() {
+  for t in tcp tcp6 udp udp6; do
+    [ -r "/proc/net/$t" ] || continue
+    while read -r sl loc rem st rest; do
+      case "$sl" in *:) ;; *) continue ;; esac
+      case "$t" in tcp*) [ "$st" = 0A ] || continue ;; esac
+      printf '%s %s %s\n' "$t" "${loc%:*}" "$((0x${loc##*:}))"
+    done < "/proc/net/$t"
+  done
+}
+has_sock() { socks | grep -qE "^$1 [0-9A-Fa-f]+ $2\$"; }
+helpers() { procs | grep -E " $e/btx-(modeld|guardd)\$" || true; }
 logtail() { tail -n 40 "$log" 2>/dev/null | sed 's/^/  debug.log: /' || true; }
 
 # The image must really be clean, or passing here proves nothing.
@@ -486,15 +697,28 @@ say "$v" | head -n 1
 v=$("$e/btx-cli" --version 2>&1) || { say "btx-cli --version failed:"; say "$v"; exit 41; }
 say "$v" | head -n 1
 
+# The quiet set: with these three the model plane runs and opens nothing.
+quiet="-modelnet=1 -modellandiscovery=0 -listen=0"
 case "$mode" in
   plain) flag="" ;;
   swapnet0) flag="-swapnet=0" ;;
   swapnet1|masked) flag="-swapnet=1" ;;
+  modelnet0) flag="-swapnet=0 -modelnet=0" ;;
+  modelnet1) flag="-swapnet=0 $quiet" ;;
+  modelnet1swapnet1) flag="-swapnet=1 $quiet" ;;
+  modelnetdefault) flag="-swapnet=0" ;;
   *) say "unknown mode: $mode"; exit 2 ;;
 esac
+if [ -f "$e/btx-modeld" ]; then
+  # A ModelNet build. There -modelnet defaults to ON (upstream init.cpp), so
+  # the modes that are about Python say -modelnet=0 and stay about Python.
+  case "$mode" in swapnet0|swapnet1|masked) flag="$flag -modelnet=0" ;; esac
+else
+  case "$mode" in modelnet*) say "mode $mode needs a ModelNet package (no btx-modeld beside btxd)"; exit 2 ;; esac
+fi
 say "starting: btxd -regtest $flag"
 started=1
-# $flag is empty or one word.
+# $flag is empty or a few plain words.
 # shellcheck disable=SC2086
 "$e/btxd" -regtest -datadir="$d" -fallbackfee=0.0001 -daemonwait $flag > "$d/start.out" 2>&1 || started=0
 
@@ -576,10 +800,105 @@ case "$mode" in
 esac
 swaplines
 
+btxd_pid=$(procs | while read -r pid ppid exe; do [ "$exe" = "$e/btxd" ] && say "$pid"; done | head -n 1)
+case "$mode" in
+  modelnet0)
+    if ! grep -q 'model network disabled (-modelnet=0)' "$log"; then
+      say "btxd -modelnet=0 never logged 'model network disabled (-modelnet=0)'"; modellines; exit 60
+    fi
+    # The swarm observer that would start btx-guardd polls every 2 s. Give it
+    # several rounds to do what it must not do.
+    sleep 8
+    if [ -n "$(helpers)" ]; then
+      say "-modelnet=0, and a model plane process is running all the same:"; helpers; exit 61
+    fi
+    out=$(cli getmodelnetworkinfo 2>&1) && rc=0 || rc=$?
+    say "getmodelnetworkinfo with -modelnet=0 (exit $rc):"
+    printf '%s\n' "$out" | head -n 30 | sed 's/^/  /'
+    case "$out" in
+      *'"enabled": false'*) ;;
+      *) say "getmodelnetworkinfo does not report \"enabled\": false"; exit 62 ;;
+    esac
+    say "sockets (listening TCP, bound UDP):"; socks | sed 's/^/  /'
+    if has_sock 'tcp6?' 29447 || has_sock 'udp6?' 29448; then
+      say "-modelnet=0, and a model plane port is open"; exit 63
+    fi
+    say "MEASURED (modelnet0): no btx-modeld, no btx-guardd, nothing on TCP 29447 or UDP 29448"
+    ;;
+  modelnet1|modelnet1swapnet1|modelnetdefault)
+    if ! grep -q 'model helper exe=' "$log"; then
+      say "the model plane is on, and btxd never logged 'model helper exe='"; modellines; exit 64
+    fi
+    # The helper creates its identity on first start; the RPC answers from
+    # btxd alone before that, without the helper's own fields.
+    n=0; out=""; rc=1
+    while [ "$n" -lt 90 ]; do
+      out=$(cli getmodelnetworkinfo 2>&1) && rc=0 || rc=$?
+      case "$out" in *'"native_participation"'*) break ;; esac
+      n=$((n + 1)); sleep 1
+    done
+    say "getmodelnetworkinfo (exit $rc, after ${n}s):"
+    printf '%s\n' "$out" | head -n 160 | sed 's/^/  /'
+    case "$out" in
+      *'"native_participation"'*) ;;
+      *) say "getmodelnetworkinfo never showed native_participation"; modellines; exit 65 ;;
+    esac
+    [ "$rc" = 0 ] || { say "getmodelnetworkinfo failed"; exit 65; }
+    # Both children, started from the package, by THIS btxd.
+    n=0; ok=0
+    while [ "$n" -lt 60 ]; do
+      h=$(helpers)
+      case "$h" in
+        *" $btxd_pid $e/btx-modeld"*) case "$h" in *" $btxd_pid $e/btx-guardd"*) ok=1; break ;; esac ;;
+      esac
+      n=$((n + 1)); sleep 1
+    done
+    say "processes (pid, parent, executable); btxd is $btxd_pid:"; procs | sed 's/^/  /'
+    if [ "$ok" != 1 ]; then
+      say "btx-modeld and btx-guardd are not both running as children of btxd"; modellines; exit 66
+    fi
+    say "sockets (listening TCP, bound UDP):"; socks | sed 's/^/  /'
+    t=no; u=no
+    if has_sock 'tcp6?' 29447; then t=yes; fi
+    if has_sock 'udp6?' 29448; then u=yes; fi
+    say "MEASURED ($mode: btxd -regtest $flag): TCP 29447 listening: $t, UDP 29448 bound: $u"
+    if [ "$mode" != modelnetdefault ] && { [ "$t" = yes ] || [ "$u" = yes ]; }; then
+      say "the quiet flags were given, and a model plane port is open"; exit 67
+    fi
+    if [ "$mode" = modelnet1swapnet1 ]; then
+      s=$(cli getswapnetworkinfo 2>&1) || { say "getswapnetworkinfo failed beside the model plane:"; say "$s"; exit 49; }
+      case "$s" in
+        *'"in_process": true'*) say "getswapnetworkinfo beside the model plane: in_process true" ;;
+        *) say "getswapnetworkinfo does not report \"in_process\": true"; exit 49 ;;
+      esac
+    fi
+    ;;
+esac
+case "$mode" in
+  modelnet*)
+    modellines
+    say "what the model plane left in the data directory:"
+    find "$d" -path '*modelnet*' 2>/dev/null | sort | head -n 60 | sed "s|^$d/|  |"
+    ;;
+esac
+
 cli stop > /dev/null 2>&1 || true
 trap - EXIT
 n=0
 while [ "$n" -lt 60 ] && cli getblockcount > /dev/null 2>&1; do n=$((n + 1)); sleep 1; done
+case "$mode" in
+  modelnet1|modelnet1swapnet1|modelnetdefault)
+    # Does stopping btxd take its children with it? Reported, and it fails the
+    # start when one is still there half a minute later.
+    n=0
+    while [ "$n" -lt 30 ] && [ -n "$(procs | grep -E " $e/btx(d|-modeld|-guardd)\$" || true)" ]; do n=$((n + 1)); sleep 1; done
+    left=$(procs | grep -E " $e/btx(d|-modeld|-guardd)\$" || true)
+    if [ -n "$left" ]; then
+      say "MEASURED ($mode): ${n}s after btx-cli stop these are still running:"; say "$left"; exit 68
+    fi
+    say "MEASURED ($mode): btxd, btx-modeld and btx-guardd were all gone ${n}s after the RPC stopped answering"
+    ;;
+esac
 say "CLEAN START OK ($mode)"
 CLEAN_START
 
@@ -599,8 +918,27 @@ CLEAN_START
 #             is the proof that swapnet1 passing
 #             means the bundled runtime was used: if a start without it also
 #             succeeded, the test would be measuring nothing.
+#
+# A ModelNet package (btx-modeld beside btxd) is started with -modelnet=0 in
+# the four modes above, and has four of its own:
+#
+#   modelnet0          -modelnet=0. btxd must log that the model network is
+#                      disabled, start neither btx-modeld nor btx-guardd, open
+#                      neither TCP 29447 nor UDP 29448, and getmodelnetworkinfo
+#                      must say "enabled": false.
+#   modelnet1          -modelnet=1 -modellandiscovery=0 -listen=0. Both helpers
+#                      must run as children of btxd from the package,
+#                      getmodelnetworkinfo must answer with native_participation,
+#                      and neither port may be open. After `stop` all three
+#                      processes must be gone.
+#   modelnet1swapnet1  the same with -swapnet=1: the Python worker and the
+#                      model plane (two OpenSSLs) in one btxd.
+#   modelnetdefault    no model flag at all, on a network with a private
+#                      address and no route out. Asserts the helpers and the
+#                      RPC like modelnet1, and REPORTS which of the two ports
+#                      the defaults open ("MEASURED" lines) without judging it.
 engine_clean_start() {
-  local bindir mode=$2 pydir empty
+  local bindir mode=$2 pydir empty net=none rc
   local -a mask=()
   bindir="$(realpath "$1")"
   command -v docker >/dev/null || { _engine_err "docker is required for the clean start"; return 1; }
@@ -610,11 +948,20 @@ engine_clean_start() {
     empty="$(mktemp -d)"; chmod 755 "$empty"
     mask=(-v "$empty:/opt/engine/bin/lib/$(basename "$pydir"):ro")
   fi
-  timeout 600 docker run --rm --network none --user "$(id -u):$(id -g)" \
+  if [[ "$mode" == modelnetdefault ]]; then
+    # LAN discovery only binds on an interface with a private address, and
+    # `--network none` has none. An internal network has one and no way out.
+    net="engine-clean-lan-$$"
+    docker network create --internal "$net" >/dev/null || { _engine_err "could not create the docker network $net"; return 1; }
+  fi
+  rc=0
+  timeout 600 docker run --rm --network "$net" --user "$(id -u):$(id -g)" \
     -v "$bindir:/opt/engine/bin:ro" "${mask[@]}" \
     "$ENGINE_CLEAN_IMAGE" \
     /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp/home \
-    /bin/sh -c "$ENGINE_CLEAN_START_SCRIPT" engine-clean-start "$mode"
+    /bin/sh -c "$ENGINE_CLEAN_START_SCRIPT" engine-clean-start "$mode" || rc=$?
+  if [[ "$net" != none ]]; then docker network rm "$net" >/dev/null 2>&1 || true; fi
+  return "$rc"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
@@ -625,8 +972,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     stage) engine_stage_tree "$@" ;;
     check) engine_check_tree "$@" ;;
     clean-start) engine_clean_start "$@" ;;
+    archive) engine_release_archive "$@" ;;
     *)
-      echo "usage: $(basename "$0") stage <src> <bin dir> | check <bin dir> [report] | clean-start <bin dir> <mode>" >&2
+      echo "usage: $(basename "$0") stage <src> <bin dir> | check <bin dir> [report] | clean-start <bin dir> <mode> | archive <bin dir> <out dir>" >&2
       exit 2
       ;;
   esac

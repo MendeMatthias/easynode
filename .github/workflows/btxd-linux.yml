@@ -42,6 +42,18 @@ name: Build Linux btxd (CUDA source build, smoked on the runner)
 # with an empty environment and no Python, and start it there. A library the
 # package forgot fails HERE, not on a user's machine.
 #
+# ⚠ THE NATIVE MODEL NETWORK IS A SECOND BUILD, NEVER THE DEFAULT ONE. With the
+# input `modelnet: on` the same commit is configured with WITH_MODELNET=ON and
+# the job uploads a DIFFERENTLY NAMED artifact (btxd-linux-modelnet-<ref>) that
+# also carries btx-modeld and btx-guardd beside btxd. With the input off, which
+# is the default and what every release so far ships, no step below does
+# anything it did not do before the input existed: same configure line, same
+# files, same artifact name. The model plane needs OpenSSL 3.5 (ML-KEM-768,
+# ML-DSA-44) and Ubuntu 22.04 has 3.0, so the ModelNet build compiles a pinned
+# OpenSSL in the job and links it STATICALLY into the executables: the package
+# gains no libssl of its own, and the libssl.so.3 it already vendors for
+# Python's `ssl` module stays the 22.04 one.
+#
 # ── STATUS ──────────────────────────────────────────────────────────────────
 # Releases 0.6.15 through 0.6.17 were built BY HAND on an Ubuntu 22.04 box,
 # following "Rebuilding the Linux release from nothing" in
@@ -53,7 +65,7 @@ name: Build Linux btxd (CUDA source build, smoked on the runner)
 #
 # Security: workflow_dispatch only, `permissions: contents: read`, no secrets.
 #
-# There are TWO inputs, and both reach shell steps. They are passed through each
+# There are THREE inputs, and all reach shell steps. They are passed through each
 # step's `env:` and dereferenced as ordinary shell variables, never expanded by
 # the ${{ }} templater into the script text - the same discipline
 # node-win-installer.yml and btxd-windows.yml already use. Expanding into script
@@ -79,6 +91,13 @@ on:
         description: "CMAKE_CUDA_ARCHITECTURES (blank = the release set)"
         required: false
         default: ""
+      modelnet:
+        description: "Native Model Network: off = the engine every release ships; on = a second artifact, btxd-linux-modelnet-<ref>, with btx-modeld and btx-guardd"
+        type: choice
+        options:
+          - "off"
+          - "on"
+        default: "off"
 
 permissions:
   contents: read
@@ -110,6 +129,14 @@ env:
   ENGINE_LIBPYTHON_SHA256: "83ef0c3cc369737f689854b1bb52b84e5d3d5dfdb24a070aadaccef8218d04df"
   # Where the finished package is started before upload. See the last steps.
   ENGINE_CLEAN_IMAGE: "ubuntu:22.04"
+  # ONLY for `modelnet: on`. The OpenSSL the model plane is linked against,
+  # built in the job from the release tarball and pinned by its sha256 (the
+  # value OpenSSL publishes beside the tarball, read 2026-11-25). 3.5.8 because
+  # that is the release upstream's own model-plane evidence runs on
+  # (contrib/modelnet/e2e-openssl-358.sh at 074dac16). 3.5 is an LTS line; a
+  # security release moves BOTH lines below in one commit.
+  ENGINE_OPENSSL_VERSION: "3.5.8"
+  ENGINE_OPENSSL_SHA256: "a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2"
 
 jobs:
   build-btxd:
@@ -135,8 +162,16 @@ jobs:
         id: pin
         env:
           BTXCHAIN_REF: ${{ inputs.btxchain_ref }}
+          MODELNET_INPUT: ${{ inputs.modelnet }}
         run: |
           set -euo pipefail
+          case "$MODELNET_INPUT" in
+            on) modelnet=on ;;
+            off|"") modelnet=off ;;
+            *) echo "::error::modelnet must be on or off, got '$MODELNET_INPUT'"; exit 1 ;;
+          esac
+          echo "modelnet=$modelnet" >> "$GITHUB_OUTPUT"
+          echo "ENGINE_MODELNET=$modelnet" >> "$GITHUB_ENV"
           cd easynode
           # shellcheck source=/dev/null
           . apps/node/scripts/lib/engine-pin.sh
@@ -148,7 +183,16 @@ jobs:
           echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
           # Artifact names cannot contain "/", and a branch name like
           # pr/0.33.3-network-stability fails the upload AFTER a full build.
-          echo "slug=$(printf '%s' "$ref" | tr '/' '-')" >> "$GITHUB_OUTPUT"
+          slug="$(printf '%s' "$ref" | tr '/' '-')"
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+          # A ModelNet build can never be taken for the engine a release pins:
+          # it has its own artifact name.
+          if [ "$modelnet" = on ]; then
+            echo "artifact=btxd-linux-modelnet-$slug" >> "$GITHUB_OUTPUT"
+            echo "Native Model Network: ON (artifact btxd-linux-modelnet-$slug)"
+          else
+            echo "artifact=btxd-linux-$slug" >> "$GITHUB_OUTPUT"
+          fi
           if [ "$pinned_ref" != "$pinned" ]; then
             echo "building $ref (app install key $pinned, NODE_RELEASE_COMMIT $pinned_ref)"
           else
@@ -318,6 +362,59 @@ jobs:
           echo "ENGINE_PYTHON=$PY" >> "$GITHUB_ENV"
           echo "ENGINE_PYTHON_PREFIX=$prefix" >> "$GITHUB_ENV"
 
+      # Static, on purpose. A shared OpenSSL 3.5 would have to ship as
+      # bin/lib/libssl.so.3, the very name the package already carries for
+      # Python's `ssl` module (the 22.04 library, 3.0), and one of the two would
+      # silently replace the other. Linked into the executables there is nothing
+      # to find at run time and nothing to clash.
+      #
+      # --prefix and --openssldir are compiled INTO the library as the place it
+      # reads openssl.cnf and looks for provider modules. /opt/btx-openssl does
+      # not exist on a user's machine and only root could create it, so no
+      # unprivileged user can plant a configuration there. A path under this
+      # runner's home would have been a path any user named `runner` owns.
+      - name: OpenSSL ${{ env.ENGINE_OPENSSL_VERSION }} for the model plane (static, pinned by sha256)
+        if: steps.pin.outputs.modelnet == 'on'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          tgz="openssl-$ENGINE_OPENSSL_VERSION.tar.gz"
+          curl -fsSL --retry 3 --retry-delay 10 -o "$tgz" \
+            "https://github.com/openssl/openssl/releases/download/openssl-$ENGINE_OPENSSL_VERSION/$tgz"
+          got=$(sha256sum "$tgz" | cut -d' ' -f1)
+          if [ "$got" != "$ENGINE_OPENSSL_SHA256" ]; then
+            echo "::error::$tgz is $got, this workflow pins $ENGINE_OPENSSL_SHA256"
+            exit 1
+          fi
+          echo "$tgz is the pinned file: $got"
+          tar xzf "$tgz"
+          cd "openssl-$ENGINE_OPENSSL_VERSION"
+          ./Configure linux-x86_64 no-shared no-tests no-docs \
+            --prefix=/opt/btx-openssl --openssldir=/opt/btx-openssl/ssl --libdir=lib \
+            > configure.log
+          tail -n 3 configure.log
+          make -j"$(nproc)" > build.log 2>&1 || { tail -n 60 build.log; exit 1; }
+          stage="$RUNNER_TEMP/openssl-stage"
+          make install_sw DESTDIR="$stage" > install.log 2>&1 || { tail -n 40 install.log; exit 1; }
+          root="$stage/opt/btx-openssl"
+          for f in lib/libssl.a lib/libcrypto.a include/openssl/ssl.h bin/openssl; do
+            [ -f "$root/$f" ] || { echo "::error::$root/$f was not installed"; exit 1; }
+          done
+          if ls "$root"/lib/*.so* >/dev/null 2>&1; then
+            echo "::error::a shared OpenSSL was built; the link below must only ever see the static one"
+            exit 1
+          fi
+          # What the model plane needs of it, asked of THIS build: the two
+          # post-quantum algorithms, from the default provider.
+          export OPENSSL_CONF=/dev/null
+          "$root/bin/openssl" version
+          "$root/bin/openssl" list -kem-algorithms | grep -E 'ML-KEM-768' \
+            || { echo "::error::this OpenSSL has no ML-KEM-768"; exit 1; }
+          "$root/bin/openssl" list -signature-algorithms | grep -E 'ML-DSA-44' \
+            || { echo "::error::this OpenSSL has no ML-DSA-44"; exit 1; }
+          stat -c '%n  %s bytes' "$root/lib/libssl.a" "$root/lib/libcrypto.a"
+          echo "ENGINE_OPENSSL_ROOT=$root" >> "$GITHUB_ENV"
+
       - name: Configure + build
         working-directory: btx
         env:
@@ -339,6 +436,33 @@ jobs:
           # REQUIRED)). This runner has 3.0, and so do the 22.04 machines the
           # binary is built for. The app never uses the model plane. OFF also
           # removes the `-modelnet` option, so nothing may pass -modelnet=0.
+          #
+          # `modelnet: on` is the one exception, and it is a different artifact.
+          # Then: WITH_MODELNET=ON against the OpenSSL built above, named by
+          # its two archives because OPENSSL_ROOT_DIR alone lets FindOpenSSL
+          # pair 3.5 headers with this runner's 3.0 libssl.so (upstream's
+          # doc/build-unix.md says so). BUILD_UTIL=ON because btx-guardd, which
+          # btxd starts as its child, is declared inside upstream's
+          # `if(BUILD_UTIL)` block (src/CMakeLists.txt); these arguments come
+          # last on the cmake line, so this ON wins over the OFF before it.
+          # btx-util is built with it and is not shipped. --exclude-libs keeps OpenSSL's symbols out of
+          # the executables' dynamic symbol tables, so the libssl.so.3 that
+          # Python's `ssl` module loads into the same process can never be
+          # bound to the copy inside btxd.
+          mn_args=(-DWITH_MODELNET=OFF)
+          if [ "$ENGINE_MODELNET" = on ]; then
+            mn_args=(
+              -DWITH_MODELNET=ON
+              -DOPENSSL_ROOT_DIR="$ENGINE_OPENSSL_ROOT"
+              -DOPENSSL_USE_STATIC_LIBS=ON
+              -DOPENSSL_SSL_LIBRARY="$ENGINE_OPENSSL_ROOT/lib/libssl.a"
+              -DOPENSSL_CRYPTO_LIBRARY="$ENGINE_OPENSSL_ROOT/lib/libcrypto.a"
+              -DOPENSSL_INCLUDE_DIR="$ENGINE_OPENSSL_ROOT/include"
+              "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--exclude-libs,libssl.a:libcrypto.a"
+              -DBUILD_UTIL=ON
+            )
+            echo "Native Model Network: ON, OpenSSL from $ENGINE_OPENSSL_ROOT"
+          fi
           #
           # Python (0.34.16 on): the interpreter by PATH, never by search. Left
           # to itself FindPython3 takes /usr/bin/python3, which is 3.10 here,
@@ -363,11 +487,11 @@ jobs:
             -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_TESTS=OFF \
             -DBUILD_FUZZ_BINARY=OFF \
             -DENABLE_WALLET=ON -DWITH_SQLITE=ON -DWITH_ZMQ=ON \
-            -DWITH_MODELNET=OFF \
             -DCMAKE_IGNORE_PATH=/mnt/c \
             -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
             -DCMAKE_CUDA_ARCHITECTURES="$archs" \
-            "${py_args[@]}"
+            "${py_args[@]}" \
+            "${mn_args[@]}"
           ninja -C build
 
       - name: Confirm the build info the canary reads
@@ -381,6 +505,37 @@ jobs:
             echo "::error::BUILD_GIT_DIRTY is not 0 — this binary would fail its canary"
             exit 1
           fi
+
+      # Read off the files, not off the configure line: FindOpenSSL has paired
+      # the wrong library with the right headers before.
+      - name: The model plane's OpenSSL is inside the executables, and private to them
+        if: steps.pin.outputs.modelnet == 'on'
+        working-directory: btx
+        run: |
+          set -euo pipefail
+          ls -l build/bin
+          for b in btxd btx-cli btx-modeld btx-guardd; do
+            [ -x "build/bin/$b" ] || { echo "::error::the ModelNet build produced no build/bin/$b"; exit 1; }
+          done
+          for b in btxd btx-modeld; do
+            if readelf -d "build/bin/$b" | grep -E 'NEEDED.*lib(ssl|crypto)\.so'; then
+              echo "::error::$b loads a shared OpenSSL; it must carry the static $ENGINE_OPENSSL_VERSION"
+              exit 1
+            fi
+            n=$(strings -a "build/bin/$b" | grep -c "OpenSSL $ENGINE_OPENSSL_VERSION " || true)
+            if [ "$n" = 0 ]; then
+              echo "::error::$b does not contain OpenSSL $ENGINE_OPENSSL_VERSION"
+              exit 1
+            fi
+            n=$(nm -D --defined-only "build/bin/$b" | grep -cE ' (EVP|SSL|OPENSSL|CRYPTO|ERR|BIO|X509)_' || true)
+            if [ "$n" != 0 ]; then
+              echo "::error::$b exports $n OpenSSL symbol(s); Python's libssl.so.3 would bind to them"
+              nm -D --defined-only "build/bin/$b" | grep -E ' (EVP|SSL|OPENSSL|CRYPTO|ERR|BIO|X509)_' | head -5
+              exit 1
+            fi
+            echo "$b: OpenSSL $ENGINE_OPENSSL_VERSION linked in, no shared libssl/libcrypto, no OpenSSL symbol exported"
+          done
+          echo "btx-guardd needs: $(readelf -d build/bin/btx-guardd | awk '/NEEDED/ {print $NF}' | tr '\n' ' ')"
 
       # THE GATE THAT MATTERS. Everything above can succeed and still produce a
       # btxd with no GPU kernels in it, which is precisely the failure that makes
@@ -479,9 +634,17 @@ jobs:
           if [ -n "${ENGINE_PYTHON_PREFIX:-}" ]; then
             export LD_LIBRARY_PATH="$ENGINE_PYTHON_PREFIX/lib"
           fi
+          # A ModelNet build has the model plane ON unless told otherwise, and
+          # on this runner that would open a listener and send LAN beacons into
+          # GitHub's network. This step is about the daemon, the wallet and a
+          # block; the model plane is started further down, in a container with
+          # no network. (An engine without ModelNet does not know the option,
+          # so it must not be given one.)
+          mn_flag=()
+          if [ "$ENGINE_MODELNET" = on ]; then mn_flag=(-modelnet=0); fi
           d=$(mktemp -d)
           ./build/bin/btxd --version | head -1
-          ./build/bin/btxd -regtest -datadir="$d" -fallbackfee=0.0001 -daemonwait
+          ./build/bin/btxd -regtest -datadir="$d" -fallbackfee=0.0001 -daemonwait "${mn_flag[@]}"
           trap './build/bin/btx-cli -regtest -datadir="'"$d"'" stop || true' EXIT
           ./build/bin/btx-cli -regtest -datadir="$d" createwallet smoke >/dev/null
           addr=$(./build/bin/btx-cli -regtest -datadir="$d" -rpcwallet=smoke getnewaddress)
@@ -514,8 +677,15 @@ jobs:
           # NO strip, anywhere. Stripping btxd removes the GPU kernels; the
           # release path passes NO_STRIP=true through packaging for the same
           # reason.
-          ENGINE_SWAPNET_SRC="$PWD/contrib/swapnet/swapnet" engine_stage_tree build/bin "$out"
+          extra=""
+          if [ "$ENGINE_MODELNET" = on ]; then extra="$ENGINE_OPTIONAL_BINARIES"; fi
+          ENGINE_EXTRA_BINARIES="$extra" ENGINE_SWAPNET_SRC="$PWD/contrib/swapnet/swapnet" \
+            engine_stage_tree build/bin "$out"
           file "$out/btxd"
+          if [ "$ENGINE_MODELNET" = on ]; then
+            # Says what the package is, for whoever stages it.
+            echo "ON openssl-$ENGINE_OPENSSL_VERSION static" > "$out/BTXD_MODELNET"
+          fi
 
           # Record what the binary REPORTS and which commit it came from, so the
           # installer workflow verifies both without trusting a filename. The
@@ -542,7 +712,22 @@ jobs:
           echo "reports $(cat "$out/BTXD_VERSION") from $(cat "$out/BTXD_COMMIT")"
           echo "cuda: $(cat "$out/BTXD_CUDA_ARCHS")"
 
-          stat -c '%n  %s bytes' "$out/btxd" "$out/btx-cli" | sed "s|$out/||"
+          engine_package_binaries "$out" | while IFS= read -r b; do
+            stat -c '%n  %s bytes' "$out/$b" | sed "s|$out/||"
+          done
+          echo "btxd $(readelf -n "$out/btxd" | sed -n 's/^ *Build ID: /BuildID /p')"
+          if [ "$ENGINE_MODELNET" = on ]; then
+            # Built and NOT shipped, on purpose. The package is btxd, btx-cli,
+            # btx-modeld, btx-guardd and what they load. btx-swarm, btx-swarmd
+            # and btx-paynetd start upstream's Python mesh with THIS runner's
+            # Python path compiled in; the other helpers are not started by
+            # btxd.
+            echo "built and left out of the package:"
+            for b in build/bin/*; do
+              n=$(basename "$b")
+              [ -f "$out/$n" ] || echo "  $n"
+            done
+          fi
           echo "libraries carried in lib/:"
           find "$out/lib" -maxdepth 1 -type f -printf '  %f  %s bytes\n' | sort
           py=$(find "$out/lib" -maxdepth 1 -type d -name 'python3.*' | head -1)
@@ -572,6 +757,9 @@ jobs:
           . easynode/apps/node/scripts/lib/engine-runtime-linux.sh
           if [ -n "$(engine_python_soname btxd-dist/btxd)" ]; then
             modes="swapnet0 swapnet1 masked"
+            if [ -f btxd-dist/btx-modeld ]; then
+              modes="$modes modelnet0 modelnet1 modelnet1swapnet1 modelnetdefault"
+            fi
           else
             # Before 0.34.16 there is no -swapnet option; passing it is a fatal
             # "Invalid parameter".
@@ -592,12 +780,56 @@ jobs:
           # thousand files and any of them can be the one that changed.
           find . -type f ! -name SHA256SUMS.txt -printf '%P\0' | sort -z \
             | xargs -0 sha256sum > SHA256SUMS.txt
-          grep -E '  (btxd|btx-cli)$' SHA256SUMS.txt
+          grep -E '  btx[a-z-]*$' SHA256SUMS.txt
           echo "$(wc -l < SHA256SUMS.txt) files listed; digest of the list: $(sha256sum < SHA256SUMS.txt | cut -d' ' -f1)"
+
+      # The ModelNet engine is never inside an installer: an installed app
+      # fetches it when its user switches the swarm on. This is the file it
+      # fetches, with its sha256, its file list in the app's own format and a
+      # description (engine_release_archive says what each one holds). The
+      # archive is unpacked again and THAT copy is started, so the bytes a user
+      # downloads are bytes that ran. Nothing is published here: a release is
+      # made by hand from this artifact, and signed, on the maintainer's
+      # machine.
+      - name: The archive an installed app fetches (ModelNet engine only)
+        if: steps.pin.outputs.modelnet == 'on'
+        env:
+          ENGINE_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          . easynode/apps/node/scripts/lib/engine-runtime-linux.sh
+          engine_release_archive btxd-dist engine-release
+          ls -l engine-release
+          cat engine-release/*.json
+          cat engine-release/*.sha256
+          head -n 6 engine-release/*.files
+          # The same package a second time must give the same archive.
+          engine_release_archive btxd-dist "$RUNNER_TEMP/engine-release-again" >/dev/null
+          cmp engine-release/*.tar.gz "$RUNNER_TEMP"/engine-release-again/*.tar.gz
+          echo "archiving the same package twice gives the same bytes"
+          # How the app tells a ModelNet engine from the default one: it looks
+          # for this option name in btxd (btx_core::swarm). It must be there.
+          n=$(grep -c -a -- '-modelnetrequired' "$ENGINE_ARCHIVE_UNPACKED/bin/btxd" || true)
+          echo "'-modelnetrequired' occurs in $n line(s) of the archived btxd"
+          [ "$n" -ge 1 ] || { echo "::error::the app would not recognise this btxd as a ModelNet engine"; exit 1; }
+          echo "::group::clean start from the unpacked archive: modelnet1"
+          engine_clean_start "$ENGINE_ARCHIVE_UNPACKED/bin" modelnet1
+          echo "::endgroup::"
+
+      - name: Upload the fetchable ModelNet engine
+        if: steps.pin.outputs.modelnet == 'on'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: engine-modelnet-linux-release-${{ steps.pin.outputs.slug }}
+          path: engine-release/*
+          if-no-files-found: error
+          # Already gzip; zipping it again only costs time.
+          compression-level: 0
 
       - name: Upload btxd artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: btxd-linux-${{ steps.pin.outputs.slug }}
+          name: ${{ steps.pin.outputs.artifact }}
           path: btxd-dist/*
           if-no-files-found: error
