@@ -26,12 +26,25 @@ one of two things first: a record of which folders easyNode itself
 installed (it has none for past installs), or a check that no running
 process was started from the folder.
 
-**Not tested on a real machine:** Windows (the error-mode call, the exit
-code read from a real btxd.exe with a DLL removed) and macOS (the `dyld`
-line). Linux was: the real 0.34.16 engine with `libpython3.14.so.1.0`
-removed exits 127 with the loader's line, the app's code names the file,
-puts it back and the engine runs again
-(`engine_files::tests::a_real_engine_with_a_library_removed_is_put_back`).
+**What was run against the real 0.34.16 engine, 2026-11-25:**
+
+- Linux: with `libpython3.14.so.1.0` removed the engine exits 127 with the
+  loader's line; the app's code names the file, puts it back and the engine
+  runs again (`engine_files::tests::a_real_engine_with_a_library_removed_is_put_back`).
+  Removing the `encodings` folder of the Python library does not stop
+  `btxd --version`, so only the start-time check finds that kind of damage.
+- Windows: with `python314.dll` removed and the error mode set, btxd.exe
+  exits with -1073741515 in under a second and prints nothing. With error
+  mode 0, which is what an app started from the desktop has, it had not
+  exited after six seconds: the system's message box. The app's own call was
+  run too (`a_real_windows_engine_with_a_dll_removed_exits_instead_of_waiting`).
+- The engine installed on the 3060 equals the 0.8.0 app's own package, file
+  for file and size for size (776 files), so a node that updates gets its
+  file list and no copy.
+
+**Not tested:** macOS (the `dyld` line is matched on its documented shape),
+and the check and the launch-loop answer inside a running app on any
+system. Their rules are tested in btx-core; the app side for wiring only.
 
 ---
 

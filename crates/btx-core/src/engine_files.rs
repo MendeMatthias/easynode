@@ -1091,6 +1091,55 @@ mod tests {
         assert_eq!(tree_state(&install, None), TreeState::Complete);
     }
 
+    /// Windows, the real engine: with a DLL removed, btxd.exe must end with
+    /// the code the app reads, not wait behind the system's message box. Run
+    /// against the 0.34.16 Windows engine on 2026-11-25: with the error mode
+    /// set it exits with this code in well under a second; with error mode 0
+    /// it had not exited after six seconds.
+    ///
+    /// `EASYNODE_TEST_BTXD_MISSING_DLL` is a btxd.exe in a copy of the engine
+    /// from which `python314.dll` was taken away.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn a_real_windows_engine_with_a_dll_removed_exits_instead_of_waiting() {
+        let Some(btxd) = std::env::var_os("EASYNODE_TEST_BTXD_MISSING_DLL").map(PathBuf::from)
+        else {
+            return;
+        };
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetErrorMode(mode: u32) -> u32;
+        }
+        // What an app started from the desktop has. A test started from a
+        // shell may have inherited the bit already, which would prove
+        // nothing about the call below.
+        // SAFETY: a bit mask in, the previous mask out, no pointers.
+        unsafe { SetErrorMode(0) };
+        crate::platform::no_loader_error_dialogs();
+
+        let started = std::time::Instant::now();
+        let mut child = std::process::Command::new(&btxd)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let code = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status.code();
+            }
+            if started.elapsed() > std::time::Duration::from_secs(10) {
+                let _ = child.kill();
+                panic!("btxd.exe is still there after 10 s: the message box is up");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        println!("exit {code:?} after {:?}", started.elapsed());
+        assert_eq!(code, Some(EXIT_DLL_NOT_FOUND));
+        assert_eq!(loader_failure("", code), Some(LoaderFailure { file: None }));
+    }
+
     /// What the check costs on a real install. Reads only.
     /// `EASYNODE_TEST_ENGINE_TREE=~/.local/btx/v0.34.16/linux-x86_64 cargo
     /// test -p btx-core engine_files::tests::cost -- --ignored --nocapture`
