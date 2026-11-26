@@ -10,6 +10,8 @@ import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { AmbientLine } from "./ambient";
+import { startHeartbeat } from "./heartbeat";
+import { MotionGate } from "./motion-gate";
 import {
   followResultText,
   followRowVisible,
@@ -402,6 +404,23 @@ const ambientCompact = new AmbientLine($("compact-canvas") as unknown as HTMLCan
 // module scope. Harmless in production.
 (window as unknown as Record<string, unknown>).__ambient = { main: ambientMain, compact: ambientCompact };
 
+// The window's heartbeat for the watchdog in Rust (window_watchdog.rs): a
+// frozen window is reloaded, then rebuilt, without anyone clicking it.
+startHeartbeat((kind, hidden) => {
+  invoke("window_heartbeat", { kind, hidden }).catch(() => {});
+});
+
+// Animations run only while someone can see them (motion-gate.ts).
+let motionAllowedNow = true;
+const motionGate = new MotionGate((allowed) => applyMotion(allowed));
+function applyMotion(allowed: boolean): void {
+  motionAllowedNow = allowed;
+  document.body.classList.toggle("motion-paused", !allowed);
+  ambientMain.setAllowed(allowed);
+  ambientCompact.setAllowed(allowed);
+  core?.setPaused(!allowed);
+}
+
 // ── Power core (energy pulse): one instance on the currently-VISIBLE surface ─
 // The core is a full WebGL context, so we mount it only for the surface on
 // screen (status or compact) and dispose on switch — never two contexts, and
@@ -421,6 +440,7 @@ function ensureCore(surface: "main" | "compact"): void {
   // "without the heavy explosions".
   core.setPower(28);
   core.setActive(lastActive);
+  core.setPaused(!motionAllowedNow);
 }
 function disposeCore(): void {
   core?.dispose();
@@ -455,6 +475,7 @@ function applyVisual(): void {
     }
   }
 }
+applyMotion(motionGate.allowed);
 let lastPulseHeight = 0;
 
 const screenWizard = $("screen-wizard");

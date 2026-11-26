@@ -17,6 +17,9 @@ pub struct TrayHandles {
 
 pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let open_i = MenuItem::with_id(app, "open", "Open BTX Node", true, None::<&str>)?;
+    // A frozen window cannot be clicked; this reloads it from outside
+    // (window_watchdog). The node is not touched.
+    let reload_i = MenuItem::with_id(app, "reload", "Reload window", true, None::<&str>)?;
     let status_i = MenuItem::with_id(app, "status", "Node: stopped", false, None::<&str>)?;
     let toggle_i = MenuItem::with_id(app, "toggle", "Start node", true, None::<&str>)?;
     let quit_i = MenuItem::with_id(app, "quit", "Quit BTX Node", true, None::<&str>)?;
@@ -24,6 +27,7 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         app,
         &[
             &open_i,
+            &reload_i,
             &PredefinedMenuItem::separator(app)?,
             &status_i,
             &toggle_i,
@@ -48,6 +52,7 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .tooltip("BTX Node")
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_main_window(app),
+            "reload" => crate::window_watchdog::reload_now(app, "tray menu"),
             "toggle" => toggle_node(app),
             "quit" => {
                 // The RunEvent::ExitRequested handler performs the graceful

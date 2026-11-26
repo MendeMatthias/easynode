@@ -6,8 +6,10 @@
 // the line — the network "playing a note". That's all it ever does.
 //
 // Deliberately low-power: ~24 fps cap, one stroke path per frame, no
-// offscreen buffers, and it fully stops when the window is hidden. The calm
-// is an engineering property, not just a look.
+// offscreen buffers, and it fully stops whenever nobody can see it (the
+// motion gate in motion-gate.ts: hidden, long unfocused, idle, or reduced
+// motion), leaving a still frame that follows the node's state. The calm is
+// an engineering property, not just a look.
 
 type AmbientMode = "ready" | "syncing" | "stopped" | "error";
 
@@ -30,20 +32,33 @@ export class AmbientLine {
   private lastFrame = 0;
   private raf = 0;
   private running = false;
+  /** This surface is the one on screen (applyVisual). */
+  private wanted = false;
+  /** Someone can see it (MotionGate). */
+  private allowed = true;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d")!;
-    // Pause completely when the window is hidden (tray-only / minimized):
-    // an invisible animation is pure battery drain.
-    document.addEventListener("visibilitychange", () => {
-      if (document.hidden) this.stop();
-      else this.start();
-    });
   }
 
   setMode(mode: AmbientMode) {
+    const changed = mode !== this.mode;
     this.mode = mode;
+    // Paused, the line still shows the node's state: one still frame.
+    if (changed && this.wanted && !this.running) this.renderFrame();
+  }
+
+  /** Whether it may animate (the motion gate). Paused, it keeps a still
+   *  frame and draws nothing per frame. */
+  setAllowed(allowed: boolean) {
+    this.allowed = allowed;
+    this.sync();
+  }
+
+  /** Whether its loop is running right now. */
+  get animating(): boolean {
+    return this.running;
   }
 
   /** A new block (or peer event) — send one gentle note through the line. */
@@ -53,6 +68,27 @@ export class AmbientLine {
   }
 
   start() {
+    this.wanted = true;
+    this.sync();
+  }
+
+  stop() {
+    this.wanted = false;
+    this.sync();
+  }
+
+  private sync() {
+    if (this.wanted && this.allowed) {
+      this.run();
+      return;
+    }
+    const was = this.running;
+    this.halt();
+    // Never leave a wanted surface blank (a reduced-motion start, say).
+    if (this.wanted && !was) this.renderFrame();
+  }
+
+  private run() {
     if (this.running) return;
     this.running = true;
     this.lastFrame = 0;
@@ -66,7 +102,7 @@ export class AmbientLine {
     this.raf = requestAnimationFrame(loop);
   }
 
-  stop() {
+  private halt() {
     this.running = false;
     cancelAnimationFrame(this.raf);
   }

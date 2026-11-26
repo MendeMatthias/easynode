@@ -34,6 +34,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "fs", "io-util"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# window_watchdog's paint probe counts the web view's GTK draws. Already in
+# the tree through tauri/wry at this version; direct so the probe can name
+# the widget traits.
+gtk = "0.18"
+
 [dev-dependencies]
 async-trait = "0.1"
 tempfile = "3"

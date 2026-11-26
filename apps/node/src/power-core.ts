@@ -373,6 +373,9 @@ export interface MiningVisualizer {
   /** No-op on the core — present so MiningVisualizer satisfies MiningSkin. */
   onShare(delta: number): void;
   /** Tear down GL resources and stop the loop. */
+  /** Stop or resume the loop while nobody can see it (motion-gate.ts). A
+   *  paused core keeps a still frame. */
+  setPaused(paused: boolean): void;
   dispose(): void;
 }
 
@@ -442,7 +445,7 @@ export function mountPowerCore(canvas: HTMLCanvasElement): MiningVisualizer {
 
   if (!gl) {
     console.warn("[visualizer] WebGL unavailable — skipping mining HUD");
-    return { setActive: () => {}, setPower: () => {}, setRate: () => {}, onShare: () => {}, dispose: () => {} };
+    return { setActive: () => {}, setPower: () => {}, setRate: () => {}, onShare: () => {}, setPaused: () => {}, dispose: () => {} };
   }
 
   // Resolve the accent color from the live CSS (respects light/dark theme).
@@ -555,6 +558,7 @@ export function mountPowerCore(canvas: HTMLCanvasElement): MiningVisualizer {
   let raf = 0;
   let lastTs = 0;
   let disposed = false;
+  let paused = false;
 
   // Mining-power tier driver. `currentPower` is the slider value (5..100) we
   // map into intensity/overdrive. `active` tracks whether mining is actually
@@ -669,7 +673,7 @@ export function mountPowerCore(canvas: HTMLCanvasElement): MiningVisualizer {
   }
 
   function startLoop(): void {
-    if (reduceMotion || raf || disposed) return;
+    if (reduceMotion || paused || raf || disposed) return;
     lastTs = 0;
     raf = requestAnimationFrame(tick);
   }
@@ -686,7 +690,7 @@ export function mountPowerCore(canvas: HTMLCanvasElement): MiningVisualizer {
   function onVisibility(): void {
     if (document.hidden) {
       stopLoop();
-    } else if (!reduceMotion) {
+    } else if (!reduceMotion && !paused) {
       startLoop();
     } else {
       drawFrame();
@@ -767,6 +771,12 @@ export function mountPowerCore(canvas: HTMLCanvasElement): MiningVisualizer {
       if (active) retargetIntensity();
     },
     setRate(_perHr: number): void {},
+    setPaused(p: boolean): void {
+      if (p === paused || disposed) return;
+      paused = p;
+      if (paused) stopLoop();
+      else if (!document.hidden) startLoop();
+    },
     onShare(_delta: number): void {},
     dispose(): void {
       disposed = true;

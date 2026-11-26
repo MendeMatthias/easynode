@@ -330,6 +330,20 @@ body {
 }
 @media (prefers-reduced-motion: reduce) { .update-banner { animation: none; } }
 
+/* Nobody can see the window (motion-gate.ts): hold every CSS loop where it
+   is. It resumes on the next input, focus or return from the tray. */
+body.motion-paused *,
+body.motion-paused *::before,
+body.motion-paused *::after {
+  animation-play-state: paused !important;
+}
+/* Reduced motion: the orb and the live dot hold still. */
+@media (prefers-reduced-motion: reduce) {
+  .status-orb::after,
+  .status-orb.is-ready::after,
+  .status-orb.is-syncing::after { animation: none; }
+}
+
 /* Setup progress steps */
 .steps { list-style: none; display: flex; flex-direction: column; gap: var(--space-s); }
 .step { display: flex; align-items: center; gap: var(--space-s); font-size: 13.5px; color: var(--color-muted); }
