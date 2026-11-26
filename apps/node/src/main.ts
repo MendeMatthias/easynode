@@ -57,7 +57,7 @@ import {
 } from "./update-check";
 import { contributionView } from "./contribution";
 import { explorerRow } from "./feature-rows";
-import { type SwarmCard, swarmView } from "./swarm-card";
+import { type SwarmCard, swarmResultStillApplies, swarmView } from "./swarm-card";
 import { type VisualMode, announceChange, headline, waitingLine } from "./headline";
 import { initOverlayKeys } from "./overlay-keys";
 import { mountPowerCore } from "./power-core";
@@ -2262,7 +2262,22 @@ async function refreshSwarm(force = false): Promise<void> {
   }
 }
 
+// The card's state when the message under the switch appeared; null until
+// the first card after it. The message goes once the card moves on
+// (swarmResultStillApplies), so "Downloading..." never outlives the download.
+let swarmResultState: SwarmCard["state"] | null = null;
+
 function reflectSwarm(card: SwarmCard): void {
+  const result = $("swarm-result");
+  if (!result.hidden) {
+    if (swarmResultState === null) {
+      swarmResultState = card.state;
+    } else if (!swarmResultStillApplies(swarmResultState, card.state)) {
+      result.hidden = true;
+      result.textContent = "";
+      swarmResultState = null;
+    }
+  }
   const view = swarmView(card);
   const t = $<HTMLInputElement>("swarm-toggle");
   if (document.activeElement !== t) t.checked = view.checked;
@@ -2295,6 +2310,7 @@ $<HTMLInputElement>("swarm-toggle").addEventListener("change", async (e) => {
     result.textContent = String(err);
   }
   result.hidden = false;
+  swarmResultState = null;
   box.disabled = false;
   void refreshSwarm(true);
 });

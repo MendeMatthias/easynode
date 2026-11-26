@@ -6665,13 +6665,35 @@ async fn end_header_bootstrap_with_restart(
     app: &AppHandle,
     state: &State<'_, AppState>,
 ) -> Result<(), String> {
-    if state.rpc.lock().await.is_none() || state.quitting.load(Ordering::SeqCst) {
+    // The same claim as every other restart, waited for: a restart already
+    // under way (the swarm switch's, Tools') finishes first, and none can
+    // start between this stop and this start. Without it the two
+    // interleaved on 2026-11-26: the switch's stop ran while this restart
+    // was starting the node, and the switch's start was refused.
+    let _restarting = crate::tools::restart_claim_when_free().await;
+    // Decided again now that the claim is held: the decision that spawned
+    // this task may be stale. A restart that ran while this one waited may
+    // have ended the bootstrap already, and a second task (spawned by the
+    // refresher of that restart's bootstrap launch) may have waited beside
+    // this one; only the first to find the marker restarts.
+    if !header_bootstrap_restart_due(
+        state.rpc.lock().await.is_some(),
+        state.quitting.load(Ordering::SeqCst),
+        btx_core::node::header_bootstrap_pending(&node_datadir()),
+    ) {
         return Ok(());
     }
     stop_node_inner(state).await;
     set_phase(app, state, NodePhase::Stopped).await;
     btx_core::node::end_header_bootstrap(&node_datadir());
     start_node_projected(app, state).await
+}
+
+/// Is the restart that ends a header bootstrap still due once it holds the
+/// restart claim? Only for a running node of this app, while the app is not
+/// quitting, and while the bootstrap's marker is still there.
+fn header_bootstrap_restart_due(rpc_armed: bool, quitting: bool, marker_present: bool) -> bool {
+    rpc_armed && !quitting && marker_present
 }
 
 /// What the log says when a header bootstrap ends. Pure, so the two endings
@@ -8375,6 +8397,9 @@ struct SwarmFacts {
     held_back: Option<String>,
     fetch: SwarmFetch,
     download_mb: u64,
+    /// The switch's restart is due: waiting for another restart or start to
+    /// finish, or under way (`apply_swarm_switch`).
+    restarting: bool,
 }
 
 /// The card. `seen` is `None` while no node runs.
@@ -8399,9 +8424,22 @@ fn swarm_card(f: &SwarmFacts, seen: Option<btx_core::swarm::Seen>) -> SwarmCard 
         ("fetching", none(), None)
     } else if !f.wanted {
         match seen {
-            Some(Seen::HelperDown { .. } | Seen::Observing(_) | Seen::Unreadable { .. }) => {
-                ("stops_next_start", none(), None)
-            }
+            // Still on the swarm engine (or between the stop and the start),
+            // and the switch's restart is due.
+            None
+            | Some(
+                Seen::HelperDown { .. }
+                | Seen::Observing(_)
+                | Seen::Unreadable { .. }
+                | Seen::Starting
+                | Seen::Unreachable { .. },
+            ) if f.restarting => ("restarting", none(), None),
+            Some(
+                Seen::HelperDown { .. }
+                | Seen::Observing(_)
+                | Seen::Unreadable { .. }
+                | Seen::Starting,
+            ) => ("stops_next_start", none(), None),
             _ if !f.fetchable && !f.engine_installed => ("not_available", none(), None),
             _ => ("off", none(), None),
         }
@@ -8415,8 +8453,17 @@ fn swarm_card(f: &SwarmFacts, seen: Option<btx_core::swarm::Seen>) -> SwarmCard 
         ("engine_missing", none(), None)
     } else {
         match seen {
+            // Not on the swarm engine yet, or between the stop and the
+            // start, and the switch's restart is due: say that, never "did
+            // not answer".
+            None | Some(Seen::NoModelNetwork | Seen::Off | Seen::Unreachable { .. })
+                if f.restarting =>
+            {
+                ("restarting", none(), None)
+            }
             None => ("node_stopped", none(), None),
             Some(Seen::NoModelNetwork | Seen::Off) => ("starts_next_start", none(), None),
+            Some(Seen::Starting) => ("starting", none(), None),
             Some(Seen::HelperDown { why }) => ("helper_down", why, None),
             Some(Seen::Observing(report)) => ("observing", none(), Some(report)),
             Some(Seen::Unreadable { why }) => ("unreadable", why, None),
@@ -8477,6 +8524,7 @@ pub async fn swarm_status(state: State<'_, AppState>) -> Result<SwarmCard, Strin
         download_mb: pin
             .map(|p| p.archive_bytes.div_ceil(1024 * 1024))
             .unwrap_or(0),
+        restarting: SWARM_RESTARTS_DUE.load(Ordering::SeqCst) > 0,
     };
     let ask = facts.linux && !facts.signs_here && (facts.wanted || facts.engine_installed);
     // A clone, so the shared handle is not held across the round-trip.
@@ -8491,7 +8539,9 @@ pub async fn swarm_status(state: State<'_, AppState>) -> Result<SwarmCard, Strin
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            Some(btx_core::swarm::read(&rpc, &datadir, now_ms).await)
+            // The launch marker decides whether the running engine is asked
+            // at all: the default engine has no model network.
+            Some(btx_core::swarm::read_running(&rpc, &datadir, now_ms).await)
         }
         None => None,
     };
@@ -8662,22 +8712,132 @@ async fn apply_swarm_switch(app: AppHandle, on: bool) {
     if matches!(swarm_fetch_now(&state), SwarmFetch::Fetching(_)) {
         set_swarm_fetch(&state, SwarmFetch::Idle);
     }
-    if state.rpc.lock().await.is_none() {
-        return; // no node running under this app; the next start follows the setting
+    // From here to the end the card says "restarting".
+    struct Due;
+    impl Drop for Due {
+        fn drop(&mut self) {
+            SWARM_RESTARTS_DUE.fetch_sub(1, Ordering::SeqCst);
+        }
     }
-    // A node already on the engine the switch asks for is left running.
-    if !swarm_switch_needs_restart(on, btx_core::swarm::wanted(&datadir)) {
-        return;
-    }
-    if let Err(why) = crate::tools::restart_node_for_setting(&app, &state).await {
-        setup_log(
-            &datadir,
-            &format!(
-                "the swarm is switched {} and the node was not restarted ({why}); it applies at \
-                 the next node start",
-                if on { "on" } else { "off" }
-            ),
+    SWARM_RESTARTS_DUE.fetch_add(1, Ordering::SeqCst);
+    let _due = Due;
+    let not_restarted = |why: &str| {
+        let msg = format!(
+            "the swarm is switched {} and the node was not restarted ({why}); it applies at the \
+             next node start",
+            if on { "on" } else { "off" }
         );
+        eprintln!("[node-app] {msg}");
+        setup_log(&datadir, &msg);
+    };
+    let began = std::time::Instant::now();
+    let mut waited = false;
+    loop {
+        let busy =
+            crate::tools::restart_in_progress() || state.start_in_flight.load(Ordering::SeqCst);
+        let step = swarm_restart_step(
+            on,
+            NodeAppSettings::load(&datadir).swarm_enabled,
+            state.quitting.load(Ordering::SeqCst),
+            busy,
+            state.rpc.lock().await.is_some(),
+            btx_core::swarm::wanted(&datadir),
+            swarm_hold(&datadir).is_some(),
+        );
+        match step {
+            SwarmRestartStep::Done => return,
+            SwarmRestartStep::Wait if began.elapsed() >= SWARM_RESTART_WAIT => {
+                not_restarted("another restart or start was still under way");
+                return;
+            }
+            SwarmRestartStep::Wait => {
+                if !waited {
+                    waited = true;
+                    let msg = format!(
+                        "the swarm is switched {}; the node restarts onto the {} engine once the \
+                         restart or start under way has finished",
+                        if on { "on" } else { "off" },
+                        if on { "swarm" } else { "usual" }
+                    );
+                    eprintln!("[node-app] {msg}");
+                    setup_log(&datadir, &msg);
+                }
+                tokio::time::sleep(SWARM_RESTART_POLL).await;
+            }
+            SwarmRestartStep::Restart => {
+                setup_log(
+                    &datadir,
+                    &format!(
+                        "the swarm is switched {}: restarting the node onto the {} engine",
+                        if on { "on" } else { "off" },
+                        if on { "swarm" } else { "usual" }
+                    ),
+                );
+                match crate::tools::restart_node_for_setting(&app, &state).await {
+                    Ok(()) => return,
+                    Err(why) if crate::tools::refused_for_now(&why) => {
+                        tokio::time::sleep(SWARM_RESTART_POLL).await;
+                    }
+                    Err(why) => {
+                        not_restarted(&why);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// How many switch requests have a restart due (`apply_swarm_switch`). A
+/// count, not a flag: an off that overtakes an on ends the on's wait while
+/// its own goes on.
+static SWARM_RESTARTS_DUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How long the switch waits for another restart or start (the restart that
+/// ends a header bootstrap, a first snapshot load, Fast-forward) before it
+/// leaves the change of engine to the next start.
+const SWARM_RESTART_WAIT: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
+
+const SWARM_RESTART_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwarmRestartStep {
+    Done,
+    Wait,
+    Restart,
+}
+
+/// What the switch's restart does next, asked again every few seconds.
+///
+/// Done: the owner changed the switch since (that request makes its own
+/// restart), the app is quitting, no node runs under this app and none is
+/// starting (the next start follows the setting), or the running node is on
+/// the engine the switch asks for already (`swarm_switch_needs_restart`; a
+/// start made by someone else launched it, since every launch decides the
+/// engine from the setting). Wait: another restart or start is under way.
+/// Its stop would end the node this restart starts, or the other way round;
+/// on 2026-11-26 the swarm switch's restart sat behind the header
+/// bootstrap's and then had its start refused "already starting".
+fn swarm_restart_step(
+    on: bool,
+    setting_now: bool,
+    quitting: bool,
+    busy: bool,
+    rpc_armed: bool,
+    running_on_swarm_engine: bool,
+    held_back: bool,
+) -> SwarmRestartStep {
+    // A swarm engine held back since the switch was flipped (the switch
+    // clears the hold) failed in a start made meanwhile, which fell back to
+    // the usual engine: a restart now would launch that engine again.
+    if setting_now != on || quitting || (on && held_back) {
+        SwarmRestartStep::Done
+    } else if busy {
+        SwarmRestartStep::Wait
+    } else if !rpc_armed || !swarm_switch_needs_restart(on, running_on_swarm_engine) {
+        SwarmRestartStep::Done
+    } else {
+        SwarmRestartStep::Restart
     }
 }
 
@@ -14226,11 +14386,12 @@ mod twin_freeze_removal {
 mod swarm_tests {
     use super::{
         claim_swarm_switch, clear_swarm_hold, engine_did_not_come_up, falls_back_from_swarm_engine,
-        hold_swarm_engine_back, swarm_card, swarm_crash_step, swarm_damage_line,
-        swarm_engine_for_launch, swarm_engine_pin, swarm_hold, swarm_on_refusal, swarm_signs_in,
-        swarm_switch_message, swarm_switch_needs_restart, update_public_key, update_signature_ok,
-        AfterPass, EngineFailure, StartPasses, SwarmCrash, SwarmCrashStep, SwarmFacts,
-        NODE_RELEASE_TAG, SWARM_ENGINE_FELL_BACK, SWARM_ENGINE_KEY_SUFFIX, SWARM_SIGNER_REFUSAL,
+        header_bootstrap_restart_due, hold_swarm_engine_back, swarm_card, swarm_crash_step,
+        swarm_damage_line, swarm_engine_for_launch, swarm_engine_pin, swarm_hold, swarm_on_refusal,
+        swarm_restart_step, swarm_signs_in, swarm_switch_message, swarm_switch_needs_restart,
+        update_public_key, update_signature_ok, AfterPass, EngineFailure, StartPasses, SwarmCrash,
+        SwarmCrashStep, SwarmFacts, ALREADY_STARTING, NODE_RELEASE_TAG, SWARM_ENGINE_FELL_BACK,
+        SWARM_ENGINE_KEY_SUFFIX, SWARM_SIGNER_REFUSAL,
     };
     use crate::state::SwarmFetch;
     use btx_core::swarm::{Guard, Report, Seen};
@@ -14267,6 +14428,7 @@ mod swarm_tests {
             held_back: None,
             fetch: SwarmFetch::Idle,
             download_mb: 470,
+            restarting: false,
         }
     }
 
@@ -14975,15 +15137,175 @@ mod swarm_tests {
             .nth(1)
             .and_then(|s| s.split("\n}\n").next())
             .unwrap();
-        let rule = apply
-            .find("swarm_switch_needs_restart(on, btx_core::swarm::wanted(&datadir))")
-            .unwrap();
+        let rule = apply.find("let step = swarm_restart_step(").unwrap();
+        let marker = apply.find("btx_core::swarm::wanted(&datadir),").unwrap();
         let restart = apply.find("restart_node_for_setting(").unwrap();
-        assert!(rule < restart);
+        assert!(rule < marker && marker < restart);
         let already = swarm_switch_message(false, true, 470, false);
         assert!(
             already.contains("nothing restarts") && !already.contains("  "),
             "{already:?}"
+        );
+    }
+
+    /// The switch's restart, step by step: it waits behind another restart or
+    /// start instead of giving up or interleaving with it, ends when the
+    /// running node is on the asked engine already (whoever started it), and
+    /// ends when the owner changed the switch since or the app quits.
+    #[test]
+    fn the_switch_restart_waits_for_another_restart_and_ends_on_the_asked_engine() {
+        use super::SwarmRestartStep::{Done, Restart, Wait};
+        // (on, setting now, quitting, busy, rpc armed, launched on swarm,
+        //  held back) -> step
+        let cases = [
+            // On, the node on its usual engine, nothing else under way.
+            ((true, true, false, false, true, false, false), Restart),
+            // The header bootstrap's restart (or a first start) is under way:
+            // wait, even across the gap with no RPC between its stop and start.
+            ((true, true, false, true, true, false, false), Wait),
+            ((true, true, false, true, false, false, false), Wait),
+            // That restart's start launched the swarm engine: nothing to do.
+            ((true, true, false, false, true, true, false), Done),
+            // That start launched the swarm engine, it failed and the start
+            // fell back: no second restart onto the usual engine.
+            ((true, true, false, false, true, false, true), Done),
+            ((true, true, false, true, true, false, true), Done),
+            // No node and nothing starting one: the next start follows.
+            ((true, true, false, false, false, false, false), Done),
+            // The owner switched it off meanwhile; the app quits.
+            ((true, false, false, true, true, false, false), Done),
+            ((true, true, true, true, true, false, false), Done),
+            // Off from the swarm engine, and off on the usual one; a hold
+            // does not keep an off from leaving the swarm engine.
+            ((false, false, false, false, true, true, false), Restart),
+            ((false, false, false, false, true, true, true), Restart),
+            ((false, false, false, false, true, false, false), Done),
+        ];
+        for ((on, now, quit, busy, rpc, marker, held), want) in cases {
+            assert_eq!(
+                swarm_restart_step(on, now, quit, busy, rpc, marker, held),
+                want,
+                "{:?}",
+                (on, now, quit, busy, rpc, marker, held)
+            );
+        }
+        // The loop asks the same hold the launch reads.
+        let src = include_str!("commands.rs");
+        let production = src.split("\nmod swarm_tests {").next().unwrap();
+        let apply = production
+            .split("\nasync fn apply_swarm_switch(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(apply.contains("swarm_hold(&datadir).is_some(),"));
+        // A refusal for now is asked again; one for good ends the wait.
+        assert!(crate::tools::refused_for_now(
+            crate::tools::ALREADY_RESTARTING
+        ));
+        assert!(crate::tools::refused_for_now(crate::tools::STILL_STARTING));
+        assert!(crate::tools::refused_for_now(ALREADY_STARTING));
+        assert!(!crate::tools::refused_for_now(
+            "This node belongs to another app."
+        ));
+    }
+
+    /// The restart that ends a header bootstrap holds the restart claim from
+    /// before its stop to after its start, so the swarm switch's restart
+    /// (and Tools') cannot stop the node it is starting.
+    #[test]
+    fn the_header_bootstrap_restart_holds_the_restart_claim_through_stop_and_start() {
+        let src = include_str!("commands.rs");
+        let production = src.split("\nmod swarm_tests {").next().unwrap();
+        let end = production
+            .split("\nasync fn end_header_bootstrap_with_restart(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let claim = end
+            .find("let _restarting = crate::tools::restart_claim_when_free().await;")
+            .unwrap();
+        let stop = end.find("stop_node_inner(state).await;").unwrap();
+        let start = end.find("start_node_projected(app, state).await").unwrap();
+        assert!(claim < stop && stop < start);
+        // The marker is asked again after the claim, before the stop.
+        let asked = end
+            .find("btx_core::node::header_bootstrap_pending(&node_datadir()),")
+            .unwrap();
+        assert!(claim < asked && asked < stop);
+    }
+
+    /// Two restarts that end one header bootstrap (one waited for the claim
+    /// while the other ran) restart the node once: the second finds the
+    /// marker gone. Read from a real node folder's marker.
+    #[test]
+    fn a_header_bootstrap_ended_while_its_restart_waited_is_not_restarted_again() {
+        let dir = tempfile::tempdir().unwrap();
+        btx_core::node::begin_header_bootstrap(dir.path());
+        let pending = || btx_core::node::header_bootstrap_pending(dir.path());
+        // The first task takes the claim: still due.
+        assert!(header_bootstrap_restart_due(true, false, pending()));
+        // It restarts the node and ends the bootstrap.
+        btx_core::node::end_header_bootstrap(dir.path());
+        // The second, which waited, takes the claim: nothing left to do.
+        assert!(!header_bootstrap_restart_due(true, false, pending()));
+        // And the old reasons still hold.
+        btx_core::node::begin_header_bootstrap(dir.path());
+        assert!(!header_bootstrap_restart_due(false, false, pending()));
+        assert!(!header_bootstrap_restart_due(true, true, pending()));
+    }
+
+    /// While the switch's restart is due the card says so, in both
+    /// directions and between the stop and the start; a node that is
+    /// loading says "starting"; neither is ever "did not answer".
+    #[test]
+    fn the_card_says_restarting_while_the_switch_restart_is_due() {
+        let due = |wanted: bool| SwarmFacts {
+            wanted,
+            restarting: true,
+            ..facts()
+        };
+        for seen in [
+            None,
+            Some(Seen::NoModelNetwork),
+            Some(Seen::Off),
+            Some(Seen::Unreachable { why: "t".into() }),
+        ] {
+            assert_eq!(
+                swarm_card(&due(true), seen.clone()).state,
+                "restarting",
+                "{seen:?}"
+            );
+        }
+        // Already reporting: the restart is over, whatever the count says.
+        assert_eq!(
+            swarm_card(&due(true), Some(Seen::Observing(report()))).state,
+            "observing"
+        );
+        for seen in [
+            None,
+            Some(Seen::Observing(report())),
+            Some(Seen::Starting),
+            Some(Seen::Unreachable { why: "t".into() }),
+        ] {
+            assert_eq!(
+                swarm_card(&due(false), seen.clone()).state,
+                "restarting",
+                "{seen:?}"
+            );
+        }
+        assert_eq!(
+            swarm_card(&due(false), Some(Seen::NoModelNetwork)).state,
+            "off"
+        );
+        assert_eq!(swarm_card(&facts(), Some(Seen::Starting)).state, "starting");
+        // A failed swarm engine that fell back says so, not "restarting".
+        let held = SwarmFacts {
+            held_back: Some("it exited with code 1".into()),
+            ..due(true)
+        };
+        assert_eq!(
+            swarm_card(&held, Some(Seen::NoModelNetwork)).state,
+            "engine_start_failed"
         );
     }
 

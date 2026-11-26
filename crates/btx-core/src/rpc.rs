@@ -203,6 +203,24 @@ impl RpcClient {
     }
 }
 
+/// The JSON-RPC "method not found" error in a 404 body, and nothing else:
+/// any other 4xx body keeps the generic message (it may echo credentials).
+fn method_not_found(body: &str) -> Option<AppError> {
+    let json = serde_json::from_str::<Value>(body).ok()?;
+    let err = json.get("error")?;
+    if err.get("code").and_then(Value::as_i64) != Some(-32601) {
+        return None;
+    }
+    Some(AppError::Rpc {
+        code: -32601,
+        message: err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Method not found")
+            .to_string(),
+    })
+}
+
 #[async_trait]
 impl Rpc for RpcClient {
     async fn call(&self, method: &str, params: Value) -> AppResult<Value> {
@@ -243,6 +261,16 @@ impl Rpc for RpcClient {
             // error object. A 4xx (e.g. 401 on a bad cookie) keeps the generic
             // message so verbose node internals — and any credential the node might
             // echo on an auth failure — never reach the webview.
+            // btxd answers a command it does not have with HTTP 404 and a
+            // JSON-RPC "method not found" (-32601) body. That is an answer,
+            // not a fault: it comes back as that error, so a caller asking
+            // whether this engine has a command (the swarm card, the snapshot
+            // offer) reads "no", and nothing is logged for it.
+            if status == reqwest::StatusCode::NOT_FOUND {
+                if let Some(e) = method_not_found(&body) {
+                    return Err(e);
+                }
+            }
             if status.is_server_error() {
                 if let Ok(json) = serde_json::from_str::<Value>(&body) {
                     if let Some(err) = json.get("error").filter(|e| !e.is_null()) {
@@ -311,6 +339,42 @@ mod tests {
         assert!(r.is_err(), "{r:?}");
         assert!(started.elapsed() < Duration::from_secs(10));
         hold.abort();
+    }
+
+    /// What btxd v0.34.16 sends for a command it lacks (measured on the
+    /// default engine, `getmodelnetworkinfo`): HTTP 404 with a -32601 body.
+    /// It is the RPC error "method not found"; another 404 stays generic.
+    #[tokio::test]
+    async fn a_404_method_not_found_is_the_rpc_error_it_carries() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(Matcher::PartialJson(json!({"method": "getmodelnetworkinfo"})))
+            .with_status(404)
+            .with_body(
+                r#"{"result":null,"error":{"code":-32601,"message":"Method not found"},"id":"easybtx"}"#,
+            )
+            .create_async()
+            .await;
+        let _other = server
+            .mock("POST", "/")
+            .match_body(Matcher::PartialJson(json!({"method": "x"})))
+            .with_status(404)
+            .with_body("not here")
+            .create_async()
+            .await;
+        let client = RpcClient::new(server.url(), "u", "p");
+        match client.call("getmodelnetworkinfo", json!([])).await {
+            Err(AppError::Rpc {
+                code: -32601,
+                message,
+            }) => assert_eq!(message, "Method not found"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            client.call("x", json!([])).await,
+            Err(AppError::Http(_))
+        ));
     }
 
     #[tokio::test]
