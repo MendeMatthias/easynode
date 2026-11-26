@@ -404,9 +404,12 @@ fn check(app: &AppHandle) {
                 "the reload did not bring the window back ({}); rebuilding the window. The node was not touched.",
                 describe(&obs)
             ));
-            if let Err(e) = recreate(app) {
-                log(&format!("rebuilding the window failed: {e}"));
-            }
+            let app = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(e) = recreate(&app) {
+                    log(&format!("rebuilding the window failed: {e}"));
+                }
+            });
         }
         Action::GiveUp => log(&format!(
             "the window is still not painting ({}); no more recoveries for {} minutes. \
@@ -417,8 +420,12 @@ fn check(app: &AppHandle) {
     }
 }
 
-/// Reload the window on request (tray menu, second launch), show it, and let
-/// the watchdog check that it came back, rebuilding it if it did not.
+/// Reload the window on request (tray menu, second launch). Someone asking
+/// by hand means the window is wrong in a way they can see, and a web view
+/// whose page has stopped (a hung web process) cannot be fixed by a reload
+/// sent to that same page. So this rebuilds the window, which also starts a
+/// fresh page, and falls back to a plain reload only if the rebuild fails.
+/// It works with the watchdog switched off too.
 pub fn reload_now(app: &AppHandle, reason: &str) {
     let now = secs();
     if let Some(watch) = app.try_state::<WindowWatch>() {
@@ -426,22 +433,22 @@ pub fn reload_now(app: &AppHandle, reason: &str) {
         g.recent.retain(|&t| now < t + HOUR_SECS);
         g.recent.push(now);
         g.last_action = now;
-        g.stage = Stage::Reloaded { at: now };
+        g.stage = Stage::Recreated { at: now };
     }
-    match app.get_webview_window("main") {
-        Some(w) => {
-            let _ = w.unminimize();
-            let _ = w.show();
-            let _ = w.set_focus();
-            match w.reload() {
-                Ok(()) => log(&format!("window reloaded ({reason})")),
-                Err(e) => log(&format!("window reload failed ({reason}): {e}")),
-            }
-        }
-        None => {
-            log(&format!("no window to reload ({reason}); building one"));
-            if let Err(e) = recreate(app) {
-                log(&format!("building the window failed: {e}"));
+    match recreate(app) {
+        Ok(()) => log(&format!("window reloaded ({reason}): rebuilt it")),
+        Err(e) => {
+            log(&format!(
+                "rebuilding the window failed ({reason}): {e}; reloading it instead"
+            ));
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+                match w.reload() {
+                    Ok(()) => log(&format!("window reloaded ({reason})")),
+                    Err(e) => log(&format!("window reload failed ({reason}): {e}")),
+                }
             }
         }
     }
@@ -469,6 +476,16 @@ fn recreate(app: &AppHandle) -> Result<(), String> {
     });
     if let Some(w) = old {
         w.destroy().map_err(|e| format!("destroy: {e}"))?;
+        // The destruction runs on the event loop; the label is free only once
+        // it has. Never called on the main thread (tray clicks hand it off),
+        // so waiting here cannot hold up the loop it waits for.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.get_webview_window("main").is_some() {
+            if Instant::now() > deadline {
+                return Err("the old window was not destroyed within 5 s".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
     let w = tauri::WebviewWindowBuilder::from_config(app, &cfg)
         .and_then(|b| b.build())
