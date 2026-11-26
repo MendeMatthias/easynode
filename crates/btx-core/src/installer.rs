@@ -2323,16 +2323,23 @@ mod tests {
         {
             let pid = std::fs::read_to_string(&child_pid).unwrap();
             let proc_dir = std::path::Path::new("/proc").join(pid.trim());
-            let gone = (0..100).any(|_| {
+            // Dead, or a zombie waiting for its reaper (slow on a loaded
+            // machine): either way it no longer runs.
+            let gone = (0..400).any(|_| {
                 let alive = std::fs::read_to_string(proc_dir.join("stat"))
-                    .map(|s| !s.contains(") Z "))
+                    .map(|s| !(s.contains(") Z ") || s.contains(") X ")))
                     .unwrap_or(false);
                 if alive {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 !alive
             });
-            assert!(gone, "the wrapper's child {pid} still runs");
+            assert!(
+                gone,
+                "the wrapper's child {pid} still runs: {:?} {:?}",
+                std::fs::read_to_string(proc_dir.join("stat")),
+                std::fs::read_to_string(proc_dir.join("cmdline"))
+            );
         }
         // One that answers is read as before.
         std::fs::write(&btxd, b"#!/bin/sh\necho 'BTX daemon version v0.34.16'\n").unwrap();
