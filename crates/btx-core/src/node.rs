@@ -5935,8 +5935,7 @@ mod tests {
     /// A one-request JSON-RPC stand-in for btxd on `listener`: it reads one
     /// request, touches `stop-asked` in `dir` when it is `stop` signed with
     /// the cookie `__cookie__:pw`, answers like btxd, and hands back the
-    /// request it read.
-    #[cfg(unix)]
+    /// request it read. Plain tokio sockets, so it runs on every OS.
     async fn answer_one_stop(listener: tokio::net::TcpListener, dir: PathBuf) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (mut sock, _) = listener.accept().await.unwrap();
@@ -6024,6 +6023,42 @@ mod tests {
             !tmp.path().join("got-term").exists(),
             "SIGTERM was sent although the RPC request arrived"
         );
+    }
+
+    /// Issue #242 item 1, on every OS (CI's Windows job runs it): when
+    /// btx-cli cannot ask (here it cannot even run), the stop goes through
+    /// the app's own RPC client to the port the launch conf names, signed
+    /// with the node's cookie. This is the only second try Windows has.
+    #[tokio::test]
+    async fn a_stop_btx_cli_cannot_make_goes_over_rpc_on_every_os() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::fs::create_dir_all(tmp.path().join("faststart")).unwrap();
+        std::fs::write(
+            crate::setup::launch_conf_path(tmp.path()),
+            format!("rpcbind=127.0.0.1\nrpcport={port}\n"),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join(".cookie"), "__cookie__:pw").unwrap();
+        let server = tokio::spawn(answer_one_stop(listener, tmp.path().to_path_buf()));
+        let no_cli = tmp.path().join("no-such-btx-cli");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            stop_unmanaged_node(tmp.path(), &no_cli, std::time::Duration::from_millis(200)),
+        )
+        .await
+        .expect("the stop hung");
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("no RPC request reached the conf's port")
+            .unwrap();
+        assert!(request.contains("\"method\":\"stop\""), "{request}");
+        assert!(tmp.path().join("stop-asked").exists(), "{request}");
+        // And the helper itself says whether the node took it: nobody on the
+        // port is a no.
+        std::fs::write(crate::setup::launch_conf_path(tmp.path()), "rpcport=1\n").unwrap();
+        assert!(!ask_stop_over_rpc(tmp.path(), None).await);
     }
 
     /// Issue #242 item 3: the stop of a node nobody here manages names the

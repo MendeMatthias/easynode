@@ -410,11 +410,13 @@ pub async fn tools_restart_node(app: AppHandle, state: State<'_, AppState>) -> R
 }
 
 /// The same restart for a setting that needs one (the swarm switch), with the
-/// same three refusals: a restart already running, a start in flight, a node
-/// this app does not own.
+/// same refusals: a restart already running, a start or a stop in flight, a
+/// node this app does not own. It does not start the node again if the owner
+/// pressed Stop after `owner_mark` was read (`commands::owner_stop_mark`).
 pub(crate) async fn restart_node_for_setting(
     app: &AppHandle,
     state: &State<'_, AppState>,
+    owner_mark: u64,
 ) -> Result<(), String> {
     let Some(_restarting) = Claim::take(&RESTARTING) else {
         return Err(ALREADY_RESTARTING.into());
@@ -427,7 +429,7 @@ pub(crate) async fn restart_node_for_setting(
         return Err(sentence.into());
     }
     destructive_allowed(node_ownership(state, &node_datadir()).await)?;
-    restart_node_projected(app, state).await
+    crate::commands::restart_node_projected_since(app, state, owner_mark).await
 }
 
 #[derive(Debug, Clone, Serialize)]
