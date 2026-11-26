@@ -3479,13 +3479,17 @@ pub async fn stop_unmanaged_node(datadir: &Path, btx_cli: &Path, grace: std::tim
             crate::engine_priority::EnginePriority::Normal,
         );
     }
+    // With the conf the node was launched with ([`stop_command_args`]), so a
+    // moved `rpcport` is asked on its own port, and through the app's own
+    // RPC client when btx-cli's request did not arrive ([`ask_stop_over_rpc`]).
+    let conf = crate::setup::launch_conf(datadir);
     let mut stop_cmd = Command::new(btx_cli);
-    stop_cmd
-        .arg(format!("-datadir={}", datadir.display()))
-        .arg("stop");
+    stop_cmd.args(stop_command_args(datadir, conf.as_deref()));
     #[cfg(windows)]
     stop_cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    let _ = stop_cmd.status().await;
+    if !matches!(stop_cmd.status().await, Ok(s) if s.success()) {
+        let _ = ask_stop_over_rpc(datadir, conf.as_deref()).await;
+    }
     // The daemon writes its own pid to <datadir>/btxd.pid and removes it at
     // the very end of shutdown; once that pid is no longer alive the datadir
     // lock is free (checking the flock itself portably would need the lock).
@@ -4229,12 +4233,59 @@ fn read_tail(path: &Path, max: u64) -> Option<Vec<u8>> {
 /// request, and the app waited on it, which also held up every restart
 /// behind it, the swarm switch's included).
 fn stop_command_args(datadir: &Path, conf: Option<&Path>) -> Vec<String> {
+    let mut args = cli_node_args(datadir, conf);
+    args.push("stop".to_string());
+    args
+}
+
+/// What every btx-cli call to the node in `datadir` starts with: its datadir
+/// and, when there is one, the conf it was launched with, so btx-cli reads
+/// the same `rpcport` btxd did ([`stop_command_args`] says what asking the
+/// default port costs). Callers that do not hold the launch record pass
+/// [`crate::setup::launch_conf`].
+pub fn cli_node_args(datadir: &Path, conf: Option<&Path>) -> Vec<String> {
     let mut args = vec![format!("-datadir={}", datadir.display())];
     if let Some(conf) = conf {
         args.push(format!("-conf={}", conf.display()));
     }
-    args.push("stop".to_string());
     args
+}
+
+/// Ask the node in `datadir` to stop through the app's own JSON-RPC client:
+/// its `.cookie`, and the endpoint its launch conf puts it on
+/// (`setup::rpc_url_from`; `EASYBTX_NODE_RPC_URL` still wins). The second
+/// try after a btx-cli request that did not arrive, and on Windows the only
+/// one: there is no SIGTERM, and Ctrl+Break does not reach a child started
+/// without a console. True when the node took the request.
+///
+/// It does not get past what refused btx-cli for the node's own reasons: a
+/// node in warmup answers `stop` with -28 here too, and is then killed once
+/// the grace is out, as before.
+async fn ask_stop_over_rpc(datadir: &Path, conf: Option<&Path>) -> bool {
+    use crate::rpc::Rpc;
+    let conf = conf
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| crate::setup::launch_conf_path(datadir));
+    let url =
+        crate::setup::rpc_url_from(std::env::var("EASYBTX_NODE_RPC_URL").ok().as_deref(), &conf);
+    let Ok(client) = crate::rpc::RpcClient::from_cookie(url.as_str(), &datadir.join(".cookie"))
+    else {
+        return false;
+    };
+    let took = client
+        .with_timeout(std::time::Duration::from_secs(10))
+        .call("stop", serde_json::json!([]))
+        .await
+        .is_ok();
+    eprintln!(
+        "[node] btx-cli stop did not reach btxd; asked it over RPC at {url}: {}",
+        if took {
+            "it is stopping"
+        } else {
+            "no answer either"
+        }
+    );
+    took
 }
 
 /// The launch parameters captured on `start`, so a later `restart` can re-spawn
@@ -4340,7 +4391,7 @@ impl NodeController {
     ///
     /// Best-effort: logs and ignores every error so a missing/dead pid never
     /// prevents the fresh spawn that follows.
-    pub async fn stop_stale(datadir: &Path, btx_cli: &Path) {
+    pub async fn stop_stale(datadir: &Path, btx_cli: &Path, conf: Option<&Path>) {
         let pidfile = pidfile_path(datadir);
         let pid_str = match std::fs::read_to_string(&pidfile) {
             Ok(s) => s.trim().to_string(),
@@ -4376,9 +4427,7 @@ impl NodeController {
                     "[node] stale btxd pid {pid} found; attempting graceful stop via btx-cli"
                 );
                 let mut stop_cmd = Command::new(btx_cli);
-                stop_cmd
-                    .arg(format!("-datadir={}", datadir.display()))
-                    .arg("stop");
+                stop_cmd.args(stop_command_args(datadir, conf));
                 #[cfg(windows)]
                 stop_cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
                 let _ = stop_cmd.status().await;
@@ -4430,7 +4479,7 @@ impl NodeController {
         }
 
         // Detect + clear any orphaned daemon from a previous run.
-        Self::stop_stale(datadir, btx_cli).await;
+        Self::stop_stale(datadir, btx_cli, Some(conf).filter(|c| c.is_file())).await;
 
         // macOS rejects the upstream binaries' signature at exec and SIGKILLs
         // them ("Code Signature Invalid") when our release app spawns them.
@@ -4914,12 +4963,20 @@ impl NodeController {
         stop_cmd.args(stop_command_args(datadir, conf.as_deref()));
         #[cfg(windows)]
         stop_cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        let asked = matches!(stop_cmd.status().await, Ok(s) if s.success());
+        let mut asked = matches!(stop_cmd.status().await, Ok(s) if s.success());
         // A request that did not arrive (btx-cli could not run, or reached no
         // node that took it) must not leave the wait below watching a node
         // that was never asked: a node in its first sync keeps a core busy,
         // which the wait reads as a flush, for up to SHUTDOWN_BUSY_CAP_SECS.
-        // btxd takes SIGTERM as the same graceful request.
+        // Asked again through the app's own RPC client first, on every OS
+        // (on Windows nothing else can ask a windowless child to stop; the
+        // kill past the grace stays the last resort). Only for a node this
+        // controller is stopping: with no child there is nothing to wait on.
+        if !asked && child.is_some() {
+            asked = ask_stop_over_rpc(datadir, conf.as_deref()).await;
+        }
+        // Then, on unix, with SIGTERM, which btxd takes as the same graceful
+        // request.
         #[cfg(unix)]
         if !asked {
             if let Some(pid) = child.as_ref().and_then(|c| c.id()) {
@@ -5854,6 +5911,233 @@ mod tests {
                 .as_deref(),
             Some("term\n"),
             "the node was not asked with SIGTERM"
+        );
+    }
+
+    /// A btx-cli stand-in that writes its arguments to `args_file` and
+    /// fails the way `Authorization failed` does.
+    #[cfg(unix)]
+    fn refusing_cli(dir: &std::path::Path, args_file: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let cli = dir.join("btx-cli-refused");
+        std::fs::write(
+            &cli,
+            format!(
+                "#!/bin/sh\necho \"$@\" > '{}'\necho 'error: Authorization failed' >&2\nexit 1\n",
+                args_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cli
+    }
+
+    /// A one-request JSON-RPC stand-in for btxd on `listener`: it reads one
+    /// request, touches `stop-asked` in `dir` when it is `stop` signed with
+    /// the cookie `__cookie__:pw`, answers like btxd, and hands back the
+    /// request it read. Plain tokio sockets, so it runs on every OS.
+    async fn answer_one_stop(listener: tokio::net::TcpListener, dir: PathBuf) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = sock.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf).to_string();
+            if let Some(head_end) = text.find("\r\n\r\n") {
+                let len = text[..head_end]
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= head_end + 4 + len {
+                    break;
+                }
+            }
+        }
+        let request = String::from_utf8_lossy(&buf).to_string();
+        // base64("__cookie__:pw")
+        if request.contains("\"method\":\"stop\"") && request.contains("Basic X19jb29raWVfXzpwdw==")
+        {
+            std::fs::write(dir.join("stop-asked"), "").unwrap();
+        }
+        let body = r#"{"result":"BTX server stopping","error":null,"id":"easybtx"}"#;
+        let _ = sock
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await;
+        request
+    }
+
+    /// Issue #242 item 1: a btx-cli request that does not arrive is made
+    /// again through the app's own RPC client, on the port the launch conf
+    /// names and with the node's cookie, before anything else. This is the
+    /// only second try Windows has; on unix it comes before SIGTERM, which
+    /// is then not sent. Before the fix the node got SIGTERM (unix) or a kill
+    /// after the whole grace (Windows).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_stop_request_is_made_again_over_rpc_on_the_conf_port() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut controller = start_shim(tmp.path(), &term_recording_node(tmp.path())).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // `start_shim` launched with this conf; the port moves after the
+        // launch only because the stand-in picks its own.
+        std::fs::write(
+            tmp.path().join("faststart.conf"),
+            format!("rpcport={port}\n"),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join(".cookie"), "__cookie__:pw").unwrap();
+        let server = tokio::spawn(answer_one_stop(listener, tmp.path().to_path_buf()));
+        let args_file = tmp.path().join("cli-args");
+        let cli = refusing_cli(tmp.path(), &args_file);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            controller.stop(&cli, tmp.path()),
+        )
+        .await
+        .expect("the stop waited out its grace on a node that was asked")
+        .unwrap();
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("no RPC request reached the conf's port")
+            .unwrap();
+        assert!(request.contains("\"method\":\"stop\""), "{request}");
+        assert!(tmp.path().join("stop-asked").exists(), "{request}");
+        assert!(
+            !tmp.path().join("got-term").exists(),
+            "SIGTERM was sent although the RPC request arrived"
+        );
+    }
+
+    /// Issue #242 item 1, on every OS (CI's Windows job runs it): when
+    /// btx-cli cannot ask (here it cannot even run), the stop goes through
+    /// the app's own RPC client to the port the launch conf names, signed
+    /// with the node's cookie. This is the only second try Windows has.
+    #[tokio::test]
+    async fn a_stop_btx_cli_cannot_make_goes_over_rpc_on_every_os() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::fs::create_dir_all(tmp.path().join("faststart")).unwrap();
+        std::fs::write(
+            crate::setup::launch_conf_path(tmp.path()),
+            format!("rpcbind=127.0.0.1\nrpcport={port}\n"),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join(".cookie"), "__cookie__:pw").unwrap();
+        let server = tokio::spawn(answer_one_stop(listener, tmp.path().to_path_buf()));
+        let no_cli = tmp.path().join("no-such-btx-cli");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            stop_unmanaged_node(tmp.path(), &no_cli, std::time::Duration::from_millis(200)),
+        )
+        .await
+        .expect("the stop hung");
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("no RPC request reached the conf's port")
+            .unwrap();
+        assert!(request.contains("\"method\":\"stop\""), "{request}");
+        assert!(tmp.path().join("stop-asked").exists(), "{request}");
+        // And the helper itself says whether the node took it: nobody on the
+        // port is a no.
+        std::fs::write(crate::setup::launch_conf_path(tmp.path()), "rpcport=1\n").unwrap();
+        assert!(!ask_stop_over_rpc(tmp.path(), None).await);
+    }
+
+    /// Issue #242 item 3: the stop of a node nobody here manages names the
+    /// launch conf when the datadir has one, and only then.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_unmanaged_node_names_the_launch_conf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args_file = tmp.path().join("cli-args");
+        let cli = refusing_cli(tmp.path(), &args_file);
+        stop_unmanaged_node(tmp.path(), &cli, std::time::Duration::from_millis(200)).await;
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        assert!(!args.contains("-conf="), "{args}");
+        std::fs::create_dir_all(tmp.path().join("faststart")).unwrap();
+        let conf = crate::setup::launch_conf_path(tmp.path());
+        std::fs::write(&conf, "rpcport=19557\n").unwrap();
+        stop_unmanaged_node(tmp.path(), &cli, std::time::Duration::from_millis(200)).await;
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        assert!(
+            args.contains(&format!("-conf={}", conf.display())),
+            "{args}"
+        );
+        assert!(args.trim_end().ends_with("stop"), "{args}");
+    }
+
+    /// Issue #242 item 3: the stale-daemon stop at the top of every start
+    /// names the conf the start is about to launch with.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_stale_names_the_launch_conf() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // A stale daemon whose name is btxd (a script's comm is its file
+        // name), recorded in the pidfile.
+        let shim = tmp.path().join("btxd");
+        std::fs::write(&shim, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut stale = None;
+        for _ in 0..EXEC_RETRIES {
+            match std::process::Command::new(&shim).spawn() {
+                Ok(c) => {
+                    stale = Some(c);
+                    break;
+                }
+                Err(_) => std::thread::sleep(EXEC_RETRY_WAIT),
+            }
+        }
+        let mut stale = stale.expect("stale daemon spawn");
+        std::fs::write(pidfile_path(tmp.path()), stale.id().to_string()).unwrap();
+        let args_file = tmp.path().join("cli-args");
+        let cli = refusing_cli(tmp.path(), &args_file);
+        let conf = tmp.path().join("launch.conf");
+        std::fs::write(&conf, "rpcport=19558\n").unwrap();
+        NodeController::stop_stale(tmp.path(), &cli, Some(&conf)).await;
+        let _ = stale.kill();
+        let _ = stale.wait();
+        if let Ok(args) = std::fs::read_to_string(&args_file) {
+            assert!(
+                args.contains(&format!("-conf={}", conf.display())),
+                "{args}"
+            );
+        } else {
+            panic!("btx-cli was not run for a live btxd pid");
+        }
+    }
+
+    #[test]
+    fn btx_cli_calls_name_the_conf_when_there_is_one() {
+        let d = Path::new("/h/.easybtx");
+        assert_eq!(
+            cli_node_args(d, None),
+            vec!["-datadir=/h/.easybtx".to_string()]
+        );
+        assert_eq!(
+            cli_node_args(d, Some(Path::new("/c.conf"))),
+            vec![
+                "-datadir=/h/.easybtx".to_string(),
+                "-conf=/c.conf".to_string()
+            ]
         );
     }
 

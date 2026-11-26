@@ -13,8 +13,24 @@ use std::path::Path;
 /// datadir lock and the cookie wait timed out.
 pub const RPC_URL: &str = "http://127.0.0.1:19334";
 
-/// The RPC endpoint this run talks to: [`RPC_URL`], or `EASYBTX_NODE_RPC_URL`
-/// when it is set.
+/// The conf the node app launches btxd in `datadir` with
+/// (`FaststartResult::faststart_conf`, passed as `-conf=`).
+pub fn launch_conf_path(datadir: &Path) -> std::path::PathBuf {
+    datadir.join("faststart").join("faststart.conf")
+}
+
+/// [`launch_conf_path`] when that file is there. btx-cli refuses a `-conf=`
+/// that names no file, so a datadir without one is asked the way it always
+/// was, with `-datadir` alone.
+pub fn launch_conf(datadir: &Path) -> Option<std::path::PathBuf> {
+    let conf = launch_conf_path(datadir);
+    conf.is_file().then_some(conf)
+}
+
+/// The RPC endpoint this run talks to for the node in `datadir`:
+/// `EASYBTX_NODE_RPC_URL` when it is set, otherwise the endpoint the launch
+/// conf puts btxd on ([`rpc_url_for_conf`]), which is [`RPC_URL`] unless the
+/// conf moves the port.
 ///
 /// The override completes the throwaway-install harness that
 /// `EASYBTX_NODE_DATADIR` starts. Both exist for the same reason and neither is
@@ -24,12 +40,64 @@ pub const RPC_URL: &str = "http://127.0.0.1:19334";
 /// "reconnecting" forever — which is how a whole feature can be tested without
 /// the app ever having reached a node (measured here on 2026-09-16).
 ///
-/// An unset or blank value is the constant, so nothing changes for anybody who
-/// does not set it.
-pub fn rpc_url() -> String {
-    match std::env::var("EASYBTX_NODE_RPC_URL") {
-        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ => RPC_URL.to_string(),
+/// An unset or blank value falls back to the conf. Before 2026-11-26 it fell
+/// back to the constant alone, so a node whose conf moved `rpcport` was
+/// launched on one port and polled on another.
+pub fn rpc_url(datadir: &Path) -> String {
+    rpc_url_from(
+        std::env::var("EASYBTX_NODE_RPC_URL").ok().as_deref(),
+        &launch_conf_path(datadir),
+    )
+}
+
+/// [`rpc_url`] with the override's value handed in, so the rule is tested
+/// without touching the process environment.
+pub fn rpc_url_from(env: Option<&str>, conf: &Path) -> String {
+    match env.map(str::trim) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => rpc_url_for_conf(conf),
+    }
+}
+
+/// The endpoint btxd answers on when launched with `conf`: the port of an
+/// `rpcbind=` that names one, else `rpcport=`, else 19334; the host of an
+/// `rpcbind=` that is not a wildcard, else 127.0.0.1. No conf, or one that
+/// sets neither key (the app's own presets bind 127.0.0.1 without a port),
+/// is exactly [`RPC_URL`].
+pub fn rpc_url_for_conf(conf: &Path) -> String {
+    let (bind_host, bind_port) = conf_kv(conf, "rpcbind")
+        .map(|b| split_host_port(&b))
+        .unwrap_or((None, None));
+    let port = bind_port
+        .or_else(|| conf_kv(conf, "rpcport").and_then(|p| p.trim().parse::<u16>().ok()))
+        .unwrap_or(19334);
+    let host = bind_host
+        .filter(|h| !matches!(h.as_str(), "0.0.0.0" | "::" | ""))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    if host == "127.0.0.1" && port == 19334 {
+        return RPC_URL.to_string();
+    }
+    if host.contains(':') {
+        format!("http://[{host}]:{port}")
+    } else {
+        format!("http://{host}:{port}")
+    }
+}
+
+/// `host[:port]`, `[v6][:port]` or a bare IPv6 address, as `rpcbind=` takes
+/// them. A port that is not a number is no port.
+fn split_host_port(s: &str) -> (Option<String>, Option<u16>) {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('[') {
+        let Some((host, after)) = rest.split_once(']') else {
+            return (None, None);
+        };
+        let port = after.strip_prefix(':').and_then(|p| p.parse().ok());
+        return (Some(host.to_string()), port);
+    }
+    match s.split_once(':') {
+        Some((host, port)) if !port.contains(':') => (Some(host.to_string()), port.parse().ok()),
+        _ => (Some(s.to_string()), None),
     }
 }
 
@@ -793,6 +861,68 @@ pub async fn wait_for_node_rpc_watching<F: FnMut() -> bool>(
 
 #[cfg(test)]
 mod tests {
+
+    mod issue_242 {
+        use super::super::*;
+        /// The endpoint follows a moved port (issue #242): the env override
+        /// still wins, a conf without the keys is the constant, `rpcport=` moves
+        /// the port, and an `rpcbind=` with a port or a host of its own wins.
+        #[test]
+        fn the_rpc_url_follows_the_launch_conf() {
+            let tmp = tempfile::tempdir().unwrap();
+            let conf = tmp.path().join("faststart.conf");
+            let url = |body: Option<&str>, env: Option<&str>| {
+                match body {
+                    Some(b) => std::fs::write(&conf, b).unwrap(),
+                    None => {
+                        let _ = std::fs::remove_file(&conf);
+                    }
+                }
+                rpc_url_from(env, &conf)
+            };
+            assert_eq!(url(None, None), RPC_URL);
+            assert_eq!(
+                url(Some(crate::installer::NODE_FASTSTART_CONF), None),
+                RPC_URL
+            );
+            assert_eq!(url(Some("rpcport=19555\n"), None), "http://127.0.0.1:19555");
+            assert_eq!(
+                url(Some("rpcport=19555\n"), Some(" http://10.0.0.1:1 ")),
+                "http://10.0.0.1:1"
+            );
+            assert_eq!(
+                url(Some("rpcport=19555\n"), Some("  ")),
+                "http://127.0.0.1:19555"
+            );
+            assert_eq!(
+                url(Some("rpcbind=127.0.0.1:19600\nrpcport=19555\n"), None),
+                "http://127.0.0.1:19600"
+            );
+            assert_eq!(
+                url(Some("rpcbind=0.0.0.0\nrpcport=19555\n"), None),
+                "http://127.0.0.1:19555"
+            );
+            assert_eq!(
+                url(Some("rpcbind=[::1]:19700\n"), None),
+                "http://[::1]:19700"
+            );
+            assert_eq!(url(Some("rpcbind=::1\n"), None), "http://[::1]:19334");
+            assert_eq!(url(Some("# rpcport=1\nrpcport=junk\n"), None), RPC_URL);
+        }
+
+        #[test]
+        fn rpc_url_reads_the_conf_in_the_datadir() {
+            let tmp = tempfile::tempdir().unwrap();
+            assert_eq!(launch_conf(tmp.path()), None);
+            std::fs::create_dir_all(tmp.path().join("faststart")).unwrap();
+            std::fs::write(launch_conf_path(tmp.path()), "rpcport=19556\n").unwrap();
+            assert_eq!(launch_conf(tmp.path()), Some(launch_conf_path(tmp.path())));
+            assert_eq!(
+                rpc_url_from(None, &launch_conf_path(tmp.path())),
+                "http://127.0.0.1:19556"
+            );
+        }
+    }
 
     /// THE WHOLE START-SEQUENCE CONF RECONCILIATION, IN ORDER, UNDER THE LOCK.
     ///

@@ -321,8 +321,14 @@ pub(crate) fn restart_in_progress() -> bool {
 /// Whether a refused restart was refused only for now: another restart or a
 /// start is under way, and asking again once it is over may succeed.
 pub(crate) fn refused_for_now(why: &str) -> bool {
-    why == ALREADY_RESTARTING || why == STILL_STARTING || why == crate::commands::ALREADY_STARTING
+    why == ALREADY_RESTARTING
+        || why == STILL_STARTING
+        || why == STILL_STOPPING
+        || why == crate::commands::ALREADY_STARTING
 }
+
+/// Why a restart waits for a stop under way (`commands::stop_under_way`).
+pub(crate) const STILL_STOPPING: &str = "Your node is still stopping. Give it a moment.";
 
 /// The restart claim for a restart the app makes on its own (the one that
 /// ends a header bootstrap), waiting for one that is under way to finish
@@ -358,12 +364,15 @@ impl Drop for Claim<'_> {
 
 /// Why Restart node may not run right now, before asking who owns the node:
 /// a restart is already running, or a start is (its stop would end the node
-/// that start is bringing up).
-fn restart_busy(restarting: bool, starting: bool) -> Option<&'static str> {
+/// that start is bringing up), or a stop is (an owner's Stop that is still
+/// flushing; a restart now would start the node again after it, #242).
+fn restart_busy(restarting: bool, starting: bool, stopping: bool) -> Option<&'static str> {
     if restarting {
         Some(ALREADY_RESTARTING)
     } else if starting {
         Some(STILL_STARTING)
+    } else if stopping {
+        Some(STILL_STOPPING)
     } else {
         None
     }
@@ -375,6 +384,7 @@ pub async fn tools_restart_check(state: State<'_, AppState>) -> Result<Option<St
     let busy = restart_busy(
         RESTARTING.load(Ordering::SeqCst),
         state.start_in_flight.load(Ordering::SeqCst),
+        crate::commands::stop_under_way(&state),
     );
     if let Some(sentence) = busy {
         return Ok(Some(sentence.into()));
@@ -388,7 +398,11 @@ pub async fn tools_restart_node(app: AppHandle, state: State<'_, AppState>) -> R
     let Some(_restarting) = Claim::take(&RESTARTING) else {
         return Err(ALREADY_RESTARTING.into());
     };
-    if let Some(sentence) = restart_busy(false, state.start_in_flight.load(Ordering::SeqCst)) {
+    if let Some(sentence) = restart_busy(
+        false,
+        state.start_in_flight.load(Ordering::SeqCst),
+        crate::commands::stop_under_way(&state),
+    ) {
         return Err(sentence.into());
     }
     destructive_allowed(node_ownership(&state, &node_datadir()).await)?;
@@ -396,20 +410,26 @@ pub async fn tools_restart_node(app: AppHandle, state: State<'_, AppState>) -> R
 }
 
 /// The same restart for a setting that needs one (the swarm switch), with the
-/// same three refusals: a restart already running, a start in flight, a node
-/// this app does not own.
+/// same refusals: a restart already running, a start or a stop in flight, a
+/// node this app does not own. It does not start the node again if the owner
+/// pressed Stop after `owner_mark` was read (`commands::owner_stop_mark`).
 pub(crate) async fn restart_node_for_setting(
     app: &AppHandle,
     state: &State<'_, AppState>,
+    owner_mark: u64,
 ) -> Result<(), String> {
     let Some(_restarting) = Claim::take(&RESTARTING) else {
         return Err(ALREADY_RESTARTING.into());
     };
-    if let Some(sentence) = restart_busy(false, state.start_in_flight.load(Ordering::SeqCst)) {
+    if let Some(sentence) = restart_busy(
+        false,
+        state.start_in_flight.load(Ordering::SeqCst),
+        crate::commands::stop_under_way(state),
+    ) {
         return Err(sentence.into());
     }
     destructive_allowed(node_ownership(state, &node_datadir()).await)?;
-    restart_node_projected(app, state).await
+    crate::commands::restart_node_projected_since(app, state, owner_mark).await
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -699,10 +719,14 @@ mod tests {
         /// its stop would end the node that start is bringing up.
         #[test]
         fn refuses_while_a_restart_or_a_start_is_running() {
-            assert_eq!(restart_busy(true, false), Some(ALREADY_RESTARTING));
-            assert_eq!(restart_busy(true, true), Some(ALREADY_RESTARTING));
-            assert_eq!(restart_busy(false, true), Some(STILL_STARTING));
-            assert_eq!(restart_busy(false, false), None);
+            assert_eq!(restart_busy(true, false, false), Some(ALREADY_RESTARTING));
+            assert_eq!(restart_busy(true, true, true), Some(ALREADY_RESTARTING));
+            assert_eq!(restart_busy(false, true, false), Some(STILL_STARTING));
+            assert_eq!(restart_busy(false, false, false), None);
+            // A stop under way (an owner's Stop still flushing) is busy too,
+            // and only for now (#242).
+            assert_eq!(restart_busy(false, false, true), Some(STILL_STOPPING));
+            assert!(refused_for_now(STILL_STOPPING));
         }
 
         #[test]

@@ -85,7 +85,7 @@ fn toggle_node(app: &AppHandle) {
             | NodePhase::Syncing { .. }
             | NodePhase::LoadingSnapshot
             | NodePhase::Warming { .. } => {
-                crate::commands::stop_node_inner(&state).await;
+                crate::commands::stop_node_by_owner(&state).await;
                 *state.phase.lock().await = NodePhase::Stopped;
                 reflect_phase(&app, &NodePhase::Stopped);
             }

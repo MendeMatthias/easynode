@@ -80,10 +80,16 @@ pub struct CliRunner {
 }
 
 impl CliRunner {
+    /// The app's runner: the datadir and, when there is one, the conf the
+    /// node was launched with, so a moved `rpcport` is followed
+    /// (`node::cli_node_args`).
     pub fn for_datadir(btx_cli: &Path, datadir: &Path) -> Self {
         Self {
             btx_cli: btx_cli.to_path_buf(),
-            args: vec![format!("-datadir={}", datadir.display())],
+            args: crate::node::cli_node_args(
+                datadir,
+                crate::setup::launch_conf(datadir).as_deref(),
+            ),
         }
     }
 }
@@ -715,6 +721,26 @@ pub fn set_aside_snapshot_chainstate(
 mod tests {
     use super::*;
     use crate::error::{AppError, AppResult};
+
+    /// Issue #242 item 3: the attested load names the launch conf when the
+    /// datadir has one, and is asked the old way when it has none.
+    #[test]
+    fn the_cli_runner_names_the_launch_conf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = Path::new("/bin/btx-cli");
+        let datadir_arg = format!("-datadir={}", tmp.path().display());
+        assert_eq!(
+            CliRunner::for_datadir(cli, tmp.path()).args,
+            vec![datadir_arg.clone()]
+        );
+        std::fs::create_dir_all(tmp.path().join("faststart")).unwrap();
+        let conf = crate::setup::launch_conf_path(tmp.path());
+        std::fs::write(&conf, "rpcport=19560\n").unwrap();
+        assert_eq!(
+            CliRunner::for_datadir(cli, tmp.path()).args,
+            vec![datadir_arg, format!("-conf={}", conf.display())]
+        );
+    }
     use serde_json::Value;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
