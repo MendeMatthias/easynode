@@ -2170,11 +2170,7 @@ mod tests {
 
         // A program running from the folder (a copy of `sleep` in libexec).
         let runner = install.join("libexec").join("keepalive");
-        std::fs::copy("/bin/sleep", &runner).unwrap();
-        let mut child = std::process::Command::new(&runner)
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut child = crate::engine_files::test_running::spawn(&runner);
         std::thread::sleep(std::time::Duration::from_millis(200));
         let out =
             put_back_missing_engine(Some(&pkg), &install, &datadir, NODE_FASTSTART_CONF, false)

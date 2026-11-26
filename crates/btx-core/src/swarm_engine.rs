@@ -1092,11 +1092,7 @@ mod tests {
         // Damage it, and run a program from it.
         std::fs::write(root.join("bin/btx-modeld"), b"he").unwrap();
         let runner = root.join("bin").join("running-node");
-        std::fs::copy("/bin/sleep", &runner).unwrap();
-        let mut child = std::process::Command::new(&runner)
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut child = crate::engine_files::test_running::spawn(&runner);
         std::thread::sleep(std::time::Duration::from_millis(200));
         let err = install_from_archive(&pin, &root, &a, "good signature", &yes)
             .await

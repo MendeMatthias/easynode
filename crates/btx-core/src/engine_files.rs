@@ -873,6 +873,43 @@ pub fn answer_loader_failure(
     }
 }
 
+/// A program that runs from a given file until it is killed, for the tests
+/// of [`process_runs_from`]. It is this test binary (a hard link, or a copy
+/// across file systems) running its own ignored `sleeper` test. A system
+/// program will not do: on Ubuntu 26.04 `sleep` is a multi-call binary that
+/// exits at once under any other name.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod test_running {
+    pub(crate) fn spawn(exe: &std::path::Path) -> std::process::Child {
+        let me = std::env::current_exe().unwrap();
+        if std::fs::hard_link(&me, exe).is_err() {
+            std::fs::copy(&me, exe).unwrap();
+        }
+        let child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "engine_files::test_running::sleeper",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("EASYNODE_TEST_SLEEPER", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        child
+    }
+
+    #[test]
+    #[ignore = "run by the tests above as a separate program"]
+    fn sleeper() {
+        if std::env::var_os("EASYNODE_TEST_SLEEPER").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod runs_from_tests {
     use super::*;
@@ -884,9 +921,8 @@ mod runs_from_tests {
         let bin = dir.path().join("eng").join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let exe = bin.join("btxd");
-        std::fs::copy("/bin/sleep", &exe).unwrap();
         assert!(!process_runs_from(&dir.path().join("eng")));
-        let mut child = std::process::Command::new(&exe).arg("30").spawn().unwrap();
+        let mut child = crate::engine_files::test_running::spawn(&exe);
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(process_runs_from(&dir.path().join("eng")));
         assert!(!process_runs_from(&dir.path().join("other")));
