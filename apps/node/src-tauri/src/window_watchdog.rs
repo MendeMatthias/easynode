@@ -277,9 +277,16 @@ impl WindowWatch {
     }
 }
 
+/// Whether the watchdog runs at all (`EASYBTX_NODE_WINDOW_WATCHDOG=0` is off).
+pub fn watchdog_on(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
+}
+
 /// The page's heartbeat (`heartbeat.ts`). `kind` is "timer" or "raf".
+/// Answers whether to keep beating: with the watchdog off the page stops,
+/// so the off switch also measures what the heartbeat itself costs.
 #[tauri::command]
-pub fn window_heartbeat(kind: String, hidden: bool, watch: tauri::State<'_, WindowWatch>) {
+pub fn window_heartbeat(kind: String, hidden: bool, watch: tauri::State<'_, WindowWatch>) -> bool {
     let now = secs();
     let mut g = watch.lock();
     g.page_hidden = hidden;
@@ -288,6 +295,7 @@ pub fn window_heartbeat(kind: String, hidden: bool, watch: tauri::State<'_, Wind
     } else {
         g.timer = Some(now);
     }
+    watchdog_on(std::env::var(WATCHDOG_VAR).ok().as_deref())
 }
 
 /// Whether the main window is being rebuilt right now (see
@@ -308,7 +316,7 @@ fn trace_on() -> bool {
 
 /// Start the watchdog. Called once from setup.
 pub fn spawn(app: AppHandle) {
-    if std::env::var(WATCHDOG_VAR).as_deref() == Ok("0") {
+    if !watchdog_on(std::env::var(WATCHDOG_VAR).ok().as_deref()) {
         println!("[window] watchdog off ({WATCHDOG_VAR}=0)");
         return;
     }
@@ -847,6 +855,15 @@ mod tests {
             raf: Some(100),
             ..o
         }));
+    }
+
+    #[test]
+    fn only_zero_turns_the_watchdog_off() {
+        assert!(watchdog_on(None));
+        assert!(watchdog_on(Some("trace")));
+        assert!(watchdog_on(Some("1")));
+        assert!(!watchdog_on(Some("0")));
+        assert!(!watchdog_on(Some(" 0 ")));
     }
 
     #[test]

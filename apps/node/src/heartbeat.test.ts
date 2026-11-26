@@ -10,12 +10,20 @@ function fakeEnv() {
   };
   const env: BeatEnv = {
     hidden: () => state.hidden,
-    every: (ms, fn) => void state.intervals.push({ ms, fn }),
+    every: (ms, fn) => {
+      const entry = { ms, fn };
+      state.intervals.push(entry);
+      return () => {
+        state.intervals = state.intervals.filter((i) => i !== entry);
+      };
+    },
     frame: (fn) => void state.frames.push(fn),
     onFocus: (fn) => void state.focus.push(fn),
   };
   const beats: [BeatKind, boolean][] = [];
-  startHeartbeat((kind, hidden) => beats.push([kind, hidden]), env);
+  startHeartbeat((kind, hidden) => {
+    beats.push([kind, hidden]);
+  }, env);
   const runFrames = () => state.frames.splice(0).forEach((f) => f());
   return { state, beats, runFrames };
 }
@@ -56,6 +64,46 @@ describe("startHeartbeat", () => {
     state.hidden = true;
     state.intervals[0].fn();
     expect(beats.at(-1)).toEqual(["timer", true]);
+  });
+
+  // EASYBTX_NODE_WINDOW_WATCHDOG=0: the app answers false and the page
+  // stops beating, so the heartbeat's own cost can be measured.
+  it("stops for good when the app answers false", async () => {
+    const state = {
+      intervals: [] as { ms: number; fn: () => void }[],
+      frames: [] as (() => void)[],
+      focus: [] as (() => void)[],
+    };
+    const env: BeatEnv = {
+      hidden: () => false,
+      every: (ms, fn) => {
+        const entry = { ms, fn };
+        state.intervals.push(entry);
+        return () => {
+          state.intervals = state.intervals.filter((i) => i !== entry);
+        };
+      },
+      frame: (fn) => void state.frames.push(fn),
+      onFocus: (fn) => void state.focus.push(fn),
+    };
+    let sent = 0;
+    startHeartbeat(() => {
+      sent++;
+      return Promise.resolve(false);
+    }, env);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(state.intervals).toHaveLength(0);
+    state.frames.splice(0).forEach((f) => f());
+    state.focus[0]();
+    expect(sent).toBe(1);
+  });
+
+  it("keeps beating while the app answers true", async () => {
+    const { state, beats } = fakeEnv();
+    await Promise.resolve();
+    expect(state.intervals).toHaveLength(1);
+    expect(beats).toHaveLength(1);
   });
 
   it("beats at once when the window gains focus", () => {

@@ -406,9 +406,9 @@ const ambientCompact = new AmbientLine($("compact-canvas") as unknown as HTMLCan
 
 // The window's heartbeat for the watchdog in Rust (window_watchdog.rs): a
 // frozen window is reloaded, then rebuilt, without anyone clicking it.
-startHeartbeat((kind, hidden) => {
-  invoke("window_heartbeat", { kind, hidden }).catch(() => {});
-});
+startHeartbeat((kind, hidden) =>
+  invoke<boolean>("window_heartbeat", { kind, hidden }).catch(() => true),
+);
 
 // Animations run only while someone can see them (motion-gate.ts).
 let motionAllowedNow = true;
