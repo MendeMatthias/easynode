@@ -6671,13 +6671,29 @@ async fn end_header_bootstrap_with_restart(
     // interleaved on 2026-11-26: the switch's stop ran while this restart
     // was starting the node, and the switch's start was refused.
     let _restarting = crate::tools::restart_claim_when_free().await;
-    if state.rpc.lock().await.is_none() || state.quitting.load(Ordering::SeqCst) {
+    // Decided again now that the claim is held: the decision that spawned
+    // this task may be stale. A restart that ran while this one waited may
+    // have ended the bootstrap already, and a second task (spawned by the
+    // refresher of that restart's bootstrap launch) may have waited beside
+    // this one; only the first to find the marker restarts.
+    if !header_bootstrap_restart_due(
+        state.rpc.lock().await.is_some(),
+        state.quitting.load(Ordering::SeqCst),
+        btx_core::node::header_bootstrap_pending(&node_datadir()),
+    ) {
         return Ok(());
     }
     stop_node_inner(state).await;
     set_phase(app, state, NodePhase::Stopped).await;
     btx_core::node::end_header_bootstrap(&node_datadir());
     start_node_projected(app, state).await
+}
+
+/// Is the restart that ends a header bootstrap still due once it holds the
+/// restart claim? Only for a running node of this app, while the app is not
+/// quitting, and while the bootstrap's marker is still there.
+fn header_bootstrap_restart_due(rpc_armed: bool, quitting: bool, marker_present: bool) -> bool {
+    rpc_armed && !quitting && marker_present
 }
 
 /// What the log says when a header bootstrap ends. Pure, so the two endings
@@ -8726,6 +8742,7 @@ async fn apply_swarm_switch(app: AppHandle, on: bool) {
             busy,
             state.rpc.lock().await.is_some(),
             btx_core::swarm::wanted(&datadir),
+            swarm_hold(&datadir).is_some(),
         );
         match step {
             SwarmRestartStep::Done => return,
@@ -8808,8 +8825,12 @@ fn swarm_restart_step(
     busy: bool,
     rpc_armed: bool,
     running_on_swarm_engine: bool,
+    held_back: bool,
 ) -> SwarmRestartStep {
-    if setting_now != on || quitting {
+    // A swarm engine held back since the switch was flipped (the switch
+    // clears the hold) failed in a start made meanwhile, which fell back to
+    // the usual engine: a restart now would launch that engine again.
+    if setting_now != on || quitting || (on && held_back) {
         SwarmRestartStep::Done
     } else if busy {
         SwarmRestartStep::Wait
@@ -14365,8 +14386,8 @@ mod twin_freeze_removal {
 mod swarm_tests {
     use super::{
         claim_swarm_switch, clear_swarm_hold, engine_did_not_come_up, falls_back_from_swarm_engine,
-        hold_swarm_engine_back, swarm_card, swarm_crash_step, swarm_damage_line,
-        swarm_engine_for_launch, swarm_engine_pin, swarm_hold, swarm_on_refusal,
+        header_bootstrap_restart_due, hold_swarm_engine_back, swarm_card, swarm_crash_step,
+        swarm_damage_line, swarm_engine_for_launch, swarm_engine_pin, swarm_hold, swarm_on_refusal,
         swarm_restart_step, swarm_signs_in, swarm_switch_message, swarm_switch_needs_restart,
         update_public_key, update_signature_ok, AfterPass, EngineFailure, StartPasses, SwarmCrash,
         SwarmCrashStep, SwarmFacts, ALREADY_STARTING, NODE_RELEASE_TAG, SWARM_ENGINE_FELL_BACK,
@@ -15134,33 +15155,49 @@ mod swarm_tests {
     #[test]
     fn the_switch_restart_waits_for_another_restart_and_ends_on_the_asked_engine() {
         use super::SwarmRestartStep::{Done, Restart, Wait};
-        // (on, setting now, quitting, busy, rpc armed, launched on swarm) -> step
+        // (on, setting now, quitting, busy, rpc armed, launched on swarm,
+        //  held back) -> step
         let cases = [
             // On, the node on its usual engine, nothing else under way.
-            ((true, true, false, false, true, false), Restart),
+            ((true, true, false, false, true, false, false), Restart),
             // The header bootstrap's restart (or a first start) is under way:
             // wait, even across the gap with no RPC between its stop and start.
-            ((true, true, false, true, true, false), Wait),
-            ((true, true, false, true, false, false), Wait),
+            ((true, true, false, true, true, false, false), Wait),
+            ((true, true, false, true, false, false, false), Wait),
             // That restart's start launched the swarm engine: nothing to do.
-            ((true, true, false, false, true, true), Done),
+            ((true, true, false, false, true, true, false), Done),
+            // That start launched the swarm engine, it failed and the start
+            // fell back: no second restart onto the usual engine.
+            ((true, true, false, false, true, false, true), Done),
+            ((true, true, false, true, true, false, true), Done),
             // No node and nothing starting one: the next start follows.
-            ((true, true, false, false, false, false), Done),
+            ((true, true, false, false, false, false, false), Done),
             // The owner switched it off meanwhile; the app quits.
-            ((true, false, false, true, true, false), Done),
-            ((true, true, true, true, true, false), Done),
-            // Off from the swarm engine, and off on the usual one.
-            ((false, false, false, false, true, true), Restart),
-            ((false, false, false, false, true, false), Done),
+            ((true, false, false, true, true, false, false), Done),
+            ((true, true, true, true, true, false, false), Done),
+            // Off from the swarm engine, and off on the usual one; a hold
+            // does not keep an off from leaving the swarm engine.
+            ((false, false, false, false, true, true, false), Restart),
+            ((false, false, false, false, true, true, true), Restart),
+            ((false, false, false, false, true, false, false), Done),
         ];
-        for ((on, now, quit, busy, rpc, marker), want) in cases {
+        for ((on, now, quit, busy, rpc, marker, held), want) in cases {
             assert_eq!(
-                swarm_restart_step(on, now, quit, busy, rpc, marker),
+                swarm_restart_step(on, now, quit, busy, rpc, marker, held),
                 want,
                 "{:?}",
-                (on, now, quit, busy, rpc, marker)
+                (on, now, quit, busy, rpc, marker, held)
             );
         }
+        // The loop asks the same hold the launch reads.
+        let src = include_str!("commands.rs");
+        let production = src.split("\nmod swarm_tests {").next().unwrap();
+        let apply = production
+            .split("\nasync fn apply_swarm_switch(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(apply.contains("swarm_hold(&datadir).is_some(),"));
         // A refusal for now is asked again; one for good ends the wait.
         assert!(crate::tools::refused_for_now(
             crate::tools::ALREADY_RESTARTING
@@ -15190,6 +15227,31 @@ mod swarm_tests {
         let stop = end.find("stop_node_inner(state).await;").unwrap();
         let start = end.find("start_node_projected(app, state).await").unwrap();
         assert!(claim < stop && stop < start);
+        // The marker is asked again after the claim, before the stop.
+        let asked = end
+            .find("btx_core::node::header_bootstrap_pending(&node_datadir()),")
+            .unwrap();
+        assert!(claim < asked && asked < stop);
+    }
+
+    /// Two restarts that end one header bootstrap (one waited for the claim
+    /// while the other ran) restart the node once: the second finds the
+    /// marker gone. Read from a real node folder's marker.
+    #[test]
+    fn a_header_bootstrap_ended_while_its_restart_waited_is_not_restarted_again() {
+        let dir = tempfile::tempdir().unwrap();
+        btx_core::node::begin_header_bootstrap(dir.path());
+        let pending = || btx_core::node::header_bootstrap_pending(dir.path());
+        // The first task takes the claim: still due.
+        assert!(header_bootstrap_restart_due(true, false, pending()));
+        // It restarts the node and ends the bootstrap.
+        btx_core::node::end_header_bootstrap(dir.path());
+        // The second, which waited, takes the claim: nothing left to do.
+        assert!(!header_bootstrap_restart_due(true, false, pending()));
+        // And the old reasons still hold.
+        btx_core::node::begin_header_bootstrap(dir.path());
+        assert!(!header_bootstrap_restart_due(false, false, pending()));
+        assert!(!header_bootstrap_restart_due(true, true, pending()));
     }
 
     /// While the switch's restart is due the card says so, in both

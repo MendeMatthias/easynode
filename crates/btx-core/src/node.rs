@@ -5816,7 +5816,7 @@ mod tests {
     async fn a_stop_request_that_does_not_arrive_is_made_again_with_sigterm() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
-        let mut controller = start_shim(tmp.path(), "exec sleep 600").await;
+        let mut controller = start_shim(tmp.path(), &term_recording_node(tmp.path())).await;
         let cli = tmp.path().join("btx-cli-refused");
         let args_file = tmp.path().join("cli-args");
         std::fs::write(
@@ -5846,6 +5846,58 @@ mod tests {
             "{args}"
         );
         assert!(args.trim_end().ends_with("stop"), "{args}");
+        // SIGTERM itself, not any signal: the stand-in node took TERM and
+        // left on its own (a SIGKILL would leave no file).
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("got-term"))
+                .ok()
+                .as_deref(),
+            Some("term\n"),
+            "the node was not asked with SIGTERM"
+        );
+    }
+
+    /// A stand-in btxd that writes `got-term` and exits 0 on SIGTERM, and
+    /// exits 0 on its own once `stop-asked` appears (what a stop request
+    /// that arrived does).
+    #[cfg(unix)]
+    fn term_recording_node(dir: &std::path::Path) -> String {
+        format!(
+            "trap 'echo term > {d}/got-term; exit 0' TERM\n\
+             while [ ! -e {d}/stop-asked ]; do sleep 0.2; done\nexit 0",
+            d = dir.display()
+        )
+    }
+
+    /// The negative: a stop request that arrives (btx-cli exits 0) is the
+    /// whole stop, and no signal is sent on top of it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_request_that_arrives_sends_no_signal() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut controller = start_shim(tmp.path(), &term_recording_node(tmp.path())).await;
+        let cli = tmp.path().join("btx-cli-ok");
+        std::fs::write(
+            &cli,
+            format!(
+                "#!/bin/sh\ntouch '{}'\necho 'BTX node stopping'\nexit 0\n",
+                tmp.path().join("stop-asked").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            controller.stop(&cli, tmp.path()),
+        )
+        .await
+        .expect("the node left on its own request")
+        .unwrap();
+        assert!(
+            !tmp.path().join("got-term").exists(),
+            "a SIGTERM was sent although the stop request arrived"
+        );
     }
 
     /// The quit backstop abandons the stop; it must not kill the node with it.
