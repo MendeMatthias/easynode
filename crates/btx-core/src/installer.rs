@@ -889,6 +889,15 @@ fn output_within(
 ) -> std::io::Result<Option<std::process::Output>> {
     use std::io::Read;
     use std::process::Stdio;
+    // Its own process group, so a timeout stops what it started too: a
+    // `bin/btxd` that is a wrapper script (the macOS package's layout) runs
+    // the real daemon as a child, and killing the script alone left that
+    // running.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -921,6 +930,13 @@ fn output_within(
             break Some(status);
         }
         if std::time::Instant::now() >= deadline {
+            #[cfg(unix)]
+            if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+                // SAFETY: a plain kill(2) of the group this call created.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
             let _ = child.kill();
             let _ = child.wait();
             break None;
@@ -2284,7 +2300,16 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let btxd = tmp.path().join("btxd");
-        std::fs::write(&btxd, b"#!/bin/sh\nexec sleep 60\n").unwrap();
+        // A wrapper that starts a child and waits, as a wrapper btxd would.
+        let child_pid = tmp.path().join("child.pid");
+        std::fs::write(
+            &btxd,
+            format!(
+                "#!/bin/sh\nsleep 60 &\necho $! > {}\nwait\n",
+                child_pid.display()
+            ),
+        )
+        .unwrap();
         std::fs::set_permissions(&btxd, std::fs::Permissions::from_mode(0o755)).unwrap();
         let started = std::time::Instant::now();
         let err =
@@ -2293,6 +2318,22 @@ mod tests {
                 .to_string();
         assert!(err.contains("did not answer in 1 s"), "{err}");
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // What it started was stopped with it.
+        #[cfg(target_os = "linux")]
+        {
+            let pid = std::fs::read_to_string(&child_pid).unwrap();
+            let proc_dir = std::path::Path::new("/proc").join(pid.trim());
+            let gone = (0..100).any(|_| {
+                let alive = std::fs::read_to_string(proc_dir.join("stat"))
+                    .map(|s| !s.contains(") Z "))
+                    .unwrap_or(false);
+                if alive {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                !alive
+            });
+            assert!(gone, "the wrapper's child {pid} still runs");
+        }
         // One that answers is read as before.
         std::fs::write(&btxd, b"#!/bin/sh\necho 'BTX daemon version v0.34.16'\n").unwrap();
         verify_btxd_reports_tag_within(&btxd, "v0.34.16", std::time::Duration::from_secs(10))
