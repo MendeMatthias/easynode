@@ -1130,7 +1130,7 @@ pub(crate) async fn set_phase(app: &AppHandle, state: &AppState, phase: NodePhas
 /// started by hand, may already be serving — attaching beats churning it.)
 pub(crate) async fn rpc_already_answering(datadir: &Path) -> Option<RpcClient> {
     let cookie = datadir.join(".cookie");
-    let client = RpcClient::from_cookie(&rpc_url(), &cookie).ok()?;
+    let client = RpcClient::from_cookie(&rpc_url(datadir), &cookie).ok()?;
     get_blockchain_info(&client).await.ok()?;
     Some(client)
 }
@@ -1305,6 +1305,9 @@ pub(crate) async fn start_node_inner(app: &AppHandle, state: &AppState) -> Resul
         }
     }
     let _in_flight = InFlight(&state.start_in_flight);
+    // A start is the node meant to run again: an owner's earlier Stop no
+    // longer holds back the restarts that wait (#242).
+    state.owner_stopped.store(false, Ordering::SeqCst);
     start_node_held(app, state).await
 }
 
@@ -2881,7 +2884,7 @@ async fn spawn_node_with_lock_retry(
             let child_gone = move || slot_child_gone(&node_slot);
             let mut wait = wait_for_node_rpc_watching(
                 datadir,
-                &rpc_url(),
+                &rpc_url(datadir),
                 RPC_WAIT_POLLS,
                 RPC_WAIT_POLL_MS,
                 RPC_WAIT_WARMUP_POLLS,
@@ -2918,7 +2921,7 @@ async fn spawn_node_with_lock_retry(
                 let node_slot = state.node.clone();
                 wait = wait_for_node_rpc_watching(
                     datadir,
-                    &rpc_url(),
+                    &rpc_url(datadir),
                     GPU_CHECK_EXTRA_POLLS,
                     RPC_WAIT_POLL_MS,
                     RPC_WAIT_WARMUP_POLLS,
@@ -3278,7 +3281,8 @@ fn spawn_warmup_watcher(app: AppHandle, state: &AppState, datadir: PathBuf) {
             if rpc_slot.lock().await.is_some() || node_slot.lock().await.is_none() {
                 return; // started, stopped, or errored — the main path owns the phase now
             }
-            let Ok(client) = btx_core::rpc::RpcClient::from_cookie(&rpc_url(), &cookie) else {
+            let Ok(client) = btx_core::rpc::RpcClient::from_cookie(&rpc_url(&datadir), &cookie)
+            else {
                 continue; // no cookie yet — still booting
             };
             match get_blockchain_info(&client).await {
@@ -3693,8 +3697,14 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                         let restart_app = app.clone();
                         tauri::async_runtime::spawn(async move {
                             let state = restart_app.state::<AppState>();
+                            // The restart claim, waited for, as the header
+                            // bootstrap's restart takes it: no other restart
+                            // stops the node this one starts (#242).
+                            let _restarting = crate::tools::restart_claim_when_free().await;
                             if state.rpc.lock().await.is_none()
                                 || state.quitting.load(Ordering::SeqCst)
+                                || stop_under_way(&state)
+                                || state.owner_stopped.load(Ordering::SeqCst)
                             {
                                 return; // stopped or quitting meanwhile: leave it
                             }
@@ -5145,7 +5155,7 @@ fn stop_needs_no_rpc(rpc_armed: bool, rpc_answers: bool) -> bool {
 /// Does the node's RPC answer at all right now, warmup (-28) included? One
 /// quick call with the cookie; no cookie or no answer is `false`.
 async fn rpc_answers_at_all(datadir: &Path) -> bool {
-    let Ok(client) = RpcClient::from_cookie(rpc_url(), &datadir.join(".cookie")) else {
+    let Ok(client) = RpcClient::from_cookie(rpc_url(datadir), &datadir.join(".cookie")) else {
         return false;
     };
     matches!(
@@ -5154,8 +5164,42 @@ async fn rpc_answers_at_all(datadir: &Path) -> bool {
     )
 }
 
+/// Counts one `stop_node_inner` in `AppState::stops_under_way` for as long
+/// as it lives, and uncounts it on every way out, a panic included.
+pub(crate) struct StopUnderWay<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> StopUnderWay<'a> {
+    fn new(count: &'a std::sync::atomic::AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for StopUnderWay<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether a stop of the node is running right now (any caller of
+/// `stop_node_inner`: the owner's Stop, a restart's, Quit's). Every restart
+/// that waits for others counts it as busy (#242).
+pub(crate) fn stop_under_way(state: &AppState) -> bool {
+    state.stops_under_way.load(Ordering::SeqCst) > 0
+}
+
+/// The owner's Stop (the button and the tray): recorded, so that a restart
+/// the app makes on its own does not start the node again (#242), then the
+/// ordinary stop.
+pub(crate) async fn stop_node_by_owner(state: &AppState) {
+    state.owner_stopped.store(true, Ordering::SeqCst);
+    stop_node_inner(state).await;
+}
+
 /// Graceful stop shared by the command, the tray, and app exit.
 pub async fn stop_node_inner(state: &AppState) {
+    // Counted for the whole stop, its flush included (`stop_under_way`).
+    let _under_way = StopUnderWay::new(&state.stops_under_way);
     // Kill the refresher first so it can't overwrite the Stopped phase.
     state.refresher_gen.fetch_add(1, Ordering::SeqCst);
     stop_esplora(state).await;
@@ -6441,6 +6485,12 @@ pub async fn restart_node_projected(
 ) -> Result<(), String> {
     stop_node_inner(state).await;
     set_phase(app, state, NodePhase::Stopped).await;
+    // The owner pressed Stop while this restart's stop ran (it waited on the
+    // node slot behind it): the node stays stopped (#242).
+    if state.owner_stopped.load(Ordering::SeqCst) {
+        eprintln!("[node-app] the owner stopped the node during a restart; not starting it");
+        return Ok(());
+    }
     start_node_projected(app, state).await
 }
 
@@ -6671,6 +6721,12 @@ async fn end_header_bootstrap_with_restart(
     // interleaved on 2026-11-26: the switch's stop ran while this restart
     // was starting the node, and the switch's start was refused.
     let _restarting = crate::tools::restart_claim_when_free().await;
+    // A stop under way (an owner's Stop still flushing, with RPC still
+    // armed) is waited out before deciding, or this restart would start the
+    // node again after it (#242).
+    while stop_under_way(state) {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
     // Decided again now that the claim is held: the decision that spawned
     // this task may be stale. A restart that ran while this one waited may
     // have ended the bootstrap already, and a second task (spawned by the
@@ -6680,20 +6736,32 @@ async fn end_header_bootstrap_with_restart(
         state.rpc.lock().await.is_some(),
         state.quitting.load(Ordering::SeqCst),
         btx_core::node::header_bootstrap_pending(&node_datadir()),
+        state.owner_stopped.load(Ordering::SeqCst),
     ) {
         return Ok(());
     }
     stop_node_inner(state).await;
     set_phase(app, state, NodePhase::Stopped).await;
+    // An owner's Stop during this stop: the node stays stopped, and the
+    // marker stays for the next start, as for a Stop before it.
+    if state.owner_stopped.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     btx_core::node::end_header_bootstrap(&node_datadir());
     start_node_projected(app, state).await
 }
 
 /// Is the restart that ends a header bootstrap still due once it holds the
 /// restart claim? Only for a running node of this app, while the app is not
-/// quitting, and while the bootstrap's marker is still there.
-fn header_bootstrap_restart_due(rpc_armed: bool, quitting: bool, marker_present: bool) -> bool {
-    rpc_armed && !quitting && marker_present
+/// quitting, while the bootstrap's marker is still there, and while the owner
+/// has not stopped the node.
+fn header_bootstrap_restart_due(
+    rpc_armed: bool,
+    quitting: bool,
+    marker_present: bool,
+    owner_stopped: bool,
+) -> bool {
+    rpc_armed && !quitting && marker_present && !owner_stopped
 }
 
 /// What the log says when a header bootstrap ends. Pure, so the two endings
@@ -7865,7 +7933,7 @@ pub async fn start_node(app: AppHandle, state: State<'_, AppState>) -> Result<()
 
 #[tauri::command]
 pub async fn stop_node(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    stop_node_inner(&state).await;
+    stop_node_by_owner(&state).await;
     set_phase(&app, &state, NodePhase::Stopped).await;
     Ok(())
 }
@@ -8733,8 +8801,9 @@ async fn apply_swarm_switch(app: AppHandle, on: bool) {
     let began = std::time::Instant::now();
     let mut waited = false;
     loop {
-        let busy =
-            crate::tools::restart_in_progress() || state.start_in_flight.load(Ordering::SeqCst);
+        let busy = crate::tools::restart_in_progress()
+            || state.start_in_flight.load(Ordering::SeqCst)
+            || stop_under_way(&state);
         let step = swarm_restart_step(
             on,
             NodeAppSettings::load(&datadir).swarm_enabled,
@@ -8743,6 +8812,7 @@ async fn apply_swarm_switch(app: AppHandle, on: bool) {
             state.rpc.lock().await.is_some(),
             btx_core::swarm::wanted(&datadir),
             swarm_hold(&datadir).is_some(),
+            state.owner_stopped.load(Ordering::SeqCst),
         );
         match step {
             SwarmRestartStep::Done => return,
@@ -8818,6 +8888,7 @@ enum SwarmRestartStep {
 /// Its stop would end the node this restart starts, or the other way round;
 /// on 2026-11-26 the swarm switch's restart sat behind the header
 /// bootstrap's and then had its start refused "already starting".
+#[allow(clippy::too_many_arguments)]
 fn swarm_restart_step(
     on: bool,
     setting_now: bool,
@@ -8826,11 +8897,14 @@ fn swarm_restart_step(
     rpc_armed: bool,
     running_on_swarm_engine: bool,
     held_back: bool,
+    owner_stopped: bool,
 ) -> SwarmRestartStep {
     // A swarm engine held back since the switch was flipped (the switch
     // clears the hold) failed in a start made meanwhile, which fell back to
-    // the usual engine: a restart now would launch that engine again.
-    if setting_now != on || quitting || (on && held_back) {
+    // the usual engine: a restart now would launch that engine again. A
+    // node the owner stopped stays stopped; the next start follows the
+    // setting (#242).
+    if setting_now != on || quitting || (on && held_back) || owner_stopped {
         SwarmRestartStep::Done
     } else if busy {
         SwarmRestartStep::Wait
@@ -15183,8 +15257,16 @@ mod swarm_tests {
         ];
         for ((on, now, quit, busy, rpc, marker, held), want) in cases {
             assert_eq!(
-                swarm_restart_step(on, now, quit, busy, rpc, marker, held),
+                swarm_restart_step(on, now, quit, busy, rpc, marker, held, false),
                 want,
+                "{:?}",
+                (on, now, quit, busy, rpc, marker, held)
+            );
+            // A node the owner stopped is never restarted by the switch,
+            // whatever else holds, RPC still armed included (#242).
+            assert_eq!(
+                swarm_restart_step(on, now, quit, busy, rpc, marker, held, true),
+                Done,
                 "{:?}",
                 (on, now, quit, busy, rpc, marker, held)
             );
@@ -15234,6 +15316,83 @@ mod swarm_tests {
         assert!(claim < asked && asked < stop);
     }
 
+    /// Issue #242: `stop_node_inner` counts as a stop under way for its whole
+    /// run, the wait for the node slot (where the flush happens) included,
+    /// and stops counting when it returns. The swarm switch, Tools' Restart
+    /// and the header bootstrap's restart wait while it counts.
+    #[tokio::test]
+    async fn a_stop_is_under_way_for_its_whole_run() {
+        let state = std::sync::Arc::new(super::AppState::new());
+        assert!(!super::stop_under_way(&state));
+        let slot = state.node.clone();
+        let held = slot.lock().await;
+        let s = state.clone();
+        let stop = tokio::spawn(async move { super::stop_node_inner(&s).await });
+        let began = std::time::Instant::now();
+        while !super::stop_under_way(&state) {
+            assert!(
+                began.elapsed() < std::time::Duration::from_secs(10),
+                "a running stop was not counted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Still counted while it waits on the node slot.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(super::stop_under_way(&state));
+        drop(held);
+        stop.await.unwrap();
+        assert!(!super::stop_under_way(&state));
+        let src = include_str!("commands.rs");
+        let production = src.split("\nmod swarm_tests {").next().unwrap();
+        let apply = production
+            .split("\nasync fn apply_swarm_switch(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(apply.contains("|| stop_under_way(&state);"));
+        assert!(apply.contains("state.owner_stopped.load(Ordering::SeqCst),"));
+    }
+
+    /// Issue #242: the owner's Stop is recorded, and a start clears it; a
+    /// restart the app makes does not start a node the owner stopped during
+    /// its own stop.
+    #[tokio::test]
+    async fn the_owners_stop_holds_back_the_apps_own_restarts() {
+        let state = super::AppState::new();
+        super::stop_node_by_owner(&state).await;
+        assert!(state
+            .owner_stopped
+            .load(std::sync::atomic::Ordering::SeqCst));
+        let src = include_str!("commands.rs");
+        let production = src.split("\nmod swarm_tests {").next().unwrap();
+        let body = |name: &str| {
+            production
+                .split(name)
+                .nth(1)
+                .and_then(|s| s.split("\n}\n").next())
+                .unwrap()
+                .to_string()
+        };
+        let restart = body("\npub async fn restart_node_projected(");
+        let stop = restart.find("stop_node_inner(state).await;").unwrap();
+        let check = restart.find("state.owner_stopped.load(").unwrap();
+        let start = restart
+            .find("start_node_projected(app, state).await")
+            .unwrap();
+        assert!(stop < check && check < start);
+        let end = body("\nasync fn end_header_bootstrap_with_restart(");
+        let wait = end.find("while stop_under_way(state) {").unwrap();
+        let stop = end.find("stop_node_inner(state).await;").unwrap();
+        let check = end[stop..].find("state.owner_stopped.load(").unwrap() + stop;
+        let start = end.find("start_node_projected(app, state).await").unwrap();
+        assert!(wait < stop && stop < check && check < start);
+        let start_inner = body("\npub(crate) async fn start_node_inner(");
+        assert!(start_inner.contains("state.owner_stopped.store(false, Ordering::SeqCst);"));
+        let command = body("\npub async fn stop_node(");
+        assert!(command.contains("stop_node_by_owner(&state).await;"));
+        assert!(include_str!("tray.rs").contains("crate::commands::stop_node_by_owner(&state)"));
+    }
+
     /// Two restarts that end one header bootstrap (one waited for the claim
     /// while the other ran) restart the node once: the second finds the
     /// marker gone. Read from a real node folder's marker.
@@ -15243,15 +15402,22 @@ mod swarm_tests {
         btx_core::node::begin_header_bootstrap(dir.path());
         let pending = || btx_core::node::header_bootstrap_pending(dir.path());
         // The first task takes the claim: still due.
-        assert!(header_bootstrap_restart_due(true, false, pending()));
+        assert!(header_bootstrap_restart_due(true, false, pending(), false));
         // It restarts the node and ends the bootstrap.
         btx_core::node::end_header_bootstrap(dir.path());
         // The second, which waited, takes the claim: nothing left to do.
-        assert!(!header_bootstrap_restart_due(true, false, pending()));
+        assert!(!header_bootstrap_restart_due(true, false, pending(), false));
         // And the old reasons still hold.
         btx_core::node::begin_header_bootstrap(dir.path());
-        assert!(!header_bootstrap_restart_due(false, false, pending()));
-        assert!(!header_bootstrap_restart_due(true, true, pending()));
+        assert!(!header_bootstrap_restart_due(
+            false,
+            false,
+            pending(),
+            false
+        ));
+        assert!(!header_bootstrap_restart_due(true, true, pending(), false));
+        // A node the owner stopped is not restarted (#242).
+        assert!(!header_bootstrap_restart_due(true, false, pending(), true));
     }
 
     /// While the switch's restart is due the card says so, in both

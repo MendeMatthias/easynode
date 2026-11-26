@@ -1150,11 +1150,12 @@ fn load_outcome(success: bool, stderr: &str) -> LoadOutcome {
     }
 }
 
-/// Run one snapshot-load RPC through btx-cli on `datadir`.
+/// Run one snapshot-load RPC through btx-cli on `datadir`, with the conf the
+/// node was launched with when there is one (`node::cli_node_args`).
 async fn run_load(btx_cli: &Path, datadir: &Path, method: &str, files: &[&Path]) -> LoadOutcome {
     run_cli_load(
         btx_cli,
-        &[format!("-datadir={}", datadir.display())],
+        &crate::node::cli_node_args(datadir, crate::setup::launch_conf(datadir).as_deref()),
         method,
         files,
     )
@@ -1201,6 +1202,48 @@ pub async fn run_cli_load(
 
 #[cfg(test)]
 mod tests {
+    /// Issue #242 item 3: the snapshot load asks btx-cli with the launch
+    /// conf, so a moved `rpcport` is followed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_snapshot_load_names_the_launch_conf() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("faststart")).unwrap();
+        let conf = crate::setup::launch_conf_path(tmp.path());
+        std::fs::write(&conf, "rpcport=19559\n").unwrap();
+        let args_file = tmp.path().join("cli-args");
+        let cli = tmp.path().join("btx-cli");
+        std::fs::write(
+            &cli,
+            format!(
+                "#!/bin/sh\necho \"$@\" > '{}'\nexit 0\n",
+                args_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = tmp.path().join("snapshot.dat");
+        // A script written a moment ago can still be busy for exec (ETXTBSY).
+        for _ in 0..40 {
+            let _ = super::run_load(&cli, tmp.path(), "loadtxoutset", &[&file]).await;
+            if args_file.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        assert!(
+            args.contains(&format!("-conf={}", conf.display())),
+            "{args}"
+        );
+        assert!(
+            args.contains(&format!("-datadir={}", tmp.path().display())),
+            "{args}"
+        );
+        assert!(args.contains("loadtxoutset"), "{args}");
+    }
+
     /// The snapshot is the only local copy of a 450 MB download, so "the load
     /// returned ok" does not earn its deletion — real progress on top of it
     /// does.

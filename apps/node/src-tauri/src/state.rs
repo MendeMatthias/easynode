@@ -763,6 +763,15 @@ pub struct AppState {
     /// Generation counter for the status refresher: each (re)start bumps it and
     /// stale refresher loops exit when their generation is superseded.
     pub refresher_gen: Arc<AtomicU64>,
+    /// How many `stop_node_inner` calls are running (`commands::StopUnderWay`).
+    /// A restart that waits for others counts a stop as busy for its whole
+    /// run: an owner's Stop keeps RPC armed until its flush is over, and a
+    /// restart that read only RPC started the node again after it (#242).
+    pub stops_under_way: Arc<std::sync::atomic::AtomicUsize>,
+    /// Set by the owner's Stop (the button, the tray), cleared by the next
+    /// start. A restart the app makes on its own does not start a node the
+    /// owner stopped while it waited or while its own stop ran (#242).
+    pub owner_stopped: Arc<AtomicBool>,
     /// Set once a graceful quit is under way, so the ExitRequested handler knows
     /// the async shutdown already ran and can let the exit proceed instead of
     /// blocking the main thread a second time (the old force-quit-inducing hang).
@@ -1008,6 +1017,8 @@ impl AppState {
             start_in_flight: Arc::new(AtomicBool::new(false)),
             attached_to: Arc::new(Mutex::new(None)),
             refresher_gen: Arc::new(AtomicU64::new(0)),
+            stops_under_way: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            owner_stopped: Arc::new(AtomicBool::new(false)),
             quitting: Arc::new(AtomicBool::new(false)),
             load_failure_restarted: Arc::new(AtomicBool::new(false)),
             rc_status_cache: Arc::new(Mutex::new(None)),
