@@ -452,6 +452,34 @@ pub async fn set_explorer_mode(
 mod tests {
     use super::*;
 
+    /// btxd restarting answers HTTP 503 with an HTML page. Through the real
+    /// RPC client that is the warmup error, so the panel says "ask again in
+    /// a moment", exactly as for RPC_IN_WARMUP, and never shows the page.
+    #[tokio::test]
+    async fn a_restarting_node_answering_503_is_warming_not_unavailable() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            let page = "<HTML><HEAD><TITLE>503 Service Unavailable</TITLE></HEAD></HTML>";
+            let reply = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                page.len()
+            );
+            s.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let client = RpcClient::new(format!("http://{addr}"), "u", "p");
+        let e = btx_core::rpc::Rpc::call(&client, "getblockchaininfo", serde_json::json!([]))
+            .await
+            .unwrap_err();
+        assert!(matches!(degrade::<u32>(e), Ask::Warming));
+        server.await.unwrap();
+    }
+
     #[test]
     fn ask_serializes_tagged_states() {
         let ready = Ask::Ready(SupplyAnswer {

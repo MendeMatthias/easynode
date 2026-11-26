@@ -986,6 +986,54 @@ pub fn reinstall_engine_tree(
     copy_and_verify_engine_tree(bundled_pkg_dir, install_root, datadir, &listing)
 }
 
+/// Put the pinned engine back in `install_root` when its folder has no
+/// btxd or btx-cli, on a computer where setup finished: the engine was
+/// deleted (by hand, by a cleaner, by antivirus software) after it was
+/// installed. A start used to stop on "node binaries not installed yet; run
+/// setup first" with no setup to run.
+///
+/// The same copy setup makes, from the same place: the app's own package
+/// (`resources/node-pkg`, which every installer carries on every OS),
+/// copied, made runnable (signed on macOS), asked for its version, and only
+/// then listed. `faststart.conf` is left as it is when there is one (it
+/// carries the owner's profile and peers); when it is gone too, the
+/// profile's conf (`conf_if_missing`) is written, as setup writes it.
+///
+/// `bundled_pkg_dir` is `None` when this build of the app carries no
+/// package: a sentence, not a panic, because the person reads it.
+pub fn reinstall_missing_engine(
+    bundled_pkg_dir: Option<&Path>,
+    install_root: &Path,
+    datadir: &Path,
+    conf_if_missing: &str,
+) -> AppResult<()> {
+    let pkg = bundled_pkg_dir.ok_or_else(|| {
+        AppError::Config(
+            "this copy of the app does not carry the node engine (its node-pkg folder is \
+             missing), so there is nothing to install it from; install the app again"
+                .to_string(),
+        )
+    })?;
+    let conf = datadir.join("faststart").join("faststart.conf");
+    if conf.is_file() {
+        reinstall_engine_tree(pkg, install_root, datadir)?;
+    } else {
+        provision_node_package(pkg, install_root, datadir, conf_if_missing)?;
+    }
+    for name in ["btxd", "btx-cli"] {
+        let file = install_root
+            .join("bin")
+            .join(crate::platform::exe_name(name));
+        if !file.is_file() {
+            return Err(AppError::Config(format!(
+                "the copy finished but {} is still not there",
+                file.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn provision_node_package(
     bundled_pkg_dir: &Path,
     install_root: &Path,
@@ -1836,6 +1884,92 @@ mod tests {
             "node preset must not carry mining keys"
         );
         assert!(res.mining_results_dir.is_none());
+    }
+
+    /// The engine deleted after setup (the 2026-11-26 click run removed
+    /// `~/.local/btx/v0.34.16/linux-x86_64`): it is copied back from the
+    /// package, whole and listed, and the owner's conf stays as it was.
+    #[test]
+    fn a_deleted_engine_is_put_back_from_the_package_and_the_conf_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("pkg");
+        let install = tmp.path().join("install");
+        let datadir = tmp.path().join("datadir");
+        fake_node_pkg(&pkg);
+        provision_node_package(&pkg, &install, &datadir, NODE_FASTSTART_CONF).unwrap();
+        let conf = datadir.join("faststart").join("faststart.conf");
+        std::fs::write(&conf, "prune=4096\nrpcport=29354\n").unwrap();
+
+        std::fs::remove_dir_all(&install).unwrap();
+        assert!(returning_paths_in(&install).is_none(), "the engine is gone");
+
+        reinstall_missing_engine(Some(&pkg), &install, &datadir, NODE_FASTSTART_CONF).unwrap();
+        let btxd = install.join("bin").join(crate::platform::exe_name("btxd"));
+        assert!(btxd.is_file());
+        assert!(install.join("libexec").join("btxd.real").is_file());
+        assert!(install.join(crate::engine_files::MANIFEST_NAME).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&btxd).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "bin/btxd must be executable");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&conf).unwrap(),
+            "prune=4096\nrpcport=29354\n",
+            "the owner's conf is not rewritten"
+        );
+    }
+
+    /// The conf gone too: the profile's conf is written, as setup writes it.
+    /// And only btx-cli gone is a missing engine as well.
+    #[test]
+    fn a_deleted_engine_and_conf_are_both_put_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("pkg");
+        let install = tmp.path().join("install");
+        let datadir = tmp.path().join("datadir");
+        fake_node_pkg(&pkg);
+        reinstall_missing_engine(Some(&pkg), &install, &datadir, "prune=1234\n").unwrap();
+        let conf = datadir.join("faststart").join("faststart.conf");
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), "prune=1234\n");
+
+        let cli = install
+            .join("bin")
+            .join(crate::platform::exe_name("btx-cli"));
+        std::fs::remove_file(&cli).unwrap();
+        reinstall_missing_engine(Some(&pkg), &install, &datadir, "prune=1\n").unwrap();
+        assert!(cli.is_file());
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), "prune=1234\n");
+    }
+
+    /// No package in this build, or a package without btxd: the reason, in a
+    /// sentence, and nothing half-installed claimed as done.
+    #[test]
+    fn a_reinstall_with_nothing_to_copy_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path().join("install");
+        let datadir = tmp.path().join("datadir");
+        let err = reinstall_missing_engine(None, &install, &datadir, NODE_FASTSTART_CONF)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not carry the node engine"), "{err}");
+        let empty = tmp.path().join("empty-pkg");
+        std::fs::create_dir_all(&empty).unwrap();
+        let err = reinstall_missing_engine(Some(&empty), &install, &datadir, NODE_FASTSTART_CONF)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bundled node package missing"), "{err}");
+        assert!(!install
+            .join("bin")
+            .join(crate::platform::exe_name("btxd"))
+            .exists());
+    }
+
+    /// `returning_launch_paths`'s test of a folder, without a HOME.
+    fn returning_paths_in(install: &Path) -> Option<PathBuf> {
+        let btxd = install.join("bin").join(crate::platform::exe_name("btxd"));
+        btxd.is_file().then_some(btxd)
     }
 
     /// A second provision of the same package copies nothing. Until 0.8.1 it

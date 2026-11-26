@@ -101,6 +101,94 @@ pub fn damage(root: &Path) -> Option<engine_files::Damage> {
     (!damage.is_empty()).then_some(damage)
 }
 
+/// The programs directly in `bin/` of an install that the owner cannot run:
+/// on the list the install wrote, there, and without the owner's execute bit.
+/// Such a file has its size and its bytes, so [`damage`] passes it, and the
+/// launch fails with "Permission denied (os error 13)" (the 2026-11-26 click
+/// run, after `chmod a-x bin/btxd`). Empty for a folder without the list, and
+/// off Unix.
+pub fn not_runnable(root: &Path) -> Vec<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(list) = engine_files::read_manifest(root).filter(|l| l.from_package) else {
+            return Vec::new();
+        };
+        let mut found: Vec<String> = list
+            .entries
+            .iter()
+            .filter(|e| Path::new(&e.rel).parent() == Some(Path::new("bin")))
+            .filter(|e| {
+                std::fs::metadata(root.join(&e.rel))
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o100 == 0)
+            })
+            .map(|e| e.rel.clone())
+            .collect();
+        found.sort();
+        found
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        Vec::new()
+    }
+}
+
+/// Give the programs [`not_runnable`] named their execute bits back, as the
+/// archive carries them (`0755`). Nothing else about them changes.
+pub fn make_runnable(root: &Path, files: &[String]) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for rel in files {
+            let path = root.join(rel);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("{} could not be made runnable: {e}", path.display()))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (root, files);
+    Ok(())
+}
+
+/// What a check of the installed swarm engine against its pin finds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Health {
+    /// A finished install of this pin's archive, every program in `bin/`
+    /// runnable.
+    Whole,
+    /// Whole by the list and the archive record, but these programs in
+    /// `bin/` lost their execute bits: [`make_runnable`] is the repair.
+    NotRunnable(Vec<String>),
+    /// Not a finished install of this pin, and why, in a few words: files
+    /// missing or the wrong size, made from another archive, or not there.
+    /// Downloading it again ([`fetch_and_install`], with the pinned sha256
+    /// and the update key's signature) is the repair.
+    NeedsFetch(String),
+}
+
+/// Check the install in `root` against `pin`: the list and sizes it wrote
+/// ([`damage`]), the archive it was made from ([`from_this_archive`]), and
+/// the execute bits of its programs ([`not_runnable`]). One `stat` per file;
+/// nothing is read or hashed.
+pub fn health(pin: &EnginePin, root: &Path) -> Health {
+    if let Some(found) = damage(root) {
+        return Health::NeedsFetch(format!("{} missing or the wrong size", found.describe()));
+    }
+    if !matches!(engine_files::read_manifest(root), Some(list) if list.from_package) {
+        return Health::NeedsFetch("it is not installed".to_string());
+    }
+    if !from_this_archive(pin, root) {
+        return Health::NeedsFetch("it is not the build this app expects".to_string());
+    }
+    let stuck = not_runnable(root);
+    if stuck.is_empty() {
+        Health::Whole
+    } else {
+        Health::NotRunnable(stuck)
+    }
+}
+
 fn sibling(root: &Path, suffix: &str) -> PathBuf {
     let name = root
         .file_name()
@@ -844,6 +932,87 @@ mod tests {
         engine_files::forget_manifest(&root);
         assert_eq!(damage(&root), None);
         assert!(!installed(&pin, &root));
+    }
+
+    /// The two ways the 2026-11-26 click run broke an installed swarm
+    /// engine, each told apart from a whole one and from the other, and each
+    /// repaired by what the app does for it.
+    ///
+    /// `chmod a-x bin/btxd`: same size, same bytes, and the launch fails with
+    /// "Permission denied". Giving the bits back makes it run again. A
+    /// truncated `bin/btx-modeld`: the wrong size, which only a fresh copy
+    /// of the archive answers.
+    #[tokio::test]
+    async fn a_swarm_engine_that_cannot_run_or_is_cut_off_is_named_and_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+        let archive = engine("v0.34.16", true);
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.tar.gz");
+        std::fs::write(&a, &archive).unwrap();
+        let pin = pin_for(&archive, "");
+        let root = dir.path().join("btx").join(&pin.key).join("plat");
+
+        assert_eq!(
+            health(&pin, &root),
+            Health::NeedsFetch("it is not installed".into())
+        );
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        install_from_archive(&pin, &root, &a, "good signature", &yes)
+            .await
+            .unwrap();
+        assert_eq!(health(&pin, &root), Health::Whole);
+        assert!(not_runnable(&root).is_empty());
+
+        // chmod a-x bin/btxd.
+        let btxd = btxd_in(&root);
+        std::fs::set_permissions(&btxd, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let denied = std::process::Command::new(&btxd)
+            .arg("--version")
+            .output()
+            .unwrap_err();
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(installed(&pin, &root), "the size check passes it");
+        assert_eq!(
+            health(&pin, &root),
+            Health::NotRunnable(vec!["bin/btxd".into()])
+        );
+        make_runnable(&root, &not_runnable(&root)).unwrap();
+        assert_eq!(health(&pin, &root), Health::Whole);
+        let ran = std::process::Command::new(&btxd)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&ran.stdout).contains("v0.34.16"));
+
+        // A truncated bin/btx-modeld.
+        let modeld = root.join("bin/btx-modeld");
+        std::fs::write(&modeld, b"hel").unwrap();
+        let Health::NeedsFetch(why) = health(&pin, &root) else {
+            panic!("a cut-off file needs a fresh copy");
+        };
+        assert!(why.contains("bin/btx-modeld"), "{why}");
+        assert!(why.contains("missing or the wrong size"), "{why}");
+        install_from_archive(&pin, &root, &a, "good signature", &yes)
+            .await
+            .unwrap();
+        assert_eq!(health(&pin, &root), Health::Whole);
+        assert_eq!(std::fs::read(&modeld).unwrap(), b"helper");
+
+        // Another archive under the same tag is not whole for this pin.
+        let mut other = pin.clone();
+        other.sha256 = "11".repeat(32);
+        assert_eq!(
+            health(&other, &root),
+            Health::NeedsFetch("it is not the build this app expects".into())
+        );
+        // A file that is not a program (in a folder under bin/) is not asked
+        // to be runnable.
+        std::fs::set_permissions(
+            root.join("bin/lib/python3.14/os.py"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert_eq!(health(&pin, &root), Health::Whole);
     }
 
     /// The same tag, another archive: the install made from the first one is

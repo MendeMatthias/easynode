@@ -1370,10 +1370,15 @@ enum AfterPass {
 /// did not come up ([`SWARM_ENGINE_FELL_BACK`], once: by then the engine is
 /// held back, so the next pass is the default engine's, and a second such
 /// answer ends the start instead of going round).
+///
+/// A third: a swarm engine that failed and was repaired on the spot
+/// ([`SWARM_ENGINE_REPAIRED`], once: the repair is spent until the swarm
+/// engine comes up, so its next failure in this start holds it back).
 #[derive(Debug, Default)]
 struct StartPasses {
     ladder_restarts: u32,
     fell_back: bool,
+    repaired: bool,
 }
 
 impl StartPasses {
@@ -1390,6 +1395,20 @@ impl StartPasses {
             return AfterPass::Failed {
                 error: "the node kept stopping on a known engine error; see setup.log in the \
                         node folder."
+                    .to_string(),
+                withdraw_hold: self.fell_back,
+            };
+        }
+        if error == SWARM_ENGINE_REPAIRED {
+            if !self.repaired {
+                self.repaired = true;
+                return AfterPass::Again;
+            }
+            // Not reachable while `SWARM_REPAIR_SPENT` works: said as a
+            // sentence rather than going round.
+            return AfterPass::Failed {
+                error: "the swarm engine was repaired and still did not start; see setup.log in \
+                        the node folder."
                     .to_string(),
                 withdraw_hold: self.fell_back,
             };
@@ -1556,9 +1575,31 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     // from the folder. A relaunch after a self-update adopts the btxd that is
     // already running, so whether one runs is asked first: with a holder, or
     // with RPC answering, the check reports and copies nothing.
+    // The engine itself gone: a computer that was set up, and the folder of
+    // the engine this app carries has no btxd or btx-cli (deleted by hand, by
+    // a cleaner, by antivirus software). The start used to end here on "node
+    // binaries not installed yet; run setup first", with no setup to run and
+    // a Start button that did the same again. It is installed again now, the
+    // way setup installs it, with the window saying so; when that fails, the
+    // reason is the error and Start node tries again.
+    let mut reinstalled_this_start = false;
+    if engine_missing(&datadir, &tag) {
+        match missing_engine_step(
+            &tag,
+            settings.setup_complete || settings.btx_release_tag.is_some(),
+        ) {
+            MissingEngine::Reinstall => {
+                reinstall_pinned_engine(app, state, &datadir, &settings.node_profile).await?;
+                reinstalled_this_start = true;
+            }
+            MissingEngine::NotOurs => return Err(missing_engine_not_ours(&tag)),
+            MissingEngine::NotSetUp => {}
+        }
+    }
+
     if engine_check_wanted(
         &tag,
-        upgraded_this_start,
+        upgraded_this_start || reinstalled_this_start,
         settings.btx_release_tag.is_some(),
     ) {
         let holder_free = btx_core::node::datadir_holder(&datadir).await == DatadirHolder::Free;
@@ -1889,7 +1930,19 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     // key the operator put in a conf signs whatever the app's own switch says.
     let swarm_held = swarm_hold(&datadir);
     let swarm_signs = swarm_signs_in(&datadir, settings.signer_enabled, signer_applies_here);
-    if cfg!(target_os = "linux") && settings.swarm_enabled && !swarm_signs {
+    // A switched-on swarm engine that is damaged or gone (files missing or
+    // cut off, or not this build's archive) is downloaded again by itself,
+    // once, while this start goes on on the usual engine
+    // (`swarm_refetch_before_launch`); the switch is no longer the only cure.
+    let swarm_refetching = swarm_refetch_before_launch(
+        app,
+        state,
+        &datadir,
+        settings.swarm_enabled,
+        swarm_signs,
+        swarm_held.is_some(),
+    );
+    if cfg!(target_os = "linux") && settings.swarm_enabled && !swarm_signs && !swarm_refetching {
         if let Some((root, damage)) = swarm_engine_damage() {
             setup_log(&datadir, &swarm_damage_line(&root, &damage));
         } else if let Some(why) = &swarm_held {
@@ -2137,7 +2190,22 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
                         state.quitting.load(Ordering::SeqCst),
                         GPU_HELD_PID.load(Ordering::SeqCst) != 0,
                     ) {
-                        hold_swarm_engine_back(&datadir, &e);
+                        // Before it is held back for good: are its files what
+                        // the pin says, and can its programs run? Lost execute
+                        // bits are given back and it is launched once more;
+                        // damaged or missing files are downloaded again while
+                        // the node runs on its usual engine. One repair per
+                        // failure (`SWARM_REPAIR_SPENT`); an engine whose
+                        // files are intact is held back as before.
+                        match after_swarm_engine_failed(app, state, &datadir, &e) {
+                            SwarmNext::LaunchAgain => {
+                                return Err(SWARM_ENGINE_REPAIRED.to_string());
+                            }
+                            SwarmNext::FetchingAgain => {}
+                            SwarmNext::HoldBack => {
+                                hold_swarm_engine_back(&datadir, &e);
+                            }
+                        }
                         return Err(SWARM_ENGINE_FELL_BACK.to_string());
                     }
                     return Err(e);
@@ -2149,6 +2217,11 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     *state.rpc.lock().await = Some(rpc.clone());
     *state.started_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
     abort_mirror_load.armed = false;
+    // The swarm engine came up: a repair made for an earlier failure is done
+    // with, and its next failure gets one again.
+    if swarm_root.is_some() && plan != PreLaunchPlan::Attach {
+        SWARM_REPAIR_SPENT.store(false, Ordering::SeqCst);
+    }
     // The engine in that folder started and answers: a copy made after a
     // loader failure worked, or none was needed. Either way the record that
     // holds a second copy back is done with.
@@ -2368,6 +2441,112 @@ fn engine_check_wanted(tag: &str, upgraded_this_start: bool, has_saved_tag: bool
     tag == NODE_RELEASE_TAG && !upgraded_this_start && has_saved_tag
 }
 
+/// What a start does when the engine folder for its tag has no btxd or
+/// btx-cli.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingEngine {
+    /// Setup never finished on this computer: the wizard installs it.
+    NotSetUp,
+    /// The engine this app carries, on a computer that was set up: install
+    /// it again from the app's own package, as setup does.
+    Reinstall,
+    /// Another engine than the one this app carries (one a failed update
+    /// left the node on). The app has no copy of it to put back.
+    NotOurs,
+}
+
+fn missing_engine_step(tag: &str, setup_done: bool) -> MissingEngine {
+    if !setup_done {
+        MissingEngine::NotSetUp
+    } else if tag == NODE_RELEASE_TAG {
+        MissingEngine::Reinstall
+    } else {
+        MissingEngine::NotOurs
+    }
+}
+
+/// The folder of the engine for `tag` has no btxd or no btx-cli: what the
+/// launch below needs, and what a deleted engine lacks.
+fn engine_missing(datadir: &Path, tag: &str) -> bool {
+    btx_core::installer::returning_launch_paths(datadir, tag).is_none()
+}
+
+/// What the person reads when the engine could not be installed again. The
+/// reason is the copy's own (no room, no package, a btxd that would not
+/// report its version), and Start node is the retry: it runs this again.
+fn engine_reinstall_failed(why: &str) -> String {
+    let why = why.trim().trim_end_matches('.');
+    format!(
+        "The node engine is missing and could not be installed again: {why}. Press Start node \
+         to try again."
+    )
+}
+
+fn missing_engine_not_ours(tag: &str) -> String {
+    format!(
+        "The node engine {tag} this node was left on is missing, and this app carries only \
+         {NODE_RELEASE_TAG}. Press Start node to try the update to {NODE_RELEASE_TAG} again."
+    )
+}
+
+/// Install the pinned engine again (`btx_core::installer::reinstall_missing_engine`),
+/// from the app's own package, with the window saying "Installing the node
+/// engine…" (`NodePhase::Preparing` on a computer that was set up). The
+/// owner's faststart.conf stays; the profile's is written only when it is
+/// gone too.
+async fn reinstall_pinned_engine(
+    app: &AppHandle,
+    state: &AppState,
+    datadir: &Path,
+    profile: &str,
+) -> Result<(), String> {
+    set_phase(app, state, NodePhase::Preparing).await;
+    let install_root = install_dir(NODE_RELEASE_TAG).ok_or_else(|| {
+        engine_reinstall_failed("this computer has no home folder to install into")
+    })?;
+    let resource_dir = app.path().resource_dir().ok();
+    let pkg = resolve_bundled_node_pkg(
+        resource_dir.as_deref(),
+        &[Path::new(env!("CARGO_MANIFEST_DIR"))],
+    );
+    let note = format!(
+        "the node engine {NODE_RELEASE_TAG} is not installed in {}; installing it again from \
+         the app's own copy",
+        install_root.display()
+    );
+    eprintln!("[node-app] {note}");
+    setup_log(datadir, &note);
+    let (root, dd, profile) = (
+        install_root.clone(),
+        datadir.to_path_buf(),
+        profile.to_string(),
+    );
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let conf = btx_core::installer::conf_for_profile(&profile, NODE_RELEASE_TAG);
+        btx_core::installer::reinstall_missing_engine(pkg.as_deref(), &root, &dd, conf)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("the copy stopped unexpectedly ({e})")));
+    match outcome {
+        Ok(()) => {
+            let done = format!(
+                "the node engine {NODE_RELEASE_TAG} was installed again in {}",
+                install_root.display()
+            );
+            eprintln!("[node-app] {done}");
+            setup_log(datadir, &done);
+            Ok(())
+        }
+        Err(e) => {
+            let failed = format!("the node engine could not be installed again: {e}");
+            eprintln!("[node-app] {failed}");
+            setup_log(datadir, &failed);
+            Err(engine_reinstall_failed(&e))
+        }
+    }
+}
+
 /// May the start-time check copy files, or only report?
 ///
 /// It copies only when nothing can be running from the engine's folder:
@@ -2553,7 +2732,8 @@ async fn answer_engine_loader_failure(
 #[cfg(test)]
 mod engine_file_tests {
     use super::{
-        engine_check_mode, engine_check_note, engine_check_wanted, engine_repair_target,
+        engine_check_mode, engine_check_note, engine_check_wanted, engine_reinstall_failed,
+        engine_repair_target, missing_engine_not_ours, missing_engine_step, MissingEngine,
         NODE_RELEASE_TAG,
     };
     use btx_core::engine_files::{Check, Damage, Mode, NotCopied};
@@ -2659,6 +2839,86 @@ mod engine_file_tests {
             engine_repair_target(&old.join("bin").join("btxd"), None),
             (old.to_path_buf(), false)
         );
+    }
+
+    /// The 2026-11-26 click run: setup done, the engine folder deleted, and
+    /// the start stopped on "run setup first". The pinned engine is installed
+    /// again wherever setup ran; another engine is named, not copied over.
+    #[test]
+    fn a_missing_engine_is_installed_again_where_setup_ran() {
+        assert_eq!(
+            missing_engine_step(NODE_RELEASE_TAG, true),
+            MissingEngine::Reinstall
+        );
+        assert_eq!(
+            missing_engine_step(NODE_RELEASE_TAG, false),
+            MissingEngine::NotSetUp
+        );
+        assert_eq!(
+            missing_engine_step("v0.34.15", true),
+            MissingEngine::NotOurs
+        );
+        let other = missing_engine_not_ours("v0.34.15");
+        assert!(
+            other.contains("v0.34.15") && other.contains(NODE_RELEASE_TAG),
+            "{other}"
+        );
+        assert!(other.contains("Press Start node"), "{other}");
+    }
+
+    /// A reinstall that fails says the copy's own reason and how to retry,
+    /// never "run setup first", which the window has no button for.
+    #[test]
+    fn a_failed_reinstall_says_why_and_how_to_try_again() {
+        let msg = engine_reinstall_failed(
+            "disk error: the engine needs 700 MiB in /h/.local/btx and there are 12 MiB free.",
+        );
+        assert!(
+            msg.contains("there are 12 MiB free. Press Start node to try again."),
+            "{msg}"
+        );
+        assert!(msg.starts_with("The node engine is missing and could not be installed again"));
+        assert!(!msg.to_lowercase().contains("run setup"), "{msg}");
+        assert!(!msg.contains(".."), "{msg}");
+    }
+
+    /// Wiring: a missing engine is installed again before the file check and
+    /// before the launch paths are read, with the window in "Installing the
+    /// node engine…", and the check does not run over what was just copied.
+    #[test]
+    fn a_missing_engine_is_reinstalled_before_the_launch_paths_are_read() {
+        let src = include_str!("commands.rs");
+        let start = src
+            .split(concat!("\nasync fn start_node", "_once("))
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("start_node_once is in this file");
+        let missing = start
+            .find("if engine_missing(&datadir, &tag) {")
+            .expect("the start asks");
+        let reinstall = start
+            .find("reinstall_pinned_engine(app, state, &datadir, &settings.node_profile).await?;")
+            .expect("and installs it again");
+        let heal = start
+            .find("heal_installed_engine(app, &datadir, mode).await;")
+            .expect("the check");
+        let resolve = start
+            .find("returning_launch_paths(&datadir, &tag)")
+            .expect("the launch paths");
+        assert!(missing < reinstall && reinstall < heal && heal < resolve);
+        assert!(start.contains("upgraded_this_start || reinstalled_this_start,"));
+        let body = src
+            .split(concat!("\nasync fn reinstall_pinned", "_engine("))
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("reinstall_pinned_engine is in this file");
+        let phase = body
+            .find("set_phase(app, state, NodePhase::Preparing).await;")
+            .expect("the window says so");
+        let copy = body
+            .find("btx_core::installer::reinstall_missing_engine(")
+            .expect("setup's copy");
+        assert!(phase < copy);
     }
 
     /// Wiring only; the decisions are tested above and in
@@ -8348,6 +8608,280 @@ fn swarm_engine_for_launch(
 const SWARM_ENGINE_FELL_BACK: &str =
     "the swarm engine did not start; starting again on the usual engine";
 
+/// What `start_node_once` returns when the swarm engine was launched, failed
+/// and was repaired on the spot (its programs had lost their execute bits):
+/// `start_node_held` begins again from the top, once, and that pass
+/// launches the repaired swarm engine. Never shown.
+const SWARM_ENGINE_REPAIRED: &str = "the swarm engine was repaired; starting it once more";
+
+/// One repair per failure of the swarm engine. Set when the app repairs it
+/// by itself (gives execute bits back, or downloads it again); cleared when a
+/// launch of the swarm engine comes up, and by the owner's switch. While it
+/// is set a failure holds the engine back as before, so a repair that did
+/// not help is never made again, and nothing goes round.
+static SWARM_REPAIR_SPENT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// What the swarm row says about the last repair the app made by itself in
+/// this run of the app. Empty when none; the owner's switch clears it.
+static SWARM_REPAIR_NOTE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+fn set_swarm_repair_note(note: String) {
+    if let Ok(mut n) = SWARM_REPAIR_NOTE.lock() {
+        *n = note;
+    }
+}
+
+fn swarm_repair_note() -> String {
+    SWARM_REPAIR_NOTE
+        .lock()
+        .map(|n| n.clone())
+        .unwrap_or_default()
+}
+
+/// What a failed launch of the swarm engine calls for, from a check of its
+/// files against the pin (`btx_core::swarm_engine::health`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SwarmRepair {
+    /// Hold it back, as before: its files are intact, or this failure
+    /// follows a repair that has not yet seen the engine come up.
+    None,
+    /// Its programs lost their execute bits: give them back, launch again.
+    MakeRunnable(Vec<String>),
+    /// Files missing or the wrong size, or not this build's archive:
+    /// download it again (pinned sha256, update-key signature).
+    FetchAgain(String),
+}
+
+fn swarm_repair_after_failure(
+    repair_spent: bool,
+    health: btx_core::swarm_engine::Health,
+) -> SwarmRepair {
+    use btx_core::swarm_engine::Health;
+    match health {
+        _ if repair_spent => SwarmRepair::None,
+        Health::Whole => SwarmRepair::None,
+        Health::NotRunnable(files) => SwarmRepair::MakeRunnable(files),
+        Health::NeedsFetch(why) => SwarmRepair::FetchAgain(why),
+    }
+}
+
+/// Before a launch: download the swarm engine again by itself, and why?
+/// Only where it would be launched (Linux, switched on, not a signer, not
+/// held back), only when the check says a fresh copy is the cure, never
+/// while a download runs, and once per failure.
+fn swarm_refetch_wanted(
+    linux: bool,
+    wanted: bool,
+    signs_here: bool,
+    held_back: bool,
+    repair_spent: bool,
+    fetch_busy: bool,
+    health: &btx_core::swarm_engine::Health,
+) -> Option<String> {
+    use btx_core::swarm_engine::Health;
+    if !linux || !wanted || signs_here || held_back || repair_spent || fetch_busy {
+        return None;
+    }
+    match health {
+        Health::NeedsFetch(why) => Some(why.clone()),
+        Health::Whole | Health::NotRunnable(_) => None,
+    }
+}
+
+/// A download already runs (the switch's, or a repair's).
+fn swarm_fetch_busy(fetch: &SwarmFetch) -> bool {
+    matches!(fetch, SwarmFetch::Fetching(_) | SwarmFetch::Repairing(_))
+}
+
+/// Take the download slot for a repair: `false` while another download runs.
+fn claim_swarm_repair(slot: &std::sync::Mutex<SwarmFetch>) -> bool {
+    let Ok(mut fetch) = slot.lock() else {
+        return false;
+    };
+    if swarm_fetch_busy(&fetch) {
+        return false;
+    }
+    *fetch = SwarmFetch::Repairing(0);
+    true
+}
+
+/// What `start_node_once` does after the swarm engine was launched and did
+/// not come up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwarmNext {
+    /// It was repaired on the spot: launch it once more.
+    LaunchAgain,
+    /// It is being downloaded again: start on the usual engine, no hold.
+    FetchingAgain,
+    /// Hold it back, as before.
+    HoldBack,
+}
+
+/// Check the swarm engine that failed against its pin, and repair it once.
+fn after_swarm_engine_failed(
+    app: &AppHandle,
+    state: &AppState,
+    datadir: &Path,
+    why: &str,
+) -> SwarmNext {
+    let Some(pin) = swarm_engine_pin() else {
+        return SwarmNext::HoldBack;
+    };
+    let Some(root) = btx_core::swarm_engine::root(&pin) else {
+        return SwarmNext::HoldBack;
+    };
+    let health = btx_core::swarm_engine::health(&pin, &root);
+    match swarm_repair_after_failure(SWARM_REPAIR_SPENT.load(Ordering::SeqCst), health) {
+        SwarmRepair::None => SwarmNext::HoldBack,
+        SwarmRepair::MakeRunnable(files) => {
+            SWARM_REPAIR_SPENT.store(true, Ordering::SeqCst);
+            let names = btx_core::engine_files::name_some(&files);
+            match btx_core::swarm_engine::make_runnable(&root, &files) {
+                Ok(()) => {
+                    let msg = format!(
+                        "the swarm engine failed ({why}); {names} in {} could not be run, so \
+                         the execute permission was given back. Starting the swarm engine once \
+                         more",
+                        root.display()
+                    );
+                    eprintln!("[node-app] {msg}");
+                    setup_log(datadir, &msg);
+                    set_swarm_repair_note(format!(
+                        "The swarm engine was damaged ({names} could not be run) and was \
+                         repaired by itself."
+                    ));
+                    SwarmNext::LaunchAgain
+                }
+                Err(e) => {
+                    let msg = format!("the swarm engine could not be repaired: {e}");
+                    eprintln!("[node-app] {msg}");
+                    setup_log(datadir, &msg);
+                    SwarmNext::HoldBack
+                }
+            }
+        }
+        SwarmRepair::FetchAgain(what) => {
+            if spawn_swarm_refetch(app, state, datadir, &what) {
+                SwarmNext::FetchingAgain
+            } else {
+                SwarmNext::HoldBack
+            }
+        }
+    }
+}
+
+/// The check before a launch (`swarm_refetch_wanted`), and the download it
+/// may start. `true` when a download of the swarm engine was started: this
+/// start goes on on the usual engine, and the node restarts onto the swarm
+/// engine once the download has been checked.
+fn swarm_refetch_before_launch(
+    app: &AppHandle,
+    state: &AppState,
+    datadir: &Path,
+    wanted: bool,
+    signs_here: bool,
+    held_back: bool,
+) -> bool {
+    if !cfg!(target_os = "linux") || !wanted {
+        return false;
+    }
+    let Some(pin) = swarm_engine_pin() else {
+        return false;
+    };
+    let Some(root) = btx_core::swarm_engine::root(&pin) else {
+        return false;
+    };
+    let health = btx_core::swarm_engine::health(&pin, &root);
+    match swarm_refetch_wanted(
+        true,
+        wanted,
+        signs_here,
+        held_back,
+        SWARM_REPAIR_SPENT.load(Ordering::SeqCst),
+        swarm_fetch_busy(&swarm_fetch_now(state)),
+        &health,
+    ) {
+        Some(what) => spawn_swarm_refetch(app, state, datadir, &what),
+        None => false,
+    }
+}
+
+/// Start downloading the swarm engine again in the background, if no other
+/// download runs. Spends the repair.
+fn spawn_swarm_refetch(app: &AppHandle, state: &AppState, datadir: &Path, what: &str) -> bool {
+    if !claim_swarm_repair(&state.swarm_fetch) {
+        return false;
+    }
+    SWARM_REPAIR_SPENT.store(true, Ordering::SeqCst);
+    let msg = format!(
+        "the swarm engine is damaged ({what}); downloading it again, checked against the same \
+         pinned sha256 and the update key's signature. The node runs on its usual engine \
+         meanwhile and restarts onto the swarm engine once the download has been checked"
+    );
+    eprintln!("[node-app] {msg}");
+    setup_log(datadir, &msg);
+    tauri::async_runtime::spawn(refetch_swarm_engine(app.clone(), what.to_string()));
+    true
+}
+
+/// The download behind a repair (`btx_core::swarm_engine::fetch_and_install`,
+/// never unverified), then the switch's own restart onto the swarm engine
+/// (`apply_swarm_switch`, which does nothing when the owner has switched the
+/// swarm off meanwhile). A failure is the row's "not installed" with the
+/// reason; the node stays on its usual engine.
+async fn refetch_swarm_engine(app: AppHandle, what: String) {
+    let state = app.state::<AppState>();
+    let datadir = node_datadir();
+    let failed = |why: String| {
+        let msg =
+            format!("the swarm engine was damaged ({what}) and downloading it again failed: {why}");
+        eprintln!("[node-app] {msg}");
+        setup_log(&datadir, &msg);
+        set_swarm_fetch(
+            &state,
+            SwarmFetch::Failed(format!(
+                "It was damaged ({what}) and downloading it again failed: {why}"
+            )),
+        );
+    };
+    let Some(pin) = swarm_engine_pin() else {
+        return failed("this version of the app names no swarm engine".to_string());
+    };
+    let Some(root) = btx_core::swarm_engine::root(&pin) else {
+        return failed("this computer has no home folder to install into".to_string());
+    };
+    let Some(key) = update_public_key() else {
+        return failed("this app has no update key to check the download with".to_string());
+    };
+    let slot = state.swarm_fetch.clone();
+    let progress = move |ratio: f64| {
+        if let Ok(mut f) = slot.lock() {
+            *f = SwarmFetch::Repairing((ratio * 100.0).floor().clamp(0.0, 100.0) as u8);
+        }
+    };
+    let signature_ok = move |file: &Path, sig: &str| -> Result<(), String> {
+        update_signature_ok(&key, file, sig)
+    };
+    match btx_core::swarm_engine::fetch_and_install(&pin, &root, &signature_ok, &progress).await {
+        Ok(()) => {
+            set_swarm_fetch(&state, SwarmFetch::Idle);
+            let msg = format!(
+                "the swarm engine was damaged ({what}) and was downloaded again into {}; \
+                 restarting the node onto it",
+                root.display()
+            );
+            eprintln!("[node-app] {msg}");
+            setup_log(&datadir, &msg);
+            set_swarm_repair_note(format!(
+                "The swarm engine was damaged ({what}) and was downloaded again by itself."
+            ));
+            apply_swarm_switch(app.clone(), true).await;
+        }
+        Err(why) => failed(why),
+    }
+}
+
 /// What the window shows while the node starts again after a swarm engine
 /// that ended badly while running.
 const SWARM_ENGINE_CRASH_RESTART: &str =
@@ -8494,7 +9028,7 @@ fn claim_swarm_switch(slot: &std::sync::Mutex<SwarmFetch>, will_fetch: bool) -> 
     let Ok(mut fetch) = slot.lock() else {
         return false;
     };
-    if matches!(*fetch, SwarmFetch::Fetching(_)) {
+    if swarm_fetch_busy(&fetch) {
         return false;
     }
     *fetch = if will_fetch {
@@ -8627,6 +9161,9 @@ pub struct SwarmCard {
     /// The size of the engine download in MB, 0 when this build has none.
     pub download_mb: u64,
     pub report: Option<btx_core::swarm::Report>,
+    /// The last repair the app made by itself in this run, as a sentence;
+    /// empty when none.
+    pub repair_note: String,
 }
 
 /// What the card is decided from, besides what the node says.
@@ -8670,6 +9207,9 @@ fn swarm_card(f: &SwarmFacts, seen: Option<btx_core::swarm::Seen>) -> SwarmCard 
     } else if let SwarmFetch::Fetching(p) = f.fetch {
         percent = p;
         ("fetching", none(), None)
+    } else if let SwarmFetch::Repairing(p) = f.fetch {
+        percent = p;
+        ("repairing", none(), None)
     } else if !f.wanted {
         match seen {
             // Still on the swarm engine (or between the stop and the start),
@@ -8725,6 +9265,7 @@ fn swarm_card(f: &SwarmFacts, seen: Option<btx_core::swarm::Seen>) -> SwarmCard 
         percent,
         download_mb: f.download_mb,
         report,
+        repair_note: String::new(),
     }
 }
 
@@ -8793,7 +9334,9 @@ pub async fn swarm_status(state: State<'_, AppState>) -> Result<SwarmCard, Strin
         }
         None => None,
     };
-    Ok(swarm_card(&facts, seen))
+    let mut card = swarm_card(&facts, seen);
+    card.repair_note = swarm_repair_note();
+    Ok(card)
 }
 
 /// Why the switch may not be turned on here, or `None`.
@@ -8849,8 +9392,11 @@ pub async fn set_swarm(
     NodeAppSettings::update(&datadir, |s| s.swarm_enabled = on);
     // The owner's own switch is the one thing that lets a swarm engine that
     // failed be tried again. Off clears the hold too, so "off and on" is the
-    // whole of what the card asks for.
+    // whole of what the card asks for. It gives the app a repair to make
+    // again, and the note of the last one goes.
     clear_swarm_hold(&datadir);
+    SWARM_REPAIR_SPENT.store(false, Ordering::SeqCst);
+    set_swarm_repair_note(String::new());
     let message = swarm_switch_message(
         on,
         installed,
@@ -14663,6 +15209,10 @@ mod twin_freeze_removal {
 #[cfg(test)]
 mod swarm_tests {
     use super::{
+        claim_swarm_repair, swarm_refetch_wanted, swarm_repair_after_failure, SwarmRepair,
+        SWARM_ENGINE_REPAIRED,
+    };
+    use super::{
         claim_swarm_switch, clear_swarm_hold, engine_did_not_come_up, falls_back_from_swarm_engine,
         header_bootstrap_restart_due, hold_swarm_engine_back, swarm_card, swarm_crash_step,
         swarm_damage_line, swarm_engine_for_launch, swarm_engine_pin, swarm_hold, swarm_on_refusal,
@@ -14673,6 +15223,7 @@ mod swarm_tests {
     };
     use crate::state::SwarmFetch;
     use btx_core::swarm::{Guard, Report, Seen};
+    use btx_core::swarm_engine::Health;
     use std::path::PathBuf;
 
     /// The tests that touch this run's hold flag (`SWARM_ENGINE_HELD_THIS_RUN`, one
@@ -15071,6 +15622,285 @@ mod swarm_tests {
             SWARM_ENGINE_FELL_BACK,
             crate::read_block_recovery::STEP_TAKEN
         );
+    }
+
+    /// One start with the repair in it, pass by pass as `start_node_held`
+    /// runs it: the real launch rule, the real hold file, the real repair
+    /// rule and the real pass counter. `runnable` is whether the swarm
+    /// engine's btxd has its execute bit; `fixes` is whether giving it back
+    /// is what the engine needed. `spent` carries the repair budget across
+    /// starts, as `SWARM_REPAIR_SPENT` does.
+    fn run_start_with_repair(
+        dir: &std::path::Path,
+        runnable: &mut bool,
+        fixes: bool,
+        spent: &mut bool,
+    ) -> (Vec<&'static str>, AfterPass) {
+        let root = Some(PathBuf::from("/h/.local/btx/x-modelnet/linux-x86_64"));
+        let mut passes = StartPasses::default();
+        let mut engines = Vec::new();
+        loop {
+            let held = btx_core::swarm::engine_held_back(dir).is_some();
+            let swarm = swarm_engine_for_launch(true, true, false, held, root.clone()).is_some();
+            engines.push(if swarm { "swarm" } else { "default" });
+            let comes_up = !swarm || (*runnable && fixes);
+            let result = if comes_up {
+                if swarm {
+                    *spent = false;
+                }
+                Ok(())
+            } else {
+                let failure = Some(EngineFailure::CouldNotRun);
+                let error =
+                    "couldn't start the node: process error: Permission denied (os error 13)";
+                assert!(falls_back_from_swarm_engine(swarm, failure, false, false));
+                let health = if *runnable {
+                    Health::Whole
+                } else {
+                    Health::NotRunnable(vec!["bin/btxd".into()])
+                };
+                match swarm_repair_after_failure(*spent, health) {
+                    SwarmRepair::MakeRunnable(files) => {
+                        assert_eq!(files, vec!["bin/btxd".to_string()]);
+                        *spent = true;
+                        *runnable = true;
+                        Err(SWARM_ENGINE_REPAIRED.to_string())
+                    }
+                    SwarmRepair::FetchAgain(_) => unreachable!("sizes are intact"),
+                    SwarmRepair::None => {
+                        btx_core::swarm::hold_engine_back(dir, "0.9.0", error).unwrap();
+                        Err(SWARM_ENGINE_FELL_BACK.to_string())
+                    }
+                }
+            };
+            match passes.after(result) {
+                AfterPass::Again => assert!(engines.len() < 10, "a start that goes round"),
+                done => return (engines, done),
+            }
+        }
+    }
+
+    /// `chmod a-x bin/btxd` on the installed swarm engine (the 2026-11-26
+    /// click run): the launch fails with "Permission denied", the check
+    /// finds the lost execute bit, gives it back, and the second pass runs
+    /// the swarm engine. No hold, and the repair is free again once the
+    /// engine came up.
+    #[test]
+    fn a_swarm_engine_that_lost_its_execute_bit_is_repaired_and_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut runnable, mut spent) = (false, false);
+        assert_eq!(
+            run_start_with_repair(dir.path(), &mut runnable, true, &mut spent),
+            (vec!["swarm", "swarm"], AfterPass::Started)
+        );
+        assert!(runnable && !spent);
+        assert_eq!(btx_core::swarm::engine_held_back(dir.path()), None);
+        // The same damage again later: one more repair, as for any failure.
+        runnable = false;
+        assert_eq!(
+            run_start_with_repair(dir.path(), &mut runnable, true, &mut spent),
+            (vec!["swarm", "swarm"], AfterPass::Started)
+        );
+    }
+
+    /// A repair that does not help is made once: the second failure holds
+    /// the engine back and the node starts on its usual engine, as before.
+    /// It never loops, in this start or the next.
+    #[test]
+    fn a_repair_that_does_not_help_is_made_once_then_the_engine_is_held_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut runnable, mut spent) = (false, false);
+        let (engines, ended) = run_start_with_repair(dir.path(), &mut runnable, false, &mut spent);
+        assert_eq!(engines, vec!["swarm", "swarm", "default"]);
+        assert_eq!(ended, AfterPass::Started);
+        assert!(spent, "the repair stays spent: the engine never came up");
+        let held = btx_core::swarm::engine_held_back(dir.path()).unwrap();
+        assert!(held.why.contains("Permission denied"), "{}", held.why);
+        // The next start: the default engine, one pass, no repair.
+        assert_eq!(
+            run_start_with_repair(dir.path(), &mut runnable, false, &mut spent),
+            (vec!["default"], AfterPass::Started)
+        );
+        // Intact files that fail: held back at once, today's behaviour.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut runnable, mut spent) = (true, false);
+        assert_eq!(
+            run_start_with_repair(dir.path(), &mut runnable, false, &mut spent),
+            (vec!["swarm", "default"], AfterPass::Started)
+        );
+        assert!(btx_core::swarm::engine_held_back(dir.path()).is_some());
+    }
+
+    #[test]
+    fn the_repair_rule_follows_the_check_and_the_budget() {
+        let lost = || Health::NotRunnable(vec!["bin/btxd".into()]);
+        let cut = || Health::NeedsFetch("1 file (bin/btx-modeld) missing or the wrong size".into());
+        assert_eq!(
+            swarm_repair_after_failure(false, lost()),
+            SwarmRepair::MakeRunnable(vec!["bin/btxd".into()])
+        );
+        assert_eq!(
+            swarm_repair_after_failure(false, cut()),
+            SwarmRepair::FetchAgain("1 file (bin/btx-modeld) missing or the wrong size".into())
+        );
+        assert_eq!(
+            swarm_repair_after_failure(false, Health::Whole),
+            SwarmRepair::None
+        );
+        for h in [lost(), cut(), Health::Whole] {
+            assert_eq!(swarm_repair_after_failure(true, h), SwarmRepair::None);
+        }
+
+        // Before a launch: a fresh copy, only where the swarm engine would
+        // run, only when the check asks for one, never twice at once.
+        let want = |linux, wanted, signs, held, spent, busy, h: &Health| {
+            swarm_refetch_wanted(linux, wanted, signs, held, spent, busy, h)
+        };
+        assert_eq!(
+            want(true, true, false, false, false, false, &cut()),
+            Some("1 file (bin/btx-modeld) missing or the wrong size".into())
+        );
+        let gone = Health::NeedsFetch("it is not installed".into());
+        assert_eq!(
+            want(true, true, false, false, false, false, &gone),
+            Some("it is not installed".into())
+        );
+        for (linux, wanted, signs, held, spent, busy) in [
+            (false, true, false, false, false, false),
+            (true, false, false, false, false, false),
+            (true, true, true, false, false, false),
+            (true, true, false, true, false, false),
+            (true, true, false, false, true, false),
+            (true, true, false, false, false, true),
+        ] {
+            assert_eq!(want(linux, wanted, signs, held, spent, busy, &cut()), None);
+        }
+        // Lost bits are the launch's to find, and a whole engine needs nothing.
+        assert_eq!(want(true, true, false, false, false, false, &lost()), None);
+        assert_eq!(
+            want(true, true, false, false, false, false, &Health::Whole),
+            None
+        );
+    }
+
+    /// One download at a time: a repair takes the slot only when no download
+    /// runs, and the switch refuses while a repair runs.
+    #[test]
+    fn a_repair_download_and_the_switch_never_run_at_once() {
+        let slot = std::sync::Mutex::new(SwarmFetch::Idle);
+        assert!(claim_swarm_repair(&slot));
+        assert_eq!(*slot.lock().unwrap(), SwarmFetch::Repairing(0));
+        assert!(!claim_swarm_repair(&slot));
+        assert!(!claim_swarm_switch(&slot, true));
+        assert!(!claim_swarm_switch(&slot, false));
+        *slot.lock().unwrap() = SwarmFetch::Fetching(10);
+        assert!(!claim_swarm_repair(&slot));
+        *slot.lock().unwrap() = SwarmFetch::Failed("no".into());
+        assert!(claim_swarm_repair(&slot));
+    }
+
+    /// The pass counter takes a repair once per start.
+    #[test]
+    fn the_start_loop_takes_a_repair_once() {
+        let repaired = || Err(SWARM_ENGINE_REPAIRED.to_string());
+        let mut p = StartPasses::default();
+        assert_eq!(p.after(repaired()), AfterPass::Again);
+        let AfterPass::Failed { error, .. } = p.after(repaired()) else {
+            panic!("a second repair goes on");
+        };
+        assert!(
+            error.contains("repaired and still did not start"),
+            "{error}"
+        );
+        assert!(!error.contains("  "), "{error:?}");
+        assert_ne!(SWARM_ENGINE_REPAIRED, SWARM_ENGINE_FELL_BACK);
+        assert_ne!(
+            SWARM_ENGINE_REPAIRED,
+            crate::read_block_recovery::STEP_TAKEN
+        );
+    }
+
+    /// The card: a repair download is its own state, with the percent.
+    #[test]
+    fn a_repair_download_shows_in_the_row() {
+        let facts = SwarmFacts {
+            linux: true,
+            wanted: true,
+            signs_here: false,
+            fetchable: true,
+            engine_installed: false,
+            engine_damaged: Some("1 file (bin/btx-modeld)".into()),
+            held_back: None,
+            fetch: SwarmFetch::Repairing(42),
+            download_mb: 500,
+            restarting: false,
+        };
+        let card = swarm_card(&facts, None);
+        assert_eq!(card.state, "repairing");
+        assert_eq!(card.percent, 42);
+        assert_eq!(card.repair_note, "");
+    }
+
+    /// Wiring: the check of the files sits between the fallback decision and
+    /// the hold, a repair on the spot begins the start again, a download
+    /// starts on the usual engine with no hold, and the budget is freed only
+    /// by a swarm engine that came up and by the owner's switch.
+    #[test]
+    fn the_repair_is_checked_before_the_hold_and_freed_when_the_engine_comes_up() {
+        let src = include_str!("commands.rs");
+        let production = src.split("\nmod swarm_tests {").next().unwrap();
+        let once = production
+            .split("\nasync fn start_node_once(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let decided = once.find("falls_back_from_swarm_engine(").unwrap();
+        let checked = once
+            .find("match after_swarm_engine_failed(app, state, &datadir, &e) {")
+            .unwrap();
+        let again = once
+            .find("return Err(SWARM_ENGINE_REPAIRED.to_string());")
+            .unwrap();
+        let held = once.find("hold_swarm_engine_back(&datadir, &e);").unwrap();
+        assert!(decided < checked && checked < again && again < held);
+        assert!(once[checked..held].contains("SwarmNext::FetchingAgain => {}"));
+        let before = once.find("swarm_refetch_before_launch(").unwrap();
+        let engine = once
+            .find("let swarm_root = swarm_engine_for_launch(")
+            .unwrap();
+        assert!(before < engine);
+        let armed = once
+            .find("*state.rpc.lock().await = Some(rpc.clone());")
+            .unwrap();
+        let freed = once
+            .find("SWARM_REPAIR_SPENT.store(false, Ordering::SeqCst);")
+            .unwrap();
+        assert!(armed < freed);
+        assert!(once[armed..freed]
+            .contains("if swarm_root.is_some() && plan != PreLaunchPlan::Attach {"));
+        assert_eq!(
+            production
+                .matches("SWARM_REPAIR_SPENT.store(false, Ordering::SeqCst);")
+                .count(),
+            2,
+            "a swarm engine that came up, and the owner's switch"
+        );
+        let switch = production
+            .split("\npub async fn set_swarm(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(switch.contains("SWARM_REPAIR_SPENT.store(false, Ordering::SeqCst);"));
+        // The download is the pinned, signed one, and nothing else.
+        let refetch = production
+            .split("\nasync fn refetch_swarm_engine(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        assert!(refetch.contains(
+            "btx_core::swarm_engine::fetch_and_install(&pin, &root, &signature_ok, &progress)"
+        ));
+        assert!(refetch.contains("update_signature_ok(&key, file, sig)"));
     }
 
     /// The signer rule reads the node folder: a key the operator put in a

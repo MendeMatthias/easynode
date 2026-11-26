@@ -242,6 +242,16 @@ describe("headline while syncing", () => {
   });
 });
 
+describe("headline while the node engine is installed again", () => {
+  it("says so instead of a bare ellipsis", () => {
+    expect(headline({ phase: "preparing" }, facts())).toEqual({
+      badge: "INSTALLING",
+      sub: "Installing the node engine…",
+      mode: "syncing",
+    });
+  });
+});
+
 describe("headline when the node is not running", () => {
   it("says the error is just below rather than leaving the line empty", () => {
     expect(headline({ phase: "error", message: "btxd exited" }, facts())).toEqual({

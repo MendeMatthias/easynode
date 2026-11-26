@@ -102,6 +102,11 @@ export function headline(p: HeadlinePhase, f: HeadlineFacts): Headline {
             : `Catching up to block ${fmtInt(p.headers)}`,
         mode: notKeepingUp(f) || f.diskCritical ? "stalled" : "syncing",
       };
+    case "preparing":
+      // On a computer that was set up, the only way here is a start that
+      // found the node engine missing and is installing it again
+      // (commands.rs `reinstall_pinned_engine`).
+      return { badge: "INSTALLING", sub: "Installing the node engine…", mode: "syncing" };
     case "starting":
       return { badge: "STARTING", sub: "This can take a moment", mode: "syncing" };
     case "loading_snapshot":
