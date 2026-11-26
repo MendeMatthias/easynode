@@ -56,14 +56,24 @@ fn cookie_mtime(path: &std::path::Path) -> String {
 /// JSON-RPC `RPC_IN_WARMUP`: btxd is alive and not ready to answer yet.
 pub const RPC_IN_WARMUP: i64 = -28;
 
-/// What an HTTP 503 from the node becomes: the warmup error, with this text.
+/// What an HTTP 503 from the node becomes: `AppError::Http` with this text.
 ///
 /// btxd answers 503 with an HTML page (`<HTML><HEAD><TITLE>503 Service
 /// Unavailable</TITLE>...`) while its HTTP server is up and its RPC is not:
-/// during a restart, on the way down and on the way up. That is the same
-/// "ask again in a moment" as `RPC_IN_WARMUP`, so it is reported as that code
-/// and every caller that waits out a warmup waits this out too.
+/// during a restart, on the way down and on the way up, and for as long as
+/// it hangs in shutdown or its RPC queue stays full.
+///
+/// It is a FAILURE, not `RPC_IN_WARMUP`. The status refresher counts
+/// failures to "The node stopped responding" and a graceful stop, and the
+/// start's RPC wait counts them against its budget; a node that answers 503
+/// for ever must reach both. Only screens that merely ask the person to try
+/// again in a moment read it as warming ([`is_not_ready`]).
 pub const NODE_NOT_READY: &str = "node not ready (HTTP 503)";
+
+/// The error a 503 became ([`NODE_NOT_READY`]).
+pub fn is_not_ready(e: &AppError) -> bool {
+    matches!(e, AppError::Http(m) if m == NODE_NOT_READY)
+}
 
 /// The last reply state a line was logged for, process-wide: 0 for an
 /// ordinary answer, else the HTTP status of a 503 or of an HTML page. Shared
@@ -319,17 +329,14 @@ impl Rpc for RpcClient {
             let body = response.text().await.unwrap_or_default();
             // A 503 (btxd restarting: its HTTP server answers and its RPC
             // does not, with an HTML page) and any other HTML page: one short
-            // line when it begins, never the page. A 503 is the warmup error,
-            // so whatever waits out a warmup waits this out too.
+            // line when it begins, never the page. Still a failure: see
+            // `NODE_NOT_READY`.
             if let Some(line) = unready_log_line(self.logged, status, &body) {
                 if let Some(line) = line {
                     eprintln!("{line}");
                 }
                 if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-                    return Err(AppError::Rpc {
-                        code: RPC_IN_WARMUP,
-                        message: NODE_NOT_READY.to_string(),
-                    });
+                    return Err(AppError::Http(NODE_NOT_READY.to_string()));
                 }
                 return Err(AppError::Http(format!("node RPC error (HTTP {status})")));
             }
@@ -468,7 +475,7 @@ mod tests {
     /// message, never the page, so every caller that waits out a warmup
     /// (`RPC_IN_WARMUP`) waits this out the same way.
     #[tokio::test]
-    async fn a_503_html_page_is_the_warmup_error_and_never_its_body() {
+    async fn a_503_html_page_is_a_short_failure_and_never_its_body() {
         let mut server = Server::new_async().await;
         let _m = server
             .mock("POST", "/")
@@ -484,11 +491,19 @@ mod tests {
             Box::leak(Box::new(std::sync::atomic::AtomicU16::new(0)));
         let client = RpcClient::new(server.url(), "u", "p").with_logged_state(logged);
         match client.call("getblockchaininfo", json!([])).await {
-            Err(AppError::Rpc { code, message }) => {
-                assert_eq!(code, RPC_IN_WARMUP);
-                assert_eq!(message, NODE_NOT_READY);
+            Err(e) => {
+                assert!(is_not_ready(&e), "{e:?}");
+                // A failure, never the warmup code a watchdog forgives.
+                assert!(!matches!(
+                    e,
+                    AppError::Rpc {
+                        code: RPC_IN_WARMUP,
+                        ..
+                    }
+                ));
+                assert!(!e.to_string().contains('<'), "{e}");
             }
-            other => panic!("expected the warmup error, got {other:?}"),
+            other => panic!("expected the not-ready error, got {other:?}"),
         }
         assert_eq!(logged.load(std::sync::atomic::Ordering::SeqCst), 503);
     }

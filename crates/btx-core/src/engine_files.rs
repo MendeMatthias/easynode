@@ -342,6 +342,50 @@ fn not_enough_space(install_root: &Path, need: u64, free: u64) -> String {
     )
 }
 
+/// Whether a running program was started from a file under `root` (Linux:
+/// every `/proc/<pid>/exe`, a replaced or deleted file included). The rule
+/// it serves: nothing is copied into, renamed or deleted from a folder a
+/// node runs from. Off Linux it is `false`, and the callers' other check
+/// (who holds the node folder, whether its RPC answers) is what applies.
+pub fn process_runs_from(root: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let Ok(procs) = std::fs::read_dir("/proc") else {
+            return false;
+        };
+        for entry in procs.flatten() {
+            let name = entry.file_name();
+            if !name.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(exe) = std::fs::read_link(entry.path().join("exe")) else {
+                continue;
+            };
+            let exe = exe.to_string_lossy();
+            let exe = exe.strip_suffix(" (deleted)").unwrap_or(&exe);
+            if Path::new(exe).starts_with(&root) {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        false
+    }
+}
+
+/// Nothing of the engine is in `install_root`: no list an install wrote,
+/// and none of the package's files. Then putting it back is a whole install
+/// (setup's copy), not a repair of some files.
+pub fn nothing_installed(package: &Path, install_root: &Path) -> AppResult<bool> {
+    let listing = list_tree(package)?;
+    Ok(read_manifest(install_root).is_none()
+        && damage_against(install_root, &listing).missing.len() == listing.len())
+}
+
 /// Why the check found damage and copied nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotCopied {
@@ -826,6 +870,29 @@ pub fn answer_loader_failure(
             Ok(say(MissingFileCase::Repairing))
         }
         Err(e) => Err(say(MissingFileCase::RepairFailed(&e.to_string()))),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod runs_from_tests {
+    use super::*;
+
+    /// A program started from the folder is seen; another folder is not.
+    #[test]
+    fn a_program_running_from_a_folder_is_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("eng").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("btxd");
+        std::fs::copy("/bin/sleep", &exe).unwrap();
+        assert!(!process_runs_from(&dir.path().join("eng")));
+        let mut child = std::process::Command::new(&exe).arg("30").spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(process_runs_from(&dir.path().join("eng")));
+        assert!(!process_runs_from(&dir.path().join("other")));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!process_runs_from(&dir.path().join("eng")));
     }
 }
 

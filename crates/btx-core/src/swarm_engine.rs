@@ -117,10 +117,11 @@ pub fn not_runnable(root: &Path) -> Vec<String> {
         let mut found: Vec<String> = list
             .entries
             .iter()
-            .filter(|e| Path::new(&e.rel).parent() == Some(Path::new("bin")))
+            .filter(|e| is_bin_program(&e.rel))
             .filter(|e| {
-                std::fs::metadata(root.join(&e.rel))
-                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o100 == 0)
+                // Never through a link: the file itself, or nothing.
+                std::fs::symlink_metadata(root.join(&e.rel))
+                    .is_ok_and(|m| m.file_type().is_file() && m.permissions().mode() & 0o100 == 0)
             })
             .map(|e| e.rel.clone())
             .collect();
@@ -134,9 +135,29 @@ pub fn not_runnable(root: &Path) -> Vec<String> {
     }
 }
 
+/// `bin/<name>` and nothing else: two plain components, so a name read from
+/// the list on disk cannot reach outside the engine folder.
+fn is_bin_program(rel: &str) -> bool {
+    let parts: Vec<Component> = Path::new(rel).components().collect();
+    matches!(parts.as_slice(), [Component::Normal(b), Component::Normal(_)] if *b == "bin")
+}
+
 /// Give the programs [`not_runnable`] named their execute bits back, as the
-/// archive carries them (`0755`). Nothing else about them changes.
+/// archive carries them (`0755`). Nothing else about them changes. A name
+/// that is not `bin/<name>`, or a file that is a link, is refused: the names
+/// come from a list on disk, and a link would carry the change elsewhere.
 pub fn make_runnable(root: &Path, files: &[String]) -> Result<(), String> {
+    for rel in files {
+        if !is_bin_program(rel) {
+            return Err(format!("{rel} is not a program of the engine"));
+        }
+        let path = root.join(rel);
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("{} could not be read: {e}", path.display()))?;
+        if !meta.file_type().is_file() {
+            return Err(format!("{} is not a plain file", path.display()));
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -370,6 +391,17 @@ pub async fn install_from_archive(
     if let Err(e) = result {
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
+    }
+
+    // Never under a running program: a node started from this folder keeps
+    // it, whatever the download brought.
+    if engine_files::process_runs_from(root) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!(
+            "A node is running from the swarm engine in {}, so it was not replaced. It is \
+             replaced once nothing runs from it.",
+            root.display()
+        ));
     }
 
     // In place, in one rename. An older install steps aside first and is
@@ -1013,6 +1045,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(health(&pin, &root), Health::Whole);
+    }
+
+    /// The names come from a list on disk: one that leaves the folder, or a
+    /// link, is refused and nothing outside changes.
+    #[test]
+    fn make_runnable_refuses_links_and_names_outside_bin() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("eng");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, b"x").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("bin/btxd")).unwrap();
+        for rel in [
+            "bin/btxd",
+            "../outside",
+            "bin/../../outside",
+            "/etc/passwd",
+            "bin/a/b",
+        ] {
+            assert!(make_runnable(&root, &[rel.to_string()]).is_err(), "{rel}");
+        }
+        let mode = std::fs::metadata(&outside).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "nothing outside changed");
+        // A link in bin/ is not reported as a program to fix either.
+        assert!(!is_bin_program("bin/../x") && is_bin_program("bin/btxd"));
+    }
+
+    /// A node running from the swarm engine's folder: a fresh download is
+    /// not put in its place, and the running program and its folder stay.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_swarm_engine_a_node_runs_from_is_not_replaced() {
+        let archive = engine("v0.34.16", true);
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.tar.gz");
+        std::fs::write(&a, &archive).unwrap();
+        let pin = pin_for(&archive, "");
+        let root = dir.path().join("btx").join(&pin.key).join("plat");
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        install_from_archive(&pin, &root, &a, "good signature", &yes)
+            .await
+            .unwrap();
+        // Damage it, and run a program from it.
+        std::fs::write(root.join("bin/btx-modeld"), b"he").unwrap();
+        let runner = root.join("bin").join("running-node");
+        std::fs::copy("/bin/sleep", &runner).unwrap();
+        let mut child = std::process::Command::new(&runner)
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let err = install_from_archive(&pin, &root, &a, "good signature", &yes)
+            .await
+            .unwrap_err();
+        assert!(err.contains("was not replaced"), "{err}");
+        assert!(runner.is_file(), "the folder in use was not moved");
+        assert_eq!(std::fs::read(root.join("bin/btx-modeld")).unwrap(), b"he");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the program still runs"
+        );
+        assert_eq!(leftovers(root.parent().unwrap()), vec!["plat"]);
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     /// The same tag, another archive: the install made from the first one is

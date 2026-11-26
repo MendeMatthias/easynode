@@ -35,6 +35,8 @@ pub enum Ask<T: Serialize> {
 pub(crate) fn degrade<T: Serialize>(e: AppError) -> Ask<T> {
     match e {
         AppError::Rpc { code: -28, .. } => Ask::Warming,
+        // A 503 (a restart under way): the panel's "ask again in a moment".
+        ref e if btx_core::rpc::is_not_ready(e) => Ask::Warming,
         other => Ask::Unavailable {
             message: other.to_string(),
         },

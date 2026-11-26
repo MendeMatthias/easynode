@@ -876,8 +876,77 @@ pub fn version_output_matches_tag(output: &str, tag: &str) -> bool {
         .any(|tok| tok == tag)
 }
 
+/// How long `btxd --version` may take. It answers in well under a second;
+/// one that hangs (a broken copy, a stalled disk) must not hold a start, and
+/// the Start button with it, for ever.
+pub const VERSION_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run `cmd` to its end, or kill it after `timeout`. Its output is read on
+/// two threads so a full pipe cannot stall it.
+fn output_within(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let read_all = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = read_all(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err = read_all(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    let Some(status) = status else {
+        return Ok(None);
+    };
+    Ok(Some(std::process::Output {
+        status,
+        stdout: out.join().unwrap_or_default(),
+        stderr: err.join().unwrap_or_default(),
+    }))
+}
+
 /// Execute the staged btxd and confirm it reports `expected_tag`.
 pub(crate) fn verify_btxd_reports_tag(btxd: &Path, expected_tag: &str) -> AppResult<()> {
+    verify_btxd_reports_tag_within(btxd, expected_tag, VERSION_CHECK_TIMEOUT)
+}
+
+fn verify_btxd_reports_tag_within(
+    btxd: &Path,
+    expected_tag: &str,
+    timeout: std::time::Duration,
+) -> AppResult<()> {
     let mut cmd = std::process::Command::new(btxd);
     cmd.arg("--version");
     #[cfg(windows)]
@@ -886,12 +955,20 @@ pub(crate) fn verify_btxd_reports_tag(btxd: &Path, expected_tag: &str) -> AppRes
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
     crate::platform::no_loader_error_dialogs();
-    let out = cmd.output().map_err(|e| {
-        AppError::Process(format!(
-            "staged btxd at {} could not be executed: {e}",
-            btxd.display()
-        ))
-    })?;
+    let out = output_within(cmd, timeout)
+        .map_err(|e| {
+            AppError::Process(format!(
+                "staged btxd at {} could not be executed: {e}",
+                btxd.display()
+            ))
+        })?
+        .ok_or_else(|| {
+            AppError::Process(format!(
+                "`btxd --version` at {} did not answer in {} s and was stopped",
+                btxd.display(),
+                timeout.as_secs()
+            ))
+        })?;
     // btxd writes its banner to stdout; keep stderr in play so a wrapper that
     // reports there is still understood.
     let text = format!(
@@ -1032,6 +1109,112 @@ pub fn reinstall_missing_engine(
         }
     }
     Ok(())
+}
+
+/// What [`put_back_missing_engine`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutBack {
+    /// Nothing of the engine was there: the whole engine was installed, as
+    /// setup installs it.
+    Installed,
+    /// The same build with files gone: only those were copied.
+    Repaired(crate::engine_files::Damage),
+    /// Nothing was copied, and why, as a sentence.
+    LeftAlone(String),
+}
+
+/// Put back the pinned engine whose folder lacks btxd or btx-cli, under the
+/// rules the start-time file check keeps (`engine_files::check_and_repair`):
+///
+/// * nothing is copied into a folder a program runs from
+///   ([`crate::engine_files::process_runs_from`]); the caller also passes
+///   whether a node holds the node folder or answers its RPC, and asks this
+///   only when none does;
+/// * an empty folder gets the whole engine ([`reinstall_missing_engine`],
+///   setup's copy, the version check included);
+/// * a folder with some of the engine gets back only the files that are
+///   gone, and only when it is this app's build: another build (other file
+///   sizes) is left exactly as it is;
+/// * on macOS a partial folder is only reported, as the file check does.
+pub fn put_back_missing_engine(
+    bundled_pkg_dir: Option<&Path>,
+    install_root: &Path,
+    datadir: &Path,
+    conf_if_missing: &str,
+    macos: bool,
+) -> AppResult<PutBack> {
+    use crate::engine_files::{Check, Mode, NotCopied};
+    if crate::engine_files::process_runs_from(install_root) {
+        return Ok(PutBack::LeftAlone(format!(
+            "a program is running from {}, so nothing is copied into it while it runs",
+            install_root.display()
+        )));
+    }
+    let Some(pkg) = bundled_pkg_dir else {
+        // No package in this build: the reinstall's own sentence says so.
+        return reinstall_missing_engine(None, install_root, datadir, conf_if_missing)
+            .map(|()| PutBack::Installed);
+    };
+    if crate::engine_files::nothing_installed(pkg, install_root)? {
+        reinstall_missing_engine(Some(pkg), install_root, datadir, conf_if_missing)?;
+        return Ok(PutBack::Installed);
+    }
+    let mode = if macos {
+        Mode::ReportOnly(NotCopied::MacOs)
+    } else {
+        Mode::Repair
+    };
+    let other_build = || {
+        PutBack::LeftAlone(format!(
+            "the engine in {} is another build than the one this app carries (its file \
+             sizes differ), so it is left exactly as it is; install this app again, or remove \
+             that folder and press Start node",
+            install_root.display()
+        ))
+    };
+    let outcome = crate::engine_files::check_and_repair(pkg, install_root, datadir, mode)?;
+    match outcome {
+        Check::Repaired(damage) => {
+            for name in ["btxd", "btx-cli"] {
+                let file = install_root
+                    .join("bin")
+                    .join(crate::platform::exe_name(name));
+                if !file.is_file() {
+                    return Err(AppError::Config(format!(
+                        "the copy finished but {} is still not there",
+                        file.display()
+                    )));
+                }
+            }
+            Ok(PutBack::Repaired(damage))
+        }
+        Check::Found {
+            why: NotCopied::OtherBuild,
+            ..
+        }
+        | Check::Adopted {
+            other_build: true, ..
+        } => Ok(other_build()),
+        Check::Found {
+            damage,
+            why: NotCopied::MacOs,
+        } => Ok(PutBack::LeftAlone(format!(
+            "{} of the engine in {} are missing; on a Mac they are only reported, not copied",
+            damage.describe(),
+            install_root.display()
+        ))),
+        Check::Found {
+            why: NotCopied::NodeRunning,
+            ..
+        } => Ok(PutBack::LeftAlone(format!(
+            "a node is running from {}, so nothing is copied into it while it runs",
+            install_root.display()
+        ))),
+        Check::Complete | Check::Adopted { .. } => Err(AppError::Config(format!(
+            "the engine's file list in {} says it is whole, yet btxd or btx-cli is missing",
+            install_root.display()
+        ))),
+    }
 }
 
 pub fn provision_node_package(
@@ -1964,6 +2147,137 @@ mod tests {
             .join("bin")
             .join(crate::platform::exe_name("btxd"))
             .exists());
+    }
+
+    /// btx-cli deleted (antivirus) from a folder btxd runs from: nothing is
+    /// copied into it, and btxd's file (inode and mtime) is untouched. With
+    /// nothing running from it, only btx-cli is copied back, and btxd's file
+    /// is still the same one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_folder_a_program_runs_from_gets_nothing_and_a_stopped_one_gets_only_whats_gone() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("pkg");
+        let install = tmp.path().join("install");
+        let datadir = tmp.path().join("datadir");
+        fake_node_pkg(&pkg);
+        provision_node_package(&pkg, &install, &datadir, NODE_FASTSTART_CONF).unwrap();
+        let btxd = install.join("bin").join("btxd");
+        let cli = install.join("bin").join("btx-cli");
+        std::fs::remove_file(&cli).unwrap();
+        let before = std::fs::metadata(&btxd).unwrap();
+
+        // A program running from the folder (a copy of `sleep` in libexec).
+        let runner = install.join("libexec").join("keepalive");
+        std::fs::copy("/bin/sleep", &runner).unwrap();
+        let mut child = std::process::Command::new(&runner)
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let out =
+            put_back_missing_engine(Some(&pkg), &install, &datadir, NODE_FASTSTART_CONF, false)
+                .unwrap();
+        assert!(
+            matches!(&out, PutBack::LeftAlone(why) if why.contains("is running from")),
+            "{out:?}"
+        );
+        assert!(!cli.exists(), "nothing was copied");
+        let still = std::fs::metadata(&btxd).unwrap();
+        assert_eq!((still.ino(), still.mtime()), (before.ino(), before.mtime()));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        std::fs::remove_file(&runner).unwrap();
+
+        // Nothing runs from it now: btx-cli alone comes back.
+        let out =
+            put_back_missing_engine(Some(&pkg), &install, &datadir, NODE_FASTSTART_CONF, false)
+                .unwrap();
+        assert!(
+            matches!(&out, PutBack::Repaired(d) if d.describe().contains("bin/btx-cli")),
+            "{out:?}"
+        );
+        assert!(cli.is_file());
+        let after = std::fs::metadata(&btxd).unwrap();
+        assert_eq!(after.ino(), before.ino(), "btxd was not replaced");
+    }
+
+    /// Another build in the pinned folder (other file sizes, no list), with
+    /// btx-cli gone: left exactly as it is.
+    #[test]
+    fn another_build_in_the_pinned_folder_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("pkg");
+        let install = tmp.path().join("install");
+        let datadir = tmp.path().join("datadir");
+        fake_node_pkg(&pkg);
+        fake_node_pkg(&install);
+        let btxd = install.join("bin").join(crate::platform::exe_name("btxd"));
+        std::fs::write(&btxd, b"#!/bin/sh\nexec another-build\n").unwrap();
+        std::fs::remove_file(
+            install
+                .join("bin")
+                .join(crate::platform::exe_name("btx-cli")),
+        )
+        .unwrap();
+        let out =
+            put_back_missing_engine(Some(&pkg), &install, &datadir, NODE_FASTSTART_CONF, false)
+                .unwrap();
+        assert!(
+            matches!(&out, PutBack::LeftAlone(why) if why.contains("another build")),
+            "{out:?}"
+        );
+        assert_eq!(
+            std::fs::read(&btxd).unwrap(),
+            b"#!/bin/sh\nexec another-build\n"
+        );
+        assert!(!install
+            .join("bin")
+            .join(crate::platform::exe_name("btx-cli"))
+            .exists());
+
+        // On a Mac a partial folder of this build is only reported.
+        let same = tmp.path().join("same");
+        provision_node_package(&pkg, &same, &datadir, NODE_FASTSTART_CONF).unwrap();
+        let cli = same.join("bin").join(crate::platform::exe_name("btx-cli"));
+        std::fs::remove_file(&cli).unwrap();
+        let out = put_back_missing_engine(Some(&pkg), &same, &datadir, NODE_FASTSTART_CONF, true)
+            .unwrap();
+        assert!(
+            matches!(&out, PutBack::LeftAlone(why) if why.contains("only reported")),
+            "{out:?}"
+        );
+        assert!(!cli.exists());
+        // And an empty folder is a whole install.
+        let empty = tmp.path().join("empty");
+        assert_eq!(
+            put_back_missing_engine(Some(&pkg), &empty, &datadir, NODE_FASTSTART_CONF, false)
+                .unwrap(),
+            PutBack::Installed
+        );
+    }
+
+    /// A btxd whose `--version` never ends: the check stops it and says so.
+    #[cfg(unix)]
+    #[test]
+    fn a_version_check_that_hangs_is_stopped_after_its_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let btxd = tmp.path().join("btxd");
+        std::fs::write(&btxd, b"#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&btxd, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let err =
+            verify_btxd_reports_tag_within(&btxd, "v0.34.16", std::time::Duration::from_secs(1))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("did not answer in 1 s"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // One that answers is read as before.
+        std::fs::write(&btxd, b"#!/bin/sh\necho 'BTX daemon version v0.34.16'\n").unwrap();
+        verify_btxd_reports_tag_within(&btxd, "v0.34.16", std::time::Duration::from_secs(10))
+            .unwrap();
     }
 
     /// `returning_launch_paths`'s test of a folder, without a HOME.

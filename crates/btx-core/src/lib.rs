@@ -54,6 +54,7 @@ pub mod operators;
 pub mod platform;
 pub mod power;
 pub mod read_block_recovery;
+pub mod repair_bound;
 pub mod role;
 pub mod rpc;
 pub mod sentinel;
