@@ -1164,6 +1164,19 @@ pub fn put_back_missing_engine(
     } else {
         Mode::Repair
     };
+    // Another build: a file there, not cut off to nothing, at another size
+    // than the package's. Decided from the files themselves, before the
+    // check, so not even a file list is written into that folder.
+    let listing = crate::engine_files::list_tree(pkg)?;
+    let another_build = crate::engine_files::damage_against(install_root, &listing)
+        .wrong_size
+        .iter()
+        .any(|rel| {
+            let path = rel
+                .split('/')
+                .fold(install_root.to_path_buf(), |p, part| p.join(part));
+            std::fs::metadata(path).is_ok_and(|m| m.len() > 0)
+        });
     let other_build = || {
         PutBack::LeftAlone(format!(
             "the engine in {} is another build than the one this app carries (its file \
@@ -1172,6 +1185,9 @@ pub fn put_back_missing_engine(
             install_root.display()
         ))
     };
+    if another_build {
+        return Ok(other_build());
+    }
     let outcome = crate::engine_files::check_and_repair(pkg, install_root, datadir, mode)?;
     match outcome {
         Check::Repaired(damage) => {
@@ -2228,6 +2244,13 @@ mod tests {
             std::fs::read(&btxd).unwrap(),
             b"#!/bin/sh\nexec another-build\n"
         );
+        // Not even a file list was written into it, so the next press says
+        // the same thing.
+        assert!(!install.join(crate::engine_files::MANIFEST_NAME).exists());
+        let again =
+            put_back_missing_engine(Some(&pkg), &install, &datadir, NODE_FASTSTART_CONF, false)
+                .unwrap();
+        assert_eq!(again, out);
         assert!(!install
             .join("bin")
             .join(crate::platform::exe_name("btx-cli"))
