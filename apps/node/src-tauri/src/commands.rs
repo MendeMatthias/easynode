@@ -3720,10 +3720,12 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                                 return; // stopped, restarted or quitting meanwhile
                             }
                             if wsl_path {
+                                let recovery = next_gpu_recovery(&state);
                                 recover_by_restarting_wsl(
                                     &restart_app,
                                     &state,
                                     owner_mark,
+                                    recovery,
                                     restarting,
                                 )
                                 .await;
@@ -6587,6 +6589,7 @@ async fn recover_by_restarting_wsl(
     app: &AppHandle,
     state: &State<'_, AppState>,
     owner_mark: u64,
+    recovery: u64,
     restarting: crate::tools::Claim<'static>,
 ) {
     let log = |note: &str| {
@@ -6614,6 +6617,7 @@ async fn recover_by_restarting_wsl(
     wsl_recovery_after_prepare(
         state,
         owner_mark,
+        recovery,
         restarting,
         set_phase(app, state, NodePhase::Stopped),
         || run_wsl_restart(&command),
@@ -6630,11 +6634,14 @@ async fn recover_by_restarting_wsl(
 /// failed or WSL did not take the app down within `grace`. Never a start
 /// after an owner's Stop that came after `owner_mark`, and the safety net
 /// only for a node nobody started meanwhile, under the claim `reclaim`
-/// takes. Generic so it is tested without a window or a WSL.
+/// takes, and only while `recovery` is still the latest one
+/// ([`next_gpu_recovery`]): a later recovery makes its own start (#247).
+/// Generic so it is tested without a window or a WSL.
 #[allow(clippy::too_many_arguments)]
 async fn wsl_recovery_after_prepare<C, P, R, Q, G, S, F>(
     state: &AppState,
     owner_mark: u64,
+    recovery: u64,
     restarting: C,
     stopped: P,
     run: R,
@@ -6684,6 +6691,10 @@ async fn wsl_recovery_after_prepare<C, P, R, Q, G, S, F>(
         log("WSL was not restarted, and the owner stopped the node meanwhile; it stays stopped");
         return;
     }
+    if state.gpu_recoveries.load(Ordering::SeqCst) != recovery {
+        log("WSL was not restarted, and a later recovery has gone ahead; it starts the node");
+        return;
+    }
     log(&format!(
         "WSL was not restarted within {} s (on Windows, see %TEMP%\\{}); starting the node again",
         grace.as_secs(),
@@ -6694,6 +6705,18 @@ async fn wsl_recovery_after_prepare<C, P, R, Q, G, S, F>(
             "the restart for a lost block verifier failed: {e}"
         ));
     }
+}
+
+/// Number a GPU recovery by WSL restart that goes ahead. Only the latest
+/// one's safety net may start the node: two recoveries in a row must not
+/// start it twice, or start it while the second's WSL restart is due (#247).
+///
+/// The rule that decides a recovery already keeps two apart in practice: it
+/// needs the verifier lost for `VERIFIER_LOST_RESTART_AFTER` (15 min) in the
+/// current run, and a run started inside the first one's two-minute wait is
+/// younger than that. This makes it hold without that timing.
+fn next_gpu_recovery(state: &AppState) -> u64 {
+    state.gpu_recoveries.fetch_add(1, Ordering::SeqCst) + 1
 }
 
 /// How long the app waits for `wsl --shutdown` to take it down before it
@@ -6853,8 +6876,6 @@ async fn end_header_bootstrap_with_restart(
     // start between this stop and this start. Without it the two
     // interleaved on 2026-11-26: the switch's stop ran while this restart
     // was starting the node, and the switch's start was refused.
-    // The owner's Stops as they stand when this restart was asked for.
-    let owner_mark = owner_stop_mark(state);
     let _restarting = crate::tools::restart_claim_when_free().await;
     // A stop under way (an owner's Stop still flushing, with RPC still
     // armed) is waited out before deciding, or this restart would start the
@@ -6862,6 +6883,11 @@ async fn end_header_bootstrap_with_restart(
     while stop_under_way(state) {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+    // The owner's Stops as they stand when this restart decides, not when it
+    // was asked for: a Stop and Start pressed while it waited leave a
+    // running bootstrap launch that still needs this restart, and a Stop
+    // alone leaves no RPC, so it is not due (#247).
+    let owner_mark = owner_stop_mark(state);
     // Decided again now that the claim is held: the decision that spawned
     // this task may be stale. A restart that ran while this one waited may
     // have ended the bootstrap already, and a second task (spawned by the
@@ -8857,9 +8883,6 @@ fn swarm_switch_message(
 async fn apply_swarm_switch(app: AppHandle, on: bool) {
     use tauri::Manager;
     let state = app.state::<AppState>();
-    // An owner's Stop after the switch was flipped ends its restart: the
-    // node stays stopped, and the next start follows the setting (#242).
-    let owner_mark = owner_stop_mark(&state);
     let datadir = node_datadir();
     if on && swarm_engine_installed().is_none() {
         let Some(pin) = swarm_engine_pin() else {
@@ -8938,16 +8961,24 @@ async fn apply_swarm_switch(app: AppHandle, on: bool) {
     };
     let began = std::time::Instant::now();
     let mut waited = false;
+    // An owner's Stop from here on ends this restart: the node stays stopped,
+    // and the next start follows the setting (#242). Read after the download
+    // and install, not when the switch was flipped: a Stop and Start pressed
+    // during the download left the node on the usual engine with the switch
+    // on (#247). `switch_owner_mark` keeps that true while the restart waits.
+    let mut owner_mark = owner_stop_mark(&state);
     loop {
         let busy = crate::tools::restart_in_progress()
             || state.start_in_flight.load(Ordering::SeqCst)
             || stop_under_way(&state);
+        let rpc_armed = state.rpc.lock().await.is_some();
+        owner_mark = switch_owner_mark(&state, owner_mark, busy, rpc_armed);
         let step = swarm_restart_step(
             on,
             NodeAppSettings::load(&datadir).swarm_enabled,
             state.quitting.load(Ordering::SeqCst),
             busy,
-            state.rpc.lock().await.is_some(),
+            rpc_armed,
             btx_core::swarm::wanted(&datadir),
             swarm_hold(&datadir).is_some(),
             owner_stopped_since(&state, owner_mark),
@@ -8993,6 +9024,20 @@ async fn apply_swarm_switch(app: AppHandle, on: bool) {
                 }
             }
         }
+    }
+}
+
+/// The owner-stop mark the swarm switch's restart decides on. An owner's
+/// Stop since `mark` ends the restart, unless the owner has started the node
+/// again since: then the node runs on whatever engine that start chose, and
+/// the switch still has its restart to make, so the mark moves to now (#247).
+/// A stop or start still under way (`busy`) keeps the mark; the next look
+/// decides.
+fn switch_owner_mark(state: &AppState, mark: u64, busy: bool, rpc_armed: bool) -> u64 {
+    if owner_stopped_since(state, mark) && !busy && rpc_armed {
+        owner_stop_mark(state)
+    } else {
+        mark
     }
 }
 
@@ -15597,6 +15642,7 @@ mod swarm_tests {
                 super::wsl_recovery_after_prepare(
                     &s,
                     mark,
+                    super::next_gpu_recovery(&s),
                     (),
                     async {},
                     move || {
@@ -15637,6 +15683,7 @@ mod swarm_tests {
             super::wsl_recovery_after_prepare(
                 &state,
                 super::owner_stop_mark(&state),
+                super::next_gpu_recovery(&state),
                 Claim(released.clone()),
                 async {},
                 move || {
@@ -15668,6 +15715,7 @@ mod swarm_tests {
             super::wsl_recovery_after_prepare(
                 &s,
                 mark,
+                super::next_gpu_recovery(&s),
                 (),
                 async {},
                 || Ok(()),
@@ -15682,6 +15730,123 @@ mod swarm_tests {
         super::stop_node_by_owner(&state).await;
         recovery.await.unwrap();
         assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Issue #247, case 1: the owner presses Stop and then Start while the
+    /// swarm engine downloads. Their Start runs the usual engine; when the
+    /// install finishes, the switch still restarts the node onto the swarm
+    /// engine. Before the fix it read its mark at the flip, saw the Stop and
+    /// gave up, leaving the switch on and the node on the usual engine.
+    #[tokio::test]
+    async fn a_stop_and_start_during_the_swarm_install_still_ends_on_the_swarm_engine() {
+        use super::SwarmRestartStep::{Done, Restart, Wait};
+        let state = super::AppState::new();
+        // The switch is flipped on; the download begins.
+        let mark = super::owner_stop_mark(&state);
+        // Stop, then Start, during the download: the node runs again, on the
+        // usual engine (the swarm engine is not installed yet).
+        super::stop_node_by_owner(&state).await;
+        *state.rpc.lock().await = Some(btx_core::rpc::RpcClient::new(
+            "http://127.0.0.1:9",
+            "u",
+            "p",
+        ));
+        // The install finishes and the restart decides.
+        let step = |mark: u64, busy: bool, rpc: bool| {
+            let mark = super::switch_owner_mark(&state, mark, busy, rpc);
+            (
+                mark,
+                swarm_restart_step(
+                    true,
+                    true,
+                    false,
+                    busy,
+                    rpc,
+                    false,
+                    false,
+                    super::owner_stopped_since(&state, mark),
+                ),
+            )
+        };
+        let (mark, decided) = step(mark, false, true);
+        assert_eq!(decided, Restart, "the node is left on the usual engine");
+        // A Stop after the install, still flushing (RPC armed, busy), ends
+        // the restart rather than being taken for a Start: the mark stays,
+        // the node stays stopped, and the owner's next start launches the
+        // swarm engine, which is installed by now.
+        state
+            .owner_stops
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (kept, decided) = step(mark, true, true);
+        assert_eq!(kept, mark);
+        assert_eq!(decided, Done);
+        // Likewise once that Stop is over and nothing started the node.
+        *state.rpc.lock().await = None;
+        assert_eq!(step(mark, false, false).1, Done);
+        // Another restart under way with no Stop is waited for.
+        let now = super::owner_stop_mark(&state);
+        assert_eq!(step(now, true, true).1, Wait);
+        // The loop decides with this mark, read after the install.
+        let src = include_str!("commands.rs");
+        let production = src.split("\nmod swarm_tests {").next().unwrap();
+        let apply = production
+            .split("\nasync fn apply_swarm_switch(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap();
+        let fetch = apply.find("fetch_and_install(").unwrap();
+        let read = apply
+            .find("let mut owner_mark = owner_stop_mark(&state);")
+            .unwrap();
+        let moved = apply
+            .find("owner_mark = switch_owner_mark(&state, owner_mark, busy, rpc_armed);")
+            .unwrap();
+        assert!(fetch < read && read < moved);
+    }
+
+    /// Issue #247, case 2: two WSL recoveries in a row, the second going
+    /// ahead while the first one waits for WSL to take the app down. The node
+    /// is started exactly once, by the second one's safety net; the first's
+    /// does nothing.
+    #[tokio::test]
+    async fn two_wsl_recoveries_in_a_row_start_the_node_once() {
+        let state = std::sync::Arc::new(super::AppState::new());
+        let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mark = super::owner_stop_mark(&state);
+        let first = super::next_gpu_recovery(&state);
+        let (s, start) = (state.clone(), counting_start(&starts));
+        let earlier = tokio::spawn(async move {
+            super::wsl_recovery_after_prepare(
+                &s,
+                mark,
+                first,
+                (),
+                async {},
+                || Ok(()),
+                std::time::Duration::from_millis(400),
+                async {},
+                start,
+                &|_| {},
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let second = super::next_gpu_recovery(&state);
+        super::wsl_recovery_after_prepare(
+            &state,
+            mark,
+            second,
+            (),
+            async {},
+            || Ok(()),
+            std::time::Duration::from_millis(400),
+            async {},
+            counting_start(&starts),
+            &|_| {},
+        )
+        .await;
+        earlier.await.unwrap();
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// Two restarts that end one header bootstrap (one waited for the claim

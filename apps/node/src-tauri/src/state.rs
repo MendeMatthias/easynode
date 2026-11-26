@@ -775,6 +775,10 @@ pub struct AppState {
     /// Stop from before the decision, a restart the owner asked for after
     /// it, holds back nothing (#242).
     pub owner_stops: Arc<AtomicU64>,
+    /// How many GPU recoveries by WSL restart have gone ahead in this run
+    /// (`commands::next_gpu_recovery`). A recovery's two-minute safety net
+    /// starts the node only while it is still the latest one (#247).
+    pub gpu_recoveries: Arc<AtomicU64>,
     /// Set once a graceful quit is under way, so the ExitRequested handler knows
     /// the async shutdown already ran and can let the exit proceed instead of
     /// blocking the main thread a second time (the old force-quit-inducing hang).
@@ -1022,6 +1026,7 @@ impl AppState {
             refresher_gen: Arc::new(AtomicU64::new(0)),
             stops_under_way: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             owner_stops: Arc::new(AtomicU64::new(0)),
+            gpu_recoveries: Arc::new(AtomicU64::new(0)),
             quitting: Arc::new(AtomicBool::new(false)),
             load_failure_restarted: Arc::new(AtomicBool::new(false)),
             rc_status_cache: Arc::new(Mutex::new(None)),
