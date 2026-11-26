@@ -4219,6 +4219,24 @@ fn read_tail(path: &Path, max: u64) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// The arguments of `btx-cli ... stop` for a node this app launched: its
+/// datadir and, when known, the conf it was launched with. btxd takes its
+/// `rpcport` from that conf (`build_node_command` passes `-conf=`), and
+/// btx-cli without it asks the default port. On a machine where that port is
+/// another node's, the request goes there and is refused (measured
+/// 2026-11-26 in an isolated test home whose conf moved the port: btx-cli
+/// answered `Authorization failed`, the node the app launched never got the
+/// request, and the app waited on it, which also held up every restart
+/// behind it, the swarm switch's included).
+fn stop_command_args(datadir: &Path, conf: Option<&Path>) -> Vec<String> {
+    let mut args = vec![format!("-datadir={}", datadir.display())];
+    if let Some(conf) = conf {
+        args.push(format!("-conf={}", conf.display()));
+    }
+    args.push("stop".to_string());
+    args
+}
+
 /// The launch parameters captured on `start`, so a later `restart` can re-spawn
 /// btxd with the exact same configuration without the caller re-supplying them.
 #[derive(Debug, Clone)]
@@ -4883,14 +4901,41 @@ impl NodeController {
         }
 
         // Issue the graceful stop request. btxd's stop RPC returns once it has
-        // received the request, NOT when it has finished flushing.
+        // received the request, NOT when it has finished flushing. It goes
+        // with the conf this controller launched the node with
+        // ([`stop_command_args`]), so btx-cli asks the port the node listens
+        // on.
+        let conf = self
+            .config
+            .as_ref()
+            .filter(|c| c.datadir == datadir)
+            .map(|c| c.conf.clone());
         let mut stop_cmd = Command::new(btx_cli);
-        stop_cmd
-            .arg(format!("-datadir={}", datadir.display()))
-            .arg("stop");
+        stop_cmd.args(stop_command_args(datadir, conf.as_deref()));
         #[cfg(windows)]
         stop_cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        let _ = stop_cmd.status().await;
+        let asked = matches!(stop_cmd.status().await, Ok(s) if s.success());
+        // A request that did not arrive (btx-cli could not run, or reached no
+        // node that took it) must not leave the wait below watching a node
+        // that was never asked: a node in its first sync keeps a core busy,
+        // which the wait reads as a flush, for up to SHUTDOWN_BUSY_CAP_SECS.
+        // btxd takes SIGTERM as the same graceful request.
+        #[cfg(unix)]
+        if !asked {
+            if let Some(pid) = child.as_ref().and_then(|c| c.id()) {
+                eprintln!(
+                    "[node] btx-cli stop did not reach btxd (pid {pid}); asking it with SIGTERM, \
+                     which it takes as the same graceful stop"
+                );
+                // SAFETY: kill(2) on the pid of the child this controller
+                // spawned and has not reaped; it only sends a signal.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = asked;
 
         if let Some(mut c) = child {
             let grace = std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS);
@@ -5741,6 +5786,66 @@ mod tests {
         assert_eq!(cpu_sample_every(ms(90_000)), ms(5000));
         assert_eq!(cpu_sample_every(ms(2000)), ms(500));
         assert_eq!(cpu_sample_every(ms(100)), ms(250));
+    }
+
+    #[test]
+    fn the_stop_request_names_the_conf_the_node_was_launched_with() {
+        let d = Path::new("/h/.easybtx");
+        let conf = Path::new("/h/.easybtx/faststart/faststart.conf");
+        assert_eq!(
+            stop_command_args(d, Some(conf)),
+            vec![
+                "-datadir=/h/.easybtx".to_string(),
+                "-conf=/h/.easybtx/faststart/faststart.conf".to_string(),
+                "stop".to_string(),
+            ]
+        );
+        assert_eq!(
+            stop_command_args(d, None),
+            vec!["-datadir=/h/.easybtx".to_string(), "stop".to_string()]
+        );
+    }
+
+    /// The real stop, on a real child: btx-cli is given the launch conf, and
+    /// when its request does not arrive (it exits 1, as `Authorization
+    /// failed` does) the node is asked with SIGTERM instead of being watched
+    /// until the grace runs out. Before 2026-11-26 this waited the whole
+    /// 90 s grace and then killed the node.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_request_that_does_not_arrive_is_made_again_with_sigterm() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut controller = start_shim(tmp.path(), "exec sleep 600").await;
+        let cli = tmp.path().join("btx-cli-refused");
+        let args_file = tmp.path().join("cli-args");
+        std::fs::write(
+            &cli,
+            format!(
+                "#!/bin/sh\necho \"$@\" > '{}'\necho 'error: Authorization failed' >&2\nexit 1\n",
+                args_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            controller.stop(&cli, tmp.path()),
+        )
+        .await
+        .expect("the stop waited out its grace on a node that was never asked")
+        .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        assert!(
+            args.contains(&format!(
+                "-conf={}",
+                tmp.path().join("faststart.conf").display()
+            )),
+            "{args}"
+        );
+        assert!(args.trim_end().ends_with("stop"), "{args}");
     }
 
     /// The quit backstop abandons the stop; it must not kill the node with it.

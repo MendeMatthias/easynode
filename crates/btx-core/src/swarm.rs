@@ -273,12 +273,27 @@ pub enum Seen {
     /// On, and the helper that runs it is not answering. `why` is the
     /// engine's sentence (a missing `btx-modeld` reads like this).
     HelperDown { why: String },
+    /// The node is up and still loading (JSON-RPC -28, "in warmup"): it
+    /// answers nothing yet, the model network included. The ordinary
+    /// minutes after a start, not a fault.
+    Starting,
     /// On and reporting.
     Observing(Report),
     /// On, and the answer is not in a shape this app knows.
     Unreadable { why: String },
     /// The node did not answer at all.
     Unreachable { why: String },
+}
+
+/// [`read`] for the node that is running now. Which engine it runs is decided
+/// at its launch, and the launch marker says so ([`wanted`]: on exactly when
+/// the swarm engine was launched). A node launched on the default engine,
+/// which has no model network, is not asked at all.
+pub async fn read_running(rpc: &dyn Rpc, datadir: &Path, now_ms: u64) -> Seen {
+    if !wanted(datadir) {
+        return Seen::NoModelNetwork;
+    }
+    read(rpc, datadir, now_ms).await
 }
 
 /// Ask the node. Two read-only commands, `getmodelnetworkinfo` and, only when
@@ -288,6 +303,7 @@ pub async fn read(rpc: &dyn Rpc, datadir: &Path, now_ms: u64) -> Seen {
         Ok(v) => v,
         // JSON-RPC "method not found": the build has no model network.
         Err(AppError::Rpc { code: -32601, .. }) => return Seen::NoModelNetwork,
+        Err(AppError::Rpc { code: -28, .. }) => return Seen::Starting,
         Err(e) => return Seen::Unreachable { why: e.to_string() },
     };
     if info["enabled"].as_bool() == Some(false) {
@@ -693,6 +709,26 @@ mod tests {
             "automatic_spend_atoms": "0", "execution_authorized": false,
             "observed_at_ms": NOW - 2000, "valid_until_ms": NOW + 28_000
         })
+    }
+
+    /// A node launched on the default engine (no launch marker) is not asked
+    /// about a model network it cannot have; one launched on the swarm
+    /// engine is.
+    #[tokio::test]
+    async fn the_running_node_is_asked_only_when_it_was_launched_on_the_swarm_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = node();
+        assert_eq!(
+            read_running(&n, dir.path(), NOW).await,
+            Seen::NoModelNetwork
+        );
+        assert!(n.methods().is_empty(), "{:?}", n.methods());
+        set_wanted(dir.path(), true).unwrap();
+        assert_eq!(
+            read_running(&n, dir.path(), NOW).await,
+            Seen::NoModelNetwork
+        );
+        assert_eq!(n.methods(), vec!["getmodelnetworkinfo"]);
     }
 
     #[tokio::test]

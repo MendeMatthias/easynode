@@ -39,6 +39,8 @@ export type SwarmCard = {
     | "engine_start_failed"
     | "starts_next_start"
     | "stops_next_start"
+    | "restarting"
+    | "starting"
     | "node_stopped"
     | "helper_down"
     | "observing"
@@ -117,6 +119,16 @@ function reportLines(r: SwarmReport): string[] {
   ];
 }
 
+/**
+ * Whether the message under the switch (what `set_swarm` answered) still
+ * says what is happening. It belongs to the card's state at the moment it
+ * appeared ("Downloading..." to `fetching`, say) and goes once the card
+ * moves on, so it never stands under a row that says something newer.
+ */
+export function swarmResultStillApplies(stateWhenShown: SwarmCard["state"], now: SwarmCard["state"]): boolean {
+  return stateWhenShown === now;
+}
+
 export function swarmView(c: SwarmCard): SwarmView {
   const base = { checked: c.wanted, disabled: false, lines: [] as string[], attention: false };
   // A switch that cannot be turned on is greyed out with the reason. It stays
@@ -171,6 +183,15 @@ export function swarmView(c: SwarmCard): SwarmView {
       return { ...base, desc: "On. It starts with the node, and only observes." };
     case "stops_next_start":
       return { ...base, desc: "Off at the next node start. Until then it is still running." };
+    case "restarting":
+      return {
+        ...base,
+        desc: c.wanted
+          ? "On. Restarting your node onto the swarm engine. This can wait for a restart or start already under way to finish first."
+          : "Off. Restarting your node onto its usual engine. Nothing the swarm wrote is deleted.",
+      };
+    case "starting":
+      return { ...base, desc: "On. Your node is starting on the swarm engine; what the swarm sees shows here once it is up." };
     case "helper_down":
       return {
         ...base,

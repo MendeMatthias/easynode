@@ -154,7 +154,7 @@ enum NoNode {
 
 /// What every Tools surface says to a node that is on its way up, whether
 /// the app is still starting it or the engine answers RPC_IN_WARMUP (-28).
-const STILL_STARTING: &str = "Your node is still starting. Try again in a moment.";
+pub(crate) const STILL_STARTING: &str = "Your node is still starting. Try again in a moment.";
 
 fn no_node(phase: &NodePhase) -> NoNode {
     match phase {
@@ -310,11 +310,36 @@ pub async fn tools_engine_notices(state: State<'_, AppState>) -> Result<Ask<Vec<
 /// the node the first one is starting, then fail its own start on top.
 static RESTARTING: AtomicBool = AtomicBool::new(false);
 
-const ALREADY_RESTARTING: &str = "Your node is already restarting. Give it a moment.";
+pub(crate) const ALREADY_RESTARTING: &str = "Your node is already restarting. Give it a moment.";
+
+/// Whether a restart (Tools, the swarm switch, or the one that ends a header
+/// bootstrap) holds the claim right now.
+pub(crate) fn restart_in_progress() -> bool {
+    RESTARTING.load(Ordering::SeqCst)
+}
+
+/// Whether a refused restart was refused only for now: another restart or a
+/// start is under way, and asking again once it is over may succeed.
+pub(crate) fn refused_for_now(why: &str) -> bool {
+    why == ALREADY_RESTARTING || why == STILL_STARTING || why == crate::commands::ALREADY_STARTING
+}
+
+/// The restart claim for a restart the app makes on its own (the one that
+/// ends a header bootstrap), waiting for one that is under way to finish
+/// rather than refusing. Holding it keeps another restart from stopping the
+/// node this one is starting, or the other way round.
+pub(crate) async fn restart_claim_when_free() -> Claim<'static> {
+    loop {
+        if let Some(claim) = Claim::take(&RESTARTING) {
+            return claim;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
 
 /// Holds a flag for as long as it lives and clears it on every way out: a
 /// return, an early `?`, an error from the restart, or a panic.
-struct Claim<'a>(&'a AtomicBool);
+pub(crate) struct Claim<'a>(&'a AtomicBool);
 
 impl<'a> Claim<'a> {
     /// The flag, if nobody holds it yet.

@@ -1,6 +1,14 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { type SwarmCard, type SwarmReport, SWARM_NOT_HERE, SWARM_SIGNER, swarmCopy, swarmView } from "./swarm-card";
+import {
+  type SwarmCard,
+  type SwarmReport,
+  SWARM_NOT_HERE,
+  SWARM_SIGNER,
+  swarmCopy,
+  swarmResultStillApplies,
+  swarmView,
+} from "./swarm-card";
 
 const card = (over: Partial<SwarmCard>): SwarmCard => ({
   wanted: false,
@@ -168,6 +176,28 @@ describe("the Swarm row", () => {
     expect(swarmView(card({ wanted: true, state: "starts_next_start" })).desc).toContain("On at the next node start");
     expect(swarmView(card({ wanted: false, state: "stops_next_start" })).desc).toContain("Off at the next node start");
     expect(swarmView(card({ wanted: true, state: "node_stopped" })).desc).toContain("starts with the node");
+  });
+
+  it("says the node is restarting onto the other engine, never that it did not answer", () => {
+    const on = swarmView(card({ wanted: true, state: "restarting" }));
+    expect(on.desc).toContain("Restarting your node onto the swarm engine");
+    expect(on.attention).toBe(false);
+    const off = swarmView(card({ wanted: false, state: "restarting" }));
+    expect(off.desc).toContain("Restarting your node onto its usual engine");
+    const starting = swarmView(card({ wanted: true, state: "starting" }));
+    expect(starting.desc).toContain("starting on the swarm engine");
+    for (const v of [on, off, starting]) {
+      expect(v.desc).not.toContain("did not answer");
+      expect(v.desc).not.toMatch(/  |\u2014/);
+    }
+  });
+
+  it("drops the message under the switch once the card has moved on", () => {
+    // "On. Downloading the swarm engine..." appeared while the card said fetching.
+    expect(swarmResultStillApplies("fetching", "fetching")).toBe(true);
+    expect(swarmResultStillApplies("fetching", "restarting")).toBe(false);
+    expect(swarmResultStillApplies("fetching", "observing")).toBe(false);
+    expect(swarmResultStillApplies("restarting", "observing")).toBe(false);
   });
 
   it("names a missing helper in the engine's words and says the node is fine", () => {
