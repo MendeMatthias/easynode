@@ -3720,12 +3720,10 @@ fn spawn_status_refresher(app: AppHandle, state: &AppState, bootstrap_launch: bo
                                 return; // stopped, restarted or quitting meanwhile
                             }
                             if wsl_path {
-                                let recovery = next_gpu_recovery(&state);
                                 recover_by_restarting_wsl(
                                     &restart_app,
                                     &state,
                                     owner_mark,
-                                    recovery,
                                     restarting,
                                 )
                                 .await;
@@ -5213,8 +5211,30 @@ pub(crate) fn stop_under_way(state: &AppState) -> bool {
 /// that decided before it does not start the node again after it (#242),
 /// then the ordinary stop.
 pub(crate) async fn stop_node_by_owner(state: &AppState) {
+    // Under way BEFORE it is counted: whoever reads a mark that includes
+    // this Stop then also sees a stop under way (`settled_owner_mark`), and
+    // never decides on a node whose RPC is still armed only because the
+    // Stop's flush has not begun (review of #248).
+    let _under_way = StopUnderWay::new(&state.stops_under_way);
     state.owner_stops.fetch_add(1, Ordering::SeqCst);
     stop_node_inner(state).await;
+}
+
+/// The owner-stop mark once no stop is under way, read so that a Stop that
+/// lands while it is read is seen: wait out stops, read the mark, and read
+/// again if a stop began meanwhile. A Stop counted in the mark is then over,
+/// so RPC says what it left (`stop_node_by_owner` counts itself as under way
+/// before it bumps the mark).
+async fn settled_owner_mark(state: &AppState) -> u64 {
+    loop {
+        while stop_under_way(state) {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let mark = owner_stop_mark(state);
+        if !stop_under_way(state) {
+            return mark;
+        }
+    }
 }
 
 /// Where the owner's Stops stand now; read when a restart decides to run.
@@ -6589,7 +6609,6 @@ async fn recover_by_restarting_wsl(
     app: &AppHandle,
     state: &State<'_, AppState>,
     owner_mark: u64,
-    recovery: u64,
     restarting: crate::tools::Claim<'static>,
 ) {
     let log = |note: &str| {
@@ -6617,7 +6636,6 @@ async fn recover_by_restarting_wsl(
     wsl_recovery_after_prepare(
         state,
         owner_mark,
-        recovery,
         restarting,
         set_phase(app, state, NodePhase::Stopped),
         || run_wsl_restart(&command),
@@ -6634,14 +6652,15 @@ async fn recover_by_restarting_wsl(
 /// failed or WSL did not take the app down within `grace`. Never a start
 /// after an owner's Stop that came after `owner_mark`, and the safety net
 /// only for a node nobody started meanwhile, under the claim `reclaim`
-/// takes, and only while `recovery` is still the latest one
-/// ([`next_gpu_recovery`]): a later recovery makes its own start (#247).
+/// takes, and only while it is still the latest recovery handed to Windows
+/// ([`next_gpu_recovery`]): a later one makes its own start (#247). A later
+/// one that failed before its hand-off takes no number, so this safety net
+/// still starts a node that recovery could not start again.
 /// Generic so it is tested without a window or a WSL.
 #[allow(clippy::too_many_arguments)]
 async fn wsl_recovery_after_prepare<C, P, R, Q, G, S, F>(
     state: &AppState,
     owner_mark: u64,
-    recovery: u64,
     restarting: C,
     stopped: P,
     run: R,
@@ -6677,6 +6696,8 @@ async fn wsl_recovery_after_prepare<C, P, R, Q, G, S, F>(
         return;
     }
     log("WSL restarts in a few seconds; easyNode starts again by itself about a minute later");
+    // Numbered only now that Windows has the restart (review of #248).
+    let recovery = next_gpu_recovery(state);
     drop(restarting);
     tokio::time::sleep(grace).await;
     let _restarting = reclaim.await;
@@ -6707,7 +6728,7 @@ async fn wsl_recovery_after_prepare<C, P, R, Q, G, S, F>(
     }
 }
 
-/// Number a GPU recovery by WSL restart that goes ahead. Only the latest
+/// Number a GPU recovery whose WSL restart was handed over. Only the latest
 /// one's safety net may start the node: two recoveries in a row must not
 /// start it twice, or start it while the second's WSL restart is due (#247).
 ///
@@ -6880,14 +6901,12 @@ async fn end_header_bootstrap_with_restart(
     // A stop under way (an owner's Stop still flushing, with RPC still
     // armed) is waited out before deciding, or this restart would start the
     // node again after it (#242).
-    while stop_under_way(state) {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
     // The owner's Stops as they stand when this restart decides, not when it
     // was asked for: a Stop and Start pressed while it waited leave a
     // running bootstrap launch that still needs this restart, and a Stop
-    // alone leaves no RPC, so it is not due (#247).
-    let owner_mark = owner_stop_mark(state);
+    // alone leaves no RPC, so it is not due (#247). Settled, so a Stop that
+    // lands while the mark is read is waited out too.
+    let owner_mark = settled_owner_mark(state).await;
     // Decided again now that the claim is held: the decision that spawned
     // this task may be stale. A restart that ran while this one waited may
     // have ended the bootstrap already, and a second task (spawned by the
@@ -9034,7 +9053,9 @@ async fn apply_swarm_switch(app: AppHandle, on: bool) {
 /// A stop or start still under way (`busy`) keeps the mark; the next look
 /// decides.
 fn switch_owner_mark(state: &AppState, mark: u64, busy: bool, rpc_armed: bool) -> u64 {
-    if owner_stopped_since(state, mark) && !busy && rpc_armed {
+    // `busy` was read before RPC, across an await: a Stop counted since is
+    // under way now, and must not be taken for a Start (review of #248).
+    if owner_stopped_since(state, mark) && !busy && !stop_under_way(state) && rpc_armed {
         owner_stop_mark(state)
     } else {
         mark
@@ -15642,7 +15663,6 @@ mod swarm_tests {
                 super::wsl_recovery_after_prepare(
                     &s,
                     mark,
-                    super::next_gpu_recovery(&s),
                     (),
                     async {},
                     move || {
@@ -15683,7 +15703,6 @@ mod swarm_tests {
             super::wsl_recovery_after_prepare(
                 &state,
                 super::owner_stop_mark(&state),
-                super::next_gpu_recovery(&state),
                 Claim(released.clone()),
                 async {},
                 move || {
@@ -15715,7 +15734,6 @@ mod swarm_tests {
             super::wsl_recovery_after_prepare(
                 &s,
                 mark,
-                super::next_gpu_recovery(&s),
                 (),
                 async {},
                 || Ok(()),
@@ -15804,22 +15822,19 @@ mod swarm_tests {
         assert!(fetch < read && read < moved);
     }
 
-    /// Issue #247, case 2: two WSL recoveries in a row, the second going
-    /// ahead while the first one waits for WSL to take the app down. The node
-    /// is started exactly once, by the second one's safety net; the first's
-    /// does nothing.
+    /// Issue #247, case 2: two WSL recoveries in a row, the second handed to
+    /// Windows while the first one waits for WSL to take the app down. The
+    /// node is started exactly once, by the second one's safety net.
     #[tokio::test]
     async fn two_wsl_recoveries_in_a_row_start_the_node_once() {
         let state = std::sync::Arc::new(super::AppState::new());
         let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mark = super::owner_stop_mark(&state);
-        let first = super::next_gpu_recovery(&state);
         let (s, start) = (state.clone(), counting_start(&starts));
         let earlier = tokio::spawn(async move {
             super::wsl_recovery_after_prepare(
                 &s,
                 mark,
-                first,
                 (),
                 async {},
                 || Ok(()),
@@ -15831,11 +15846,9 @@ mod swarm_tests {
             .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let second = super::next_gpu_recovery(&state);
         super::wsl_recovery_after_prepare(
             &state,
             mark,
-            second,
             (),
             async {},
             || Ok(()),
@@ -15847,6 +15860,125 @@ mod swarm_tests {
         .await;
         earlier.await.unwrap();
         assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Review of #248: a second recovery that fails before its hand-off, and
+    /// whose own start fails too, does not hold back the first one's safety
+    /// net: the node is started, once. And when that second recovery's start
+    /// works, the first's safety net finds the node running and does nothing.
+    #[tokio::test]
+    async fn a_second_recovery_that_fails_before_its_hand_off_leaves_the_start_to_the_first() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        for second_start_works in [false, true] {
+            let state = std::sync::Arc::new(super::AppState::new());
+            let mark = super::owner_stop_mark(&state);
+            let first_starts = std::sync::Arc::new(AtomicUsize::new(0));
+            let (s, f) = (state.clone(), first_starts.clone());
+            let earlier = tokio::spawn(async move {
+                let s2 = s.clone();
+                super::wsl_recovery_after_prepare(
+                    &s,
+                    mark,
+                    (),
+                    async {},
+                    || Ok(()),
+                    std::time::Duration::from_millis(400),
+                    async {},
+                    move || {
+                        f.fetch_add(1, SeqCst);
+                        let s3 = s2.clone();
+                        Box::pin(async move {
+                            *s3.rpc.lock().await = Some(btx_core::rpc::RpcClient::new(
+                                "http://127.0.0.1:9",
+                                "u",
+                                "p",
+                            ));
+                            Ok(())
+                        })
+                            as std::pin::Pin<
+                                Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
+                            >
+                    },
+                    &|_| {},
+                )
+                .await
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // The second: WSL refuses the hand-off; it starts the node itself.
+            let second_starts = std::sync::Arc::new(AtomicUsize::new(0));
+            let (g, s4) = (second_starts.clone(), state.clone());
+            super::wsl_recovery_after_prepare(
+                &state,
+                mark,
+                (),
+                async {},
+                || Err("refused".to_string()),
+                std::time::Duration::from_millis(400),
+                async {},
+                move || {
+                    g.fetch_add(1, SeqCst);
+                    let s5 = s4.clone();
+                    Box::pin(async move {
+                        if second_start_works {
+                            *s5.rpc.lock().await = Some(btx_core::rpc::RpcClient::new(
+                                "http://127.0.0.1:9",
+                                "u",
+                                "p",
+                            ));
+                            Ok(())
+                        } else {
+                            Err("could not start".to_string())
+                        }
+                    })
+                        as std::pin::Pin<
+                            Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
+                        >
+                },
+                &|_| {},
+            )
+            .await;
+            earlier.await.unwrap();
+            assert_eq!(second_starts.load(SeqCst), 1);
+            let want_first = if second_start_works { 0 } else { 1 };
+            assert_eq!(
+                first_starts.load(SeqCst),
+                want_first,
+                "{second_start_works}"
+            );
+            assert!(state.rpc.lock().await.is_some(), "the node was left down");
+        }
+    }
+
+    /// Review of #248, point 3: the header-bootstrap restart's mark is read
+    /// only once no stop is under way, so a Stop that is landing when it is
+    /// read is waited out and counted, and the restart then sees what that
+    /// Stop left (no RPC: not due).
+    #[tokio::test]
+    async fn the_bootstrap_mark_waits_out_a_stop_that_lands_while_it_is_read() {
+        let state = std::sync::Arc::new(super::AppState::new());
+        let slot = state.node.clone();
+        let held = slot.lock().await;
+        let s = state.clone();
+        let owner = tokio::spawn(async move { super::stop_node_by_owner(&s).await });
+        // The owner's Stop is counted, and its flush is still to come.
+        while super::owner_stop_mark(&state) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(super::stop_under_way(&state), "counted before under way");
+        let s = state.clone();
+        let read = tokio::spawn(async move { super::settled_owner_mark(&s).await });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!read.is_finished(), "the mark was read during the Stop");
+        drop(held);
+        owner.await.unwrap();
+        let mark = read.await.unwrap();
+        assert_eq!(mark, 1);
+        assert!(!super::header_bootstrap_restart_due(
+            state.rpc.lock().await.is_some(),
+            false,
+            true,
+            super::owner_stopped_since(&state, mark),
+        ));
     }
 
     /// Two restarts that end one header bootstrap (one waited for the claim
