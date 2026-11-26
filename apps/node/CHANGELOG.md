@@ -8,6 +8,8 @@ root).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-26 · linux + windows (no mac build; the mac stays on the version it has)
+
 **Swarm (model network): a switch for Linux, off by default, and a card that
 shows what it sees.** BTX's engine can run a "model network": nodes that hold
 AI models find each other. Settings has a new switch for it, "Swarm (model
