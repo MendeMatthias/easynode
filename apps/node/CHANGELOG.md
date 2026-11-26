@@ -63,6 +63,16 @@ network)", under Helping the network.
   project's own archive from upstream) is now started with the model network
   off, where it ran by the engine's default before.
 
+**The app's "stop" now reaches its own node on any port.** When the app
+stopped or restarted the node, it asked the node on the standard port. A node
+that had been moved to another port in its configuration never heard the
+request: a restart could hang for a long time, and on a computer with two
+nodes the request went to the other one (which refused it). The app now
+addresses the node it started, by that node's own configuration, and if the
+request cannot be delivered on Linux or a Mac it asks the same process to
+stop cleanly. A node on the standard port, which is nearly every install,
+behaved correctly before and behaves the same now.
+
 ## [0.8.1] - 2026-11-25 · linux + windows (no mac build; the mac stays on the version it has)
 
 **A node engine with a file missing is put back, and says which file.** Since
