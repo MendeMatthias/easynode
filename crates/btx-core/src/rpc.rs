@@ -471,9 +471,9 @@ mod tests {
     }
 
     /// What btxd sends while it restarts, as the app logged it on 2026-11-26:
-    /// HTTP 503 with an HTML page. It is the warmup error with a short
-    /// message, never the page, so every caller that waits out a warmup
-    /// (`RPC_IN_WARMUP`) waits this out the same way.
+    /// HTTP 503 with an HTML page. It is a short failure (`NODE_NOT_READY`),
+    /// never the page, and never the warmup code: a node that answers 503 for
+    /// ever must still reach the status refresher's "stopped responding".
     #[tokio::test]
     async fn a_503_html_page_is_a_short_failure_and_never_its_body() {
         let mut server = Server::new_async().await;

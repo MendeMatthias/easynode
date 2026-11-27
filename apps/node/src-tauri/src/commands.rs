@@ -1591,11 +1591,33 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     let holder_free = btx_core::node::datadir_holder(&datadir).await == DatadirHolder::Free;
     let rpc_answering = rpc_already_answering(&datadir).await.is_some();
     let node_running = !holder_free || rpc_answering;
-    let owner_asked = OWNER_ASKED_START.swap(false, Ordering::SeqCst);
+    let owner_asked = owner_asked_this_start();
     let setup_done = settings.setup_complete || settings.btx_release_tag.is_some();
     let mut reinstalled_this_start = false;
+    let mut attach_without_cli = false;
     if engine_missing(&datadir, &tag) {
+        let pinned_btxd = install_dir(NODE_RELEASE_TAG)
+            .map(|root| root.join("bin").join(btx_core::platform::exe_name("btxd")));
         match missing_engine_step(&tag, setup_done) {
+            MissingEngine::Reinstall
+                if adopt_without_cli(
+                    node_running,
+                    pinned_btxd.as_deref().is_some_and(Path::is_file),
+                ) =>
+            {
+                // A node runs from the folder and only btx-cli is gone: adopt
+                // it as the start always does, and stop it over RPC when it
+                // must stop (`stop_unmanaged_node` asks over RPC when btx-cli
+                // cannot). Nothing is copied under it; the next start with no
+                // node running puts the file back (#249).
+                attach_without_cli = true;
+                let msg = "btx-cli is missing from the node engine's folder, and a node is \
+                           running from it: that node is adopted, and stopped over RPC when it \
+                           must stop. Nothing was copied; the next start with no node running \
+                           puts the file back";
+                eprintln!("[node-app] {msg}");
+                setup_log(&datadir, msg);
+            }
             MissingEngine::Reinstall => {
                 put_back_pinned_engine(
                     app,
@@ -1615,15 +1637,20 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
 
     if engine_check_wanted(
         &tag,
-        upgraded_this_start || reinstalled_this_start,
+        upgraded_this_start || reinstalled_this_start || attach_without_cli,
         settings.btx_release_tag.is_some(),
     ) {
         let mode = engine_check_mode(holder_free, rpc_answering, cfg!(target_os = "macos"));
         heal_installed_engine(app, &datadir, mode).await;
     }
 
-    let paths: FaststartResult =
-        returning_launch_paths(&datadir, &tag).ok_or_else(|| no_engine_message(setup_done))?;
+    let paths: FaststartResult = returning_launch_paths(&datadir, &tag)
+        .or_else(|| {
+            attach_without_cli
+                .then(|| paths_without_cli(&datadir))
+                .flatten()
+        })
+        .ok_or_else(|| no_engine_message(setup_done))?;
 
     // Double-spawn guard: a controller whose child is still alive means a
     // previous start is in flight (e.g. a long warmup). Overwriting it would
@@ -1948,7 +1975,7 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
     // cut off, or not this build's archive) is downloaded again by itself,
     // once, while this start goes on on the usual engine
     // (`swarm_refetch_before_launch`); the switch is no longer the only cure.
-    let swarm_refetching = swarm_refetch_before_launch(
+    let swarm_prelaunch = swarm_refetch_before_launch(
         app,
         state,
         &datadir,
@@ -1957,7 +1984,11 @@ async fn start_node_once(app: &AppHandle, state: &AppState) -> Result<(), String
         swarm_held.is_some(),
         node_running,
     );
-    if cfg!(target_os = "linux") && settings.swarm_enabled && !swarm_signs && !swarm_refetching {
+    if cfg!(target_os = "linux")
+        && settings.swarm_enabled
+        && !swarm_signs
+        && swarm_prelaunch == SwarmPrelaunch::Quiet
+    {
         if let Some((root, damage)) = swarm_engine_damage() {
             setup_log(&datadir, &swarm_damage_line(&root, &damage));
         } else if let Some(why) = &swarm_held {
@@ -2578,9 +2609,18 @@ fn missing_engine_not_ours(tag: &str) -> String {
 /// does not get a 700 MB copy on every start. Start node is always allowed.
 const ENGINE_PUT_BACK_RECORD: &str = "easynode-engine-reinstall";
 
-/// Set by the Start node button for the start it begins: the owner asked,
-/// so a bound on repairs the app makes by itself does not apply.
-static OWNER_ASKED_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+tokio::task_local! {
+    /// Set by the Start node button around the start it begins, and seen only
+    /// inside that start: the owner asked, so a bound on repairs the app makes
+    /// by itself does not apply. A task-local rather than one global value, so
+    /// an automatic start running at the same moment cannot take it (#249).
+    static OWNER_STARTED: bool;
+}
+
+/// Whether the start running on this task is one the owner began.
+fn owner_asked_this_start() -> bool {
+    OWNER_STARTED.try_with(|v| *v).unwrap_or(false)
+}
 
 /// May the engine be put back now?
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2601,7 +2641,7 @@ fn engine_put_back_gate(
 ) -> PutBackGate {
     if node_running {
         PutBackGate::NodeRunning
-    } else if btx_core::repair_bound::allows(last, now, owner_asked) {
+    } else if btx_core::repair_bound::allows_backing_off(last, now, owner_asked) {
         PutBackGate::Go
     } else {
         PutBackGate::Bounded
@@ -2618,13 +2658,65 @@ fn engine_in_use_message(install_root: &Path) -> String {
 }
 
 fn engine_put_back_bounded(last: &btx_core::repair_bound::Attempt) -> String {
-    format!(
-        "The node engine is missing again: it was put back at {} and something removed it \
-         since (antivirus software often does). It is not copied again by itself before {}. \
-         Press Start node to put it back now.",
-        btx_core::repair_bound::clock(last.at),
-        btx_core::repair_bound::clock(btx_core::repair_bound::next_allowed(last))
-    )
+    let next =
+        btx_core::repair_bound::clock(btx_core::repair_bound::next_allowed_backing_off(last));
+    match &last.failed {
+        // It was never put back: say what happened, not "was put back".
+        Some(why) => format!(
+            "The node engine is missing, and putting it back failed at {} ({}). It is tried \
+             again by itself at {next}. Press Start node to try now.",
+            btx_core::repair_bound::clock(last.at),
+            why.trim().trim_end_matches('.')
+        ),
+        None => format!(
+            "The node engine is missing again: it was put back at {} and something removed it \
+             since (antivirus software often does). It is not copied again by itself before \
+             {next}. Press Start node to put it back now.",
+            btx_core::repair_bound::clock(last.at)
+        ),
+    }
+}
+
+/// After a failed put-back, start the node again by itself once the backoff
+/// allows (`repair_bound::retry_wait`): a passing full disk or a file lock
+/// must not keep an unattended node down until the next day (#249). Only a
+/// node that is still down with an error, and never while quitting.
+fn retry_put_back_later(app: &AppHandle, after_secs: u64) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(after_secs)).await;
+        let state = app.state::<AppState>();
+        if state.quitting.load(Ordering::SeqCst)
+            || state.rpc.lock().await.is_some()
+            || !matches!(*state.phase.lock().await, NodePhase::Error { .. })
+        {
+            return;
+        }
+        let _ = start_node_projected(&app, &state).await;
+    });
+}
+
+/// A node runs from the pinned engine's folder and that folder lost only
+/// btx-cli (btxd is still there): the start adopts the running node instead
+/// of refusing it. Anything else missing under a running node is refused, as
+/// before: nothing is copied under it.
+fn adopt_without_cli(node_running: bool, btxd_present: bool) -> bool {
+    node_running && btxd_present
+}
+
+/// The launch paths of the pinned engine for a node adopted without btx-cli:
+/// btx-cli's path is where it belongs, though it is not there.
+fn paths_without_cli(datadir: &Path) -> Option<FaststartResult> {
+    let root = install_dir(NODE_RELEASE_TAG)?;
+    let btxd = root.join("bin").join(btx_core::platform::exe_name("btxd"));
+    btxd.is_file().then(|| FaststartResult {
+        btxd,
+        btx_cli: root
+            .join("bin")
+            .join(btx_core::platform::exe_name("btx-cli")),
+        faststart_conf: datadir.join("faststart").join("faststart.conf"),
+        mining_results_dir: None,
+    })
 }
 
 /// The launch paths are missing after everything above: before setup that
@@ -2677,7 +2769,7 @@ async fn put_back_pinned_engine(
             return refuse(engine_put_back_bounded(&last));
         }
     }
-    set_phase(app, state, NodePhase::Preparing).await;
+    set_phase(app, state, NodePhase::Installing).await;
     let resource_dir = app.path().resource_dir().ok();
     let pkg = resolve_bundled_node_pkg(
         resource_dir.as_deref(),
@@ -2711,7 +2803,12 @@ async fn put_back_pinned_engine(
     .unwrap_or_else(|e| Err(format!("the copy stopped unexpectedly ({e})")));
     use btx_core::installer::PutBack;
     let written = |failed: Option<&str>| {
-        if let Err(e) = btx_core::repair_bound::record(&record, now, failed) {
+        let failures = if failed.is_some() {
+            btx_core::repair_bound::failures_after(last.as_ref())
+        } else {
+            0
+        };
+        if let Err(e) = btx_core::repair_bound::record_attempt(&record, now, failed, failures) {
             setup_log(
                 datadir,
                 &format!("the record of the engine's reinstall could not be written: {e}"),
@@ -2735,9 +2832,17 @@ async fn put_back_pinned_engine(
         }
         Err(e) => {
             written(Some(&e));
-            let failed = format!("the node engine could not be installed again: {e}");
+            let wait = btx_core::repair_bound::read(&record)
+                .map(|a| btx_core::repair_bound::retry_wait(&a))
+                .unwrap_or(btx_core::repair_bound::RETRY_AFTER_FAILURE_SECS);
+            let failed = format!(
+                "the node engine could not be installed again: {e}. It is tried again by itself \
+                 in {} min",
+                wait / 60
+            );
             eprintln!("[node-app] {failed}");
             setup_log(datadir, &failed);
+            retry_put_back_later(app, wait);
             return Err(engine_reinstall_failed(&e));
         }
     };
@@ -2932,10 +3037,11 @@ async fn answer_engine_loader_failure(
 #[cfg(test)]
 mod engine_file_tests {
     use super::{
-        engine_check_mode, engine_check_note, engine_check_wanted, engine_in_use_message,
-        engine_put_back_bounded, engine_put_back_gate, engine_reinstall_failed,
-        engine_repair_target, missing_engine_not_ours, missing_engine_step, no_engine_message,
-        MissingEngine, PutBackGate, NODE_RELEASE_TAG,
+        adopt_without_cli, engine_check_mode, engine_check_note, engine_check_wanted,
+        engine_in_use_message, engine_put_back_bounded, engine_put_back_gate,
+        engine_reinstall_failed, engine_repair_target, missing_engine_not_ours,
+        missing_engine_step, no_engine_message, owner_asked_this_start, MissingEngine, PutBackGate,
+        NODE_RELEASE_TAG, OWNER_STARTED,
     };
     use btx_core::engine_files::{Check, Damage, Mode, NotCopied};
     use std::path::Path;
@@ -3130,6 +3236,78 @@ mod engine_file_tests {
         );
         let busy = engine_in_use_message(std::path::Path::new("/h/.local/btx/v0.34.16/x"));
         assert!(busy.contains("nothing was copied while it runs"), "{busy}");
+    }
+
+    /// #249: a put-back that FAILED is tried again in 15 minutes, then 30,
+    /// not after a day, and its message does not say it "was put back".
+    /// Read from the record file, as the next start reads it.
+    #[test]
+    fn a_failed_put_back_is_retried_soon_and_says_it_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("easynode-engine-reinstall");
+        let now = 1_795_720_000;
+        let wait = btx_core::repair_bound::RETRY_AFTER_FAILURE_SECS;
+        btx_core::repair_bound::record_attempt(&record, now, Some("disk error: no room"), 1)
+            .unwrap();
+        let last = btx_core::repair_bound::read(&record);
+        assert_eq!(
+            engine_put_back_gate(false, last.as_ref(), now + wait - 1, false),
+            PutBackGate::Bounded
+        );
+        assert_eq!(
+            engine_put_back_gate(false, last.as_ref(), now + wait, false),
+            PutBackGate::Go
+        );
+        let msg = engine_put_back_bounded(last.as_ref().unwrap());
+        assert!(msg.contains("putting it back failed at"), "{msg}");
+        assert!(msg.contains("(disk error: no room)"), "{msg}");
+        assert!(!msg.contains("was put back"), "{msg}");
+        // A second failure in a row waits twice as long.
+        let n = btx_core::repair_bound::failures_after(last.as_ref());
+        btx_core::repair_bound::record_attempt(&record, now, Some("x"), n).unwrap();
+        let last = btx_core::repair_bound::read(&record);
+        assert_eq!(
+            engine_put_back_gate(false, last.as_ref(), now + wait, false),
+            PutBackGate::Bounded
+        );
+        assert_eq!(
+            engine_put_back_gate(false, last.as_ref(), now + 2 * wait, false),
+            PutBackGate::Go
+        );
+    }
+
+    /// #249: only the node folder losing btx-cli alone, with a node running,
+    /// adopts that node; the paths it is adopted with point btxd at the
+    /// folder and btx-cli where it belongs.
+    #[test]
+    fn a_running_node_that_lost_only_btx_cli_is_adopted() {
+        assert!(adopt_without_cli(true, true));
+        assert!(!adopt_without_cli(true, false), "btxd gone too: refused");
+        assert!(!adopt_without_cli(false, true), "nothing runs: put back");
+    }
+
+    /// #249: the owner's Start node is seen only by the start it began. An
+    /// automatic start running at the same moment on another task does not
+    /// take it.
+    #[tokio::test]
+    async fn only_the_start_the_owner_began_counts_as_asked() {
+        let owner = OWNER_STARTED.scope(true, async {
+            tokio::task::yield_now().await;
+            let first = owner_asked_this_start();
+            tokio::task::yield_now().await;
+            (first, owner_asked_this_start())
+        });
+        let automatic = async {
+            tokio::task::yield_now().await;
+            let first = owner_asked_this_start();
+            tokio::task::yield_now().await;
+            (first, owner_asked_this_start())
+        };
+        let (o, a) = tokio::join!(owner, automatic);
+        assert_eq!(o, (true, true));
+        assert_eq!(a, (false, false));
+        let spawned = tokio::spawn(async { owner_asked_this_start() });
+        assert!(!spawned.await.unwrap());
     }
 
     /// Before setup the answer is still setup's; after it, never.
@@ -5872,6 +6050,9 @@ pub fn spawn_graceful_quit(app: &AppHandle) {
     if state.quitting.swap(true, Ordering::SeqCst) {
         return; // a quit is already in flight
     }
+    // Every quit, the red X's included: a launch from now on is told
+    // "exiting" and waits for this app to be gone (second_launch, #250).
+    crate::second_launch::exiting();
     // Show progress instead of a frozen dock icon — reassuring even on a tray
     // quit where the window was hidden.
     if let Some(w) = app.get_webview_window("main") {
@@ -5887,6 +6068,8 @@ pub fn spawn_graceful_quit(app: &AppHandle) {
         // stop overruns the grace window, exit anyway. btxd's pidfile/lock
         // recovery handles the hard stop on the next launch.
         let _ = tokio::time::timeout(QUIT_GRACE, stop_node_inner(&state)).await;
+        // The node is stopped: a launch waiting on the socket may start now.
+        crate::second_launch::release();
         app.exit(0);
     });
 }
@@ -8593,11 +8776,11 @@ pub async fn start_node(app: AppHandle, state: State<'_, AppState>) -> Result<()
         return Ok(()); // already running
     }
     // The owner pressed Start node: repairs the app bounds when it makes them
-    // by itself (putting back a deleted engine) may be made now.
-    OWNER_ASKED_START.store(true, Ordering::SeqCst);
-    let result = start_node_projected(&app, &state).await;
-    OWNER_ASKED_START.store(false, Ordering::SeqCst);
-    result
+    // by itself (putting back a deleted engine) may be made now, in this
+    // start only.
+    OWNER_STARTED
+        .scope(true, start_node_projected(&app, &state))
+        .await
 }
 
 #[tauri::command]
@@ -9062,11 +9245,50 @@ fn after_swarm_engine_failed(
     }
 }
 
+/// What the check before a launch did, so the start does not say the same
+/// thing twice in setup.log (#249).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwarmPrelaunch {
+    /// A download of the swarm engine was started: this start goes on on the
+    /// usual engine and moves onto the swarm engine once it is checked.
+    Fetching,
+    /// It wrote why the damaged swarm engine is not downloaded now.
+    Said,
+    /// It did and said nothing; the start says what it always said.
+    Quiet,
+}
+
+/// Why a damaged swarm engine is not downloaded now, when that is worth a
+/// line: only where it would otherwise be (not a signer, not held back), so
+/// a signer with the swarm saved on does not write it at every start (#249).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwarmNotNow {
+    /// A repair was tried within its window.
+    Spent,
+    /// A node runs from this node folder or the swarm engine's.
+    InUse,
+}
+
+fn swarm_not_now(
+    signs_here: bool,
+    held_back: bool,
+    spent: bool,
+    in_use: bool,
+) -> Option<SwarmNotNow> {
+    if signs_here || held_back {
+        None
+    } else if spent {
+        Some(SwarmNotNow::Spent)
+    } else if in_use {
+        Some(SwarmNotNow::InUse)
+    } else {
+        None
+    }
+}
+
 /// The check before a launch (`swarm_refetch_wanted`), and the download it
-/// may start. `true` when a download of the swarm engine was started: this
-/// start goes on on the usual engine, and the node restarts onto the swarm
-/// engine once the download has been checked. `node_running`: a node holds
-/// this node folder or answers its RPC (the start then attaches to it).
+/// may start. `node_running`: a node holds this node folder or answers its
+/// RPC (the start then attaches to it).
 fn swarm_refetch_before_launch(
     app: &AppHandle,
     state: &AppState,
@@ -9075,51 +9297,57 @@ fn swarm_refetch_before_launch(
     signs_here: bool,
     held_back: bool,
     node_running: bool,
-) -> bool {
+) -> SwarmPrelaunch {
     if !cfg!(target_os = "linux") || !wanted {
-        return false;
+        return SwarmPrelaunch::Quiet;
     }
     let Some(pin) = swarm_engine_pin() else {
-        return false;
+        return SwarmPrelaunch::Quiet;
     };
     let Some(root) = btx_core::swarm_engine::root(&pin) else {
-        return false;
+        return SwarmPrelaunch::Quiet;
     };
     let health = btx_core::swarm_engine::health(&pin, &root);
     let btx_core::swarm_engine::Health::NeedsFetch(what) = &health else {
-        return false;
+        return SwarmPrelaunch::Quiet;
     };
     let now = unix_now_secs();
     let spent = swarm_repair_spent(datadir, now);
     let in_use = node_running || btx_core::engine_files::process_runs_from(&root);
-    if spent {
-        let last = btx_core::repair_bound::read(&swarm_repair_record(datadir));
-        let msg = format!(
-            "the swarm engine is damaged ({what}); it is not downloaded again by itself before \
-             {} (the last try was at {}{}). The node starts on its usual engine. Switching the \
-             swarm off and on tries now",
-            last.as_ref()
-                .map(|a| btx_core::repair_bound::clock(btx_core::repair_bound::next_allowed(a)))
-                .unwrap_or_default(),
-            last.as_ref()
-                .map(|a| btx_core::repair_bound::clock(a.at))
-                .unwrap_or_default(),
-            last.as_ref()
-                .and_then(|a| a.failed.as_deref())
-                .map(|f| format!(" and failed: {f}"))
-                .unwrap_or_default()
-        );
-        eprintln!("[node-app] {msg}");
-        setup_log(datadir, &msg);
-    } else if in_use {
-        let msg = format!(
-            "the swarm engine is damaged ({what}), and a node is running from this node folder \
-             or from the swarm engine's, so it is not replaced now"
-        );
-        eprintln!("[node-app] {msg}");
-        setup_log(datadir, &msg);
-    }
-    match swarm_refetch_wanted(
+    let said = match swarm_not_now(signs_here, held_back, spent, in_use) {
+        Some(SwarmNotNow::Spent) => {
+            let last = btx_core::repair_bound::read(&swarm_repair_record(datadir));
+            let msg = format!(
+                "the swarm engine is damaged ({what}); it is not downloaded again by itself \
+                 before {} (the last try was at {}{}). The node starts on its usual engine. \
+                 Switching the swarm off and on tries now",
+                last.as_ref()
+                    .map(|a| btx_core::repair_bound::clock(btx_core::repair_bound::next_allowed(a)))
+                    .unwrap_or_default(),
+                last.as_ref()
+                    .map(|a| btx_core::repair_bound::clock(a.at))
+                    .unwrap_or_default(),
+                last.as_ref()
+                    .and_then(|a| a.failed.as_deref())
+                    .map(|f| format!(" and failed: {f}"))
+                    .unwrap_or_default()
+            );
+            eprintln!("[node-app] {msg}");
+            setup_log(datadir, &msg);
+            true
+        }
+        Some(SwarmNotNow::InUse) => {
+            let msg = format!(
+                "the swarm engine is damaged ({what}), and a node is running from this node \
+                 folder or from the swarm engine's, so it is not replaced now"
+            );
+            eprintln!("[node-app] {msg}");
+            setup_log(datadir, &msg);
+            true
+        }
+        None => false,
+    };
+    let fetching = match swarm_refetch_wanted(
         true,
         wanted,
         signs_here,
@@ -9131,6 +9359,13 @@ fn swarm_refetch_before_launch(
     ) {
         Some(what) => spawn_swarm_refetch(app, state, datadir, &what),
         None => false,
+    };
+    if fetching {
+        SwarmPrelaunch::Fetching
+    } else if said {
+        SwarmPrelaunch::Said
+    } else {
+        SwarmPrelaunch::Quiet
     }
 }
 
@@ -15541,8 +15776,9 @@ mod twin_freeze_removal {
 #[cfg(test)]
 mod swarm_tests {
     use super::{
-        claim_swarm_repair, note_swarm_repair, swarm_refetch_wanted, swarm_repair_after_failure,
-        swarm_repair_failed_note, swarm_repair_spent, SwarmRepair, SWARM_ENGINE_REPAIRED,
+        claim_swarm_repair, note_swarm_repair, swarm_not_now, swarm_refetch_wanted,
+        swarm_repair_after_failure, swarm_repair_failed_note, swarm_repair_spent, SwarmNotNow,
+        SwarmRepair, SWARM_ENGINE_REPAIRED,
     };
     use super::{
         claim_swarm_switch, clear_swarm_hold, engine_did_not_come_up, falls_back_from_swarm_engine,
@@ -16122,6 +16358,27 @@ mod swarm_tests {
         // The owner's switch clears the record.
         btx_core::repair_bound::clear(&dir.path().join("easynode-swarm-repair"));
         assert!(wanted(now + 200, false).is_some());
+    }
+
+    /// #249: why a damaged swarm engine is not downloaded is said only where
+    /// it would otherwise be: a signer or a held-back engine says nothing at
+    /// every start.
+    #[test]
+    fn the_not_now_line_is_only_for_an_engine_that_would_be_downloaded() {
+        assert_eq!(
+            swarm_not_now(false, false, true, false),
+            Some(SwarmNotNow::Spent)
+        );
+        assert_eq!(
+            swarm_not_now(false, false, false, true),
+            Some(SwarmNotNow::InUse)
+        );
+        assert_eq!(swarm_not_now(false, false, false, false), None);
+        for (signs, held) in [(true, false), (false, true), (true, true)] {
+            for (spent, in_use) in [(true, false), (false, true), (true, true)] {
+                assert_eq!(swarm_not_now(signs, held, spent, in_use), None);
+            }
+        }
     }
 
     #[test]

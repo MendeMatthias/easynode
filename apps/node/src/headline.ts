@@ -39,7 +39,7 @@ export type HeadlinePhase =
   | { phase: "warming"; message: string }
   | { phase: "error"; message: string }
   | {
-      phase: "welcome" | "downloading" | "preparing" | "starting" | "loading_snapshot" | "stopped";
+      phase: "welcome" | "downloading" | "preparing" | "installing" | "starting" | "loading_snapshot" | "stopped";
     };
 
 export type HeadlineFacts = {
@@ -103,9 +103,11 @@ export function headline(p: HeadlinePhase, f: HeadlineFacts): Headline {
         mode: notKeepingUp(f) || f.diskCritical ? "stalled" : "syncing",
       };
     case "preparing":
-      // On a computer that was set up, the only way here is a start that
-      // found the node engine missing and is installing it again
-      // (commands.rs `reinstall_pinned_engine`).
+      // Setup's own copy of the engine and its conf.
+      return { badge: "PREPARING", sub: "Preparing the node…", mode: "syncing" };
+    case "installing":
+      // A start that found the node engine missing and is putting it back
+      // (commands.rs `put_back_pinned_engine`).
       return { badge: "INSTALLING", sub: "Installing the node engine…", mode: "syncing" };
     case "starting":
       return { badge: "STARTING", sub: "This can take a moment", mode: "syncing" };

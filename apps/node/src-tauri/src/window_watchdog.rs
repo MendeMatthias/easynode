@@ -63,6 +63,12 @@ pub const VERIFY_SECS: u64 = 20;
 pub const FOCUS_PROBE_SECS: u64 = 5;
 /// How often the watchdog looks.
 pub const TICK_SECS: u64 = 5;
+/// How long the page's word that it is hidden is trusted without another
+/// beat. A hidden page still beats (throttled: macOS WebKit slows a hidden
+/// page's timers to about one a minute); a page whose web process hung right
+/// after a beat that said hidden never beats again, and must not keep the
+/// window out of judgement for good (#250).
+pub const HIDDEN_TRUST_SECS: u64 = 300;
 /// Reloads and rebuilds together, per rolling hour. Two whole episodes.
 pub const MAX_RECOVERIES_PER_HOUR: usize = 4;
 /// After a rebuild that did not help, or with the hour's budget spent, the
@@ -119,13 +125,26 @@ pub struct Observation {
     pub baseline: u64,
     /// When the window last gained focus, while that probe is open.
     pub focus_probe: Option<u64>,
+    /// The window does not have the focus. Under WSLg a minimised window
+    /// still counts as shown to GTK (Wayland tells a client nothing about
+    /// minimising) and gets no frames, so it looks frozen; building it again
+    /// would put it back on the desktop. A window nobody is using is reloaded
+    /// but not rebuilt until it has the focus again (#250).
+    pub in_background: bool,
+}
+
+/// Whether the page's word that it is hidden still counts: it was said in a
+/// beat within [`HIDDEN_TRUST_SECS`].
+pub fn page_says_hidden(o: &Observation) -> bool {
+    let last_beat = o.timer.max(o.raf);
+    o.page_hidden && last_beat.is_some_and(|t| o.now < t + HIDDEN_TRUST_SECS)
 }
 
 /// Whether every signal this window owes has arrived since `since`. A page
 /// that says it is hidden owes nothing: no frames, no paint, and not even
 /// timer beats, which browsers throttle in hidden pages (macOS WebKit does).
 pub fn healthy_since(o: &Observation, since: u64) -> bool {
-    if o.page_hidden {
+    if page_says_hidden(o) {
         return true;
     }
     let after = |t: Option<u64>| t.is_some_and(|t| t >= since);
@@ -142,7 +161,7 @@ pub fn stalled(o: &Observation) -> bool {
     if let Some(f) = o.focus_probe {
         let from = f.max(o.baseline);
         if o.paint_probe
-            && !o.page_hidden
+            && !page_says_hidden(o)
             && o.now >= from + FOCUS_PROBE_SECS
             && !o.paint.is_some_and(|p| p >= from)
         {
@@ -185,6 +204,11 @@ pub fn decide(o: &Observation, stage: Stage, recent: &[u64]) -> (Action, Stage) 
             if o.now < at + VERIFY_SECS {
                 return (Action::None, stage);
             }
+            // A rebuild puts the window on the desktop; one nobody is using
+            // (minimised under WSLg looks just like this) waits for the focus.
+            if matches!(stage, Stage::Reloaded { .. }) && o.in_background {
+                return (Action::None, stage);
+            }
             if matches!(stage, Stage::Reloaded { .. }) && budget_left(o.now, recent) {
                 (Action::Recreate, Stage::Recreated { at: o.now })
             } else {
@@ -224,8 +248,13 @@ pub fn describe(o: &Observation) -> String {
     if o.paint_probe {
         s.push_str(&format!(", paint {}", age(o.now, o.paint)));
     }
-    if o.page_hidden {
+    if page_says_hidden(o) {
         s.push_str(", page says hidden");
+    } else if o.page_hidden {
+        s.push_str(", page said hidden but has not beaten since");
+    }
+    if o.in_background {
+        s.push_str(", not focused");
     }
     s
 }
@@ -353,6 +382,23 @@ pub fn hold_off_exit(code: Option<i32>, armed: &AtomicU64, now: u64) -> bool {
     }
 }
 
+/// Arm the hold-off, then destroy the window. A destroy that fails at once
+/// raises no exit request, so the arm is taken back: left armed, it would
+/// swallow the next real quit for up to [`HOLD_OFF_SECS`], and a Cmd+Q would
+/// need pressing twice.
+pub fn destroy_armed<E>(
+    armed: &AtomicU64,
+    now: u64,
+    destroy: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    armed.store(now + 1, Ordering::SeqCst);
+    let result = destroy();
+    if result.is_err() {
+        armed.store(0, Ordering::SeqCst);
+    }
+    result
+}
+
 /// [`hold_off_exit`] for this app. A held-off request whose window is gone
 /// (a destroy that ran after the rebuild had given up waiting for it) gets
 /// its window built now, so the app is never left without one.
@@ -430,6 +476,7 @@ fn check(app: &AppHandle) {
     };
     let watch = app.state::<WindowWatch>();
     let shown = w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false);
+    let in_background = !w.is_focused().unwrap_or(true);
     if shown {
         probe::queue(&w);
     }
@@ -452,6 +499,7 @@ fn check(app: &AppHandle) {
             paint,
             baseline: g.shown_since.unwrap_or(now).max(g.last_action),
             focus_probe: g.focus_probe,
+            in_background,
         };
         let (action, stage) = decide(&obs, g.stage, &g.recent);
         if g.focus_probe
@@ -681,8 +729,7 @@ fn recreate(app: &AppHandle, focus: bool) -> Result<(), String> {
         // that request takes it, even if the destroy runs late, so a late
         // destroy can never stop the node. It is cleared once the new window
         // exists.
-        watch.destroy_armed.store(secs() + 1, Ordering::SeqCst);
-        if let Err(e) = w.destroy() {
+        if let Err(e) = destroy_armed(&watch.destroy_armed, secs(), || w.destroy()) {
             return Err(format!("destroy: {e}"));
         }
         // The destruction runs on the event loop; the label is free only once
@@ -773,6 +820,7 @@ mod tests {
             paint: Some(now - 2),
             baseline: 0,
             focus_probe: None,
+            in_background: false,
         }
     }
 
@@ -860,12 +908,13 @@ mod tests {
     }
 
     // macOS WebKit throttles a hidden page's timers; a hidden page owes
-    // nothing at all, not even timer beats.
+    // no frames, no paint and no regular timer beats, only one beat within
+    // HIDDEN_TRUST_SECS to say it is still hidden.
     #[test]
     fn a_hidden_page_owes_not_even_timer_beats() {
         let o = Observation {
             page_hidden: true,
-            timer: Some(10),
+            timer: Some(5_000 - HIDDEN_TRUST_SECS + 1),
             raf: None,
             paint: None,
             ..live(5_000)
@@ -937,6 +986,78 @@ mod tests {
             ..live(496 + FOCUS_PROBE_SECS)
         };
         assert!(!stalled(&o));
+    }
+
+    // #250: the web process hung right after a beat that said hidden. The
+    // page never speaks again, so its last word must not keep the window out
+    // of judgement for good: once it is HIDDEN_TRUST_SECS old the window is
+    // judged like any other, and reloaded.
+    #[test]
+    fn a_hidden_beat_from_a_page_that_hung_expires() {
+        let hung = |now| Observation {
+            page_hidden: true,
+            timer: Some(1_000),
+            raf: Some(990),
+            paint: Some(990),
+            ..live(now)
+        };
+        assert!(!stalled(&hung(1_000 + HIDDEN_TRUST_SECS - 1)));
+        let o = hung(1_000 + HIDDEN_TRUST_SECS);
+        assert!(stalled(&o));
+        assert_eq!(decide(&o, Stage::Watching, &[]).0, Action::Reload);
+        assert!(describe(&o).contains("page said hidden but has not beaten since"));
+        // A focus on it is judged too.
+        let clicked = Observation {
+            focus_probe: Some(1_000 + HIDDEN_TRUST_SECS),
+            paint: Some(900),
+            ..hung(1_000 + HIDDEN_TRUST_SECS + FOCUS_PROBE_SECS)
+        };
+        assert!(stalled(&clicked));
+    }
+
+    // #250: under WSLg a minimised window counts as shown and gets no frames.
+    // It is reloaded (which leaves it minimised), but not rebuilt onto the
+    // desktop while it does not have the focus; once it is focused again and
+    // still frozen, it is.
+    #[test]
+    fn a_window_without_the_focus_is_reloaded_but_not_rebuilt_until_focused() {
+        let stuck = |now, in_background| Observation {
+            paint: Some(400),
+            in_background,
+            ..live(now)
+        };
+        assert_eq!(
+            decide(&stuck(500, true), Stage::Watching, &[]),
+            (Action::Reload, Stage::Reloaded { at: 500 })
+        );
+        for now in [520, 600, 4_000] {
+            assert_eq!(
+                decide(&stuck(now, true), Stage::Reloaded { at: 500 }, &[500]),
+                (Action::None, Stage::Reloaded { at: 500 }),
+                "{now}"
+            );
+        }
+        assert_eq!(
+            decide(&stuck(4_005, false), Stage::Reloaded { at: 500 }, &[500]),
+            (Action::Recreate, Stage::Recreated { at: 4_005 })
+        );
+        assert!(describe(&stuck(500, true)).contains("not focused"));
+    }
+
+    // A destroy that failed at once raises no exit request: the next quit
+    // (a Cmd+Q, without a code) must go through the first time.
+    #[test]
+    fn a_destroy_that_fails_does_not_hold_off_the_next_quit() {
+        let armed = AtomicU64::new(0);
+        assert_eq!(
+            destroy_armed(&armed, 100, || Err::<(), _>("gone")),
+            Err("gone")
+        );
+        assert!(!hold_off_exit(None, &armed, 101));
+        // One that succeeded still holds off its own exit request, once.
+        assert_eq!(destroy_armed(&armed, 200, || Ok::<(), &str>(())), Ok(()));
+        assert!(hold_off_exit(None, &armed, 201));
+        assert!(!hold_off_exit(None, &armed, 202));
     }
 
     #[test]

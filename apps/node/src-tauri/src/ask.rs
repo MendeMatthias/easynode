@@ -455,8 +455,9 @@ mod tests {
     use super::*;
 
     /// btxd restarting answers HTTP 503 with an HTML page. Through the real
-    /// RPC client that is the warmup error, so the panel says "ask again in
-    /// a moment", exactly as for RPC_IN_WARMUP, and never shows the page.
+    /// RPC client that is the short "node not ready" failure, which this
+    /// panel reads as "ask again in a moment", as for RPC_IN_WARMUP, and it
+    /// never shows the page.
     #[tokio::test]
     async fn a_restarting_node_answering_503_is_warming_not_unavailable() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

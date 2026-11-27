@@ -321,7 +321,10 @@ pub fn run() {
                     let state = app.state::<AppState>();
                     if !state.quitting.load(std::sync::atomic::Ordering::SeqCst) {
                         api.prevent_exit();
-                        second_launch::release();
+                        // The socket is kept (answering "exiting") until the
+                        // node is stopped and the app exits
+                        // (`spawn_graceful_quit`), so a launch meanwhile
+                        // waits instead of starting beside it.
                         commands::spawn_graceful_quit(app);
                     }
                 }

@@ -231,6 +231,7 @@ export type TrendPhase =
         | "welcome"
         | "downloading"
         | "preparing"
+        | "installing"
         | "starting"
         | "warming"
         | "loading_snapshot"

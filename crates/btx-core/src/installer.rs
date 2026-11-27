@@ -879,7 +879,18 @@ pub fn version_output_matches_tag(output: &str, tag: &str) -> bool {
 /// How long `btxd --version` may take. It answers in well under a second;
 /// one that hangs (a broken copy, a stalled disk) must not hold a start, and
 /// the Start button with it, for ever.
-pub const VERSION_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const VERSION_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// [`VERSION_CHECK_TIMEOUT`] for setup and engine upgrades: the first run of
+/// a freshly copied engine can be slow while antivirus software (Windows
+/// Defender) scans it, and a setup that gives up on that is worse than a
+/// longer wait (#249).
+pub const SETUP_VERSION_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// How long the output is read after the program exited. A program it
+/// started may keep the pipes open long after (#249); the check does not wait
+/// for that.
+const OUTPUT_AFTER_EXIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Run `cmd` to its end, or kill it after `timeout`. Its output is read on
 /// two threads so a full pipe cannot stall it.
@@ -903,14 +914,31 @@ fn output_within(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let read_all = |pipe: Option<Box<dyn Read + Send>>| {
+    // Each pipe is read into a buffer as it comes, so what was written is
+    // there to take even while something still holds the pipe open.
+    type Pipe = (
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        std::sync::mpsc::Receiver<()>,
+    );
+    let read_all = |pipe: Option<Box<dyn Read + Send>>| -> Pipe {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let into = buf.clone();
         std::thread::spawn(move || {
-            let mut buf = Vec::new();
             if let Some(mut p) = pipe {
-                let _ = p.read_to_end(&mut buf);
+                let mut chunk = [0u8; 4096];
+                while let Ok(n) = p.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut b) = into.lock() {
+                        b.extend_from_slice(&chunk[..n]);
+                    }
+                }
             }
-            buf
-        })
+            let _ = tx.send(());
+        });
+        (buf, rx)
     };
     let out = read_all(
         child
@@ -946,10 +974,28 @@ fn output_within(
     let Some(status) = status else {
         return Ok(None);
     };
+    // A program it started may still hold the pipes: read what is there
+    // within a bound, and stop that program's group if it is still holding
+    // them (its group id stays allocated while any member lives, so this
+    // reaches only what the check started).
+    let collect = |(buf, done): Pipe| {
+        if done.recv_timeout(OUTPUT_AFTER_EXIT).is_err() {
+            #[cfg(unix)]
+            if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+                // SAFETY: a plain kill(2) of the group this call created.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
+        }
+        buf.lock().map(|b| b.clone()).unwrap_or_default()
+    };
+    let stdout = collect(out);
+    let stderr = collect(err);
     Ok(Some(std::process::Output {
         status,
-        stdout: out.join().unwrap_or_default(),
-        stderr: err.join().unwrap_or_default(),
+        stdout,
+        stderr,
     }))
 }
 
@@ -1052,6 +1098,7 @@ fn copy_and_verify_engine_tree(
     install_root: &Path,
     datadir: &Path,
     listing: &[crate::engine_files::FileEntry],
+    version_timeout: std::time::Duration,
 ) -> AppResult<()> {
     crate::engine_files::ensure_space_for(install_root, listing)?;
     crate::engine_files::forget_manifest(install_root);
@@ -1061,7 +1108,7 @@ fn copy_and_verify_engine_tree(
         let btxd_path = install_root
             .join("bin")
             .join(crate::platform::exe_name("btxd"));
-        verify_btxd_reports_tag(&btxd_path, &expected)?;
+        verify_btxd_reports_tag_within(&btxd_path, &expected, version_timeout)?;
     }
     crate::engine_files::write_manifest(install_root, true, listing)
 }
@@ -1076,7 +1123,13 @@ pub fn reinstall_engine_tree(
     datadir: &Path,
 ) -> AppResult<()> {
     let listing = crate::engine_files::list_tree(bundled_pkg_dir)?;
-    copy_and_verify_engine_tree(bundled_pkg_dir, install_root, datadir, &listing)
+    copy_and_verify_engine_tree(
+        bundled_pkg_dir,
+        install_root,
+        datadir,
+        &listing,
+        VERSION_CHECK_TIMEOUT,
+    )
 }
 
 /// Put the pinned engine back in `install_root` when its folder has no
@@ -1322,7 +1375,14 @@ pub fn provision_node_package(
     // Packages without the marker keep the old behaviour: verify against the
     // install-root tag.
     if !already_installed {
-        copy_and_verify_engine_tree(bundled_pkg_dir, install_root, datadir, &listing)?;
+        // Setup and engine upgrades: the longer limit.
+        copy_and_verify_engine_tree(
+            bundled_pkg_dir,
+            install_root,
+            datadir,
+            &listing,
+            SETUP_VERSION_CHECK_TIMEOUT,
+        )?;
     }
 
     // Write the node faststart.conf (bootstrap peers appended by the caller via
@@ -2345,6 +2405,33 @@ mod tests {
         std::fs::write(&btxd, b"#!/bin/sh\necho 'BTX daemon version v0.34.16'\n").unwrap();
         verify_btxd_reports_tag_within(&btxd, "v0.34.16", std::time::Duration::from_secs(10))
             .unwrap();
+    }
+
+    /// #249: a btxd that answers and exits but leaves a program behind that
+    /// holds its output open. The check reads what was said and returns, and
+    /// does not wait for that program.
+    #[cfg(unix)]
+    #[test]
+    fn a_version_check_does_not_wait_for_a_program_that_holds_the_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let btxd = tmp.path().join("btxd");
+        std::fs::write(
+            &btxd,
+            b"#!/bin/sh\necho 'BTX daemon version v0.34.16'\nsleep 30 &\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&btxd, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        verify_btxd_reports_tag_within(&btxd, "v0.34.16", std::time::Duration::from_secs(20))
+            .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        // Setup's limit is the longer one.
+        assert!(SETUP_VERSION_CHECK_TIMEOUT > VERSION_CHECK_TIMEOUT);
     }
 
     /// `returning_launch_paths`'s test of a folder, without a HOME.

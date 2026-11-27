@@ -97,6 +97,7 @@ type NodePhase =
   | { phase: "welcome" }
   | { phase: "downloading"; progress: number }
   | { phase: "preparing" }
+  | { phase: "installing" }
   | { phase: "starting" }
   | { phase: "warming"; message: string }
   | { phase: "loading_snapshot" }
@@ -1285,7 +1286,8 @@ function renderStatus(status: NodeStatusInfo) {
   toggleNodeBtn.textContent = running ? "Stop node" : "Start node";
   toggleNodeBtn.classList.toggle("is-stop", running);
   // Also while the node engine is installed again: the start is under way.
-  toggleNodeBtn.disabled = p.phase === "starting" || p.phase === "preparing";
+  toggleNodeBtn.disabled =
+    p.phase === "starting" || p.phase === "preparing" || p.phase === "installing";
 }
 
 // ── Poll loop ────────────────────────────────────────────────────────────────
