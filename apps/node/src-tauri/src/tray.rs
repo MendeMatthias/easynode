@@ -163,6 +163,7 @@ pub fn tray_status(phase: &NodePhase, stuck: bool) -> (String, bool) {
             (format!("Setting up… {:.0}%", progress * 100.0), false)
         }
         NodePhase::Preparing => ("Setting up…".to_string(), false),
+        NodePhase::Installing => ("Node: installing the engine…".to_string(), false),
         NodePhase::Starting => ("Node: starting…".to_string(), true),
         NodePhase::Warming { .. } => ("Node: getting ready…".to_string(), true),
         NodePhase::LoadingSnapshot => ("Node: loading snapshot…".to_string(), true),
@@ -198,6 +199,7 @@ pub fn reflect_status(app: &AppHandle, phase: &NodePhase, stuck: bool) {
         NodePhase::Starting
             | NodePhase::Downloading { .. }
             | NodePhase::Preparing
+            | NodePhase::Installing
             | NodePhase::Welcome
     );
     let _ = handles.toggle.set_enabled(actionable);

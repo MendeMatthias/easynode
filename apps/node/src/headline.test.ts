@@ -244,11 +244,19 @@ describe("headline while syncing", () => {
 
 describe("headline while the node engine is installed again", () => {
   it("says so instead of a bare ellipsis", () => {
-    expect(headline({ phase: "preparing" }, facts())).toEqual({
+    expect(headline({ phase: "installing" }, facts())).toEqual({
       badge: "INSTALLING",
       sub: "Installing the node engine…",
       mode: "syncing",
     });
+  });
+});
+
+describe("headline during setup's own preparing step", () => {
+  it("does not claim the engine is being installed again (#249)", () => {
+    const h = headline({ phase: "preparing" }, facts());
+    expect(h.badge).toBe("PREPARING");
+    expect(h.sub).not.toContain("Installing the node engine");
   });
 });
 

@@ -648,6 +648,9 @@ pub enum NodePhase {
     Downloading { progress: f64 },
     /// Copying + signing the bundled node binaries, writing the conf.
     Preparing,
+    /// Putting a missing node engine back on a computer that was set up
+    /// (`commands::put_back_pinned_engine`); setup's own copy is `Preparing`.
+    Installing,
     /// btxd spawned; waiting for its RPC to come up.
     Starting,
     /// btxd is alive but answering RPC_IN_WARMUP (-28): verifying blocks /

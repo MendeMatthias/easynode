@@ -8,6 +8,28 @@ root).
 
 ## [Unreleased]
 
+**The swarm engine heals itself, and says so (0.9.1).**
+
+- **With the swarm on, the swarm engine now downloads by itself** (about
+  500 MB): after a download from the switch that failed (tried again once a
+  day), and whenever an app release changes the swarm engine it expects, at
+  the next start after the update. The node keeps running on its usual engine
+  while it downloads.
+- **A failed attempt to put a deleted node engine back is retried in 15
+  minutes** (then 30, 60 ... at most a day), so a passing full disk or a file
+  lock no longer leaves the node down until the next day, also across a
+  restart of the app. Its message says it failed, not that the engine "was put
+  back".
+- **A node whose btx-cli was deleted is adopted, not refused**, and stopped
+  over RPC when it must stop; the file is put back at the next start.
+- **A second launch during a quit or a slow start no longer starts a second
+  app** (Linux): it waits for the quitting app to be gone, and a starting app
+  answers it at once.
+- **Under WSL a window whose page hung right after saying it was hidden is
+  judged again after five minutes.** WSL never tells the app that its window
+  was minimised, so a minimised window that looks frozen can still be rebuilt
+  onto the desktop: a frozen window would be worse.
+
 **A frozen window under WSL comes back by itself (PR #246).**
 
 - **Under WSL the window no longer freezes after the screen goes idle.** The

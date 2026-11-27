@@ -102,6 +102,7 @@ fn phase_words(phase: &NodePhase) -> String {
             format!("downloading the snapshot, {:.0}%", progress * 100.0)
         }
         NodePhase::Preparing => "preparing the node".into(),
+        NodePhase::Installing => "installing the node engine".into(),
         NodePhase::Starting => "starting".into(),
         NodePhase::Warming { message } => format!("warming up: {message}"),
         NodePhase::LoadingSnapshot => "loading the snapshot".into(),
@@ -158,7 +159,10 @@ pub(crate) const STILL_STARTING: &str = "Your node is still starting. Try again 
 
 fn no_node(phase: &NodePhase) -> NoNode {
     match phase {
-        NodePhase::Preparing | NodePhase::Starting | NodePhase::Warming { .. } => NoNode::Starting,
+        NodePhase::Preparing
+        | NodePhase::Installing
+        | NodePhase::Starting
+        | NodePhase::Warming { .. } => NoNode::Starting,
         _ => NoNode::Stopped,
     }
 }
