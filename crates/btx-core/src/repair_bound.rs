@@ -68,7 +68,16 @@ pub fn record_attempt(
 ) -> std::io::Result<()> {
     let why = failed.unwrap_or("").replace(['\n', '\r'], " ");
     let why: String = why.chars().take(600).collect();
-    crate::fsx::atomic_write(path, format!("{at}\n{why}\n{failures}\n").as_bytes())
+    // The count only after a failure: an app from before it read every line
+    // after the first as the reason, so a success with a "0" line would read
+    // to it as a failure named "0". After a failure it reads "reason 2",
+    // still a failure.
+    let text = if failed.is_some() {
+        format!("{at}\n{why}\n{failures}\n")
+    } else {
+        format!("{at}\n\n")
+    };
+    crate::fsx::atomic_write(path, text.as_bytes())
 }
 
 /// How many failures in a row the attempt about to be written makes, given
@@ -243,8 +252,10 @@ mod tests {
         // Many failures: capped at the day.
         record_attempt(&path, t, Some("x"), 40).unwrap();
         assert_eq!(retry_wait(&read(&path).unwrap()), WINDOW_SECS);
-        // A success starts again and waits the day.
+        // A success starts again and waits the day, and is written as an
+        // older app reads a success: no reason, nothing after it.
         record(&path, t, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{t}\n\n"));
         let last = read(&path).unwrap();
         assert_eq!((last.failures, retry_wait(&last)), (0, WINDOW_SECS));
         assert_eq!(failures_after(Some(&last)), 1);

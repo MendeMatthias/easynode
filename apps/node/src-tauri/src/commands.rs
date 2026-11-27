@@ -2677,22 +2677,68 @@ fn engine_put_back_bounded(last: &btx_core::repair_bound::Attempt) -> String {
     }
 }
 
+/// When the node, down because putting the engine back FAILED, may be started
+/// again by itself: `None` unless the last attempt failed. Read from the
+/// record, so a start after an app restart, a reboot or an update arms the
+/// same retry the failed attempt did (#252 review).
+fn put_back_retry_delay(last: Option<&btx_core::repair_bound::Attempt>, now: u64) -> Option<u64> {
+    let last = last.filter(|a| a.failed.is_some())?;
+    Some(btx_core::repair_bound::next_allowed_backing_off(last).saturating_sub(now))
+}
+
+/// Whether the error on screen is the put-back's own: the retry starts the
+/// node only for that, never over another error someone should read.
+fn is_put_back_error(message: &str) -> bool {
+    message.starts_with("The node engine is missing")
+}
+
+/// Whether the retry, when its time comes, starts the node: not while
+/// quitting, not when a node runs, and only while the put-back's own error is
+/// what the window shows.
+fn retry_should_start(quitting: bool, rpc_armed: bool, phase: &NodePhase) -> bool {
+    !quitting
+        && !rpc_armed
+        && matches!(phase, NodePhase::Error { message } if is_put_back_error(message))
+}
+
+/// Wait `delay`, then start if `still_wanted` says so.
+async fn run_put_back_retry<W, S>(delay: std::time::Duration, still_wanted: W, start: S)
+where
+    W: std::future::Future<Output = bool>,
+    S: std::future::Future<Output = ()>,
+{
+    tokio::time::sleep(delay).await;
+    if still_wanted.await {
+        start.await;
+    }
+}
+
+/// One retry timer at a time: every refused start would otherwise arm one.
+static PUT_BACK_RETRY_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// After a failed put-back, start the node again by itself once the backoff
 /// allows (`repair_bound::retry_wait`): a passing full disk or a file lock
-/// must not keep an unattended node down until the next day (#249). Only a
-/// node that is still down with an error, and never while quitting.
+/// must not keep an unattended node down until the next day (#249). Armed by
+/// the failure and by every start the backoff refuses after it, so an app
+/// restart in between does not lose it.
 fn retry_put_back_later(app: &AppHandle, after_secs: u64) {
+    if PUT_BACK_RETRY_ARMED.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(after_secs)).await;
         let state = app.state::<AppState>();
-        if state.quitting.load(Ordering::SeqCst)
-            || state.rpc.lock().await.is_some()
-            || !matches!(*state.phase.lock().await, NodePhase::Error { .. })
-        {
-            return;
-        }
-        let _ = start_node_projected(&app, &state).await;
+        let wanted = async {
+            PUT_BACK_RETRY_ARMED.store(false, Ordering::SeqCst);
+            let rpc_armed = state.rpc.lock().await.is_some();
+            let phase = state.phase.lock().await.clone();
+            retry_should_start(state.quitting.load(Ordering::SeqCst), rpc_armed, &phase)
+        };
+        let start = async {
+            let _ = start_node_projected(&app, &state).await;
+        };
+        run_put_back_retry(std::time::Duration::from_secs(after_secs), wanted, start).await;
     });
 }
 
@@ -2707,7 +2753,10 @@ fn adopt_without_cli(node_running: bool, btxd_present: bool) -> bool {
 /// The launch paths of the pinned engine for a node adopted without btx-cli:
 /// btx-cli's path is where it belongs, though it is not there.
 fn paths_without_cli(datadir: &Path) -> Option<FaststartResult> {
-    let root = install_dir(NODE_RELEASE_TAG)?;
+    paths_without_cli_in(&install_dir(NODE_RELEASE_TAG)?, datadir)
+}
+
+fn paths_without_cli_in(root: &Path, datadir: &Path) -> Option<FaststartResult> {
     let btxd = root.join("bin").join(btx_core::platform::exe_name("btxd"));
     btxd.is_file().then(|| FaststartResult {
         btxd,
@@ -2766,6 +2815,11 @@ async fn put_back_pinned_engine(
         PutBackGate::NodeRunning => return refuse(engine_in_use_message(&install_root)),
         PutBackGate::Bounded => {
             let last = last.expect("bounded implies a record");
+            // After a failure, this start (an app restart since, say) arms
+            // the retry the failure armed, so the node is not left down.
+            if let Some(delay) = put_back_retry_delay(Some(&last), now) {
+                retry_put_back_later(app, delay);
+            }
             return refuse(engine_put_back_bounded(&last));
         }
     }
@@ -3043,6 +3097,10 @@ mod engine_file_tests {
         missing_engine_step, no_engine_message, owner_asked_this_start, MissingEngine, PutBackGate,
         NODE_RELEASE_TAG, OWNER_STARTED,
     };
+    use super::{
+        is_put_back_error, paths_without_cli_in, put_back_retry_delay, retry_should_start,
+        run_put_back_retry, NodePhase,
+    };
     use btx_core::engine_files::{Check, Damage, Mode, NotCopied};
     use std::path::Path;
 
@@ -3284,6 +3342,103 @@ mod engine_file_tests {
         assert!(adopt_without_cli(true, true));
         assert!(!adopt_without_cli(true, false), "btxd gone too: refused");
         assert!(!adopt_without_cli(false, true), "nothing runs: put back");
+
+        // The paths it is adopted with: the folder's btxd, btx-cli where it
+        // belongs (not there), the node's own conf.
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("v0.34.16").join("plat");
+        let datadir = home.path().join("dd");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        assert!(
+            paths_without_cli_in(&root, &datadir).is_none(),
+            "no btxd: nothing to adopt with"
+        );
+        let btxd = bin.join(btx_core::platform::exe_name("btxd"));
+        std::fs::write(&btxd, b"engine").unwrap();
+        let paths = paths_without_cli_in(&root, &datadir).unwrap();
+        assert_eq!(paths.btxd, btxd);
+        assert_eq!(
+            paths.btx_cli,
+            bin.join(btx_core::platform::exe_name("btx-cli"))
+        );
+        assert!(!paths.btx_cli.exists());
+        assert_eq!(
+            paths.faststart_conf,
+            datadir.join("faststart").join("faststart.conf")
+        );
+        assert!(adopt_without_cli(true, paths.btxd.is_file()));
+    }
+
+    /// #252 review: a put-back failed, the app restarted (only the record
+    /// is left), the start is refused by the backoff, and the timer it arms
+    /// fires and starts the node. A success record arms nothing, and the
+    /// timer never starts over another error or a running node.
+    #[tokio::test]
+    async fn a_failed_put_back_is_retried_after_an_app_restart() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("easynode-engine-reinstall");
+        let failed_at = 1_795_720_000;
+        let wait = btx_core::repair_bound::RETRY_AFTER_FAILURE_SECS;
+        btx_core::repair_bound::record_attempt(&record, failed_at, Some("disk error: no room"), 1)
+            .unwrap();
+
+        // The restarted app: one second before the backoff ends.
+        let now = failed_at + wait - 1;
+        let last = btx_core::repair_bound::read(&record);
+        assert_eq!(
+            engine_put_back_gate(false, last.as_ref(), now, false),
+            PutBackGate::Bounded
+        );
+        let delay = put_back_retry_delay(last.as_ref(), now).expect("a retry is armed");
+        assert_eq!(delay, 1);
+        let shown = NodePhase::Error {
+            message: engine_put_back_bounded(last.as_ref().unwrap()),
+        };
+        let started = AtomicBool::new(false);
+        let began = std::time::Instant::now();
+        run_put_back_retry(
+            std::time::Duration::from_secs(delay),
+            async { retry_should_start(false, false, &shown) },
+            async { started.store(true, Ordering::SeqCst) },
+        )
+        .await;
+        assert!(started.load(Ordering::SeqCst), "the node was started");
+        assert!(began.elapsed() >= std::time::Duration::from_secs(1));
+        // At that time the backoff allows the start the timer makes.
+        assert_eq!(
+            engine_put_back_gate(false, last.as_ref(), now + delay, false),
+            PutBackGate::Go
+        );
+
+        // Not over another error, a running node, or a quit.
+        let other = NodePhase::Error {
+            message: "The node stopped responding. Press Start to relaunch it.".into(),
+        };
+        assert!(!retry_should_start(false, false, &other));
+        assert!(!retry_should_start(false, true, &shown));
+        assert!(!retry_should_start(true, false, &shown));
+        let not_started = AtomicBool::new(false);
+        run_put_back_retry(
+            std::time::Duration::from_millis(1),
+            async { retry_should_start(false, false, &other) },
+            async { not_started.store(true, Ordering::SeqCst) },
+        )
+        .await;
+        assert!(!not_started.load(Ordering::SeqCst));
+        // And the immediate failure's own message is the put-back's too.
+        assert!(is_put_back_error(&engine_reinstall_failed(
+            "disk error: no room"
+        )));
+
+        // A put-back that succeeded (something removed the engine since)
+        // arms no retry: that is the day-long bound, by design.
+        btx_core::repair_bound::record(&record, failed_at, None).unwrap();
+        assert_eq!(
+            put_back_retry_delay(btx_core::repair_bound::read(&record).as_ref(), now),
+            None
+        );
     }
 
     /// #249: the owner's Start node is seen only by the start it began. An

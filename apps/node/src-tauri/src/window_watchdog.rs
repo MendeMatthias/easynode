@@ -125,12 +125,6 @@ pub struct Observation {
     pub baseline: u64,
     /// When the window last gained focus, while that probe is open.
     pub focus_probe: Option<u64>,
-    /// The window does not have the focus. Under WSLg a minimised window
-    /// still counts as shown to GTK (Wayland tells a client nothing about
-    /// minimising) and gets no frames, so it looks frozen; building it again
-    /// would put it back on the desktop. A window nobody is using is reloaded
-    /// but not rebuilt until it has the focus again (#250).
-    pub in_background: bool,
 }
 
 /// Whether the page's word that it is hidden still counts: it was said in a
@@ -204,9 +198,15 @@ pub fn decide(o: &Observation, stage: Stage, recent: &[u64]) -> (Action, Stage) 
             if o.now < at + VERIFY_SECS {
                 return (Action::None, stage);
             }
-            // A rebuild puts the window on the desktop; one nobody is using
-            // (minimised under WSLg looks just like this) waits for the focus.
-            if matches!(stage, Stage::Reloaded { .. }) && o.in_background {
+            // A window shown again this very tick (restored from minimised)
+            // gets that tick before a rebuild: GTK reports the change a beat
+            // before the first frame. A minimised window that GTK reports
+            // as minimised is not `shown` and ended the episode above. Under
+            // WSLg a minimise is never reported (Wayland tells a client
+            // nothing about it), so there a frozen window is rebuilt and
+            // comes back on the desktop: a frozen window is worse than an
+            // un-minimised one (#250, #252 review).
+            if matches!(stage, Stage::Reloaded { .. }) && o.now <= o.baseline {
                 return (Action::None, stage);
             }
             if matches!(stage, Stage::Reloaded { .. }) && budget_left(o.now, recent) {
@@ -253,9 +253,7 @@ pub fn describe(o: &Observation) -> String {
     } else if o.page_hidden {
         s.push_str(", page said hidden but has not beaten since");
     }
-    if o.in_background {
-        s.push_str(", not focused");
-    }
+
     s
 }
 
@@ -476,7 +474,6 @@ fn check(app: &AppHandle) {
     };
     let watch = app.state::<WindowWatch>();
     let shown = w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false);
-    let in_background = !w.is_focused().unwrap_or(true);
     if shown {
         probe::queue(&w);
     }
@@ -499,7 +496,6 @@ fn check(app: &AppHandle) {
             paint,
             baseline: g.shown_since.unwrap_or(now).max(g.last_action),
             focus_probe: g.focus_probe,
-            in_background,
         };
         let (action, stage) = decide(&obs, g.stage, &g.recent);
         if g.focus_probe
@@ -820,7 +816,6 @@ mod tests {
             paint: Some(now - 2),
             baseline: 0,
             focus_probe: None,
-            in_background: false,
         }
     }
 
@@ -1015,33 +1010,45 @@ mod tests {
         assert!(stalled(&clicked));
     }
 
-    // #250: under WSLg a minimised window counts as shown and gets no frames.
-    // It is reloaded (which leaves it minimised), but not rebuilt onto the
-    // desktop while it does not have the focus; once it is focused again and
-    // still frozen, it is.
+    // PR 246's own case, kept by the #252 review: a WSLg window that is
+    // shown but does not have the focus (the screen went idle) and stays
+    // frozen after the reload is rebuilt; being unfocused is not being
+    // minimised. Under WSLg a minimise is never reported, so a minimised
+    // window there is rebuilt too: the trade-off is a window back on the
+    // desktop rather than a frozen one.
     #[test]
-    fn a_window_without_the_focus_is_reloaded_but_not_rebuilt_until_focused() {
-        let stuck = |now, in_background| Observation {
+    fn a_shown_window_without_the_focus_is_still_rebuilt() {
+        let stuck = Observation {
             paint: Some(400),
-            in_background,
-            ..live(now)
+            ..live(520)
         };
         assert_eq!(
-            decide(&stuck(500, true), Stage::Watching, &[]),
-            (Action::Reload, Stage::Reloaded { at: 500 })
+            decide(&stuck, Stage::Reloaded { at: 500 }, &[500]),
+            (Action::Recreate, Stage::Recreated { at: 520 })
         );
-        for now in [520, 600, 4_000] {
-            assert_eq!(
-                decide(&stuck(now, true), Stage::Reloaded { at: 500 }, &[500]),
-                (Action::None, Stage::Reloaded { at: 500 }),
-                "{now}"
-            );
-        }
+    }
+
+    // A window restored this very tick gets that tick before a rebuild, and
+    // is rebuilt on the next if it is still frozen.
+    #[test]
+    fn a_window_shown_again_this_tick_gets_one_tick_before_a_rebuild() {
+        let restored = Observation {
+            paint: Some(400),
+            baseline: 600,
+            ..live(600)
+        };
         assert_eq!(
-            decide(&stuck(4_005, false), Stage::Reloaded { at: 500 }, &[500]),
-            (Action::Recreate, Stage::Recreated { at: 4_005 })
+            decide(&restored, Stage::Reloaded { at: 500 }, &[500]),
+            (Action::None, Stage::Reloaded { at: 500 })
         );
-        assert!(describe(&stuck(500, true)).contains("not focused"));
+        let next = Observation {
+            now: 605,
+            ..restored
+        };
+        assert_eq!(
+            decide(&next, Stage::Reloaded { at: 500 }, &[500]),
+            (Action::Recreate, Stage::Recreated { at: 605 })
+        );
     }
 
     // A destroy that failed at once raises no exit request: the next quit
