@@ -8,6 +8,28 @@ root).
 
 ## [Unreleased]
 
+**A frozen window under WSL comes back by itself (PR #246).**
+
+- **Under WSL the window no longer freezes after the screen goes idle.** The
+  app now renders its window without WebKit's accelerated compositing under
+  WSL (`WEBKIT_DISABLE_COMPOSITING_MODE=1`, set by the app itself). On the
+  WSL box where the window always froze about 15 minutes into a screen idle,
+  it kept painting 66 minutes into one. `EASYBTX_NODE_WEBKIT=gpu` goes back
+  to WebKit's defaults (`software` and `no-dmabuf` are the other choices).
+- **A window that stops anyway is brought back without a click** (under WSL):
+  when it stops painting for 30 seconds it is reloaded, and rebuilt if that
+  does not help. The node is never touched. At most four times an hour, and
+  every time is written to setup.log. `EASYBTX_NODE_WINDOW_WATCHDOG=1` turns
+  this on outside WSL, `0` turns it off.
+- **Launching the app again rebuilds its window** (Linux). Under WSLg there
+  is no tray icon at all, so that is the way out there; on desktops with a
+  tray, the tray menu has "Reload window" too. A second launch no longer
+  starts a second app beside the first.
+- **The animations stop when nobody looks**: when the window is hidden, out
+  of focus for a minute, or untouched for five minutes, and always with
+  reduced motion. Under WSLg a minimised window still counts as visible, so
+  there the five-minute rule is the one that stops them.
+
 **The node heals itself after a deleted or broken engine.**
 
 - **A missing node engine is put back by itself.** If the engine's folder

@@ -17,6 +17,9 @@ pub struct TrayHandles {
 
 pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let open_i = MenuItem::with_id(app, "open", "Open BTX Node", true, None::<&str>)?;
+    // A frozen window cannot be clicked; this reloads it from outside
+    // (window_watchdog). The node is not touched.
+    let reload_i = MenuItem::with_id(app, "reload", "Reload window", true, None::<&str>)?;
     let status_i = MenuItem::with_id(app, "status", "Node: stopped", false, None::<&str>)?;
     let toggle_i = MenuItem::with_id(app, "toggle", "Start node", true, None::<&str>)?;
     let quit_i = MenuItem::with_id(app, "quit", "Quit BTX Node", true, None::<&str>)?;
@@ -24,6 +27,7 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         app,
         &[
             &open_i,
+            &reload_i,
             &PredefinedMenuItem::separator(app)?,
             &status_i,
             &toggle_i,
@@ -48,6 +52,13 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .tooltip("BTX Node")
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_main_window(app),
+            "reload" => {
+                // Off the main thread: rebuilding waits for the event loop.
+                let app = app.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    crate::window_watchdog::reload_now(&app, "tray menu")
+                });
+            }
             "toggle" => toggle_node(app),
             "quit" => {
                 // The RunEvent::ExitRequested handler performs the graceful
@@ -64,7 +75,14 @@ pub fn show_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.set_focus();
+        return;
     }
+    // No window: a rebuild could not build one (window_watchdog). Build it
+    // now, off the main thread, which the build waits on.
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = crate::window_watchdog::ensure_window(&app, true);
+    });
 }
 
 fn toggle_node(app: &AppHandle) {

@@ -11,6 +11,7 @@ mod ask;
 mod commands;
 mod fast_forward;
 mod read_block_recovery;
+mod second_launch;
 mod state;
 mod tools;
 mod tray;
@@ -18,6 +19,8 @@ mod update_binding;
 mod update_log;
 mod update_timer;
 mod wallet;
+mod webkit_env;
+mod window_watchdog;
 
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 
@@ -25,6 +28,20 @@ use crate::state::{node_datadir, AppState, NodeAppSettings, NodePhase};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before anything reads the environment: how WebKitGTK renders under WSL
+    // (webkit_env). The process has one thread here.
+    #[cfg(target_os = "linux")]
+    let rendering = webkit_env::apply();
+
+    // On Linux a second launch reloads the running app's window and exits
+    // (second_launch): the way out of a frozen window on WSLg, which has no
+    // tray. Anything short of a clear "ok" from a running app starts normally.
+    let claim = second_launch::claim(&node_datadir());
+    if matches!(claim, second_launch::Claim::Second) {
+        println!("[node-app] easyNode is already running; it reloaded its window");
+        std::process::exit(0);
+    }
+
     tauri::Builder::default()
         // Every update the plugin offers must be signed under this app's
         // name at the version the feed announces (update_binding). Both
@@ -41,6 +58,7 @@ pub fn run() {
             None,
         ))
         .manage(AppState::new())
+        .manage(window_watchdog::WindowWatch::new())
         .invoke_handler(tauri::generate_handler![
             commands::get_node_status,
             commands::begin_setup,
@@ -104,9 +122,32 @@ pub fn run() {
             wallet::wallet_receive_address,
             wallet::wallet_send,
             wallet::wallet_open_explorer,
+            window_watchdog::window_heartbeat,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             tray::build_tray(app.handle())?;
+
+            #[cfg(target_os = "linux")]
+            commands::setup_log(&node_datadir(), &rendering);
+
+            // The window proves it is alive and is brought back when it stops
+            // (window_watchdog); second launches reload it (second_launch).
+            // Neither touches the node.
+            window_watchdog::spawn(app.handle().clone());
+            let handle = app.handle().clone();
+            let quitting = app.handle().clone();
+            second_launch::serve(
+                claim,
+                move || {
+                    quitting
+                        .state::<AppState>()
+                        .quitting
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                },
+                move || {
+                    window_watchdog::reload_now(&handle, "the app was launched again");
+                },
+            );
 
             // The high-water mark update_binding refuses to go below.
             update_binding::remember_running_version(&node_datadir(), &app.package_info().version);
@@ -206,6 +247,11 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            // A click on the window: it must paint within seconds
+            // (window_watchdog's focus probe).
+            if let WindowEvent::Focused(true) = event {
+                window_watchdog::on_focus(window.app_handle());
+            }
             // Red X: behavior is the user's choice, remembered in settings.
             //   "tray"  → hide; the node keeps supporting the network (old default)
             //   "quit"  → graceful stop + exit
@@ -259,11 +305,23 @@ pub fn run() {
                     // `AttachedTo::OurOrphan` and adopts it, which is exactly
                     // the case the attached-mode stop path was written for.
                     if code == Some(tauri::RESTART_EXIT_CODE) {
+                        // The relaunched instance must start as the first one.
+                        second_launch::release();
+                        return;
+                    }
+                    // The watchdog destroying the main window to build it
+                    // again leaves no window for a moment, which the runtime
+                    // reports as one exit request without a code. It is not
+                    // a quit: the node must not be stopped for it. Only that
+                    // one request is held off; any later quit goes through.
+                    if window_watchdog::hold_off_for_rebuild(app, code) {
+                        api.prevent_exit();
                         return;
                     }
                     let state = app.state::<AppState>();
                     if !state.quitting.load(std::sync::atomic::Ordering::SeqCst) {
                         api.prevent_exit();
+                        second_launch::release();
                         commands::spawn_graceful_quit(app);
                     }
                 }
