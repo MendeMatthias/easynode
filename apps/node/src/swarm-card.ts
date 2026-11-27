@@ -33,6 +33,7 @@ export type SwarmCard = {
     | "not_available"
     | "off"
     | "fetching"
+    | "repairing"
     | "fetch_failed"
     | "engine_missing"
     | "engine_damaged"
@@ -47,11 +48,14 @@ export type SwarmCard = {
     | "unreadable"
     | "unreachable";
   why: string;
-  /** The download's progress while `state` is "fetching". */
+  /** The download's progress while `state` is "fetching" or "repairing". */
   percent: number;
   /** The engine download's size in MB; 0 when this version has none. */
   download_mb: number;
   report: SwarmReport | null;
+  /** The last repair the app made by itself in this run, as a sentence;
+   *  empty (or absent, from an older backend) when none. */
+  repair_note?: string;
 };
 
 export type SwarmView = {
@@ -130,6 +134,14 @@ export function swarmResultStillApplies(stateWhenShown: SwarmCard["state"], now:
 }
 
 export function swarmView(c: SwarmCard): SwarmView {
+  const v = swarmViewOf(c);
+  // A repair the app made by itself is said on the card while the swarm is
+  // on, above whatever the card says now.
+  const note = (c.repair_note ?? "").trim();
+  return note && c.wanted ? { ...v, lines: [note, ...v.lines] } : v;
+}
+
+function swarmViewOf(c: SwarmCard): SwarmView {
   const base = { checked: c.wanted, disabled: false, lines: [] as string[], attention: false };
   // A switch that cannot be turned on is greyed out with the reason. It stays
   // usable when it is saved as on, so it can always be switched off.
@@ -148,6 +160,12 @@ export function swarmView(c: SwarmCard): SwarmView {
         ...base,
         disabled: true,
         desc: `Downloading the swarm engine: ${c.percent}%. Your node keeps running on its usual engine and restarts once the download has been checked.`,
+      };
+    case "repairing":
+      return {
+        ...base,
+        disabled: true,
+        desc: `The swarm engine was damaged; downloading it again: ${c.percent}%. Your node keeps running on its usual engine and restarts on the swarm engine once the download has been checked.`,
       };
     case "fetch_failed":
       return {

@@ -53,6 +53,71 @@ fn cookie_mtime(path: &std::path::Path) -> String {
     format!("mtime {unix} (written {ago}s ago)")
 }
 
+/// JSON-RPC `RPC_IN_WARMUP`: btxd is alive and not ready to answer yet.
+pub const RPC_IN_WARMUP: i64 = -28;
+
+/// What an HTTP 503 from the node becomes: `AppError::Http` with this text.
+///
+/// btxd answers 503 with an HTML page (`<HTML><HEAD><TITLE>503 Service
+/// Unavailable</TITLE>...`) while its HTTP server is up and its RPC is not:
+/// during a restart, on the way down and on the way up, and for as long as
+/// it hangs in shutdown or its RPC queue stays full.
+///
+/// It is a FAILURE, not `RPC_IN_WARMUP`. The status refresher counts
+/// failures to "The node stopped responding" and a graceful stop, and the
+/// start's RPC wait counts them against its budget; a node that answers 503
+/// for ever must reach both. Only screens that merely ask the person to try
+/// again in a moment read it as warming ([`is_not_ready`]).
+pub const NODE_NOT_READY: &str = "node not ready (HTTP 503)";
+
+/// The error a 503 became ([`NODE_NOT_READY`]).
+pub fn is_not_ready(e: &AppError) -> bool {
+    matches!(e, AppError::Http(m) if m == NODE_NOT_READY)
+}
+
+/// The last reply state a line was logged for, process-wide: 0 for an
+/// ordinary answer, else the HTTP status of a 503 or of an HTML page. Shared
+/// by every client, because the app builds a fresh client for many probes
+/// (the warmup watcher makes one every two seconds), and "once per state
+/// change" has to hold across them.
+static LOGGED_REPLY_STATE: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// A reply body that is an HTML page rather than JSON. A JSON-RPC body starts
+/// with `{`; one that starts with `<` is markup, whatever its status.
+fn is_html(body: &str) -> bool {
+    body.trim_start().starts_with('<')
+}
+
+/// What to log for a failed reply with `status` and `body`, given the state
+/// last logged in `logged`.
+///
+/// `None`: not a 503 and not an HTML page; the caller handles it as before,
+/// and the state goes back to "answering", so the next 503 is a new one.
+/// `Some(line)`: a 503 or an HTML page. `line` is the one short line to log
+/// when that state begins, and `None` while it lasts. The page itself is
+/// never in it.
+fn unready_log_line(
+    logged: &std::sync::atomic::AtomicU16,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> Option<Option<String>> {
+    use std::sync::atomic::Ordering;
+    let unready = status == reqwest::StatusCode::SERVICE_UNAVAILABLE;
+    if !unready && !is_html(body) {
+        logged.store(0, Ordering::SeqCst);
+        return None;
+    }
+    let code = status.as_u16();
+    let first = logged.swap(code, Ordering::SeqCst) != code;
+    Some(first.then(|| {
+        if unready {
+            format!("[rpc] {NODE_NOT_READY}; said once until the node answers again")
+        } else {
+            format!("[rpc] HTTP {status} from node (an HTML page, not logged)")
+        }
+    }))
+}
+
 #[async_trait]
 pub trait Rpc: Send + Sync {
     async fn call(&self, method: &str, params: Value) -> AppResult<Value>;
@@ -78,6 +143,9 @@ pub struct RpcClient {
     /// This handle's own request timeout, in place of the client's 60 s
     /// ([`RpcClient::with_timeout`]). `None` keeps the 60 s.
     timeout: Option<Duration>,
+    /// Where the "logged once" state of unready replies is kept: the
+    /// process-wide [`LOGGED_REPLY_STATE`], except in tests.
+    logged: &'static std::sync::atomic::AtomicU16,
 }
 
 impl RpcClient {
@@ -110,7 +178,16 @@ impl RpcClient {
             creds: std::sync::Arc::new(std::sync::RwLock::new((user.into(), pass.into()))),
             cookie_path: None,
             timeout: None,
+            logged: &LOGGED_REPLY_STATE,
         }
+    }
+
+    /// This handle with its own "logged once" state, so a test can read it
+    /// without the process-wide one other tests share.
+    #[cfg(test)]
+    fn with_logged_state(mut self, logged: &'static std::sync::atomic::AtomicU16) -> Self {
+        self.logged = logged;
+        self
     }
 
     pub fn for_wallet(&self, name: &str) -> Self {
@@ -128,6 +205,7 @@ impl RpcClient {
             creds: self.creds.clone(),
             cookie_path: self.cookie_path.clone(),
             timeout: self.timeout,
+            logged: self.logged,
         }
     }
 
@@ -249,6 +327,19 @@ impl Rpc for RpcClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            // A 503 (btxd restarting: its HTTP server answers and its RPC
+            // does not, with an HTML page) and any other HTML page: one short
+            // line when it begins, never the page. Still a failure: see
+            // `NODE_NOT_READY`.
+            if let Some(line) = unready_log_line(self.logged, status, &body) {
+                if let Some(line) = line {
+                    eprintln!("{line}");
+                }
+                if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                    return Err(AppError::Http(NODE_NOT_READY.to_string()));
+                }
+                return Err(AppError::Http(format!("node RPC error (HTTP {status})")));
+            }
             // btxd reports genuine JSON-RPC errors — most importantly RPC_IN_WARMUP
             // (-28), returned for minutes while it verifies blocks / rebuilds
             // shielded state — as an HTTP 500 with a structured error body. Surface
@@ -290,6 +381,8 @@ impl Rpc for RpcClient {
             return Err(AppError::Http(format!("node RPC error (HTTP {status})")));
         }
 
+        // An answer: a 503 or an HTML page after this is a new one to log.
+        self.logged.store(0, std::sync::atomic::Ordering::SeqCst);
         let json: Value = response
             .json()
             .await
@@ -375,6 +468,115 @@ mod tests {
             client.call("x", json!([])).await,
             Err(AppError::Http(_))
         ));
+    }
+
+    /// What btxd sends while it restarts, as the app logged it on 2026-11-26:
+    /// HTTP 503 with an HTML page. It is the warmup error with a short
+    /// message, never the page, so every caller that waits out a warmup
+    /// (`RPC_IN_WARMUP`) waits this out the same way.
+    #[tokio::test]
+    async fn a_503_html_page_is_a_short_failure_and_never_its_body() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .with_status(503)
+            .with_header("content-type", "text/html")
+            .with_body(
+                "<HTML><HEAD><TITLE>503 Service Unavailable</TITLE></HEAD>\
+                 <BODY><H1>503 Service Unavailable</H1></BODY></HTML>",
+            )
+            .create_async()
+            .await;
+        let logged: &'static std::sync::atomic::AtomicU16 =
+            Box::leak(Box::new(std::sync::atomic::AtomicU16::new(0)));
+        let client = RpcClient::new(server.url(), "u", "p").with_logged_state(logged);
+        match client.call("getblockchaininfo", json!([])).await {
+            Err(e) => {
+                assert!(is_not_ready(&e), "{e:?}");
+                // A failure, never the warmup code a watchdog forgives.
+                assert!(!matches!(
+                    e,
+                    AppError::Rpc {
+                        code: RPC_IN_WARMUP,
+                        ..
+                    }
+                ));
+                assert!(!e.to_string().contains('<'), "{e}");
+            }
+            other => panic!("expected the not-ready error, got {other:?}"),
+        }
+        assert_eq!(logged.load(std::sync::atomic::Ordering::SeqCst), 503);
+    }
+
+    /// An HTML page with another status is a plain HTTP error that names the
+    /// status and carries none of the page.
+    #[tokio::test]
+    async fn an_html_page_with_another_status_is_a_short_http_error() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .with_status(502)
+            .with_body("<html><body>Bad Gateway: secret-internal-host</body></html>")
+            .create_async()
+            .await;
+        let logged: &'static std::sync::atomic::AtomicU16 =
+            Box::leak(Box::new(std::sync::atomic::AtomicU16::new(0)));
+        let client = RpcClient::new(server.url(), "u", "p").with_logged_state(logged);
+        match client.call("getblockchaininfo", json!([])).await {
+            Err(AppError::Http(msg)) => {
+                assert!(msg.contains("502"), "{msg}");
+                assert!(!msg.contains('<') && !msg.contains("secret"), "{msg}");
+            }
+            other => panic!("expected AppError::Http, got {other:?}"),
+        }
+    }
+
+    /// One line when the node stops being ready, none while it stays so, and
+    /// one again after it has answered in between. The line never carries
+    /// the page.
+    #[test]
+    fn an_unready_node_is_logged_once_per_state_change() {
+        use reqwest::StatusCode;
+        let logged = std::sync::atomic::AtomicU16::new(0);
+        let page = "<HTML><HEAD><TITLE>503 Service Unavailable</TITLE></HEAD></HTML>";
+        let first = unready_log_line(&logged, StatusCode::SERVICE_UNAVAILABLE, page)
+            .expect("a 503 is an unready reply")
+            .expect("logged when it begins");
+        assert!(first.contains(NODE_NOT_READY), "{first}");
+        assert!(!first.contains('<'), "{first}");
+        for _ in 0..5 {
+            assert_eq!(
+                unready_log_line(&logged, StatusCode::SERVICE_UNAVAILABLE, page),
+                Some(None),
+                "not again while it lasts"
+            );
+        }
+        // A JSON-RPC error (the -28 warmup body) is an answer, not a page.
+        let warm = r#"{"result":null,"error":{"code":-28,"message":"Loading"},"id":"x"}"#;
+        assert_eq!(
+            unready_log_line(&logged, StatusCode::INTERNAL_SERVER_ERROR, warm),
+            None
+        );
+        assert!(
+            unready_log_line(&logged, StatusCode::SERVICE_UNAVAILABLE, page)
+                .unwrap()
+                .is_some()
+        );
+        // An HTML page with another status: its own state, once, no page.
+        let html = unready_log_line(&logged, StatusCode::BAD_GATEWAY, "  <html>x</html>")
+            .unwrap()
+            .unwrap();
+        assert!(html.contains("502") && !html.contains("<html"), "{html}");
+        assert_eq!(
+            unready_log_line(&logged, StatusCode::BAD_GATEWAY, "<html>x</html>"),
+            Some(None)
+        );
+        // A 503 without a page is still the unready state.
+        assert!(
+            unready_log_line(&logged, StatusCode::SERVICE_UNAVAILABLE, "")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

@@ -8,6 +8,32 @@ root).
 
 ## [Unreleased]
 
+**The node heals itself after a deleted or broken engine.**
+
+- **A missing node engine is put back by itself.** If the engine's folder
+  lost btxd or btx-cli after setup (deleted by hand, by a cleaner or by
+  antivirus software), the next start puts it back from the app's own copy,
+  showing "Installing the node engine…", and starts the node. A whole missing
+  engine is copied as setup copies it; a partial one gets back only the files
+  that are gone. Nothing is ever copied into a folder a node is running from,
+  and another build of the engine is left exactly as it is. By itself this
+  happens at most once a day; Start node always tries again.
+- **A broken swarm engine is repaired once before it is set aside.** When
+  the swarm engine fails to start, its files are checked against what this
+  version expects. Lost execute permissions are given back and it is started
+  once more; damaged or missing files are downloaded again (same checksum and
+  signature checks) while the node runs on its usual engine, and the node
+  then moves back onto it. Intact files that still fail are set aside as
+  before. At most once a day by itself; switching the swarm off and on tries
+  now. The Swarm row says what happened.
+- **Behaviour change: with the swarm on and its engine missing or damaged,
+  the next start now downloads it by itself** (about 470 MB), instead of
+  waiting for the switch to be flipped off and on.
+- **No more HTML pages in the log.** While the node restarts it answers
+  "503 Service Unavailable" with an HTML page; the app now logs one short
+  "node not ready (HTTP 503)" line when that begins, never the page. A node
+  that keeps answering 503 still counts as not responding.
+
 ## [0.9.0] - 2026-11-26 · linux + windows (no mac build; the mac stays on the version it has)
 
 **Swarm (model network): a switch for Linux, off by default, and a card that

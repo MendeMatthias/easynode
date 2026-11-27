@@ -31,6 +31,27 @@ const report = (over: Partial<SwarmReport> = {}): SwarmReport => ({
   ...over,
 });
 
+describe("the Swarm row when the app repairs the swarm engine by itself", () => {
+  it("says the engine was damaged and is downloading again, with the percent", () => {
+    const v = swarmView(card({ state: "repairing", wanted: true, percent: 37 }));
+    expect(v.disabled).toBe(true);
+    expect(v.attention).toBe(false);
+    expect(v.desc).toContain("The swarm engine was damaged; downloading it again: 37%.");
+    expect(v.desc).toContain("keeps running on its usual engine");
+  });
+
+  it("then says what was repaired, above what the swarm sees", () => {
+    const note = "The swarm engine was damaged (1 file (bin/btxd) could not be run) and was repaired by itself.";
+    const v = swarmView(card({ state: "observing", wanted: true, report: report(), repair_note: note }));
+    expect(v.lines[0]).toBe(note);
+    expect(v.lines.length).toBe(6);
+    expect(v.desc).toContain("On, observing only");
+    // Not on a switched-off row, and not from an older backend without it.
+    expect(swarmView(card({ state: "off", repair_note: note })).lines).toEqual([]);
+    expect(swarmView(card({ state: "starting", wanted: true })).lines).toEqual([]);
+  });
+});
+
 describe("the Swarm row", () => {
   it("is off and says, before the switch, what on would do", () => {
     const v = swarmView(card({}));

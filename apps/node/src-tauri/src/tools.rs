@@ -170,7 +170,7 @@ async fn no_node_now(state: &State<'_, AppState>) -> NoNode {
 /// RPC_IN_WARMUP: the engine is up but still verifying or rebuilding, as in
 /// `crate::ask::degrade`.
 fn is_warming(e: &AppError) -> bool {
-    matches!(e, AppError::Rpc { code: -28, .. })
+    matches!(e, AppError::Rpc { code: -28, .. }) || btx_core::rpc::is_not_ready(e)
 }
 
 fn console_without_node(n: NoNode) -> ConsoleAnswer {

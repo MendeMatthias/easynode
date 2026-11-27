@@ -722,6 +722,9 @@ pub enum SwarmFetch {
     Idle,
     /// Percent done.
     Fetching(u8),
+    /// Downloading again, by itself, a swarm engine found damaged; percent
+    /// done. The node runs on the default engine meanwhile.
+    Repairing(u8),
     /// Not installed, and why; the node is on the default engine.
     Failed(String),
 }

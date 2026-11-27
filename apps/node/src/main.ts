@@ -1263,7 +1263,8 @@ function renderStatus(status: NodeStatusInfo) {
   const running = isNodeActive(p, status.rc_stalled);
   toggleNodeBtn.textContent = running ? "Stop node" : "Start node";
   toggleNodeBtn.classList.toggle("is-stop", running);
-  toggleNodeBtn.disabled = p.phase === "starting";
+  // Also while the node engine is installed again: the start is under way.
+  toggleNodeBtn.disabled = p.phase === "starting" || p.phase === "preparing";
 }
 
 // ── Poll loop ────────────────────────────────────────────────────────────────
