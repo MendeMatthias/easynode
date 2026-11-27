@@ -8,6 +8,23 @@ root).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-27 · linux + windows (no mac build; the mac stays on the version it has)
+
+**Stop means stop, and Restart always restarts (PRs #244, #248).**
+
+- **A Stop you press is no longer undone by the app.** Before, a restart the
+  app had already decided on (switching the swarm, the first-sync restart,
+  getting a graphics card back) could start the node again after you had
+  pressed Stop. Now a Stop that comes after such a decision holds; a Stop
+  followed by your own Start counts as a Start.
+- **Restart node in Tools now starts a stopped node.** Before, after a Stop
+  it said "Your node restarted." and did nothing.
+- **The app reaches its own node on any port.** Every command the app sends
+  to the node now uses the node's own configuration, and a stop that cannot
+  be delivered by the command-line tool is sent again directly, on Windows
+  too, before the app waits for the node to end.
+
+
 **The swarm engine heals itself, and says so (0.9.1).**
 
 - **With the swarm on, the swarm engine now downloads by itself** (about
