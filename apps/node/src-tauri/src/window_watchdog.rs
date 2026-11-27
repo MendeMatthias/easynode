@@ -27,7 +27,13 @@
 //! [`VERIFY_SECS`], the main window is destroyed and built again from the
 //! config. It never stops, restarts or otherwise touches the node: the node is
 //! owned by `AppState`, which neither path goes near, and destroying the last
-//! window would otherwise ask the app to exit, which [`recreating`] holds off.
+//! window would otherwise ask the app to exit, which [`hold_off_exit`] holds
+//! off for that one request. An automatic rebuild never takes the focus.
+//!
+//! It acts on its own under WSL only, where the freeze was seen; elsewhere it
+//! waits for [`WATCHDOG_VAR`] (see [`watchdog_mode`]). The tray's "Reload
+//! window" and a second launch rebuild the window by hand on every platform
+//! that has them.
 //!
 //! A legitimately unseen window is not a frozen one: rAF pauses in a hidden or
 //! minimised window and GTK does not draw an unmapped one. So nothing is judged
@@ -64,8 +70,8 @@ pub const MAX_RECOVERIES_PER_HOUR: usize = 4;
 pub const BACKOFF_SECS: u64 = 3600;
 const HOUR_SECS: u64 = 3600;
 
-/// `EASYBTX_NODE_WINDOW_WATCHDOG=0` turns the watchdog off; `=trace` prints
-/// every tick's signals to stdout.
+/// `EASYBTX_NODE_WINDOW_WATCHDOG`: `0`/`off` off, `1`/`on` on anywhere,
+/// `trace` on and printing every tick; unset is on under WSL only.
 pub const WATCHDOG_VAR: &str = "EASYBTX_NODE_WINDOW_WATCHDOG";
 
 /// Where the watchdog is in an episode.
@@ -116,12 +122,15 @@ pub struct Observation {
 }
 
 /// Whether every signal this window owes has arrived since `since`. A page
-/// that says it is hidden owes no frames and no paint.
+/// that says it is hidden owes nothing: no frames, no paint, and not even
+/// timer beats, which browsers throttle in hidden pages (macOS WebKit does).
 pub fn healthy_since(o: &Observation, since: u64) -> bool {
+    if o.page_hidden {
+        return true;
+    }
     let after = |t: Option<u64>| t.is_some_and(|t| t >= since);
-    let framed = o.page_hidden || after(o.raf);
-    let painted = !o.paint_probe || o.page_hidden || after(o.paint);
-    after(o.timer) && framed && painted
+    let painted = !o.paint_probe || after(o.paint);
+    after(o.timer) && after(o.raf) && painted
 }
 
 /// Whether a shown window has stopped: a signal missing for [`STALL_SECS`]
@@ -237,6 +246,10 @@ struct Inner {
     shown_since: Option<u64>,
     last_action: u64,
     focus_probe: Option<u64>,
+    /// When a rebuild left the app without a window.
+    lost_at: Option<u64>,
+    /// When building a lost window was last tried.
+    last_build_try: Option<u64>,
 }
 
 /// The watchdog's state, managed by the app.
@@ -277,9 +290,56 @@ impl WindowWatch {
     }
 }
 
-/// Whether the watchdog runs at all (`EASYBTX_NODE_WINDOW_WATCHDOG=0` is off).
-pub fn watchdog_on(value: Option<&str>) -> bool {
-    value.map(str::trim) != Some("0")
+/// Whether the watchdog acts on its own, and how loudly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Off,
+    On,
+    /// On, and every tick printed to stdout.
+    Trace,
+}
+
+/// The watchdog's mode from [`WATCHDOG_VAR`] and whether this is WSL.
+///
+/// On by default under WSL only, where the freeze was seen. Elsewhere a
+/// shown window can legitimately stop drawing: on a Linux Wayland desktop a
+/// window on another virtual desktop or behind the lock screen gets no frames
+/// while GTK3 still calls it visible and not minimised, and GTK3 has no
+/// occlusion state to tell the two apart. There an automatic reload or
+/// rebuild would be wrong, so it waits for the override: `1`/`on` or `trace`
+/// turn it on anywhere, `0`/`off` turn it off anywhere. The tray's "Reload
+/// window" and a second launch work in every mode.
+pub fn watchdog_mode(value: Option<&str>, wsl: bool) -> Mode {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("0") | Some("off") => Mode::Off,
+        Some("1") | Some("on") => Mode::On,
+        Some("trace") => Mode::Trace,
+        _ if wsl => Mode::On,
+        _ => Mode::Off,
+    }
+}
+
+/// This process's watchdog mode.
+fn mode() -> Mode {
+    watchdog_mode(
+        std::env::var(WATCHDOG_VAR).ok().as_deref(),
+        crate::webkit_env::running_under_wsl(),
+    )
+}
+
+/// Whether an exit request must be held off because the watchdog is
+/// rebuilding the window: only a request without an exit code (the runtime's
+/// "last window gone"), and only once per rebuild. The flag is taken by that
+/// one request, so any later quit, a user's Cmd+Q included, goes through. A
+/// quit with an exit code (the tray's Quit) is never held off.
+pub fn hold_off_exit(code: Option<i32>, rebuilding: &AtomicBool) -> bool {
+    code.is_none() && rebuilding.swap(false, Ordering::SeqCst)
+}
+
+/// [`hold_off_exit`] for this app.
+pub fn hold_off_for_rebuild(app: &AppHandle, code: Option<i32>) -> bool {
+    app.try_state::<WindowWatch>()
+        .is_some_and(|w| hold_off_exit(code, &w.recreating))
 }
 
 /// The page's heartbeat (`heartbeat.ts`). `kind` is "timer" or "raf".
@@ -295,14 +355,7 @@ pub fn window_heartbeat(kind: String, hidden: bool, watch: tauri::State<'_, Wind
     } else {
         g.timer = Some(now);
     }
-    watchdog_on(std::env::var(WATCHDOG_VAR).ok().as_deref())
-}
-
-/// Whether the main window is being rebuilt right now (see
-/// [`WindowWatch::recreating`]).
-pub fn recreating(app: &AppHandle) -> bool {
-    app.try_state::<WindowWatch>()
-        .is_some_and(|w| w.recreating.load(Ordering::SeqCst))
+    mode() != Mode::Off
 }
 
 fn log(msg: &str) {
@@ -310,14 +363,12 @@ fn log(msg: &str) {
     crate::commands::setup_log(&node_datadir(), &format!("window: {msg}"));
 }
 
-fn trace_on() -> bool {
-    std::env::var(WATCHDOG_VAR).as_deref() == Ok("trace")
-}
-
 /// Start the watchdog. Called once from setup.
 pub fn spawn(app: AppHandle) {
-    if !watchdog_on(std::env::var(WATCHDOG_VAR).ok().as_deref()) {
-        println!("[window] watchdog off ({WATCHDOG_VAR}=0)");
+    if mode() == Mode::Off {
+        println!(
+            "[window] watchdog off (on by default under WSL only; {WATCHDOG_VAR}=1 turns it on)"
+        );
         return;
     }
     if let Some(w) = app.get_webview_window("main") {
@@ -347,6 +398,7 @@ pub fn on_focus(app: &AppHandle) {
 
 fn check(app: &AppHandle) {
     let Some(w) = app.get_webview_window("main") else {
+        retry_lost_window(app);
         return;
     };
     let watch = app.state::<WindowWatch>();
@@ -388,7 +440,7 @@ fn check(app: &AppHandle) {
         }
         (action, obs)
     };
-    if trace_on() {
+    if mode() == Mode::Trace {
         println!(
             "[window] tick shown={} {} -> {:?}",
             obs.shown,
@@ -414,7 +466,9 @@ fn check(app: &AppHandle) {
             ));
             let app = app.clone();
             tauri::async_runtime::spawn_blocking(move || {
-                if let Err(e) = recreate(&app) {
+                // Automatic: never take the focus, so the window does not
+                // jump in front of whatever the person is doing.
+                if let Err(e) = recreate(&app, false) {
                     log(&format!("rebuilding the window failed: {e}"));
                 }
             });
@@ -443,7 +497,7 @@ pub fn reload_now(app: &AppHandle, reason: &str) {
         g.last_action = now;
         g.stage = Stage::Recreated { at: now };
     }
-    match recreate(app) {
+    match recreate(app, true) {
         Ok(()) => log(&format!("window reloaded ({reason}): rebuilt it")),
         Err(e) => {
             log(&format!(
@@ -462,9 +516,17 @@ pub fn reload_now(app: &AppHandle, reason: &str) {
     }
 }
 
-/// Destroy the main window and build it again from the config, where it was.
-fn recreate(app: &AppHandle) -> Result<(), String> {
-    let watch = app.state::<WindowWatch>();
+/// How often a window that could not be built is tried again.
+const LOST_RETRY_SECS: u64 = 60;
+/// Build attempts within one rebuild.
+const BUILD_ATTEMPTS: u32 = 3;
+
+/// Build the main window from the config, a few times if it fails.
+fn build_main(
+    app: &AppHandle,
+    position: Option<tauri::PhysicalPosition<i32>>,
+    focus: bool,
+) -> Result<(), String> {
     let cfg = app
         .config()
         .app
@@ -472,37 +534,96 @@ fn recreate(app: &AppHandle) -> Result<(), String> {
         .first()
         .cloned()
         .ok_or_else(|| "the app config has no window".to_string())?;
-    let old = app.get_webview_window("main");
-    let position = old.as_ref().and_then(|w| w.outer_position().ok());
-    watch.recreating.store(true, Ordering::SeqCst);
-    let clear = app.clone();
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        if let Some(w) = clear.try_state::<WindowWatch>() {
-            w.recreating.store(false, Ordering::SeqCst);
+    let mut last = String::new();
+    for attempt in 1..=BUILD_ATTEMPTS {
+        match tauri::WebviewWindowBuilder::from_config(app, &cfg).and_then(|b| b.build()) {
+            Ok(w) => {
+                if let Some(p) = position {
+                    let _ = w.set_position(p);
+                }
+                if focus {
+                    let _ = w.set_focus();
+                }
+                install_probe(app, &w);
+                if let Some(watch) = app.try_state::<WindowWatch>() {
+                    watch.lock().lost_at = None;
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                last = e.to_string();
+                log(&format!(
+                    "building the window failed (attempt {attempt} of {BUILD_ATTEMPTS}): {last}"
+                ));
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+    if let Some(watch) = app.try_state::<WindowWatch>() {
+        let mut g = watch.lock();
+        if g.lost_at.is_none() {
+            g.lost_at = Some(secs());
+        }
+    }
+    log(&format!(
+        "THE APP HAS NO WINDOW: building it failed {BUILD_ATTEMPTS} times ({last}). The node keeps running; \
+         the watchdog tries again every {LOST_RETRY_SECS} s, and launching the app again tries at once."
+    ));
+    Err(format!("build: {last}"))
+}
+
+/// The window is gone because a rebuild could not build it: try again, at
+/// most once a minute.
+fn retry_lost_window(app: &AppHandle) {
+    let Some(watch) = app.try_state::<WindowWatch>() else {
+        return;
+    };
+    let now = secs();
+    {
+        let mut g = watch.lock();
+        if g.lost_at.is_none() || g.last_build_try.is_some_and(|t| now < t + LOST_RETRY_SECS) {
+            return;
+        }
+        g.last_build_try = Some(now);
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if build_main(&app, None, false).is_ok() {
+            log("window built again after it was lost");
         }
     });
+}
+
+/// Destroy the main window and build it again from the config, where it was.
+/// `focus` only for a rebuild someone asked for by hand.
+fn recreate(app: &AppHandle, focus: bool) -> Result<(), String> {
+    let watch = app.state::<WindowWatch>();
+    let old = app.get_webview_window("main");
+    let position = old.as_ref().and_then(|w| w.outer_position().ok());
     if let Some(w) = old {
-        w.destroy().map_err(|e| format!("destroy: {e}"))?;
+        // Destroying the last window raises one exit request without a code;
+        // this flag holds exactly that one off (`hold_off_exit`). It is
+        // cleared again as soon as the new window exists.
+        watch.recreating.store(true, Ordering::SeqCst);
+        if let Err(e) = w.destroy() {
+            watch.recreating.store(false, Ordering::SeqCst);
+            return Err(format!("destroy: {e}"));
+        }
         // The destruction runs on the event loop; the label is free only once
         // it has. Never called on the main thread (tray clicks hand it off),
         // so waiting here cannot hold up the loop it waits for.
         let deadline = Instant::now() + Duration::from_secs(5);
         while app.get_webview_window("main").is_some() {
             if Instant::now() > deadline {
+                watch.recreating.store(false, Ordering::SeqCst);
                 return Err("the old window was not destroyed within 5 s".to_string());
             }
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    let w = tauri::WebviewWindowBuilder::from_config(app, &cfg)
-        .and_then(|b| b.build())
-        .map_err(|e| format!("build: {e}"))?;
-    if let Some(p) = position {
-        let _ = w.set_position(p);
-    }
-    let _ = w.set_focus();
-    install_probe(app, &w);
+    let built = build_main(app, position, focus);
+    watch.recreating.store(false, Ordering::SeqCst);
+    built?;
     log("window rebuilt");
     Ok(())
 }
@@ -653,12 +774,24 @@ mod tests {
             ..live(5_000)
         };
         assert!(!stalled(&o));
-        // But its script must still run.
-        let dead = Observation {
+    }
+
+    // macOS WebKit throttles a hidden page's timers; a hidden page owes
+    // nothing at all, not even timer beats.
+    #[test]
+    fn a_hidden_page_owes_not_even_timer_beats() {
+        let o = Observation {
+            page_hidden: true,
             timer: Some(10),
-            ..o
+            raf: None,
+            paint: None,
+            ..live(5_000)
         };
-        assert!(stalled(&dead));
+        assert!(!stalled(&o));
+        assert_eq!(
+            decide(&o, Stage::Watching, &[]),
+            (Action::None, Stage::Watching)
+        );
     }
 
     // A window shown from the tray after hours has hours-old frame beats;
@@ -858,12 +991,56 @@ mod tests {
     }
 
     #[test]
-    fn only_zero_turns_the_watchdog_off() {
-        assert!(watchdog_on(None));
-        assert!(watchdog_on(Some("trace")));
-        assert!(watchdog_on(Some("1")));
-        assert!(!watchdog_on(Some("0")));
-        assert!(!watchdog_on(Some(" 0 ")));
+    fn the_watchdog_is_on_by_default_under_wsl_only() {
+        assert_eq!(watchdog_mode(None, true), Mode::On);
+        assert_eq!(watchdog_mode(None, false), Mode::Off);
+        assert_eq!(watchdog_mode(Some(""), false), Mode::Off);
+    }
+
+    // Ordinary Linux Wayland: another virtual desktop or the lock screen
+    // stops a "visible" window's frames. It stays off there unless asked.
+    #[test]
+    fn the_watchdog_stays_off_outside_wsl_and_the_override_turns_it_on() {
+        assert_eq!(watchdog_mode(None, false), Mode::Off);
+        assert_eq!(watchdog_mode(Some("1"), false), Mode::On);
+        assert_eq!(watchdog_mode(Some(" ON "), false), Mode::On);
+        assert_eq!(watchdog_mode(Some("trace"), false), Mode::Trace);
+    }
+
+    #[test]
+    fn the_override_turns_it_off_anywhere() {
+        assert_eq!(watchdog_mode(Some("0"), true), Mode::Off);
+        assert_eq!(watchdog_mode(Some(" off "), true), Mode::Off);
+        assert_eq!(watchdog_mode(Some("trace"), true), Mode::Trace);
+    }
+
+    // The rebuild holds off the one "last window gone" exit request its
+    // destroy raises, and nothing else.
+    #[test]
+    fn a_rebuild_holds_off_only_its_own_exit_request() {
+        let flag = AtomicBool::new(true);
+        assert!(hold_off_exit(None, &flag));
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_user_quit_during_a_rebuild_exits() {
+        // Cmd+Q (no exit code) after the rebuild's own request was held off.
+        let flag = AtomicBool::new(true);
+        assert!(hold_off_exit(None, &flag));
+        assert!(!hold_off_exit(None, &flag));
+        // A quit with an exit code (the tray's Quit) is never held off, and
+        // does not use up the rebuild's one hold-off.
+        let flag = AtomicBool::new(true);
+        assert!(!hold_off_exit(Some(0), &flag));
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn nothing_is_held_off_without_a_rebuild() {
+        let flag = AtomicBool::new(false);
+        assert!(!hold_off_exit(None, &flag));
+        assert!(!hold_off_exit(Some(0), &flag));
     }
 
     #[test]

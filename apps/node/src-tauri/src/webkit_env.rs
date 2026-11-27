@@ -12,9 +12,11 @@
 //! a launcher script) already exported a `WEBKIT_DISABLE_*` variable, which is
 //! respected as it stands. [`OVERRIDE_VAR`] chooses explicitly:
 //!
-//! * `gpu`: leave WebKit's own defaults (what every release before did);
-//! * `software`: `WEBKIT_DISABLE_COMPOSITING_MODE=1`;
-//! * `no-dmabuf`: `WEBKIT_DISABLE_DMABUF_RENDERER=1`;
+//! * `gpu`: WebKit's own defaults (what every release before did). Both
+//!   `WEBKIT_DISABLE_*` variables are removed, because an update relaunch
+//!   inherits the environment the previous run set;
+//! * `software`: `WEBKIT_DISABLE_COMPOSITING_MODE=1` (and the other removed);
+//! * `no-dmabuf`: `WEBKIT_DISABLE_DMABUF_RENDERER=1` (and the other removed);
 //! * `auto`, empty or unset: [`WSL_DEFAULT`] under WSL, nothing elsewhere.
 //!
 //! Nothing changes outside WSL unless the override asks for it.
@@ -23,16 +25,18 @@ pub const OVERRIDE_VAR: &str = "EASYBTX_NODE_WEBKIT";
 pub const DISABLE_COMPOSITING: &str = "WEBKIT_DISABLE_COMPOSITING_MODE";
 pub const DISABLE_DMABUF: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
 
-/// The variable set under WSL when nothing says otherwise. Measured on WSLg
-/// on 2026-11-26 (PR body): software compositing is the setting the sandbox
-/// runs never froze with, and it costs the least CPU of the three.
+/// The variable set under WSL when nothing says otherwise. On the live WSL
+/// box on 2026-11-26 the window kept repainting 66 minutes into a display
+/// idle with it, and froze about 15 minutes into one without it (PR #246).
 pub const WSL_DEFAULT: &str = DISABLE_COMPOSITING;
 
 /// What the app does to the environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
-    /// Set this variable to 1.
+    /// Set this variable to 1 and remove the other `WEBKIT_DISABLE_*`.
     Set(&'static str),
+    /// Remove both `WEBKIT_DISABLE_*` variables: WebKit's defaults.
+    Clear,
     /// Leave the environment alone, for this reason.
     Leave(&'static str),
 }
@@ -51,7 +55,7 @@ pub fn choose(wsl: bool, override_value: Option<&str>, already_set: bool) -> Cho
         .map(|v| v.trim().to_ascii_lowercase())
         .unwrap_or_default();
     match wanted.as_str() {
-        "gpu" => Choice::Leave("the override asks for WebKit's defaults"),
+        "gpu" => Choice::Clear,
         "software" => Choice::Set(DISABLE_COMPOSITING),
         "no-dmabuf" => Choice::Set(DISABLE_DMABUF),
         _ if already_set => Choice::Leave("a WEBKIT_DISABLE_* variable is already set"),
@@ -60,27 +64,48 @@ pub fn choose(wsl: bool, override_value: Option<&str>, already_set: bool) -> Cho
     }
 }
 
+/// Whether this process runs under WSL (Linux only; false elsewhere).
+pub fn running_under_wsl() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let osrelease = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+        is_wsl(&osrelease, std::env::var("WSL_DISTRO_NAME").ok().as_deref())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// Apply the choice. Runs first thing in `run()`, while the process has one
 /// thread and before GTK or WebKit read the environment. Returns the line it
 /// printed, for setup.log.
 #[cfg(target_os = "linux")]
 pub fn apply() -> String {
-    let osrelease = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
-    let distro = std::env::var("WSL_DISTRO_NAME").ok();
-    let wsl = is_wsl(&osrelease, distro.as_deref());
+    let wsl = running_under_wsl();
     let override_value = std::env::var(OVERRIDE_VAR).ok();
     let already_set = [DISABLE_COMPOSITING, DISABLE_DMABUF]
         .iter()
         .any(|v| std::env::var_os(v).is_some());
     let line = match choose(wsl, override_value.as_deref(), already_set) {
         Choice::Set(var) => {
+            for other in [DISABLE_COMPOSITING, DISABLE_DMABUF] {
+                if other != var {
+                    std::env::remove_var(other);
+                }
+            }
             std::env::set_var(var, "1");
             format!(
                 "web view rendering: {var}=1 ({}; {OVERRIDE_VAR}=gpu turns it off)",
                 if wsl { "WSL" } else { "asked by the override" }
             )
         }
-        Choice::Leave(why) => format!("web view rendering: WebKit defaults ({why})"),
+        Choice::Clear => {
+            std::env::remove_var(DISABLE_COMPOSITING);
+            std::env::remove_var(DISABLE_DMABUF);
+            format!("web view rendering: WebKit defaults ({OVERRIDE_VAR}=gpu; any inherited WEBKIT_DISABLE_* removed)")
+        }
+        Choice::Leave(why) => format!("web view rendering: as the environment says ({why})"),
     };
     println!("[node-app] {line}");
     line
@@ -130,11 +155,7 @@ mod tests {
 
     #[test]
     fn the_override_chooses_explicitly() {
-        assert!(matches!(choose(true, Some("gpu"), false), Choice::Leave(_)));
-        assert!(matches!(
-            choose(true, Some(" GPU "), true),
-            Choice::Leave(_)
-        ));
+        assert_eq!(choose(true, Some("gpu"), false), Choice::Clear);
         assert_eq!(
             choose(false, Some("software"), false),
             Choice::Set(DISABLE_COMPOSITING)
@@ -147,6 +168,14 @@ mod tests {
             choose(true, Some("No-DMABuf"), true),
             Choice::Set(DISABLE_DMABUF)
         );
+    }
+
+    // An update relaunch inherits the WEBKIT_DISABLE_COMPOSITING_MODE=1 the
+    // previous run set; `gpu` must take it away, not just skip setting it.
+    #[test]
+    fn gpu_removes_an_inherited_variable() {
+        assert_eq!(choose(true, Some("gpu"), true), Choice::Clear);
+        assert_eq!(choose(false, Some(" GPU "), true), Choice::Clear);
     }
 
     #[test]

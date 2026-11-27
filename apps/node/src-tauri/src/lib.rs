@@ -33,7 +33,7 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     let rendering = webkit_env::apply();
 
-    // A second launch reloads the running app's window and exits
+    // On Linux a second launch reloads the running app's window and exits
     // (second_launch): the way out of a frozen window on WSLg, which has no
     // tray. Anything short of a clear "ok" from a running app starts normally.
     let claim = second_launch::claim(&node_datadir());
@@ -311,9 +311,10 @@ pub fn run() {
                     }
                     // The watchdog destroying the main window to build it
                     // again leaves no window for a moment, which the runtime
-                    // reports as an exit request. It is not a quit: the node
-                    // must not be stopped for it.
-                    if code.is_none() && window_watchdog::recreating(app) {
+                    // reports as one exit request without a code. It is not
+                    // a quit: the node must not be stopped for it. Only that
+                    // one request is held off; any later quit goes through.
+                    if window_watchdog::hold_off_for_rebuild(app, code) {
                         api.prevent_exit();
                         return;
                     }
