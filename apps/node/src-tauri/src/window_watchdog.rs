@@ -44,7 +44,7 @@
 //!
 //! Every recovery is written to setup.log and stdout.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -257,9 +257,13 @@ pub struct WindowWatch {
     inner: Mutex<Inner>,
     /// Last paint, as `secs() + 1`; 0 is never.
     paint: Arc<AtomicU64>,
-    /// Set while the main window is being rebuilt, so the "last window gone"
-    /// exit request that its destruction raises is not taken for a quit.
-    recreating: AtomicBool,
+    /// When a rebuild destroyed the main window, as `secs() + 1` (0: no
+    /// rebuild waiting). The "last window gone" exit request that the
+    /// destruction raises is held off while this is set (`hold_off_exit`).
+    destroy_armed: AtomicU64,
+    /// One rebuild at a time: the tray, a second launch, "Open BTX Node"
+    /// and the watchdog all go through it.
+    rebuild: Mutex<()>,
 }
 
 impl Default for WindowWatch {
@@ -274,7 +278,8 @@ impl WindowWatch {
         Self {
             inner: Mutex::new(Inner::default()),
             paint: Arc::new(AtomicU64::new(0)),
-            recreating: AtomicBool::new(false),
+            destroy_armed: AtomicU64::new(0),
+            rebuild: Mutex::new(()),
         }
     }
 
@@ -327,19 +332,41 @@ fn mode() -> Mode {
     )
 }
 
-/// Whether an exit request must be held off because the watchdog is
-/// rebuilding the window: only a request without an exit code (the runtime's
-/// "last window gone"), and only once per rebuild. The flag is taken by that
-/// one request, so any later quit, a user's Cmd+Q included, goes through. A
-/// quit with an exit code (the tray's Quit) is never held off.
-pub fn hold_off_exit(code: Option<i32>, rebuilding: &AtomicBool) -> bool {
-    code.is_none() && rebuilding.swap(false, Ordering::SeqCst)
+/// How long after a rebuild destroyed the window its exit request is still
+/// expected. A destroy that the event loop runs late (a busy main thread)
+/// is still held off; past this, a request is a real quit.
+pub const HOLD_OFF_SECS: u64 = 120;
+
+/// Whether an exit request must be held off because a rebuild destroyed the
+/// main window. `armed` is when it did, as `secs() + 1` (0: no rebuild). Only
+/// a request without an exit code (the runtime's "last window gone"), only
+/// once per rebuild (the request takes the arm, so any later quit, a user's
+/// Cmd+Q included, goes through), and only within [`HOLD_OFF_SECS`]. A quit
+/// with an exit code (the tray's Quit) is never held off.
+pub fn hold_off_exit(code: Option<i32>, armed: &AtomicU64, now: u64) -> bool {
+    if code.is_some() {
+        return false;
+    }
+    match armed.swap(0, Ordering::SeqCst) {
+        0 => false,
+        v => now < (v - 1) + HOLD_OFF_SECS,
+    }
 }
 
-/// [`hold_off_exit`] for this app.
+/// [`hold_off_exit`] for this app. A held-off request whose window is gone
+/// (a destroy that ran after the rebuild had given up waiting for it) gets
+/// its window built now, so the app is never left without one.
 pub fn hold_off_for_rebuild(app: &AppHandle, code: Option<i32>) -> bool {
-    app.try_state::<WindowWatch>()
-        .is_some_and(|w| hold_off_exit(code, &w.recreating))
+    let held = app
+        .try_state::<WindowWatch>()
+        .is_some_and(|w| hold_off_exit(code, &w.destroy_armed, secs()));
+    if held {
+        let app = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let _ = ensure_window(&app, false);
+        });
+    }
+    held
 }
 
 /// The page's heartbeat (`heartbeat.ts`). `kind` is "timer" or "raf".
@@ -516,12 +543,38 @@ pub fn reload_now(app: &AppHandle, reason: &str) {
     }
 }
 
-/// How often a window that could not be built is tried again.
+/// How often the watchdog tries again to build a window it lost.
 const LOST_RETRY_SECS: u64 = 60;
 /// Build attempts within one rebuild.
 const BUILD_ATTEMPTS: u32 = 3;
+/// How long a rebuild waits for the old window's destruction.
+const DESTROY_WAIT: Duration = Duration::from_secs(5);
 
-/// Build the main window from the config, a few times if it fails.
+/// Where the new window goes: where the old one was, unless it was
+/// minimised (a minimised window on Windows sits at -32000,-32000).
+pub fn keep_position(
+    position: Option<tauri::PhysicalPosition<i32>>,
+    minimized: bool,
+) -> Option<tauri::PhysicalPosition<i32>> {
+    if minimized {
+        None
+    } else {
+        position
+    }
+}
+
+/// What the log says will bring a lost window back.
+pub fn lost_window_hint(watchdog: Mode) -> String {
+    let by_hand = "\"Open BTX Node\" in the tray menu, \"Reload window\", or launching the app again builds it";
+    if watchdog == Mode::Off {
+        format!("{by_hand}.")
+    } else {
+        format!("the watchdog tries again every {LOST_RETRY_SECS} s, and {by_hand} at once.")
+    }
+}
+
+/// Build the main window from the config, a few times if it fails. Callers
+/// hold `WindowWatch::rebuild`.
 fn build_main(
     app: &AppHandle,
     position: Option<tauri::PhysicalPosition<i32>>,
@@ -559,17 +612,38 @@ fn build_main(
             }
         }
     }
+    mark_lost(app);
+    log(&format!(
+        "THE APP HAS NO WINDOW: building it failed {BUILD_ATTEMPTS} times ({last}). The node keeps running; {}",
+        lost_window_hint(mode())
+    ));
+    Err(format!("build: {last}"))
+}
+
+fn mark_lost(app: &AppHandle) {
     if let Some(watch) = app.try_state::<WindowWatch>() {
         let mut g = watch.lock();
         if g.lost_at.is_none() {
             g.lost_at = Some(secs());
         }
     }
-    log(&format!(
-        "THE APP HAS NO WINDOW: building it failed {BUILD_ATTEMPTS} times ({last}). The node keeps running; \
-         the watchdog tries again every {LOST_RETRY_SECS} s, and launching the app again tries at once."
-    ));
-    Err(format!("build: {last}"))
+}
+
+/// Build the main window if there is none ("Open BTX Node" on an app whose
+/// rebuild failed, or a late destroy). Nothing happens when it exists.
+pub fn ensure_window(app: &AppHandle, focus: bool) -> Result<(), String> {
+    let watch = app.state::<WindowWatch>();
+    let _one = watch.rebuild.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(w) = app.get_webview_window("main") {
+        if focus {
+            let _ = w.show();
+            let _ = w.set_focus();
+        }
+        return Ok(());
+    }
+    build_main(app, None, focus)?;
+    log("window built");
+    Ok(())
 }
 
 /// The window is gone because a rebuild could not build it: try again, at
@@ -588,41 +662,50 @@ fn retry_lost_window(app: &AppHandle) {
     }
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if build_main(&app, None, false).is_ok() {
-            log("window built again after it was lost");
-        }
+        let _ = ensure_window(&app, false);
     });
 }
 
 /// Destroy the main window and build it again from the config, where it was.
-/// `focus` only for a rebuild someone asked for by hand.
+/// `focus` only for a rebuild someone asked for by hand. One at a time.
 fn recreate(app: &AppHandle, focus: bool) -> Result<(), String> {
     let watch = app.state::<WindowWatch>();
+    let _one = watch.rebuild.lock().unwrap_or_else(|e| e.into_inner());
     let old = app.get_webview_window("main");
-    let position = old.as_ref().and_then(|w| w.outer_position().ok());
+    let position = old
+        .as_ref()
+        .and_then(|w| keep_position(w.outer_position().ok(), w.is_minimized().unwrap_or(false)));
     if let Some(w) = old {
         // Destroying the last window raises one exit request without a code;
-        // this flag holds exactly that one off (`hold_off_exit`). It is
-        // cleared again as soon as the new window exists.
-        watch.recreating.store(true, Ordering::SeqCst);
+        // `destroy_armed` holds exactly that one off. It stays armed until
+        // that request takes it, even if the destroy runs late, so a late
+        // destroy can never stop the node. It is cleared once the new window
+        // exists.
+        watch.destroy_armed.store(secs() + 1, Ordering::SeqCst);
         if let Err(e) = w.destroy() {
-            watch.recreating.store(false, Ordering::SeqCst);
             return Err(format!("destroy: {e}"));
         }
         // The destruction runs on the event loop; the label is free only once
         // it has. Never called on the main thread (tray clicks hand it off),
         // so waiting here cannot hold up the loop it waits for.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + DESTROY_WAIT;
         while app.get_webview_window("main").is_some() {
             if Instant::now() > deadline {
-                watch.recreating.store(false, Ordering::SeqCst);
-                return Err("the old window was not destroyed within 5 s".to_string());
+                // Still armed: when the destroy lands, its exit request is
+                // held off and the window is built then (hold_off_for_rebuild).
+                mark_lost(app);
+                return Err(format!(
+                    "the old window was not destroyed within {} s; it is built when the destroy lands",
+                    DESTROY_WAIT.as_secs()
+                ));
             }
             std::thread::sleep(Duration::from_millis(50));
         }
     }
     let built = build_main(app, position, focus);
-    watch.recreating.store(false, Ordering::SeqCst);
+    if built.is_ok() {
+        watch.destroy_armed.store(0, Ordering::SeqCst);
+    }
     built?;
     log("window rebuilt");
     Ok(())
@@ -1014,33 +1097,70 @@ mod tests {
         assert_eq!(watchdog_mode(Some("trace"), true), Mode::Trace);
     }
 
+    fn armed_at(t: u64) -> AtomicU64 {
+        AtomicU64::new(t + 1)
+    }
+
     // The rebuild holds off the one "last window gone" exit request its
     // destroy raises, and nothing else.
     #[test]
     fn a_rebuild_holds_off_only_its_own_exit_request() {
-        let flag = AtomicBool::new(true);
-        assert!(hold_off_exit(None, &flag));
-        assert!(!flag.load(Ordering::SeqCst));
+        let armed = armed_at(100);
+        assert!(hold_off_exit(None, &armed, 100));
+        assert_eq!(armed.load(Ordering::SeqCst), 0);
     }
 
     #[test]
     fn a_user_quit_during_a_rebuild_exits() {
         // Cmd+Q (no exit code) after the rebuild's own request was held off.
-        let flag = AtomicBool::new(true);
-        assert!(hold_off_exit(None, &flag));
-        assert!(!hold_off_exit(None, &flag));
+        let armed = armed_at(100);
+        assert!(hold_off_exit(None, &armed, 101));
+        assert!(!hold_off_exit(None, &armed, 102));
         // A quit with an exit code (the tray's Quit) is never held off, and
         // does not use up the rebuild's one hold-off.
-        let flag = AtomicBool::new(true);
-        assert!(!hold_off_exit(Some(0), &flag));
-        assert!(flag.load(Ordering::SeqCst));
+        let armed = armed_at(100);
+        assert!(!hold_off_exit(Some(0), &armed, 101));
+        assert_ne!(armed.load(Ordering::SeqCst), 0);
+    }
+
+    // The review's case A: the main thread was busy, the rebuild gave up
+    // waiting after 5 s and left the hold-off armed; the destroy lands later.
+    // Its exit request is held off (no exit, no node stop).
+    #[test]
+    fn a_destroy_that_lands_after_the_timeout_does_not_exit() {
+        let armed = armed_at(100);
+        let late = 100 + DESTROY_WAIT.as_secs() + 30;
+        assert!(hold_off_exit(None, &armed, late));
+        // And the request after it is a real quit again.
+        assert!(!hold_off_exit(None, &armed, late + 1));
+    }
+
+    #[test]
+    fn an_arm_nobody_used_expires() {
+        let armed = armed_at(100);
+        assert!(!hold_off_exit(None, &armed, 100 + HOLD_OFF_SECS));
     }
 
     #[test]
     fn nothing_is_held_off_without_a_rebuild() {
-        let flag = AtomicBool::new(false);
-        assert!(!hold_off_exit(None, &flag));
-        assert!(!hold_off_exit(Some(0), &flag));
+        let armed = AtomicU64::new(0);
+        assert!(!hold_off_exit(None, &armed, 5));
+        assert!(!hold_off_exit(Some(0), &armed, 5));
+    }
+
+    #[test]
+    fn a_minimised_window_does_not_pass_its_off_screen_position_on() {
+        let p = tauri::PhysicalPosition::new(-32000, -32000);
+        assert_eq!(keep_position(Some(p), true), None);
+        let q = tauri::PhysicalPosition::new(120, 80);
+        assert_eq!(keep_position(Some(q), false), Some(q));
+    }
+
+    #[test]
+    fn the_lost_window_log_only_promises_retries_the_watchdog_makes() {
+        assert!(!lost_window_hint(Mode::Off).contains("tries again"));
+        assert!(lost_window_hint(Mode::Off).contains("Open BTX Node"));
+        assert!(lost_window_hint(Mode::On).contains("tries again every 60 s"));
     }
 
     #[test]

@@ -75,7 +75,14 @@ pub fn show_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.set_focus();
+        return;
     }
+    // No window: a rebuild could not build one (window_watchdog). Build it
+    // now, off the main thread, which the build waits on.
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = crate::window_watchdog::ensure_window(&app, true);
+    });
 }
 
 fn toggle_node(app: &AppHandle) {
