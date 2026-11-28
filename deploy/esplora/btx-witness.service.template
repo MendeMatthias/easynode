@@ -1,5 +1,5 @@
 [Unit]
-Description=BTX fork witness (serves /blocks/tip/height and /block-height/<h>)
+Description=BTX fork witness and swap index (block hashes, and the five HTLC swap routes)
 After=network-online.target btxd.service
 Wants=network-online.target
 
@@ -32,7 +32,11 @@ ExecStart=/usr/local/bin/btx-witness --datadir /var/lib/btx --rpc 127.0.0.1:1933
 Restart=always
 RestartSec=5
 
-# It reads the node's cookie and answers two GETs. It needs nothing else.
+# It reads the node's cookie and answers GETs from the node and from an
+# in-memory index of the blocks the node holds (the swap routes: ~52 MiB for
+# the default 100,000 blocks, ~115 MB RSS in all, built at start and paced so
+# the node is not slowed; --no-swap turns it off).
+# It needs nothing else.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

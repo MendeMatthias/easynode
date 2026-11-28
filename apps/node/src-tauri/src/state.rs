@@ -311,6 +311,12 @@ pub struct NodeAppSettings {
     /// Serving other machines still means changing the bind to `0.0.0.0`,
     /// which stays an explicit choice because there is no proxy in front of it
     /// (see the header of `btx_core::witness`).
+    ///
+    /// Bound publicly, it also serves the five swap routes from an in-memory
+    /// index of the blocks the node holds (2026-11-28,
+    /// `WitnessOptions::for_bind`); on loopback it does not, because no swap
+    /// client can reach it there and the index would cost every start a read
+    /// of the last 100,000 blocks.
     #[serde(default)]
     pub witness_enabled: bool,
     /// Where the witness binds. Loopback by default: accepting connections

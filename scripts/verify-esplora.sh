@@ -333,6 +333,36 @@ done
 [ "$wfail" -eq 0 ] && info "witness route is trustworthy at every checked height"
 
 echo
+echo "── the five swap routes, byte for byte against the reference ──"
+# An HTLC swap client checks /tx/<txid>/status, /hex, /merkle-proof,
+# /outspend/<vout> and /block/<hash>/header across a quorum of independent
+# operators (docs/esplora-mode.md, "The swap routes"). An Esplora endpoint
+# serves all five from electrs, so they must equal the reference's byte for
+# byte — status, content type and body — on recent blocks with real merkle
+# branches, and every proof must fold into the candidate's own header. The
+# comparison is scripts/verify-swap-routes.py; it can also be run alone against
+# a witness (which may abstain outside its window) or, with --json, against a
+# reference that is not electrs.
+if command -v python3 >/dev/null 2>&1; then
+  sw="$(python3 "$(dirname "$0")/verify-swap-routes.py" "$CAND" "$REF" 2>&1)"
+  sw_pass="$(printf '%s\n' "$sw" | grep -c '^PASS ')"
+  sw_abst="$(printf '%s\n' "$sw" | grep -c '^ABSTAIN ')"
+  sw_fail="$(printf '%s\n' "$sw" | grep -c '^FAIL ')"
+  while IFS= read -r line; do
+    case "$line" in FAIL\ *) bad "${line#FAIL }" ;; esac
+  done <<< "$sw"
+  if [ "$sw_fail" -eq 0 ] && [ "$sw_pass" -gt 0 ]; then
+    ok "all $sw_pass swap-route comparisons identical to the reference"
+  elif [ "$sw_pass" -eq 0 ]; then
+    bad "no swap-route answer could be compared: $(printf '%s\n' "$sw" | tail -1)"
+  fi
+  # An Esplora endpoint has the whole chain; it has nothing to abstain on.
+  [ "$sw_abst" -gt 0 ] && bad "$sw_abst swap-route answers abstained (503 or 404); an Esplora endpoint holds every block"
+else
+  bad "python3 is needed for the swap-route comparison"
+fi
+
+echo
 echo "── CORS is emitted exactly once ──"
 # Duplicate Access-Control-Allow-Origin is rejected by browsers outright and
 # broke the web wallet; btx-esplora fb705c4 fixed it by making the reverse proxy

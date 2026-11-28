@@ -10982,9 +10982,21 @@ async fn start_witness(state: &AppState, datadir: &Path) -> Result<(), String> {
         *state.witness_error.lock().await = Some(msg.clone());
         return Err(msg);
     };
-    match btx_core::witness::WitnessServer::start(Arc::new(rpc), &listen).await {
+    // The five swap routes (and the block index behind them) only when this
+    // witness serves other machines: on loopback no swap client can reach
+    // them. See `WitnessOptions::for_bind`.
+    let opts = btx_core::witness::WitnessOptions::for_bind(&listen);
+    match btx_core::witness::WitnessServer::start_with(Arc::new(rpc), &listen, opts).await {
         Ok(server) => {
-            eprintln!("[witness] serving block hashes on {}", server.addr);
+            eprintln!(
+                "[witness] serving block hashes on {}{}",
+                server.addr,
+                if opts.swap_window.is_some() {
+                    ", and the swap routes"
+                } else {
+                    ""
+                }
+            );
             *state.witness_error.lock().await = None;
             *state.witness.lock().await = Some(server);
             Ok(())
