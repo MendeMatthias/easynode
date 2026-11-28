@@ -570,6 +570,12 @@ pub struct SwapIndex {
     pub wake: tokio::sync::Notify,
 }
 
+/// btxd's answer for a block whose data it has pruned away:
+/// "Block not available (pruned data)".
+fn is_pruned(e: &AppError) -> bool {
+    matches!(e, AppError::Rpc { message, .. } if message.contains("pruned"))
+}
+
 /// Every RPC the index makes takes one permit from the server's in-flight
 /// bound first, so the index and the requests together never hold more than
 /// `MAX_INFLIGHT` calls open against the node.
@@ -615,6 +621,29 @@ impl SwapIndex {
             )));
         }
         Ok(b)
+    }
+
+    /// Whether the node's prune line has moved above `failed`, a height whose
+    /// block it just called pruned. Only then does a rebuild from the node's
+    /// lowest block skip it. If it has not (pruning that is not a contiguous
+    /// prefix, or some other error that mentions "pruned"), a rebuild would
+    /// reach the same block again after a full paced rescan, every time; the
+    /// caller returns the error instead, and the run loop retries it cheaply
+    /// after its back-off.
+    async fn prune_line_passed(
+        &self,
+        rpc: &dyn Rpc,
+        gate: &tokio::sync::Semaphore,
+        failed: u64,
+    ) -> AppResult<bool> {
+        let info = call(rpc, gate, "getblockchaininfo", json!([])).await?;
+        let line = info.get("pruneheight").and_then(Value::as_u64).unwrap_or(0);
+        if line <= failed {
+            eprintln!(
+                "[witness] swap index: block {failed} is pruned but the node's prune line is {line}; not rebuilding"
+            );
+        }
+        Ok(line > failed)
     }
 
     /// The first build: from the bottom of the window to the tip, following
@@ -682,7 +711,29 @@ impl SwapIndex {
                 );
             }
             let Some(h) = next.next else { break };
-            next = self.fetch(rpc, gate, &h).await?;
+            next = match self.fetch(rpc, gate, &h).await {
+                Ok(b) => b,
+                Err(e) if is_pruned(&e) => {
+                    // The node pruned blocks the scan had not reached yet. The
+                    // window must be contiguous, so what was read is useless:
+                    // start again from the node's new lowest block. Keeping
+                    // the partial index would leave the incremental sync
+                    // asking for the same pruned block forever. If the prune
+                    // line has NOT moved past it, a rebuild would only reach
+                    // it again, so the error goes back to the run loop's
+                    // back-off instead and the index never claims ready.
+                    let failed = u64::from(next.height) + 1;
+                    if !self.prune_line_passed(rpc, gate, failed).await? {
+                        return Err(e);
+                    }
+                    eprintln!(
+                        "[witness] swap index: block {failed} was pruned under the scan; starting again above it"
+                    );
+                    self.state.write().await.clear();
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
         }
         // Not ready yet: where the scan stopped is the node's tip only if the
         // node still says so. The next sync step asks, disconnects a block a
@@ -778,8 +829,29 @@ impl SwapIndex {
             }
             Some(n) => n,
         };
+        // The height of the block `next` names: one above the last connected.
+        let mut want = u64::from(tip_h) + 1;
         loop {
-            let b = self.fetch(rpc, gate, &next).await?;
+            let b = match self.fetch(rpc, gate, &next).await {
+                Ok(b) => b,
+                // The next block after our tip is already pruned: the index
+                // fell so far behind (a first build that failed part-way, or
+                // a long node outage) that the node no longer holds what it
+                // needs to catch up. Only a rebuild from the node's lowest
+                // block can, so start one rather than retry forever, as long
+                // as the prune line has moved past it (see prune_line_passed).
+                Err(e) if is_pruned(&e) => {
+                    if !self.prune_line_passed(rpc, gate, want).await? {
+                        return Err(e);
+                    }
+                    eprintln!(
+                        "[witness] swap index: block {want} is pruned; rebuilding from the node's lowest block"
+                    );
+                    self.state.write().await.clear();
+                    return Ok(SyncOutcome::Reset);
+                }
+                Err(e) => return Err(e),
+            };
             {
                 let mut s = self.state.write().await;
                 if s.connect(&b).is_err() {
@@ -788,6 +860,7 @@ impl SwapIndex {
                 }
                 s.trim(self.window);
             }
+            want += 1;
             match b.next {
                 Some(n) => next = n,
                 None => return Ok(SyncOutcome::Moved),
