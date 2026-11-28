@@ -199,6 +199,15 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// have the app blame the node for it. Eight leaves btxd's queue mostly to the
 /// app's own polling, and eight concurrent block-hash lookups is still
 /// thousands of answers a second.
+///
+/// A slot is held for as long as the node takes to answer (up to the RPC
+/// client's 60 s per call, five calls in a row for an outspend), and that is
+/// deliberate. A per-answer deadline that answered 503 and freed the slot was
+/// written and withdrawn on 2026-11-28: dropping the call does not stop btxd
+/// working on it, so a node that is slow but alive would be sent eight new
+/// calls every deadline on top of the ones it is still running, filling the
+/// very work queue this bound protects. A node that has stopped answering is
+/// not helped by freeing slots either, since every route needs it.
 const MAX_INFLIGHT: usize = 8;
 
 /// How long a tip height is reused instead of asked for again.
@@ -1735,6 +1744,10 @@ mod tests {
         ibd: bool,
         behind: u64,
         calls: Vec<String>,
+        /// When block `.0` is read, the node prunes everything below `.1`.
+        prune_after: Option<(u64, u64)>,
+        /// A block whose data is gone though the prune line is below it.
+        pruned_hole: Option<u64>,
     }
 
     struct ChainNode(std::sync::Mutex<ChainState>);
@@ -1820,12 +1833,18 @@ mod tests {
                         return Err(rpc_err(-5, "Block not found"));
                     };
                     let h = b["height"].as_u64().unwrap();
-                    if h < st.pruned_below {
+                    if h < st.pruned_below || st.pruned_hole == Some(h) {
                         return Err(rpc_err(-1, "Block not available (pruned data)"));
                     }
                     if st.is_active(&hash) {
                         if let Some(n) = st.active_at(h + 1) {
                             b["nextblockhash"] = json!(n);
+                        }
+                    }
+                    if let Some((at, below)) = st.prune_after {
+                        if h == at {
+                            st.pruned_below = below;
+                            st.prune_after = None;
                         }
                     }
                     Ok(b)
@@ -2176,6 +2195,92 @@ mod tests {
         index.sync_once(node.as_ref(), &gate).await.unwrap();
         let st = index.state.read().await.stats();
         assert_eq!((st.bottom, st.tip, st.blocks), (288859, 288860, 2));
+    }
+
+    /// The node prunes blocks the first scan has not reached yet. The index
+    /// must start again above them and become ready, not keep asking for a
+    /// pruned block and answer 503 until a restart.
+    #[tokio::test]
+    async fn a_block_pruned_ahead_of_the_scan_restarts_it_above() {
+        let node = Arc::new(ChainNode::from_fixture(&[288858, 288859, 288860]));
+        node.with(|st| st.prune_after = Some((288858, 288860)));
+        let s = serve(node.clone()).await;
+        wait_ready(&s, 288860).await;
+        let (_, st) = s.swap_stats().await.unwrap();
+        assert_eq!((st.bottom, st.tip, st.blocks), (288860, 288860, 1));
+    }
+
+    /// The index fell behind (here: the node advanced two blocks and pruned
+    /// past them before the index read them). Catching up needs a block the
+    /// node no longer has, so the index rebuilds from the node's lowest.
+    #[tokio::test]
+    async fn an_index_left_below_the_prune_line_rebuilds() {
+        let node = Arc::new(ChainNode::from_fixture(&[288858, 288859, 288860]));
+        let later = node.with(|st| st.active.split_off(1));
+        let s = serve(node.clone()).await;
+        wait_ready(&s, 288858).await;
+        node.with(|st| {
+            st.active.extend(later);
+            st.pruned_below = 288860;
+        });
+        s.index.as_ref().unwrap().wake.notify_one();
+        wait_ready(&s, 288860).await;
+        let (_, st) = s.swap_stats().await.unwrap();
+        assert_eq!((st.bottom, st.tip, st.blocks), (288860, 288860, 1));
+    }
+
+    /// A block called pruned while the node's prune line stays below it. A
+    /// rebuild would only reach it again, so the index must not start one
+    /// (on mainnet each is a ten-minute paced rescan); it backs off and
+    /// retries, and never claims to be ready over the gap.
+    #[tokio::test]
+    async fn a_pruned_block_above_the_prune_line_does_not_loop_rebuilds() {
+        let node = Arc::new(ChainNode::from_fixture(&[288858, 288859, 288860]));
+        node.with(|st| st.pruned_hole = Some(288859));
+        let s = serve(node.clone()).await;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(!s.swap_stats().await.unwrap().0, "ready over a gap");
+        let scans = node.with(|st| {
+            st.calls
+                .iter()
+                .filter(|m| m.as_str() == "getblockchaininfo")
+                .count()
+        });
+        assert!(
+            scans <= 4,
+            "{scans} rebuilds in 2.5 s: the index is looping"
+        );
+    }
+
+    /// The same gap met while catching up, after one new block connected: the
+    /// built index must be kept, not thrown away for a rebuild that would
+    /// only reach the gap again.
+    #[tokio::test]
+    async fn a_gap_met_while_catching_up_keeps_the_index() {
+        let node = Arc::new(ChainNode::from_fixture(&[288858, 288859, 288860]));
+        let later = node.with(|st| st.active.split_off(1));
+        let s = serve(node.clone()).await;
+        wait_ready(&s, 288858).await;
+        node.with(|st| {
+            st.active.extend(later);
+            st.pruned_hole = Some(288860);
+            st.calls.clear();
+        });
+        s.index.as_ref().unwrap().wake.notify_one();
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let (ready, st) = s.swap_stats().await.unwrap();
+        assert_eq!(
+            (ready, st.bottom, st.tip, st.blocks),
+            (true, 288858, 288859, 2),
+            "the index was thrown away"
+        );
+        let infos = node.with(|st| {
+            st.calls
+                .iter()
+                .filter(|m| m.as_str() == "getblockchaininfo")
+                .count()
+        });
+        assert_eq!(infos, 1, "one prune-line check, no rebuild");
     }
 
     /// The app's witness is on by default, on loopback. There it must not

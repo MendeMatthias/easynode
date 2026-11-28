@@ -210,6 +210,32 @@ ingress:
       httpHostHeader: "127.0.0.1:3080"
 ```
 
+**Behind a tunnel every client is 127.0.0.1, unless the front reads the
+header.** cloudflared reaches Caddy from loopback, so a limit keyed on
+`{remote_host}` is one bucket for the whole internet: one client sending 200
+requests in 10 s puts every wallet's fork check into 429. The front therefore
+trusts loopback to name the client in `Cf-Connecting-IP` (Cloudflare sets it
+and overwrites any value the caller sent) and keys both limits on
+`{client_ip}`. A request from anywhere else is keyed on its own address, header
+or not. `X-Forwarded-For` is never used to pick the bucket, because a caller
+controls its front; with loopback trusted, Caddy does pass a loopback caller's
+forwarding headers on to electrs and btxd REST, which read none of them.
+
+**So only the tunnel may relay outside traffic to the front over loopback.**
+Anything else that does (an `ssh -R`, a second tunnel, a `netsh portproxy` or
+other port forward aimed at 127.0.0.1) lets its callers name any
+`Cf-Connecting-IP` and get a fresh bucket per request, which is no limit at
+all. That is not a new opening for local processes: anything on the box can
+already reach the witness or electrs directly, past this front. `test-front.sh` checks that a second client named in the header still
+gets through when loopback's bucket is empty, and is throttled in its own turn.
+It does not check that a non-loopback caller is denied the header: that needs
+a second local address, so it rests on Caddy's `trusted_proxies` (only
+loopback is listed). A tunnel other than Cloudflare's needs its own header
+added to `client_ip_headers`. An IPv6 client can change address within its
+/64 and get a fresh bucket each time; this is still far better than one bucket
+for everyone, and a Cloudflare rate-limiting rule at the edge covers it if it is
+ever abused.
+
 ## Changes made during the port
 
 `PROVENANCE.md` has the table. In one paragraph: the guardian's witness moved

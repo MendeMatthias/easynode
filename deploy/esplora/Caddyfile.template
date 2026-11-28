@@ -67,6 +67,28 @@
 	# The ordering is a total order, so `before handle` also keeps rate_limit
 	# ahead of `reverse_proxy` inside the @rawblock handler below.
 	order rate_limit before handle
+
+	# WHO THE CLIENT IS, for the rate limits below. Behind a Cloudflare tunnel
+	# (witness-1.easybtx.com) every request reaches Caddy from cloudflared on
+	# loopback, so `{remote_host}` is 127.0.0.1 for the whole internet: the
+	# per-IP limit became ONE shared bucket, and a single client sending 200
+	# requests in 10 s pushed every wallet's fork check into 429.
+	#
+	# So a request from loopback may name its client in Cf-Connecting-IP, the
+	# header Cloudflare sets itself (overwriting any the caller sent), and the
+	# limits key on `{client_ip}`. Only loopback is trusted: a request from
+	# anywhere else that carries the header is keyed on its own address as
+	# before, so the header cannot be used to dodge the limit. X-Forwarded-For
+	# is deliberately NOT read: a caller can put anything at its front, and
+	# Cloudflare only appends.
+	#
+	# Where nothing on loopback sets the header (the app's own front, a box
+	# exposed directly) `{client_ip}` is `{remote_host}` and nothing changes.
+	# Checked by deploy/esplora/test-front.sh.
+	servers {
+		trusted_proxies static 127.0.0.1/8 ::1
+		client_ip_headers Cf-Connecting-IP
+	}
 }
 
 # Shared Esplora API config. Caddy is the SINGLE source of CORS; upstream
@@ -113,7 +135,7 @@
 	handle @rawblock {
 		rate_limit {
 			zone rawblock {
-				key {remote_host}
+				key {client_ip}
 				events 60
 				window 10s
 			}
@@ -129,7 +151,7 @@
 
 	rate_limit {
 		zone perip {
-			key {remote_host}
+			key {client_ip}
 			events 200
 			window 10s
 		}

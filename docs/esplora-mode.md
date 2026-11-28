@@ -184,6 +184,22 @@ strict: 64 lowercase hex for ids, a canonical decimal vout of one to four
 digits (at most 9,999), no query string, fragment, trailing slash or extra
 segment, GET only.
 
+### When the node is slow, or prunes under the index
+
+- **A slow node keeps its slots, on purpose.** A connection holds one of the
+  eight slots the index also uses until the node answers it (the RPC client
+  allows 60 s per call, and an outspend makes up to five). An answer deadline
+  that replied 503 and freed the slot was tried and withdrawn: btxd keeps
+  working on a call its caller dropped, so a slow node would be handed eight new
+  calls every deadline on top of the ones it is still running. That fills the
+  work queue `MAX_INFLIGHT` protects, and the app reaps a node whose status
+  polls keep failing. A node that has stopped answering cannot answer any route
+  anyway.
+- **A block pruned before the index read it** (the node pruned during the
+  first scan, or the index fell behind past the prune line) starts the index
+  again from the node's lowest block. It answers 503 while it rebuilds, instead
+  of asking for the pruned block forever and answering 503 until a restart.
+
 ### Measured on the 3060 signer, a pruned mainnet node
 
 The 3060 runs the live signer: btxd 0.34.16, `prune=4096`, no `-txindex`,
@@ -198,6 +214,7 @@ pruneheight 184,942, tip ~290,600 on 2026-11-28. The witness ran beside it at
 | `btx-witness` RSS, serving, after the build | 65 MB |
 | `btx-witness` RSS, peak during the build | 161 MB |
 | first build, paced | 523 s to read, ready at 574 s (~190 blocks/s) |
+| the same, later that day with the machine busier (load 4–8.8) | 1,110 s to read, ready at 1,247 s; RPC 4–18 ms throughout. The pace follows the node's answer times, so expect 10–20 minutes |
 | the signer meanwhile | RPC `getblockcount` 3–19 ms throughout; lag behind api.btxscan.io 0–4, back to 0 at the end |
 | first build, unpaced (not shipped) | ~400 blocks/s, but load 4 → 7 on the signer's machine |
 | `test-witness.sh`, 2,000-block window | 55 PASS, 0 FAIL (index built in 15 s) |

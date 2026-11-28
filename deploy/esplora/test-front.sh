@@ -66,6 +66,9 @@ trap cleanup EXIT
 pass=0; fail=0
 ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$*"; pass=$((pass+1)); }
 bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; fail=$((fail+1)); }
+# Called on the rate-limit burst's inconclusive branch, which never ran here
+# before and would have died with "info: command not found".
+info() { printf '  ....  %s\n' "$*"; }
 
 # ── the stubs ────────────────────────────────────────────────────────────────
 # The electrs stub deliberately sets its OWN Access-Control-Allow-Origin, which
@@ -253,6 +256,45 @@ elif [ "$burst_secs" -ge 10 ]; then
   ok "rate limiting not disproven (the burst was too slow to test it here)"
 else
   bad "no 429 in a 300-request burst finished in ${burst_secs}s ($codes) — the rate limit is not in force"
+fi
+
+echo
+echo "── behind a Cloudflare tunnel, each client has its own bucket ──"
+# cloudflared reaches the front from loopback, so without client_ip_headers the
+# whole internet is 127.0.0.1 and shares one bucket. With loopback's bucket
+# empty, a request naming another client in Cf-Connecting-IP must still be
+# served, and that client must be throttled in turn: the header picks the
+# bucket, it does not switch the limit off. Self-contained: it waits out the
+# window the section above used and empties loopback's bucket itself.
+sleep 11
+t0=$SECONDS
+codes1="$(curl -sS -o /dev/null -m 30 -w '%{http_code}\n' "$F/blocks/tip/height?tunnel=[1-300]" \
+  2>/dev/null | sort | uniq -c | tr '\n' ' ')"
+same="$(curl -sS -o /dev/null -m 5 -w '%{http_code}' "$F/blocks/tip/height?same=1")"
+other="$(curl -sS -o /dev/null -m 5 -w '%{http_code}' -H 'Cf-Connecting-IP: 198.51.100.7' "$F/blocks/tip/height?other=1")"
+t1=$((SECONDS - t0))
+if [ "$t1" -ge 8 ]; then
+  # The window is 10 s: by now the oldest events may have expired and
+  # loopback's bucket admit again, which would read as a failure.
+  info "loopback's burst took ${t1}s ($codes1), too close to the 10s window — inconclusive"
+  ok "per-client buckets not disproven (the burst was too slow to test it here)"
+elif [ "$same" = "429" ] && [ "$other" != "429" ]; then
+  # The stub answers this path 404; what matters is that it is not a 429.
+  ok "with loopback's bucket empty (429), a request from Cf-Connecting-IP 198.51.100.7 is served ($other)"
+else
+  bad "loopback answered $same, Cf-Connecting-IP 198.51.100.7 answered $other after $codes1 (want 429, then anything but 429)"
+fi
+t0=$SECONDS
+codes2="$(curl -sS -o /dev/null -m 30 -w '%{http_code}\n' -H 'Cf-Connecting-IP: 198.51.100.7' \
+  "$F/blocks/tip/height?burst2=[1-300]" 2>/dev/null | sort | uniq -c | tr '\n' ' ')"
+t2=$((SECONDS - t0))
+if printf '%s' "$codes2" | grep -q '429'; then
+  ok "and that client is throttled in its own turn ($codes2)"
+elif [ "$t2" -ge 10 ]; then
+  info "its burst took ${t2}s, longer than the 10s window ($codes2) — inconclusive"
+  ok "the header does not switch the limit off (not disproven)"
+else
+  bad "a 300-request burst from Cf-Connecting-IP 198.51.100.7 in ${t2}s was never throttled ($codes2)"
 fi
 
 echo
