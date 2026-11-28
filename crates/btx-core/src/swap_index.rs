@@ -81,8 +81,9 @@ pub const POLL: Duration = Duration::from_secs(2);
 /// four minutes on the 3060 signer), and `getblock` takes the node's main lock
 /// to find the block. A node that signs blocks must not be slowed by a witness
 /// beside it: measured 2026-11-28, an unpaced build took that machine's load
-/// average from 4 to 7. At 2 the build uses at most a third of one RPC thread
-/// and takes about three times as long, once, at start.
+/// average from 4 to 7. At 2 the build uses at most a third of one RPC thread;
+/// measured, it took 523 s instead of ~250 s, once, at start, with the signer's
+/// RPC answering in 3-19 ms throughout.
 pub const BUILD_PACE: u32 = 2;
 
 /// Parse exactly 64 lowercase hex characters. Uppercase is refused on
@@ -716,6 +717,7 @@ impl SwapIndex {
             self.build(rpc, gate).await?;
             return Ok(SyncOutcome::Moved);
         };
+        let asked = tokio::time::Instant::now();
         let hdr = match call(
             rpc,
             gate,
@@ -737,6 +739,10 @@ impl SwapIndex {
             .and_then(Value::as_i64)
             .unwrap_or(-1);
         if confirmations < 1 {
+            // Paced like a block read: after a -reindex every block in the
+            // index comes back unknown, and unwinding a hundred thousand of
+            // them back to back would be its own flood on a busy node.
+            tokio::time::sleep(asked.elapsed() * BUILD_PACE).await;
             // Our tip is no longer on the active chain: take it off.
             let mut s = self.state.write().await;
             if s.tip() == Some((tip_h, tip_hash)) {

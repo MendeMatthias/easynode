@@ -788,11 +788,23 @@ pub async fn answer_outspend(rpc: &dyn Rpc, index: &SwapIndex, txid: &Id, vout: 
 /// Said instead of "unspent" while the node is behind the network.
 pub const NODE_BEHIND: &str = "this node is behind the network; it cannot say unspent";
 
-/// Is the node at the network's tip, as far as it can tell? Not in initial
-/// block download, not more than two headers ahead of its blocks, and its tip
-/// not older than `node_api::TIP_STALE_AFTER_SECS` (two hours, about eighty
-/// missed blocks). This cannot see a branch the node holds only as
-/// unattested headers; nothing a node reports about itself can.
+/// Is the node at the network's tip, as far as it can tell? Every signal the
+/// crate has for "behind", because a "no" here costs one 503 and a wrong "yes"
+/// costs an "unspent" that is not:
+///
+/// - not in initial block download (which latches off once caught up, so
+///   it is the weakest of these);
+/// - not `tip_unsafe_to_act_on`: btxd's own `is_stale`, or its tip behind its
+///   best header at all. It flaps by design while a block arrives; flapping
+///   into a 503 is the safe direction;
+/// - `network_height` (blocks, headers and the signed frontier when it is on
+///   this chain) no more than two above `blocks`: after mainnet 244,000
+///   `headers` alone stays near `blocks` while a node catches up;
+/// - its tip not older than `node_api::TIP_STALE_AFTER_SECS`.
+///
+/// It still cannot see a branch the node holds only as headers it has not
+/// accepted; nothing a node reports about itself can. That is why "unspent"
+/// is never proof to a swap client.
 async fn node_is_caught_up(rpc: &dyn Rpc) -> Result<bool, AppError> {
     let info = crate::node_api::get_blockchain_info(rpc).await?;
     let now = std::time::SystemTime::now()
@@ -800,7 +812,8 @@ async fn node_is_caught_up(rpc: &dyn Rpc) -> Result<bool, AppError> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     Ok(!info.initial_block_download
-        && info.headers <= info.blocks + 2
+        && !info.tip_unsafe_to_act_on()
+        && info.network_height() <= info.blocks + 2
         && !crate::node_api::tip_is_stale(info.median_time, now))
 }
 
@@ -1720,6 +1733,7 @@ mod tests {
         utxos: std::collections::HashSet<(String, u64)>,
         pruned_below: u64,
         ibd: bool,
+        behind: u64,
         calls: Vec<String>,
     }
 
@@ -1791,6 +1805,7 @@ mod tests {
                     "blocks": st.tip(), "headers": st.tip(),
                     "pruned": true, "pruneheight": st.pruned_below,
                     "initialblockdownload": st.ibd,
+                    "behind_best_header": st.behind,
                 })),
                 "getbestblockhash" => Ok(json!(st.active.last().unwrap())),
                 "getblockhash" => {
@@ -2019,6 +2034,17 @@ mod tests {
         }
         let r = fetch(s.addr, &format!("/tx/{t0}/outspend/0")).await;
         assert!(r.2.starts_with(r#"{"spent":true"#), "{r:?}");
+        // IBD latches off once a node has caught up, so a node that falls
+        // behind later says so only through its other signals.
+        node.with(|st| {
+            st.ibd = false;
+            st.behind = 3;
+        });
+        let r = fetch(s.addr, &format!("/tx/{t0}/outspend/7")).await;
+        assert_eq!(r, (503, TEXT.into(), NODE_BEHIND.into()));
+        node.with(|st| st.behind = 0);
+        let r = fetch(s.addr, &format!("/tx/{t0}/outspend/7")).await;
+        assert_eq!(r, (200, JSON.into(), UNSPENT_JSON.into()));
     }
 
     /// The node stops knowing the index's tip at all (a -reindex, or a

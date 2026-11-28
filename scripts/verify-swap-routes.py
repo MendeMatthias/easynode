@@ -154,8 +154,13 @@ def main(argv):
                     break
                 time.sleep(wait)
                 cc, ct, cb = get(cand, p)
-            if p.startswith("/tx/") and "/outspend/" not in p and cc in (200, 404):
-                answered.setdefault(p.split("/")[2], {}).setdefault(str(cc), []).append(p.split("/")[3])
+            # status and merkle-proof come from the same index entry, so they
+            # must agree; hex may come from a txindex or a block since pruned,
+            # and honestly differ from them.
+            if (p.endswith("/status") or p.endswith("/merkle-proof")) and cc in (200, 404):
+                # {"confirmed":false} (in the mempool) has no proof, honestly.
+                if not (p.endswith("/status") and cc == 200 and '"confirmed":true' not in cb):
+                    answered.setdefault(p.split("/")[2], {}).setdefault(str(cc), []).append(p.split("/")[3])
             label = p.split("/")[-1] if "/outspend/" not in p else "outspend/" + p.rsplit("/", 1)[1]
             label = "%s %s…" % (label, p.split("/")[2][:12])
             if cc == 0:
@@ -174,7 +179,7 @@ def main(argv):
                 else:
                     say("FAIL", "%s: candidate 404 '%s', reference 200" % (label, cb[:60]))
                 continue
-            if as_json and rc in (404, 503) and cc == 200:
+            if as_json and "/outspend/" in p and rc in (404, 503) and cc == 200:
                 # A reference that is not electrs abstaining where the candidate
                 # answered: Byron Bay 404s an output index past the end of a
                 # transaction, where electrs (and so any candidate matching

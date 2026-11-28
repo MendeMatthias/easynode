@@ -192,28 +192,39 @@ pruneheight 184,942, tip ~290,600 on 2026-11-28. The witness ran beside it at
 
 | | measured |
 |---|---|
-| window | 100,000 blocks (190,607..290,606) |
-| indexed | 109,968 transactions, 232,573 spent outpoints |
+| window | 100,000 blocks (190,626..290,625) |
+| indexed | 109,969 transactions, 232,579 spent outpoints |
 | the index's own structures | ~52 MiB (from their capacities) |
-| process RSS, serving, after the build | 115 MB |
-| process RSS, peak during the build | PEAK_PLACEHOLDER |
-| first build, paced | 700 s (11.7 min), ~143 blocks/s |
-| the signer meanwhile | RPC `getblockcount` 4–15 ms throughout; load 4–6 (as before); lag behind api.btxscan.io unchanged |
+| `btx-witness` RSS, serving, after the build | 65 MB |
+| `btx-witness` RSS, peak during the build | 161 MB |
+| first build, paced | 523 s to read, ready at 574 s (~190 blocks/s) |
+| the signer meanwhile | RPC `getblockcount` 3–19 ms throughout; lag behind api.btxscan.io 0–4, back to 0 at the end |
 | first build, unpaced (not shipped) | ~400 blocks/s, but load 4 → 7 on the signer's machine |
 | `test-witness.sh`, 2,000-block window | 55 PASS, 0 FAIL (index built in 15 s) |
 
-The RSS above the index is the runtime and what glibc keeps from parsing
-`getblock` answers: post-quantum witnesses make some of them hundreds of
-kilobytes of JSON. The build hands free memory back every 2,000 blocks and at
-its end (`malloc_trim`); without that the process kept its ~300 MB build peak
-for life.
+The binary runs a single-threaded runtime and hands free memory back every
+2,000 blocks and at the end of the build (`malloc_trim`). Both matter: the
+first build parses a hundred thousand `getblock` answers, some of them hundreds
+of kilobytes of JSON (post-quantum witnesses are large). Measured the same day
+on the same node, the multi-threaded runtime (glibc keeps an arena per worker,
+24 here) left the process at 189 MB after the build with a 284 MB peak, and
+without any trimming it kept a ~300 MB peak for life. The app's witness on a
+public bind runs inside the app's own multi-threaded runtime, so expect it
+nearer the higher figures.
 
 **Live, against the reference** (`scripts/verify-swap-routes.py`, from WSL,
 2026-11-28, the witness above as candidate; recent multi-transaction blocks
 plus heights 288858, 288860, 289982, 250000, 200000 and 190700):
 
-- `api.btxscan.io` (electrs), byte for byte: COMPARE_BTXSCAN
-- `esplora.btxbyronbay.com`, as parsed JSON: COMPARE_BYRON
+- `api.btxscan.io` (electrs), byte for byte: **136 of 136 route answers
+  identical** (status code, content type and body) across 11 blocks and 25
+  transactions, merkle branches of up to 5 entries included, and all 25 proofs
+  fold into the witness's own headers. 0 failures, 0 abstentions.
+- `esplora.btxbyronbay.com`, as parsed JSON: **128 of 136 agree**, 0
+  disagree. The other 8 are `/outspend/1` on transactions with one output:
+  Byron Bay answers `404 {"error":"not found"}` for an output index past the
+  end, where electrs, and so the witness, answers `{"spent":false}`. The
+  script lists those as REFABSTAIN.
 
 ### How to check a node, and an endpoint
 

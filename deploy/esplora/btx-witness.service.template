@@ -34,7 +34,7 @@ RestartSec=5
 
 # It reads the node's cookie and answers GETs from the node and from an
 # in-memory index of the blocks the node holds (the swap routes: ~52 MiB for
-# the default 100,000 blocks, ~115 MB RSS in all, built at start and paced so
+# the default 100,000 blocks, ~65 MB RSS in all, built at start and paced so
 # the node is not slowed; --no-swap turns it off).
 # It needs nothing else.
 NoNewPrivileges=true

@@ -68,7 +68,12 @@ A pruned node can serve all of these: pruning discards block data, not the
 block index, and the swap index is built from the blocks the node still holds.
 ";
 
-#[tokio::main]
+// One thread. Everything here is I/O-bound and at most `MAX_INFLIGHT`
+// requests are served at once, and a multi-threaded runtime gives glibc an
+// allocator arena per worker: measured 2026-11-28 on a 24-core machine, the
+// swap index's first build left the process at 189 MB RSS (284 MB peak) for an
+// index of 52 MiB, because freed `getblock` JSON stayed spread across them.
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut datadir: Option<PathBuf> = None;
     let mut rpc = "127.0.0.1:19334".to_string();
