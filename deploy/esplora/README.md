@@ -19,7 +19,8 @@ is worth doing at all.
 | `install-systemd.sh` | installs the units, `--mode witness` (default) or `--mode esplora` |
 | `btx-witness.service.template` | the witness server as a unit; runs on any node, pruned or not |
 | `btx-confirmer.service.template` | the snapshot confirmer as a unit, for a listed operator without the app |
-| `test-witness.sh` | proves the node here can serve as a fork witness |
+| `test-witness.sh` | proves the node here can serve as a fork witness and a swap index |
+| `witness-swap-check.py` | the swap-route half of `test-witness.sh`: every route checked against the node's own RPC |
 | `test-front.sh` | starts the real Caddyfile against stubs and checks every claim in it |
 | `test-guardian.sh` | runs the freshness guardian against stubs and pins that it agrees with the Rust |
 | `test-stack.sh` | the whole stack against a REAL btxd on a throwaway regtest chain |
@@ -49,9 +50,14 @@ Everything lives under `<datadir>/esplora/`: `run/` (the markers),
 **Without the app, on a server.** Two tiers, and most operators want the
 smaller one.
 
-A **witness** serves the two routes a wallet needs to settle a fork. It runs on
-any node, including a pruned one, because pruning discards block data and not
-the block index. It is the tier the network is short of:
+A **witness** serves the two routes a wallet needs to settle a fork, and the
+five an HTLC swap client checks across a quorum of operators
+(`/tx/<txid>/status`, `/hex`, `/merkle-proof`, `/outspend/<vout>`,
+`/block/<hash>/header`, in electrs' formats; see "The swap routes" in
+`docs/esplora-mode.md`). It runs on any node, including a pruned one, because
+pruning discards block data and not the block index, and the swap routes come
+from an in-memory index of the blocks the node still holds. It is the tier the
+network is short of:
 
 ```bash
 (cd crates/btx-core && cargo build --release --bin btx-witness)

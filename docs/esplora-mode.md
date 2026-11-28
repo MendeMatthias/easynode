@@ -58,19 +58,20 @@ runs on any node anybody already has.
 
 | | witness | esplora |
 |---|---|---|
-| serves | the two block routes | the whole Esplora API |
+| serves | the two block routes, and the five swap routes (below) | the whole Esplora API |
 | needs | any node, pruned or not | `prune=0`, ~124 GiB, an index, a GPU to build it |
 | binary | `btx-witness` (in this repository) | electrs (vendored, built from source) |
-| proves | which chain a wallet is on | that, plus balances and history |
-| acceptance | its answers match a node's own `getblockhash` | `scripts/verify-esplora.sh`, a UTXO set comparison |
+| proves | which chain a wallet is on; that a swap's transaction is confirmed, and what spent it | that, plus balances and history |
+| acceptance | its answers match a node's own RPC (`test-witness.sh`) and electrs byte for byte (`verify-swap-routes.py`) | `scripts/verify-esplora.sh`, a UTXO set comparison |
 
 `crates/btx-core/src/witness.rs` is the server and
 `crates/btx-core/src/bin/btx-witness.rs` the binary.
 `deploy/esplora/install-systemd.sh --mode witness` is the default, and
 `deploy/esplora/test-witness.sh` proves a given node can do it.
 
-**A witness serves the two routes and 404s everything else**, including every
-`/address` and `/tx` route. That is not a gap to be filled in later. A node
+**A witness serves the two routes, the signer census and the five swap routes,
+and 404s everything else**, including every `/address` route, `GET /tx/<txid>`,
+the mempool and every broadcast. That is not a gap to be filled in later. A node
 serving witness data has made no promise about an address index, and the defect
 that retired the last independent witness was an address index answering every
 route confidently while not recording spends. The wallet enforces the same
@@ -81,6 +82,164 @@ Measured end to end on 2026-09-06, on the pruned validator: 21 checks, the
 front carrying CORS exactly once, the money routes 404 through it, and the real
 freshness guardian against the real census returning
 `state=fresh why=settled-block-matches proven_at=211747`.
+
+## The swap routes: any node as an independent swap index
+
+*Added 2026-11-28. Measurements in this section are from that day.*
+
+An HTLC atomic swap client (repchic's swap core, shipping first in bonuz and
+the PQ wallet) checks one transaction across a **quorum of independent
+operators**, with five GETs. Operators are counted, not hosts:
+`api.btxscan.io` and `witness-1.easybtx.com` are one operator.
+`esplora.btxbyronbay.com` (Jarek, its own index, not electrs) serves all five
+since 2026-11-28 and is the second. Every easyNode node that publishes its
+witness can now be a third, fourth, and so on, pruned or not, without the
+124 GiB archive or a GPU.
+
+| route | answer | content type | how the client checks it |
+|---|---|---|---|
+| `/tx/<txid>/status` | `{"confirmed":true,"block_height":H,"block_hash":"…","block_time":T}` | `application/json` | the block hash against `/block-height/H` from other operators |
+| `/tx/<txid>/hex` | the transaction, lowercase hex | `text/plain` | it hashes to the txid |
+| `/tx/<txid>/merkle-proof` | `{"block_height":H,"merkle":[…],"pos":P}` | `application/json` | the branch folds into the header's merkle root |
+| `/tx/<txid>/outspend/<vout>` | `{"spent":true,"txid":"…","vin":N,"status":{…}}` or `{"spent":false}` | `application/json` | "spent": fetch the spender and verify it spends the output. "unspent": never proof |
+| `/block/<hash>/header` | the serialized header (182 bytes, 364 hex) | `text/plain` | it hashes to the block hash other operators confirm |
+
+Every body is **electrs' format byte for byte** (the reference is
+`btx-esplora/electrs/src/rest.rs` and the live `api.btxscan.io`): the key
+order, `block_time` being the header's own timestamp, merkle branch entries in
+display order, and the 404 bodies `Transaction not found`,
+`Transaction not found or is unconfirmed` and `Block not found` word for word.
+`crates/btx-core/tests/fixtures/witness_swap/mainnet-288858.json` holds four
+real mainnet blocks (one with 3 transactions, one with 17) and 53 answers
+btxscan gave about them; a unit test serves the same blocks and compares all 53
+for status, content type and body.
+
+### How a pruned node answers them
+
+`/block/<hash>/header` is `getblockheader`, which works on any node. The other
+four need to know which block holds a txid, and the fleet runs `prune=4096`
+with no `-txindex`. So the witness keeps an **in-memory index of the blocks the
+node still holds** (`crates/btx-core/src/swap_index.rs`): txid → (height,
+position) and outpoint → (spending txid, input, height), plus each block's
+txids for the merkle branch. No transaction bytes, amounts, scripts or
+addresses. It is built at start from the bottom of the window to the tip
+(`getblock <hash> 2`, one block at a time, inside the server's in-flight bound),
+then follows the tip every two seconds.
+
+- **The window** is the last 100,000 blocks (~104 days), or what a pruned node
+  still holds if that is less; `--swap-window` changes it, `--no-swap` turns
+  the five routes off. On the fleet's `prune=4096` a node held 105,640 blocks
+  on 2026-11-28 (pruneheight 184,942), because post-fork blocks are ~8 kB. The
+  cap is what keeps an archival node from walking the ~1 MB-a-block MatMul era.
+- **Every block's txids are checked against its header's merkle root** as it
+  is indexed. A block that does not match is still indexed (its spends are
+  real) but no proof is served from it.
+- **Reorgs**: a block connects only onto the index's tip; each sync step asks
+  the node whether the index's tip is still active and disconnects it if not,
+  removing exactly what it added. Every answer that names a block is re-checked
+  at request time (`getblockhash` at that height), so a reorg the index has not
+  reached yet gives a **503**, never a stale "confirmed" or "spent".
+- **Until the first build reaches the tip**, the four index routes answer 503.
+  The header route does not need the index.
+- **The first build is paced**: after each block it waits twice as long as the
+  read took, so it never holds more than a third of one of the node's RPC
+  threads. A node that signs blocks must not be slowed by a witness beside it.
+- **Who turns it on.** `btx-witness` (the server binary operators run behind a
+  public front) serves the swap routes by default. The app's built-in witness,
+  on by default on every install but bound to loopback, serves them only when
+  its bind address is public (`WitnessOptions::for_bind`): on loopback no swap
+  client can reach them, and the index would cost every app start a read of
+  the last 100,000 blocks for nobody.
+
+### When it says "unspent", and when it abstains
+
+"Spent" is said when the spend is seen, confirmed in the index or waiting in the
+mempool (`gettxspendingprevout`). "Unspent" is said only when it is complete up
+to the node's tip:
+
+1. the transaction that created the output is in the window or the mempool,
+   the index is at the node's tip, and neither holds a spend. The window is
+   contiguous to the tip, so every block that could hold a spend was read; or
+2. the node's UTXO set still holds the output (`gettxout` with the mempool).
+
+Anything else is **404 `Output not known to this witness`**: an output created
+below the window and gone from the UTXO set was spent somewhere this node
+cannot see. The mempool is read before the index is checked against the tip,
+so a spend that moves from the mempool into a block in between is still seen.
+
+### Where it differs from electrs, deliberately
+
+| case | electrs (btxscan) | Byron Bay | witness |
+|---|---|---|---|
+| unknown txid, `/status` | `200 {"confirmed":false}` | `404 {"error":"not found"}` | `404 Transaction not found` |
+| output it cannot place, `/outspend` | `200 {"spent":false}` | — | `404 Output not known to this witness` |
+| uppercase txid or hash | accepted | — | 404: one id, one spelling |
+| index building, or a reorg in flight | — | `503` while it re-checks | `503` |
+
+A pruned witness cannot tell "never existed" from "confirmed below my window",
+so it never says `{"confirmed":false}` about a txid it does not hold: that would
+be a claim about the second case. None of the "not found" answers proves
+anything to a quorum client, and a 503 is an abstention, not a vote. Shapes are
+strict: 64 lowercase hex for ids, a canonical decimal vout of one to four
+digits (at most 9,999), no query string, fragment, trailing slash or extra
+segment, GET only.
+
+### Measured on the 3060 signer, a pruned mainnet node
+
+The 3060 runs the live signer: btxd 0.34.16, `prune=4096`, no `-txindex`,
+pruneheight 184,942, tip ~290,600 on 2026-11-28. The witness ran beside it at
+`nice -n 19 ionice -c3`, read-only, with the default window.
+
+| | measured |
+|---|---|
+| window | 100,000 blocks (190,626..290,625) |
+| indexed | 109,969 transactions, 232,579 spent outpoints |
+| the index's own structures | ~52 MiB (from their capacities) |
+| `btx-witness` RSS, serving, after the build | 65 MB |
+| `btx-witness` RSS, peak during the build | 161 MB |
+| first build, paced | 523 s to read, ready at 574 s (~190 blocks/s) |
+| the signer meanwhile | RPC `getblockcount` 3–19 ms throughout; lag behind api.btxscan.io 0–4, back to 0 at the end |
+| first build, unpaced (not shipped) | ~400 blocks/s, but load 4 → 7 on the signer's machine |
+| `test-witness.sh`, 2,000-block window | 55 PASS, 0 FAIL (index built in 15 s) |
+
+The binary runs a single-threaded runtime and hands free memory back every
+2,000 blocks and at the end of the build (`malloc_trim`). Both matter: the
+first build parses a hundred thousand `getblock` answers, some of them hundreds
+of kilobytes of JSON (post-quantum witnesses are large). Measured the same day
+on the same node, the multi-threaded runtime (glibc keeps an arena per worker,
+24 here) left the process at 189 MB after the build with a 284 MB peak, and
+without any trimming it kept a ~300 MB peak for life. The app's witness on a
+public bind runs inside the app's own multi-threaded runtime, so expect it
+nearer the higher figures.
+
+**Live, against the reference** (`scripts/verify-swap-routes.py`, from WSL,
+2026-11-28, the witness above as candidate; recent multi-transaction blocks
+plus heights 288858, 288860, 289982, 250000, 200000 and 190700):
+
+- `api.btxscan.io` (electrs), byte for byte: **136 of 136 route answers
+  identical** (status code, content type and body) across 11 blocks and 25
+  transactions, merkle branches of up to 5 entries included, and all 25 proofs
+  fold into the witness's own headers. 0 failures, 0 abstentions.
+- `esplora.btxbyronbay.com`, as parsed JSON: **128 of 136 agree**, 0
+  disagree. The other 8 are `/outspend/1` on transactions with one output:
+  Byron Bay answers `404 {"error":"not found"}` for an output index past the
+  end, where electrs, and so the witness, answers `{"spent":false}`. The
+  script lists those as REFABSTAIN.
+
+### How to check a node, and an endpoint
+
+- `deploy/esplora/test-witness.sh` runs the witness against the node on the
+  machine and checks every route against that node's own RPC: status against
+  `getblock`, hex against `getrawtransaction`, each merkle proof folded into
+  the header's root, a real confirmed spend, an unspent output, a tx below the
+  window (404), a side-branch header (404), block 1's header below the prune
+  height, and the refusals. It uses `deploy/esplora/witness-swap-check.py`.
+- `scripts/verify-swap-routes.py <candidate> [reference]` compares a live
+  endpoint's five routes with a reference (default `api.btxscan.io`) byte for
+  byte, or as parsed JSON with `--json` for a reference that is not electrs,
+  and checks every proof against the candidate's own header. Abstentions (503,
+  or a 404 outside a window) are counted apart from failures.
+  `scripts/verify-esplora.sh` runs it as part of the Esplora gate.
 
 ## The route contract
 

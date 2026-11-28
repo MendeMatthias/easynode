@@ -35,13 +35,14 @@
 //! machine nobody had. It now needs a node anybody already runs.
 //!
 //! ── WHAT THIS DELIBERATELY WILL NOT DO ──────────────────────────────────────
-//! It serves two routes and 404s everything else, including every `/address`
-//! and `/tx` route. That is not an oversight to be filled in later: a node
-//! serving witness data has made no promise about an address index, and the
-//! defect that retired Byron Bay was an address index that answered every route
-//! confidently while not recording spends. A witness that also served balances
-//! would be exactly that machine. The wallet enforces the same split from its
-//! side (`WITNESS_ONLY_ORIGINS`), and this is the server half of it.
+//! It serves the routes listed here and 404s everything else, including every
+//! `/address` route, `GET /tx/<txid>`, the mempool and every broadcast. That
+//! is not an oversight to be filled in later: a node serving witness data has
+//! made no promise about an address index, and the defect that retired Byron
+//! Bay was an address index that answered every route confidently while not
+//! recording spends. A witness that also served balances would be exactly that
+//! machine. The wallet enforces the same split from its side
+//! (`WITNESS_ONLY_ORIGINS`), and this is the server half of it.
 //!
 //! It also reports what the node actually sees, always, including while the
 //! node is behind or on a branch. A witness that withheld its answer when it
@@ -60,6 +61,37 @@
 //! transaction or a mempool, and those stay 404. The PQ wallet's egress gate
 //! does not list this route and is unaffected by its existence.
 //!
+//! ── THE FIVE SWAP ROUTES (2026-11-28) ───────────────────────────────────────
+//! An HTLC atomic swap client checks one transaction across a quorum of
+//! independent Esplora operators, with five GETs:
+//!
+//! ```text
+//!   /tx/<txid>/status          where it is confirmed            JSON
+//!   /tx/<txid>/hex             its bytes                        text
+//!   /tx/<txid>/merkle-proof    how it hashes into its block     JSON
+//!   /tx/<txid>/outspend/<vout> what spent this output, if any   JSON
+//!   /block/<hash>/header       the block's header               text
+//! ```
+//!
+//! They are served here, byte for byte in electrs' formats (the reference is
+//! `btx-esplora/electrs/src/rest.rs` and the live `api.btxscan.io`), so any
+//! easyNode node, pruned ones included, can be one more independent operator
+//! without the 124 GiB archive. They are the same kind of thing as the hash
+//! routes, which is why they belong here and the address routes do not: every
+//! answer is one the client checks itself. The hex hashes to the txid, the
+//! proof folds into the header's merkle root, the header hashes to a block hash
+//! other operators confirm, and "spent" names a spending transaction the client
+//! fetches and verifies. "Unspent" is never proof of anything, and this server
+//! says it only when the answer is complete up to the node's tip (see
+//! `answer_outspend`).
+//!
+//! A pruned node without `-txindex` cannot find a txid, so the first four are
+//! answered from an in-memory index of the blocks the node still holds
+//! (`crate::swap_index`). Outside that window the answer is 404, "this witness
+//! does not know", and never a guess: a 404 is an abstention a quorum client
+//! can count, a confident wrong answer is not. While the index is being built,
+//! or is catching up with a reorg, the answer is 503.
+//!
 //! ── THE SERVER ──────────────────────────────────────────────────────────────
 //! Hand-written HTTP over tokio rather than a web framework. Two read-only GET
 //! routes on loopback do not justify a new dependency tree in a crate that
@@ -67,8 +99,10 @@
 //! small enough to read in one sitting: a bounded read, one request line, a
 //! path allow-list, a fixed response, close.
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::rpc::Rpc;
+use crate::swap_index::{id_hex, parse_id, BlockRef, Id, IndexState, SwapIndex};
+use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -198,6 +232,31 @@ pub enum WitnessRoute {
     /// (`signer::RecentSignersSummary`). Served from a window the server keeps
     /// current, never computed from scratch per request.
     RecentSigners,
+    /// `GET /tx/<txid>/status` — electrs' `TransactionStatus` JSON.
+    TxStatus(Id),
+    /// `GET /tx/<txid>/hex` — the transaction's bytes, lowercase hex.
+    TxHex(Id),
+    /// `GET /tx/<txid>/merkle-proof` — `{block_height, merkle, pos}`.
+    TxMerkleProof(Id),
+    /// `GET /tx/<txid>/outspend/<vout>` — electrs' `SpendingValue` JSON.
+    TxOutspend(Id, u32),
+    /// `GET /block/<hash>/header` — the serialized header, lowercase hex.
+    BlockHeader(Id),
+}
+
+impl WitnessRoute {
+    /// The five swap routes, which exist only when the server was started
+    /// with a swap index.
+    pub fn is_swap(&self) -> bool {
+        matches!(
+            self,
+            WitnessRoute::TxStatus(_)
+                | WitnessRoute::TxHex(_)
+                | WitnessRoute::TxMerkleProof(_)
+                | WitnessRoute::TxOutspend(..)
+                | WitnessRoute::BlockHeader(_)
+        )
+    }
 }
 
 /// Parse the request line of an HTTP request: `GET /path HTTP/1.1`.
@@ -232,9 +291,33 @@ fn parse_height(s: &str) -> Option<u64> {
     s.parse().ok()
 }
 
-/// Which route, if any. `None` is a 404 and covers every address, transaction,
-/// mempool and broadcast route — a witness is not asked those, and answering
-/// them would be a promise about an index this node has not made.
+/// The largest output index the outspend route accepts.
+///
+/// A small cap, like the height's, so the segment is a number and not a free
+/// slot a compromised client could smuggle bytes through. Four digits covers
+/// every output a swap names (an HTLC is one output of a small transaction)
+/// and the largest transactions on the chain today (a pool payout with 74
+/// outputs); a vout above it is answered 404, an abstention, never a guess.
+pub const MAX_VOUT: u32 = 9_999;
+
+/// An output index path segment: plain decimal, one to four digits, no
+/// leading zero, so one vout has exactly one spelling.
+fn parse_vout(s: &str) -> Option<u32> {
+    if s.is_empty() || s.len() > 4 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if s.len() > 1 && s.starts_with('0') {
+        return None;
+    }
+    s.parse().ok().filter(|v| *v <= MAX_VOUT)
+}
+
+/// Which route, if any. `None` is a 404 and covers every address, mempool and
+/// broadcast route and `GET /tx/<txid>` itself — a witness is not asked those,
+/// and answering them would be a promise about an index this node has not
+/// made. A txid or block hash is exactly 64 lowercase hex characters: electrs
+/// also accepts uppercase, and this does not, so one id has one spelling here
+/// as it does in the wallet's egress gate.
 pub fn route(method: &str, path: &str) -> Option<WitnessRoute> {
     if method != "GET" {
         return None;
@@ -248,6 +331,13 @@ pub fn route(method: &str, path: &str) -> Option<WitnessRoute> {
         ["", "blocks", "tip", "height"] => Some(WitnessRoute::TipHeight),
         ["", "block-height", h] => parse_height(h).map(WitnessRoute::BlockHash),
         ["", "signers", "recent"] => Some(WitnessRoute::RecentSigners),
+        ["", "tx", t, "status"] => parse_id(t).map(WitnessRoute::TxStatus),
+        ["", "tx", t, "hex"] => parse_id(t).map(WitnessRoute::TxHex),
+        ["", "tx", t, "merkle-proof"] => parse_id(t).map(WitnessRoute::TxMerkleProof),
+        ["", "tx", t, "outspend", v] => {
+            Some(WitnessRoute::TxOutspend(parse_id(t)?, parse_vout(v)?))
+        }
+        ["", "block", h, "header"] => parse_id(h).map(WitnessRoute::BlockHeader),
         _ => None,
     }
 }
@@ -270,6 +360,7 @@ pub fn http_response_typed(status: u16, content_type: &str, body: &str) -> Vec<u
         400 => "Bad Request",
         404 => "Not Found",
         413 => "Payload Too Large",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
     format!(
@@ -317,6 +408,437 @@ pub async fn answer(rpc: &dyn Rpc, r: WitnessRoute) -> (u16, String) {
         WitnessRoute::RecentSigners => {
             (500, "the signer window is served by the server".to_string())
         }
+        // The swap routes need the server's index; see `answer_swap`.
+        _ => (500, "the swap routes are served by the server".to_string()),
+    }
+}
+
+/// One answer: status, content type and body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reply {
+    pub status: u16,
+    pub content_type: &'static str,
+    pub body: String,
+}
+
+/// electrs' content types, exactly: `application/json` for the JSON routes,
+/// bare `text/plain` (no charset) for hex, headers and its error messages.
+pub const JSON: &str = "application/json";
+pub const TEXT: &str = "text/plain";
+
+fn reply(status: u16, content_type: &'static str, body: impl Into<String>) -> Reply {
+    Reply {
+        status,
+        content_type,
+        body: body.into(),
+    }
+}
+
+/// The bodies electrs answers a miss with, word for word, so a client that
+/// matches on them reads this witness the same way.
+pub const TX_NOT_FOUND: &str = "Transaction not found";
+pub const TX_NOT_CONFIRMED: &str = "Transaction not found or is unconfirmed";
+pub const BLOCK_NOT_FOUND: &str = "Block not found";
+/// An outpoint this witness cannot place. electrs never says this (it answers
+/// `{"spent":false}` for any outpoint it has not seen spent, existing or not);
+/// a pruned witness says it whenever the output was created below its window
+/// and has already left the UTXO set, because "unspent" there would be a guess.
+pub const OUTPOINT_UNKNOWN: &str = "Output not known to this witness";
+
+fn not_ready() -> Reply {
+    reply(503, TEXT, "the swap index is still being built")
+}
+
+fn catching_up(index: &SwapIndex) -> Reply {
+    index.wake.notify_one();
+    reply(503, TEXT, "the swap index is catching up with the node")
+}
+
+fn node_failed(what: &str, e: &AppError) -> Reply {
+    eprintln!("[witness] {what} failed: {e}");
+    reply(500, TEXT, "the node did not answer")
+}
+
+/// electrs' `TransactionStatus`, field for field and in its order.
+pub fn status_json(b: &BlockRef) -> String {
+    format!(
+        r#"{{"confirmed":true,"block_height":{},"block_hash":"{}","block_time":{}}}"#,
+        b.height,
+        id_hex(&b.hash),
+        b.time
+    )
+}
+
+/// electrs' `SpendingValue` for a spent output. `block` is `None` for a spend
+/// still in the mempool, which electrs reports as `{"confirmed":false}`.
+pub fn spent_json(txid: &Id, vin: u32, block: Option<&BlockRef>) -> String {
+    let status = match block {
+        Some(b) => status_json(b),
+        None => r#"{"confirmed":false}"#.to_string(),
+    };
+    format!(
+        r#"{{"spent":true,"txid":"{}","vin":{vin},"status":{status}}}"#,
+        id_hex(txid)
+    )
+}
+
+/// electrs' merkle-proof object: `{block_height, merkle, pos}`, in that order.
+pub fn proof_json(p: &crate::swap_index::Proof) -> String {
+    let merkle: Vec<String> = p.branch.iter().map(id_hex).collect();
+    json!({
+        "block_height": p.block.height,
+        "merkle": merkle,
+        "pos": p.pos,
+    })
+    .to_string()
+}
+
+const MERKLE_MISMATCH: &str =
+    "this block's transactions do not hash to its merkle root; no proof is served";
+
+pub const UNSPENT_JSON: &str = r#"{"spent":false}"#;
+pub const UNCONFIRMED_JSON: &str = r#"{"confirmed":false}"#;
+
+/// Is this block still where the index says it is, on the node's active chain?
+/// `Err` only when the node did not answer at all.
+async fn still_active(rpc: &dyn Rpc, b: &BlockRef) -> Result<bool, AppError> {
+    match rpc.call("getblockhash", json!([b.height])).await {
+        Ok(v) => Ok(v.as_str() == Some(id_hex(&b.hash).as_str())),
+        // A height above the node's tip: the block is not active any more.
+        Err(AppError::Rpc { .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// What a second look at the index found, after a miss.
+enum Recheck<T> {
+    /// Connected since the first look; the index is at the node's tip, so the
+    /// block it names is on the active chain.
+    Found(T),
+    /// Not there, and the index is at the node's tip: a real miss.
+    Missing,
+    /// The index is not at the node's tip: no miss can be reported yet.
+    Behind,
+}
+
+/// A miss is only reported as a miss when it is one. A txid in a block the
+/// index has not read yet must read as "catching up", not as "not found"; and
+/// one in a block connected between the first look and the tip check must be
+/// found, so the look is repeated under the same lock as the tip comparison.
+async fn recheck<T>(
+    rpc: &dyn Rpc,
+    index: &SwapIndex,
+    look: impl Fn(&IndexState) -> Option<T>,
+) -> Result<Recheck<T>, AppError> {
+    let best = rpc.call("getbestblockhash", json!([])).await?;
+    let best = best.as_str().and_then(parse_id);
+    let s = index.state.read().await;
+    if best.is_none() || s.tip().map(|t| t.1) != best {
+        return Ok(Recheck::Behind);
+    }
+    Ok(match look(&s) {
+        Some(x) => Recheck::Found(x),
+        None => Recheck::Missing,
+    })
+}
+
+/// A string of lowercase hex, even length, non-empty: the only shape a
+/// transaction or header body may leave this server in.
+fn is_lower_hex(s: &str) -> bool {
+    !s.is_empty()
+        && s.len().is_multiple_of(2)
+        && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Answer one of the five swap routes. Any other route is a caller error.
+pub async fn answer_swap(rpc: &dyn Rpc, index: &SwapIndex, r: WitnessRoute) -> Reply {
+    match r {
+        WitnessRoute::TxStatus(t) => answer_status(rpc, index, &t).await,
+        WitnessRoute::TxHex(t) => answer_hex(rpc, index, &t).await,
+        WitnessRoute::TxMerkleProof(t) => answer_merkle_proof(rpc, index, &t).await,
+        WitnessRoute::TxOutspend(t, v) => answer_outspend(rpc, index, &t, v).await,
+        WitnessRoute::BlockHeader(h) => answer_header(rpc, &h).await,
+        _ => reply(500, TEXT, "not a swap route"),
+    }
+}
+
+/// `/tx/<txid>/status`: confirmed (from the index, re-checked against the
+/// node), unconfirmed (in the mempool), or 404.
+///
+/// electrs answers an unknown txid `200 {"confirmed":false}`. This answers
+/// 404, as Byron Bay does: a pruned witness cannot tell "never existed" from
+/// "confirmed below my window", and `{"confirmed":false}` would be a claim
+/// about the second. Neither answer proves anything to a quorum client; both
+/// read as "not confirmed".
+pub async fn answer_status(rpc: &dyn Rpc, index: &SwapIndex, txid: &Id) -> Reply {
+    let found = {
+        let s = index.state.read().await;
+        if !s.ready {
+            return not_ready();
+        }
+        s.tx(txid)
+    };
+    if let Some(b) = found {
+        return match still_active(rpc, &b).await {
+            Ok(true) => reply(200, JSON, status_json(&b)),
+            Ok(false) => catching_up(index),
+            Err(e) => node_failed("getblockhash", &e),
+        };
+    }
+    match rpc.call("getmempoolentry", json!([id_hex(txid)])).await {
+        Ok(_) => return reply(200, JSON, UNCONFIRMED_JSON),
+        Err(AppError::Rpc { .. }) => {}
+        Err(e) => return node_failed("getmempoolentry", &e),
+    }
+    match recheck(rpc, index, |s| s.tx(txid)).await {
+        Ok(Recheck::Found(b)) => reply(200, JSON, status_json(&b)),
+        Ok(Recheck::Missing) => reply(404, TEXT, TX_NOT_FOUND),
+        Ok(Recheck::Behind) => catching_up(index),
+        Err(e) => node_failed("getbestblockhash", &e),
+    }
+}
+
+/// `/tx/<txid>/hex`: the bytes, from the block the index places it in (works
+/// pruned while that block is on disk), else from the mempool or a txindex.
+pub async fn answer_hex(rpc: &dyn Rpc, index: &SwapIndex, txid: &Id) -> Reply {
+    let found = {
+        let s = index.state.read().await;
+        if !s.ready {
+            return not_ready();
+        }
+        s.tx(txid)
+    };
+    let t = id_hex(txid);
+    if let Some(b) = found {
+        match rpc
+            .call("getrawtransaction", json!([t, false, id_hex(&b.hash)]))
+            .await
+        {
+            Ok(v) => {
+                if let Some(hex) = v.as_str().filter(|h| is_lower_hex(h)) {
+                    return reply(200, TEXT, hex);
+                }
+                return reply(500, TEXT, "the node returned a malformed transaction");
+            }
+            // Pruned since it was indexed: fall through to the mempool/txindex.
+            Err(AppError::Rpc { .. }) => {}
+            Err(e) => return node_failed("getrawtransaction", &e),
+        }
+    }
+    match rpc.call("getrawtransaction", json!([t, false])).await {
+        Ok(v) => match v.as_str().filter(|h| is_lower_hex(h)) {
+            Some(hex) => reply(200, TEXT, hex),
+            None => reply(500, TEXT, "the node returned a malformed transaction"),
+        },
+        Err(AppError::Rpc { .. }) => reply(404, TEXT, TX_NOT_FOUND),
+        Err(e) => node_failed("getrawtransaction", &e),
+    }
+}
+
+/// `/tx/<txid>/merkle-proof`: the electrum-style branch, computed from the
+/// block's txids, which the index has checked hash to the header's root.
+pub async fn answer_merkle_proof(rpc: &dyn Rpc, index: &SwapIndex, txid: &Id) -> Reply {
+    let found = {
+        let s = index.state.read().await;
+        if !s.ready {
+            return not_ready();
+        }
+        s.proof(txid)
+    };
+    match found {
+        Some(Ok(p)) => match still_active(rpc, &p.block).await {
+            Ok(true) => reply(200, JSON, proof_json(&p)),
+            Ok(false) => catching_up(index),
+            Err(e) => node_failed("getblockhash", &e),
+        },
+        Some(Err(())) => reply(500, TEXT, MERKLE_MISMATCH),
+        None => match recheck(rpc, index, |s| s.proof(txid)).await {
+            Ok(Recheck::Found(Ok(p))) => reply(200, JSON, proof_json(&p)),
+            Ok(Recheck::Found(Err(()))) => reply(500, TEXT, MERKLE_MISMATCH),
+            Ok(Recheck::Missing) => reply(404, TEXT, TX_NOT_CONFIRMED),
+            Ok(Recheck::Behind) => catching_up(index),
+            Err(e) => node_failed("getbestblockhash", &e),
+        },
+    }
+}
+
+/// `/tx/<txid>/outspend/<vout>`.
+///
+/// "Spent" is said when the spend is seen: confirmed in the index (and its
+/// block re-checked against the node) or waiting in the mempool. Either way
+/// the client fetches the named spender and verifies it.
+///
+/// "Unspent" is said only when it is complete up to the node's tip, which is
+/// one of two cases:
+///
+/// 1. the transaction that created the output is in the index's window or in
+///    the mempool, the index is at the node's tip, and neither the index nor
+///    the mempool holds a spend. The window is contiguous to the tip, so every
+///    block that could hold a spend was read;
+/// 2. the node's UTXO set holds the output (`gettxout` with the mempool).
+///
+/// Anything else is 404: an output created below the window that is no longer
+/// in the UTXO set was spent somewhere this witness cannot see, and saying
+/// either word about it would be a guess. The order of the checks matters: the
+/// mempool is read BEFORE the index is checked against the node's tip, so a
+/// spend that leaves the mempool for a block in between is still seen.
+///
+/// electrs answers `{"spent":false}` for an output index past the end of a
+/// transaction it knows; so does this (case 1), byte for byte.
+pub async fn answer_outspend(rpc: &dyn Rpc, index: &SwapIndex, txid: &Id, vout: u32) -> Reply {
+    let confirmed = {
+        let s = index.state.read().await;
+        if !s.ready {
+            return not_ready();
+        }
+        s.spend(txid, vout)
+    };
+    if let Some(sp) = confirmed {
+        return match still_active(rpc, &sp.block).await {
+            Ok(true) => reply(200, JSON, spent_json(&sp.txid, sp.vin, Some(&sp.block))),
+            Ok(false) => catching_up(index),
+            Err(e) => node_failed("getblockhash", &e),
+        };
+    }
+
+    // The mempool, first (see above).
+    let t = id_hex(txid);
+    let q = json!([[{"txid": t, "vout": vout}]]);
+    let spender = match rpc.call("gettxspendingprevout", q).await {
+        Ok(v) => v
+            .get(0)
+            .and_then(|e| e.get("spendingtxid"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        Err(e) => {
+            // Without the mempool this cannot say "unspent", and a node
+            // without the call cannot be asked another way.
+            eprintln!("[witness] gettxspendingprevout failed: {e}");
+            return reply(503, TEXT, "the mempool cannot be read");
+        }
+    };
+    if let Some(sp) = spender {
+        let Some(sp_id) = parse_id(&sp) else {
+            return reply(500, TEXT, "the node named a malformed spender");
+        };
+        return match rpc.call("getrawtransaction", json!([sp, 1])).await {
+            Ok(v) => {
+                let vin = v.get("vin").and_then(Value::as_array).and_then(|ins| {
+                    ins.iter().position(|i| {
+                        i.get("txid").and_then(Value::as_str) == Some(t.as_str())
+                            && i.get("vout").and_then(Value::as_u64) == Some(vout as u64)
+                    })
+                });
+                match vin.and_then(|i| u32::try_from(i).ok()) {
+                    Some(i) => reply(200, JSON, spent_json(&sp_id, i, None)),
+                    // Mined or evicted between the two calls: ask again.
+                    None => reply(503, TEXT, "the mempool changed; ask again"),
+                }
+            }
+            Err(AppError::Rpc { .. }) => reply(503, TEXT, "the mempool changed; ask again"),
+            Err(e) => node_failed("getrawtransaction", &e),
+        };
+    }
+
+    // Now the index, which must be at the node's tip to say anything more.
+    let best = match rpc.call("getbestblockhash", json!([])).await {
+        Ok(v) => v.as_str().and_then(parse_id),
+        Err(e) => return node_failed("getbestblockhash", &e),
+    };
+    let funding_in_window = {
+        let s = index.state.read().await;
+        if best.is_none() || s.tip().map(|x| x.1) != best {
+            drop(s);
+            return catching_up(index);
+        }
+        // A block connected since the first look may hold the spend.
+        if let Some(sp) = s.spend(txid, vout) {
+            return reply(200, JSON, spent_json(&sp.txid, sp.vin, Some(&sp.block)));
+        }
+        s.tx(txid).is_some()
+    };
+    let mut known_unspent = funding_in_window;
+    if !known_unspent {
+        known_unspent = match rpc.call("getmempoolentry", json!([t])).await {
+            Ok(_) => true,
+            Err(AppError::Rpc { .. }) => false,
+            Err(e) => return node_failed("getmempoolentry", &e),
+        };
+    }
+    if !known_unspent {
+        known_unspent = match rpc.call("gettxout", json!([t, vout, true])).await {
+            Ok(Value::Null) | Err(AppError::Rpc { .. }) => false,
+            Ok(_) => true,
+            Err(e) => return node_failed("gettxout", &e),
+        };
+    }
+    if !known_unspent {
+        return reply(404, TEXT, OUTPOINT_UNKNOWN);
+    }
+    // Complete up to the node's tip is only "unspent" if that tip is the
+    // network's: a node still syncing, or one that stopped following the
+    // chain, has not seen the blocks a spend may be in.
+    match node_is_caught_up(rpc).await {
+        Ok(true) => reply(200, JSON, UNSPENT_JSON),
+        Ok(false) => reply(503, TEXT, NODE_BEHIND),
+        Err(e) => node_failed("getblockchaininfo", &e),
+    }
+}
+
+/// Said instead of "unspent" while the node is behind the network.
+pub const NODE_BEHIND: &str = "this node is behind the network; it cannot say unspent";
+
+/// Is the node at the network's tip, as far as it can tell? Every signal the
+/// crate has for "behind", because a "no" here costs one 503 and a wrong "yes"
+/// costs an "unspent" that is not:
+///
+/// - not in initial block download (which latches off once caught up, so
+///   it is the weakest of these);
+/// - not `tip_unsafe_to_act_on`: btxd's own `is_stale`, or its tip behind its
+///   best header at all. It flaps by design while a block arrives; flapping
+///   into a 503 is the safe direction;
+/// - `network_height` (blocks, headers and the signed frontier when it is on
+///   this chain) no more than two above `blocks`: after mainnet 244,000
+///   `headers` alone stays near `blocks` while a node catches up;
+/// - its tip not older than `node_api::TIP_STALE_AFTER_SECS`.
+///
+/// It still cannot see a branch the node holds only as headers it has not
+/// accepted; nothing a node reports about itself can. That is why "unspent"
+/// is never proof to a swap client.
+async fn node_is_caught_up(rpc: &dyn Rpc) -> Result<bool, AppError> {
+    let info = crate::node_api::get_blockchain_info(rpc).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Ok(!info.initial_block_download
+        && !info.tip_unsafe_to_act_on()
+        && info.network_height() <= info.blocks + 2
+        && !crate::node_api::tip_is_stale(info.median_time, now))
+}
+
+/// `/block/<hash>/header`: the header of a block on the node's active chain.
+/// Needs no index, and works on any node, pruned or not. A block the node
+/// knows only as a side branch is a 404, as electrs answers it: electrs
+/// serves headers from its best chain only.
+pub async fn answer_header(rpc: &dyn Rpc, hash: &Id) -> Reply {
+    let h = id_hex(hash);
+    match rpc.call("getblockheader", json!([h, true])).await {
+        Ok(v) => {
+            if v.get("confirmations").and_then(Value::as_i64).unwrap_or(-1) < 1 {
+                return reply(404, TEXT, BLOCK_NOT_FOUND);
+            }
+        }
+        Err(AppError::Rpc { .. }) => return reply(404, TEXT, BLOCK_NOT_FOUND),
+        Err(e) => return node_failed("getblockheader", &e),
+    }
+    match rpc.call("getblockheader", json!([h, false])).await {
+        Ok(v) => match v.as_str().filter(|x| is_lower_hex(x)) {
+            Some(hex) => reply(200, TEXT, hex),
+            None => reply(500, TEXT, "the node returned a malformed header"),
+        },
+        Err(AppError::Rpc { .. }) => reply(404, TEXT, BLOCK_NOT_FOUND),
+        Err(e) => node_failed("getblockheader", &e),
     }
 }
 
@@ -430,6 +952,7 @@ async fn serve_one(
     rpc: Arc<dyn Rpc>,
     tip: Arc<TipCache>,
     signers: Arc<SignersCache>,
+    index: Option<Arc<SwapIndex>>,
     mut stream: TcpStream,
 ) {
     let deadline = tokio::time::Instant::now() + READ_TIMEOUT;
@@ -437,6 +960,15 @@ async fn serve_one(
     let (status, body) = match read_request_line(&mut stream, deadline).await {
         Err(code) => (code, String::new()),
         Ok(line) => match parse_request_line(&line).and_then(|(m, p)| route(m, p)) {
+            Some(r) if r.is_swap() => match &index {
+                Some(index) => {
+                    let got = answer_swap(rpc.as_ref(), index, r).await;
+                    content_type = got.content_type;
+                    (got.status, got.body)
+                }
+                // Started without a swap index: these routes do not exist.
+                None => (404, "not found".to_string()),
+            },
             Some(WitnessRoute::TipHeight) => match tip.get() {
                 Some(cached) => (200, cached),
                 None => {
@@ -475,22 +1007,91 @@ async fn serve_one(
 /// handle left to stop it.
 pub struct WitnessServer {
     task: tokio::task::JoinHandle<()>,
+    /// The task that keeps the swap index on the node's tip, when there is one.
+    index_task: Option<tokio::task::JoinHandle<()>>,
+    index: Option<Arc<SwapIndex>>,
     pub addr: SocketAddr,
 }
 
+/// How a witness server is started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WitnessOptions {
+    /// Serve the five swap routes from an index of this many blocks below the
+    /// tip (capped by what a pruned node still holds). `None` leaves the
+    /// routes out entirely: they answer 404 and the node is asked nothing
+    /// extra.
+    pub swap_window: Option<u32>,
+}
+
+impl Default for WitnessOptions {
+    /// The swap routes on, over the default window: what `btx-witness` runs.
+    fn default() -> Self {
+        Self {
+            swap_window: Some(crate::swap_index::DEFAULT_WINDOW),
+        }
+    }
+}
+
+impl WitnessOptions {
+    /// What the app serves on `addr`: the swap routes only when the witness
+    /// accepts connections from other machines. On loopback (the default
+    /// install) no swap client can reach them, and the index would cost the
+    /// owner's node a full read of the window on every start for nobody.
+    pub fn for_bind(addr: &str) -> Self {
+        if is_public_bind(addr) {
+            Self::default()
+        } else {
+            Self::without_swap()
+        }
+    }
+
+    /// The witness as it was before the swap routes: hash routes and signers.
+    pub fn without_swap() -> Self {
+        Self { swap_window: None }
+    }
+}
+
 impl WitnessServer {
-    /// Bind and start serving. Binding is done here, not in the task, so a
-    /// port already in use is an error the caller sees immediately rather than
-    /// a server that silently never came up.
+    /// Bind and start serving the hash routes and the signer census, WITHOUT
+    /// the swap routes: exactly the witness every caller had before them.
+    /// Binding is done here, not in the task, so a port already in use is an
+    /// error the caller sees immediately rather than a server that silently
+    /// never came up.
+    ///
+    /// The swap index is opt-in through `start_with` on purpose. The app's
+    /// witness is on by default on every install, bound to loopback where no
+    /// swap client can reach it; turning the index on there would make every
+    /// app start read the last 100,000 blocks from its owner's node for
+    /// nobody. `btx-witness`, which operators run behind a public front, turns
+    /// it on; the app does when its witness is bound publicly.
     pub async fn start(rpc: Arc<dyn Rpc>, addr: &str) -> AppResult<Self> {
+        Self::start_with(rpc, addr, WitnessOptions::without_swap()).await
+    }
+
+    /// Bind and start serving with explicit options.
+    pub async fn start_with(
+        rpc: Arc<dyn Rpc>,
+        addr: &str,
+        opts: WitnessOptions,
+    ) -> AppResult<Self> {
         let listener = TcpListener::bind(addr).await.map_err(|e| {
             crate::error::AppError::Config(format!("witness server cannot bind {addr}: {e}"))
         })?;
         let bound = listener.local_addr().map_err(|e| {
             crate::error::AppError::Config(format!("witness server has no address: {e}"))
         })?;
+        // One bound for everything that reaches the node: requests take a
+        // permit per connection, the index takes one per RPC.
+        let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT));
+        let index = opts.swap_window.map(|w| Arc::new(SwapIndex::new(w)));
+        let index_task = index.clone().map(|index| {
+            let rpc = rpc.clone();
+            let gate = inflight.clone();
+            tokio::spawn(async move { index.run(rpc.as_ref(), &gate).await })
+        });
+        let served_index = index.clone();
         let task = tokio::spawn(async move {
-            let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT));
+            let index = served_index;
             let tip = Arc::new(TipCache::default());
             let signers = Arc::new(SignersCache::default());
             loop {
@@ -507,8 +1108,9 @@ impl WitnessServer {
                         let rpc = rpc.clone();
                         let tip = tip.clone();
                         let signers = signers.clone();
+                        let index = index.clone();
                         tokio::spawn(async move {
-                            serve_one(rpc, tip, signers, stream).await;
+                            serve_one(rpc, tip, signers, index, stream).await;
                             drop(permit);
                         });
                     }
@@ -522,21 +1124,38 @@ impl WitnessServer {
                 }
             }
         });
-        Ok(Self { task, addr: bound })
+        Ok(Self {
+            task,
+            index_task,
+            index,
+            addr: bound,
+        })
     }
 
     pub fn stop(self) {
-        self.task.abort();
+        // Drop does the aborting, for both tasks.
+        drop(self);
     }
 
     pub fn is_running(&self) -> bool {
         !self.task.is_finished()
+    }
+
+    /// The swap index's counts, and whether it has reached the tip; `None`
+    /// when the server was started without one.
+    pub async fn swap_stats(&self) -> Option<(bool, crate::swap_index::IndexStats)> {
+        let index = self.index.as_ref()?;
+        let s = index.state.read().await;
+        Some((s.ready, s.stats()))
     }
 }
 
 impl Drop for WitnessServer {
     fn drop(&mut self) {
         self.task.abort();
+        if let Some(t) = &self.index_task {
+            t.abort();
+        }
     }
 }
 
@@ -602,7 +1221,7 @@ mod tests {
         assert_eq!(route("GET", "/signers"), None);
 
         let node = Arc::new(StubNode { height: 211_500 });
-        let server = WitnessServer::start(node, "127.0.0.1:0").await.unwrap();
+        let server = start_plain(node, "127.0.0.1:0").await.unwrap();
         let got = ask(server.addr, "GET /signers/recent HTTP/1.1\r\n\r\n").await;
         assert!(got.starts_with("HTTP/1.1 200"), "{got:?}");
         assert!(
@@ -627,7 +1246,7 @@ mod tests {
     async fn the_signer_window_is_reused_not_recomputed_per_request() {
         let node = Arc::new(CountingNode::new(Duration::ZERO));
         let calls = node.calls.clone();
-        let server = WitnessServer::start(node, "127.0.0.1:0").await.unwrap();
+        let server = start_plain(node, "127.0.0.1:0").await.unwrap();
         let first = ask(server.addr, "GET /signers/recent HTTP/1.1\r\n\r\n").await;
         assert!(first.starts_with("HTTP/1.1 200"), "{first:?}");
         let cold = calls.load(std::sync::atomic::Ordering::SeqCst);
@@ -701,7 +1320,7 @@ mod tests {
     async fn a_burst_is_answered_in_full_but_never_hits_the_node_all_at_once() {
         let node = Arc::new(CountingNode::new(Duration::from_millis(30)));
         let peak = node.peak.clone();
-        let server = WitnessServer::start(node, "127.0.0.1:0").await.unwrap();
+        let server = start_plain(node, "127.0.0.1:0").await.unwrap();
         let addr = server.addr;
 
         let mut asks = Vec::new();
@@ -761,7 +1380,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_with_a_long_head_still_gets_its_whole_response() {
         let node = Arc::new(StubNode { height: 211_500 });
-        let server = WitnessServer::start(node, "127.0.0.1:0").await.unwrap();
+        let server = start_plain(node, "127.0.0.1:0").await.unwrap();
         let padding = "X-Pad: ".to_string() + &"p".repeat(4000) + "\r\n";
         let request = format!(
             "GET /blocks/tip/height HTTP/1.1\r\nHost: x\r\n{padding}Cookie: {}\r\n\r\n",
@@ -781,7 +1400,7 @@ mod tests {
     async fn the_tip_height_is_reused_for_a_second_instead_of_asked_again() {
         let node = Arc::new(CountingNode::new(Duration::ZERO));
         let calls = node.calls.clone();
-        let server = WitnessServer::start(node, "127.0.0.1:0").await.unwrap();
+        let server = start_plain(node, "127.0.0.1:0").await.unwrap();
         for _ in 0..20 {
             let got = ask(server.addr, "GET /blocks/tip/height HTTP/1.1\r\n\r\n").await;
             assert!(got.ends_with("211500"), "answer was: {got:?}");
@@ -811,15 +1430,13 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_server_really_does_free_the_port() {
         let node = Arc::new(StubNode { height: 1 });
-        let server = WitnessServer::start(node.clone(), "127.0.0.1:0")
-            .await
-            .unwrap();
+        let server = start_plain(node.clone(), "127.0.0.1:0").await.unwrap();
         let addr = server.addr;
         drop(server);
         // The abort has to be observed by the runtime before the port is free.
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            if let Ok(again) = WitnessServer::start(node.clone(), &addr.to_string()).await {
+            if let Ok(again) = start_plain(node.clone(), &addr.to_string()).await {
                 again.stop();
                 return;
             }
@@ -972,7 +1589,7 @@ mod tests {
         let node: Arc<dyn Rpc> = Arc::new(StubNode { height: 211_500 });
         // Port 0: the OS picks a free one, so the test cannot collide with a
         // real deployment or with itself running twice.
-        let server = WitnessServer::start(node, "127.0.0.1:0").await.unwrap();
+        let server = start_plain(node, "127.0.0.1:0").await.unwrap();
         let addr = server.addr;
         assert!(server.is_running());
 
@@ -1075,16 +1692,625 @@ mod tests {
     #[tokio::test]
     async fn a_port_already_taken_is_an_error_the_caller_sees() {
         let node: Arc<dyn Rpc> = Arc::new(StubNode { height: 1 });
-        let first = WitnessServer::start(node.clone(), "127.0.0.1:0")
-            .await
-            .unwrap();
+        let first = start_plain(node.clone(), "127.0.0.1:0").await.unwrap();
         let taken = first.addr.to_string();
         // Binding happens in start(), not in the spawned task, so this is an
         // error rather than a server that silently never came up.
-        let second = WitnessServer::start(node, &taken).await;
+        let second = start_plain(node, &taken).await;
         assert!(second.is_err(), "a taken port must fail loudly");
         let msg = second.err().unwrap().to_string();
         assert!(msg.contains("cannot bind"), "{msg}");
         first.stop();
+    }
+
+    /// The witness as it was before the swap routes: the tests above count
+    /// RPC calls and must not see an index's.
+    async fn start_plain(node: Arc<dyn Rpc>, addr: &str) -> AppResult<WitnessServer> {
+        WitnessServer::start_with(node, addr, WitnessOptions::without_swap()).await
+    }
+
+    // ── the five swap routes ────────────────────────────────────────────────
+
+    const FIXTURE: &str = include_str!("../tests/fixtures/witness_swap/mainnet-288858.json");
+
+    fn rpc_err(code: i64, message: &str) -> AppError {
+        AppError::Rpc {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// A node backed by real mainnet blocks, with an active chain, a mempool
+    /// and a UTXO set the test can change under the server.
+    #[derive(Default, Clone)]
+    struct ChainState {
+        blocks: std::collections::HashMap<String, Value>,
+        headers: std::collections::HashMap<String, String>,
+        raw: std::collections::HashMap<String, (String, String)>,
+        active: Vec<String>,
+        base: u64,
+        mempool: std::collections::HashMap<String, Value>,
+        utxos: std::collections::HashSet<(String, u64)>,
+        pruned_below: u64,
+        ibd: bool,
+        behind: u64,
+        calls: Vec<String>,
+    }
+
+    struct ChainNode(std::sync::Mutex<ChainState>);
+
+    impl ChainNode {
+        /// The fixture's blocks at `heights`, as one active chain.
+        fn from_fixture(heights: &[u64]) -> Self {
+            let f: Value = serde_json::from_str(FIXTURE).unwrap();
+            let mut st = ChainState::default();
+            for b in f["blocks"].as_array().unwrap() {
+                let h = b["height"].as_u64().unwrap();
+                if !heights.contains(&h) {
+                    continue;
+                }
+                let hash = b["hash"].as_str().unwrap().to_string();
+                let mut b = b.clone();
+                b.as_object_mut().unwrap().remove("nextblockhash");
+                st.blocks.insert(hash.clone(), b);
+                st.active.push(hash);
+            }
+            for (k, v) in f["headers"].as_object().unwrap() {
+                st.headers
+                    .insert(k.clone(), v.as_str().unwrap().to_string());
+            }
+            for (k, v) in f["raw"].as_object().unwrap() {
+                st.raw.insert(
+                    k.clone(),
+                    (
+                        v["block"].as_str().unwrap().to_string(),
+                        v["hex"].as_str().unwrap().to_string(),
+                    ),
+                );
+            }
+            st.base = heights[0];
+            st.pruned_below = heights[0];
+            Self(std::sync::Mutex::new(st))
+        }
+
+        fn with<R>(&self, f: impl FnOnce(&mut ChainState) -> R) -> R {
+            f(&mut self.0.lock().unwrap())
+        }
+    }
+
+    impl ChainState {
+        fn height_of(&self, hash: &str) -> Option<u64> {
+            self.blocks.get(hash).and_then(|b| b["height"].as_u64())
+        }
+        fn active_at(&self, h: u64) -> Option<&String> {
+            self.active.get(h.checked_sub(self.base)? as usize)
+        }
+        fn is_active(&self, hash: &str) -> bool {
+            self.height_of(hash)
+                .is_some_and(|h| self.active_at(h).map(String::as_str) == Some(hash))
+        }
+        fn tip(&self) -> u64 {
+            self.base + self.active.len() as u64 - 1
+        }
+    }
+
+    #[async_trait]
+    impl Rpc for ChainNode {
+        async fn call(&self, method: &str, p: Value) -> AppResult<Value> {
+            let mut st = self.0.lock().unwrap();
+            st.calls.push(method.to_string());
+            let s = |i: usize| p[i].as_str().unwrap_or("").to_string();
+            match method {
+                "getblockchaininfo" => Ok(json!({
+                    "blocks": st.tip(), "headers": st.tip(),
+                    "pruned": true, "pruneheight": st.pruned_below,
+                    "initialblockdownload": st.ibd,
+                    "behind_best_header": st.behind,
+                })),
+                "getbestblockhash" => Ok(json!(st.active.last().unwrap())),
+                "getblockhash" => {
+                    let h = p[0].as_u64().unwrap();
+                    st.active_at(h)
+                        .map(|x| json!(x))
+                        .ok_or_else(|| rpc_err(-8, "Block height out of range"))
+                }
+                "getblock" => {
+                    let hash = s(0);
+                    let Some(mut b) = st.blocks.get(&hash).cloned() else {
+                        return Err(rpc_err(-5, "Block not found"));
+                    };
+                    let h = b["height"].as_u64().unwrap();
+                    if h < st.pruned_below {
+                        return Err(rpc_err(-1, "Block not available (pruned data)"));
+                    }
+                    if st.is_active(&hash) {
+                        if let Some(n) = st.active_at(h + 1) {
+                            b["nextblockhash"] = json!(n);
+                        }
+                    }
+                    Ok(b)
+                }
+                "getblockheader" => {
+                    let hash = s(0);
+                    let Some(h) = st.height_of(&hash) else {
+                        return Err(rpc_err(-5, "Block not found"));
+                    };
+                    if p[1] == json!(false) {
+                        return Ok(json!(st
+                            .headers
+                            .get(&hash)
+                            .cloned()
+                            .unwrap_or_else(|| "00".repeat(182))));
+                    }
+                    let active = st.is_active(&hash);
+                    let mut v = json!({
+                        "hash": hash, "height": h,
+                        "confirmations": if active { (st.tip() - h + 1) as i64 } else { -1 },
+                    });
+                    if active {
+                        if let Some(n) = st.active_at(h + 1) {
+                            v["nextblockhash"] = json!(n);
+                        }
+                    }
+                    Ok(v)
+                }
+                "getrawtransaction" => {
+                    let t = s(0);
+                    if let Some(blockhash) = p.get(2).and_then(Value::as_str) {
+                        return match st.raw.get(&t) {
+                            Some((b, hex)) if b == blockhash => Ok(json!(hex)),
+                            _ => Err(rpc_err(
+                                -5,
+                                "No such transaction found in the provided block",
+                            )),
+                        };
+                    }
+                    match st.mempool.get(&t) {
+                        Some(tx) if p[1] == json!(1) => Ok(tx.clone()),
+                        Some(tx) => Ok(tx["hex"].clone()),
+                        None => Err(rpc_err(-5, "No such mempool transaction")),
+                    }
+                }
+                "getmempoolentry" => match st.mempool.contains_key(&s(0)) {
+                    true => Ok(json!({"vsize": 1})),
+                    false => Err(rpc_err(-5, "Transaction not in mempool")),
+                },
+                "gettxspendingprevout" => {
+                    let q = &p[0][0];
+                    let mut out = json!({"txid": q["txid"], "vout": q["vout"]});
+                    for (txid, tx) in &st.mempool {
+                        for i in tx["vin"].as_array().unwrap() {
+                            if i["txid"] == q["txid"] && i["vout"] == q["vout"] {
+                                out["spendingtxid"] = json!(txid);
+                            }
+                        }
+                    }
+                    Ok(json!([out]))
+                }
+                "gettxout" => {
+                    let key = (s(0), p[1].as_u64().unwrap());
+                    Ok(if st.utxos.contains(&key) {
+                        json!({"value": 1.0})
+                    } else {
+                        Value::Null
+                    })
+                }
+                other => panic!("a witness must never call {other}"),
+            }
+        }
+    }
+
+    /// A full HTTP exchange: (status, content type, body).
+    async fn fetch(addr: SocketAddr, path: &str) -> (u16, String, String) {
+        let raw = ask(addr, &format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n")).await;
+        let (head, body) = raw.split_once("\r\n\r\n").expect("a head");
+        let status = head[9..12].parse().unwrap();
+        let ctype = head
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Type: "))
+            .unwrap_or("")
+            .to_string();
+        (status, ctype, body.to_string())
+    }
+
+    async fn wait_ready(server: &WitnessServer, tip: u32) {
+        for _ in 0..500 {
+            if let Some((true, st)) = server.swap_stats().await {
+                if st.tip == tip {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "the swap index never reached {tip}: {:?}",
+            server.swap_stats().await
+        );
+    }
+
+    async fn serve(node: Arc<ChainNode>) -> WitnessServer {
+        WitnessServer::start_with(node, "127.0.0.1:0", WitnessOptions::default())
+            .await
+            .unwrap()
+    }
+
+    /// The acceptance test in miniature: every swap-route answer api.btxscan.io
+    /// (electrs) gave for these mainnet blocks, served again by a witness on a
+    /// pruned node that holds only those blocks, compared byte for byte —
+    /// status, content type and body.
+    #[tokio::test]
+    async fn mainnet_fixture_answers_match_electrs_byte_for_byte() {
+        let f: Value = serde_json::from_str(FIXTURE).unwrap();
+        let chain = Arc::new(ChainNode::from_fixture(&[288858, 288859, 288860]));
+        let lone = Arc::new(ChainNode::from_fixture(&[289982]));
+        let a = serve(chain.clone()).await;
+        let b = serve(lone.clone()).await;
+        wait_ready(&a, 288860).await;
+        wait_ready(&b, 289982).await;
+        let in_lone = |p: &str| {
+            let blk = &f["blocks"].as_array().unwrap()[3];
+            p.contains(blk["hash"].as_str().unwrap())
+                || blk["tx"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| p.contains(t["txid"].as_str().unwrap()))
+        };
+        let mut compared = 0;
+        for (path, want) in f["expect"].as_object().unwrap() {
+            if path.starts_with("/block-height/") {
+                continue;
+            }
+            let at = if in_lone(path) { b.addr } else { a.addr };
+            let (code, ctype, body) = fetch(at, path).await;
+            assert_eq!(code as u64, want["status"].as_u64().unwrap(), "{path}");
+            assert_eq!(ctype, want["type"].as_str().unwrap(), "{path}");
+            assert_eq!(body, want["body"].as_str().unwrap(), "{path}");
+            compared += 1;
+        }
+        // 2 outspends, 1 hex, 4 headers, and status + proof for 23 txs.
+        assert_eq!(compared, 53);
+    }
+
+    #[tokio::test]
+    async fn outspend_says_unspent_only_when_it_is_complete_to_the_tip() {
+        let node = Arc::new(ChainNode::from_fixture(&[288858, 288859, 288860]));
+        let s = serve(node.clone()).await;
+        wait_ready(&s, 288860).await;
+        let t0 = "37f03c45f1ecf44b91b52c9b5ff7debc5067cf1669e0ab714b35ad3c35354fb5";
+        // Created in the window and not spent in it: unspent, from the index
+        // alone, whatever gettxout says. vout 7 does not exist; electrs says
+        // the same thing about it.
+        for v in [1, 7] {
+            let r = fetch(s.addr, &format!("/tx/{t0}/outspend/{v}")).await;
+            assert_eq!(r, (200, JSON.into(), UNSPENT_JSON.into()), "vout {v}");
+        }
+        // Created below the window: only the UTXO set can say unspent ...
+        let below = "1111111111111111111111111111111111111111111111111111111111111111";
+        node.with(|st| st.utxos.insert((below.into(), 3)));
+        let r = fetch(s.addr, &format!("/tx/{below}/outspend/3")).await;
+        assert_eq!(r, (200, JSON.into(), UNSPENT_JSON.into()));
+        // ... and when it is not there either, this witness does not know.
+        let r = fetch(s.addr, &format!("/tx/{below}/outspend/4")).await;
+        assert_eq!(r, (404, TEXT.into(), OUTPOINT_UNKNOWN.into()));
+        // A spend waiting in the mempool is a spend, with the input it uses.
+        let spender = "2222222222222222222222222222222222222222222222222222222222222222";
+        node.with(|st| {
+            st.mempool.insert(
+                spender.into(),
+                json!({"hex": "00", "vin": [
+                    {"txid": below, "vout": 9},
+                    {"txid": t0, "vout": 1},
+                ]}),
+            )
+        });
+        let r = fetch(s.addr, &format!("/tx/{t0}/outspend/1")).await;
+        assert_eq!(
+            r.2,
+            format!(
+                r#"{{"spent":true,"txid":"{spender}","vin":1,"status":{{"confirmed":false}}}}"#
+            )
+        );
+        // Funding still in the mempool, spend not: unspent.
+        node.with(|st| {
+            st.mempool
+                .insert(below.into(), json!({"hex": "00", "vin": []}))
+        });
+        let r = fetch(s.addr, &format!("/tx/{below}/outspend/5")).await;
+        assert_eq!(r, (200, JSON.into(), UNSPENT_JSON.into()));
+        // A node still syncing has not seen the blocks a spend may be in:
+        // every "unspent" becomes an abstention, and "spent" stays spent.
+        node.with(|st| st.ibd = true);
+        for p in [
+            format!("/tx/{t0}/outspend/7"),
+            format!("/tx/{below}/outspend/3"),
+            format!("/tx/{below}/outspend/5"),
+        ] {
+            assert_eq!(
+                fetch(s.addr, &p).await,
+                (503, TEXT.into(), NODE_BEHIND.into()),
+                "{p}"
+            );
+        }
+        let r = fetch(s.addr, &format!("/tx/{t0}/outspend/0")).await;
+        assert!(r.2.starts_with(r#"{"spent":true"#), "{r:?}");
+        // IBD latches off once a node has caught up, so a node that falls
+        // behind later says so only through its other signals.
+        node.with(|st| {
+            st.ibd = false;
+            st.behind = 3;
+        });
+        let r = fetch(s.addr, &format!("/tx/{t0}/outspend/7")).await;
+        assert_eq!(r, (503, TEXT.into(), NODE_BEHIND.into()));
+        node.with(|st| st.behind = 0);
+        let r = fetch(s.addr, &format!("/tx/{t0}/outspend/7")).await;
+        assert_eq!(r, (200, JSON.into(), UNSPENT_JSON.into()));
+    }
+
+    /// The node stops knowing the index's tip at all (a -reindex, or a
+    /// different datadir behind the same port). The index must take it off
+    /// and carry on, not answer 503 until someone restarts it.
+    #[tokio::test]
+    async fn an_index_tip_the_node_no_longer_knows_is_disconnected() {
+        let node = Arc::new(ChainNode::from_fixture(&[288858, 288859, 288860]));
+        let s = serve(node.clone()).await;
+        wait_ready(&s, 288860).await;
+        node.with(|st| {
+            let gone = st.active.pop().unwrap();
+            st.blocks.remove(&gone);
+        });
+        let spender = "1f01798f15c704e13e31c478f75f68cb795acee603f4b2503ebf61ad36ecac46";
+        for _ in 0..500 {
+            let r = fetch(s.addr, &format!("/tx/{spender}/status")).await;
+            if r == (404, TEXT.into(), TX_NOT_FOUND.into()) {
+                assert_eq!(s.swap_stats().await.unwrap().1.tip, 288859);
+                return;
+            }
+            assert_eq!(r.0, 503, "{r:?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the index never let go of a tip the node does not know");
+    }
+
+    /// A reorg that replaces the block holding a spend must turn "spent" into
+    /// "unspent" — through a 503 while the index catches up, never through a
+    /// stale answer — and back again when the chain returns.
+    #[tokio::test]
+    async fn a_reorg_is_followed_and_never_answered_stale() {
+        let node = Arc::new(ChainNode::from_fixture(&[288858, 288859, 288860]));
+        let s = serve(node.clone()).await;
+        wait_ready(&s, 288860).await;
+        let funding = "37f03c45f1ecf44b91b52c9b5ff7debc5067cf1669e0ab714b35ad3c35354fb5";
+        let spender = "1f01798f15c704e13e31c478f75f68cb795acee603f4b2503ebf61ad36ecac46";
+        let spent = fetch(s.addr, &format!("/tx/{funding}/outspend/0")).await;
+        assert!(spent.2.starts_with(r#"{"spent":true"#), "{spent:?}");
+
+        // Replace 288860 with a sibling that spends nothing.
+        let real = node.with(|st| st.active[2].clone());
+        let fake = "3333333333333333333333333333333333333333333333333333333333333333";
+        let fake_cb = "4444444444444444444444444444444444444444444444444444444444444444";
+        node.with(|st| {
+            let prev = st.active[1].clone();
+            st.blocks.insert(
+                fake.into(),
+                json!({
+                    "hash": fake, "height": 288860, "time": 1, "previousblockhash": prev,
+                    "merkleroot": fake_cb,
+                    "tx": [{"txid": fake_cb, "vin": [{"coinbase": "00"}]}],
+                }),
+            );
+            st.active[2] = fake.into();
+        });
+        // Every answer about the replaced block is either a 503 (not caught
+        // up) or the new truth. Never the old "spent", never the old status.
+        let mut saw_new = false;
+        for _ in 0..300 {
+            let st = fetch(s.addr, &format!("/tx/{spender}/status")).await;
+            let os = fetch(s.addr, &format!("/tx/{funding}/outspend/0")).await;
+            assert!(
+                st.0 == 503 || st == (404, TEXT.into(), TX_NOT_FOUND.into()),
+                "{st:?}"
+            );
+            assert!(os.0 == 503 || os.2 == UNSPENT_JSON, "{os:?}");
+            if st.0 == 404 && os.2 == UNSPENT_JSON {
+                saw_new = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(saw_new, "the index never followed the reorg");
+        let cb = fetch(s.addr, &format!("/tx/{fake_cb}/status")).await;
+        assert_eq!(cb.0, 200, "{cb:?}");
+        // The proof for the new block's only tx: the tx is its own root.
+        let pf = fetch(s.addr, &format!("/tx/{fake_cb}/merkle-proof")).await;
+        assert_eq!(pf.2, r#"{"block_height":288860,"merkle":[],"pos":0}"#);
+        // The replaced block's header is a side branch now: 404, as electrs.
+        let h = fetch(s.addr, &format!("/block/{real}/header")).await;
+        assert_eq!(h, (404, TEXT.into(), BLOCK_NOT_FOUND.into()));
+
+        // And back.
+        node.with(|st| st.active[2] = real.clone());
+        for _ in 0..300 {
+            let os = fetch(s.addr, &format!("/tx/{funding}/outspend/0")).await;
+            if os.2.starts_with(r#"{"spent":true"#) {
+                return;
+            }
+            assert!(os.0 == 503 || os.2 == UNSPENT_JSON, "{os:?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the index never followed the chain back");
+    }
+
+    /// While the first scan runs nothing is answered from the index: a half
+    /// built index would call an output unspent while its spend sits in a
+    /// block not read yet.
+    #[tokio::test]
+    async fn nothing_is_answered_from_an_index_that_is_not_built() {
+        let node = ChainNode::from_fixture(&[288858, 288859, 288860]);
+        let index = SwapIndex::new(1000);
+        let t =
+            parse_id("37f03c45f1ecf44b91b52c9b5ff7debc5067cf1669e0ab714b35ad3c35354fb5").unwrap();
+        for r in [
+            answer_status(&node, &index, &t).await,
+            answer_hex(&node, &index, &t).await,
+            answer_merkle_proof(&node, &index, &t).await,
+            answer_outspend(&node, &index, &t, 0).await,
+        ] {
+            assert_eq!(r.status, 503, "{r:?}");
+        }
+        // The header needs no index.
+        let h =
+            parse_id("429bfa29bdb12edbb5491c6a66e9ebccd5cb34cb25584118d1acd4c6cdc4ddc2").unwrap();
+        assert_eq!(answer_header(&node, &h).await.status, 200);
+    }
+
+    /// The node prunes its bottom block while the index starts: the scan steps
+    /// past it rather than failing.
+    #[tokio::test]
+    async fn the_first_scan_steps_past_a_block_pruned_under_it() {
+        let node = Arc::new(ChainNode::from_fixture(&[288858, 288859, 288860]));
+        // getblockchaininfo still reports 288858, but its data is gone.
+        node.with(|st| st.pruned_below = 288859);
+        let index = SwapIndex::new(1000);
+        let gate = tokio::sync::Semaphore::new(MAX_INFLIGHT);
+        index.sync_once(node.as_ref(), &gate).await.unwrap();
+        let st = index.state.read().await.stats();
+        assert_eq!((st.bottom, st.tip, st.blocks), (288859, 288860, 2));
+    }
+
+    /// The app's witness is on by default, on loopback. There it must not
+    /// build an index nobody can reach; bound publicly it serves the routes.
+    #[test]
+    fn the_app_builds_the_index_only_for_a_public_bind() {
+        for local in ["127.0.0.1:3081", "[::1]:3081"] {
+            assert_eq!(
+                WitnessOptions::for_bind(local),
+                WitnessOptions::without_swap()
+            );
+        }
+        for public in ["0.0.0.0:3081", "192.168.1.50:3081", "[::]:3081"] {
+            assert_eq!(
+                WitnessOptions::for_bind(public).swap_window,
+                Some(crate::swap_index::DEFAULT_WINDOW)
+            );
+        }
+    }
+
+    /// `start`, which the app used before the swap routes, still starts the
+    /// witness without them.
+    #[tokio::test]
+    async fn start_alone_is_still_the_witness_without_swap() {
+        let node = Arc::new(ChainNode::from_fixture(&[288858, 288859, 288860]));
+        let s = WitnessServer::start(node.clone(), "127.0.0.1:0")
+            .await
+            .unwrap();
+        assert!(s.swap_stats().await.is_none());
+        let t = "37f03c45f1ecf44b91b52c9b5ff7debc5067cf1669e0ab714b35ad3c35354fb5";
+        assert_eq!(fetch(s.addr, &format!("/tx/{t}/status")).await.0, 404);
+    }
+
+    #[tokio::test]
+    async fn a_witness_started_without_swap_serves_none_of_the_five() {
+        let node = Arc::new(ChainNode::from_fixture(&[288858, 288859, 288860]));
+        let s =
+            WitnessServer::start_with(node.clone(), "127.0.0.1:0", WitnessOptions::without_swap())
+                .await
+                .unwrap();
+        let t = "37f03c45f1ecf44b91b52c9b5ff7debc5067cf1669e0ab714b35ad3c35354fb5";
+        let h = "429bfa29bdb12edbb5491c6a66e9ebccd5cb34cb25584118d1acd4c6cdc4ddc2";
+        for p in [
+            format!("/tx/{t}/status"),
+            format!("/tx/{t}/hex"),
+            format!("/tx/{t}/merkle-proof"),
+            format!("/tx/{t}/outspend/0"),
+            format!("/block/{h}/header"),
+        ] {
+            assert_eq!(fetch(s.addr, &p).await.0, 404, "{p}");
+        }
+        assert!(s.swap_stats().await.is_none());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            node.with(|st| st.calls.is_empty()),
+            "the node was asked something"
+        );
+    }
+
+    #[test]
+    fn the_swap_routes_have_exactly_one_spelling() {
+        let t = "37f03c45f1ecf44b91b52c9b5ff7debc5067cf1669e0ab714b35ad3c35354fb5";
+        let id = parse_id(t).unwrap();
+        assert_eq!(
+            route("GET", &format!("/tx/{t}/status")),
+            Some(WitnessRoute::TxStatus(id))
+        );
+        assert_eq!(
+            route("GET", &format!("/tx/{t}/hex")),
+            Some(WitnessRoute::TxHex(id))
+        );
+        assert_eq!(
+            route("GET", &format!("/tx/{t}/merkle-proof")),
+            Some(WitnessRoute::TxMerkleProof(id))
+        );
+        assert_eq!(
+            route("GET", &format!("/tx/{t}/outspend/0")),
+            Some(WitnessRoute::TxOutspend(id, 0))
+        );
+        assert_eq!(
+            route("GET", &format!("/tx/{t}/outspend/9999")),
+            Some(WitnessRoute::TxOutspend(id, MAX_VOUT))
+        );
+        assert_eq!(
+            route("GET", &format!("/block/{t}/header")),
+            Some(WitnessRoute::BlockHeader(id))
+        );
+        let upper = t.to_uppercase();
+        let short = &t[..63];
+        for p in [
+            // ids: case, length, characters
+            format!("/tx/{upper}/status"),
+            format!("/tx/{short}/status"),
+            format!("/tx/{t}0/status"),
+            format!("/tx/{}g/hex", &t[..63]),
+            format!("/block/{upper}/header"),
+            format!("/block/{short}/header"),
+            // vouts: one spelling, a small cap
+            format!("/tx/{t}/outspend/00"),
+            format!("/tx/{t}/outspend/01"),
+            format!("/tx/{t}/outspend/10000"),
+            format!("/tx/{t}/outspend/99999"),
+            format!("/tx/{t}/outspend/-1"),
+            format!("/tx/{t}/outspend/+1"),
+            format!("/tx/{t}/outspend/1e3"),
+            format!("/tx/{t}/outspend/0x1"),
+            format!("/tx/{t}/outspend/ 1"),
+            format!("/tx/{t}/outspend/١"),
+            format!("/tx/{t}/outspend/"),
+            format!("/tx/{t}/outspend"),
+            format!("/tx/{t}/outspend/1/2"),
+            // shape: no trailing slash, query, fragment, extra segment
+            format!("/tx/{t}/status/"),
+            format!("/tx/{t}/hex?x=1"),
+            format!("/tx/{t}/merkle-proof#f"),
+            format!("/block/{t}/header/"),
+            format!("/block/{t}/header?seed=1"),
+            format!("//tx/{t}/status"),
+            format!("/tx//{t}/status"),
+            // electrs routes a witness does not serve
+            format!("/tx/{t}"),
+            format!("/tx/{t}/raw"),
+            format!("/tx/{t}/outspends"),
+            format!("/tx/{t}/merkleblock-proof"),
+            format!("/block/{t}"),
+            format!("/block/{t}/status"),
+            format!("/block/{t}/txids"),
+            format!("/block/{t}/raw"),
+            format!("/block/{t}/txid/0"),
+        ] {
+            assert_eq!(route("GET", &p), None, "{p} must be refused");
+        }
+        for m in ["POST", "PUT", "HEAD", "OPTIONS", "get"] {
+            assert_eq!(route(m, &format!("/tx/{t}/status")), None, "{m}");
+            assert_eq!(route(m, &format!("/block/{t}/header")), None, "{m}");
+        }
     }
 }
